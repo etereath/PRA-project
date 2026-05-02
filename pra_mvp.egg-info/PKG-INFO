@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: pra-mvp
+Version: 0.1.0
+Summary: 平台无关的价格与上下架自动化 MVP（预留 AI 定价接入能力）。
+Requires-Python: >=3.11
+Requires-Dist: openpyxl<4,>=3.1.5

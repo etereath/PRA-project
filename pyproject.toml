@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pra-mvp"
+version = "0.1.0"
+description = "平台无关的价格与上下架自动化 MVP（预留 AI 定价接入能力）。"
+requires-python = ">=3.11"
+dependencies = [
+  "openpyxl>=3.1.5,<4",
+]
+
+[tool.setuptools]
+packages = ["app"]

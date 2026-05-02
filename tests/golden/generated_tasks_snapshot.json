@@ -1,0 +1,34 @@
+[
+  {
+    "internal_sku": "SKU-002",
+    "action_type": "set_offline",
+    "priority": 1,
+    "target_price": null,
+    "target_status": "set_offline",
+    "pricing_source": null
+  },
+  {
+    "internal_sku": "SKU-003",
+    "action_type": "set_offline",
+    "priority": 1,
+    "target_price": null,
+    "target_status": "set_offline",
+    "pricing_source": null
+  },
+  {
+    "internal_sku": "SKU-001",
+    "action_type": "set_online",
+    "priority": 5,
+    "target_price": null,
+    "target_status": "set_online",
+    "pricing_source": null
+  },
+  {
+    "internal_sku": "SKU-001",
+    "action_type": "update_price",
+    "priority": 10,
+    "target_price": "16.50",
+    "target_status": null,
+    "pricing_source": "rule_plus_ai"
+  }
+]

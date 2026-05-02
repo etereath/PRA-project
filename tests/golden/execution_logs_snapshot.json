@@ -1,0 +1,22 @@
+[
+  {
+    "executor_name": "golden_executor",
+    "success_flag": true,
+    "raw_output": "simulated:set_offline:SKU-002"
+  },
+  {
+    "executor_name": "golden_executor",
+    "success_flag": true,
+    "raw_output": "simulated:set_offline:SKU-003"
+  },
+  {
+    "executor_name": "golden_executor",
+    "success_flag": true,
+    "raw_output": "simulated:set_online:SKU-001"
+  },
+  {
+    "executor_name": "golden_executor",
+    "success_flag": true,
+    "raw_output": "simulated:update_price:SKU-001"
+  }
+]

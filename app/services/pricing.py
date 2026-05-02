@@ -1,0 +1,122 @@
+from __future__ import annotations
+
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
+
+from app.enums import PricingMethod, PricingSource, RoundingRule
+from app.models import (
+    AISuggestionInput,
+    FinalPricingDecision,
+    PriceRule,
+    Product,
+    RulePricingInput,
+    RulePricingResult,
+)
+from app.services.ai import AISuggestionProvider, NullAISuggestionProvider
+
+
+class PricingService:
+    def __init__(self, ai_provider: AISuggestionProvider | None = None) -> None:
+        self.ai_provider = ai_provider or NullAISuggestionProvider()
+
+    def calculate(self, product: Product, platform_name: str, rules: list[PriceRule]) -> FinalPricingDecision:
+        rule_result = self._calculate_rule_price(RulePricingInput(product=product, platform_name=platform_name, rules=rules))
+        ai_input = AISuggestionInput(
+            internal_sku=product.internal_sku,
+            product_name=product.product_name,
+            platform_name=platform_name,
+            cost=product.base_cost,
+            stock=product.current_stock,
+            last_price=product.last_price,
+            features=product.metadata | {"variety": product.variety, "grade": product.grade},
+        )
+        ai_result = self.ai_provider.suggest(ai_input)
+        final_price = rule_result.rule_price
+        source = PricingSource.RULE_ONLY
+        if ai_result and ai_result.suggested_price is not None:
+            source = PricingSource.RULE_PLUS_AI
+        decision_trace = {
+            "matched_rule_ids": rule_result.matched_rule_ids,
+            "matched_rule_names": rule_result.matched_rule_names,
+            "rule_steps": rule_result.applied_steps,
+            "rule_price": str(rule_result.rule_price),
+            "ai_considered": ai_result is not None,
+            "ai_suggested_price": str(ai_result.suggested_price) if ai_result and ai_result.suggested_price is not None else None,
+            "ai_confidence": str(ai_result.confidence) if ai_result and ai_result.confidence is not None else None,
+            "ai_reason": ai_result.reason if ai_result else "",
+            "final_policy": "rule_price_kept_for_current_stage",
+        }
+        return FinalPricingDecision(
+            internal_sku=product.internal_sku,
+            platform_name=platform_name,
+            rule_price=rule_result.rule_price,
+            final_price=final_price,
+            pricing_source=source,
+            decision_trace=decision_trace,
+            ai_suggestion=ai_result,
+        )
+
+    def _calculate_rule_price(self, request: RulePricingInput) -> RulePricingResult:
+        applicable = [
+            rule
+            for rule in request.rules
+            if rule.active and self._matches_scope(request.product, request.platform_name, rule)
+        ]
+        applicable.sort(key=lambda item: item.priority)
+        matched_rule_ids: list[str] = []
+        matched_rule_names: list[str] = []
+        steps: list[str] = [f"base_cost={request.product.base_cost}"]
+        price = request.product.base_cost
+        for rule in applicable:
+            matched_rule_ids.append(rule.rule_id)
+            matched_rule_names.append(rule.rule_name)
+            price = self._apply_method(price, rule)
+            steps.append(f"rule:{rule.rule_id}:{rule.pricing_method.value}->{price}")
+            if rule.min_price is not None and price < rule.min_price:
+                price = rule.min_price
+                steps.append(f"rule:{rule.rule_id}:min_price->{price}")
+            price = self._apply_rounding(price, rule)
+            steps.append(f"rule:{rule.rule_id}:rounded->{price}")
+        return RulePricingResult(
+            matched_rule_ids=matched_rule_ids,
+            matched_rule_names=matched_rule_names,
+            rule_price=price.quantize(Decimal("0.01")),
+            applied_steps=steps,
+        )
+
+    def _matches_scope(self, product: Product, platform_name: str, rule: PriceRule) -> bool:
+        scope = rule.scope_type
+        value = rule.scope_value
+        if scope == "all":
+            return value == "*"
+        if scope == "platform":
+            return value == platform_name
+        if scope == "variety":
+            return value == product.variety
+        if scope == "grade":
+            return value == product.grade
+        if scope == "sku":
+            return value == product.internal_sku
+        return False
+
+    def _apply_method(self, price: Decimal, rule: PriceRule) -> Decimal:
+        if rule.pricing_method == PricingMethod.FIXED_MARKUP:
+            return price + rule.markup_value
+        if rule.pricing_method == PricingMethod.PERCENTAGE_MARKUP:
+            return price * (Decimal("1") + rule.markup_value / Decimal("100"))
+        return price
+
+    def _apply_rounding(self, price: Decimal, rule: PriceRule) -> Decimal:
+        if rule.rounding_rule == RoundingRule.NONE:
+            return price
+        if rule.rounding_rule == RoundingRule.ROUND:
+            return price.quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+        if rule.rounding_rule == RoundingRule.CEIL:
+            return price.quantize(Decimal("1"), rounding=ROUND_CEILING)
+        if rule.rounding_rule == RoundingRule.FLOOR:
+            return price.quantize(Decimal("1"), rounding=ROUND_FLOOR)
+        if rule.rounding_rule == RoundingRule.STEP:
+            step = rule.rounding_step or Decimal("1")
+            quotient = (price / step).to_integral_value(rounding=ROUND_CEILING)
+            return quotient * step
+        return price
+
