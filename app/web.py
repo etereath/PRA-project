@@ -7,7 +7,7 @@ from html import escape
 from http.cookies import SimpleCookie
 from pathlib import Path
 from secrets import token_urlsafe
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import parse_qs, unquote, urlencode
 from wsgiref.simple_server import make_server
 
 from app.enums import NotificationSendStatus, ReviewTaskStatus, TaskStatus
@@ -29,12 +29,14 @@ from app.services.workflow import (
     get_runtime_notification_log,
     get_runtime_review_task,
     get_runtime_task,
+    get_mobile_review_detail,
     list_runtime_notification_logs,
     list_runtime_task_history,
     list_runtime_review_tasks,
     list_runtime_tasks,
     list_manual_intervention_tasks,
     preview_tasks_from_sources,
+    resolve_mobile_review,
     resolve_runtime_review_task,
     simulate_execution_from_tasks,
     validate_sources,
@@ -69,6 +71,7 @@ TABLE_OPTIONS = {
 TABLE_HEADER_LABELS = FIELD_LABELS
 RUNTIME_SESSION_COOKIE = "pra_runtime_session"
 RUNTIME_SESSION_TTL_SECONDS = 3600
+MOBILE_RESOLUTION_PAYLOAD_MAX_BYTES = 4096
 _RUNTIME_SESSIONS: dict[str, dict[str, object]] = {}
 
 UI_TEXT = {
@@ -169,6 +172,15 @@ UI_TEXT = {
     "runtime_notification_detail": "\u901a\u77e5\u8be6\u60c5",
     "runtime_notification_none": "\u6682\u65e0\u7b26\u5408\u6761\u4ef6\u7684\u901a\u77e5\u8bb0\u5f55\u3002",
     "runtime_history_summary": "\u72b6\u6001\u5386\u53f2\u6458\u8981",
+    "mobile_review_title": "\u624b\u673a\u590d\u6838",
+    "mobile_review_lede": "\u8fd9\u662f review_tasks \u7684\u8f7b\u91cf\u5904\u7406\u5165\u53e3\uff0c\u6240\u6709\u590d\u6838\u4f9d\u7136\u7531\u8fd0\u884c\u6001\u670d\u52a1\u7edf\u4e00\u5199\u5165\u3002",
+    "mobile_review_invalid": "\u94fe\u63a5\u5df2\u5931\u6548\u6216\u65e0\u6743\u8bbf\u95ee\u8be5\u590d\u6838\u4efb\u52a1",
+    "mobile_review_handled": "\u8be5\u590d\u6838\u5df2\u5904\u7406",
+    "mobile_review_submit": "\u63d0\u4ea4\u590d\u6838",
+    "mobile_review_note": "\u5904\u7406\u5907\u6ce8",
+    "mobile_review_payload": "\u7ed3\u679c JSON\uff08\u53ef\u7559\u7a7a\uff09",
+    "mobile_review_source_status": "\u6e90\u4efb\u52a1\u72b6\u6001",
+    "mobile_review_payload_summary": "\u590d\u6838\u4e0a\u4e0b\u6587\u6458\u8981",
 }
 
 
@@ -192,6 +204,12 @@ def application(environ, start_response):
         return _respond(start_response, "200 OK", "text/html; charset=utf-8", _handle_execution(method, environ))
     if path == "/manual-intervention":
         return _respond(start_response, "200 OK", "text/html; charset=utf-8", _handle_manual_intervention(method, environ))
+    if path.startswith("/mobile/review/"):
+        result = _handle_mobile_review(method, path, environ)
+        if isinstance(result, tuple):
+            status, body, headers = result
+            return _respond(start_response, status, "text/html; charset=utf-8", body, headers=headers)
+        return _respond(start_response, "200 OK", "text/html; charset=utf-8", result)
     if path == "/runtime/login":
         status, body, headers = _handle_runtime_login(environ)
         return _respond(start_response, status, "text/html; charset=utf-8", body, headers=headers)
@@ -400,6 +418,77 @@ def _handle_manual_intervention(method: str, environ) -> str:
         message_level=level,
         tasks=tasks,
     )
+
+
+def _handle_mobile_review(method: str, path: str, environ) -> str | tuple[str, str, list[tuple[str, str]]]:
+    parsed_path = _parse_mobile_review_path(path)
+    if parsed_path is None:
+        return render_mobile_review_error_page("Not Found")
+    review_task_id, is_resolve = parsed_path
+    query = _parse_query(environ)
+
+    if method == "GET" and not is_resolve:
+        if _first(query, "resolved", "") == "1":
+            return render_mobile_review_resolved_page(review_task_id)
+        token = _first(query, "token", "")
+        runtime_db = _first(query, "runtime_db", str(DEFAULT_RUNTIME_DB))
+        try:
+            detail = get_mobile_review_detail(Path(runtime_db), review_task_id, token)
+            return render_mobile_review_page(
+                detail=detail,
+                runtime_db=runtime_db,
+                raw_token=token,
+            )
+        except (ValidationError, FileNotFoundError):
+            return render_mobile_review_error_page(UI_TEXT["mobile_review_invalid"])
+
+    if method == "POST" and is_resolve:
+        parsed = _parse_body(environ)
+        token = _first(parsed, "token", "")
+        action = _first(parsed, "action", "")
+        runtime_db = _first(parsed, "runtime_db", str(DEFAULT_RUNTIME_DB))
+        note = _first(parsed, "resolution_note", "")
+        try:
+            resolution_payload = _parse_mobile_resolution_payload(
+                _first(parsed, "resolution_payload_json", "")
+            )
+            resolve_mobile_review(
+                Path(runtime_db),
+                review_task_id,
+                token,
+                action,
+                note=note,
+                resolution_payload=resolution_payload,
+            )
+            return _redirect_response(
+                f"/mobile/review/{review_task_id}?{urlencode({'resolved': '1', 'runtime_db': runtime_db})}"
+            )
+        except ValidationError as exc:
+            message = (
+                str(exc)
+                if str(exc) not in {UI_TEXT["mobile_review_invalid"], "链接已失效或无权访问该复核任务"}
+                else UI_TEXT["mobile_review_invalid"]
+            )
+            return render_mobile_review_error_page(message)
+        except FileNotFoundError:
+            return render_mobile_review_error_page(UI_TEXT["mobile_review_invalid"])
+
+    return render_mobile_review_error_page("Method Not Allowed")
+
+
+def _parse_mobile_review_path(path: str) -> tuple[str, bool] | None:
+    prefix = "/mobile/review/"
+    if not path.startswith(prefix):
+        return None
+    tail = path[len(prefix) :].strip("/")
+    if not tail:
+        return None
+    parts = tail.split("/")
+    if len(parts) == 1:
+        return (unquote(parts[0]), False)
+    if len(parts) == 2 and parts[1] == "resolve":
+        return (unquote(parts[0]), True)
+    return None
 
 
 def _handle_runtime(method: str, environ) -> str | tuple[str, str, list[tuple[str, str]]]:
@@ -1145,6 +1234,115 @@ def render_manual_intervention_page(
           <tbody>{rows_html}</tbody>
         </table>
       </div>
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+
+def render_mobile_review_page(*, detail, runtime_db: str, raw_token: str) -> str:
+    review = detail.review_task
+    source_status = detail.source_task.task_status.value if detail.source_task is not None else "-"
+    payload_rows = _mobile_payload_summary_rows(review.review_payload)
+    actions_html = "".join(
+        f"<button class='primary' type='submit' name='action' value='{escape(action)}'>{escape(action)}</button>"
+        for action in detail.allowed_actions
+    )
+    if not actions_html:
+        actions_html = f"<p class='subtle'>{escape(UI_TEXT['mobile_review_handled'])}</p>"
+
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(UI_TEXT["mobile_review_title"])}</title>
+  {common_styles()}
+</head>
+<body>
+  <main class="shell">
+    {_hero(UI_TEXT["mobile_review_title"], UI_TEXT["mobile_review_lede"])}
+    <section class="panel">
+      <h2>{escape(str(review.review_type))}</h2>
+      <div class="metrics">
+        <div class="metric"><span class="label">trade_date</span><strong>{escape(str(review.trade_date or "-"))}</strong></div>
+        <div class="metric"><span class="label">status</span><strong>{escape(review.review_status.value)}</strong></div>
+      </div>
+      <p class="subtle">scope: {escape(str(review.scope_type))} / {escape(review.scope_key or "-")}</p>
+      <p class="subtle">reason: {escape(review.reason or "-")}</p>
+      <p class="subtle">required_by: {escape(str(review.required_by) if review.required_by else "-")}</p>
+      <p class="subtle">{escape(UI_TEXT["mobile_review_source_status"])}: {escape(source_status)}</p>
+    </section>
+    <section class="panel">
+      <h2>{escape(UI_TEXT["mobile_review_payload_summary"])}</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>field</th><th>value</th></tr></thead>
+          <tbody>{payload_rows}</tbody>
+        </table>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>{escape(UI_TEXT["mobile_review_submit"])}</h2>
+      <form method="post" action="/mobile/review/{escape(review.review_task_id)}/resolve" class="grid">
+        <input type="hidden" name="token" value="{escape(raw_token)}">
+        <input type="hidden" name="runtime_db" value="{escape(runtime_db)}">
+        <div class="field">
+          <label for="resolution_note">{escape(UI_TEXT["mobile_review_note"])}</label>
+          <textarea id="resolution_note" name="resolution_note"></textarea>
+        </div>
+        <div class="field">
+          <label for="resolution_payload_json">{escape(UI_TEXT["mobile_review_payload"])}</label>
+          <textarea id="resolution_payload_json" name="resolution_payload_json" placeholder='{{}}'></textarea>
+        </div>
+        <div class="actions">
+          {actions_html}
+        </div>
+      </form>
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+
+def render_mobile_review_error_page(message: str) -> str:
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(UI_TEXT["mobile_review_title"])}</title>
+  {common_styles()}
+</head>
+<body>
+  <main class="shell">
+    {_hero(UI_TEXT["mobile_review_title"], UI_TEXT["mobile_review_lede"])}
+    {_banner(message, "error")}
+  </main>
+</body>
+</html>
+"""
+
+
+def render_mobile_review_resolved_page(review_task_id: str) -> str:
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(UI_TEXT["mobile_review_title"])}</title>
+  {common_styles()}
+</head>
+<body>
+  <main class="shell">
+    {_hero(UI_TEXT["mobile_review_title"], UI_TEXT["mobile_review_lede"])}
+    {_banner(UI_TEXT["mobile_review_handled"], "success")}
+    <section class="panel">
+      <h2>{escape(UI_TEXT["mobile_review_handled"])}</h2>
+      <p class="subtle">review_task_id: {escape(review_task_id)}</p>
+      <p class="subtle">该页面不会再次展示操作按钮，避免刷新或重复提交。</p>
     </section>
   </main>
 </body>
@@ -2268,6 +2466,45 @@ def _parse_resolution_payload(payload_text: str) -> dict[str, object]:
     if not isinstance(loaded, dict):
         raise ValidationError("resolution_payload_json 必须是 JSON 对象。")
     return loaded
+
+
+def _parse_mobile_resolution_payload(payload_text: str) -> dict[str, object]:
+    raw = payload_text.strip()
+    if not raw:
+        return {}
+    if len(raw.encode("utf-8")) > MOBILE_RESOLUTION_PAYLOAD_MAX_BYTES:
+        raise ValidationError(f"resolution_payload_json 不能超过 {MOBILE_RESOLUTION_PAYLOAD_MAX_BYTES} bytes")
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValidationError(f"resolution_payload_json 不是合法 JSON: {exc.msg}") from exc
+    if not isinstance(loaded, dict):
+        raise ValidationError("resolution_payload_json 必须是 JSON object")
+    return loaded
+
+
+def _mobile_payload_summary_rows(payload: object) -> str:
+    safe_keys = [
+        "task_id",
+        "action_type",
+        "target_price",
+        "target_status",
+        "pricing_source",
+        "required_by",
+    ]
+    if not isinstance(payload, dict):
+        return "<tr><td colspan='2'>-</td></tr>"
+    rows = []
+    for key in safe_keys:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if isinstance(value, (dict, list)):
+            value_text = json.dumps(value, ensure_ascii=False)
+        else:
+            value_text = str(value)
+        rows.append(f"<tr><td>{escape(key)}</td><td>{escape(value_text)}</td></tr>")
+    return "".join(rows) or "<tr><td colspan='2'>-</td></tr>"
 
 
 def _build_runtime_query(

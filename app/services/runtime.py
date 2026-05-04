@@ -1,16 +1,33 @@
 from __future__ import annotations
 
-from dataclasses import replace
-from datetime import date, datetime
+import hashlib
+import hmac
+import base64
+import json
+import secrets
+import time
+from dataclasses import dataclass, replace
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 import os
 from typing import Protocol
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote
+from urllib.request import Request, urlopen
 from uuid import uuid4
 
 from app.enums import NotificationSendStatus, ReviewTaskStatus, TaskActionType, TaskStatus
 from app.exceptions import ValidationError
-from app.models import ExecutionLog, NotificationLog, NotificationSendResult, ReviewTask, Task, TaskStatusHistory
+from app.models import (
+    ExecutionLog,
+    NotificationLog,
+    NotificationSendResult,
+    ReviewTask,
+    ReviewToken,
+    Task,
+    TaskStatusHistory,
+)
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.execution import ExecutionSimulationService
 from app.services.manual_intervention import MANUAL_INTERVENTION_ACTIONS
@@ -53,6 +70,16 @@ ALLOWED_REVIEW_TRANSITIONS = {
         ReviewTaskStatus.CANCELLED,
     }
 }
+
+DEFAULT_MOBILE_REVIEW_ACTIONS = [
+    ReviewTaskStatus.APPROVED.value,
+    ReviewTaskStatus.REJECTED.value,
+    ReviewTaskStatus.ADJUSTED.value,
+    ReviewTaskStatus.CANCELLED.value,
+]
+
+FEISHU_WEBHOOK_URL_REQUIRED = "FEISHU_WEBHOOK_URL is required for feishu notification"
+FEISHU_TOKEN_URL_CREATION_FAILED = "mobile_review_url creation failed"
 
 
 class RuntimeTaskService:
@@ -337,6 +364,179 @@ class ReviewTaskService:
             raise ValidationError(f"invalid review status transition: {from_status.value} -> {to_status.value}")
 
 
+@dataclass(slots=True)
+class ReviewTokenCreationResult:
+    review_token: ReviewToken
+    raw_token: str
+    mobile_review_url: str
+
+
+@dataclass(slots=True)
+class ReviewTokenValidationResult:
+    is_valid: bool
+    failure_reason: str
+    review_token: ReviewToken | None = None
+    review_task: ReviewTask | None = None
+    token_subject: str = ""
+
+
+class ReviewTokenService:
+    def __init__(self, repository: SQLiteRuntimeRepository) -> None:
+        self.repository = repository
+
+    def create_token(
+        self,
+        review_task_id: str,
+        *,
+        token_subject: str = "operations",
+        allowed_actions: list[str] | None = None,
+        expires_at: datetime | None = None,
+        created_by: str = "system",
+        note: str | None = None,
+    ) -> ReviewTokenCreationResult:
+        review_task = self.repository.get_review_task(review_task_id)
+        if review_task is None:
+            raise ValidationError(f"review task not found: {review_task_id}")
+        if review_task.review_status != ReviewTaskStatus.PENDING:
+            raise ValidationError(f"cannot create review token for non-pending review task: {review_task_id}")
+
+        raw_token = secrets.token_urlsafe(32)
+        token_hash = self._hash_raw_token(raw_token)
+        resolved_actions = allowed_actions or DEFAULT_MOBILE_REVIEW_ACTIONS
+        now = datetime.now()
+        review_token = ReviewToken(
+            token_id=uuid4().hex[:12],
+            review_task_id=review_task_id,
+            token_hash=token_hash,
+            token_subject=token_subject,
+            allowed_actions=resolved_actions,
+            expires_at=expires_at or self._default_expires_at(review_task, now),
+            created_at=now,
+            created_by=created_by,
+            note=note,
+        )
+        inserted = self.repository.insert_review_token(review_token)
+        if inserted != 1:
+            raise ValidationError("review token was not inserted")
+        return ReviewTokenCreationResult(
+            review_token=review_token,
+            raw_token=raw_token,
+            mobile_review_url=self.build_mobile_review_url(review_task_id, raw_token),
+        )
+
+    def validate_token(self, review_task_id: str, raw_token: str, action: str | None = None) -> ReviewTokenValidationResult:
+        try:
+            token_hash = self._hash_raw_token(raw_token)
+        except ValidationError as exc:
+            return ReviewTokenValidationResult(is_valid=False, failure_reason=str(exc))
+
+        review_token = self.repository.get_review_token_by_hash(token_hash)
+        if review_token is None:
+            return ReviewTokenValidationResult(is_valid=False, failure_reason="token not found")
+        review_task = self.repository.get_review_task(review_task_id)
+        if review_task is None:
+            return ReviewTokenValidationResult(
+                is_valid=False,
+                failure_reason=f"review task not found: {review_task_id}",
+                review_token=review_token,
+                token_subject=review_token.token_subject,
+            )
+        if review_token.review_task_id != review_task_id:
+            return self._invalid("token review_task_id mismatch", review_token, review_task)
+        now = datetime.now()
+        if review_token.expires_at <= now:
+            return self._invalid("token expired", review_token, review_task)
+        if review_token.revoked_at is not None:
+            return self._invalid("token revoked", review_token, review_task)
+        if review_token.used_at is not None:
+            return self._invalid("token already used", review_token, review_task)
+        if review_task.review_status != ReviewTaskStatus.PENDING:
+            return self._invalid("review task is not pending", review_token, review_task)
+        if action is not None:
+            if action not in review_token.allowed_actions:
+                return self._invalid("action not allowed by token", review_token, review_task)
+            if action not in _allowed_mobile_actions_for_review_type(review_task.review_type):
+                return self._invalid("action not allowed by review_type", review_token, review_task)
+        return ReviewTokenValidationResult(
+            is_valid=True,
+            failure_reason="",
+            review_token=review_token,
+            review_task=review_task,
+            token_subject=review_token.token_subject,
+        )
+
+    def record_detail_access(self, token_id: str) -> ReviewToken:
+        token = self.repository.get_review_token(token_id)
+        if token is None:
+            raise ValidationError(f"review token not found: {token_id}")
+        now = datetime.now()
+        self.repository.update_review_token_usage(token_id, last_used_at=now)
+        updated = self.repository.get_review_token(token_id)
+        if updated is None:
+            raise ValidationError(f"review token not found after update: {token_id}")
+        return updated
+
+    def record_resolve_usage(self, token_id: str) -> ReviewToken:
+        token = self.repository.get_review_token(token_id)
+        if token is None:
+            raise ValidationError(f"review token not found: {token_id}")
+        if token.used_at is not None:
+            raise ValidationError(f"review token already used: {token_id}")
+        now = datetime.now()
+        self.repository.update_review_token_usage(token_id, used_at=now, last_used_at=now)
+        updated = self.repository.get_review_token(token_id)
+        if updated is None:
+            raise ValidationError(f"review token not found after update: {token_id}")
+        return updated
+
+    def revoke_token(self, token_id: str, revoked_at: datetime | None = None) -> ReviewToken:
+        token = self.repository.get_review_token(token_id)
+        if token is None:
+            raise ValidationError(f"review token not found: {token_id}")
+        self.repository.revoke_review_token(token_id, revoked_at or datetime.now())
+        updated = self.repository.get_review_token(token_id)
+        if updated is None:
+            raise ValidationError(f"review token not found after revoke: {token_id}")
+        return updated
+
+    def revoke_tokens_for_review_task(self, review_task_id: str, revoked_at: datetime | None = None) -> int:
+        return self.repository.revoke_review_tokens_by_review_task_id(review_task_id, revoked_at or datetime.now())
+
+    def build_mobile_review_url(self, review_task_id: str, raw_token: str) -> str:
+        path = f"/mobile/review/{quote(review_task_id)}?token={quote(raw_token)}"
+        base_url = os.getenv("MOBILE_REVIEW_BASE_URL", "").strip()
+        if not base_url:
+            return path
+        return f"{base_url.rstrip('/')}{path}"
+
+    def _hash_raw_token(self, raw_token: str) -> str:
+        secret = os.getenv("REVIEW_TOKEN_SECRET", "").strip()
+        if not secret:
+            raise ValidationError("REVIEW_TOKEN_SECRET is required")
+        digest = hmac.new(secret.encode("utf-8"), raw_token.encode("utf-8"), hashlib.sha256)
+        return digest.hexdigest()
+
+    def _default_expires_at(self, review_task: ReviewTask, now: datetime) -> datetime:
+        default_expiry = now + timedelta(hours=24)
+        if review_task.required_by is None:
+            return default_expiry
+        return min(review_task.required_by, default_expiry)
+
+    def _invalid(
+        self,
+        reason: str,
+        review_token: ReviewToken,
+        review_task: ReviewTask,
+    ) -> ReviewTokenValidationResult:
+        return ReviewTokenValidationResult(
+            is_valid=False,
+            failure_reason=reason,
+            review_token=review_token,
+            review_task=review_task,
+            token_subject=review_token.token_subject,
+        )
+
+
 class NotificationLogService:
     def __init__(self, repository: SQLiteRuntimeRepository) -> None:
         self.repository = repository
@@ -362,19 +562,112 @@ class NotificationLogService:
 class NotificationSender(Protocol):
     channel: str
 
-    def send(self, log: NotificationLog) -> NotificationSendResult:
+    def send(self, log: NotificationLog, payload: dict[str, object] | None = None) -> NotificationSendResult:
         ...
 
 
 class MockNotificationSender:
     channel = "mock"
 
-    def send(self, log: NotificationLog) -> NotificationSendResult:
+    def send(self, log: NotificationLog, payload: dict[str, object] | None = None) -> NotificationSendResult:
         return NotificationSendResult(
             send_status=NotificationSendStatus.SUCCESS.value,
             sent_at=datetime.now(),
             raw_response_json={"mock": True},
         )
+
+
+class FailedNotificationSender:
+    def __init__(self, channel: str, error_message: str) -> None:
+        self.channel = channel
+        self.error_message = error_message
+
+    def send(self, log: NotificationLog, payload: dict[str, object] | None = None) -> NotificationSendResult:
+        return NotificationSendResult(
+            send_status=NotificationSendStatus.FAILED.value,
+            sent_at=None,
+            error_message=self.error_message,
+            raw_response_json={"error": self.error_message, "channel": self.channel},
+        )
+
+
+class FeishuWebhookNotificationSender:
+    channel = "feishu"
+
+    def send(self, log: NotificationLog, payload: dict[str, object] | None = None) -> NotificationSendResult:
+        webhook_url = os.getenv("FEISHU_WEBHOOK_URL", "").strip()
+        if not webhook_url:
+            return NotificationSendResult(
+                send_status=NotificationSendStatus.FAILED.value,
+                sent_at=None,
+                error_message=FEISHU_WEBHOOK_URL_REQUIRED,
+                raw_response_json={"error": FEISHU_WEBHOOK_URL_REQUIRED},
+            )
+
+        request_body = self._build_request_body(log, payload)
+        encoded_body = json.dumps(request_body, ensure_ascii=False).encode("utf-8")
+        request = Request(
+            webhook_url,
+            data=encoded_body,
+            headers={"Content-Type": "application/json; charset=utf-8"},
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=_feishu_timeout_seconds()) as response:
+                status_code = response.getcode()
+                response_text = response.read().decode("utf-8", errors="replace")
+        except HTTPError as exc:
+            response_text = exc.read().decode("utf-8", errors="replace")
+            return NotificationSendResult(
+                send_status=NotificationSendStatus.FAILED.value,
+                sent_at=None,
+                error_message=f"feishu webhook HTTP {exc.code}",
+                raw_response_json=_feishu_response_summary(status_code=exc.code, response_text=response_text),
+            )
+        except (TimeoutError, URLError, OSError) as exc:
+            return NotificationSendResult(
+                send_status=NotificationSendStatus.FAILED.value,
+                sent_at=None,
+                error_message=f"feishu webhook request failed: {type(exc).__name__}: {exc}",
+                raw_response_json={"error_type": type(exc).__name__, "error": str(exc)},
+            )
+
+        response_json = _feishu_response_summary(status_code=status_code, response_text=response_text)
+        if status_code < 200 or status_code >= 300:
+            return NotificationSendResult(
+                send_status=NotificationSendStatus.FAILED.value,
+                sent_at=None,
+                error_message=f"feishu webhook HTTP {status_code}",
+                raw_response_json=response_json,
+            )
+        if not _is_feishu_success_response(response_json):
+            return NotificationSendResult(
+                send_status=NotificationSendStatus.FAILED.value,
+                sent_at=None,
+                error_message=_feishu_error_message(response_json),
+                raw_response_json=response_json,
+            )
+
+        return NotificationSendResult(
+            send_status=NotificationSendStatus.SUCCESS.value,
+            sent_at=datetime.now(),
+            provider_message_id=str(response_json.get("request_id") or response_json.get("RequestId") or ""),
+            raw_response_json=response_json,
+        )
+
+    def _build_request_body(self, log: NotificationLog, payload: dict[str, object] | None) -> dict[str, object]:
+        text = str((payload or {}).get("text") or log.message)
+        # MVP keeps Feishu webhook messages short and text-only; no retry queue or interactive approval here.
+        body: dict[str, object] = {
+            "msg_type": "text",
+            "content": {"text": text},
+        }
+        secret = os.getenv("FEISHU_WEBHOOK_SECRET", "").strip()
+        if secret:
+            timestamp = str(int(time.time()))
+            body["timestamp"] = timestamp
+            body["sign"] = _build_feishu_sign(timestamp, secret)
+        return body
 
 
 class ReviewNotificationService:
@@ -392,13 +685,16 @@ class ReviewNotificationService:
         recipient_type = os.getenv("DEFAULT_NOTIFICATION_RECIPIENT_TYPE", "role").strip() or "role"
         recipient = os.getenv("DEFAULT_NOTIFICATION_RECIPIENT", "operations").strip() or "operations"
         channel = os.getenv("DEFAULT_NOTIFICATION_CHANNEL", "mock").strip() or "mock"
+        message, send_payload, pre_send_failure = self._build_initial_notification_content(review_task, channel)
         return self._create_notification(
             review_task,
             recipient_type=recipient_type,
             recipient=recipient,
             channel=channel,
             dedupe_suffix="initial",
-            message=_build_review_notification_message(review_task),
+            message=message,
+            send_payload=send_payload,
+            pre_send_failure=pre_send_failure,
         )
 
     def create_expired_notification(self, review_task: ReviewTask, *, timeout_at: datetime) -> NotificationLog | None:
@@ -423,6 +719,8 @@ class ReviewNotificationService:
         channel: str,
         dedupe_suffix: str,
         message: str,
+        send_payload: dict[str, object] | None = None,
+        pre_send_failure: str = "",
     ) -> NotificationLog | None:
         sender = self.sender_factory.build(channel)
         now = datetime.now()
@@ -439,7 +737,15 @@ class ReviewNotificationService:
             message=message,
             created_at=now,
         )
-        result = sender.send(log)
+        if pre_send_failure:
+            result = NotificationSendResult(
+                send_status=NotificationSendStatus.FAILED.value,
+                sent_at=None,
+                error_message=pre_send_failure,
+                raw_response_json={"error": pre_send_failure},
+            )
+        else:
+            result = sender.send(log, send_payload)
         log = replace(
             log,
             send_status=result.send_status,
@@ -449,13 +755,55 @@ class ReviewNotificationService:
         inserted = self.notification_log_service.append(log)
         return log if inserted == 1 else None
 
+    def _build_initial_notification_content(
+        self,
+        review_task: ReviewTask,
+        channel: str,
+    ) -> tuple[str, dict[str, object] | None, str]:
+        message = _build_review_notification_message(review_task)
+        normalized_channel = channel.strip().lower()
+        if normalized_channel == "feishu":
+            try:
+                token = ReviewTokenService(self.repository).create_token(
+                    review_task.review_task_id,
+                    created_by="notification_service",
+                    note="feishu mobile_review_url notification link",
+                )
+            except (ValidationError, RuntimeError) as exc:
+                return (
+                    f"{message} | mobile_review_url_created=false",
+                    None,
+                    f"{FEISHU_TOKEN_URL_CREATION_FAILED}: {exc}",
+                )
+            return (
+                f"{message} | mobile_review_url_created=true",
+                {"text": _build_feishu_review_notification_text(review_task, token.mobile_review_url)},
+                "",
+            )
+        if os.getenv("ENABLE_MOBILE_REVIEW_URL_IN_NOTIFICATION", "").strip().lower() != "true":
+            return message, None, ""
+        try:
+            ReviewTokenService(self.repository).create_token(
+                review_task.review_task_id,
+                created_by="notification_service",
+                note="mobile_review_url notification link",
+            )
+        except (ValidationError, RuntimeError):
+            return f"{message} | mobile_review_url_created=false", None, ""
+        return f"{message} | mobile_review_url_created=true", None, ""
+
 
 class NotificationSenderFactory:
     def build(self, channel: str) -> NotificationSender:
         normalized = channel.strip().lower()
         if normalized == "mock":
             return MockNotificationSender()
-        raise ValidationError(f"unsupported notification channel: {channel}")
+        if normalized == "feishu":
+            return FeishuWebhookNotificationSender()
+        return FailedNotificationSender(
+            normalized or "unknown",
+            f"unsupported notification channel: {channel}",
+        )
 
 
 class ExecutionRuntimeService:
@@ -604,6 +952,74 @@ def _resolution_payload_summary(payload: dict[str, object]) -> dict[str, object]
     if "adjustment" in payload:
         summary["adjustment"] = payload.get("adjustment")
     return summary
+
+
+def _allowed_mobile_actions_for_review_type(review_type: str) -> list[str]:
+    return DEFAULT_MOBILE_REVIEW_ACTIONS
+
+
+def _feishu_timeout_seconds() -> float:
+    raw = os.getenv("FEISHU_WEBHOOK_TIMEOUT_SECONDS", "5").strip()
+    try:
+        timeout = float(raw)
+    except ValueError:
+        return 5.0
+    return timeout if timeout > 0 else 5.0
+
+
+def _build_feishu_sign(timestamp: str, secret: str) -> str:
+    string_to_sign = f"{timestamp}\n{secret}"
+    digest = hmac.new(string_to_sign.encode("utf-8"), b"", hashlib.sha256).digest()
+    return base64.b64encode(digest).decode("utf-8")
+
+
+def _feishu_response_summary(*, status_code: int, response_text: str) -> dict[str, object]:
+    try:
+        parsed = json.loads(response_text) if response_text else {}
+    except json.JSONDecodeError:
+        parsed = {"raw_text": response_text[:500]}
+    if isinstance(parsed, dict):
+        parsed.setdefault("http_status", status_code)
+        return parsed
+    return {"http_status": status_code, "raw_json": parsed}
+
+
+def _is_feishu_success_response(response_json: dict[str, object]) -> bool:
+    if "code" in response_json:
+        return response_json.get("code") == 0
+    if "StatusCode" in response_json:
+        return response_json.get("StatusCode") == 0
+    return True
+
+
+def _feishu_error_message(response_json: dict[str, object]) -> str:
+    message = (
+        response_json.get("msg")
+        or response_json.get("message")
+        or response_json.get("StatusMessage")
+        or response_json.get("error")
+        or "feishu webhook returned failure"
+    )
+    return str(message)
+
+
+def _build_feishu_review_notification_text(review_task: ReviewTask, mobile_review_url: str) -> str:
+    trade_date = review_task.trade_date.isoformat() if review_task.trade_date else "-"
+    required_by = review_task.required_by.isoformat() if review_task.required_by else "-"
+    reason = (review_task.reason or "-").strip()
+    if len(reason) > 160:
+        reason = f"{reason[:157]}..."
+    return "\n".join(
+        [
+            "PRA 复核通知",
+            f"review_type: {review_task.review_type}",
+            f"trade_date: {trade_date}",
+            f"scope: {review_task.scope_type}/{review_task.scope_key}",
+            f"required_by: {required_by}",
+            f"reason: {reason}",
+            f"mobile_review_url: {mobile_review_url}",
+        ]
+    )
 
 
 def _build_review_notification_message(review_task: ReviewTask) -> str:

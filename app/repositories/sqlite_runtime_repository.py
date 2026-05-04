@@ -9,11 +9,11 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from app.enums import PricingSource, ReviewTaskStatus, TaskActionType, TaskStatus
-from app.models import ExecutionLog, NotificationLog, ReviewTask, Task, TaskStatusHistory
+from app.models import ExecutionLog, NotificationLog, ReviewTask, ReviewToken, Task, TaskStatusHistory
 from app.utils import serialize_decimal
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 TERMINAL_TASK_STATUSES = ("success", "skipped", "cancelled", "expired")
 
 
@@ -78,6 +78,31 @@ SCHEMA_SQL = [
         resolution_note TEXT NOT NULL DEFAULT '',
         FOREIGN KEY(source_task_id) REFERENCES tasks(task_id)
     )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS review_tokens (
+        token_id TEXT PRIMARY KEY,
+        review_task_id TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        token_subject TEXT NOT NULL,
+        allowed_actions TEXT NOT NULL DEFAULT '[]',
+        expires_at TEXT NOT NULL,
+        used_at TEXT,
+        revoked_at TEXT,
+        created_at TEXT NOT NULL,
+        created_by TEXT NOT NULL DEFAULT 'system',
+        last_used_at TEXT,
+        note TEXT,
+        FOREIGN KEY(review_task_id) REFERENCES review_tasks(review_task_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_review_tokens_review_task_id
+    ON review_tokens(review_task_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_review_tokens_expires_at
+    ON review_tokens(expires_at)
     """,
     """
     CREATE UNIQUE INDEX IF NOT EXISTS ux_review_tasks_pending_dedupe
@@ -160,7 +185,14 @@ class SQLiteRuntimeRepository:
                 INSERT OR IGNORE INTO runtime_schema_migrations(schema_version, applied_at, note)
                 VALUES (?, ?, ?)
                 """,
-                (SCHEMA_VERSION, _datetime_to_text(datetime.now()), "initial runtime schema"),
+                (1, _datetime_to_text(datetime.now()), "initial runtime schema"),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO runtime_schema_migrations(schema_version, applied_at, note)
+                VALUES (?, ?, ?)
+                """,
+                (2, _datetime_to_text(datetime.now()), "review token runtime schema"),
             )
 
     def schema_versions(self) -> list[int]:
@@ -357,6 +389,97 @@ class SQLiteRuntimeRepository:
                 row,
             )
 
+    def insert_review_token(self, review_token: ReviewToken) -> int:
+        row = _review_token_to_row(review_token)
+        with closing(self.connect()) as connection, connection:
+            before = connection.total_changes
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO review_tokens(
+                    token_id, review_task_id, token_hash, token_subject, allowed_actions,
+                    expires_at, used_at, revoked_at, created_at, created_by, last_used_at, note
+                )
+                VALUES(
+                    :token_id, :review_task_id, :token_hash, :token_subject, :allowed_actions,
+                    :expires_at, :used_at, :revoked_at, :created_at, :created_by, :last_used_at, :note
+                )
+                """,
+                row,
+            )
+            return connection.total_changes - before
+
+    def get_review_token(self, token_id: str) -> ReviewToken | None:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM review_tokens WHERE token_id = ?",
+                (token_id,),
+            ).fetchone()
+        return _row_to_review_token(row) if row is not None else None
+
+    def get_review_token_by_hash(self, token_hash: str) -> ReviewToken | None:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM review_tokens WHERE token_hash = ?",
+                (token_hash,),
+            ).fetchone()
+        return _row_to_review_token(row) if row is not None else None
+
+    def list_review_tokens_by_review_task_id(self, review_task_id: str) -> list[ReviewToken]:
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM review_tokens
+                WHERE review_task_id = ?
+                ORDER BY created_at ASC, token_id ASC
+                """,
+                (review_task_id,),
+            ).fetchall()
+        return [_row_to_review_token(row) for row in rows]
+
+    def update_review_token_usage(
+        self,
+        token_id: str,
+        *,
+        used_at: datetime | None = None,
+        last_used_at: datetime | None = None,
+    ) -> None:
+        assignments: list[str] = []
+        params: list[str] = []
+        if used_at is not None:
+            assignments.append("used_at = ?")
+            params.append(_datetime_to_text(used_at) or "")
+        if last_used_at is not None:
+            assignments.append("last_used_at = ?")
+            params.append(_datetime_to_text(last_used_at) or "")
+        if not assignments:
+            return
+        params.append(token_id)
+        with closing(self.connect()) as connection, connection:
+            connection.execute(
+                f"UPDATE review_tokens SET {', '.join(assignments)} WHERE token_id = ?",
+                params,
+            )
+
+    def revoke_review_token(self, token_id: str, revoked_at: datetime) -> None:
+        with closing(self.connect()) as connection, connection:
+            connection.execute(
+                "UPDATE review_tokens SET revoked_at = ? WHERE token_id = ?",
+                (_datetime_to_text(revoked_at), token_id),
+            )
+
+    def revoke_review_tokens_by_review_task_id(self, review_task_id: str, revoked_at: datetime) -> int:
+        with closing(self.connect()) as connection, connection:
+            before = connection.total_changes
+            connection.execute(
+                """
+                UPDATE review_tokens
+                SET revoked_at = ?
+                WHERE review_task_id = ? AND revoked_at IS NULL
+                """,
+                (_datetime_to_text(revoked_at), review_task_id),
+            )
+            return connection.total_changes - before
+
     def insert_execution_logs(self, logs: Iterable[ExecutionLog]) -> int:
         rows = [_execution_log_to_row(log) for log in logs]
         if not rows:
@@ -534,6 +657,41 @@ def _row_to_review_task(row: sqlite3.Row) -> ReviewTask:
     )
 
 
+def _review_token_to_row(review_token: ReviewToken) -> dict[str, Any]:
+    created_at = review_token.created_at or datetime.now()
+    return {
+        "token_id": review_token.token_id,
+        "review_task_id": review_token.review_task_id,
+        "token_hash": review_token.token_hash,
+        "token_subject": review_token.token_subject,
+        "allowed_actions": _json_dump(review_token.allowed_actions),
+        "expires_at": _datetime_to_text(review_token.expires_at),
+        "used_at": _datetime_to_text(review_token.used_at),
+        "revoked_at": _datetime_to_text(review_token.revoked_at),
+        "created_at": _datetime_to_text(created_at),
+        "created_by": review_token.created_by,
+        "last_used_at": _datetime_to_text(review_token.last_used_at),
+        "note": review_token.note,
+    }
+
+
+def _row_to_review_token(row: sqlite3.Row) -> ReviewToken:
+    return ReviewToken(
+        token_id=str(row["token_id"]),
+        review_task_id=str(row["review_task_id"]),
+        token_hash=str(row["token_hash"]),
+        token_subject=str(row["token_subject"]),
+        allowed_actions=_json_list_load(row["allowed_actions"]),
+        expires_at=_text_to_datetime(row["expires_at"]) or datetime.now(),
+        used_at=_text_to_datetime(row["used_at"]),
+        revoked_at=_text_to_datetime(row["revoked_at"]),
+        created_at=_text_to_datetime(row["created_at"]),
+        created_by=str(row["created_by"]),
+        last_used_at=_text_to_datetime(row["last_used_at"]),
+        note=row["note"],
+    )
+
+
 def _execution_log_to_row(log: ExecutionLog) -> dict[str, Any]:
     return {
         "log_id": log.log_id,
@@ -618,8 +776,8 @@ def _text_to_datetime(value: str | None) -> datetime | None:
     return datetime.fromisoformat(str(value))
 
 
-def _json_dump(value: dict[str, Any]) -> str:
-    return json.dumps(value or {}, ensure_ascii=False, sort_keys=True)
+def _json_dump(value: Any) -> str:
+    return json.dumps({} if value is None else value, ensure_ascii=False, sort_keys=True)
 
 
 def _json_load(value: str | None) -> dict[str, Any]:
@@ -627,3 +785,12 @@ def _json_load(value: str | None) -> dict[str, Any]:
         return {}
     loaded = json.loads(str(value))
     return loaded if isinstance(loaded, dict) else {}
+
+
+def _json_list_load(value: str | None) -> list[str]:
+    if value in ("", None):
+        return []
+    loaded = json.loads(str(value))
+    if not isinstance(loaded, list):
+        return []
+    return [str(item) for item in loaded]

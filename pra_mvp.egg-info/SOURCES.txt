@@ -13,11 +13,13 @@ pra_mvp.egg-info/SOURCES.txt
 pra_mvp.egg-info/dependency_links.txt
 pra_mvp.egg-info/requires.txt
 pra_mvp.egg-info/top_level.txt
+tests/test_cli.py
 tests/test_e2e_regression.py
 tests/test_listing_and_tasks.py
 tests/test_manual_and_strategy.py
 tests/test_predictive_decisions.py
 tests/test_pricing.py
+tests/test_runtime_persistence.py
 tests/test_web.py
 tests/test_workbook_repository.py
 tests/test_workflow.py

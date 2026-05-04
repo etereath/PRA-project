@@ -11,7 +11,7 @@ from unittest.mock import patch
 from app.enums import ReviewTaskStatus, TaskActionType, TaskStatus
 from app.models import Task
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.services.runtime import ReviewTaskService, RuntimeTaskService
+from app.services.runtime import ReviewTaskService, ReviewTokenService, RuntimeTaskService
 from app.web import (
     TABLE_OPTIONS,
     _RUNTIME_SESSIONS,
@@ -351,6 +351,176 @@ class WebTests(unittest.TestCase):
                 self.assertIn("通知详情", body)
                 self.assertIn(notification.notification_id, body)
                 self.assertIn("send_status", body)
+
+    def test_mobile_review_get_records_detail_access_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "runtime.sqlite3"
+            repository = SQLiteRuntimeRepository(db_path)
+            task_service = RuntimeTaskService(repository)
+            task_service.init_schema()
+            task = _runtime_task("TASK-M1", status=TaskStatus.MANUAL_REVIEW)
+            task_service.create_tasks([task])
+            review_service = ReviewTaskService(repository, runtime_task_service=task_service)
+            review_service.create_from_tasks([task])
+            review = review_service.list_review_tasks()[0]
+
+            with patch.dict("os.environ", {"REVIEW_TOKEN_SECRET": "unit-test-secret"}, clear=False):
+                token_result = ReviewTokenService(repository).create_token(
+                    review.review_task_id,
+                    token_subject="mobile_reviewer",
+                )
+                status, _, body = self._call_app(
+                    path=f"/mobile/review/{review.review_task_id}",
+                    method="GET",
+                    query=urlencode({"runtime_db": str(db_path), "token": token_result.raw_token}),
+                )
+
+            self.assertEqual(status, "200 OK")
+            self.assertIn("manual_price_review", body)
+            self.assertIn("TASK-M1", body)
+            self.assertIn("approved", body)
+            stored_token = repository.get_review_token(token_result.review_token.token_id)
+            self.assertIsNone(stored_token.used_at)
+            self.assertIsNotNone(stored_token.last_used_at)
+
+    def test_mobile_review_post_resolves_and_prevents_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "runtime.sqlite3"
+            repository = SQLiteRuntimeRepository(db_path)
+            task_service = RuntimeTaskService(repository)
+            task_service.init_schema()
+            task = _runtime_task("TASK-M2", status=TaskStatus.MANUAL_REVIEW)
+            task_service.create_tasks([task])
+            review_service = ReviewTaskService(repository, runtime_task_service=task_service)
+            review_service.create_from_tasks([task])
+            review = review_service.list_review_tasks()[0]
+
+            with patch.dict("os.environ", {"REVIEW_TOKEN_SECRET": "unit-test-secret"}, clear=False):
+                token_result = ReviewTokenService(repository).create_token(
+                    review.review_task_id,
+                    token_subject="mobile_reviewer",
+                )
+                body = urlencode(
+                    {
+                        "runtime_db": str(db_path),
+                        "token": token_result.raw_token,
+                        "action": "approved",
+                        "resolution_note": "mobile approved",
+                        "resolution_payload_json": '{"source":"mobile"}',
+                    }
+                )
+                first_status, first_headers, _ = self._call_app(
+                    path=f"/mobile/review/{review.review_task_id}/resolve",
+                    method="POST",
+                    body=body,
+                )
+                second_status, _, second_body = self._call_app(
+                    path=f"/mobile/review/{review.review_task_id}/resolve",
+                    method="POST",
+                    body=body,
+                )
+
+            self.assertEqual(first_status, "303 See Other")
+            self.assertIn("resolved=1", first_headers["Location"])
+            self.assertEqual(second_status, "200 OK")
+            self.assertIn("链接已失效或无权访问该复核任务", second_body)
+
+            stored_token = repository.get_review_token(token_result.review_token.token_id)
+            resolved_review = review_service.get_review_task(review.review_task_id)
+            resolved_task = task_service.get_task(task.task_id)
+            history = task_service.list_status_history(task.task_id)
+            self.assertIsNotNone(stored_token.used_at)
+            self.assertEqual(resolved_review.resolved_by, "mobile_reviewer")
+            self.assertEqual(resolved_task.task_status, TaskStatus.PENDING)
+            self.assertTrue(any(item.metadata.get("actor_source") == "mobile_review_token" for item in history))
+
+    def test_mobile_review_post_rejects_invalid_payload_and_expired_action(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "runtime.sqlite3"
+            repository = SQLiteRuntimeRepository(db_path)
+            task_service = RuntimeTaskService(repository)
+            task_service.init_schema()
+            task = _runtime_task("TASK-M3", status=TaskStatus.MANUAL_REVIEW)
+            task_service.create_tasks([task])
+            review_service = ReviewTaskService(repository, runtime_task_service=task_service)
+            review_service.create_from_tasks([task])
+            review = review_service.list_review_tasks()[0]
+
+            with patch.dict("os.environ", {"REVIEW_TOKEN_SECRET": "unit-test-secret"}, clear=False):
+                token_result = ReviewTokenService(repository).create_token(
+                    review.review_task_id,
+                    token_subject="mobile_reviewer",
+                    allowed_actions=["approved", "expired"],
+                )
+                invalid_json_status, _, invalid_json_body = self._call_app(
+                    path=f"/mobile/review/{review.review_task_id}/resolve",
+                    method="POST",
+                    body=urlencode(
+                        {
+                            "runtime_db": str(db_path),
+                            "token": token_result.raw_token,
+                            "action": "approved",
+                            "resolution_payload_json": "[]",
+                        }
+                    ),
+                )
+                expired_status, _, expired_body = self._call_app(
+                    path=f"/mobile/review/{review.review_task_id}/resolve",
+                    method="POST",
+                    body=urlencode(
+                        {
+                            "runtime_db": str(db_path),
+                            "token": token_result.raw_token,
+                            "action": "expired",
+                            "resolution_payload_json": "{}",
+                        }
+                    ),
+                )
+
+            self.assertEqual(invalid_json_status, "200 OK")
+            self.assertIn("JSON object", invalid_json_body)
+            self.assertEqual(expired_status, "200 OK")
+            self.assertIn("链接已失效或无权访问该复核任务", expired_body)
+
+    def test_mobile_review_token_fails_after_web_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "runtime.sqlite3"
+            repository = SQLiteRuntimeRepository(db_path)
+            task_service = RuntimeTaskService(repository)
+            task_service.init_schema()
+            task = _runtime_task("TASK-M4", status=TaskStatus.MANUAL_REVIEW)
+            task_service.create_tasks([task])
+            review_service = ReviewTaskService(repository, runtime_task_service=task_service)
+            review_service.create_from_tasks([task])
+            review = review_service.list_review_tasks()[0]
+
+            with patch.dict("os.environ", {"REVIEW_TOKEN_SECRET": "unit-test-secret"}, clear=False):
+                token_result = ReviewTokenService(repository).create_token(
+                    review.review_task_id,
+                    token_subject="mobile_reviewer",
+                )
+                review_service.resolve_review_task(
+                    review_task_id=review.review_task_id,
+                    status=ReviewTaskStatus.CANCELLED,
+                    actor="admin",
+                    actor_source="web_session",
+                    source_task_status=TaskStatus.CANCELLED,
+                )
+                status, _, body = self._call_app(
+                    path=f"/mobile/review/{review.review_task_id}/resolve",
+                    method="POST",
+                    body=urlencode(
+                        {
+                            "runtime_db": str(db_path),
+                            "token": token_result.raw_token,
+                            "action": "approved",
+                            "resolution_payload_json": "{}",
+                        }
+                    ),
+                )
+
+            self.assertEqual(status, "200 OK")
+            self.assertIn("链接已失效或无权访问该复核任务", body)
 
 
 if __name__ == "__main__":

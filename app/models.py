@@ -335,6 +335,22 @@ class ReviewTask:
 
 
 @dataclass(slots=True)
+class ReviewToken:
+    token_id: str
+    review_task_id: str
+    token_hash: str
+    token_subject: str
+    allowed_actions: list[str]
+    expires_at: datetime
+    used_at: datetime | None = None
+    revoked_at: datetime | None = None
+    created_at: datetime | None = None
+    created_by: str = "system"
+    last_used_at: datetime | None = None
+    note: str | None = None
+
+
+@dataclass(slots=True)
 class NotificationLog:
     notification_id: str
     related_task_id: str | None

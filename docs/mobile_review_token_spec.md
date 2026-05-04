@@ -171,6 +171,11 @@
 - `created_at`
 - `created_by`
 
+`expires_at` 默认规则建议：
+
+- `expires_at = min(review_task.required_by, now + 24h)`
+- 如果 `review_task.required_by` 为空，则默认 `expires_at = now + 24h`
+
 ### 5.2 使用
 
 建议手机端访问路由：
@@ -187,7 +192,10 @@
 - token 未过期
 - token 未撤销
 - `review_task` 仍为 `pending`
-- 请求动作在 `allowed_actions` 内
+- 请求动作满足多重校验：
+  - 在 `token.allowed_actions` 内
+  - 当前 `review_task.review_status` 仍为 `pending`
+  - 当前 `review_type` 允许该动作
 - token 与 `review_task_id` 完全匹配
 
 ### 5.4 完成
@@ -320,6 +328,18 @@
 - 所有提交仍经过 `ReviewTaskService`
 - 若需要推动源任务，仍通过 `RuntimeTaskService`
 - 成功提交后采用 POST-Redirect-GET，避免刷新重复提交
+
+MVP 可以使用：
+
+- `GET /mobile/review/{review_task_id}?token=...`
+
+但后续接入真实外部通知渠道时，应考虑更安全的链接与提交机制，例如：
+
+- 短链
+- 一次性 code
+- POST 提交流程
+
+以降低 token 在浏览器历史、服务器日志、转发截图中的泄露风险。
 
 ### 8.3 数据最小暴露原则
 

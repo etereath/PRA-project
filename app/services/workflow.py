@@ -16,6 +16,7 @@ from app.models import (
     PriceForecast,
     Product,
     ReviewTask,
+    ReviewToken,
     Task,
     TaskStatusHistory,
 )
@@ -42,6 +43,7 @@ from app.services.runtime import (
     ExpireReviewTasksSummary,
     NotificationLogService,
     ReviewTaskService,
+    ReviewTokenService,
     RuntimeTaskService,
 )
 from app.services.task_generation import TaskGenerationService
@@ -125,6 +127,22 @@ class RuntimeReviewResolutionInputs:
     note: str = ""
     source_task_status: TaskStatus | None = None
     resolution_payload: dict[str, object] | None = None
+
+
+@dataclass(slots=True)
+class MobileReviewDetail:
+    review_task: ReviewTask
+    review_token: ReviewToken
+    source_task: Task | None
+    allowed_actions: list[str]
+
+
+@dataclass(slots=True)
+class MobileReviewResolutionSummary:
+    review_task: ReviewTask
+    review_token: ReviewToken
+    source_task: Task | None
+    source_task_status: TaskStatus | None
 
 
 @dataclass(slots=True)
@@ -274,6 +292,92 @@ def resolve_runtime_review_task(inputs: RuntimeReviewResolutionInputs) -> Review
         resolution_payload=inputs.resolution_payload,
         source_task_status=inputs.source_task_status,
     )
+
+
+def get_mobile_review_detail(db_path: Path, review_task_id: str, raw_token: str) -> MobileReviewDetail:
+    repository = SQLiteRuntimeRepository(db_path)
+    runtime_task_service = RuntimeTaskService(repository)
+    runtime_task_service.init_schema()
+    token_service = ReviewTokenService(repository)
+    validation = token_service.validate_token(review_task_id, raw_token, action=None)
+    if not validation.is_valid or validation.review_token is None or validation.review_task is None:
+        raise ValidationError("链接已失效或无权访问该复核任务")
+    review_token = token_service.record_detail_access(validation.review_token.token_id)
+    source_task = (
+        runtime_task_service.get_task(validation.review_task.source_task_id)
+        if validation.review_task.source_task_id
+        else None
+    )
+    allowed_actions = [
+        action
+        for action in review_token.allowed_actions
+        if action in {"approved", "rejected", "adjusted", "cancelled"}
+    ]
+    return MobileReviewDetail(
+        review_task=validation.review_task,
+        review_token=review_token,
+        source_task=source_task,
+        allowed_actions=allowed_actions,
+    )
+
+
+def resolve_mobile_review(
+    db_path: Path,
+    review_task_id: str,
+    raw_token: str,
+    action: str,
+    note: str = "",
+    resolution_payload: dict[str, object] | None = None,
+) -> MobileReviewResolutionSummary:
+    repository = SQLiteRuntimeRepository(db_path)
+    runtime_task_service = RuntimeTaskService(repository)
+    runtime_task_service.init_schema()
+    token_service = ReviewTokenService(repository)
+    validation = token_service.validate_token(review_task_id, raw_token, action=action)
+    if not validation.is_valid or validation.review_token is None or validation.review_task is None:
+        raise ValidationError("链接已失效或无权访问该复核任务")
+
+    try:
+        review_status = ReviewTaskStatus(action)
+    except ValueError as exc:
+        raise ValidationError("链接已失效或无权访问该复核任务") from exc
+
+    source_task = (
+        runtime_task_service.get_task(validation.review_task.source_task_id)
+        if validation.review_task.source_task_id
+        else None
+    )
+    source_task_status = None
+    if source_task is not None and source_task.task_status == TaskStatus.MANUAL_REVIEW:
+        source_task_status = _source_task_status_for_mobile_review(review_status)
+
+    resolved_review = ReviewTaskService(
+        repository,
+        runtime_task_service=runtime_task_service,
+    ).resolve_review_task(
+        review_task_id=review_task_id,
+        status=review_status,
+        actor=validation.token_subject,
+        actor_source="mobile_review_token",
+        note=note,
+        resolution_payload=resolution_payload,
+        source_task_status=source_task_status,
+    )
+    used_token = token_service.record_resolve_usage(validation.review_token.token_id)
+    return MobileReviewResolutionSummary(
+        review_task=resolved_review,
+        review_token=used_token,
+        source_task=source_task,
+        source_task_status=source_task_status,
+    )
+
+
+def _source_task_status_for_mobile_review(status: ReviewTaskStatus) -> TaskStatus:
+    if status == ReviewTaskStatus.APPROVED:
+        return TaskStatus.PENDING
+    if status == ReviewTaskStatus.CANCELLED:
+        return TaskStatus.CANCELLED
+    return TaskStatus.SKIPPED
 
 
 def expire_runtime_review_tasks(inputs: ExpireReviewTasksInputs) -> ExpireReviewTasksSummary:
