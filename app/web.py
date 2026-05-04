@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import json
 import os
+from datetime import datetime, timedelta
 from html import escape
+from http.cookies import SimpleCookie
 from pathlib import Path
-from urllib.parse import parse_qs
+from secrets import token_urlsafe
+from urllib.parse import parse_qs, urlencode
 from wsgiref.simple_server import make_server
 
+from app.enums import NotificationSendStatus, ReviewTaskStatus, TaskStatus
 from app.exceptions import TableValidationError, ValidationError
 from app.field_labels import FIELD_LABELS, TABLE_LABELS
 from app.repositories.workbook_repository import (
@@ -16,21 +21,26 @@ from app.repositories.workbook_repository import (
 from app.services.workflow import (
     ExecutionSimulationInputs,
     ExecutionSimulationSummary,
-    ManualInterventionInputs,
+    RuntimeReviewResolutionInputs,
     TaskGenerationSummary,
     ValidationSummary,
     WorkflowInputs,
     generate_tasks_from_sources,
+    get_runtime_notification_log,
+    get_runtime_review_task,
+    get_runtime_task,
     list_runtime_notification_logs,
+    list_runtime_task_history,
     list_runtime_review_tasks,
     list_runtime_tasks,
     list_manual_intervention_tasks,
     preview_tasks_from_sources,
-    resolve_manual_intervention_task,
+    resolve_runtime_review_task,
     simulate_execution_from_tasks,
     validate_sources,
 )
 from app.services.runtime import DEFAULT_RUNTIME_DB
+from app.utils import parse_date
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -57,6 +67,9 @@ TABLE_OPTIONS = {
 }
 
 TABLE_HEADER_LABELS = FIELD_LABELS
+RUNTIME_SESSION_COOKIE = "pra_runtime_session"
+RUNTIME_SESSION_TTL_SECONDS = 3600
+_RUNTIME_SESSIONS: dict[str, dict[str, object]] = {}
 
 UI_TEXT = {
     "site_title": "PRA \u7ba1\u7406\u53f0",
@@ -121,12 +134,41 @@ UI_TEXT = {
     "manual_resolved": "\u5df2\u5904\u7406\u4efb\u52a1 {task_id} -> {status}",
     "manual_decision": "\u5904\u7406\u7ed3\u679c",
     "manual_submit": "\u63d0\u4ea4",
+    "manual_readonly_notice": "\u65e7 Excel \u4eba\u5de5\u4ecb\u5165\u94fe\u8def\u5df2\u8fdb\u5165\u53ea\u8bfb\u517c\u5bb9\u72b6\u6001\uff0c\u4e0d\u518d\u5141\u8bb8\u5728\u8fd9\u91cc\u6267\u884c\u6b63\u5f0f\u5904\u7406\u3002\u8bf7\u6539\u7528 SQLite review_tasks \u6216 /runtime \u5165\u53e3\u3002",
     "runtime_panel_title": "SQLite \u8fd0\u884c\u6001\u67e5\u770b",
     "runtime_db_path": "\u8fd0\u884c\u6001\u6570\u636e\u5e93\u8def\u5f84",
     "runtime_load_button": "\u52a0\u8f7d\u8fd0\u884c\u6001\u6570\u636e",
+    "runtime_login_title": "\u8fd0\u884c\u6001\u767b\u5f55",
+    "runtime_login_user": "\u540e\u53f0\u8d26\u53f7",
+    "runtime_login_password": "\u540e\u53f0\u5bc6\u7801",
+    "runtime_login_button": "\u767b\u5f55",
+    "runtime_logout_button": "\u9000\u51fa\u767b\u5f55",
+    "runtime_session_user": "\u5f53\u524d\u767b\u5f55\u8eab\u4efd",
+    "runtime_review_detail": "\u590d\u6838\u8be6\u60c5",
+    "runtime_review_handle": "\u5904\u7406\u590d\u6838",
+    "runtime_history": "\u4efb\u52a1\u72b6\u6001\u5386\u53f2",
+    "runtime_history_empty": "\u6682\u65e0\u72b6\u6001\u53d8\u66f4\u5386\u53f2\u3002",
+    "runtime_reviewer_code": "\u590d\u6838\u7801\uff08\u8fc7\u6e21\u5b57\u6bb5\uff09",
+    "runtime_resolution_note": "\u5904\u7406\u5907\u6ce8",
+    "runtime_resolution_payload": "\u7ed3\u679c JSON",
+    "runtime_submit_review": "\u63d0\u4ea4\u590d\u6838\u7ed3\u679c",
+    "runtime_login_required": "\u8fd0\u884c\u6001\u590d\u6838\u5904\u7406\u9700\u8981\u5148\u767b\u5f55\u3002",
+    "runtime_already_handled": "\u8be5\u590d\u6838\u4efb\u52a1\u5df2\u5904\u7406\uff0c\u4e0d\u80fd\u91cd\u590d\u63d0\u4ea4\u3002",
+    "runtime_review_resolved": "\u5df2\u5904\u7406\u590d\u6838\u4efb\u52a1 {review_task_id} -> {status}",
+    "runtime_source_not_advanced": "\u6e90\u4efb\u52a1\u5f53\u524d\u4e0d\u662f manual_review\uff0c\u672a\u81ea\u52a8\u63a8\u52a8\u72b6\u6001\u3002",
+    "runtime_adjusted_followup": "\u590d\u6838\u7ed3\u679c\u4e3a adjusted\uff0c\u539f\u4efb\u52a1\u5df2\u8df3\u8fc7\uff0c\u9700\u540e\u7eed\u751f\u6210\u65b0\u4efb\u52a1\u3002",
+    "runtime_pending_only": "\u53ea\u6709 pending \u72b6\u6001\u7684\u590d\u6838\u4efb\u52a1\u53ef\u4ee5\u5904\u7406\u3002",
     "runtime_tasks": "\u8fd0\u884c\u6001\u4efb\u52a1",
     "runtime_reviews": "\u4eba\u5de5\u590d\u6838\u4efb\u52a1",
     "runtime_notifications": "\u901a\u77e5\u8bb0\u5f55",
+    "runtime_task_filters": "\u4efb\u52a1\u7b5b\u9009",
+    "runtime_review_filters": "\u590d\u6838\u7b5b\u9009",
+    "runtime_notification_filters": "\u901a\u77e5\u7b5b\u9009",
+    "runtime_filter_apply": "\u5e94\u7528\u7b5b\u9009",
+    "runtime_filter_reset": "\u91cd\u7f6e",
+    "runtime_notification_detail": "\u901a\u77e5\u8be6\u60c5",
+    "runtime_notification_none": "\u6682\u65e0\u7b26\u5408\u6761\u4ef6\u7684\u901a\u77e5\u8bb0\u5f55\u3002",
+    "runtime_history_summary": "\u72b6\u6001\u5386\u53f2\u6458\u8981",
 }
 
 
@@ -150,8 +192,18 @@ def application(environ, start_response):
         return _respond(start_response, "200 OK", "text/html; charset=utf-8", _handle_execution(method, environ))
     if path == "/manual-intervention":
         return _respond(start_response, "200 OK", "text/html; charset=utf-8", _handle_manual_intervention(method, environ))
+    if path == "/runtime/login":
+        status, body, headers = _handle_runtime_login(environ)
+        return _respond(start_response, status, "text/html; charset=utf-8", body, headers=headers)
+    if path == "/runtime/logout":
+        status, body, headers = _handle_runtime_logout(environ)
+        return _respond(start_response, status, "text/html; charset=utf-8", body, headers=headers)
     if path == "/runtime":
-        return _respond(start_response, "200 OK", "text/html; charset=utf-8", _handle_runtime(method, environ))
+        result = _handle_runtime(method, environ)
+        if isinstance(result, tuple):
+            status, body, headers = result
+            return _respond(start_response, status, "text/html; charset=utf-8", body, headers=headers)
+        return _respond(start_response, "200 OK", "text/html; charset=utf-8", result)
     return _respond(start_response, "404 Not Found", "text/plain; charset=utf-8", "Not Found")
 
 
@@ -318,7 +370,7 @@ def _handle_execution(method: str, environ) -> str:
 
 def _handle_manual_intervention(method: str, environ) -> str:
     params = default_manual_state()
-    message = ""
+    message = UI_TEXT["manual_readonly_notice"]
     level = "info"
     tasks = []
 
@@ -330,30 +382,14 @@ def _handle_manual_intervention(method: str, environ) -> str:
             "actor": _first(parsed, "actor", params["actor"]),
             "note": _first(parsed, "note", ""),
         }
-        action = _first(parsed, "action", "load")
         try:
-            if action == "resolve":
-                summary = resolve_manual_intervention_task(
-                    ManualInterventionInputs(
-                        tasks_path=Path(str(params["tasks_path"])),
-                        output_path=Path(str(params["output_path"])),
-                        task_id=_first(parsed, "task_id", ""),
-                        decision=_first(parsed, "decision", "acknowledge"),
-                        actor=str(params["actor"]),
-                        note=str(params["note"]),
-                    )
-                )
-                message = UI_TEXT["manual_resolved"].format(
-                    task_id=summary.updated_task.task_id,
-                    status=summary.updated_task.task_status.value,
-                )
-                level = "success"
-                tasks = summary.open_tasks
-            else:
-                tasks = list_manual_intervention_tasks(Path(str(params["tasks_path"])))
-                if not tasks:
-                    message = UI_TEXT["manual_empty"]
-                    level = "info"
+            tasks = list_manual_intervention_tasks(Path(str(params["tasks_path"])))
+            if _first(parsed, "action", "load") == "resolve":
+                message = "旧 Excel 人工介入入口已弃用，不能再执行正式处理。请改用 SQLite review_tasks 或 /runtime 入口。"
+                level = "error"
+            elif not tasks:
+                message = UI_TEXT["manual_empty"]
+                level = "info"
         except (ValidationError, FileNotFoundError) as exc:
             message = str(exc)
             level = "error"
@@ -366,25 +402,157 @@ def _handle_manual_intervention(method: str, environ) -> str:
     )
 
 
-def _handle_runtime(method: str, environ) -> str:
+def _handle_runtime(method: str, environ) -> str | tuple[str, str, list[tuple[str, str]]]:
     params = default_runtime_state()
-    message = ""
-    level = "info"
+    query = _parse_query(environ)
+    params["runtime_db"] = _first(query, "runtime_db", params["runtime_db"])
+    params["review_task_id"] = _first(query, "review_task_id", "")
+    params["task_id"] = _first(query, "task_id", "")
+    params["notification_id"] = _first(query, "notification_id", "")
+    params["task_trade_date"] = _first(query, "task_trade_date", "")
+    params["task_status"] = _first(query, "task_status", "")
+    params["review_trade_date"] = _first(query, "review_trade_date", "")
+    params["review_status"] = _first(query, "review_status", "")
+    params["notification_related_review_task_id"] = _first(query, "notification_related_review_task_id", "")
+    params["notification_send_status"] = _first(query, "notification_send_status", "")
+    message = _first(query, "message", "")
+    level = _first(query, "level", "info" if message else "info")
     tasks = []
     reviews = []
     notifications = []
+    selected_review = None
+    selected_task = None
+    selected_notification = None
+    history = []
+    session_user = _get_runtime_session_user(environ)
+    filters = _runtime_filter_state(params)
 
     if method == "POST":
+        if session_user is None:
+            return _redirect_response(
+                _build_runtime_url(
+                    params["runtime_db"],
+                    **filters,
+                    message=UI_TEXT["runtime_login_required"],
+                    level="error",
+                )
+            )
         parsed = _parse_body(environ)
-        params = {"runtime_db": _first(parsed, "runtime_db", params["runtime_db"])}
-    try:
-        db_path = Path(str(params["runtime_db"]))
-        tasks = list_runtime_tasks(db_path)
-        reviews = list_runtime_review_tasks(db_path)
-        notifications = list_runtime_notification_logs(db_path)
-    except (ValidationError, FileNotFoundError) as exc:
-        message = str(exc)
-        level = "error"
+        params["runtime_db"] = _first(parsed, "runtime_db", params["runtime_db"])
+        params["review_task_id"] = _first(parsed, "review_task_id", params["review_task_id"])
+        params["task_id"] = _first(parsed, "task_id", params["task_id"])
+        params["notification_id"] = _first(parsed, "notification_id", params["notification_id"])
+        params["task_trade_date"] = _first(parsed, "task_trade_date", params["task_trade_date"])
+        params["task_status"] = _first(parsed, "task_status", params["task_status"])
+        params["review_trade_date"] = _first(parsed, "review_trade_date", params["review_trade_date"])
+        params["review_status"] = _first(parsed, "review_status", params["review_status"])
+        params["notification_related_review_task_id"] = _first(
+            parsed,
+            "notification_related_review_task_id",
+            params["notification_related_review_task_id"],
+        )
+        params["notification_send_status"] = _first(parsed, "notification_send_status", params["notification_send_status"])
+        filters = _runtime_filter_state(params)
+        action = _first(parsed, "action", "load")
+        if action == "resolve_review":
+            try:
+                db_path = Path(str(params["runtime_db"]))
+                review = get_runtime_review_task(db_path, params["review_task_id"])
+                if review is None:
+                    raise ValidationError(f"review task not found: {params['review_task_id']}")
+                if review.review_status != ReviewTaskStatus.PENDING:
+                    raise ValidationError(UI_TEXT["runtime_already_handled"])
+
+                resolution_payload = _parse_resolution_payload(
+                    _first(parsed, "resolution_payload_json", "{}")
+                )
+                reviewer_code = _first(parsed, "reviewer_code", "").strip()
+                if reviewer_code:
+                    resolution_payload["reviewer_code"] = reviewer_code
+
+                review_status = ReviewTaskStatus(_first(parsed, "review_status", ReviewTaskStatus.APPROVED.value))
+                source_task_status = None
+                source_followup_message = ""
+                if review.source_task_id:
+                    source_task = get_runtime_task(db_path, review.source_task_id)
+                    if source_task is not None and source_task.task_status == TaskStatus.MANUAL_REVIEW:
+                        source_task_status = _map_review_to_source_task_status(review_status)
+                    else:
+                        source_followup_message = UI_TEXT["runtime_source_not_advanced"]
+                    params["task_id"] = review.source_task_id
+
+                resolved = resolve_runtime_review_task(
+                    RuntimeReviewResolutionInputs(
+                        db_path=db_path,
+                        review_task_id=review.review_task_id,
+                        status=review_status,
+                        actor=session_user,
+                        actor_source="session_user",
+                        note=_first(parsed, "resolution_note", ""),
+                        source_task_status=source_task_status,
+                        resolution_payload=resolution_payload,
+                    )
+                )
+                success_message = UI_TEXT["runtime_review_resolved"].format(
+                    review_task_id=resolved.review_task_id,
+                    status=resolved.review_status.value,
+                )
+                if review_status == ReviewTaskStatus.ADJUSTED:
+                    success_message = f"{success_message} {UI_TEXT['runtime_adjusted_followup']}"
+                if source_followup_message:
+                    success_message = f"{success_message} {source_followup_message}"
+                return _redirect_response(
+                    _build_runtime_url(
+                        params["runtime_db"],
+                        review_task_id=resolved.review_task_id,
+                        task_id=params["task_id"],
+                        notification_related_review_task_id=filters["notification_related_review_task_id"],
+                        notification_send_status=filters["notification_send_status"],
+                        task_trade_date=filters["task_trade_date"],
+                        task_status=filters["task_status"],
+                        review_trade_date=filters["review_trade_date"],
+                        review_status=filters["review_status"],
+                        message=success_message,
+                        level="success",
+                    )
+                )
+            except (ValidationError, FileNotFoundError) as exc:
+                message = str(exc)
+                level = "error"
+
+    if session_user is not None:
+        try:
+            db_path = Path(str(params["runtime_db"]))
+            tasks = list_runtime_tasks(
+                db_path,
+                trade_date=parse_date(params["task_trade_date"], "task_trade_date") if params["task_trade_date"] else None,
+                status=TaskStatus(params["task_status"]) if params["task_status"] else None,
+            )
+            reviews = list_runtime_review_tasks(
+                db_path,
+                trade_date=parse_date(params["review_trade_date"], "review_trade_date") if params["review_trade_date"] else None,
+                status=ReviewTaskStatus(params["review_status"]) if params["review_status"] else None,
+            )
+            notifications = list_runtime_notification_logs(
+                db_path,
+                related_review_task_id=params["notification_related_review_task_id"] or None,
+                send_status=params["notification_send_status"] or None,
+            )
+            if params["review_task_id"]:
+                selected_review = get_runtime_review_task(db_path, params["review_task_id"])
+                if selected_review is not None and not params["task_id"] and selected_review.source_task_id:
+                    params["task_id"] = selected_review.source_task_id
+            if params["task_id"]:
+                selected_task = get_runtime_task(db_path, params["task_id"])
+                if selected_task is not None:
+                    history = list_runtime_task_history(db_path, selected_task.task_id)
+            if params["notification_id"]:
+                selected_notification = get_runtime_notification_log(db_path, params["notification_id"])
+        except (ValidationError, FileNotFoundError) as exc:
+            message = str(exc)
+            level = "error"
+    elif not message:
+        message = UI_TEXT["runtime_login_required"]
 
     return render_runtime_page(
         params=params,
@@ -393,6 +561,76 @@ def _handle_runtime(method: str, environ) -> str:
         tasks=tasks,
         reviews=reviews,
         notifications=notifications,
+        session_user=session_user,
+        selected_review=selected_review,
+        selected_task=selected_task,
+        selected_notification=selected_notification,
+        task_history=history,
+    )
+
+
+def _handle_runtime_login(environ) -> tuple[str, str, list[tuple[str, str]]]:
+    parsed = _parse_body(environ)
+    runtime_db = _first(parsed, "runtime_db", str(DEFAULT_RUNTIME_DB))
+    username = _first(parsed, "username", _runtime_admin_user()).strip() or _runtime_admin_user()
+    password = _first(parsed, "password", "")
+    redirect_target = _build_runtime_url(runtime_db)
+
+    expected_password = os.getenv("RUNTIME_ADMIN_PASSWORD", "")
+    if expected_password and username == _runtime_admin_user() and password == expected_password:
+        return _redirect_response(
+            redirect_target,
+            headers=_session_cookie_headers(_runtime_admin_user()),
+        )
+    if _dev_mode():
+        shared_password = os.getenv("RUNTIME_DEV_SHARED_PASSWORD", "")
+        if shared_password and password == shared_password:
+            return _redirect_response(
+                redirect_target,
+                headers=_session_cookie_headers("dev_shared_user"),
+            )
+
+    message = "登录失败：账号或密码不正确。"
+    if not expected_password and not (_dev_mode() and os.getenv("RUNTIME_DEV_SHARED_PASSWORD", "")):
+        message = "尚未配置 RUNTIME_ADMIN_PASSWORD，无法进行运行态复核登录。"
+    body = render_runtime_page(
+        params={
+            "runtime_db": runtime_db,
+            "review_task_id": "",
+            "task_id": "",
+            "notification_id": "",
+            "task_trade_date": "",
+            "task_status": "",
+            "review_trade_date": "",
+            "review_status": "",
+            "notification_related_review_task_id": "",
+            "notification_send_status": "",
+        },
+        message=message,
+        message_level="error",
+        tasks=[],
+        reviews=[],
+        notifications=[],
+        session_user=None,
+        selected_review=None,
+        selected_task=None,
+        selected_notification=None,
+        task_history=[],
+    )
+    return ("200 OK", body, [])
+
+
+def _handle_runtime_logout(environ) -> tuple[str, str, list[tuple[str, str]]]:
+    parsed = _parse_body(environ)
+    runtime_db = _first(parsed, "runtime_db", str(DEFAULT_RUNTIME_DB))
+    cookie = SimpleCookie()
+    cookie.load(environ.get("HTTP_COOKIE", ""))
+    session_cookie = cookie.get(RUNTIME_SESSION_COOKIE)
+    if session_cookie is not None:
+        _RUNTIME_SESSIONS.pop(session_cookie.value, None)
+    return _redirect_response(
+        _build_runtime_url(runtime_db, message="已退出运行态登录。", level="success"),
+        headers=_clear_session_cookie_headers(),
     )
 
 
@@ -446,7 +684,18 @@ def default_manual_state() -> dict[str, str]:
 
 
 def default_runtime_state() -> dict[str, str]:
-    return {"runtime_db": str(DEFAULT_RUNTIME_DB)}
+    return {
+        "runtime_db": str(DEFAULT_RUNTIME_DB),
+        "review_task_id": "",
+        "task_id": "",
+        "notification_id": "",
+        "task_trade_date": "",
+        "task_status": "",
+        "review_trade_date": "",
+        "review_status": "",
+        "notification_related_review_task_id": "",
+        "notification_send_status": "",
+    }
 
 
 def render_dashboard_page(
@@ -828,41 +1077,18 @@ def render_manual_intervention_page(
     message_level: str,
     tasks,
 ) -> str:
-    rows_html = ""
-    if tasks:
-        rows = []
-        for task in tasks:
-            decision_options = (
-                "<option value='acknowledge'>acknowledge</option>"
-                "<option value='approve'>approve</option>"
-                "<option value='reject'>reject</option>"
-            )
-            rows.append(
-                "<tr>"
-                f"<td>{escape(task.task_id)}</td>"
-                f"<td>{escape(task.internal_sku)}</td>"
-                f"<td>{escape(task.action_type.value)}</td>"
-                f"<td>{escape(task.task_status.value)}</td>"
-                f"<td>{escape(task.result_message or '-')}</td>"
-                f"<td>{escape(str(task.required_by) if task.required_by is not None else '-')}</td>"
-                "<td>"
-                "<form method='post' class='grid'>"
-                f"<input type='hidden' name='tasks_path' value='{escape(params['tasks_path'])}'>"
-                f"<input type='hidden' name='output_path' value='{escape(params['output_path'])}'>"
-                f"<input type='hidden' name='task_id' value='{escape(task.task_id)}'>"
-                f"<input type='hidden' name='actor' value='{escape(params['actor'])}'>"
-                "<select name='decision'>"
-                f"{decision_options}"
-                "</select>"
-                f"<input name='note' type='text' value='{escape(params['note'])}' placeholder='note'>"
-                f"<button class='primary' type='submit' name='action' value='resolve'>{escape(UI_TEXT['manual_submit'])}</button>"
-                "</form>"
-                "</td>"
-                "</tr>"
-            )
-        rows_html = "".join(rows)
-    else:
-        rows_html = f"<tr><td colspan='7'>{escape(UI_TEXT['manual_empty'])}</td></tr>"
+    rows_html = "".join(
+        "<tr>"
+        f"<td>{escape(task.task_id)}</td>"
+        f"<td>{escape(task.internal_sku or '-')}</td>"
+        f"<td>{escape(task.action_type.value)}</td>"
+        f"<td>{escape(task.task_status.value)}</td>"
+        f"<td>{escape(task.result_message or '-')}</td>"
+        f"<td>{escape(str(task.required_by) if task.required_by is not None else '-')}</td>"
+        f"<td>{escape(UI_TEXT['manual_readonly_notice'])}</td>"
+        "</tr>"
+        for task in tasks
+    ) or f"<tr><td colspan='7'>{escape(UI_TEXT['manual_empty'])}</td></tr>"
 
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -879,6 +1105,7 @@ def render_manual_intervention_page(
     {_banner(message, message_level)}
     <section class="panel">
       <h2>{escape(UI_TEXT["manual_panel_title"])}</h2>
+      <p class="subtle">{escape(UI_TEXT["manual_readonly_notice"])}</p>
       <form method="post" class="grid two-col">
         <div class="field">
           <label for="tasks_path">{escape(UI_TEXT["manual_tasks_path"])}</label>
@@ -912,7 +1139,7 @@ def render_manual_intervention_page(
               <th>status</th>
               <th>message</th>
               <th>required_by</th>
-              <th>handle</th>
+              <th>mode</th>
             </tr>
           </thead>
           <tbody>{rows_html}</tbody>
@@ -933,10 +1160,58 @@ def render_runtime_page(
     tasks,
     reviews,
     notifications,
+    session_user: str | None,
+    selected_review,
+    selected_task,
+    task_history,
 ) -> str:
+    if session_user is None:
+        login_panel = f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_login_title"])}</h2>
+      <form method="post" action="/runtime/login" class="grid two-col">
+        <input type="hidden" name="runtime_db" value="{escape(params["runtime_db"])}">
+        <div class="field">
+          <label for="runtime_username">{escape(UI_TEXT["runtime_login_user"])}</label>
+          <input id="runtime_username" name="username" type="text" value="{escape(_runtime_admin_user())}">
+        </div>
+        <div class="field">
+          <label for="runtime_password">{escape(UI_TEXT["runtime_login_password"])}</label>
+          <input id="runtime_password" name="password" type="password" value="">
+        </div>
+        <div class="actions">
+          <button class="primary" type="submit">{escape(UI_TEXT["runtime_login_button"])}</button>
+        </div>
+      </form>
+    </section>
+"""
+        return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(UI_TEXT["runtime_tab"])}</title>
+  {common_styles()}
+</head>
+<body>
+  <main class="shell wide-shell">
+    {_hero(UI_TEXT["runtime_panel_title"], UI_TEXT["dashboard_lede"])}
+    {navigation("/runtime")}
+    {_banner(message, message_level)}
+    {login_panel}
+  </main>
+</body>
+</html>
+"""
+
+    runtime_query = _build_runtime_query(
+        params["runtime_db"],
+        review_task_id=params.get("review_task_id", ""),
+        task_id=params.get("task_id", ""),
+    )
     task_rows = "".join(
         "<tr>"
-        f"<td>{escape(task.task_id)}</td>"
+        f"<td><a href='/runtime?{escape(_build_runtime_query(params['runtime_db'], task_id=task.task_id, review_task_id=params.get('review_task_id', '')))}'>{escape(task.task_id)}</a></td>"
         f"<td>{escape(task.trade_date.isoformat() if task.trade_date else '-')}</td>"
         f"<td>{escape(task.scope_type)}:{escape(task.scope_key)}</td>"
         f"<td>{escape(task.action_type.value)}</td>"
@@ -948,7 +1223,7 @@ def render_runtime_page(
     ) or "<tr><td colspan='7'>-</td></tr>"
     review_rows = "".join(
         "<tr>"
-        f"<td>{escape(review.review_task_id)}</td>"
+        f"<td><a href='/runtime?{escape(_build_runtime_query(params['runtime_db'], review_task_id=review.review_task_id, task_id=review.source_task_id or ''))}'>{escape(review.review_task_id)}</a></td>"
         f"<td>{escape(review.trade_date.isoformat() if review.trade_date else '-')}</td>"
         f"<td>{escape(review.scope_type)}:{escape(review.scope_key)}</td>"
         f"<td>{escape(review.review_type)}</td>"
@@ -966,10 +1241,141 @@ def render_runtime_page(
         f"<td>{escape(log.recipient_type)}:{escape(log.recipient)}</td>"
         f"<td>{escape(log.channel)}</td>"
         f"<td>{escape(log.send_status)}</td>"
+        f"<td>{escape(log.sent_at.isoformat() if log.sent_at else '-')}</td>"
         f"<td>{escape(log.message)}</td>"
         "</tr>"
         for log in notifications[:100]
-    ) or "<tr><td colspan='7'>-</td></tr>"
+    ) or "<tr><td colspan='8'>-</td></tr>"
+
+    selected_review_html = ""
+    if selected_review is not None:
+        next_source_status = (
+            "approved->pending / rejected->skipped / adjusted->skipped / cancelled->cancelled"
+            if selected_review.source_task_id
+            else "-"
+        )
+        details = [
+            ("review_task_id", selected_review.review_task_id),
+            ("review_type", selected_review.review_type),
+            ("review_status", selected_review.review_status.value),
+            ("scope", f"{selected_review.scope_type}:{selected_review.scope_key}"),
+            ("source_task_id", selected_review.source_task_id or "-"),
+            ("required_by", selected_review.required_by.isoformat() if selected_review.required_by else "-"),
+            ("reason", selected_review.reason or "-"),
+            ("resolved_by", selected_review.resolved_by or "-"),
+            ("resolved_at", selected_review.resolved_at.isoformat() if selected_review.resolved_at else "-"),
+        ]
+        detail_rows = "".join(
+            f"<tr><th>{escape(label)}</th><td>{escape(str(value))}</td></tr>" for label, value in details
+        )
+        resolution_pre = escape(_to_pretty_json(selected_review.resolution_payload))
+        review_payload_pre = escape(_to_pretty_json(selected_review.review_payload))
+        related_notifications = [
+            log for log in notifications if log.related_review_task_id == selected_review.review_task_id
+        ]
+        related_notification_rows = "".join(
+            "<tr>"
+            f"<td>{escape(log.notification_id)}</td>"
+            f"<td>{escape(log.recipient_type)}:{escape(log.recipient)}</td>"
+            f"<td>{escape(log.channel)}</td>"
+            f"<td>{escape(log.send_status)}</td>"
+            f"<td>{escape(log.sent_at.isoformat() if log.sent_at else '-')}</td>"
+            f"<td>{escape(log.message)}</td>"
+            "</tr>"
+            for log in related_notifications
+        ) or "<tr><td colspan='6'>-</td></tr>"
+        selected_review_html = f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_review_detail"])}</h2>
+      <div class="table-wrap">
+        <table>
+          <tbody>{detail_rows}</tbody>
+        </table>
+      </div>
+      <div class="grid two-col">
+        <div class="field">
+          <label>review_payload_json</label>
+          <pre>{review_payload_pre}</pre>
+        </div>
+        <div class="field">
+          <label>resolution_payload_json</label>
+          <pre>{resolution_pre}</pre>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>notification_id</th><th>recipient</th><th>channel</th><th>send_status</th><th>sent_at</th><th>message</th></tr></thead>
+          <tbody>{related_notification_rows}</tbody>
+        </table>
+      </div>
+    </section>
+"""
+        if selected_review.review_status == ReviewTaskStatus.PENDING:
+            selected_review_html += f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_review_handle"])}</h2>
+      <form method="post" action="/runtime" class="grid">
+        <input type="hidden" name="action" value="resolve_review">
+        <input type="hidden" name="runtime_db" value="{escape(params["runtime_db"])}">
+        <input type="hidden" name="review_task_id" value="{escape(selected_review.review_task_id)}">
+        <input type="hidden" name="task_id" value="{escape(selected_review.source_task_id or '')}">
+        <div class="field">
+          <label for="review_status">review_status</label>
+          <select id="review_status" name="review_status">
+            <option value="approved">approved</option>
+            <option value="rejected">rejected</option>
+            <option value="adjusted">adjusted</option>
+            <option value="cancelled">cancelled</option>
+          </select>
+        </div>
+        <div class="field">
+          <label>{escape(UI_TEXT["runtime_session_user"])}</label>
+          <input type="text" value="{escape(session_user)}" disabled>
+        </div>
+        <div class="field">
+          <label for="reviewer_code">{escape(UI_TEXT["runtime_reviewer_code"])}</label>
+          <input id="reviewer_code" name="reviewer_code" type="text" value="">
+        </div>
+        <div class="field">
+          <label for="resolution_note">{escape(UI_TEXT["runtime_resolution_note"])}</label>
+          <input id="resolution_note" name="resolution_note" type="text" value="">
+        </div>
+        <div class="field">
+          <label for="resolution_payload_json">{escape(UI_TEXT["runtime_resolution_payload"])}</label>
+          <textarea id="resolution_payload_json" name="resolution_payload_json" rows="8">{{}}</textarea>
+        </div>
+        <p class="subtle">source_task_status: {escape(next_source_status)}（仅当源任务当前处于 manual_review 时自动推动）</p>
+        <div class="actions">
+          <button class="primary" type="submit">{escape(UI_TEXT["runtime_submit_review"])}</button>
+        </div>
+      </form>
+    </section>
+"""
+
+    history_rows = "".join(
+        "<tr>"
+        f"<td>{escape(item.changed_at.isoformat())}</td>"
+        f"<td>{escape(item.from_status.value if item.from_status else '-')}</td>"
+        f"<td>{escape(item.to_status.value)}</td>"
+        f"<td>{escape(item.changed_by)}</td>"
+        f"<td>{escape(item.reason)}</td>"
+        f"<td><pre>{escape(_to_pretty_json(item.metadata))}</pre></td>"
+        "</tr>"
+        for item in task_history
+    ) or f"<tr><td colspan='6'>{escape(UI_TEXT['runtime_history_empty'])}</td></tr>"
+    history_panel = ""
+    if selected_task is not None:
+        history_panel = f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_history"])}: {escape(selected_task.task_id)}</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>changed_at</th><th>from</th><th>to</th><th>changed_by</th><th>reason</th><th>metadata_json</th></tr></thead>
+          <tbody>{history_rows}</tbody>
+        </table>
+      </div>
+    </section>
+"""
 
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -986,7 +1392,7 @@ def render_runtime_page(
     {_banner(message, message_level)}
     <section class="panel">
       <h2>{escape(UI_TEXT["runtime_panel_title"])}</h2>
-      <form method="post" class="grid two-col">
+      <form method="get" action="/runtime" class="grid two-col">
         <div class="field">
           <label for="runtime_db">{escape(UI_TEXT["runtime_db_path"])}</label>
           <input id="runtime_db" name="runtime_db" type="text" value="{escape(params["runtime_db"])}">
@@ -995,7 +1401,16 @@ def render_runtime_page(
           <button class="secondary" type="submit">{escape(UI_TEXT["runtime_load_button"])}</button>
         </div>
       </form>
+      <div class="actions">
+        <span class="subtle">{escape(UI_TEXT["runtime_session_user"])}: {escape(session_user)}</span>
+        <form method="post" action="/runtime/logout">
+          <input type="hidden" name="runtime_db" value="{escape(params["runtime_db"])}">
+          <button class="secondary" type="submit">{escape(UI_TEXT["runtime_logout_button"])}</button>
+        </form>
+      </div>
     </section>
+    {selected_review_html}
+    {history_panel}
     <section class="panel">
       <h2>{escape(UI_TEXT["runtime_tasks"])}</h2>
       <div class="table-wrap"><table><thead><tr><th>task_id</th><th>trade_date</th><th>scope</th><th>action</th><th>status</th><th>SKU</th><th>platform</th></tr></thead><tbody>{task_rows}</tbody></table></div>
@@ -1006,7 +1421,388 @@ def render_runtime_page(
     </section>
     <section class="panel">
       <h2>{escape(UI_TEXT["runtime_notifications"])}</h2>
-      <div class="table-wrap"><table><thead><tr><th>notification_id</th><th>related_task_id</th><th>related_review_task_id</th><th>recipient</th><th>channel</th><th>send_status</th><th>message</th></tr></thead><tbody>{notification_rows}</tbody></table></div>
+      <div class="table-wrap"><table><thead><tr><th>notification_id</th><th>related_task_id</th><th>related_review_task_id</th><th>recipient</th><th>channel</th><th>send_status</th><th>sent_at</th><th>message</th></tr></thead><tbody>{notification_rows}</tbody></table></div>
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+
+def render_runtime_page(
+    *,
+    params: dict[str, str],
+    message: str,
+    message_level: str,
+    tasks,
+    reviews,
+    notifications,
+    session_user: str | None,
+    selected_review,
+    selected_task,
+    selected_notification,
+    task_history,
+) -> str:
+    if session_user is None:
+        login_panel = f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_login_title"])}</h2>
+      <form method="post" action="/runtime/login" class="grid two-col">
+        <input type="hidden" name="runtime_db" value="{escape(params["runtime_db"])}">
+        <div class="field">
+          <label for="runtime_username">{escape(UI_TEXT["runtime_login_user"])}</label>
+          <input id="runtime_username" name="username" type="text" value="{escape(_runtime_admin_user())}">
+        </div>
+        <div class="field">
+          <label for="runtime_password">{escape(UI_TEXT["runtime_login_password"])}</label>
+          <input id="runtime_password" name="password" type="password" value="">
+        </div>
+        <div class="actions">
+          <button class="primary" type="submit">{escape(UI_TEXT["runtime_login_button"])}</button>
+        </div>
+      </form>
+    </section>
+"""
+        return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(UI_TEXT["runtime_tab"])}</title>
+  {common_styles()}
+</head>
+<body>
+  <main class="shell wide-shell">
+    {_hero(UI_TEXT["runtime_panel_title"], UI_TEXT["dashboard_lede"])}
+    {navigation("/runtime")}
+    {_banner(message, message_level)}
+    {login_panel}
+  </main>
+</body>
+</html>
+"""
+
+    base_filters = {
+        "task_trade_date": params.get("task_trade_date", ""),
+        "task_status": params.get("task_status", ""),
+        "review_trade_date": params.get("review_trade_date", ""),
+        "review_status": params.get("review_status", ""),
+        "notification_related_review_task_id": params.get("notification_related_review_task_id", ""),
+        "notification_send_status": params.get("notification_send_status", ""),
+    }
+    task_status_options = "".join(
+        f"<option value='{escape(option.value)}'{' selected' if params.get('task_status') == option.value else ''}>{escape(option.value)}</option>"
+        for option in TaskStatus
+    )
+    review_status_options = "".join(
+        f"<option value='{escape(option.value)}'{' selected' if params.get('review_status') == option.value else ''}>{escape(option.value)}</option>"
+        for option in ReviewTaskStatus
+    )
+    notification_status_options = "".join(
+        f"<option value='{escape(option.value)}'{' selected' if params.get('notification_send_status') == option.value else ''}>{escape(option.value)}</option>"
+        for option in NotificationSendStatus
+    )
+
+    task_rows = "".join(
+        "<tr>"
+        f"<td><a href='/runtime?{escape(_build_runtime_query(params['runtime_db'], task_id=task.task_id, review_task_id=params.get('review_task_id', ''), notification_id=params.get('notification_id', ''), **base_filters))}'>{escape(task.task_id)}</a></td>"
+        f"<td>{escape(task.trade_date.isoformat() if task.trade_date else '-')}</td>"
+        f"<td>{escape(task.scope_type)}:{escape(task.scope_key)}</td>"
+        f"<td>{escape(task.action_type.value)}</td>"
+        f"<td>{escape(task.task_status.value)}</td>"
+        f"<td>{escape(task.internal_sku or '-')}</td>"
+        f"<td>{escape(task.platform_name or '-')}</td>"
+        "</tr>"
+        for task in tasks[:100]
+    ) or "<tr><td colspan='7'>-</td></tr>"
+    review_rows = "".join(
+        "<tr>"
+        f"<td><a href='/runtime?{escape(_build_runtime_query(params['runtime_db'], review_task_id=review.review_task_id, task_id=review.source_task_id or '', notification_id=params.get('notification_id', ''), **base_filters))}'>{escape(review.review_task_id)}</a></td>"
+        f"<td>{escape(review.trade_date.isoformat() if review.trade_date else '-')}</td>"
+        f"<td>{escape(review.scope_type)}:{escape(review.scope_key)}</td>"
+        f"<td>{escape(review.review_type)}</td>"
+        f"<td>{escape(review.review_status.value)}</td>"
+        f"<td>{escape(review.source_task_id or '-')}</td>"
+        f"<td>{escape(review.reason)}</td>"
+        "</tr>"
+        for review in reviews[:100]
+    ) or "<tr><td colspan='7'>-</td></tr>"
+    notification_rows = "".join(
+        "<tr>"
+        f"<td><a href='/runtime?{escape(_build_runtime_query(params['runtime_db'], notification_id=log.notification_id, review_task_id=params.get('review_task_id', ''), task_id=params.get('task_id', ''), **base_filters))}'>{escape(log.notification_id)}</a></td>"
+        f"<td>{escape(log.related_task_id or '-')}</td>"
+        f"<td>{escape(log.related_review_task_id or '-')}</td>"
+        f"<td>{escape(log.recipient_type)}:{escape(log.recipient)}</td>"
+        f"<td>{escape(log.channel)}</td>"
+        f"<td>{escape(log.send_status)}</td>"
+        f"<td>{escape(log.sent_at.isoformat() if log.sent_at else '-')}</td>"
+        f"<td>{escape(log.message)}</td>"
+        "</tr>"
+        for log in notifications[:100]
+    ) or f"<tr><td colspan='8'>{escape(UI_TEXT['runtime_notification_none'])}</td></tr>"
+
+    selected_review_html = ""
+    if selected_review is not None:
+        next_source_status = (
+            "approved->pending / rejected->skipped / adjusted->skipped / cancelled->cancelled"
+            if selected_review.source_task_id
+            else "-"
+        )
+        details = [
+            ("review_task_id", selected_review.review_task_id),
+            ("review_type", selected_review.review_type),
+            ("review_status", selected_review.review_status.value),
+            ("scope", f"{selected_review.scope_type}:{selected_review.scope_key}"),
+            ("source_task_id", selected_review.source_task_id or "-"),
+            ("required_by", selected_review.required_by.isoformat() if selected_review.required_by else "-"),
+            ("reason", selected_review.reason or "-"),
+            ("resolved_by", selected_review.resolved_by or "-"),
+            ("resolved_at", selected_review.resolved_at.isoformat() if selected_review.resolved_at else "-"),
+        ]
+        detail_rows = "".join(f"<tr><th>{escape(label)}</th><td>{escape(str(value))}</td></tr>" for label, value in details)
+        resolution_pre = escape(_to_pretty_json(selected_review.resolution_payload))
+        review_payload_pre = escape(_to_pretty_json(selected_review.review_payload))
+        related_notification_rows = "".join(
+            "<tr>"
+            f"<td><a href='/runtime?{escape(_build_runtime_query(params['runtime_db'], notification_id=log.notification_id, review_task_id=selected_review.review_task_id, task_id=selected_review.source_task_id or '', **base_filters))}'>{escape(log.notification_id)}</a></td>"
+            f"<td>{escape(log.recipient_type)}:{escape(log.recipient)}</td>"
+            f"<td>{escape(log.channel)}</td>"
+            f"<td>{escape(log.send_status)}</td>"
+            f"<td>{escape(log.sent_at.isoformat() if log.sent_at else '-')}</td>"
+            f"<td>{escape(log.message)}</td>"
+            "</tr>"
+            for log in notifications
+            if log.related_review_task_id == selected_review.review_task_id
+        ) or "<tr><td colspan='6'>-</td></tr>"
+        selected_review_html = f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_review_detail"])}</h2>
+      <div class="table-wrap"><table><tbody>{detail_rows}</tbody></table></div>
+      <div class="grid two-col">
+        <div class="field">
+          <label>review_payload_json</label>
+          <pre>{review_payload_pre}</pre>
+        </div>
+        <div class="field">
+          <label>resolution_payload_json</label>
+          <pre>{resolution_pre}</pre>
+        </div>
+      </div>
+      <h3>{escape(UI_TEXT["runtime_notifications"])}</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>notification_id</th><th>recipient</th><th>channel</th><th>status</th><th>sent_at</th><th>message</th></tr></thead>
+          <tbody>{related_notification_rows}</tbody>
+        </table>
+      </div>
+    </section>
+"""
+        if selected_review.review_status == ReviewTaskStatus.PENDING:
+            resolve_status_options = "".join(
+                f"<option value='{escape(option.value)}'>{escape(option.value)}</option>"
+                for option in (
+                    ReviewTaskStatus.APPROVED,
+                    ReviewTaskStatus.REJECTED,
+                    ReviewTaskStatus.ADJUSTED,
+                    ReviewTaskStatus.CANCELLED,
+                )
+            )
+            hidden_filters = "".join(
+                f"<input type='hidden' name='{escape(key)}' value='{escape(value)}'>"
+                for key, value in base_filters.items()
+            )
+            selected_review_html += f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_review_handle"])}</h2>
+      <form method="post" class="grid">
+        <input type="hidden" name="action" value="resolve_review">
+        <input type="hidden" name="runtime_db" value="{escape(params["runtime_db"])}">
+        <input type="hidden" name="review_task_id" value="{escape(selected_review.review_task_id)}">
+        <input type="hidden" name="task_id" value="{escape(selected_review.source_task_id or '')}">
+        <input type="hidden" name="notification_id" value="{escape(params.get("notification_id", ""))}">
+        {hidden_filters}
+        <div class="field">
+          <label for="review_status">review_status</label>
+          <select id="review_status" name="review_status">{resolve_status_options}</select>
+        </div>
+        <div class="field">
+          <label for="reviewer_code">{escape(UI_TEXT["runtime_reviewer_code"])}</label>
+          <input id="reviewer_code" name="reviewer_code" type="text" value="">
+        </div>
+        <div class="field">
+          <label for="resolution_note">{escape(UI_TEXT["runtime_resolution_note"])}</label>
+          <input id="resolution_note" name="resolution_note" type="text" value="">
+        </div>
+        <div class="field">
+          <label for="resolution_payload_json">{escape(UI_TEXT["runtime_resolution_payload"])}</label>
+          <textarea id="resolution_payload_json" name="resolution_payload_json" rows="8">{{}}</textarea>
+        </div>
+        <p class="subtle">source_task_status: {escape(next_source_status)}（仅当源任务当前处于 manual_review 时自动推动）</p>
+        <div class="actions">
+          <button class="primary" type="submit">{escape(UI_TEXT["runtime_submit_review"])}</button>
+        </div>
+      </form>
+    </section>
+"""
+
+    history_panel = ""
+    if selected_task is not None:
+        history_rows = "".join(
+            "<tr>"
+            f"<td>{escape(item.changed_at.isoformat())}</td>"
+            f"<td>{escape(item.from_status.value if item.from_status else '-')}</td>"
+            f"<td>{escape(item.to_status.value)}</td>"
+            f"<td>{escape(item.changed_by)}</td>"
+            f"<td>{escape(item.reason)}</td>"
+            f"<td>{_metadata_summary_rows(item.metadata)}</td>"
+            "</tr>"
+            for item in task_history
+        ) or f"<tr><td colspan='6'>{escape(UI_TEXT['runtime_history_empty'])}</td></tr>"
+        history_panel = f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_history"])}: {escape(selected_task.task_id)}</h2>
+      <p class="subtle">{escape(UI_TEXT["runtime_history_summary"])}</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>changed_at</th><th>from</th><th>to</th><th>changed_by</th><th>reason</th><th>summary</th></tr></thead>
+          <tbody>{history_rows}</tbody>
+        </table>
+      </div>
+    </section>
+"""
+
+    selected_notification_panel = ""
+    if selected_notification is not None:
+        notification_details = [
+            ("notification_id", selected_notification.notification_id),
+            ("related_task_id", selected_notification.related_task_id or "-"),
+            ("related_review_task_id", selected_notification.related_review_task_id or "-"),
+            ("recipient_type", selected_notification.recipient_type),
+            ("recipient", selected_notification.recipient),
+            ("channel", selected_notification.channel),
+            ("send_status", selected_notification.send_status),
+            ("sent_at", selected_notification.sent_at.isoformat() if selected_notification.sent_at else "-"),
+            ("message", selected_notification.message or "-"),
+            ("error_message", selected_notification.error_message or "-"),
+        ]
+        notification_detail_rows = "".join(
+            f"<tr><th>{escape(label)}</th><td>{escape(str(value))}</td></tr>"
+            for label, value in notification_details
+        )
+        selected_notification_panel = f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_notification_detail"])}</h2>
+      <div class="table-wrap"><table><tbody>{notification_detail_rows}</tbody></table></div>
+    </section>
+"""
+
+    filter_panels = f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_panel_title"])}</h2>
+      <form method="get" action="/runtime" class="grid two-col">
+        <div class="field">
+          <label for="runtime_db">{escape(UI_TEXT["runtime_db_path"])}</label>
+          <input id="runtime_db" name="runtime_db" type="text" value="{escape(params["runtime_db"])}">
+        </div>
+        <div class="actions">
+          <button class="secondary" type="submit">{escape(UI_TEXT["runtime_load_button"])}</button>
+        </div>
+      </form>
+      <div class="actions">
+        <span class="subtle">{escape(UI_TEXT["runtime_session_user"])}: {escape(session_user)}</span>
+        <form method="post" action="/runtime/logout">
+          <input type="hidden" name="runtime_db" value="{escape(params["runtime_db"])}">
+          <button class="secondary" type="submit">{escape(UI_TEXT["runtime_logout_button"])}</button>
+        </form>
+      </div>
+    </section>
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_task_filters"])}</h2>
+      <form method="get" action="/runtime" class="grid two-col">
+        <input type="hidden" name="runtime_db" value="{escape(params["runtime_db"])}">
+        <div class="field">
+          <label for="task_trade_date">trade_date</label>
+          <input id="task_trade_date" name="task_trade_date" type="text" value="{escape(params.get("task_trade_date", ""))}" placeholder="YYYY-MM-DD">
+        </div>
+        <div class="field">
+          <label for="task_status">task_status</label>
+          <select id="task_status" name="task_status"><option value="">-</option>{task_status_options}</select>
+        </div>
+        <div class="actions">
+          <button class="secondary" type="submit">{escape(UI_TEXT["runtime_filter_apply"])}</button>
+        </div>
+      </form>
+    </section>
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_review_filters"])}</h2>
+      <form method="get" action="/runtime" class="grid two-col">
+        <input type="hidden" name="runtime_db" value="{escape(params["runtime_db"])}">
+        <input type="hidden" name="task_trade_date" value="{escape(params.get("task_trade_date", ""))}">
+        <input type="hidden" name="task_status" value="{escape(params.get("task_status", ""))}">
+        <div class="field">
+          <label for="review_trade_date">trade_date</label>
+          <input id="review_trade_date" name="review_trade_date" type="text" value="{escape(params.get("review_trade_date", ""))}" placeholder="YYYY-MM-DD">
+        </div>
+        <div class="field">
+          <label for="review_status">review_status</label>
+          <select id="review_status" name="review_status"><option value="">-</option>{review_status_options}</select>
+        </div>
+        <div class="actions">
+          <button class="secondary" type="submit">{escape(UI_TEXT["runtime_filter_apply"])}</button>
+        </div>
+      </form>
+    </section>
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_notification_filters"])}</h2>
+      <form method="get" action="/runtime" class="grid two-col">
+        <input type="hidden" name="runtime_db" value="{escape(params["runtime_db"])}">
+        <input type="hidden" name="task_trade_date" value="{escape(params.get("task_trade_date", ""))}">
+        <input type="hidden" name="task_status" value="{escape(params.get("task_status", ""))}">
+        <input type="hidden" name="review_trade_date" value="{escape(params.get("review_trade_date", ""))}">
+        <input type="hidden" name="review_status" value="{escape(params.get("review_status", ""))}">
+        <div class="field">
+          <label for="notification_related_review_task_id">related_review_task_id</label>
+          <input id="notification_related_review_task_id" name="notification_related_review_task_id" type="text" value="{escape(params.get("notification_related_review_task_id", ""))}">
+        </div>
+        <div class="field">
+          <label for="notification_send_status">send_status</label>
+          <select id="notification_send_status" name="notification_send_status"><option value="">-</option>{notification_status_options}</select>
+        </div>
+        <div class="actions">
+          <button class="secondary" type="submit">{escape(UI_TEXT["runtime_filter_apply"])}</button>
+        </div>
+      </form>
+    </section>
+"""
+
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(UI_TEXT["runtime_tab"])}</title>
+  {common_styles()}
+</head>
+<body>
+  <main class="shell wide-shell">
+    {_hero(UI_TEXT["runtime_panel_title"], UI_TEXT["dashboard_lede"])}
+    {navigation("/runtime")}
+    {_banner(message, message_level)}
+    {filter_panels}
+    {selected_review_html}
+    {history_panel}
+    {selected_notification_panel}
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_tasks"])}</h2>
+      <div class="table-wrap"><table><thead><tr><th>task_id</th><th>trade_date</th><th>scope</th><th>action</th><th>status</th><th>SKU</th><th>platform</th></tr></thead><tbody>{task_rows}</tbody></table></div>
+    </section>
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_reviews"])}</h2>
+      <div class="table-wrap"><table><thead><tr><th>review_task_id</th><th>trade_date</th><th>scope</th><th>type</th><th>status</th><th>source_task_id</th><th>reason</th></tr></thead><tbody>{review_rows}</tbody></table></div>
+    </section>
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_notifications"])}</h2>
+      <div class="table-wrap"><table><thead><tr><th>notification_id</th><th>related_task_id</th><th>related_review_task_id</th><th>recipient</th><th>channel</th><th>send_status</th><th>sent_at</th><th>message</th></tr></thead><tbody>{notification_rows}</tbody></table></div>
     </section>
   </main>
 </body>
@@ -1154,7 +1950,7 @@ def common_styles() -> str:
       letter-spacing: 0.04em;
       text-transform: uppercase;
     }
-    input[type="text"], select {
+    input[type="text"], input[type="password"], select, textarea {
       width: 100%;
       padding: 14px 16px;
       border: 1px solid var(--line);
@@ -1162,6 +1958,10 @@ def common_styles() -> str:
       font: inherit;
       color: var(--ink);
       background: rgba(255,255,255,0.95);
+    }
+    textarea {
+      resize: vertical;
+      min-height: 120px;
     }
     .checkbox {
       display: flex;
@@ -1329,6 +2129,17 @@ def common_styles() -> str:
       font-size: 13px;
       word-break: break-all;
     }
+    pre {
+      margin: 0;
+      padding: 12px 14px;
+      border-radius: 14px;
+      background: rgba(29,42,49,0.05);
+      color: var(--ink);
+      font-family: "Cascadia Mono", Consolas, monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
     @media (max-width: 960px) {
       .layout, .two-col { grid-template-columns: 1fr; }
       .shell, .wide-shell {
@@ -1363,10 +2174,213 @@ def _banner(message: str, level: str) -> str:
     return f"<div class='banner {escape(level)}'>{escape(message)}</div>"
 
 
+def _parse_query(environ) -> dict[str, list[str]]:
+    return parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
+
+
 def _parse_body(environ) -> dict[str, list[str]]:
     size = int(environ.get("CONTENT_LENGTH") or 0)
     body = environ["wsgi.input"].read(size).decode("utf-8")
     return parse_qs(body)
+
+
+def _runtime_admin_user() -> str:
+    return os.getenv("RUNTIME_ADMIN_USER", "admin")
+
+
+def _dev_mode() -> bool:
+    return os.getenv("DEV_MODE", "").strip().lower() == "true"
+
+
+def _session_cookie_headers(session_user: str) -> list[tuple[str, str]]:
+    _cleanup_runtime_sessions()
+    session_id = token_urlsafe(24)
+    expires_at = datetime.now() + timedelta(seconds=RUNTIME_SESSION_TTL_SECONDS)
+    _RUNTIME_SESSIONS[session_id] = {"user": session_user, "expires_at": expires_at}
+    cookie = SimpleCookie()
+    cookie[RUNTIME_SESSION_COOKIE] = session_id
+    cookie[RUNTIME_SESSION_COOKIE]["path"] = "/"
+    cookie[RUNTIME_SESSION_COOKIE]["httponly"] = True
+    cookie[RUNTIME_SESSION_COOKIE]["samesite"] = "Lax"
+    cookie[RUNTIME_SESSION_COOKIE]["max-age"] = str(RUNTIME_SESSION_TTL_SECONDS)
+    return [("Set-Cookie", cookie.output(header="").strip())]
+
+
+def _clear_session_cookie_headers() -> list[tuple[str, str]]:
+    cookie = SimpleCookie()
+    cookie[RUNTIME_SESSION_COOKIE] = ""
+    cookie[RUNTIME_SESSION_COOKIE]["path"] = "/"
+    cookie[RUNTIME_SESSION_COOKIE]["httponly"] = True
+    cookie[RUNTIME_SESSION_COOKIE]["samesite"] = "Lax"
+    cookie[RUNTIME_SESSION_COOKIE]["max-age"] = "0"
+    cookie[RUNTIME_SESSION_COOKIE]["expires"] = "Thu, 01 Jan 1970 00:00:00 GMT"
+    return [("Set-Cookie", cookie.output(header="").strip())]
+
+
+def _get_runtime_session_user(environ) -> str | None:
+    _cleanup_runtime_sessions()
+    cookie_header = environ.get("HTTP_COOKIE", "")
+    if not cookie_header:
+        return None
+    cookie = SimpleCookie()
+    cookie.load(cookie_header)
+    session_cookie = cookie.get(RUNTIME_SESSION_COOKIE)
+    if session_cookie is None:
+        return None
+    session = _RUNTIME_SESSIONS.get(session_cookie.value)
+    if session is None:
+        return None
+    expires_at = session.get("expires_at")
+    if not isinstance(expires_at, datetime) or expires_at <= datetime.now():
+        _RUNTIME_SESSIONS.pop(session_cookie.value, None)
+        return None
+    user = session.get("user")
+    return str(user) if user else None
+
+
+def _cleanup_runtime_sessions() -> None:
+    now = datetime.now()
+    expired = [
+        session_id
+        for session_id, payload in _RUNTIME_SESSIONS.items()
+        if not isinstance(payload.get("expires_at"), datetime) or payload.get("expires_at") <= now
+    ]
+    for session_id in expired:
+        _RUNTIME_SESSIONS.pop(session_id, None)
+
+
+def _map_review_to_source_task_status(status: ReviewTaskStatus) -> TaskStatus:
+    mapping = {
+        ReviewTaskStatus.APPROVED: TaskStatus.PENDING,
+        ReviewTaskStatus.REJECTED: TaskStatus.SKIPPED,
+        ReviewTaskStatus.ADJUSTED: TaskStatus.SKIPPED,
+        ReviewTaskStatus.CANCELLED: TaskStatus.CANCELLED,
+    }
+    return mapping[status]
+
+
+def _parse_resolution_payload(payload_text: str) -> dict[str, object]:
+    raw = payload_text.strip() or "{}"
+    try:
+        loaded = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValidationError(f"resolution_payload_json 不是合法 JSON: {exc.msg}") from exc
+    if not isinstance(loaded, dict):
+        raise ValidationError("resolution_payload_json 必须是 JSON 对象。")
+    return loaded
+
+
+def _build_runtime_query(
+    runtime_db: str,
+    *,
+    review_task_id: str = "",
+    task_id: str = "",
+    notification_id: str = "",
+    task_trade_date: str = "",
+    task_status: str = "",
+    review_trade_date: str = "",
+    review_status: str = "",
+    notification_related_review_task_id: str = "",
+    notification_send_status: str = "",
+    message: str = "",
+    level: str = "",
+) -> str:
+    params = {"runtime_db": runtime_db}
+    if review_task_id:
+        params["review_task_id"] = review_task_id
+    if task_id:
+        params["task_id"] = task_id
+    if notification_id:
+        params["notification_id"] = notification_id
+    if task_trade_date:
+        params["task_trade_date"] = task_trade_date
+    if task_status:
+        params["task_status"] = task_status
+    if review_trade_date:
+        params["review_trade_date"] = review_trade_date
+    if review_status:
+        params["review_status"] = review_status
+    if notification_related_review_task_id:
+        params["notification_related_review_task_id"] = notification_related_review_task_id
+    if notification_send_status:
+        params["notification_send_status"] = notification_send_status
+    if message:
+        params["message"] = message
+    if level:
+        params["level"] = level
+    return urlencode(params)
+
+
+def _build_runtime_url(
+    runtime_db: str,
+    *,
+    review_task_id: str = "",
+    task_id: str = "",
+    notification_id: str = "",
+    task_trade_date: str = "",
+    task_status: str = "",
+    review_trade_date: str = "",
+    review_status: str = "",
+    notification_related_review_task_id: str = "",
+    notification_send_status: str = "",
+    message: str = "",
+    level: str = "",
+) -> str:
+    return (
+        "/runtime?"
+        + _build_runtime_query(
+            runtime_db,
+            review_task_id=review_task_id,
+            task_id=task_id,
+            notification_id=notification_id,
+            task_trade_date=task_trade_date,
+            task_status=task_status,
+            review_trade_date=review_trade_date,
+            review_status=review_status,
+            notification_related_review_task_id=notification_related_review_task_id,
+            notification_send_status=notification_send_status,
+            message=message,
+            level=level,
+        )
+    )
+
+
+def _redirect_response(location: str, headers: list[tuple[str, str]] | None = None) -> tuple[str, str, list[tuple[str, str]]]:
+    response_headers = [("Location", location)]
+    if headers:
+        response_headers.extend(headers)
+    return ("303 See Other", "", response_headers)
+
+
+def _to_pretty_json(value: object) -> str:
+    if not value:
+        return "{}"
+    return json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def _metadata_summary_rows(metadata: object) -> str:
+    if not isinstance(metadata, dict) or not metadata:
+        return "-"
+    parts: list[str] = []
+    for key in sorted(metadata.keys()):
+        value = metadata[key]
+        if isinstance(value, dict):
+            value_text = ", ".join(f"{sub_key}={value[sub_key]}" for sub_key in sorted(value.keys()))
+        else:
+            value_text = str(value)
+        parts.append(f"{key}: {value_text}")
+    return "<br>".join(escape(part) for part in parts)
+
+
+def _runtime_filter_state(params: dict[str, str]) -> dict[str, str]:
+    return {
+        "task_trade_date": params.get("task_trade_date", ""),
+        "task_status": params.get("task_status", ""),
+        "review_trade_date": params.get("review_trade_date", ""),
+        "review_status": params.get("review_status", ""),
+        "notification_related_review_task_id": params.get("notification_related_review_task_id", ""),
+        "notification_send_status": params.get("notification_send_status", ""),
+    }
 
 
 def _extract_table_rows(parsed: dict[str, list[str]], headers: list[str]) -> list[dict[str, object]]:
@@ -1390,9 +2404,12 @@ def _extract_table_rows(parsed: dict[str, list[str]], headers: list[str]) -> lis
     return rows
 
 
-def _respond(start_response, status: str, content_type: str, body: str):
+def _respond(start_response, status: str, content_type: str, body: str, *, headers: list[tuple[str, str]] | None = None):
     payload = body.encode("utf-8")
-    start_response(status, [("Content-Type", content_type), ("Content-Length", str(len(payload)))])
+    response_headers = [("Content-Type", content_type), ("Content-Length", str(len(payload)))]
+    if headers:
+        response_headers.extend(headers)
+    start_response(status, response_headers)
     return [payload]
 
 

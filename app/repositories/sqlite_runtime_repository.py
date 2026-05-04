@@ -195,10 +195,19 @@ class SQLiteRuntimeRepository:
             )
             return connection.total_changes - before
 
-    def list_tasks(self, *, status: TaskStatus | None = None, action_type: TaskActionType | None = None) -> list[Task]:
+    def list_tasks(
+        self,
+        *,
+        trade_date: date | None = None,
+        status: TaskStatus | None = None,
+        action_type: TaskActionType | None = None,
+    ) -> list[Task]:
         query = "SELECT * FROM tasks"
         clauses: list[str] = []
         params: list[str] = []
+        if trade_date is not None:
+            clauses.append("trade_date = ?")
+            params.append(trade_date.isoformat())
         if status is not None:
             clauses.append("task_status = ?")
             params.append(status.value)
@@ -287,12 +296,23 @@ class SQLiteRuntimeRepository:
             )
             return connection.total_changes - before
 
-    def list_review_tasks(self, *, status: ReviewTaskStatus | None = None) -> list[ReviewTask]:
+    def list_review_tasks(
+        self,
+        *,
+        trade_date: date | None = None,
+        status: ReviewTaskStatus | None = None,
+    ) -> list[ReviewTask]:
         query = "SELECT * FROM review_tasks"
+        clauses: list[str] = []
         params: list[str] = []
+        if trade_date is not None:
+            clauses.append("trade_date = ?")
+            params.append(trade_date.isoformat())
         if status is not None:
-            query = f"{query} WHERE review_status = ?"
+            clauses.append("review_status = ?")
             params.append(status.value)
+        if clauses:
+            query = f"{query} WHERE {' AND '.join(clauses)}"
         query = f"{query} ORDER BY required_by IS NULL, required_by ASC, created_at ASC"
         with closing(self.connect()) as connection:
             rows = connection.execute(query, params).fetchall()
@@ -305,6 +325,20 @@ class SQLiteRuntimeRepository:
                 (review_task_id,),
             ).fetchone()
         return _row_to_review_task(row) if row is not None else None
+
+    def list_pending_review_tasks_due_before(self, cutoff: datetime) -> list[ReviewTask]:
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM review_tasks
+                WHERE review_status = 'pending'
+                  AND required_by IS NOT NULL
+                  AND required_by < ?
+                ORDER BY required_by ASC, created_at ASC
+                """,
+                (_datetime_to_text(cutoff),),
+            ).fetchall()
+        return [_row_to_review_task(row) for row in rows]
 
     def update_review_task(self, review_task: ReviewTask) -> None:
         row = _review_task_to_row(review_task)
@@ -365,12 +399,37 @@ class SQLiteRuntimeRepository:
             )
             return connection.total_changes - before
 
-    def list_notification_logs(self) -> list[NotificationLog]:
+    def list_notification_logs(
+        self,
+        *,
+        related_review_task_id: str | None = None,
+        send_status: str | None = None,
+    ) -> list[NotificationLog]:
+        query = "SELECT * FROM notification_logs"
+        clauses: list[str] = []
+        params: list[str] = []
+        if related_review_task_id:
+            clauses.append("related_review_task_id = ?")
+            params.append(related_review_task_id)
+        if send_status:
+            clauses.append("send_status = ?")
+            params.append(send_status)
+        if clauses:
+            query = f"{query} WHERE {' AND '.join(clauses)}"
         with closing(self.connect()) as connection:
             rows = connection.execute(
-                "SELECT * FROM notification_logs ORDER BY created_at DESC, notification_id ASC"
+                f"{query} ORDER BY created_at DESC, notification_id ASC",
+                params,
             ).fetchall()
         return [_row_to_notification_log(row) for row in rows]
+
+    def get_notification_log(self, notification_id: str) -> NotificationLog | None:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM notification_logs WHERE notification_id = ?",
+                (notification_id,),
+            ).fetchone()
+        return _row_to_notification_log(row) if row is not None else None
 
 
 def _task_to_row(task: Task) -> dict[str, Any]:

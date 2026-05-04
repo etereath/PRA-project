@@ -7,6 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from app.enums import TaskActionType, TaskStatus
+from app.exceptions import ValidationError
 from app.models import Task
 from app.repositories.workbook_repository import export_tasks
 from app.services.inventory_planning import InventoryPlanningService
@@ -83,7 +84,7 @@ class ManualAndStrategyTests(unittest.TestCase):
         self.assertIn("alice", resolved.result_message)
         self.assertEqual(resolved.decision_trace["manual_intervention"]["decision"], "approve")
 
-    def test_manual_intervention_workflow_can_round_trip_excel(self) -> None:
+    def test_manual_intervention_workflow_is_deprecated(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             source = Path(tmpdir) / "tasks.xlsx"
             output = Path(tmpdir) / "resolved_tasks.xlsx"
@@ -92,18 +93,17 @@ class ManualAndStrategyTests(unittest.TestCase):
             open_tasks = list_manual_intervention_tasks(source)
             self.assertEqual(len(open_tasks), 1)
 
-            summary = resolve_manual_intervention_task(
-                ManualInterventionInputs(
-                    tasks_path=source,
-                    output_path=output,
-                    task_id="TASK-100",
-                    decision="acknowledge",
-                    actor="operator",
-                    note="noted",
+            with self.assertRaises(ValidationError):
+                resolve_manual_intervention_task(
+                    ManualInterventionInputs(
+                        tasks_path=source,
+                        output_path=output,
+                        task_id="TASK-100",
+                        decision="acknowledge",
+                        actor="operator",
+                        note="noted",
+                    )
                 )
-            )
-            self.assertEqual(summary.updated_task.task_status, TaskStatus.SKIPPED)
-            self.assertEqual(len(summary.open_tasks), 0)
 
 
 if __name__ == "__main__":

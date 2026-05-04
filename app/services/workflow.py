@@ -6,6 +6,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from app.enums import ReviewTaskStatus, TaskActionType, TaskStatus
+from app.exceptions import ValidationError
 from app.models import (
     ColdStorageStatus,
     ExecutionLog,
@@ -38,6 +39,7 @@ from app.services.manual_intervention import ManualInterventionService
 from app.services.pricing import PricingService
 from app.services.runtime import (
     DEFAULT_RUNTIME_DB,
+    ExpireReviewTasksSummary,
     NotificationLogService,
     ReviewTaskService,
     RuntimeTaskService,
@@ -104,7 +106,9 @@ class RuntimeTaskGenerationSummary:
     tasks: list[Task]
     inserted_tasks_count: int
     inserted_review_tasks_count: int
+    inserted_notification_logs_count: int
     db_path: Path
+    notification_errors: list[str] | None = None
 
     @property
     def task_counts(self) -> dict[str, int]:
@@ -117,9 +121,18 @@ class RuntimeReviewResolutionInputs:
     review_task_id: str
     status: ReviewTaskStatus
     actor: str = "manual_operator"
+    actor_source: str = "manual_operator"
     note: str = ""
     source_task_status: TaskStatus | None = None
     resolution_payload: dict[str, object] | None = None
+
+
+@dataclass(slots=True)
+class ExpireReviewTasksInputs:
+    db_path: Path
+    apply: bool = False
+    now: datetime | None = None
+    enable_notification: bool = False
 
 
 @dataclass(slots=True)
@@ -188,7 +201,7 @@ def generate_runtime_tasks_from_sources(inputs: WorkflowInputs, *, db_path: Path
     runtime_task_service = RuntimeTaskService(repository)
     runtime_task_service.init_schema()
     inserted_tasks = runtime_task_service.create_tasks(summary.tasks, trade_date=inputs.trade_date)
-    inserted_reviews = ReviewTaskService(repository, runtime_task_service=runtime_task_service).create_from_tasks(
+    review_summary = ReviewTaskService(repository, runtime_task_service=runtime_task_service).create_from_tasks(
         summary.tasks,
         trade_date=inputs.trade_date,
     )
@@ -196,20 +209,27 @@ def generate_runtime_tasks_from_sources(inputs: WorkflowInputs, *, db_path: Path
         validation=summary.validation,
         tasks=summary.tasks,
         inserted_tasks_count=inserted_tasks,
-        inserted_review_tasks_count=inserted_reviews,
+        inserted_review_tasks_count=review_summary.inserted_review_tasks_count,
+        inserted_notification_logs_count=review_summary.inserted_notification_logs_count,
         db_path=db_path,
+        notification_errors=review_summary.notification_errors,
     )
 
 
 def list_runtime_tasks(
     db_path: Path = DEFAULT_RUNTIME_DB,
     *,
+    trade_date: date | None = None,
     status: TaskStatus | None = None,
     action_type: TaskActionType | None = None,
 ) -> list[Task]:
     repository = SQLiteRuntimeRepository(db_path)
     RuntimeTaskService(repository).init_schema()
-    return RuntimeTaskService(repository).list_tasks(status=status, action_type=action_type)
+    return RuntimeTaskService(repository).list_tasks(
+        trade_date=trade_date,
+        status=status,
+        action_type=action_type,
+    )
 
 
 def list_runtime_task_history(db_path: Path, task_id: str) -> list[TaskStatusHistory]:
@@ -218,14 +238,27 @@ def list_runtime_task_history(db_path: Path, task_id: str) -> list[TaskStatusHis
     return RuntimeTaskService(repository).list_status_history(task_id)
 
 
+def get_runtime_task(db_path: Path, task_id: str) -> Task | None:
+    repository = SQLiteRuntimeRepository(db_path)
+    RuntimeTaskService(repository).init_schema()
+    return RuntimeTaskService(repository).get_task(task_id)
+
+
 def list_runtime_review_tasks(
     db_path: Path = DEFAULT_RUNTIME_DB,
     *,
+    trade_date: date | None = None,
     status: ReviewTaskStatus | None = None,
 ) -> list[ReviewTask]:
     repository = SQLiteRuntimeRepository(db_path)
     RuntimeTaskService(repository).init_schema()
-    return ReviewTaskService(repository).list_review_tasks(status=status)
+    return ReviewTaskService(repository).list_review_tasks(trade_date=trade_date, status=status)
+
+
+def get_runtime_review_task(db_path: Path, review_task_id: str) -> ReviewTask | None:
+    repository = SQLiteRuntimeRepository(db_path)
+    RuntimeTaskService(repository).init_schema()
+    return ReviewTaskService(repository).get_review_task(review_task_id)
 
 
 def resolve_runtime_review_task(inputs: RuntimeReviewResolutionInputs) -> ReviewTask:
@@ -236,16 +269,42 @@ def resolve_runtime_review_task(inputs: RuntimeReviewResolutionInputs) -> Review
         review_task_id=inputs.review_task_id,
         status=inputs.status,
         actor=inputs.actor,
+        actor_source=inputs.actor_source,
         note=inputs.note,
         resolution_payload=inputs.resolution_payload,
         source_task_status=inputs.source_task_status,
     )
 
 
-def list_runtime_notification_logs(db_path: Path = DEFAULT_RUNTIME_DB) -> list[NotificationLog]:
+def expire_runtime_review_tasks(inputs: ExpireReviewTasksInputs) -> ExpireReviewTasksSummary:
+    repository = SQLiteRuntimeRepository(inputs.db_path)
+    runtime_task_service = RuntimeTaskService(repository)
+    runtime_task_service.init_schema()
+    return ReviewTaskService(repository, runtime_task_service=runtime_task_service).expire_pending_review_tasks(
+        now=inputs.now,
+        apply=inputs.apply,
+        enable_notification=inputs.enable_notification,
+    )
+
+
+def list_runtime_notification_logs(
+    db_path: Path = DEFAULT_RUNTIME_DB,
+    *,
+    related_review_task_id: str | None = None,
+    send_status: str | None = None,
+) -> list[NotificationLog]:
     repository = SQLiteRuntimeRepository(db_path)
     RuntimeTaskService(repository).init_schema()
-    return NotificationLogService(repository).list_logs()
+    return NotificationLogService(repository).list_logs(
+        related_review_task_id=related_review_task_id,
+        send_status=send_status,
+    )
+
+
+def get_runtime_notification_log(db_path: Path, notification_id: str) -> NotificationLog | None:
+    repository = SQLiteRuntimeRepository(db_path)
+    RuntimeTaskService(repository).init_schema()
+    return NotificationLogService(repository).get_log(notification_id)
 
 
 def validate_sources(inputs: WorkflowInputs) -> ValidationSummary:
@@ -359,21 +418,6 @@ def list_manual_intervention_tasks(tasks_path: Path) -> list[Task]:
 
 
 def resolve_manual_intervention_task(inputs: ManualInterventionInputs) -> ManualInterventionSummary:
-    tasks = load_tasks(inputs.tasks_path)
-    service = ManualInterventionService()
-    updated_tasks = service.resolve_task(
-        tasks,
-        task_id=inputs.task_id,
-        decision=inputs.decision,
-        actor=inputs.actor,
-        note=inputs.note,
-    )
-    export_tasks(inputs.output_path, updated_tasks)
-    open_tasks = service.list_open_tasks(updated_tasks)
-    updated_task = next(task for task in updated_tasks if task.task_id == inputs.task_id)
-    return ManualInterventionSummary(
-        source_tasks_path=inputs.tasks_path,
-        output_path=inputs.output_path,
-        open_tasks=open_tasks,
-        updated_task=updated_task,
+    raise ValidationError(
+        "旧 Excel 人工介入入口已弃用，不能再执行正式处理。请改用 SQLite review_tasks 或 Web /runtime 入口。"
     )

@@ -10,11 +10,12 @@ from app.services.ai import MockAISuggestionProvider
 from app.services.pricing import PricingService
 from app.services.runtime import DEFAULT_RUNTIME_DB
 from app.services.workflow import (
+    ExpireReviewTasksInputs,
     ExecutionSimulationInputs,
-    ManualInterventionInputs,
     RuntimeDatabaseInputs,
     RuntimeReviewResolutionInputs,
     WorkflowInputs,
+    expire_runtime_review_tasks,
     generate_runtime_tasks_from_sources,
     generate_tasks_from_sources,
     init_runtime_database,
@@ -23,7 +24,6 @@ from app.services.workflow import (
     list_runtime_task_history,
     list_runtime_tasks,
     preview_tasks_from_sources,
-    resolve_manual_intervention_task,
     resolve_runtime_review_task,
     simulate_execution_from_tasks,
     validate_sources,
@@ -66,10 +66,10 @@ def build_parser() -> argparse.ArgumentParser:
     execution_parser.add_argument("--updated-tasks-output", type=Path)
     execution_parser.add_argument("--executor-name", default="mock_executor")
 
-    list_manual_parser = subparsers.add_parser("list-manual-tasks", help="列出 Excel 待人工介入任务")
+    list_manual_parser = subparsers.add_parser("list-manual-tasks", help="列出旧 Excel 人工介入任务（只读兼容）")
     list_manual_parser.add_argument("--tasks", required=True, type=Path)
 
-    resolve_manual_parser = subparsers.add_parser("resolve-manual-task", help="处理 Excel 人工介入任务")
+    resolve_manual_parser = subparsers.add_parser("resolve-manual-task", help="旧 Excel 人工介入处理入口（已弃用）")
     resolve_manual_parser.add_argument("--tasks", required=True, type=Path)
     resolve_manual_parser.add_argument("--output", required=True, type=Path)
     resolve_manual_parser.add_argument("--task-id", required=True)
@@ -88,6 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     list_tasks_parser = subparsers.add_parser("list-tasks", help="列出 SQLite 运行态任务")
     list_tasks_parser.add_argument("--runtime-db", type=Path, default=DEFAULT_RUNTIME_DB)
+    list_tasks_parser.add_argument("--trade-date")
     list_tasks_parser.add_argument("--status")
     list_tasks_parser.add_argument("--action-type")
 
@@ -97,6 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     list_reviews_parser = subparsers.add_parser("list-review-tasks", help="列出 SQLite 人工复核任务")
     list_reviews_parser.add_argument("--runtime-db", type=Path, default=DEFAULT_RUNTIME_DB)
+    list_reviews_parser.add_argument("--trade-date")
     list_reviews_parser.add_argument("--status")
 
     resolve_review_parser = subparsers.add_parser("resolve-review-task", help="处理 SQLite 人工复核任务")
@@ -106,6 +108,12 @@ def build_parser() -> argparse.ArgumentParser:
     resolve_review_parser.add_argument("--actor", default="manual_operator")
     resolve_review_parser.add_argument("--note", default="")
     resolve_review_parser.add_argument("--source-task-status")
+
+    expire_reviews_parser = subparsers.add_parser("expire-review-tasks", help="处理超时的 SQLite pending 复核任务")
+    expire_reviews_parser.add_argument("--runtime-db", type=Path, default=DEFAULT_RUNTIME_DB)
+    expire_reviews_parser.add_argument("--apply", action="store_true")
+    expire_reviews_parser.add_argument("--now")
+    expire_reviews_parser.add_argument("--enable-notification", action="store_true")
 
     web_parser = subparsers.add_parser("serve-web", help="启动简单 Web 管理页")
     web_parser.add_argument("--host", default="127.0.0.1")
@@ -210,25 +218,15 @@ def main() -> int:
 
         if args.command == "list-manual-tasks":
             tasks = list_manual_intervention_tasks(args.tasks)
+            print("兼容只读入口：旧 Excel 人工介入链路已弃用，请改用 SQLite review_tasks 或 Web /runtime 入口处理。")
             print(f"待人工介入任务：共 {len(tasks)} 条")
             for task in tasks:
                 print(_format_task(task))
             return 0
 
         if args.command == "resolve-manual-task":
-            summary = resolve_manual_intervention_task(
-                ManualInterventionInputs(
-                    tasks_path=args.tasks,
-                    output_path=args.output,
-                    task_id=args.task_id,
-                    decision=args.decision,
-                    actor=args.actor,
-                    note=args.note,
-                )
-            )
-            print(f"已处理任务 {summary.updated_task.task_id} -> {summary.updated_task.task_status.value}")
-            print(f"输出到 {summary.output_path}")
-            return 0
+            print("旧 Excel 人工介入入口已弃用，不能再执行正式处理。请改用 SQLite review_tasks 或 Web /runtime 入口。")
+            return 1
 
         if args.command == "init-runtime-db":
             versions = init_runtime_database(RuntimeDatabaseInputs(db_path=args.runtime_db))
@@ -241,14 +239,20 @@ def main() -> int:
                 f"运行态任务生成完成：planned={len(summary.tasks)} "
                 f"inserted_tasks={summary.inserted_tasks_count} "
                 f"inserted_review_tasks={summary.inserted_review_tasks_count} "
+                f"inserted_notification_logs={summary.inserted_notification_logs_count} "
                 f"db={summary.db_path}"
             )
+            if summary.notification_errors:
+                print("notification_errors:")
+                for error in summary.notification_errors:
+                    print(f"- {error}")
             return 0
 
         if args.command == "list-tasks":
             status = TaskStatus(args.status) if args.status else None
             action_type = TaskActionType(args.action_type) if args.action_type else None
-            tasks = list_runtime_tasks(args.runtime_db, status=status, action_type=action_type)
+            trade_date = parse_date(args.trade_date, "trade_date") if args.trade_date else None
+            tasks = list_runtime_tasks(args.runtime_db, trade_date=trade_date, status=status, action_type=action_type)
             print(f"运行态任务：共 {len(tasks)} 条")
             for task in tasks:
                 print(_format_task(task))
@@ -264,7 +268,8 @@ def main() -> int:
 
         if args.command == "list-review-tasks":
             status = ReviewTaskStatus(args.status) if args.status else None
-            reviews = list_runtime_review_tasks(args.runtime_db, status=status)
+            trade_date = parse_date(args.trade_date, "trade_date") if args.trade_date else None
+            reviews = list_runtime_review_tasks(args.runtime_db, trade_date=trade_date, status=status)
             print(f"人工复核任务：共 {len(reviews)} 条")
             for review in reviews:
                 print(
@@ -286,6 +291,30 @@ def main() -> int:
                 )
             )
             print(f"已处理复核任务 {review.review_task_id} -> {review.review_status.value}")
+            return 0
+
+        if args.command == "expire-review-tasks":
+            summary = expire_runtime_review_tasks(
+                ExpireReviewTasksInputs(
+                    db_path=args.runtime_db,
+                    apply=bool(args.apply),
+                    now=parse_datetime(args.now, "now") if getattr(args, "now", None) else None,
+                    enable_notification=bool(args.enable_notification),
+                )
+            )
+            mode = "apply" if args.apply else "dry-run"
+            print(
+                f"review timeout scan completed: mode={mode} "
+                f"scanned_review_tasks={summary.scanned_review_tasks} "
+                f"expired_review_tasks={summary.expired_review_tasks} "
+                f"expired_source_tasks={summary.expired_source_tasks} "
+                f"skipped_source_tasks={summary.skipped_source_tasks} "
+                f"notification_logs_created={summary.notification_logs_created}"
+            )
+            if summary.errors:
+                print("errors:")
+                for error in summary.errors:
+                    print(f"- {error}")
             return 0
 
         parser.error("未知命令")

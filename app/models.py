@@ -351,6 +351,15 @@ class NotificationLog:
 
 
 @dataclass(slots=True)
+class NotificationSendResult:
+    send_status: str
+    sent_at: datetime | None
+    error_message: str = ""
+    provider_message_id: str = ""
+    raw_response_json: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
 class TaskStatusHistory:
     history_id: str
     task_id: str
