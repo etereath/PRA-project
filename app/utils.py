@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -42,8 +42,31 @@ def parse_int(value: Any, field_name: str) -> int:
         raise ValidationError(f"{field_name} must be an integer") from exc
 
 
+def parse_date(value: Any, field_name: str) -> date:
+    if value is None or value == "":
+        raise ValidationError(f"{field_name} is required")
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value).strip())
+    except ValueError as exc:
+        raise ValidationError(f"{field_name} must be YYYY-MM-DD") from exc
+
+
+def parse_datetime(value: Any, field_name: str) -> datetime:
+    if value is None or value == "":
+        raise ValidationError(f"{field_name} is required")
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value).strip())
+    except ValueError as exc:
+        raise ValidationError(f"{field_name} must be ISO datetime") from exc
+
+
 def serialize_decimal(value: Decimal | None) -> str | None:
     if value is None:
         return None
     return format(value.quantize(Decimal("0.01")), "f")
-

@@ -1,110 +1,114 @@
 # Excel 表格字段说明
 
-本文档说明当前阶段 Web 管理页和任务生成流程中使用的 3 份 Excel 主表。  
-注意：Excel 文件中的第一行字段名保持英文不变，Web 页面会显示更易阅读的中文表头。
+本文档说明当前阶段 Web 管理页、CLI 和任务生成流程使用的 Excel 表格。
+
+注意：Excel 第一行字段名必须保持英文不变；Web 页面会把字段显示为中文，但不会改变 Excel 表头结构。
 
 ## 1. 商品主表 `products.xlsx`
 
-用于维护统一商品主数据，是当前系统最核心的输入表。
-
-| Excel 字段 | 中文说明 | 是否必填 | 示例 |
+| Excel 字段 | 中文名 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `internal_sku` | 内部 SKU，系统内唯一商品编码 | 是 | `SKU-001` |
-| `product_name` | 商品名称 | 是 | `红色月季A级` |
-| `variety` | 品种 | 是 | `rose` |
-| `grade` | 等级 | 是 | `A` |
-| `stem_length` | 枝长或规格 | 是 | `60cm` |
-| `unit` | 销售单位 | 是 | `bundle` |
-| `base_cost` | 基础成本 | 是 | `10` |
-| `current_stock` | 当前库存 | 是 | `50` |
-| `sale_enabled` | 是否允许销售，支持 `true/false` | 是 | `true` |
-| `last_price` | 上次售价，可为空 | 否 | `18` |
-| `remark` | 备注 | 否 | `normal stock` |
-| `feature_season` | 预留的季节特征，供后期 AI 建模使用 | 否 | `spring` |
-| `feature_color` | 预留的颜色特征，供后期 AI 建模使用 | 否 | `red` |
-
-### 使用建议
-
-- `internal_sku` 必须唯一，不能重复。
-- `base_cost`、`current_stock`、`last_price` 应填写数值。
-- `sale_enabled=false` 时，系统会优先生成下架任务。
+| `internal_sku` | 内部 SKU | 是 | 系统内唯一商品编码。 |
+| `product_name` | 商品名称/品种 | 是 | 当前项目只关注玫瑰，可作为业务上的品种字段使用。 |
+| `grade` | 等级 | 是 | 如 `A`、`B`、`C`。 |
+| `stem_length` | 枝长/规格 | 是 | 如 `60`、`70`。 |
+| `unit` | 单位 | 是 | 如 `扎`。 |
+| `base_cost` | 基础成本 | 是 | 用于保本价、最低价和规则定价。 |
+| `current_stock` | 当前库存 | 否 | 为空时按 `0` 处理。 |
+| `sale_enabled` | 允许销售 | 是 | `false` 是最高优先级禁售信号。 |
+| `last_price` | 上次售价 | 否 | 用于限制自动降价幅度。 |
+| `recommended_price` | 推荐价格 | 否 | 兼容字段；后续优先使用 `price_forecasts.xlsx` 的推荐价。 |
+| `remark` | 备注 | 否 | 人工说明。 |
+| `feature_season` | 季节特征 | 否 | 为后续 AI/预测特征预留。 |
+| `feature_color` | 颜色特征 | 否 | 为后续 AI/预测特征预留。 |
 
 ## 2. 价格规则表 `price_rules.xlsx`
 
-用于配置商品如何从成本计算出目标价格。
-
-| Excel 字段 | 中文说明 | 是否必填 | 示例 |
+| Excel 字段 | 中文名 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `rule_id` | 规则 ID，建议唯一 | 是 | `RULE-ALL-1` |
-| `rule_name` | 规则名称 | 是 | `全局固定加价` |
-| `scope_type` | 作用范围类型 | 是 | `all` / `grade` / `variety` / `sku` / `platform` |
-| `scope_value` | 作用范围值 | 是 | `*` / `A` / `rose` |
-| `pricing_method` | 定价方式 | 是 | `fixed_markup` / `percentage_markup` |
-| `markup_value` | 加价值 | 是 | `5` / `10` |
-| `min_price` | 最低价限制，可为空 | 否 | `14` |
-| `rounding_rule` | 取整规则 | 是 | `none` / `round` / `ceil` / `floor` / `step` |
-| `rounding_step` | 取整步长，`step` 模式下建议填写 | 否 | `0.5` |
-| `active` | 是否启用，支持 `true/false` | 是 | `true` |
-| `priority` | 优先级，数字越小越先执行 | 是 | `10` |
-| `remark` | 备注 | 否 | `A级单独加价` |
-
-### 使用建议
-
-- `scope_type=all` 时，`scope_value` 建议写 `*`。
-- `pricing_method=percentage_markup` 时，`markup_value=10` 表示加价 10%。
-- 多条规则会按 `priority` 从小到大依次计算。
+| `rule_id` | 规则 ID | 是 | 价格规则唯一标识。 |
+| `rule_name` | 规则名称 | 是 | 便于人工查看。 |
+| `scope_type` | 作用范围类型 | 是 | 支持 `all`、`grade`、`product_name`、`product`、`sku`、`platform`。 |
+| `scope_value` | 作用范围值 | 是 | 如 `*`、`A`、某个 SKU。 |
+| `pricing_method` | 定价方式 | 是 | `fixed_markup` 或 `percentage_markup`。 |
+| `markup_value` | 加价值 | 否 | 固定加价金额或百分比数值。 |
+| `min_price` | 最低价 | 否 | 当前规则层最低价限制。 |
+| `rounding_rule` | 取整规则 | 是 | `none`、`round`、`ceil`、`floor`、`step`。 |
+| `rounding_step` | 取整步长 | 否 | `rounding_rule=step` 时使用。 |
+| `active` | 是否启用 | 是 | `true` / `false`。 |
+| `priority` | 优先级 | 是 | 数字越小越先执行。 |
+| `remark` | 备注 | 否 | 人工说明。 |
 
 ## 3. 上下架规则表 `listing_rules.xlsx`
 
-用于根据库存和销售开关决定是否上架或下架。
-
-| Excel 字段 | 中文说明 | 是否必填 | 示例 |
+| Excel 字段 | 中文名 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `rule_id` | 规则 ID，建议唯一 | 是 | `LIST-LOW` |
-| `rule_name` | 规则名称 | 是 | `库存小于等于0下架` |
-| `condition_type` | 条件类型 | 是 | `stock_lte` / `stock_gte` / `sale_disabled` |
-| `condition_value` | 条件值，部分条件可为空 | 否 | `0` / `10` |
-| `action` | 执行动作 | 是 | `set_online` / `set_offline` |
-| `active` | 是否启用，支持 `true/false` | 是 | `true` |
-| `priority` | 优先级，数字越小越先执行 | 是 | `1` |
-| `remark` | 备注 | 否 | `恢复库存后允许上架` |
+| `rule_id` | 规则 ID | 是 | 上下架规则唯一标识。 |
+| `rule_name` | 规则名称 | 是 | 便于人工查看。 |
+| `condition_type` | 条件类型 | 是 | `stock_lte`、`stock_gte`、`sale_disabled`、`time_gte`。 |
+| `condition_value` | 条件值 | 视条件而定 | 库存阈值或 `HH:MM` 时间。 |
+| `action` | 执行动作 | 是 | `set_online` 或 `set_offline`。 |
+| `active` | 是否启用 | 是 | `true` / `false`。 |
+| `priority` | 优先级 | 是 | 数字越小越先执行。 |
+| `remark` | 备注 | 否 | 人工说明。 |
 
-### 使用建议
+## 4. 产量预测表 `harvest_forecasts.xlsx`
 
-- `condition_type=stock_lte` 常用于缺货下架。
-- `condition_type=stock_gte` 常用于补货后恢复上架。
-- `sale_enabled=false` 会在业务逻辑中优先触发强制下架。
+| Excel 字段 | 中文名 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `forecast_id` | 预测 ID | 是 | 产量预测记录唯一标识。 |
+| `forecast_date` | 预测生成日期 | 是 | 预测生成的日期，格式 `YYYY-MM-DD`。 |
+| `target_trade_date` | 目标交易日 | 是 | 该预测服务的交易日。 |
+| `variety` | 品种 | 是 | 当前与 `products.product_name` 匹配。 |
+| `grade` | 等级 | 是 | 与商品等级匹配。 |
+| `predicted_harvest_qty` | 预测采收量 | 是 | 单位为扎。 |
+| `lower_bound_qty` | 预测数量下界 | 否 | 预测区间下界。 |
+| `upper_bound_qty` | 预测数量上界 | 否 | 预测区间上界。 |
+| `confidence` | 置信度 | 否 | 0 到 1 的数值。 |
+| `source` | 来源 | 否 | 如 `manual`、`ai_model`、`market_data`。 |
+| `generated_at` | 生成时间 | 否 | ISO 时间，如 `2026-05-03T16:00:00`。 |
+| `note` | 说明 | 否 | 人工说明。 |
 
-## 4. Web 页面与 Excel 的关系
+## 5. 价格预测表 `price_forecasts.xlsx`
 
-- Web 管理页表头显示中文，方便阅读和录入。
-- 实际保存回 Excel 时，字段名仍然保持英文，不会改动第一行结构。
-- 如果切换表格类型，页面会自动切换到对应默认文件路径。
+| Excel 字段 | 中文名 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `forecast_id` | 预测 ID | 是 | 价格预测记录唯一标识。 |
+| `forecast_date` | 预测生成日期 | 是 | 预测生成的日期，格式 `YYYY-MM-DD`。 |
+| `target_trade_date` | 目标交易日 | 是 | 该预测服务的交易日。 |
+| `variety` | 品种 | 是 | 当前与 `products.product_name` 匹配。 |
+| `grade` | 等级 | 是 | 与商品等级匹配。 |
+| `recommended_price` | 推荐价格 | 是 | 单位为元/扎，是预测基准价，不是最终锁价。 |
+| `lower_bound_price` | 预测价格下界 | 否 | 预测区间下界。 |
+| `upper_bound_price` | 预测价格上界 | 否 | 预测区间上界。 |
+| `confidence` | 置信度 | 否 | 0 到 1 的数值。 |
+| `source` | 来源 | 否 | 如 `manual`、`rule_based`、`ai_model`、`market_data`、`hybrid`。 |
+| `generated_at` | 生成时间 | 否 | ISO 时间。 |
+| `note` | 说明 | 否 | 人工说明。 |
 
-## 5. 常见错误
+## 6. 包装产能计划表 `capacity_plans.xlsx`
 
-### 表头不匹配
+| Excel 字段 | 中文名 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `trade_date` | 交易日 | 是 | 产能计划对应的交易日。 |
+| `normal_packing_capacity_qty` | 正常包装产能 | 否 | 默认 250 扎/天。 |
+| `temp_worker_capacity_qty` | 每名临时工产能 | 否 | 默认 100 扎/天。 |
+| `confirmed_temp_worker_count` | 已确认临时工人数 | 否 | 未确认时填 0 或留空。 |
+| `allocation_rule` | 产能分配规则 | 否 | 当前默认 `proportional_by_forecast`。 |
+| `note` | 说明 | 否 | 人工说明。 |
 
-如果出现：
+## 7. 冷库状态表 `cold_storage_status.xlsx`
 
-```text
-invalid headers. Expected [...]
-```
+| Excel 字段 | 中文名 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `trade_date` | 交易日 | 是 | 冷库状态对应的交易日。 |
+| `cold_storage_total_capacity_qty` | 冷库总容量 | 否 | 默认 500 扎，全场共享。 |
+| `cold_storage_current_qty` | 冷库已用容量 | 否 | 当前已占用冷库数量。 |
+| `note` | 说明 | 否 | 人工说明。 |
 
-说明当前加载的 Excel 文件与所选表格类型不一致。  
-例如：选择了 `listing_rules`，但实际路径还是 `products.xlsx`。
+## 8. 常见错误
 
-### 必填字段缺失
-
-如果出现：
-
-```text
-row N: xxx is required
-```
-
-说明第 `N` 行缺少必填字段，需要补齐后再保存。
-
-### 数值或布尔值格式错误
-
-- 数值字段请填写纯数字或小数。
-- 布尔字段建议填写 `true` 或 `false`。
+1. `invalid headers`：表头与系统预期不一致，常见原因是把错误的 Excel 文件路径填到了当前表格类型里。
+2. `row N: xxx is required`：第 `N` 行缺少必填字段。
+3. `condition_value must be HH:MM`：`condition_type=time_gte` 时，时间格式不正确。
+4. `请输入 YYYY-MM-DD 日期`：日期列需要填写 `2026-05-04` 这样的格式。

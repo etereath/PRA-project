@@ -27,7 +27,11 @@ class PricingService:
             cost=product.base_cost,
             stock=product.current_stock,
             last_price=product.last_price,
-            features=product.metadata | {"variety": product.variety, "grade": product.grade},
+            features=product.metadata
+            | {
+                "grade": product.grade,
+                "recommended_price": str(product.recommended_price) if product.recommended_price is not None else None,
+            },
         )
         ai_result = self.ai_provider.suggest(ai_input)
         final_price = rule_result.rule_price
@@ -91,7 +95,11 @@ class PricingService:
         if scope == "platform":
             return value == platform_name
         if scope == "variety":
-            return value == product.variety
+            return value == product.product_name
+        if scope == "product_name":
+            return value == product.product_name
+        if scope == "product":
+            return value == product.product_name
         if scope == "grade":
             return value == product.grade
         if scope == "sku":
@@ -119,4 +127,3 @@ class PricingService:
             quotient = (price / step).to_integral_value(rounding=ROUND_CEILING)
             return quotient * step
         return price
-

@@ -6,14 +6,8 @@ from pathlib import Path
 
 from openpyxl import Workbook
 
-from app.exceptions import ValidationError
-from app.exceptions import TableValidationError
-from app.repositories.workbook_repository import (
-    PRODUCT_HEADERS,
-    load_products,
-    load_table_records,
-    save_table_records,
-)
+from app.exceptions import TableValidationError, ValidationError
+from app.repositories.workbook_repository import PRODUCT_HEADERS, load_products, load_table_records, save_table_records
 
 
 class WorkbookRepositoryTests(unittest.TestCase):
@@ -23,7 +17,7 @@ class WorkbookRepositoryTests(unittest.TestCase):
             workbook = Workbook()
             sheet = workbook.active
             sheet.append(PRODUCT_HEADERS)
-            row = ["SKU-001", "rose", "rose", "A", "60cm", "bundle", 10, 1, True, 18, "", "spring", "red"]
+            row = ["SKU-001", "rose", "A", "60cm", "bundle", 10, 1, True, 18, 19, "", "spring", "red"]
             sheet.append(row)
             sheet.append(row)
             workbook.save(path)
@@ -38,7 +32,6 @@ class WorkbookRepositoryTests(unittest.TestCase):
                 {
                     "internal_sku": "SKU-001",
                     "product_name": "rose",
-                    "variety": "rose",
                     "grade": "A",
                     "stem_length": "60cm",
                     "unit": "bundle",
@@ -46,6 +39,7 @@ class WorkbookRepositoryTests(unittest.TestCase):
                     "current_stock": "5",
                     "sale_enabled": "true",
                     "last_price": "18",
+                    "recommended_price": "19",
                     "remark": "",
                     "feature_season": "spring",
                     "feature_color": "red",
@@ -63,7 +57,6 @@ class WorkbookRepositoryTests(unittest.TestCase):
                 {
                     "internal_sku": "SKU-001",
                     "product_name": "",
-                    "variety": "rose",
                     "grade": "A",
                     "stem_length": "60cm",
                     "unit": "bundle",
@@ -71,6 +64,7 @@ class WorkbookRepositoryTests(unittest.TestCase):
                     "current_stock": "five",
                     "sale_enabled": "maybe",
                     "last_price": "",
+                    "recommended_price": "x",
                     "remark": "",
                     "feature_season": "spring",
                     "feature_color": "red",
@@ -84,6 +78,7 @@ class WorkbookRepositoryTests(unittest.TestCase):
             self.assertIn(("base_cost", "请输入数字"), issues)
             self.assertIn(("current_stock", "请输入整数"), issues)
             self.assertIn(("sale_enabled", "请输入 true/false、1/0、yes/no"), issues)
+            self.assertIn(("recommended_price", "请输入数字"), issues)
 
 
 if __name__ == "__main__":

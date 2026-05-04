@@ -3,12 +3,17 @@ from __future__ import annotations
 import unittest
 
 from app.web import (
+    TABLE_OPTIONS,
     _resolve_table_path,
     default_dashboard_state,
     default_execution_state,
+    default_manual_state,
+    default_runtime_state,
     default_table_editor_state,
     render_dashboard_page,
     render_execution_page,
+    render_manual_intervention_page,
+    render_runtime_page,
     render_table_editor_page,
 )
 
@@ -25,6 +30,9 @@ class WebTests(unittest.TestCase):
         )
         self.assertIn("\u7ba1\u7406\u53f0", html)
         self.assertIn("\u4efb\u52a1\u751f\u6210", html)
+        self.assertIn("\u5e93\u5b58\u7b56\u7565", html)
+        self.assertIn("\u4fdd\u5b88\u7b56\u7565", html)
+        self.assertIn("\u5e73\u8861\u7b56\u7565", html)
 
     def test_render_table_editor_contains_management_ui(self) -> None:
         html = render_table_editor_page(
@@ -40,6 +48,20 @@ class WebTests(unittest.TestCase):
         self.assertIn("\u5185\u90e8 SKU", html)
         self.assertIn("\u5546\u54c1\u540d\u79f0", html)
         self.assertIn("SKU-001", html)
+
+    def test_new_predictive_tables_have_chinese_labels(self) -> None:
+        self.assertIn("harvest_forecasts", TABLE_OPTIONS)
+        html = render_table_editor_page(
+            params={"table_name": "harvest_forecasts", "table_path": "data/samples/harvest_forecasts.xlsx"},
+            headers=["forecast_id", "target_trade_date", "predicted_harvest_qty"],
+            records=[],
+            message="ok",
+            message_level="success",
+            table_issues=[],
+        )
+        self.assertIn("\u4ea7\u91cf\u9884\u6d4b\u8868", html)
+        self.assertIn("\u76ee\u6807\u4ea4\u6613\u65e5", html)
+        self.assertIn("\u9884\u6d4b\u91c7\u6536\u91cf", html)
 
     def test_render_table_editor_marks_invalid_cells(self) -> None:
         html = render_table_editor_page(
@@ -70,6 +92,29 @@ class WebTests(unittest.TestCase):
         )
         self.assertIn("\u6a21\u62df\u6267\u884c", html)
         self.assertIn("mock_executor", html)
+
+    def test_render_manual_intervention_page_contains_manual_tab(self) -> None:
+        html = render_manual_intervention_page(
+            params=default_manual_state(),
+            message="ok",
+            message_level="success",
+            tasks=[],
+        )
+        self.assertIn("\u4eba\u5de5\u4ecb\u5165", html)
+        self.assertIn("\u5f85\u4eba\u5de5\u4ecb\u5165\u4efb\u52a1", html)
+
+    def test_render_runtime_page_contains_read_only_sections(self) -> None:
+        html = render_runtime_page(
+            params=default_runtime_state(),
+            message="ok",
+            message_level="success",
+            tasks=[],
+            reviews=[],
+            notifications=[],
+        )
+        self.assertIn("SQLite", html)
+        self.assertIn("\u8fd0\u884c\u6001\u4efb\u52a1", html)
+        self.assertIn("\u901a\u77e5\u8bb0\u5f55", html)
 
 
 if __name__ == "__main__":

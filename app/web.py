@@ -7,6 +7,7 @@ from urllib.parse import parse_qs
 from wsgiref.simple_server import make_server
 
 from app.exceptions import TableValidationError, ValidationError
+from app.field_labels import FIELD_LABELS, TABLE_LABELS
 from app.repositories.workbook_repository import (
     get_table_headers,
     load_table_records,
@@ -15,14 +16,21 @@ from app.repositories.workbook_repository import (
 from app.services.workflow import (
     ExecutionSimulationInputs,
     ExecutionSimulationSummary,
+    ManualInterventionInputs,
     TaskGenerationSummary,
     ValidationSummary,
     WorkflowInputs,
     generate_tasks_from_sources,
+    list_runtime_notification_logs,
+    list_runtime_review_tasks,
+    list_runtime_tasks,
+    list_manual_intervention_tasks,
     preview_tasks_from_sources,
+    resolve_manual_intervention_task,
     simulate_execution_from_tasks,
     validate_sources,
 )
+from app.services.runtime import DEFAULT_RUNTIME_DB
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,42 +40,23 @@ DEFAULT_LISTING_RULES = ROOT / "data" / "samples" / "listing_rules.xlsx"
 DEFAULT_OUTPUT = ROOT / "data" / "samples" / "web_generated_tasks.xlsx"
 DEFAULT_EXECUTION_LOGS = ROOT / "data" / "samples" / "web_execution_logs.xlsx"
 DEFAULT_EXECUTED_TASKS = ROOT / "data" / "samples" / "web_executed_tasks.xlsx"
+DEFAULT_HARVEST_FORECASTS = ROOT / "data" / "samples" / "harvest_forecasts.xlsx"
+DEFAULT_PRICE_FORECASTS = ROOT / "data" / "samples" / "price_forecasts.xlsx"
+DEFAULT_CAPACITY_PLANS = ROOT / "data" / "samples" / "capacity_plans.xlsx"
+DEFAULT_COLD_STORAGE_STATUS = ROOT / "data" / "samples" / "cold_storage_status.xlsx"
+DEFAULT_MANUAL_TASKS = ROOT / "data" / "samples" / "web_generated_tasks.xlsx"
 
 TABLE_OPTIONS = {
-    "products": {"label": "\u5546\u54c1\u4e3b\u8868", "path": DEFAULT_PRODUCTS},
-    "price_rules": {"label": "\u4ef7\u683c\u89c4\u5219\u8868", "path": DEFAULT_PRICE_RULES},
-    "listing_rules": {"label": "\u4e0a\u4e0b\u67b6\u89c4\u5219\u8868", "path": DEFAULT_LISTING_RULES},
+    "products": {"label": TABLE_LABELS["products"], "path": DEFAULT_PRODUCTS},
+    "price_rules": {"label": TABLE_LABELS["price_rules"], "path": DEFAULT_PRICE_RULES},
+    "listing_rules": {"label": TABLE_LABELS["listing_rules"], "path": DEFAULT_LISTING_RULES},
+    "harvest_forecasts": {"label": TABLE_LABELS["harvest_forecasts"], "path": DEFAULT_HARVEST_FORECASTS},
+    "price_forecasts": {"label": TABLE_LABELS["price_forecasts"], "path": DEFAULT_PRICE_FORECASTS},
+    "capacity_plans": {"label": TABLE_LABELS["capacity_plans"], "path": DEFAULT_CAPACITY_PLANS},
+    "cold_storage_status": {"label": TABLE_LABELS["cold_storage_status"], "path": DEFAULT_COLD_STORAGE_STATUS},
 }
 
-TABLE_HEADER_LABELS = {
-    "internal_sku": "\u5185\u90e8 SKU",
-    "product_name": "\u5546\u54c1\u540d\u79f0",
-    "variety": "\u54c1\u79cd",
-    "grade": "\u7b49\u7ea7",
-    "stem_length": "\u679d\u957f/\u89c4\u683c",
-    "unit": "\u5355\u4f4d",
-    "base_cost": "\u57fa\u7840\u6210\u672c",
-    "current_stock": "\u5f53\u524d\u5e93\u5b58",
-    "sale_enabled": "\u5141\u8bb8\u9500\u552e",
-    "last_price": "\u4e0a\u6b21\u552e\u4ef7",
-    "remark": "\u5907\u6ce8",
-    "feature_season": "\u5b63\u8282\u7279\u5f81",
-    "feature_color": "\u989c\u8272\u7279\u5f81",
-    "rule_id": "\u89c4\u5219 ID",
-    "rule_name": "\u89c4\u5219\u540d\u79f0",
-    "scope_type": "\u4f5c\u7528\u8303\u56f4\u7c7b\u578b",
-    "scope_value": "\u4f5c\u7528\u8303\u56f4\u503c",
-    "pricing_method": "\u5b9a\u4ef7\u65b9\u5f0f",
-    "markup_value": "\u52a0\u4ef7\u503c",
-    "min_price": "\u6700\u4f4e\u4ef7",
-    "rounding_rule": "\u53d6\u6574\u89c4\u5219",
-    "rounding_step": "\u53d6\u6574\u6b65\u957f",
-    "active": "\u662f\u5426\u542f\u7528",
-    "priority": "\u4f18\u5148\u7ea7",
-    "condition_type": "\u6761\u4ef6\u7c7b\u578b",
-    "condition_value": "\u6761\u4ef6\u503c",
-    "action": "\u6267\u884c\u52a8\u4f5c",
-}
+TABLE_HEADER_LABELS = FIELD_LABELS
 
 UI_TEXT = {
     "site_title": "PRA \u7ba1\u7406\u53f0",
@@ -76,6 +65,8 @@ UI_TEXT = {
     "dashboard_tab": "\u4efb\u52a1\u9762\u677f",
     "tables_tab": "Excel \u8868\u683c\u7ba1\u7406",
     "execution_tab": "\u6267\u884c\u56de\u5199",
+    "manual_tab": "\u4eba\u5de5\u4ecb\u5165",
+    "runtime_tab": "SQLite \u8fd0\u884c\u6001",
     "task_panel_title": "\u4efb\u52a1\u751f\u6210",
     "execution_panel_title": "\u6a21\u62df\u6267\u884c\u4e0e\u56de\u5199",
     "resources_title": "\u5185\u7f6e\u8d44\u6e90",
@@ -84,6 +75,9 @@ UI_TEXT = {
     "listing_rules_path": "\u4e0a\u4e0b\u67b6\u89c4\u5219\u8def\u5f84",
     "output_path": "\u4efb\u52a1\u8f93\u51fa\u8def\u5f84",
     "platform_name": "\u5e73\u53f0\u540d\u79f0",
+    "inventory_strategy": "\u5e93\u5b58\u7b56\u7565",
+    "inventory_strategy_conservative": "\u4fdd\u5b88\u7b56\u7565\uff08\u4f18\u5148\u63a7\u5236\u8d85\u552e\u98ce\u9669\uff09",
+    "inventory_strategy_balanced": "\u5e73\u8861\u7b56\u7565\uff08\u5728\u98ce\u9669\u53ef\u63a7\u524d\u63d0\u4e0b\u63d0\u9ad8\u53ef\u552e\u91cf\uff09",
     "use_mock_ai": "\u4f7f\u7528 Mock AI \u5b9a\u4ef7\u5efa\u8bae",
     "validate_button": "\u5148\u6821\u9a8c\u6570\u636e",
     "preview_button": "\u9884\u89c8\u4efb\u52a1",
@@ -117,6 +111,22 @@ UI_TEXT = {
     "previewed": "\u5df2\u9884\u89c8 {count} \u6761\u4efb\u52a1\uff0c\u5c1a\u672a\u5199\u5165 Excel \u3002",
     "execution_done": "\u5df2\u6a21\u62df\u6267\u884c {count} \u6761\u4efb\u52a1\uff0c\u65e5\u5fd7\u5df2\u5199\u51fa\u3002",
     "table_validation_summary": "\u4fdd\u5b58\u672a\u6210\u529f\uff0c\u8bf7\u5148\u4fee\u6b63\u4ee5\u4e0b\u5355\u5143\u683c\u95ee\u9898\uff1a",
+    "manual_panel_title": "\u4eba\u5de5\u4ecb\u5165\u5de5\u4f5c\u53f0",
+    "manual_tasks_path": "\u4efb\u52a1\u6587\u4ef6\u8def\u5f84",
+    "manual_output_path": "\u56de\u5199\u8f93\u51fa\u8def\u5f84",
+    "manual_actor": "\u5904\u7406\u4eba",
+    "manual_note": "\u5907\u6ce8",
+    "manual_load_button": "\u52a0\u8f7d\u5f85\u5904\u7406\u4efb\u52a1",
+    "manual_empty": "\u5f53\u524d\u6ca1\u6709\u5f85\u4eba\u5de5\u4ecb\u5165\u4efb\u52a1\u3002",
+    "manual_resolved": "\u5df2\u5904\u7406\u4efb\u52a1 {task_id} -> {status}",
+    "manual_decision": "\u5904\u7406\u7ed3\u679c",
+    "manual_submit": "\u63d0\u4ea4",
+    "runtime_panel_title": "SQLite \u8fd0\u884c\u6001\u67e5\u770b",
+    "runtime_db_path": "\u8fd0\u884c\u6001\u6570\u636e\u5e93\u8def\u5f84",
+    "runtime_load_button": "\u52a0\u8f7d\u8fd0\u884c\u6001\u6570\u636e",
+    "runtime_tasks": "\u8fd0\u884c\u6001\u4efb\u52a1",
+    "runtime_reviews": "\u4eba\u5de5\u590d\u6838\u4efb\u52a1",
+    "runtime_notifications": "\u901a\u77e5\u8bb0\u5f55",
 }
 
 
@@ -138,6 +148,10 @@ def application(environ, start_response):
         return _respond(start_response, "200 OK", "text/html; charset=utf-8", _handle_tables(method, environ))
     if path == "/execution":
         return _respond(start_response, "200 OK", "text/html; charset=utf-8", _handle_execution(method, environ))
+    if path == "/manual-intervention":
+        return _respond(start_response, "200 OK", "text/html; charset=utf-8", _handle_manual_intervention(method, environ))
+    if path == "/runtime":
+        return _respond(start_response, "200 OK", "text/html; charset=utf-8", _handle_runtime(method, environ))
     return _respond(start_response, "404 Not Found", "text/plain; charset=utf-8", "Not Found")
 
 
@@ -157,6 +171,7 @@ def _handle_dashboard(method: str, environ) -> str:
             "listing_rules": _first(parsed, "listing_rules", params["listing_rules"]),
             "output": _first(parsed, "output", params["output"]),
             "platform": _first(parsed, "platform", params["platform"]),
+            "inventory_strategy": _first(parsed, "inventory_strategy", params["inventory_strategy"]),
             "use_mock_ai": "use_mock_ai" in parsed,
         }
         action = _first(parsed, "action", "validate")
@@ -168,6 +183,7 @@ def _handle_dashboard(method: str, environ) -> str:
                 listing_rules_path=Path(str(params["listing_rules"])),
                 output_path=Path(str(params["output"])),
                 platform_name=str(params["platform"]),
+                inventory_strategy=str(params["inventory_strategy"]),
                 use_mock_ai=bool(params["use_mock_ai"]),
             )
             if action == "validate":
@@ -300,6 +316,86 @@ def _handle_execution(method: str, environ) -> str:
     )
 
 
+def _handle_manual_intervention(method: str, environ) -> str:
+    params = default_manual_state()
+    message = ""
+    level = "info"
+    tasks = []
+
+    if method == "POST":
+        parsed = _parse_body(environ)
+        params = {
+            "tasks_path": _first(parsed, "tasks_path", params["tasks_path"]),
+            "output_path": _first(parsed, "output_path", params["output_path"]),
+            "actor": _first(parsed, "actor", params["actor"]),
+            "note": _first(parsed, "note", ""),
+        }
+        action = _first(parsed, "action", "load")
+        try:
+            if action == "resolve":
+                summary = resolve_manual_intervention_task(
+                    ManualInterventionInputs(
+                        tasks_path=Path(str(params["tasks_path"])),
+                        output_path=Path(str(params["output_path"])),
+                        task_id=_first(parsed, "task_id", ""),
+                        decision=_first(parsed, "decision", "acknowledge"),
+                        actor=str(params["actor"]),
+                        note=str(params["note"]),
+                    )
+                )
+                message = UI_TEXT["manual_resolved"].format(
+                    task_id=summary.updated_task.task_id,
+                    status=summary.updated_task.task_status.value,
+                )
+                level = "success"
+                tasks = summary.open_tasks
+            else:
+                tasks = list_manual_intervention_tasks(Path(str(params["tasks_path"])))
+                if not tasks:
+                    message = UI_TEXT["manual_empty"]
+                    level = "info"
+        except (ValidationError, FileNotFoundError) as exc:
+            message = str(exc)
+            level = "error"
+
+    return render_manual_intervention_page(
+        params=params,
+        message=message,
+        message_level=level,
+        tasks=tasks,
+    )
+
+
+def _handle_runtime(method: str, environ) -> str:
+    params = default_runtime_state()
+    message = ""
+    level = "info"
+    tasks = []
+    reviews = []
+    notifications = []
+
+    if method == "POST":
+        parsed = _parse_body(environ)
+        params = {"runtime_db": _first(parsed, "runtime_db", params["runtime_db"])}
+    try:
+        db_path = Path(str(params["runtime_db"]))
+        tasks = list_runtime_tasks(db_path)
+        reviews = list_runtime_review_tasks(db_path)
+        notifications = list_runtime_notification_logs(db_path)
+    except (ValidationError, FileNotFoundError) as exc:
+        message = str(exc)
+        level = "error"
+
+    return render_runtime_page(
+        params=params,
+        message=message,
+        message_level=level,
+        tasks=tasks,
+        reviews=reviews,
+        notifications=notifications,
+    )
+
+
 def _resolve_table_path(table_name: str, previous_table_name: str, posted_path: str) -> str:
     previous_default = str(TABLE_OPTIONS.get(previous_table_name, TABLE_OPTIONS["products"])["path"])
     current_default = str(TABLE_OPTIONS[table_name]["path"])
@@ -319,6 +415,7 @@ def default_dashboard_state() -> dict[str, str | bool]:
         "listing_rules": str(DEFAULT_LISTING_RULES),
         "output": str(DEFAULT_OUTPUT),
         "platform": "default_platform",
+        "inventory_strategy": "conservative_v1",
         "use_mock_ai": True,
     }
 
@@ -337,6 +434,19 @@ def default_execution_state() -> dict[str, str]:
         "updated_tasks_output": str(DEFAULT_EXECUTED_TASKS),
         "executor_name": "mock_executor",
     }
+
+
+def default_manual_state() -> dict[str, str]:
+    return {
+        "tasks_path": str(DEFAULT_MANUAL_TASKS),
+        "output_path": str(DEFAULT_MANUAL_TASKS),
+        "actor": "manual_operator",
+        "note": "",
+    }
+
+
+def default_runtime_state() -> dict[str, str]:
+    return {"runtime_db": str(DEFAULT_RUNTIME_DB)}
 
 
 def render_dashboard_page(
@@ -394,6 +504,7 @@ def render_dashboard_page(
               <input type="hidden" name="listing_rules" value="{escape(str(params["listing_rules"]))}">
               <input type="hidden" name="output" value="{escape(str(params["output"]))}">
               <input type="hidden" name="platform" value="{escape(str(params["platform"]))}">
+              <input type="hidden" name="inventory_strategy" value="{escape(str(params["inventory_strategy"]))}">
               {mock_ai_hidden}
               <button class="primary" type="submit" name="action" value="confirm_generate">{escape(UI_TEXT["confirm_button"])}</button>
             </form>
@@ -424,6 +535,17 @@ def render_dashboard_page(
         """
 
     checked = "checked" if params["use_mock_ai"] else ""
+    inventory_strategy_options = [
+        ("conservative_v1", UI_TEXT["inventory_strategy_conservative"]),
+        ("balanced_v1", UI_TEXT["inventory_strategy_balanced"]),
+    ]
+    inventory_strategy_html = "".join(
+        (
+            f"<option value='{escape(value)}' {'selected' if params['inventory_strategy'] == value else ''}>"
+            f"{escape(label)}</option>"
+        )
+        for value, label in inventory_strategy_options
+    )
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -460,6 +582,10 @@ def render_dashboard_page(
           <div class="field">
             <label for="platform">{escape(UI_TEXT["platform_name"])}</label>
             <input id="platform" name="platform" type="text" value="{escape(str(params["platform"]))}">
+          </div>
+          <div class="field">
+            <label for="inventory_strategy">{escape(UI_TEXT["inventory_strategy"])}</label>
+            <select id="inventory_strategy" name="inventory_strategy">{inventory_strategy_html}</select>
           </div>
           <label class="checkbox">
             <input name="use_mock_ai" type="checkbox" {checked}>
@@ -695,15 +821,212 @@ def render_execution_page(
 """
 
 
+def render_manual_intervention_page(
+    *,
+    params: dict[str, str],
+    message: str,
+    message_level: str,
+    tasks,
+) -> str:
+    rows_html = ""
+    if tasks:
+        rows = []
+        for task in tasks:
+            decision_options = (
+                "<option value='acknowledge'>acknowledge</option>"
+                "<option value='approve'>approve</option>"
+                "<option value='reject'>reject</option>"
+            )
+            rows.append(
+                "<tr>"
+                f"<td>{escape(task.task_id)}</td>"
+                f"<td>{escape(task.internal_sku)}</td>"
+                f"<td>{escape(task.action_type.value)}</td>"
+                f"<td>{escape(task.task_status.value)}</td>"
+                f"<td>{escape(task.result_message or '-')}</td>"
+                f"<td>{escape(str(task.required_by) if task.required_by is not None else '-')}</td>"
+                "<td>"
+                "<form method='post' class='grid'>"
+                f"<input type='hidden' name='tasks_path' value='{escape(params['tasks_path'])}'>"
+                f"<input type='hidden' name='output_path' value='{escape(params['output_path'])}'>"
+                f"<input type='hidden' name='task_id' value='{escape(task.task_id)}'>"
+                f"<input type='hidden' name='actor' value='{escape(params['actor'])}'>"
+                "<select name='decision'>"
+                f"{decision_options}"
+                "</select>"
+                f"<input name='note' type='text' value='{escape(params['note'])}' placeholder='note'>"
+                f"<button class='primary' type='submit' name='action' value='resolve'>{escape(UI_TEXT['manual_submit'])}</button>"
+                "</form>"
+                "</td>"
+                "</tr>"
+            )
+        rows_html = "".join(rows)
+    else:
+        rows_html = f"<tr><td colspan='7'>{escape(UI_TEXT['manual_empty'])}</td></tr>"
+
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(UI_TEXT["manual_tab"])}</title>
+  {common_styles()}
+</head>
+<body>
+  <main class="shell wide-shell">
+    {_hero(UI_TEXT["manual_panel_title"], UI_TEXT["dashboard_lede"])}
+    {navigation("/manual-intervention")}
+    {_banner(message, message_level)}
+    <section class="panel">
+      <h2>{escape(UI_TEXT["manual_panel_title"])}</h2>
+      <form method="post" class="grid two-col">
+        <div class="field">
+          <label for="tasks_path">{escape(UI_TEXT["manual_tasks_path"])}</label>
+          <input id="tasks_path" name="tasks_path" type="text" value="{escape(params["tasks_path"])}">
+        </div>
+        <div class="field">
+          <label for="output_path">{escape(UI_TEXT["manual_output_path"])}</label>
+          <input id="output_path" name="output_path" type="text" value="{escape(params["output_path"])}">
+        </div>
+        <div class="field">
+          <label for="actor">{escape(UI_TEXT["manual_actor"])}</label>
+          <input id="actor" name="actor" type="text" value="{escape(params["actor"])}">
+        </div>
+        <div class="field">
+          <label for="note">{escape(UI_TEXT["manual_note"])}</label>
+          <input id="note" name="note" type="text" value="{escape(params["note"])}">
+        </div>
+        <div class="actions">
+          <button class="secondary" type="submit" name="action" value="load">{escape(UI_TEXT["manual_load_button"])}</button>
+        </div>
+      </form>
+    </section>
+    <section class="panel">
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>task_id</th>
+              <th>SKU</th>
+              <th>action</th>
+              <th>status</th>
+              <th>message</th>
+              <th>required_by</th>
+              <th>handle</th>
+            </tr>
+          </thead>
+          <tbody>{rows_html}</tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+
+def render_runtime_page(
+    *,
+    params: dict[str, str],
+    message: str,
+    message_level: str,
+    tasks,
+    reviews,
+    notifications,
+) -> str:
+    task_rows = "".join(
+        "<tr>"
+        f"<td>{escape(task.task_id)}</td>"
+        f"<td>{escape(task.trade_date.isoformat() if task.trade_date else '-')}</td>"
+        f"<td>{escape(task.scope_type)}:{escape(task.scope_key)}</td>"
+        f"<td>{escape(task.action_type.value)}</td>"
+        f"<td>{escape(task.task_status.value)}</td>"
+        f"<td>{escape(task.internal_sku or '-')}</td>"
+        f"<td>{escape(task.platform_name or '-')}</td>"
+        "</tr>"
+        for task in tasks[:100]
+    ) or "<tr><td colspan='7'>-</td></tr>"
+    review_rows = "".join(
+        "<tr>"
+        f"<td>{escape(review.review_task_id)}</td>"
+        f"<td>{escape(review.trade_date.isoformat() if review.trade_date else '-')}</td>"
+        f"<td>{escape(review.scope_type)}:{escape(review.scope_key)}</td>"
+        f"<td>{escape(review.review_type)}</td>"
+        f"<td>{escape(review.review_status.value)}</td>"
+        f"<td>{escape(review.source_task_id or '-')}</td>"
+        f"<td>{escape(review.reason)}</td>"
+        "</tr>"
+        for review in reviews[:100]
+    ) or "<tr><td colspan='7'>-</td></tr>"
+    notification_rows = "".join(
+        "<tr>"
+        f"<td>{escape(log.notification_id)}</td>"
+        f"<td>{escape(log.related_task_id or '-')}</td>"
+        f"<td>{escape(log.related_review_task_id or '-')}</td>"
+        f"<td>{escape(log.recipient_type)}:{escape(log.recipient)}</td>"
+        f"<td>{escape(log.channel)}</td>"
+        f"<td>{escape(log.send_status)}</td>"
+        f"<td>{escape(log.message)}</td>"
+        "</tr>"
+        for log in notifications[:100]
+    ) or "<tr><td colspan='7'>-</td></tr>"
+
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(UI_TEXT["runtime_tab"])}</title>
+  {common_styles()}
+</head>
+<body>
+  <main class="shell wide-shell">
+    {_hero(UI_TEXT["runtime_panel_title"], UI_TEXT["dashboard_lede"])}
+    {navigation("/runtime")}
+    {_banner(message, message_level)}
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_panel_title"])}</h2>
+      <form method="post" class="grid two-col">
+        <div class="field">
+          <label for="runtime_db">{escape(UI_TEXT["runtime_db_path"])}</label>
+          <input id="runtime_db" name="runtime_db" type="text" value="{escape(params["runtime_db"])}">
+        </div>
+        <div class="actions">
+          <button class="secondary" type="submit">{escape(UI_TEXT["runtime_load_button"])}</button>
+        </div>
+      </form>
+    </section>
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_tasks"])}</h2>
+      <div class="table-wrap"><table><thead><tr><th>task_id</th><th>trade_date</th><th>scope</th><th>action</th><th>status</th><th>SKU</th><th>platform</th></tr></thead><tbody>{task_rows}</tbody></table></div>
+    </section>
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_reviews"])}</h2>
+      <div class="table-wrap"><table><thead><tr><th>review_task_id</th><th>trade_date</th><th>scope</th><th>type</th><th>status</th><th>source_task_id</th><th>reason</th></tr></thead><tbody>{review_rows}</tbody></table></div>
+    </section>
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_notifications"])}</h2>
+      <div class="table-wrap"><table><thead><tr><th>notification_id</th><th>related_task_id</th><th>related_review_task_id</th><th>recipient</th><th>channel</th><th>send_status</th><th>message</th></tr></thead><tbody>{notification_rows}</tbody></table></div>
+    </section>
+  </main>
+</body>
+</html>
+"""
+
+
 def navigation(active_path: str) -> str:
     dashboard_class = "nav-link active" if active_path == "/" else "nav-link"
     tables_class = "nav-link active" if active_path == "/tables" else "nav-link"
     execution_class = "nav-link active" if active_path == "/execution" else "nav-link"
+    manual_class = "nav-link active" if active_path == "/manual-intervention" else "nav-link"
+    runtime_class = "nav-link active" if active_path == "/runtime" else "nav-link"
     return (
         "<nav class='nav-strip'>"
         f"<a class='{dashboard_class}' href='/'>{escape(UI_TEXT['dashboard_tab'])}</a>"
         f"<a class='{tables_class}' href='/tables'>{escape(UI_TEXT['tables_tab'])}</a>"
         f"<a class='{execution_class}' href='/execution'>{escape(UI_TEXT['execution_tab'])}</a>"
+        f"<a class='{manual_class}' href='/manual-intervention'>{escape(UI_TEXT['manual_tab'])}</a>"
+        f"<a class='{runtime_class}' href='/runtime'>{escape(UI_TEXT['runtime_tab'])}</a>"
         "</nav>"
     )
 

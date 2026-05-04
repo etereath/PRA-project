@@ -14,7 +14,6 @@ class PricingServiceTests(unittest.TestCase):
         self.product = Product(
             internal_sku="SKU-001",
             product_name="rose",
-            variety="rose",
             grade="A",
             stem_length="60cm",
             unit="bundle",
@@ -70,4 +69,3 @@ class PricingServiceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

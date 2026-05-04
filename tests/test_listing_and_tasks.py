@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime
 from decimal import Decimal
 
 from app.enums import ConditionType, ListingAction, PricingMethod, RoundingRule, TaskActionType
@@ -17,7 +18,6 @@ class ListingAndTaskTests(unittest.TestCase):
             Product(
                 internal_sku="SKU-ONLINE",
                 product_name="online",
-                variety="rose",
                 grade="A",
                 stem_length="60cm",
                 unit="bundle",
@@ -28,7 +28,6 @@ class ListingAndTaskTests(unittest.TestCase):
             Product(
                 internal_sku="SKU-OFFLINE",
                 product_name="offline",
-                variety="rose",
                 grade="B",
                 stem_length="50cm",
                 unit="bundle",
@@ -39,7 +38,6 @@ class ListingAndTaskTests(unittest.TestCase):
             Product(
                 internal_sku="SKU-DISABLED",
                 product_name="disabled",
-                variety="rose",
                 grade="A",
                 stem_length="70cm",
                 unit="bundle",
@@ -101,6 +99,21 @@ class ListingAndTaskTests(unittest.TestCase):
         self.assertIn(("SKU-OFFLINE", TaskActionType.SET_OFFLINE), actions)
         self.assertIn(("SKU-DISABLED", TaskActionType.SET_OFFLINE), actions)
         self.assertNotIn(("SKU-DISABLED", TaskActionType.UPDATE_PRICE), actions)
+
+    def test_listing_time_rule_can_force_online_after_threshold(self) -> None:
+        service = ListingService(now_provider=lambda: datetime(2026, 4, 28, 22, 30, 0))
+        time_rule = ListingRule(
+            rule_id="L3",
+            rule_name="time-online",
+            condition_type=ConditionType.TIME_GTE,
+            condition_value="22:00",
+            action=ListingAction.SET_ONLINE,
+            active=True,
+            priority=0,
+        )
+        action, trace = service.evaluate(self.products[0], [time_rule, *self.listing_rules])
+        self.assertEqual(action, ListingAction.SET_ONLINE.value)
+        self.assertTrue(any("L3" in item for item in trace))
 
 
 if __name__ == "__main__":
