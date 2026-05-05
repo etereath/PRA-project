@@ -124,13 +124,16 @@
 - 飞书 sender 通过环境变量配置：
   - `FEISHU_WEBHOOK_URL`
   - `FEISHU_WEBHOOK_SECRET`（可选，启用签名）
+  - `FEISHU_MESSAGE_TYPE`（可选，`post / text`，默认 `post`）
   - `DEFAULT_NOTIFICATION_CHANNEL=feishu`
   - `MOBILE_REVIEW_BASE_URL`
   - `REVIEW_TOKEN_SECRET`
 - 飞书通知创建时会生成 `mobile_review_url`，完整 raw token URL 只进入实际飞书发送 payload。
 - `notification_logs.message` 只保存简短摘要和 `mobile_review_url_created=true/false`，不会持久化完整 `token=` 链接。
 - 如果 `REVIEW_TOKEN_SECRET` 缺失导致 mobile review URL 创建失败，本次飞书通知会记录 `send_status=failed`，不会发送缺少处理链接的半成品通知。
-- MVP 使用飞书 `text` 消息；后续可以升级为 `post` 富文本消息，以便更好展示字段和手机复核链接。
+- 飞书消息默认使用 `post` 富文本消息，链接文本为“👉 点击处理复核”；可通过 `FEISHU_MESSAGE_TYPE=text` 回退到纯文本消息。
+- `post` 消息展示复核类型、交易日、对象、截止时间、原因和处理链接；`reason` 最多展示 200 字，完整上下文仍通过 mobile review 页面查看。
+- `required_by` 在飞书消息中格式化为分钟级时间，例如 `2026-05-06 09:01`，避免展示带小数秒的 ISO 时间。
 - 当前不实现限流队列或复杂重试；发送失败记录 `failed`，消息体保持简短，避免超过 webhook 请求体限制。
 
 ---
@@ -153,6 +156,9 @@
 - Web 已处理后 mobile 再提交失败
 - 审计链路 `actor_source=mobile_review_token`
 - 飞书 sender 选择、缺少 webhook URL 失败、固定 timestamp/secret 签名
+- `FEISHU_MESSAGE_TYPE=post` 默认发送富文本 payload，且包含“👉 点击处理复核”链接
+- `FEISHU_MESSAGE_TYPE=text` 保留纯文本消息回退
+- 非法 `FEISHU_MESSAGE_TYPE` 返回 failed，且不发出 HTTP 请求
 - 飞书发送成功、飞书业务失败、HTTP 异常失败
 - 飞书主流程外发 payload 包含完整 `mobile_review_url`
 - `notification_logs.message` 不持久化完整 raw token URL
@@ -160,12 +166,27 @@
 
 ---
 
-## 4. 当前尚未完成（后续事项）
+## 4. 端到端验收结果（已通过）
+
+当前飞书通知 + Mobile Review 端到端验收已通过，实际验证结果如下：
+
+- pending `review_task` 生成后，飞书自定义机器人可以发送真实通知。
+- 飞书消息中包含 `mobile_review_url`。
+- 手机点击 `mobile_review_url` 可以打开 mobile review 复核页。
+- 手机端可以提交复核结果。
+- `review_task`、`review_token`、`task_status_history` 写回行为符合当前规则。
+- 同一 token 成功提交后再次访问/重复提交会被拒绝，并显示统一失效提示。
+
+本次验收确认：飞书真实通知、mobile review token、手机复核页、运行态复核写回、防重复提交主链路已经跑通。
+
+---
+
+## 5. 当前尚未完成（后续事项）
 
 以下仍为后续增强，不属于当前已落地范围：
 
 - 完整手机端 UI/UX（当前为 MVP 表单页）
-- 飞书 `post` 富文本消息、交互卡片、按钮审批、回调接口、OAuth、应用机器人
+- 飞书交互卡片、按钮审批、回调接口、OAuth、应用机器人
 - 企业微信 / Bark 等其他真实通知渠道
 - 通知限流队列、复杂重试队列、长期外部响应审计 schema
 - 短链/一次性 code 机制（降低 query token 暴露风险）
@@ -175,19 +196,19 @@
 
 ---
 
-## 5. 下一步建议（按当前进度）
+## 6. 下一步建议（按当前进度）
 
 建议下一阶段从“可用 MVP”推进到“可运营增强”，顺序如下：
 
-1. 完善 mobile 页面体验（更清晰的摘要、错误页、状态页）。
-2. 细化 `review_type` 动作矩阵，减少误操作空间。
-3. 将飞书通知从 `text` 消息升级为 `post` 富文本消息，改善手机端链接展示。
+1. Mobile 页面体验优化：更清晰的摘要、错误页、状态页和适合手机操作的表单。
+2. 飞书 `post` 消息继续优化：按 `review_type` 调整字段顺序、增加风险等级摘要，必要时再评估交互卡片。
+3. 细化 `review_type -> allowed_actions` 动作矩阵，减少误操作空间。
 4. 引入短链/一次性 code 或 POST 交换流程，降低 token 泄露面。
 5. 结合运营策略，增加 token 轮转、批量撤销、通知限流和重试治理策略。
 
 ---
 
-## 6. 当前阶段暂不实现事项
+## 7. 当前阶段暂不实现事项
 
 - 不接真实平台 / RPA
 - 不引入 AI Agent 自动复核

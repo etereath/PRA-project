@@ -1,0 +1,12 @@
+.env
+.env.*
+!.env.example
+
+scripts/local_env.ps1
+
+data/runtime/
+*.sqlite3
+*.db
+
+__pycache__/
+*.pyc

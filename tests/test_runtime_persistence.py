@@ -236,6 +236,7 @@ class RuntimePersistenceTests(unittest.TestCase):
                 "FEISHU_WEBHOOK_URL": "https://open.feishu.test/webhook",
                 "FEISHU_WEBHOOK_SECRET": "sign-secret",
                 "FEISHU_WEBHOOK_TIMEOUT_SECONDS": "7",
+                "FEISHU_MESSAGE_TYPE": "text",
             },
             clear=False,
         ), patch("app.services.runtime.time.time", return_value=1234567890), patch(
@@ -265,6 +266,67 @@ class RuntimePersistenceTests(unittest.TestCase):
         self.assertEqual(captured["body"]["timestamp"], "1234567890")
         self.assertEqual(captured["body"]["sign"], _build_feishu_sign("1234567890", "sign-secret"))
         self.assertEqual(captured["body"]["content"]["text"], "review message with mobile url")
+
+    def test_feishu_sender_builds_post_message_by_default(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            def getcode(self):
+                return 200
+
+            def read(self):
+                return b'{"code":0,"msg":"success"}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def fake_urlopen(request, timeout):
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse()
+
+        log = NotificationLog(
+            notification_id="N-1",
+            related_task_id=None,
+            related_review_task_id=None,
+            recipient_type="role",
+            recipient="operations",
+            channel="feishu",
+            sent_at=None,
+            send_status=NotificationSendStatus.PENDING.value,
+            dedupe_key="feishu|1",
+            message="log summary",
+        )
+        payload = {
+            "review_type": "manual_review",
+            "review_type_label": "人工复核",
+            "trade_date": "2026-05-05",
+            "scope_type": "global",
+            "scope_key": "mobile_review_test",
+            "required_by": "2026-05-06 09:01",
+            "reason": "mobile review test task",
+            "mobile_review_url": "https://pra.example/mobile/review/R-1?token=secret",
+        }
+        with patch.dict(
+            "os.environ",
+            {
+                "FEISHU_WEBHOOK_URL": "https://open.feishu.test/webhook",
+                "FEISHU_MESSAGE_TYPE": "",
+            },
+            clear=False,
+        ), patch("app.services.runtime.urlopen", side_effect=fake_urlopen):
+            result = FeishuWebhookNotificationSender().send(log, payload)
+
+        self.assertEqual(result.send_status, NotificationSendStatus.SUCCESS.value)
+        body = captured["body"]
+        self.assertEqual(body["msg_type"], "post")
+        post = body["content"]["post"]["zh_cn"]
+        self.assertEqual(post["title"], "PRA 复核通知")
+        flattened = [part for row in post["content"] for part in row]
+        self.assertIn({"tag": "a", "text": "👉 点击处理复核", "href": payload["mobile_review_url"]}, flattened)
+        self.assertTrue(any("人工复核" in part.get("text", "") for part in flattened))
 
     def test_feishu_sender_failed_response_and_http_exception(self) -> None:
         class FailedResponse:
@@ -308,6 +370,33 @@ class RuntimePersistenceTests(unittest.TestCase):
         self.assertIn("bad sign", failed_response.error_message)
         self.assertEqual(failed_exception.send_status, NotificationSendStatus.FAILED.value)
         self.assertIn("TimeoutError", failed_exception.error_message)
+
+    def test_feishu_sender_rejects_unknown_message_type(self) -> None:
+        log = NotificationLog(
+            notification_id="N-1",
+            related_task_id=None,
+            related_review_task_id=None,
+            recipient_type="role",
+            recipient="operations",
+            channel="feishu",
+            sent_at=None,
+            send_status=NotificationSendStatus.PENDING.value,
+            dedupe_key="feishu|1",
+            message="summary",
+        )
+        with patch.dict(
+            "os.environ",
+            {
+                "FEISHU_WEBHOOK_URL": "https://open.feishu.test/webhook",
+                "FEISHU_MESSAGE_TYPE": "card",
+            },
+            clear=False,
+        ), patch("app.services.runtime.urlopen") as mocked_urlopen:
+            result = FeishuWebhookNotificationSender().send(log, {"text": "message"})
+
+        self.assertEqual(result.send_status, NotificationSendStatus.FAILED.value)
+        self.assertIn("FEISHU_MESSAGE_TYPE", result.error_message)
+        mocked_urlopen.assert_not_called()
 
     def test_review_task_creation_also_creates_initial_notification_log(self) -> None:
         source = _runtime_task("TASK-1")
@@ -365,6 +454,7 @@ class RuntimePersistenceTests(unittest.TestCase):
             "os.environ",
             {
                 "DEFAULT_NOTIFICATION_CHANNEL": "feishu",
+                "FEISHU_MESSAGE_TYPE": "post",
                 "FEISHU_WEBHOOK_URL": "https://open.feishu.test/webhook",
                 "REVIEW_TOKEN_SECRET": "test-secret",
                 "MOBILE_REVIEW_BASE_URL": "https://pra.example",
@@ -380,6 +470,54 @@ class RuntimePersistenceTests(unittest.TestCase):
         self.assertEqual(logs[0].send_status, NotificationSendStatus.SUCCESS.value)
         self.assertIn("mobile_review_url_created=true", logs[0].message)
         self.assertNotIn("token=", logs[0].message)
+        self.assertEqual(captured["body"]["msg_type"], "post")
+        post = captured["body"]["content"]["post"]["zh_cn"]
+        flattened = [part for row in post["content"] for part in row]
+        link_parts = [part for part in flattened if part.get("tag") == "a"]
+        self.assertEqual(link_parts[0]["text"], "👉 点击处理复核")
+        self.assertIn("https://pra.example/mobile/review/", link_parts[0]["href"])
+        self.assertIn("token=", link_parts[0]["href"])
+        self.assertNotIn("token=", logs[0].message)
+
+    def test_feishu_notification_flow_can_send_text_message(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            def getcode(self):
+                return 200
+
+            def read(self):
+                return b'{"code":0,"msg":"success"}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def fake_urlopen(request, timeout):
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse()
+
+        source = _runtime_task("TASK-1")
+        self.task_service.create_tasks([source])
+        review_service = ReviewTaskService(self.repository, runtime_task_service=self.task_service)
+        with patch.dict(
+            "os.environ",
+            {
+                "DEFAULT_NOTIFICATION_CHANNEL": "feishu",
+                "FEISHU_MESSAGE_TYPE": "text",
+                "FEISHU_WEBHOOK_URL": "https://open.feishu.test/webhook",
+                "REVIEW_TOKEN_SECRET": "test-secret",
+                "MOBILE_REVIEW_BASE_URL": "https://pra.example",
+            },
+            clear=False,
+        ), patch("app.services.runtime.urlopen", side_effect=fake_urlopen):
+            summary = review_service.create_from_tasks([source])
+
+        self.assertEqual(summary.inserted_review_tasks_count, 1)
+        self.assertEqual(summary.inserted_notification_logs_count, 1)
+        self.assertEqual(captured["body"]["msg_type"], "text")
         sent_text = captured["body"]["content"]["text"]
         self.assertIn("mobile_review_url: https://pra.example/mobile/review/", sent_text)
         self.assertIn("token=", sent_text)

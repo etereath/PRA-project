@@ -80,6 +80,19 @@ DEFAULT_MOBILE_REVIEW_ACTIONS = [
 
 FEISHU_WEBHOOK_URL_REQUIRED = "FEISHU_WEBHOOK_URL is required for feishu notification"
 FEISHU_TOKEN_URL_CREATION_FAILED = "mobile_review_url creation failed"
+FEISHU_MESSAGE_TYPE_INVALID = "FEISHU_MESSAGE_TYPE must be 'post' or 'text'"
+FEISHU_POST_REVIEW_LINK_TEXT = "👉 点击处理复核"
+
+FEISHU_REVIEW_TYPE_LABELS = {
+    "manual_review": "人工复核",
+    "manual_price_review": "人工价格复核",
+    "below_break_even_review": "低于保本价复核",
+    "labor_required": "临时工确认",
+    "capacity_warning": "产能预警",
+    "shortage_warning": "短缺预警",
+    "cold_storage_warning": "冷库预警",
+    "clearance_warning": "清库存预警",
+}
 
 
 class RuntimeTaskService:
@@ -604,7 +617,16 @@ class FeishuWebhookNotificationSender:
                 raw_response_json={"error": FEISHU_WEBHOOK_URL_REQUIRED},
             )
 
-        request_body = self._build_request_body(log, payload)
+        message_type = _feishu_message_type()
+        if message_type not in {"post", "text"}:
+            return NotificationSendResult(
+                send_status=NotificationSendStatus.FAILED.value,
+                sent_at=None,
+                error_message=FEISHU_MESSAGE_TYPE_INVALID,
+                raw_response_json={"error": FEISHU_MESSAGE_TYPE_INVALID, "message_type": message_type},
+            )
+
+        request_body = self._build_request_body(log, payload, message_type)
         encoded_body = json.dumps(request_body, ensure_ascii=False).encode("utf-8")
         request = Request(
             webhook_url,
@@ -655,13 +677,17 @@ class FeishuWebhookNotificationSender:
             raw_response_json=response_json,
         )
 
-    def _build_request_body(self, log: NotificationLog, payload: dict[str, object] | None) -> dict[str, object]:
-        text = str((payload or {}).get("text") or log.message)
-        # MVP keeps Feishu webhook messages short and text-only; no retry queue or interactive approval here.
-        body: dict[str, object] = {
-            "msg_type": "text",
-            "content": {"text": text},
-        }
+    def _build_request_body(
+        self,
+        log: NotificationLog,
+        payload: dict[str, object] | None,
+        message_type: str,
+    ) -> dict[str, object]:
+        # MVP keeps webhook messages short; no rate-limit queue, rich interaction, or retry workflow here.
+        if message_type == "post":
+            body = _build_feishu_review_notification_post_body(log, payload)
+        else:
+            body = _build_feishu_review_notification_text_body(log, payload)
         secret = os.getenv("FEISHU_WEBHOOK_SECRET", "").strip()
         if secret:
             timestamp = str(int(time.time()))
@@ -777,7 +803,7 @@ class ReviewNotificationService:
                 )
             return (
                 f"{message} | mobile_review_url_created=true",
-                {"text": _build_feishu_review_notification_text(review_task, token.mobile_review_url)},
+                _build_feishu_review_notification_payload(review_task, token.mobile_review_url),
                 "",
             )
         if os.getenv("ENABLE_MOBILE_REVIEW_URL_IN_NOTIFICATION", "").strip().lower() != "true":
@@ -967,6 +993,10 @@ def _feishu_timeout_seconds() -> float:
     return timeout if timeout > 0 else 5.0
 
 
+def _feishu_message_type() -> str:
+    return os.getenv("FEISHU_MESSAGE_TYPE", "post").strip().lower() or "post"
+
+
 def _build_feishu_sign(timestamp: str, secret: str) -> str:
     string_to_sign = f"{timestamp}\n{secret}"
     digest = hmac.new(string_to_sign.encode("utf-8"), b"", hashlib.sha256).digest()
@@ -1003,16 +1033,74 @@ def _feishu_error_message(response_json: dict[str, object]) -> str:
     return str(message)
 
 
+def _build_feishu_review_notification_payload(review_task: ReviewTask, mobile_review_url: str) -> dict[str, object]:
+    return {
+        "text": _build_feishu_review_notification_text(review_task, mobile_review_url),
+        "review_type": review_task.review_type,
+        "review_type_label": _feishu_review_type_label(review_task.review_type),
+        "trade_date": review_task.trade_date.isoformat() if review_task.trade_date else "-",
+        "scope_type": review_task.scope_type,
+        "scope_key": review_task.scope_key,
+        "required_by": _format_feishu_datetime(review_task.required_by),
+        "reason": _truncate_for_feishu(review_task.reason, 200),
+        "mobile_review_url": mobile_review_url,
+    }
+
+
+def _build_feishu_review_notification_text_body(
+    log: NotificationLog,
+    payload: dict[str, object] | None,
+) -> dict[str, object]:
+    text = str((payload or {}).get("text") or log.message)
+    return {
+        "msg_type": "text",
+        "content": {"text": text},
+    }
+
+
+def _build_feishu_review_notification_post_body(
+    log: NotificationLog,
+    payload: dict[str, object] | None,
+) -> dict[str, object]:
+    values = payload or {}
+    review_type = str(values.get("review_type") or "-")
+    review_type_label = str(values.get("review_type_label") or _feishu_review_type_label(review_type))
+    trade_date = str(values.get("trade_date") or "-")
+    scope_type = str(values.get("scope_type") or "-")
+    scope_key = str(values.get("scope_key") or "-")
+    required_by = str(values.get("required_by") or "-")
+    reason = _truncate_for_feishu(values.get("reason") or log.message, 200)
+    mobile_review_url = str(values.get("mobile_review_url") or "")
+    content: list[list[dict[str, str]]] = [
+        [{"tag": "text", "text": f"复核类型：{review_type_label} ({review_type})"}],
+        [{"tag": "text", "text": f"交易日：{trade_date}"}],
+        [{"tag": "text", "text": f"对象：{scope_type}/{scope_key}"}],
+        [{"tag": "text", "text": f"截止时间：{required_by}"}],
+        [{"tag": "text", "text": f"原因：{reason}"}],
+    ]
+    if mobile_review_url:
+        content.append([{"tag": "a", "text": FEISHU_POST_REVIEW_LINK_TEXT, "href": mobile_review_url}])
+    return {
+        "msg_type": "post",
+        "content": {
+            "post": {
+                "zh_cn": {
+                    "title": "PRA 复核通知",
+                    "content": content,
+                }
+            }
+        },
+    }
+
+
 def _build_feishu_review_notification_text(review_task: ReviewTask, mobile_review_url: str) -> str:
     trade_date = review_task.trade_date.isoformat() if review_task.trade_date else "-"
-    required_by = review_task.required_by.isoformat() if review_task.required_by else "-"
-    reason = (review_task.reason or "-").strip()
-    if len(reason) > 160:
-        reason = f"{reason[:157]}..."
+    required_by = _format_feishu_datetime(review_task.required_by)
+    reason = _truncate_for_feishu(review_task.reason, 200)
     return "\n".join(
         [
             "PRA 复核通知",
-            f"review_type: {review_task.review_type}",
+            f"review_type: {_feishu_review_type_label(review_task.review_type)} ({review_task.review_type})",
             f"trade_date: {trade_date}",
             f"scope: {review_task.scope_type}/{review_task.scope_key}",
             f"required_by: {required_by}",
@@ -1020,6 +1108,23 @@ def _build_feishu_review_notification_text(review_task: ReviewTask, mobile_revie
             f"mobile_review_url: {mobile_review_url}",
         ]
     )
+
+
+def _feishu_review_type_label(review_type: str) -> str:
+    return FEISHU_REVIEW_TYPE_LABELS.get(review_type, review_type)
+
+
+def _format_feishu_datetime(value: datetime | None) -> str:
+    if value is None:
+        return "-"
+    return value.strftime("%Y-%m-%d %H:%M")
+
+
+def _truncate_for_feishu(value: object, max_length: int) -> str:
+    text = str(value or "-").strip() or "-"
+    if len(text) <= max_length:
+        return text
+    return f"{text[: max_length - 3]}..."
 
 
 def _build_review_notification_message(review_task: ReviewTask) -> str:
