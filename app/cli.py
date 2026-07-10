@@ -311,6 +311,8 @@ def main() -> int:
                 f"skipped_source_tasks={summary.skipped_source_tasks} "
                 f"notification_logs_created={summary.notification_logs_created}"
             )
+            if not args.apply:
+                print("dry-run preview only: no review task or source task status was changed.")
             if summary.errors:
                 print("errors:")
                 for error in summary.errors:

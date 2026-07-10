@@ -9,11 +9,23 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from app.enums import PricingSource, ReviewTaskStatus, TaskActionType, TaskStatus
-from app.models import ExecutionLog, NotificationLog, ReviewTask, ReviewToken, Task, TaskStatusHistory
+from app.models import (
+    ExecutionLog,
+    NotificationLog,
+    ReviewTask,
+    ReviewToken,
+    ScriptRun,
+    ScriptRunItem,
+    ShadowBotExecutionAttempt,
+    ShadowBotOperationLedger,
+    ShadowBotSideEffectCheckpoint,
+    Task,
+    TaskStatusHistory,
+)
 from app.utils import serialize_decimal
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 TERMINAL_TASK_STATUSES = ("success", "skipped", "cancelled", "expired")
 
 
@@ -162,6 +174,101 @@ SCHEMA_SQL = [
         FOREIGN KEY(task_id) REFERENCES tasks(task_id)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS script_runs (
+        script_run_id TEXT PRIMARY KEY,
+        evaluator_id TEXT NOT NULL,
+        evaluator_name TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        run_mode TEXT NOT NULL,
+        run_status TEXT NOT NULL,
+        trade_date TEXT,
+        started_at TEXT NOT NULL,
+        finished_at TEXT,
+        summary_json TEXT NOT NULL DEFAULT '{}',
+        error_message TEXT NOT NULL DEFAULT '',
+        created_by TEXT NOT NULL DEFAULT 'system'
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS script_run_items (
+        item_id TEXT PRIMARY KEY,
+        script_run_id TEXT NOT NULL,
+        proposal_type TEXT NOT NULL,
+        dedupe_key TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        item_status TEXT NOT NULL,
+        message TEXT NOT NULL DEFAULT '',
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        decision_trace_json TEXT NOT NULL DEFAULT '{}',
+        related_task_id TEXT,
+        related_review_task_id TEXT,
+        related_notification_id TEXT,
+        error_message TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(script_run_id) REFERENCES script_runs(script_run_id),
+        FOREIGN KEY(related_task_id) REFERENCES tasks(task_id),
+        FOREIGN KEY(related_review_task_id) REFERENCES review_tasks(review_task_id),
+        FOREIGN KEY(related_notification_id) REFERENCES notification_logs(notification_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_script_run_items_script_run_id
+    ON script_run_items(script_run_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_script_runs_started_at
+    ON script_runs(started_at)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS shadowbot_operations (
+        operation_id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        product_identity_json TEXT NOT NULL DEFAULT '{}',
+        expected_old_price TEXT NOT NULL,
+        target_price TEXT NOT NULL,
+        status TEXT NOT NULL,
+        lock_owner TEXT NOT NULL DEFAULT '',
+        approved_payload_hash TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(task_id) REFERENCES tasks(task_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS shadowbot_execution_attempts (
+        execution_attempt_id TEXT PRIMARY KEY,
+        operation_id TEXT NOT NULL,
+        execution_mode TEXT NOT NULL,
+        shadowbot_run_id TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL,
+        side_effect_state TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        instruction_hash TEXT NOT NULL DEFAULT '',
+        request_file_sha256 TEXT NOT NULL DEFAULT '',
+        queue_request_path TEXT NOT NULL DEFAULT '',
+        ended_at TEXT,
+        raw_output_json TEXT NOT NULL DEFAULT '{}',
+        FOREIGN KEY(operation_id) REFERENCES shadowbot_operations(operation_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_shadowbot_execution_attempts_operation_id
+    ON shadowbot_execution_attempts(operation_id)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS shadowbot_side_effect_checkpoints (
+        operation_id TEXT NOT NULL,
+        execution_attempt_id TEXT NOT NULL,
+        side_effect_state TEXT NOT NULL,
+        checkpoint_at TEXT NOT NULL,
+        version INTEGER NOT NULL,
+        PRIMARY KEY(operation_id, version),
+        FOREIGN KEY(operation_id) REFERENCES shadowbot_operations(operation_id),
+        FOREIGN KEY(execution_attempt_id) REFERENCES shadowbot_execution_attempts(execution_attempt_id)
+    )
+    """,
 ]
 
 
@@ -180,6 +287,9 @@ class SQLiteRuntimeRepository:
         with closing(self.connect()) as connection, connection:
             for statement in SCHEMA_SQL:
                 connection.execute(statement)
+            _ensure_column(connection, "shadowbot_execution_attempts", "instruction_hash", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(connection, "shadowbot_execution_attempts", "request_file_sha256", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(connection, "shadowbot_execution_attempts", "queue_request_path", "TEXT NOT NULL DEFAULT ''")
             connection.execute(
                 """
                 INSERT OR IGNORE INTO runtime_schema_migrations(schema_version, applied_at, note)
@@ -193,6 +303,27 @@ class SQLiteRuntimeRepository:
                 VALUES (?, ?, ?)
                 """,
                 (2, _datetime_to_text(datetime.now()), "review token runtime schema"),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO runtime_schema_migrations(schema_version, applied_at, note)
+                VALUES (?, ?, ?)
+                """,
+                (3, _datetime_to_text(datetime.now()), "business rule evaluation runtime schema"),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO runtime_schema_migrations(schema_version, applied_at, note)
+                VALUES (?, ?, ?)
+                """,
+                (4, _datetime_to_text(datetime.now()), "shadowbot executor runtime schema"),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO runtime_schema_migrations(schema_version, applied_at, note)
+                VALUES (?, ?, ?)
+                """,
+                (5, _datetime_to_text(datetime.now()), "shadowbot file queue audit fields"),
             )
 
     def schema_versions(self) -> list[int]:
@@ -227,12 +358,17 @@ class SQLiteRuntimeRepository:
             )
             return connection.total_changes - before
 
+    def insert_task(self, task: Task) -> int:
+        return self.insert_tasks([task])
+
     def list_tasks(
         self,
         *,
         trade_date: date | None = None,
         status: TaskStatus | None = None,
         action_type: TaskActionType | None = None,
+        scope_type: str | None = None,
+        scope_key: str | None = None,
     ) -> list[Task]:
         query = "SELECT * FROM tasks"
         clauses: list[str] = []
@@ -246,6 +382,12 @@ class SQLiteRuntimeRepository:
         if action_type is not None:
             clauses.append("action_type = ?")
             params.append(action_type.value)
+        if scope_type:
+            clauses.append("scope_type = ?")
+            params.append(scope_type)
+        if scope_key:
+            clauses.append("scope_key = ?")
+            params.append(scope_key)
         if clauses:
             query = f"{query} WHERE {' AND '.join(clauses)}"
         query = f"{query} ORDER BY priority ASC, created_at ASC, task_id ASC"
@@ -258,6 +400,22 @@ class SQLiteRuntimeRepository:
             row = connection.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
         return _row_to_task(row) if row is not None else None
 
+    def get_open_task_by_dedupe_key(self, dedupe_key: str) -> Task | None:
+        if not dedupe_key:
+            return None
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM tasks
+                WHERE dedupe_key = ?
+                  AND task_status NOT IN ('success', 'skipped', 'cancelled', 'expired')
+                ORDER BY created_at DESC, task_id ASC
+                LIMIT 1
+                """,
+                (dedupe_key,),
+            ).fetchone()
+        return _row_to_task(row) if row is not None else None
+
     def update_task_status(self, task_id: str, status: TaskStatus, *, result_message: str = "") -> None:
         updated_at = _datetime_to_text(datetime.now())
         with closing(self.connect()) as connection, connection:
@@ -268,6 +426,43 @@ class SQLiteRuntimeRepository:
                 WHERE task_id = ?
                 """,
                 (status.value, result_message, updated_at, task_id),
+            )
+
+    def update_task_status_with_history(
+        self,
+        task_id: str,
+        status: TaskStatus,
+        *,
+        history: TaskStatusHistory,
+        result_message: str = "",
+    ) -> None:
+        updated_at = _datetime_to_text(datetime.now())
+        with closing(self.connect()) as connection, connection:
+            connection.execute(
+                """
+                UPDATE tasks
+                SET task_status = ?, result_message = COALESCE(NULLIF(?, ''), result_message), updated_at = ?
+                WHERE task_id = ?
+                """,
+                (status.value, result_message, updated_at, task_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_status_history(
+                    history_id, task_id, from_status, to_status, changed_by, changed_at, reason, metadata_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    history.history_id,
+                    history.task_id,
+                    history.from_status.value if history.from_status is not None else None,
+                    history.to_status.value,
+                    history.changed_by,
+                    _datetime_to_text(history.changed_at),
+                    history.reason,
+                    _json_dump(history.metadata),
+                ),
             )
 
     def insert_status_history(self, history: TaskStatusHistory) -> None:
@@ -358,6 +553,21 @@ class SQLiteRuntimeRepository:
             ).fetchone()
         return _row_to_review_task(row) if row is not None else None
 
+    def get_pending_review_task_by_dedupe_key(self, dedupe_key: str) -> ReviewTask | None:
+        if not dedupe_key:
+            return None
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM review_tasks
+                WHERE dedupe_key = ? AND review_status = 'pending'
+                ORDER BY created_at DESC, review_task_id ASC
+                LIMIT 1
+                """,
+                (dedupe_key,),
+            ).fetchone()
+        return _row_to_review_task(row) if row is not None else None
+
     def list_pending_review_tasks_due_before(self, cutoff: datetime) -> list[ReviewTask]:
         with closing(self.connect()) as connection:
             rows = connection.execute(
@@ -387,6 +597,60 @@ class SQLiteRuntimeRepository:
                 WHERE review_task_id = :review_task_id
                 """,
                 row,
+            )
+
+    def update_review_task_with_optional_task_status(
+        self,
+        review_task: ReviewTask,
+        *,
+        task_id: str | None = None,
+        task_status: TaskStatus | None = None,
+        history: TaskStatusHistory | None = None,
+        result_message: str = "",
+    ) -> None:
+        review_row = _review_task_to_row(review_task)
+        with closing(self.connect()) as connection, connection:
+            connection.execute(
+                """
+                UPDATE review_tasks
+                SET review_status = :review_status,
+                    resolution_payload_json = :resolution_payload_json,
+                    updated_at = :updated_at,
+                    resolved_by = :resolved_by,
+                    resolved_at = :resolved_at,
+                    resolution_note = :resolution_note
+                WHERE review_task_id = :review_task_id
+                """,
+                review_row,
+            )
+            if task_id is None or task_status is None or history is None:
+                return
+            updated_at = _datetime_to_text(datetime.now())
+            connection.execute(
+                """
+                UPDATE tasks
+                SET task_status = ?, result_message = COALESCE(NULLIF(?, ''), result_message), updated_at = ?
+                WHERE task_id = ?
+                """,
+                (task_status.value, result_message, updated_at, task_id),
+            )
+            connection.execute(
+                """
+                INSERT INTO task_status_history(
+                    history_id, task_id, from_status, to_status, changed_by, changed_at, reason, metadata_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    history.history_id,
+                    history.task_id,
+                    history.from_status.value if history.from_status is not None else None,
+                    history.to_status.value,
+                    history.changed_by,
+                    _datetime_to_text(history.changed_at),
+                    history.reason,
+                    _json_dump(history.metadata),
+                ),
             )
 
     def insert_review_token(self, review_token: ReviewToken) -> int:
@@ -501,6 +765,220 @@ class SQLiteRuntimeRepository:
             )
             return connection.total_changes - before
 
+    def list_execution_logs(self, *, task_id: str | None = None, limit: int | None = None) -> list[ExecutionLog]:
+        query = "SELECT * FROM execution_logs"
+        params: list[object] = []
+        if task_id:
+            query = f"{query} WHERE task_id = ?"
+            params.append(task_id)
+        query = f"{query} ORDER BY created_at DESC, log_id ASC"
+        if limit is not None:
+            query = f"{query} LIMIT ?"
+            params.append(limit)
+        with closing(self.connect()) as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [_row_to_execution_log(row) for row in rows]
+
+    def insert_shadowbot_operation(self, operation: ShadowBotOperationLedger) -> int:
+        row = _shadowbot_operation_to_row(operation)
+        with closing(self.connect()) as connection, connection:
+            before = connection.total_changes
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO shadowbot_operations(
+                    operation_id, task_id, platform, product_identity_json, expected_old_price,
+                    target_price, status, lock_owner, approved_payload_hash, created_at, updated_at
+                )
+                VALUES(
+                    :operation_id, :task_id, :platform, :product_identity_json, :expected_old_price,
+                    :target_price, :status, :lock_owner, :approved_payload_hash, :created_at, :updated_at
+                )
+                """,
+                row,
+            )
+            return connection.total_changes - before
+
+    def get_shadowbot_operation(self, operation_id: str) -> ShadowBotOperationLedger | None:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM shadowbot_operations WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+        return _row_to_shadowbot_operation(row) if row is not None else None
+
+    def acquire_shadowbot_operation_lock(self, operation_id: str, lock_owner: str) -> bool:
+        with closing(self.connect()) as connection, connection:
+            cursor = connection.execute(
+                """
+                UPDATE shadowbot_operations
+                SET lock_owner = ?, updated_at = ?
+                WHERE operation_id = ? AND (lock_owner = '' OR lock_owner = ?)
+                """,
+                (lock_owner, _datetime_to_text(datetime.now()), operation_id, lock_owner),
+            )
+            return cursor.rowcount == 1
+
+    def update_shadowbot_operation_status(self, operation_id: str, status: str, *, lock_owner: str | None = None) -> None:
+        assignments = ["status = ?", "updated_at = ?"]
+        params: list[object] = [status, _datetime_to_text(datetime.now())]
+        if lock_owner is not None:
+            assignments.append("lock_owner = ?")
+            params.append(lock_owner)
+        params.append(operation_id)
+        with closing(self.connect()) as connection, connection:
+            connection.execute(
+                f"UPDATE shadowbot_operations SET {', '.join(assignments)} WHERE operation_id = ?",
+                params,
+            )
+
+    def insert_shadowbot_execution_attempt(self, attempt: ShadowBotExecutionAttempt) -> int:
+        row = _shadowbot_attempt_to_row(attempt)
+        with closing(self.connect()) as connection, connection:
+            before = connection.total_changes
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO shadowbot_execution_attempts(
+                    execution_attempt_id, operation_id, execution_mode, shadowbot_run_id,
+                    status, side_effect_state, started_at, instruction_hash,
+                    request_file_sha256, queue_request_path, ended_at, raw_output_json
+                )
+                VALUES(
+                    :execution_attempt_id, :operation_id, :execution_mode, :shadowbot_run_id,
+                    :status, :side_effect_state, :started_at, :instruction_hash,
+                    :request_file_sha256, :queue_request_path, :ended_at, :raw_output_json
+                )
+                """,
+                row,
+            )
+            return connection.total_changes - before
+
+    def get_shadowbot_execution_attempt(self, execution_attempt_id: str) -> ShadowBotExecutionAttempt | None:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM shadowbot_execution_attempts WHERE execution_attempt_id = ?",
+                (execution_attempt_id,),
+            ).fetchone()
+        return _row_to_shadowbot_attempt(row) if row is not None else None
+
+    def list_shadowbot_execution_attempts(self, *, operation_id: str) -> list[ShadowBotExecutionAttempt]:
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM shadowbot_execution_attempts
+                WHERE operation_id = ?
+                ORDER BY started_at, execution_attempt_id
+                """,
+                (operation_id,),
+            ).fetchall()
+        return [_row_to_shadowbot_attempt(row) for row in rows]
+
+    def update_shadowbot_execution_attempt(
+        self,
+        execution_attempt_id: str,
+        *,
+        shadowbot_run_id: str | None = None,
+        status: str | None = None,
+        side_effect_state: str | None = None,
+        instruction_hash: str | None = None,
+        request_file_sha256: str | None = None,
+        queue_request_path: str | None = None,
+        ended_at: datetime | None = None,
+        raw_output: dict[str, Any] | None = None,
+    ) -> None:
+        assignments: list[str] = []
+        params: list[object] = []
+        if shadowbot_run_id is not None:
+            assignments.append("shadowbot_run_id = ?")
+            params.append(shadowbot_run_id)
+        if status is not None:
+            assignments.append("status = ?")
+            params.append(status)
+        if side_effect_state is not None:
+            assignments.append("side_effect_state = ?")
+            params.append(side_effect_state)
+        if instruction_hash is not None:
+            assignments.append("instruction_hash = ?")
+            params.append(instruction_hash)
+        if request_file_sha256 is not None:
+            assignments.append("request_file_sha256 = ?")
+            params.append(request_file_sha256)
+        if queue_request_path is not None:
+            assignments.append("queue_request_path = ?")
+            params.append(queue_request_path)
+        if ended_at is not None:
+            assignments.append("ended_at = ?")
+            params.append(_datetime_to_text(ended_at))
+        if raw_output is not None:
+            assignments.append("raw_output_json = ?")
+            params.append(_json_dump(raw_output))
+        if not assignments:
+            return
+        params.append(execution_attempt_id)
+        with closing(self.connect()) as connection, connection:
+            connection.execute(
+                f"UPDATE shadowbot_execution_attempts SET {', '.join(assignments)} WHERE execution_attempt_id = ?",
+                params,
+            )
+
+    def insert_shadowbot_side_effect_checkpoint(
+        self,
+        *,
+        operation_id: str,
+        execution_attempt_id: str,
+        side_effect_state: str,
+        checkpoint_at: datetime,
+    ) -> ShadowBotSideEffectCheckpoint:
+        with closing(self.connect()) as connection, connection:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(version), 0) + 1 AS next_version FROM shadowbot_side_effect_checkpoints WHERE operation_id = ?",
+                (operation_id,),
+            ).fetchone()
+            version = int(row["next_version"])
+            checkpoint = ShadowBotSideEffectCheckpoint(
+                operation_id=operation_id,
+                execution_attempt_id=execution_attempt_id,
+                side_effect_state=side_effect_state,
+                checkpoint_at=checkpoint_at,
+                version=version,
+            )
+            connection.execute(
+                """
+                INSERT INTO shadowbot_side_effect_checkpoints(
+                    operation_id, execution_attempt_id, side_effect_state, checkpoint_at, version
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    checkpoint.operation_id,
+                    checkpoint.execution_attempt_id,
+                    checkpoint.side_effect_state,
+                    _datetime_to_text(checkpoint.checkpoint_at),
+                    checkpoint.version,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE shadowbot_execution_attempts
+                SET side_effect_state = ?
+                WHERE execution_attempt_id = ?
+                """,
+                (side_effect_state, execution_attempt_id),
+            )
+        return checkpoint
+
+    def latest_shadowbot_side_effect_checkpoint(self, operation_id: str) -> ShadowBotSideEffectCheckpoint | None:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM shadowbot_side_effect_checkpoints
+                WHERE operation_id = ?
+                ORDER BY version DESC
+                LIMIT 1
+                """,
+                (operation_id,),
+            ).fetchone()
+        return _row_to_shadowbot_checkpoint(row) if row is not None else None
+
     def insert_notification_logs(self, logs: Iterable[NotificationLog]) -> int:
         rows = [_notification_log_to_row(log) for log in logs]
         if not rows:
@@ -527,6 +1005,7 @@ class SQLiteRuntimeRepository:
         *,
         related_review_task_id: str | None = None,
         send_status: str | None = None,
+        channel: str | None = None,
     ) -> list[NotificationLog]:
         query = "SELECT * FROM notification_logs"
         clauses: list[str] = []
@@ -537,6 +1016,9 @@ class SQLiteRuntimeRepository:
         if send_status:
             clauses.append("send_status = ?")
             params.append(send_status)
+        if channel:
+            clauses.append("channel = ?")
+            params.append(channel)
         if clauses:
             query = f"{query} WHERE {' AND '.join(clauses)}"
         with closing(self.connect()) as connection:
@@ -553,6 +1035,97 @@ class SQLiteRuntimeRepository:
                 (notification_id,),
             ).fetchone()
         return _row_to_notification_log(row) if row is not None else None
+
+    def insert_script_run(self, script_run: ScriptRun) -> int:
+        row = _script_run_to_row(script_run)
+        with closing(self.connect()) as connection, connection:
+            before = connection.total_changes
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO script_runs(
+                    script_run_id, evaluator_id, evaluator_name, description, run_mode,
+                    run_status, trade_date, started_at, finished_at, summary_json,
+                    error_message, created_by
+                )
+                VALUES(
+                    :script_run_id, :evaluator_id, :evaluator_name, :description, :run_mode,
+                    :run_status, :trade_date, :started_at, :finished_at, :summary_json,
+                    :error_message, :created_by
+                )
+                """,
+                row,
+            )
+            return connection.total_changes - before
+
+    def update_script_run(self, script_run: ScriptRun) -> None:
+        row = _script_run_to_row(script_run)
+        with closing(self.connect()) as connection, connection:
+            connection.execute(
+                """
+                UPDATE script_runs
+                SET run_status = :run_status,
+                    finished_at = :finished_at,
+                    summary_json = :summary_json,
+                    error_message = :error_message
+                WHERE script_run_id = :script_run_id
+                """,
+                row,
+            )
+
+    def list_script_runs(self, *, limit: int | None = None) -> list[ScriptRun]:
+        query = "SELECT * FROM script_runs ORDER BY started_at DESC, script_run_id ASC"
+        params: list[object] = []
+        if limit is not None:
+            query = f"{query} LIMIT ?"
+            params.append(limit)
+        with closing(self.connect()) as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [_row_to_script_run(row) for row in rows]
+
+    def get_script_run(self, script_run_id: str) -> ScriptRun | None:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM script_runs WHERE script_run_id = ?",
+                (script_run_id,),
+            ).fetchone()
+        return _row_to_script_run(row) if row is not None else None
+
+    def insert_script_run_items(self, items: Iterable[ScriptRunItem]) -> int:
+        rows = [_script_run_item_to_row(item) for item in items]
+        if not rows:
+            return 0
+        with closing(self.connect()) as connection, connection:
+            before = connection.total_changes
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO script_run_items(
+                    item_id, script_run_id, proposal_type, dedupe_key, severity,
+                    item_status, message, payload_json, decision_trace_json,
+                    related_task_id, related_review_task_id, related_notification_id,
+                    error_message, created_at
+                )
+                VALUES(
+                    :item_id, :script_run_id, :proposal_type, :dedupe_key, :severity,
+                    :item_status, :message, :payload_json, :decision_trace_json,
+                    :related_task_id, :related_review_task_id, :related_notification_id,
+                    :error_message, :created_at
+                )
+                """,
+                rows,
+            )
+            return connection.total_changes - before
+
+    def list_script_run_items(self, script_run_id: str) -> list[ScriptRunItem]:
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM script_run_items
+                WHERE script_run_id = ?
+                ORDER BY created_at ASC, item_id ASC
+                """,
+                (script_run_id,),
+            ).fetchall()
+        return [_row_to_script_run_item(row) for row in rows]
 
 
 def _task_to_row(task: Task) -> dict[str, Any]:
@@ -709,6 +1282,108 @@ def _execution_log_to_row(log: ExecutionLog) -> dict[str, Any]:
     }
 
 
+def _row_to_execution_log(row: sqlite3.Row) -> ExecutionLog:
+    success_flag = row["success_flag"]
+    return ExecutionLog(
+        log_id=str(row["log_id"]),
+        task_id=str(row["task_id"]),
+        executor_name=str(row["executor_name"]),
+        start_time=_text_to_datetime(row["start_time"]) or datetime.now(),
+        end_time=_text_to_datetime(row["end_time"]),
+        success_flag=bool(success_flag) if success_flag is not None else None,
+        error_code=str(row["error_code"] or ""),
+        error_message=str(row["error_message"] or ""),
+        raw_output=str(row["raw_output"] or ""),
+        ai_model_version=str(row["ai_model_version"] or ""),
+        ai_summary=str(row["ai_summary"] or ""),
+        created_at=_text_to_datetime(row["created_at"]),
+    )
+
+
+def _shadowbot_operation_to_row(operation: ShadowBotOperationLedger) -> dict[str, Any]:
+    created_at = operation.created_at or datetime.now()
+    updated_at = operation.updated_at or created_at
+    return {
+        "operation_id": operation.operation_id,
+        "task_id": operation.task_id,
+        "platform": operation.platform,
+        "product_identity_json": _json_dump(operation.product_identity),
+        "expected_old_price": serialize_decimal(operation.expected_old_price),
+        "target_price": serialize_decimal(operation.target_price),
+        "status": operation.status,
+        "lock_owner": operation.lock_owner,
+        "approved_payload_hash": operation.approved_payload_hash,
+        "created_at": _datetime_to_text(created_at),
+        "updated_at": _datetime_to_text(updated_at),
+    }
+
+
+def _ensure_column(connection: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
+    columns = {str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in columns:
+        connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
+
+
+def _row_to_shadowbot_operation(row: sqlite3.Row) -> ShadowBotOperationLedger:
+    return ShadowBotOperationLedger(
+        operation_id=str(row["operation_id"]),
+        task_id=str(row["task_id"]),
+        platform=str(row["platform"]),
+        product_identity=_json_load(row["product_identity_json"]),
+        expected_old_price=Decimal(str(row["expected_old_price"])),
+        target_price=Decimal(str(row["target_price"])),
+        status=str(row["status"]),
+        lock_owner=str(row["lock_owner"] or ""),
+        approved_payload_hash=str(row["approved_payload_hash"] or ""),
+        created_at=_text_to_datetime(row["created_at"]),
+        updated_at=_text_to_datetime(row["updated_at"]),
+    )
+
+
+def _shadowbot_attempt_to_row(attempt: ShadowBotExecutionAttempt) -> dict[str, Any]:
+    return {
+        "execution_attempt_id": attempt.execution_attempt_id,
+        "operation_id": attempt.operation_id,
+        "execution_mode": attempt.execution_mode,
+        "shadowbot_run_id": attempt.shadowbot_run_id,
+        "status": attempt.status,
+        "side_effect_state": attempt.side_effect_state,
+        "started_at": _datetime_to_text(attempt.started_at),
+        "instruction_hash": attempt.instruction_hash,
+        "request_file_sha256": attempt.request_file_sha256,
+        "queue_request_path": attempt.queue_request_path,
+        "ended_at": _datetime_to_text(attempt.ended_at),
+        "raw_output_json": _json_dump(attempt.raw_output),
+    }
+
+
+def _row_to_shadowbot_attempt(row: sqlite3.Row) -> ShadowBotExecutionAttempt:
+    return ShadowBotExecutionAttempt(
+        execution_attempt_id=str(row["execution_attempt_id"]),
+        operation_id=str(row["operation_id"]),
+        execution_mode=str(row["execution_mode"]),
+        shadowbot_run_id=str(row["shadowbot_run_id"] or ""),
+        status=str(row["status"]),
+        side_effect_state=str(row["side_effect_state"]),
+        started_at=_text_to_datetime(row["started_at"]) or datetime.now(),
+        instruction_hash=str(row["instruction_hash"] or ""),
+        request_file_sha256=str(row["request_file_sha256"] or ""),
+        queue_request_path=str(row["queue_request_path"] or ""),
+        ended_at=_text_to_datetime(row["ended_at"]),
+        raw_output=_json_load(row["raw_output_json"]),
+    )
+
+
+def _row_to_shadowbot_checkpoint(row: sqlite3.Row) -> ShadowBotSideEffectCheckpoint:
+    return ShadowBotSideEffectCheckpoint(
+        operation_id=str(row["operation_id"]),
+        execution_attempt_id=str(row["execution_attempt_id"]),
+        side_effect_state=str(row["side_effect_state"]),
+        checkpoint_at=_text_to_datetime(row["checkpoint_at"]) or datetime.now(),
+        version=int(row["version"]),
+    )
+
+
 def _notification_log_to_row(log: NotificationLog) -> dict[str, Any]:
     return {
         "notification_id": log.notification_id,
@@ -738,6 +1413,78 @@ def _row_to_notification_log(row: sqlite3.Row) -> NotificationLog:
         send_status=str(row["send_status"]),
         dedupe_key=str(row["dedupe_key"] or ""),
         message=str(row["message"] or ""),
+        error_message=str(row["error_message"] or ""),
+        created_at=_text_to_datetime(row["created_at"]),
+    )
+
+
+def _script_run_to_row(script_run: ScriptRun) -> dict[str, Any]:
+    return {
+        "script_run_id": script_run.script_run_id,
+        "evaluator_id": script_run.evaluator_id,
+        "evaluator_name": script_run.evaluator_name,
+        "description": script_run.description,
+        "run_mode": script_run.run_mode,
+        "run_status": script_run.run_status,
+        "trade_date": _date_to_text(script_run.trade_date),
+        "started_at": _datetime_to_text(script_run.started_at),
+        "finished_at": _datetime_to_text(script_run.finished_at),
+        "summary_json": _json_dump(script_run.summary),
+        "error_message": script_run.error_message,
+        "created_by": script_run.created_by,
+    }
+
+
+def _row_to_script_run(row: sqlite3.Row) -> ScriptRun:
+    return ScriptRun(
+        script_run_id=str(row["script_run_id"]),
+        evaluator_id=str(row["evaluator_id"]),
+        evaluator_name=str(row["evaluator_name"]),
+        description=str(row["description"] or ""),
+        run_mode=str(row["run_mode"]),
+        run_status=str(row["run_status"]),
+        trade_date=_text_to_date(row["trade_date"]),
+        started_at=_text_to_datetime(row["started_at"]) or datetime.now(),
+        finished_at=_text_to_datetime(row["finished_at"]),
+        summary=_json_load(row["summary_json"]),
+        error_message=str(row["error_message"] or ""),
+        created_by=str(row["created_by"] or "system"),
+    )
+
+
+def _script_run_item_to_row(item: ScriptRunItem) -> dict[str, Any]:
+    return {
+        "item_id": item.item_id,
+        "script_run_id": item.script_run_id,
+        "proposal_type": item.proposal_type,
+        "dedupe_key": item.dedupe_key,
+        "severity": item.severity,
+        "item_status": item.item_status,
+        "message": item.message,
+        "payload_json": _json_dump(item.payload),
+        "decision_trace_json": _json_dump(item.decision_trace),
+        "related_task_id": item.related_task_id,
+        "related_review_task_id": item.related_review_task_id,
+        "related_notification_id": item.related_notification_id,
+        "error_message": item.error_message,
+        "created_at": _datetime_to_text(item.created_at or datetime.now()),
+    }
+
+
+def _row_to_script_run_item(row: sqlite3.Row) -> ScriptRunItem:
+    return ScriptRunItem(
+        item_id=str(row["item_id"]),
+        script_run_id=str(row["script_run_id"]),
+        proposal_type=str(row["proposal_type"]),
+        dedupe_key=str(row["dedupe_key"]),
+        severity=str(row["severity"]),
+        item_status=str(row["item_status"]),
+        message=str(row["message"] or ""),
+        payload=_json_load(row["payload_json"]),
+        decision_trace=_json_load(row["decision_trace_json"]),
+        related_task_id=row["related_task_id"],
+        related_review_task_id=row["related_review_task_id"],
+        related_notification_id=row["related_notification_id"],
         error_message=str(row["error_message"] or ""),
         created_at=_text_to_datetime(row["created_at"]),
     )

@@ -44,10 +44,17 @@
 - `execution_logs`
 - `notification_logs`
 - `task_status_history`
+- `review_tokens`
+- `script_runs`
+- `script_run_items`
 
-并且初始化时会写入：
+并且初始化时会写入迁移历史：
 
 - `schema_version = 1`
+- `schema_version = 2`
+- `schema_version = 3`
+
+当前最新 runtime schema 要求为 v3。
 
 ### 2.2 `tasks` 表已实现
 
@@ -245,6 +252,27 @@
 - 英文字段名不变
 - 中文字段名只用于展示和说明
 
+### 2.11 自动规则评估运行记录已实现
+
+runtime schema v3 已新增：
+
+- `script_runs`
+- `script_run_items`
+
+用途：
+
+- 记录自动规则 evaluator 的每次运行。
+- 区分 `dry-run / apply`。
+- 保存 proposal 预览、落库结果、跳过原因和错误摘要。
+- 在 Web 任务中心的“脚本状态”分页展示运行记录。
+
+当前已落地的关键约束：
+
+- `dry-run` 可以写入 `script_runs / script_run_items`，但绝不能写入业务 `tasks / review_tasks / notification_logs`。
+- `apply` 才会通过现有 service 写入业务任务、复核和通知。
+- apply 前基于 `proposal.dedupe_key` 做幂等检查，已有业务结果时记录 `skipped` 和 `skip_reason`。
+- evaluator 不直接写 SQLite 业务表，不直接发送飞书，不绕过运行态 service。
+
 ---
 
 ## 3. 已完成验证
@@ -346,12 +374,13 @@
 3. CLI 第一阶段闭环：已完成
 4. Web 运行态人工复核闭环 MVP：已完成
 5. 通知接入 review 主流程 MVP：已完成
-6. 完整运行态后台化：未完成
-7. 完整运营系统：未完成
+6. 自动规则评估运行记录与任务中心脚本状态页：已完成第一版
+7. 完整运行态后台化：未完成
+8. 完整运营系统：未完成
 
 因此，这一阶段不应再描述为“纯计划中”，更准确的说法是：
 
-`SQLite 运行态持久化第一版已实现，运行态运营闭环增强第一版也已完成，当前处于从可运行闭环向更完整运营后台扩展的阶段。`
+`SQLite 运行态持久化第一版已实现，运行态运营闭环增强第一版也已完成，当前已进入 schema v3 自动规则评估记录阶段，正在从可运行闭环向更完整运营后台扩展。`
 
 ---
 
@@ -362,8 +391,9 @@
 1. 进一步弱化旧 Excel 人工介入入口，例如移出主导航或仅保留内部兼容入口
 2. 扩展运行态 Web 的更多筛选、搜索、批量处理和可视化能力
 3. 为真实通知渠道补 sender 实现，例如企业微信、Bark、飞书
-4. 为 `review_token` 与手机端 review 页面保留并逐步实现稳定接口
-5. 在后续阶段再推进真实平台、真实 RPA、完整权限系统
+4. 基于 evaluator 框架继续规划上下架规则、冷库压力和包装产能等自动规则
+5. 为 `review_token` 与手机端 review 页面保留并逐步实现稳定接口
+6. 在后续阶段再推进真实平台、真实 RPA、完整权限系统
 
 当前仍然不建议做：
 

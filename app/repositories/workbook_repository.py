@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from openpyxl import Workbook, load_workbook
 
-from app.enums import ConditionType, ListingAction, PricingMethod, PricingSource, RoundingRule, TaskActionType, TaskStatus
+from app.enums import ConditionType, ListingAction, ListingStrategy, PricingMethod, PricingSource, RoundingRule, TaskActionType, TaskStatus
 from app.exceptions import TableValidationError, TableValidationIssue, ValidationError
 from app.models import (
     ColdStorageStatus,
@@ -45,8 +45,9 @@ PRODUCT_HEADERS = [
 PRICE_RULE_HEADERS = [
     "rule_id",
     "rule_name",
-    "scope_type",
-    "scope_value",
+    "variety_filter",
+    "grade_filter",
+    "platform_filter",
     "pricing_method",
     "markup_value",
     "min_price",
@@ -60,9 +61,11 @@ PRICE_RULE_HEADERS = [
 LISTING_RULE_HEADERS = [
     "rule_id",
     "rule_name",
-    "condition_type",
-    "condition_value",
-    "action",
+    "variety_filter",
+    "grade_filter",
+    "platform_filter",
+    "stock_threshold",
+    "listing_strategy",
     "active",
     "priority",
     "remark",
@@ -103,15 +106,35 @@ CAPACITY_PLAN_HEADERS = [
     "normal_packing_capacity_qty",
     "temp_worker_capacity_qty",
     "confirmed_temp_worker_count",
+    "confirmed_packing_capacity_qty",
     "allocation_rule",
+    "active",
     "note",
 ]
 
 COLD_STORAGE_STATUS_HEADERS = [
     "trade_date",
-    "cold_storage_total_capacity_qty",
-    "cold_storage_current_qty",
+    "total_capacity_qty",
+    "current_occupied_qty",
+    "expected_inbound_qty",
+    "expected_outbound_qty",
+    "warning_threshold_qty",
+    "projected_occupied_qty",
+    "remaining_capacity_qty",
+    "active",
     "note",
+]
+
+PLATFORM_MAPPING_HEADERS = [
+    "mapping_id",
+    "internal_sku",
+    "platform_name",
+    "platform_product_id",
+    "platform_product_name",
+    "search_keyword",
+    "mapping_status",
+    "last_verified_at",
+    "remark",
 ]
 
 TASK_HEADERS = [
@@ -152,6 +175,7 @@ TABLE_HEADERS = {
     "price_forecasts": PRICE_FORECAST_HEADERS,
     "capacity_plans": CAPACITY_PLAN_HEADERS,
     "cold_storage_status": COLD_STORAGE_STATUS_HEADERS,
+    "platform_mappings": PLATFORM_MAPPING_HEADERS,
 }
 
 
@@ -165,6 +189,7 @@ def create_template_workbooks(output_dir: Path) -> list[Path]:
         _create_template(output_dir / "price_forecasts_template.xlsx", PRICE_FORECAST_HEADERS),
         _create_template(output_dir / "capacity_plans_template.xlsx", CAPACITY_PLAN_HEADERS),
         _create_template(output_dir / "cold_storage_status_template.xlsx", COLD_STORAGE_STATUS_HEADERS),
+        _create_template(output_dir / "platform_mappings_template.xlsx", PLATFORM_MAPPING_HEADERS),
     ]
 
 
@@ -228,12 +253,13 @@ def load_price_rules(path: Path) -> list[PriceRule]:
             PriceRule(
                 rule_id=_required_text(row["rule_id"], "rule_id", row_number),
                 rule_name=_required_text(row["rule_name"], "rule_name", row_number),
-                scope_type=_required_text(row["scope_type"], "scope_type", row_number),
-                scope_value=_required_text(row["scope_value"], "scope_value", row_number),
+                variety_filter=_required_text(row["variety_filter"], "variety_filter", row_number),
+                grade_filter=_required_text(row["grade_filter"], "grade_filter", row_number),
+                platform_filter=_required_text(row["platform_filter"], "platform_filter", row_number),
                 pricing_method=PricingMethod(_required_text(row["pricing_method"], "pricing_method", row_number)),
-                markup_value=parse_decimal(row["markup_value"], f"price_rules row {row_number} markup_value")
-                if row.get("markup_value") not in ("", None)
-                else parse_decimal("0", f"price_rules row {row_number} markup_value"),
+                markup_value=_parse_required_non_zero_decimal(
+                    row["markup_value"], f"price_rules row {row_number} markup_value"
+                ),
                 min_price=parse_decimal(row["min_price"], f"price_rules row {row_number} min_price")
                 if row.get("min_price") not in ("", None)
                 else None,
@@ -249,23 +275,30 @@ def load_price_rules(path: Path) -> list[PriceRule]:
     return rules
 
 
+def _parse_required_non_zero_decimal(value: object, field_context: str):
+    if value in ("", None):
+        raise ValidationError(f"{field_context} is required")
+    parsed = parse_decimal(value, field_context)
+    if parsed == 0:
+        raise ValidationError(f"{field_context} must not be zero")
+    return parsed
+
+
 def load_listing_rules(path: Path) -> list[ListingRule]:
     rows = _read_rows(path, LISTING_RULE_HEADERS)
     rules: list[ListingRule] = []
     for row_number, row in enumerate(rows, start=2):
-        condition_type = ConditionType(_required_text(row["condition_type"], "condition_type", row_number))
-        condition_value = _parse_listing_condition_value(
-            condition_type=condition_type,
-            raw_value=row.get("condition_value"),
-            field_context=f"listing_rules row {row_number} condition_value",
-        )
         rules.append(
             ListingRule(
                 rule_id=_required_text(row["rule_id"], "rule_id", row_number),
                 rule_name=_required_text(row["rule_name"], "rule_name", row_number),
-                condition_type=condition_type,
-                condition_value=condition_value,
-                action=ListingAction(_required_text(row["action"], "action", row_number)),
+                variety_filter=_required_text(row["variety_filter"], "variety_filter", row_number),
+                grade_filter=_required_text(row["grade_filter"], "grade_filter", row_number),
+                platform_filter=_required_text(row["platform_filter"], "platform_filter", row_number),
+                stock_threshold=parse_decimal(row["stock_threshold"], f"listing_rules row {row_number} stock_threshold"),
+                listing_strategy=ListingStrategy(
+                    _required_text(row["listing_strategy"], "listing_strategy", row_number)
+                ),
                 active=parse_bool(row["active"], f"listing_rules row {row_number} active"),
                 priority=parse_int(row["priority"], f"listing_rules row {row_number} priority"),
                 remark=str(row.get("remark") or ""),
@@ -356,52 +389,120 @@ def load_price_forecasts(path: Path) -> list[PriceForecast]:
     return forecasts
 
 
-def load_capacity_plan(path: Path) -> PackingCapacityPlan:
-    rows = _read_rows(path, CAPACITY_PLAN_HEADERS)
+def load_capacity_plans(path: Path) -> list[PackingCapacityPlan]:
+    rows = _read_capacity_plan_rows(path)
     if not rows:
         raise ValidationError(f"{path.name}: capacity plan requires at least one row")
-    row = rows[0]
-    return PackingCapacityPlan(
-        trade_date=parse_date(row["trade_date"], "capacity_plans row 2 trade_date"),
-        normal_packing_capacity_qty=_parse_int_or_default(
-            row.get("normal_packing_capacity_qty"),
-            field_name="capacity_plans row 2 normal_packing_capacity_qty",
-            default_value=250,
-        ),
-        temp_worker_capacity_qty=_parse_int_or_default(
-            row.get("temp_worker_capacity_qty"),
-            field_name="capacity_plans row 2 temp_worker_capacity_qty",
-            default_value=100,
-        ),
-        confirmed_temp_worker_count=_parse_int_or_default(
-            row.get("confirmed_temp_worker_count"),
-            field_name="capacity_plans row 2 confirmed_temp_worker_count",
-            default_value=0,
-        ),
-        allocation_rule=str(row.get("allocation_rule") or "proportional_by_forecast"),
-        note=str(row.get("note") or ""),
-    )
+    plans: list[PackingCapacityPlan] = []
+    for row_number, row in enumerate(rows, start=2):
+        confirmed_override = None
+        if row.get("confirmed_packing_capacity_qty") not in ("", None):
+            confirmed_override = _parse_non_negative_int_or_default(
+                row.get("confirmed_packing_capacity_qty"),
+                field_name=f"capacity_plans row {row_number} confirmed_packing_capacity_qty",
+                default_value=250,
+            )
+        plans.append(
+            PackingCapacityPlan(
+                trade_date=parse_date(row["trade_date"], f"capacity_plans row {row_number} trade_date"),
+                normal_packing_capacity_qty=_parse_non_negative_int_or_default(
+                    row.get("normal_packing_capacity_qty"),
+                    field_name=f"capacity_plans row {row_number} normal_packing_capacity_qty",
+                    default_value=250,
+                ),
+                temp_worker_capacity_qty=_parse_non_negative_int_or_default(
+                    row.get("temp_worker_capacity_qty"),
+                    field_name=f"capacity_plans row {row_number} temp_worker_capacity_qty",
+                    default_value=100,
+                ),
+                confirmed_temp_worker_count=_parse_non_negative_int_or_default(
+                    row.get("confirmed_temp_worker_count"),
+                    field_name=f"capacity_plans row {row_number} confirmed_temp_worker_count",
+                    default_value=0,
+                ),
+                confirmed_packing_capacity_qty_override=confirmed_override,
+                allocation_rule=str(row.get("allocation_rule") or "proportional_by_forecast"),
+                active=parse_bool(row.get("active", True), f"capacity_plans row {row_number} active"),
+                note=str(row.get("note") or ""),
+            )
+        )
+    return plans
+
+
+def load_capacity_plan(path: Path) -> PackingCapacityPlan:
+    plans = load_capacity_plans(path)
+    for plan in plans:
+        if plan.active:
+            return plan
+    return plans[0]
+
+
+def load_cold_storage_statuses(path: Path) -> list[ColdStorageStatus]:
+    rows = _read_cold_storage_status_rows(path)
+    if not rows:
+        raise ValidationError(f"{path.name}: cold storage status requires at least one row")
+    statuses: list[ColdStorageStatus] = []
+    for row_number, row in enumerate(rows, start=2):
+        projected_override = None
+        if row.get("projected_occupied_qty") not in ("", None):
+            projected_override = _parse_non_negative_int_or_default(
+                row.get("projected_occupied_qty"),
+                field_name=f"cold_storage_status row {row_number} projected_occupied_qty",
+                default_value=0,
+            )
+        remaining_override = None
+        if row.get("remaining_capacity_qty") not in ("", None):
+            remaining_override = _parse_int_or_default(
+                row.get("remaining_capacity_qty"),
+                field_name=f"cold_storage_status row {row_number} remaining_capacity_qty",
+                default_value=0,
+            )
+        total_capacity = _parse_non_negative_int_or_default(
+            row.get("total_capacity_qty"),
+            field_name=f"cold_storage_status row {row_number} total_capacity_qty",
+            default_value=500,
+        )
+        if total_capacity <= 0:
+            raise ValidationError(f"cold_storage_status row {row_number} total_capacity_qty must be greater than 0")
+        statuses.append(
+            ColdStorageStatus(
+                trade_date=parse_date(row["trade_date"], f"cold_storage_status row {row_number} trade_date"),
+                total_capacity_qty=total_capacity,
+                current_occupied_qty=_parse_non_negative_int_or_default(
+                    row.get("current_occupied_qty"),
+                    field_name=f"cold_storage_status row {row_number} current_occupied_qty",
+                    default_value=0,
+                ),
+                expected_inbound_qty=_parse_non_negative_int_or_default(
+                    row.get("expected_inbound_qty"),
+                    field_name=f"cold_storage_status row {row_number} expected_inbound_qty",
+                    default_value=0,
+                ),
+                expected_outbound_qty=_parse_non_negative_int_or_default(
+                    row.get("expected_outbound_qty"),
+                    field_name=f"cold_storage_status row {row_number} expected_outbound_qty",
+                    default_value=0,
+                ),
+                warning_threshold_qty=_parse_non_negative_int_or_default(
+                    row.get("warning_threshold_qty"),
+                    field_name=f"cold_storage_status row {row_number} warning_threshold_qty",
+                    default_value=50,
+                ),
+                projected_occupied_qty_override=projected_override,
+                remaining_capacity_qty_override=remaining_override,
+                active=parse_bool(row.get("active", True), f"cold_storage_status row {row_number} active"),
+                note=str(row.get("note") or ""),
+            )
+        )
+    return statuses
 
 
 def load_cold_storage_status(path: Path) -> ColdStorageStatus:
-    rows = _read_rows(path, COLD_STORAGE_STATUS_HEADERS)
-    if not rows:
-        raise ValidationError(f"{path.name}: cold storage status requires at least one row")
-    row = rows[0]
-    return ColdStorageStatus(
-        trade_date=parse_date(row["trade_date"], "cold_storage_status row 2 trade_date"),
-        cold_storage_total_capacity_qty=_parse_int_or_default(
-            row.get("cold_storage_total_capacity_qty"),
-            field_name="cold_storage_status row 2 cold_storage_total_capacity_qty",
-            default_value=500,
-        ),
-        cold_storage_current_qty=_parse_int_or_default(
-            row.get("cold_storage_current_qty"),
-            field_name="cold_storage_status row 2 cold_storage_current_qty",
-            default_value=0,
-        ),
-        note=str(row.get("note") or ""),
-    )
+    statuses = load_cold_storage_statuses(path)
+    for status in statuses:
+        if status.active:
+            return status
+    return statuses[0]
 
 
 def export_tasks(path: Path, tasks: Iterable[Task]) -> Path:
@@ -497,6 +598,10 @@ def export_execution_logs(path: Path, logs: Iterable[ExecutionLog]) -> Path:
 
 def load_table_records(table_name: str, path: Path) -> list[dict[str, object]]:
     headers = get_table_headers(table_name)
+    if table_name == "capacity_plans":
+        return _read_capacity_plan_rows(path)
+    if table_name == "cold_storage_status":
+        return _read_cold_storage_status_rows(path)
     return _read_rows(path, headers)
 
 
@@ -551,6 +656,8 @@ def _validate_table_records(table_name: str, rows: list[dict[str, object]]) -> N
             load_capacity_plan(temp_path)
         elif table_name == "cold_storage_status":
             load_cold_storage_status(temp_path)
+        elif table_name == "platform_mappings":
+            load_table_records("platform_mappings", temp_path)
     finally:
         temp_path.unlink(missing_ok=True)
 
@@ -570,7 +677,26 @@ def _collect_table_validation_issues(table_name: str, rows: list[dict[str, objec
         return _collect_capacity_plan_issues(rows)
     if table_name == "cold_storage_status":
         return _collect_cold_storage_issues(rows)
+    if table_name == "platform_mappings":
+        return _collect_platform_mapping_issues(rows)
     raise ValidationError(f"unsupported table '{table_name}'")
+
+
+def _collect_platform_mapping_issues(rows: list[dict[str, object]]) -> list[TableValidationIssue]:
+    issues: list[TableValidationIssue] = []
+    seen_mapping_ids: dict[str, int] = {}
+    for row_number, row in enumerate(rows, start=2):
+        mapping_id = str(row.get("mapping_id") or "").strip()
+        platform_name = str(row.get("platform_name") or "").strip()
+        if not mapping_id:
+            issues.append(TableValidationIssue(row_number, "mapping_id", "该字段必填"))
+        elif mapping_id in seen_mapping_ids:
+            issues.append(TableValidationIssue(row_number, "mapping_id", f"与第 {seen_mapping_ids[mapping_id]} 行重复"))
+        else:
+            seen_mapping_ids[mapping_id] = row_number
+        if not platform_name:
+            issues.append(TableValidationIssue(row_number, "platform_name", "该字段必填"))
+    return issues
 
 
 def _collect_product_issues(rows: list[dict[str, object]]) -> list[TableValidationIssue]:
@@ -602,7 +728,16 @@ def _collect_product_issues(rows: list[dict[str, object]]) -> list[TableValidati
 
 def _collect_price_rule_issues(rows: list[dict[str, object]]) -> list[TableValidationIssue]:
     issues: list[TableValidationIssue] = []
-    required_fields = ["rule_id", "rule_name", "scope_type", "scope_value", "pricing_method", "rounding_rule"]
+    required_fields = [
+        "rule_id",
+        "rule_name",
+        "variety_filter",
+        "grade_filter",
+        "platform_filter",
+        "pricing_method",
+        "markup_value",
+        "rounding_rule",
+    ]
 
     for row_number, row in enumerate(rows, start=2):
         for field_name in required_fields:
@@ -611,7 +746,15 @@ def _collect_price_rule_issues(rows: list[dict[str, object]]) -> list[TableValid
                 issues.append(TableValidationIssue(row_number, field_name, "该字段必填"))
 
         _try_enum(row.get("pricing_method"), PricingMethod, row_number, "pricing_method", issues)
-        _try_parse_decimal(row.get("markup_value"), row_number, "markup_value", issues, required=False)
+        grade_filter = str(row.get("grade_filter") or "").strip().upper()
+        if grade_filter not in {"*", "A", "B", "C", "D", "E", "0"}:
+            issues.append(TableValidationIssue(row_number, "grade_filter", "必须为 * / A / B / C / D / E / 0"))
+        _try_parse_decimal(row.get("markup_value"), row_number, "markup_value", issues, required=True)
+        try:
+            if row.get("markup_value") not in ("", None) and parse_decimal(row.get("markup_value"), "") == 0:
+                issues.append(TableValidationIssue(row_number, "markup_value", "不能为 0；正数表示涨价，负数表示降价"))
+        except ValidationError:
+            pass
         _try_parse_decimal(row.get("min_price"), row_number, "min_price", issues, required=False)
         _try_enum(row.get("rounding_rule"), RoundingRule, row_number, "rounding_rule", issues)
         _try_parse_decimal(row.get("rounding_step"), row_number, "rounding_step", issues, required=False)
@@ -623,7 +766,17 @@ def _collect_price_rule_issues(rows: list[dict[str, object]]) -> list[TableValid
 
 def _collect_listing_rule_issues(rows: list[dict[str, object]]) -> list[TableValidationIssue]:
     issues: list[TableValidationIssue] = []
-    required_fields = ["rule_id", "rule_name", "condition_type", "action", "active", "priority"]
+    required_fields = [
+        "rule_id",
+        "rule_name",
+        "variety_filter",
+        "grade_filter",
+        "platform_filter",
+        "stock_threshold",
+        "listing_strategy",
+        "active",
+        "priority",
+    ]
 
     for row_number, row in enumerate(rows, start=2):
         for field_name in required_fields:
@@ -631,16 +784,23 @@ def _collect_listing_rule_issues(rows: list[dict[str, object]]) -> list[TableVal
             if value is None or str(value).strip() == "":
                 issues.append(TableValidationIssue(row_number, field_name, "该字段必填"))
 
-        condition_type_raw = str(row.get("condition_type") or "").strip()
-        _try_enum(condition_type_raw, ConditionType, row_number, "condition_type", issues)
-        _try_enum(row.get("action"), ListingAction, row_number, "action", issues)
+        grade_filter = str(row.get("grade_filter") or "").strip().upper()
+        if grade_filter not in {"*", "A", "B", "C", "D", "E", "0"}:
+            issues.append(TableValidationIssue(row_number, "grade_filter", "必须为 * / A / B / C / D / E / 0"))
+        _try_parse_decimal(row.get("stock_threshold"), row_number, "stock_threshold", issues, required=True)
+        try:
+            if row.get("stock_threshold") not in ("", None) and parse_decimal(row.get("stock_threshold"), "") < 0:
+                issues.append(TableValidationIssue(row_number, "stock_threshold", "必须大于或等于 0"))
+        except ValidationError:
+            pass
+        _try_enum(row.get("listing_strategy"), ListingStrategy, row_number, "listing_strategy", issues)
         _try_parse_bool(row.get("active"), row_number, "active", issues, required=True)
         _try_parse_int(row.get("priority"), row_number, "priority", issues, required=True)
-
-        if condition_type_raw in {ConditionType.STOCK_LTE.value, ConditionType.STOCK_GTE.value}:
-            _try_parse_decimal(row.get("condition_value"), row_number, "condition_value", issues, required=True)
-        elif condition_type_raw == ConditionType.TIME_GTE.value:
-            _try_parse_time(row.get("condition_value"), row_number, "condition_value", issues, required=True)
+        try:
+            if row.get("priority") not in ("", None) and parse_int(row.get("priority"), "") < 0:
+                issues.append(TableValidationIssue(row_number, "priority", "必须大于或等于 0"))
+        except ValidationError:
+            pass
 
     return issues
 
@@ -717,11 +877,43 @@ def _collect_capacity_plan_issues(rows: list[dict[str, object]]) -> list[TableVa
     if not rows:
         issues.append(TableValidationIssue(2, "trade_date", "该字段必填"))
         return issues
+    active_trade_dates: dict[str, int] = {}
     for row_number, row in enumerate(rows, start=2):
         _try_parse_date(row.get("trade_date"), row_number, "trade_date", issues, required=True)
-        _try_parse_int(row.get("normal_packing_capacity_qty"), row_number, "normal_packing_capacity_qty", issues, required=False)
-        _try_parse_int(row.get("temp_worker_capacity_qty"), row_number, "temp_worker_capacity_qty", issues, required=False)
-        _try_parse_int(row.get("confirmed_temp_worker_count"), row_number, "confirmed_temp_worker_count", issues, required=False)
+        _try_parse_non_negative_int(
+            row.get("normal_packing_capacity_qty"),
+            row_number,
+            "normal_packing_capacity_qty",
+            issues,
+            required=False,
+        )
+        _try_parse_non_negative_int(row.get("temp_worker_capacity_qty"), row_number, "temp_worker_capacity_qty", issues, required=False)
+        _try_parse_non_negative_int(row.get("confirmed_temp_worker_count"), row_number, "confirmed_temp_worker_count", issues, required=False)
+        _try_parse_non_negative_int(
+            row.get("confirmed_packing_capacity_qty"),
+            row_number,
+            "confirmed_packing_capacity_qty",
+            issues,
+            required=False,
+        )
+        active_value = row.get("active", True)
+        try:
+            is_active = parse_bool(active_value, f"capacity_plans row {row_number} active")
+        except ValidationError:
+            issues.append(TableValidationIssue(row_number, "active", "请输入是或否"))
+            is_active = False
+        trade_date_value = str(row.get("trade_date") or "").strip()
+        if is_active and trade_date_value:
+            if trade_date_value in active_trade_dates:
+                issues.append(
+                    TableValidationIssue(
+                        row_number,
+                        "trade_date",
+                        f"与第 {active_trade_dates[trade_date_value]} 行存在同一业务日期的启用计划",
+                    )
+                )
+            else:
+                active_trade_dates[trade_date_value] = row_number
     return issues
 
 
@@ -730,10 +922,34 @@ def _collect_cold_storage_issues(rows: list[dict[str, object]]) -> list[TableVal
     if not rows:
         issues.append(TableValidationIssue(2, "trade_date", "该字段必填"))
         return issues
+    active_trade_dates: dict[str, int] = {}
     for row_number, row in enumerate(rows, start=2):
         _try_parse_date(row.get("trade_date"), row_number, "trade_date", issues, required=True)
-        _try_parse_int(row.get("cold_storage_total_capacity_qty"), row_number, "cold_storage_total_capacity_qty", issues, required=False)
-        _try_parse_int(row.get("cold_storage_current_qty"), row_number, "cold_storage_current_qty", issues, required=False)
+        _try_parse_positive_int(row.get("total_capacity_qty"), row_number, "total_capacity_qty", issues, required=False)
+        _try_parse_non_negative_int(row.get("current_occupied_qty"), row_number, "current_occupied_qty", issues, required=False)
+        _try_parse_non_negative_int(row.get("expected_inbound_qty"), row_number, "expected_inbound_qty", issues, required=False)
+        _try_parse_non_negative_int(row.get("expected_outbound_qty"), row_number, "expected_outbound_qty", issues, required=False)
+        _try_parse_non_negative_int(row.get("warning_threshold_qty"), row_number, "warning_threshold_qty", issues, required=False)
+        _try_parse_non_negative_int(row.get("projected_occupied_qty"), row_number, "projected_occupied_qty", issues, required=False)
+        _try_parse_int(row.get("remaining_capacity_qty"), row_number, "remaining_capacity_qty", issues, required=False)
+        active_value = row.get("active", True)
+        try:
+            is_active = parse_bool(active_value, f"cold_storage_status row {row_number} active")
+        except ValidationError:
+            issues.append(TableValidationIssue(row_number, "active", "请输入是或否"))
+            is_active = False
+        trade_date_value = str(row.get("trade_date") or "").strip()
+        if is_active and trade_date_value:
+            if trade_date_value in active_trade_dates:
+                issues.append(
+                    TableValidationIssue(
+                        row_number,
+                        "trade_date",
+                        f"与第 {active_trade_dates[trade_date_value]} 行存在同一业务日期的启用冷库状态",
+                    )
+                )
+            else:
+                active_trade_dates[trade_date_value] = row_number
     return issues
 
 
@@ -781,6 +997,48 @@ def _try_parse_int(
         parse_int(value, f"row {row_number} {field_name}")
     except ValidationError:
         issues.append(TableValidationIssue(row_number, field_name, "请输入整数"))
+
+
+def _try_parse_non_negative_int(
+    value: object,
+    row_number: int,
+    field_name: str,
+    issues: list[TableValidationIssue],
+    *,
+    required: bool,
+) -> None:
+    if value in (None, ""):
+        if required:
+            issues.append(TableValidationIssue(row_number, field_name, "该字段必填"))
+        return
+    try:
+        parsed = parse_int(value, f"row {row_number} {field_name}")
+    except ValidationError:
+        issues.append(TableValidationIssue(row_number, field_name, "请输入整数"))
+        return
+    if parsed < 0:
+        issues.append(TableValidationIssue(row_number, field_name, "不能小于 0"))
+
+
+def _try_parse_positive_int(
+    value: object,
+    row_number: int,
+    field_name: str,
+    issues: list[TableValidationIssue],
+    *,
+    required: bool,
+) -> None:
+    if value in (None, ""):
+        if required:
+            issues.append(TableValidationIssue(row_number, field_name, "该字段必填"))
+        return
+    try:
+        parsed = parse_int(value, f"row {row_number} {field_name}")
+    except ValidationError:
+        issues.append(TableValidationIssue(row_number, field_name, "请输入整数"))
+        return
+    if parsed <= 0:
+        issues.append(TableValidationIssue(row_number, field_name, "必须大于 0"))
 
 
 def _try_parse_bool(
@@ -909,6 +1167,85 @@ def _read_rows(path: Path, expected_headers: list[str]) -> list[dict[str, object
     return rows
 
 
+def _read_capacity_plan_rows(path: Path) -> list[dict[str, object]]:
+    workbook = load_workbook(path)
+    sheet = workbook.active
+    header_row = [cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
+    legacy_headers = [
+        "trade_date",
+        "normal_packing_capacity_qty",
+        "temp_worker_capacity_qty",
+        "confirmed_temp_worker_count",
+        "allocation_rule",
+        "note",
+    ]
+    if header_row == CAPACITY_PLAN_HEADERS:
+        accepted_headers = CAPACITY_PLAN_HEADERS
+    elif header_row == legacy_headers:
+        accepted_headers = legacy_headers
+    else:
+        raise ValidationError(f"{path.name}: invalid headers. Expected {CAPACITY_PLAN_HEADERS}, got {header_row}")
+
+    rows: list[dict[str, object]] = []
+    for raw_row in sheet.iter_rows(min_row=2, values_only=True):
+        if all(_is_blank_cell(value) for value in raw_row):
+            continue
+        row = dict(zip(accepted_headers, raw_row, strict=True))
+        row.setdefault("confirmed_packing_capacity_qty", "")
+        row.setdefault("active", True)
+        rows.append(row)
+    return rows
+
+
+def _read_cold_storage_status_rows(path: Path) -> list[dict[str, object]]:
+    workbook = load_workbook(path)
+    sheet = workbook.active
+    header_row = [cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
+    legacy_headers = [
+        "trade_date",
+        "cold_storage_total_capacity_qty",
+        "cold_storage_current_qty",
+        "note",
+    ]
+    if header_row == COLD_STORAGE_STATUS_HEADERS:
+        accepted_headers = COLD_STORAGE_STATUS_HEADERS
+    elif header_row == legacy_headers:
+        accepted_headers = legacy_headers
+    else:
+        raise ValidationError(
+            f"{path.name}: invalid headers. Expected {COLD_STORAGE_STATUS_HEADERS}, got {header_row}"
+        )
+
+    rows: list[dict[str, object]] = []
+    for raw_row in sheet.iter_rows(min_row=2, values_only=True):
+        if all(_is_blank_cell(value) for value in raw_row):
+            continue
+        row = dict(zip(accepted_headers, raw_row, strict=True))
+        if accepted_headers == legacy_headers:
+            row = {
+                "trade_date": row.get("trade_date"),
+                "total_capacity_qty": row.get("cold_storage_total_capacity_qty"),
+                "current_occupied_qty": row.get("cold_storage_current_qty"),
+                "expected_inbound_qty": 0,
+                "expected_outbound_qty": 0,
+                "warning_threshold_qty": 50,
+                "projected_occupied_qty": "",
+                "remaining_capacity_qty": "",
+                "active": True,
+                "note": row.get("note") or "",
+            }
+        else:
+            row.setdefault("expected_inbound_qty", 0)
+            row.setdefault("expected_outbound_qty", 0)
+            row.setdefault("warning_threshold_qty", 50)
+            row.setdefault("projected_occupied_qty", "")
+            row.setdefault("remaining_capacity_qty", "")
+            row.setdefault("active", True)
+            row.setdefault("note", "")
+        rows.append(row)
+    return rows
+
+
 def _read_task_rows(path: Path) -> list[dict[str, object]]:
     workbook = load_workbook(path)
     sheet = workbook.active
@@ -940,6 +1277,13 @@ def _parse_int_or_default(value: object, *, field_name: str, default_value: int)
     if value in (None, ""):
         return default_value
     return parse_int(value, field_name)
+
+
+def _parse_non_negative_int_or_default(value: object, *, field_name: str, default_value: int) -> int:
+    parsed = _parse_int_or_default(value, field_name=field_name, default_value=default_value)
+    if parsed < 0:
+        raise ValidationError(f"{field_name} must be greater than or equal to 0")
+    return parsed
 
 
 def _is_blank_cell(value: object) -> bool:

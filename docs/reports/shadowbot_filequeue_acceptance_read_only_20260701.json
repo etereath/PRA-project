@@ -1,0 +1,211 @@
+{
+  "checks": [
+    {
+      "detail": "ATTEMPT-ACCEPT-READ-20260701-002",
+      "name": "attempt_exists",
+      "ok": true
+    },
+    {
+      "detail": "READ_ONLY",
+      "name": "execution_mode_matches",
+      "ok": true
+    },
+    {
+      "detail": "2026-07-01 09:50:38.680926+00:00",
+      "name": "attempt_finished",
+      "ok": true
+    },
+    {
+      "detail": "sha256:2f37b36e3bf0e9c6742be957682ba45090f2530683df9643efaca61fb8ac70a2",
+      "name": "instruction_hash_recorded",
+      "ok": true
+    },
+    {
+      "detail": "792cdbb0f75c3f2ada9877645271f78eb36e3b71076158b0d5199c1afe4ac98f",
+      "name": "request_sha256_recorded",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\inbox\\ATTEMPT-ACCEPT-READ-20260701-002.ready.json",
+      "name": "queue_request_path_recorded",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-ACCEPT-READ-20260701-002",
+      "name": "archive_directory_exists",
+      "ok": true
+    },
+    {
+      "detail": [
+        "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-ACCEPT-READ-20260701-002\\ATTEMPT-ACCEPT-READ-20260701-002.request.json"
+      ],
+      "name": "one_archived_request",
+      "ok": true
+    },
+    {
+      "detail": [
+        "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-ACCEPT-READ-20260701-002\\ATTEMPT-ACCEPT-READ-20260701-002.result.json"
+      ],
+      "name": "one_archived_result",
+      "ok": true
+    },
+    {
+      "detail": [
+        "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-ACCEPT-READ-20260701-002\\ATTEMPT-ACCEPT-READ-20260701-002.phase.json"
+      ],
+      "name": "one_archived_phase",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-ACCEPT-READ-20260701-002\\ATTEMPT-ACCEPT-READ-20260701-002.request.json",
+      "name": "request_checksum_valid",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-ACCEPT-READ-20260701-002\\ATTEMPT-ACCEPT-READ-20260701-002.result.json",
+      "name": "result_checksum_valid",
+      "ok": true
+    },
+    {
+      "detail": "792cdbb0f75c3f2ada9877645271f78eb36e3b71076158b0d5199c1afe4ac98f",
+      "name": "request_hash_matches_database",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "TASK-ACCEPT-READ-20260701-002",
+        "result": "TASK-ACCEPT-READ-20260701-002"
+      },
+      "name": "binding_task_id",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "OP-ACCEPT-READ-20260701-002",
+        "result": "OP-ACCEPT-READ-20260701-002"
+      },
+      "name": "binding_operation_id",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "ATTEMPT-ACCEPT-READ-20260701-002",
+        "result": "ATTEMPT-ACCEPT-READ-20260701-002"
+      },
+      "name": "binding_execution_attempt_id",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "READ_ONLY",
+        "result": "READ_ONLY"
+      },
+      "name": "binding_execution_mode",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "sha256:2f37b36e3bf0e9c6742be957682ba45090f2530683df9643efaca61fb8ac70a2",
+        "result": "sha256:2f37b36e3bf0e9c6742be957682ba45090f2530683df9643efaca61fb8ac70a2"
+      },
+      "name": "binding_instruction_hash",
+      "ok": true
+    },
+    {
+      "detail": "792cdbb0f75c3f2ada9877645271f78eb36e3b71076158b0d5199c1afe4ac98f",
+      "name": "result_request_hash_matches",
+      "ok": true
+    },
+    {
+      "detail": "READ_ONLY",
+      "name": "result_mode_matches",
+      "ok": true
+    },
+    {
+      "detail": "READ_COMPLETED",
+      "name": "result_status_accepted",
+      "ok": true
+    },
+    {
+      "detail": true,
+      "name": "technical_run_succeeded",
+      "ok": true
+    },
+    {
+      "detail": false,
+      "name": "no_business_completion",
+      "ok": true
+    },
+    {
+      "detail": "NOT_STARTED",
+      "name": "no_side_effect",
+      "ok": true
+    },
+    {
+      "detail": "RESULT_WRITTEN",
+      "name": "phase_result_written",
+      "ok": true
+    },
+    {
+      "detail": "LAPTOP-O9O76RQV",
+      "name": "phase_worker_recorded",
+      "ok": true
+    },
+    {
+      "detail": 1,
+      "name": "evidence_present",
+      "ok": true
+    },
+    {
+      "detail": "c2dbab83fbef1bc6ee028c354a0a8395124bb77b088661b418b8b8b81850457b",
+      "name": "evidence_1_sha256",
+      "ok": true
+    },
+    {
+      "detail": "2026-07-01T17:49:50+08:00",
+      "name": "evidence_1_captured_at",
+      "ok": true
+    },
+    {
+      "detail": "SUCCESS",
+      "name": "evidence_1_upload_success",
+      "ok": true
+    },
+    {
+      "detail": true,
+      "name": "evidence_1_hash_verified",
+      "ok": true
+    },
+    {
+      "detail": "\\\\LAPTOP-O9O76RQV\\pra-evidence\\ATTEMPT-ACCEPT-READ-20260701-002\\ATTEMPT-ACCEPT-READ-20260701-002_supply_price.png",
+      "name": "evidence_1_storage_exists",
+      "ok": true
+    },
+    {
+      "detail": "c2dbab83fbef1bc6ee028c354a0a8395124bb77b088661b418b8b8b81850457b",
+      "name": "evidence_1_storage_hash",
+      "ok": true
+    },
+    {
+      "detail": [],
+      "name": "no_active_queue_files",
+      "ok": true
+    },
+    {
+      "detail": [],
+      "name": "not_quarantined",
+      "ok": true
+    },
+    {
+      "detail": 1,
+      "name": "execution_log_written",
+      "ok": true
+    }
+  ],
+  "execution_attempt_id": "ATTEMPT-ACCEPT-READ-20260701-002",
+  "execution_mode": "READ_ONLY",
+  "failed_checks": [],
+  "ok": true,
+  "schema_version": "shadowbot-filequeue-acceptance-1.0",
+  "status": "READ_COMPLETED"
+}

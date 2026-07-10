@@ -2,17 +2,24 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta
+import re
+import sqlite3
+from datetime import date, datetime, timedelta, timezone
 from html import escape
 from http.cookies import SimpleCookie
 from pathlib import Path
 from secrets import token_urlsafe
-from urllib.parse import parse_qs, unquote, urlencode
-from wsgiref.simple_server import make_server
+from socketserver import ThreadingMixIn
+from urllib.parse import parse_qs, unquote, urlencode, urlparse
+from uuid import uuid4
+from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
-from app.enums import NotificationSendStatus, ReviewTaskStatus, TaskStatus
+from app.enums import NotificationSendStatus, ReviewTaskStatus, TaskActionType, TaskStatus
 from app.exceptions import TableValidationError, ValidationError
 from app.field_labels import FIELD_LABELS, TABLE_LABELS
+from app.models import NotificationLog
+from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.repositories.mock_platform_repository import DEFAULT_MOCK_PLATFORM_DB, MockPlatformRepository
 from app.repositories.workbook_repository import (
     get_table_headers,
     load_table_records,
@@ -30,6 +37,7 @@ from app.services.workflow import (
     get_runtime_review_task,
     get_runtime_task,
     get_mobile_review_detail,
+    list_runtime_execution_logs,
     list_runtime_notification_logs,
     list_runtime_task_history,
     list_runtime_review_tasks,
@@ -39,15 +47,92 @@ from app.services.workflow import (
     resolve_mobile_review,
     resolve_runtime_review_task,
     simulate_execution_from_tasks,
+    source_task_status_for_review_resolution,
     validate_sources,
 )
-from app.services.runtime import DEFAULT_RUNTIME_DB
+from app.services.runtime import DEFAULT_RUNTIME_DB, NotificationLogService, NotificationSenderFactory
+from app.services.shadowbot_executor import ShadowBotExecutor, build_shadowbot_task_runner_from_environment
+from app.services.business_rule_evaluation import BusinessRuleRunner
+from app.services.product_inventory_input import (
+    FOLLOW_GRADE_VALUE,
+    GRADE_STEM_LENGTH_MAP,
+    GRADE_OPTIONS,
+    PLATFORM_OPTIONS,
+    STEM_LENGTH_OPTIONS,
+    UNIT_OPTIONS,
+    ProductInventoryInputError,
+    apply_inventory_input,
+    apply_product_edit,
+    extract_variety_options,
+    format_product_number,
+    load_product_input_rows,
+    persist_product_rows,
+    sale_enabled_display,
+    validate_inventory_form,
+    validate_product_edit_form,
+)
+from app.services.price_rule_input import (
+    PRICING_METHOD_OPTIONS,
+    ROUNDING_RULE_OPTIONS,
+    PriceRuleInputError,
+    active_display,
+    apply_price_rule_edit,
+    apply_price_rule_input,
+    format_price_rule_number,
+    load_price_rule_input_rows,
+    persist_price_rule_rows,
+    validate_price_rule_form,
+)
+from app.services.listing_rule_input import (
+    LISTING_STRATEGY_OPTIONS,
+    ListingRuleInputError,
+    active_display as listing_active_display,
+    apply_listing_rule_edit,
+    apply_listing_rule_input,
+    format_listing_rule_number,
+    format_listing_rule_scope,
+    load_listing_rule_input_rows,
+    persist_listing_rule_rows,
+    validate_listing_rule_form,
+)
+from app.services.capacity_plan_input import (
+    CapacityPlanInputError,
+    active_display as capacity_active_display,
+    apply_capacity_plan_edit,
+    apply_capacity_plan_input,
+    computed_capacity_from_row,
+    format_capacity_number,
+    load_capacity_plan_input_rows,
+    persist_capacity_plan_rows,
+    validate_capacity_plan_form,
+)
+from app.services.cold_storage_input import (
+    ColdStorageInputError,
+    active_display as cold_storage_active_display,
+    apply_cold_storage_edit,
+    apply_cold_storage_input,
+    computed_projected_occupied_from_row,
+    computed_remaining_capacity_from_row,
+    format_cold_storage_number,
+    load_cold_storage_input_rows,
+    persist_cold_storage_rows,
+    validate_cold_storage_form,
+)
+from app.services.platform_mapping_input import (
+    PlatformMappingInputError,
+    apply_platform_input,
+    ensure_platform_mappings_workbook,
+    load_platform_mapping_rows,
+    persist_platform_mapping_rows,
+    platform_options_from_rows,
+)
 from app.utils import parse_date
 
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PRODUCTS = ROOT / "data" / "samples" / "products.xlsx"
 DEFAULT_PRICE_RULES = ROOT / "data" / "samples" / "price_rules.xlsx"
+DEFAULT_PLATFORM_MAPPINGS = ROOT / "data" / "samples" / "platform_mappings.xlsx"
 DEFAULT_LISTING_RULES = ROOT / "data" / "samples" / "listing_rules.xlsx"
 DEFAULT_OUTPUT = ROOT / "data" / "samples" / "web_generated_tasks.xlsx"
 DEFAULT_EXECUTION_LOGS = ROOT / "data" / "samples" / "web_execution_logs.xlsx"
@@ -57,10 +142,18 @@ DEFAULT_PRICE_FORECASTS = ROOT / "data" / "samples" / "price_forecasts.xlsx"
 DEFAULT_CAPACITY_PLANS = ROOT / "data" / "samples" / "capacity_plans.xlsx"
 DEFAULT_COLD_STORAGE_STATUS = ROOT / "data" / "samples" / "cold_storage_status.xlsx"
 DEFAULT_MANUAL_TASKS = ROOT / "data" / "samples" / "web_generated_tasks.xlsx"
+BUSINESS_INPUT_TABS = {
+    "inventory": "录入库存",
+    "price_rules": "价格规则管理",
+    "listing_rules": "上下架规则管理",
+    "capacity_plans": "包装产能计划",
+    "cold_storage_status": "冷库状态",
+}
 
 TABLE_OPTIONS = {
     "products": {"label": TABLE_LABELS["products"], "path": DEFAULT_PRODUCTS},
     "price_rules": {"label": TABLE_LABELS["price_rules"], "path": DEFAULT_PRICE_RULES},
+    "platform_mappings": {"label": TABLE_LABELS["platform_mappings"], "path": DEFAULT_PLATFORM_MAPPINGS},
     "listing_rules": {"label": TABLE_LABELS["listing_rules"], "path": DEFAULT_LISTING_RULES},
     "harvest_forecasts": {"label": TABLE_LABELS["harvest_forecasts"], "path": DEFAULT_HARVEST_FORECASTS},
     "price_forecasts": {"label": TABLE_LABELS["price_forecasts"], "path": DEFAULT_PRICE_FORECASTS},
@@ -72,18 +165,212 @@ TABLE_HEADER_LABELS = FIELD_LABELS
 RUNTIME_SESSION_COOKIE = "pra_runtime_session"
 RUNTIME_SESSION_TTL_SECONDS = 3600
 MOBILE_RESOLUTION_PAYLOAD_MAX_BYTES = 4096
+CURRENT_RUNTIME_SCHEMA_VERSION = 3
+PAGE_SIZE = 50
+TERMINAL_TASK_STATUS_VALUES = {"success", "skipped", "cancelled", "expired"}
 _RUNTIME_SESSIONS: dict[str, dict[str, object]] = {}
+DISPLAY_TIMEZONE = timezone(timedelta(hours=8))
+
+DISPLAY_ENUM_LABELS = {
+    "task_status": {
+        "pending": "待处理",
+        "running": "执行中",
+        "success": "已完成",
+        "failed": "失败",
+        "skipped": "已跳过",
+        "manual_review": "等待人工确认",
+        "cancelled": "已取消",
+        "expired": "已过期",
+    },
+    "review_status": {
+        "pending": "待处理",
+        "approved": "已通过",
+        "rejected": "已拒绝",
+        "adjusted": "已调整",
+        "expired": "已过期",
+        "cancelled": "已取消",
+    },
+    "send_status": {
+        "pending": "待发送",
+        "success": "发送成功",
+        "failed": "发送失败",
+    },
+    "action_type": {
+        "update_price": "改价",
+        "set_online": "上架",
+        "set_offline": "下架",
+        "sync_status": "同步状态",
+        "capacity_warning": "产能预警",
+        "labor_required": "临时工确认",
+        "manual_price_review": "人工价格复核",
+        "below_break_even_review": "低于保本价复核",
+        "shortage_warning": "短缺预警",
+        "cold_storage_warning": "冷库预警",
+        "clearance_warning": "清库存预警",
+        "manual_review": "人工复核",
+    },
+    "review_type": {
+        "manual_review": "人工复核",
+        "manual_price_review": "人工价格复核",
+        "below_break_even_review": "低于保本价复核",
+        "labor_required": "临时工确认",
+        "capacity_warning": "产能预警",
+        "shortage_warning": "短缺预警",
+        "cold_storage_warning": "冷库预警",
+        "clearance_warning": "清库存预警",
+    },
+    "scope_type": {
+        "global": "全局事项",
+        "forecast_group": "预测分组",
+        "all": "全部商品",
+        "grade": "按等级",
+        "variety": "按品种",
+        "product_name": "按品种",
+        "product": "按品种",
+        "sku": "单个商品",
+        "platform": "单个平台",
+        "task": "单个任务",
+    },
+    "pricing_method": {
+        "fixed_markup": "固定改价",
+        "percentage_markup": "百分比改价",
+    },
+    "rounding_rule": {
+        "none": "不取整",
+        "round": "四舍五入到整数",
+        "ceil": "向上取整",
+        "floor": "向下取整",
+        "step": "按步长向上取整",
+    },
+    "listing_strategy": {
+        "allow_online": "允许上架",
+        "prohibit_online": "禁止上架",
+        "stock_below_offline": "库存低于阈值下架",
+        "stock_above_online": "库存高于阈值允许上架",
+    },
+    "channel": {
+        "mock": "模拟通知",
+        "feishu": "飞书",
+    },
+    "recipient_type": {
+        "role": "角色",
+        "system": "系统",
+        "user": "用户",
+    },
+}
 
 UI_TEXT = {
-    "site_title": "PRA \u7ba1\u7406\u53f0",
-    "dashboard_title": "PRA \u7ba1\u7406\u53f0",
-    "dashboard_lede": "\u5f53\u524d\u9875\u9762\u7528\u4e8e\u6821\u9a8c Excel \u6570\u636e\u3001\u751f\u6210\u4efb\u52a1\uff0c\u5e76\u5728\u4fdd\u7559 AI \u5b9a\u4ef7\u5efa\u8bae\u5f00\u5173\u7684\u524d\u63d0\u4e0b\u5feb\u901f\u9a8c\u8bc1\u6574\u6761\u4e1a\u52a1\u94fe\u8def\u3002",
-    "dashboard_tab": "\u4efb\u52a1\u9762\u677f",
+    "site_title": "PRA \u8fd0\u884c\u6001\u8fd0\u8425\u540e\u53f0",
+    "dashboard_title": "PRA 业务数据与任务生成",
+    "dashboard_lede": "在这里维护业务表格、校验输入，并生成后续需要处理的任务。",
+    "dashboard_tab": "\u9996\u9875\u603b\u89c8",
+    "tasks_tab": "\u4efb\u52a1\u4e2d\u5fc3",
+    "reviews_tab": "\u590d\u6838\u4e2d\u5fc3",
+    "notifications_tab": "\u901a\u77e5\u4e2d\u5fc3",
+    "execution_logs_tab": "执行记录",
+    "business_inputs_tab": "业务数据",
+    "system_tab": "系统维护",
     "tables_tab": "Excel \u8868\u683c\u7ba1\u7406",
     "execution_tab": "\u6267\u884c\u56de\u5199",
     "manual_tab": "\u4eba\u5de5\u4ecb\u5165",
     "runtime_tab": "SQLite \u8fd0\u884c\u6001",
+    "ops_dashboard_title": "PRA \u8fd0\u884c\u6001\u8fd0\u8425\u540e\u53f0",
+    "ops_dashboard_lede": "首页总览用于查看今天是否有待处理复核、即将超时事项、通知失败和待执行任务。",
+    "legacy_root_notice": "\u65e7 /\u9875\u9762\u4ecd\u4fdd\u7559\u4efb\u52a1\u751f\u6210\u6d41\u7a0b\uff0c\u8fd0\u884c\u6001\u5bfc\u822a\u5df2\u8fc1\u79fb\u5230 /dashboard\u3002",
+    "legacy_tables_notice": "\u8be5\u9875\u5df2\u5f52\u5165\u4e1a\u52a1\u8f93\u5165\uff0c\u8fd0\u884c\u6001\u6570\u636e\u8bf7\u4ece\u65b0\u5bfc\u822a\u8fdb\u5165\u3002",
+    "legacy_execution_notice": "\u8be5\u9875\u7528\u4e8e mock \u6267\u884c/\u65e7\u56de\u5199\u517c\u5bb9\uff0c\u6b63\u5f0f\u67e5\u770b\u8bf7\u8fdb\u5165\u6267\u884c\u65e5\u5fd7\u3002",
+    "legacy_manual_notice": "\u65e7 Excel \u4eba\u5de5\u4ecb\u5165\u53ea\u8bfb\u517c\u5bb9\uff0c\u6b63\u5f0f\u590d\u6838\u8bf7\u8fdb\u5165\u590d\u6838\u4e2d\u5fc3\u3002",
+    "legacy_runtime_notice": "\u8fd0\u884c\u6001\u80fd\u529b\u5df2\u62c6\u5206\u4e3a\u4efb\u52a1\u4e2d\u5fc3\u3001\u590d\u6838\u4e2d\u5fc3\u548c\u901a\u77e5\u4e2d\u5fc3\uff0c\u8fd9\u91cc\u4fdd\u7559\u805a\u5408\u517c\u5bb9\u5165\u53e3\u3002",
     "task_panel_title": "\u4efb\u52a1\u751f\u6210",
+    "ops_tasks_title": "\u4efb\u52a1\u4e2d\u5fc3",
+    "ops_reviews_title": "\u590d\u6838\u4e2d\u5fc3",
+    "ops_notifications_title": "\u901a\u77e5\u4e2d\u5fc3",
+    "ops_execution_logs_title": "执行记录",
+    "ops_business_inputs_title": "业务数据",
+    "ops_system_title": "系统维护",
+    "ops_login_required": "这些运营页面需要先登录后才能查看。",
+    "ops_empty_tasks": "当前没有待执行或待处理任务。可以先去业务数据生成任务。",
+    "ops_empty_reviews": "当前没有需要人工确认的事项。",
+    "ops_empty_notifications": "当前还没有飞书或系统通知记录。",
+    "ops_empty_execution_logs": "当前还没有执行器回写结果；接入真实 RPA 后会在这里查看执行结果。",
+    "ops_execution_logs_note": "执行记录用于查看系统或执行器实际处理后的结果；ShadowBot 记录会展示操作、尝试、模式、价格、证据和对账告警。",
+    "ops_review_runtime_hint": "复核中心是 Web 人工复核主入口；旧聚合页仍可用于排障。",
+    "ops_system_config_only": "系统维护用于检查飞书通知、手机复核链接、数据库和后台配置；本页只做配置与本地状态检查。",
+    "ops_system_config_checks": "\u914d\u7f6e\u68c0\u67e5",
+    "ops_system_db_checks": "\u8fd0\u884c\u6001\u6570\u636e\u5e93\u68c0\u67e5",
+    "ops_system_runtime_counts": "\u8fd0\u884c\u6001\u8ba1\u6570",
+    "ops_system_runtime_summary": "\u8fd0\u884c\u72b6\u6001\u6458\u8981",
+    "ops_system_connectivity": "\u5916\u90e8\u8fde\u901a\u6027\u8fb9\u754c",
+    "ops_system_module": "\u6a21\u5757",
+    "ops_system_item": "\u68c0\u67e5\u9879",
+    "ops_system_status": "\u72b6\u6001",
+    "ops_system_value": "\u503c",
+    "ops_system_recommendation": "\u5efa\u8bae",
+    "ops_system_status_ok": "ok",
+    "ops_system_status_info": "info",
+    "ops_system_status_warning": "warning",
+    "ops_system_status_error": "error",
+    "ops_system_status_not_configured": "not_configured",
+    "ops_system_not_verified": "\u672a\u9a8c\u8bc1",
+    "ops_system_latest_schema": "最新结构版本要求",
+    "ops_system_db_exists": "DB \u6587\u4ef6",
+    "ops_system_db_readable": "DB \u53ef\u8bfb",
+    "ops_system_table_count": "\u8868\u8ba1\u6570",
+    "ops_system_external_note": "\u672c\u9875\u4e0d\u81ea\u52a8\u53d1\u9001\u98de\u4e66\u6d4b\u8bd5\u6d88\u606f\uff0c\u4e0d\u81ea\u52a8\u63a2\u6d4b cpolar \u6216 Mobile Review \u5916\u7f51\u94fe\u8def\uff1b\u771f\u5b9e\u8fde\u901a\u6027\u9700\u5355\u72ec\u624b\u52a8\u9a8c\u8bc1\u3002",
+    "ops_system_test_feishu_title": "\u624b\u52a8\u6d4b\u8bd5\u98de\u4e66\u901a\u77e5",
+    "ops_system_test_feishu_note": "\u8be5\u6d4b\u8bd5\u53ea\u9a8c\u8bc1 FeishuWebhookNotificationSender\u3001Webhook\u3001\u7b7e\u540d\u548c\u7f51\u7edc\uff0c\u4e0d\u521b\u5efa review_task\u3001review_token \u6216 mobile_review_url\u3002",
+    "ops_system_test_feishu_button": "\u53d1\u9001\u98de\u4e66\u6d4b\u8bd5\u901a\u77e5",
+    "ops_system_test_feishu_success": "\u98de\u4e66\u6d4b\u8bd5\u901a\u77e5\u53d1\u9001\u6210\u529f\u3002",
+    "ops_system_test_feishu_not_feishu": "\u5f53\u524d\u901a\u77e5\u6e20\u9053\u4e0d\u662f feishu\uff0c\u4e0d\u4f1a\u53d1\u9001\u98de\u4e66\u6d4b\u8bd5\u901a\u77e5\u3002",
+    "ops_system_test_feishu_failed": "\u98de\u4e66\u6d4b\u8bd5\u901a\u77e5\u53d1\u9001\u5931\u8d25\uff1a{error}",
+    "ops_config_present": "\u5df2\u914d\u7f6e",
+    "ops_config_missing": "\u672a\u914d\u7f6e",
+    "ops_runtime_db_path": "运行数据库",
+    "ops_schema_versions": "结构版本",
+    "ops_link_to_tables": "\u8fdb\u5165 Excel \u8868\u683c\u7ba1\u7406",
+    "ops_link_to_generator": "生成待处理任务",
+    "ops_link_to_execution": "\u8fdb\u5165 mock \u6267\u884c\u517c\u5bb9\u9875",
+    "ops_link_to_runtime": "\u8fdb\u5165\u65e7 /runtime \u805a\u5408\u9875",
+    "ops_dashboard_pending_reviews": "\u5f85\u590d\u6838",
+    "ops_dashboard_due_soon_reviews": "\u5373\u5c06\u8d85\u65f6\u590d\u6838",
+    "ops_dashboard_failed_notifications": "\u5931\u8d25\u901a\u77e5",
+    "ops_dashboard_pending_tasks": "\u5f85\u6267\u884c\u4efb\u52a1",
+    "ops_dashboard_expired_total": "\u5df2\u8fc7\u671f",
+    "ops_dashboard_expired_breakdown": "\u4efb\u52a1 {tasks}\uff0c\u590d\u6838 {reviews}",
+    "ops_dashboard_view_tasks": "\u67e5\u770b\u8fc7\u671f\u4efb\u52a1",
+    "ops_dashboard_view_reviews": "\u67e5\u770b\u8fc7\u671f\u590d\u6838",
+    "ops_filter_all": "\u5168\u90e8",
+    "ops_filter_apply": "\u7b5b\u9009",
+    "ops_filter_due_soon": "\u4ec5\u5373\u5c06\u8d85\u65f6",
+    "ops_task_detail_title": "\u4efb\u52a1\u8be6\u60c5",
+    "ops_task_not_found": "\u672a\u627e\u5230\u5bf9\u5e94\u4efb\u52a1\u3002",
+    "ops_task_related_reviews_title": "\u5173\u8054\u590d\u6838",
+    "ops_task_related_notifications_title": "\u5173\u8054\u901a\u77e5",
+    "ops_task_related_execution_logs_title": "\u5173\u8054\u6267\u884c\u65e5\u5fd7",
+    "ops_task_no_related_reviews": "\u5f53\u524d\u4efb\u52a1\u6ca1\u6709 source_task_id \u6307\u5411\u5b83\u7684\u590d\u6838\u4efb\u52a1\u3002",
+    "ops_task_no_related_notifications": "\u5f53\u524d\u4efb\u52a1\u6682\u65e0\u5173\u8054\u901a\u77e5\u3002",
+    "ops_task_no_execution_logs": "\u5f53\u524d\u6682\u65e0\u6267\u884c\u65e5\u5fd7\u3002",
+    "ops_task_notification_direct": "\u76f4\u63a5\u5173\u8054",
+    "ops_task_notification_via_review": "\u901a\u8fc7\u590d\u6838\u5173\u8054",
+    "ops_review_detail_title": "\u590d\u6838\u8be6\u60c5",
+    "ops_review_handle_title": "\u5904\u7406\u590d\u6838",
+    "ops_review_source_task_title": "\u6e90\u4efb\u52a1\u72b6\u6001",
+    "ops_review_related_notifications_title": "\u5173\u8054\u901a\u77e5",
+    "ops_review_tokens_title": "\u624b\u673a\u590d\u6838 Token \u6458\u8981",
+    "ops_review_history_title": "\u72b6\u6001\u5386\u53f2",
+    "ops_review_detail_link": "\u67e5\u770b\u8be6\u60c5",
+    "ops_review_no_detail": "\u672a\u627e\u5230\u6307\u5b9a\u7684\u590d\u6838\u4efb\u52a1\u3002",
+    "ops_review_handled_hint": "\u8be5\u590d\u6838\u4efb\u52a1\u5df2\u5904\u7406\uff0c\u4e0d\u518d\u663e\u793a\u5904\u7406\u8868\u5355\u3002",
+    "ops_json_full": "\u67e5\u770b\u622a\u65ad\u540e\u7684\u5b8c\u6574 JSON",
+    "ops_notification_detail_title": "\u901a\u77e5\u8be6\u60c5",
+    "ops_notification_related_review_title": "\u5173\u8054\u590d\u6838",
+    "ops_notification_related_task_title": "\u5173\u8054\u4efb\u52a1",
+    "ops_notification_not_found": "\u672a\u627e\u5230\u5bf9\u5e94\u901a\u77e5\u3002",
+    "ops_notification_view_detail": "\u67e5\u770b\u8be6\u60c5",
+    "ops_notification_current_feishu_type": "\u5f53\u524d\u98de\u4e66\u6d88\u606f\u7c7b\u578b",
+    "ops_notification_config_snapshot_note": "\u8be5\u503c\u6765\u81ea\u5f53\u524d\u914d\u7f6e\uff0c\u4e0d\u4ee3\u8868\u6bcf\u6761\u5386\u53f2\u901a\u77e5\u7684\u6301\u4e45\u5316\u5b57\u6bb5\u3002",
+    "ops_notification_no_related_review": "\u8be5\u901a\u77e5\u672a\u5173\u8054\u590d\u6838\u4efb\u52a1\uff0c\u6216\u5173\u8054\u590d\u6838\u5df2\u4e0d\u5b58\u5728\u3002",
+    "ops_notification_no_related_task": "\u8be5\u901a\u77e5\u672a\u5173\u8054\u6e90\u4efb\u52a1\uff0c\u6216\u5173\u8054\u4efb\u52a1\u5df2\u4e0d\u5b58\u5728\u3002",
     "execution_panel_title": "\u6a21\u62df\u6267\u884c\u4e0e\u56de\u5199",
     "resources_title": "\u5185\u7f6e\u8d44\u6e90",
     "products_path": "\u5546\u54c1\u8868\u8def\u5f84",
@@ -184,9 +471,19 @@ UI_TEXT = {
 }
 
 
+class ThreadedWSGIServer(ThreadingMixIn, WSGIServer):
+    daemon_threads = True
+
+
 def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
     print(f"{UI_TEXT['site_title']} {host}:{port}")
-    with make_server(host, port, application) as httpd:
+    with make_server(
+        host,
+        port,
+        application,
+        server_class=ThreadedWSGIServer,
+        handler_class=WSGIRequestHandler,
+    ) as httpd:
         httpd.serve_forever()
 
 
@@ -196,6 +493,38 @@ def application(environ, start_response):
 
     if path == "/health":
         return _respond(start_response, "200 OK", "text/plain; charset=utf-8", "ok")
+    if path == "/dashboard":
+        return _respond(start_response, "200 OK", "text/html; charset=utf-8", _handle_ops_dashboard(environ))
+    if path == "/tasks":
+        return _respond(start_response, "200 OK", "text/html; charset=utf-8", _handle_tasks_page(environ))
+    if path == "/reviews":
+        result = _handle_reviews_page(method, environ)
+        if isinstance(result, tuple):
+            status, body, headers = result
+            return _respond(start_response, status, "text/html; charset=utf-8", body, headers=headers)
+        return _respond(start_response, "200 OK", "text/html; charset=utf-8", result)
+    if path == "/notifications":
+        return _respond(start_response, "200 OK", "text/html; charset=utf-8", _handle_notifications_page(environ))
+    if path == "/execution-logs":
+        result = _handle_execution_logs_page(method, environ)
+        if isinstance(result, tuple):
+            status, body, headers = result
+            return _respond(start_response, status, "text/html; charset=utf-8", body, headers=headers)
+        return _respond(start_response, "200 OK", "text/html; charset=utf-8", result)
+    if path == "/business-inputs":
+        result = _handle_business_inputs_page(method, environ)
+        if isinstance(result, tuple):
+            status, body, headers = result
+            return _respond(start_response, status, "text/html; charset=utf-8", body, headers=headers)
+        return _respond(start_response, "200 OK", "text/html; charset=utf-8", result)
+    if path == "/system/test-feishu-notification":
+        result = _handle_system_test_feishu_notification(method, environ)
+        if isinstance(result, tuple):
+            status, body, headers = result
+            return _respond(start_response, status, "text/html; charset=utf-8", body, headers=headers)
+        return _respond(start_response, "200 OK", "text/html; charset=utf-8", result)
+    if path == "/system":
+        return _respond(start_response, "200 OK", "text/html; charset=utf-8", _handle_system_page(environ))
     if path == "/":
         return _respond(start_response, "200 OK", "text/html; charset=utf-8", _handle_dashboard(method, environ))
     if path == "/tables":
@@ -431,12 +760,10 @@ def _handle_mobile_review(method: str, path: str, environ) -> str | tuple[str, s
         if _first(query, "resolved", "") == "1":
             return render_mobile_review_resolved_page(review_task_id)
         token = _first(query, "token", "")
-        runtime_db = _first(query, "runtime_db", str(DEFAULT_RUNTIME_DB))
         try:
-            detail = get_mobile_review_detail(Path(runtime_db), review_task_id, token)
+            detail = get_mobile_review_detail(DEFAULT_RUNTIME_DB, review_task_id, token)
             return render_mobile_review_page(
                 detail=detail,
-                runtime_db=runtime_db,
                 raw_token=token,
             )
         except (ValidationError, FileNotFoundError):
@@ -446,14 +773,13 @@ def _handle_mobile_review(method: str, path: str, environ) -> str | tuple[str, s
         parsed = _parse_body(environ)
         token = _first(parsed, "token", "")
         action = _first(parsed, "action", "")
-        runtime_db = _first(parsed, "runtime_db", str(DEFAULT_RUNTIME_DB))
         note = _first(parsed, "resolution_note", "")
         try:
             resolution_payload = _parse_mobile_resolution_payload(
                 _first(parsed, "resolution_payload_json", "")
             )
             resolve_mobile_review(
-                Path(runtime_db),
+                DEFAULT_RUNTIME_DB,
                 review_task_id,
                 token,
                 action,
@@ -461,7 +787,7 @@ def _handle_mobile_review(method: str, path: str, environ) -> str | tuple[str, s
                 resolution_payload=resolution_payload,
             )
             return _redirect_response(
-                f"/mobile/review/{review_task_id}?{urlencode({'resolved': '1', 'runtime_db': runtime_db})}"
+                f"/mobile/review/{review_task_id}?{urlencode({'resolved': '1'})}"
             )
         except ValidationError as exc:
             message = (
@@ -564,9 +890,8 @@ def _handle_runtime(method: str, environ) -> str | tuple[str, str, list[tuple[st
                 source_followup_message = ""
                 if review.source_task_id:
                     source_task = get_runtime_task(db_path, review.source_task_id)
-                    if source_task is not None and source_task.task_status == TaskStatus.MANUAL_REVIEW:
-                        source_task_status = _map_review_to_source_task_status(review_status)
-                    else:
+                    source_task_status = source_task_status_for_review_resolution(source_task, review_status)
+                    if source_task_status is None:
                         source_followup_message = UI_TEXT["runtime_source_not_advanced"]
                     params["task_id"] = review.source_task_id
 
@@ -612,21 +937,21 @@ def _handle_runtime(method: str, environ) -> str | tuple[str, str, list[tuple[st
     if session_user is not None:
         try:
             db_path = Path(str(params["runtime_db"]))
-            tasks = list_runtime_tasks(
+            tasks = _sort_tasks_for_display(list_runtime_tasks(
                 db_path,
                 trade_date=parse_date(params["task_trade_date"], "task_trade_date") if params["task_trade_date"] else None,
                 status=TaskStatus(params["task_status"]) if params["task_status"] else None,
-            )
-            reviews = list_runtime_review_tasks(
+            ))
+            reviews = _sort_reviews_for_display(list_runtime_review_tasks(
                 db_path,
                 trade_date=parse_date(params["review_trade_date"], "review_trade_date") if params["review_trade_date"] else None,
                 status=ReviewTaskStatus(params["review_status"]) if params["review_status"] else None,
-            )
-            notifications = list_runtime_notification_logs(
+            ))
+            notifications = _sort_notifications_for_display(list_runtime_notification_logs(
                 db_path,
                 related_review_task_id=params["notification_related_review_task_id"] or None,
                 send_status=params["notification_send_status"] or None,
-            )
+            ))
             if params["review_task_id"]:
                 selected_review = get_runtime_review_task(db_path, params["review_task_id"])
                 if selected_review is not None and not params["task_id"] and selected_review.source_task_id:
@@ -661,22 +986,25 @@ def _handle_runtime(method: str, environ) -> str | tuple[str, str, list[tuple[st
 def _handle_runtime_login(environ) -> tuple[str, str, list[tuple[str, str]]]:
     parsed = _parse_body(environ)
     runtime_db = _first(parsed, "runtime_db", str(DEFAULT_RUNTIME_DB))
+    next_path = _safe_internal_path(_first(parsed, "next", ""))
     username = _first(parsed, "username", _runtime_admin_user()).strip() or _runtime_admin_user()
     password = _first(parsed, "password", "")
-    redirect_target = _build_runtime_url(runtime_db)
+    redirect_target = next_path or _build_runtime_url(runtime_db)
+    if next_path:
+        redirect_target = _append_query_to_path(next_path, {"runtime_db": runtime_db})
 
     expected_password = os.getenv("RUNTIME_ADMIN_PASSWORD", "")
     if expected_password and username == _runtime_admin_user() and password == expected_password:
         return _redirect_response(
             redirect_target,
-            headers=_session_cookie_headers(_runtime_admin_user()),
+            headers=_session_cookie_headers(_runtime_admin_user(), runtime_db=runtime_db),
         )
     if _dev_mode():
         shared_password = os.getenv("RUNTIME_DEV_SHARED_PASSWORD", "")
         if shared_password and password == shared_password:
             return _redirect_response(
                 redirect_target,
-                headers=_session_cookie_headers("dev_shared_user"),
+                headers=_session_cookie_headers("dev_shared_user", runtime_db=runtime_db),
             )
 
     message = "登录失败：账号或密码不正确。"
@@ -712,14 +1040,794 @@ def _handle_runtime_login(environ) -> tuple[str, str, list[tuple[str, str]]]:
 def _handle_runtime_logout(environ) -> tuple[str, str, list[tuple[str, str]]]:
     parsed = _parse_body(environ)
     runtime_db = _first(parsed, "runtime_db", str(DEFAULT_RUNTIME_DB))
+    next_path = _safe_internal_path(_first(parsed, "next", ""))
     cookie = SimpleCookie()
     cookie.load(environ.get("HTTP_COOKIE", ""))
     session_cookie = cookie.get(RUNTIME_SESSION_COOKIE)
     if session_cookie is not None:
         _RUNTIME_SESSIONS.pop(session_cookie.value, None)
     return _redirect_response(
-        _build_runtime_url(runtime_db, message="已退出运行态登录。", level="success"),
+        _append_query_to_path(
+            next_path or "/runtime",
+            {
+                "runtime_db": runtime_db,
+                "message": "已退出运行态登录。",
+                "level": "success",
+            },
+        ),
         headers=_clear_session_cookie_headers(),
+    )
+
+
+def _handle_ops_dashboard(environ) -> str:
+    runtime_db = _runtime_db_for_request(environ)
+    session_user = _get_runtime_session_user(environ)
+    if session_user is None:
+        return _render_login_required_page(
+            title=UI_TEXT["ops_dashboard_title"],
+            description=UI_TEXT["ops_dashboard_lede"],
+            active_path="/dashboard",
+            runtime_db=runtime_db,
+            next_path=_append_query_to_path("/dashboard", {"runtime_db": runtime_db}),
+            message=UI_TEXT["ops_login_required"],
+        )
+
+    tasks = list_runtime_tasks(Path(runtime_db))
+    reviews = list_runtime_review_tasks(Path(runtime_db))
+    notifications = list_runtime_notification_logs(Path(runtime_db))
+    try:
+        execution_logs = list_runtime_execution_logs(Path(runtime_db), limit=100)
+    except FileNotFoundError:
+        execution_logs = []
+    return render_ops_dashboard_page(
+        runtime_db=runtime_db,
+        session_user=session_user,
+        tasks=tasks,
+        reviews=reviews,
+        notifications=notifications,
+        execution_logs=execution_logs,
+        now=datetime.now(),
+    )
+
+
+def _handle_tasks_page(environ) -> str:
+    query = _parse_query(environ)
+    runtime_db = _runtime_db_for_request(environ)
+    task_tab = _first(query, "task_tab", "tasks") or "tasks"
+    task_status = _first(query, "task_status", "")
+    trade_date_text = _first(query, "trade_date", "")
+    action_type_text = _first(query, "action_type", "")
+    scope_type = _first(query, "scope_type", "")
+    scope_key = _first(query, "scope_key", "")
+    selected_task_id = _first(query, "task_id", "")
+    page = _parse_page_number(_first(query, "page", "1"))
+    session_user = _get_runtime_session_user(environ)
+    if session_user is None:
+        return _render_login_required_page(
+            title=UI_TEXT["ops_tasks_title"],
+            description="查看运行态任务基础列表，复杂详情和状态时间线留到后续阶段。",
+            active_path="/tasks",
+            runtime_db=runtime_db,
+            next_path=_append_query_to_path("/tasks", {"runtime_db": runtime_db}),
+            message=UI_TEXT["ops_login_required"],
+        )
+    if task_tab == "mock_platform":
+        mock_platform_db = _first(query, "mock_platform_db", str(DEFAULT_MOCK_PLATFORM_DB)) or str(DEFAULT_MOCK_PLATFORM_DB)
+        platform_filter = _first(query, "platform", "")
+        sku_filter = _first(query, "internal_sku", "")
+        mock_platform_path = Path(mock_platform_db)
+        states = []
+        if mock_platform_path.exists():
+            try:
+                mock_repository = MockPlatformRepository(mock_platform_path)
+                states = mock_repository.list_product_states(
+                    platform_name=platform_filter or None,
+                    internal_sku=sku_filter or None,
+                )
+            except sqlite3.Error:
+                states = []
+        paged_states, pagination = _paginate_items(states, page)
+        return render_tasks_mock_platform_page(
+            runtime_db=runtime_db,
+            session_user=session_user,
+            states=paged_states,
+            pagination=pagination,
+            platform_filter=platform_filter,
+            sku_filter=sku_filter,
+        )
+    if task_tab == "automation":
+        db_path = Path(runtime_db)
+        repository = SQLiteRuntimeRepository(db_path)
+        repository.init_schema()
+        script_runs = repository.list_script_runs(limit=200)
+        selected_script_run_id = _first(query, "script_run_id", "")
+        selected_script_run = repository.get_script_run(selected_script_run_id) if selected_script_run_id else None
+        script_run_items = (
+            repository.list_script_run_items(selected_script_run.script_run_id)
+            if selected_script_run is not None
+            else []
+        )
+        paged_script_runs, pagination = _paginate_items(script_runs, page)
+        return render_tasks_automation_page(
+            runtime_db=runtime_db,
+            session_user=session_user,
+            script_runs=paged_script_runs,
+            pagination=pagination,
+            selected_script_run=selected_script_run,
+            script_run_items=script_run_items,
+        )
+    parsed_trade_date = _parse_optional_date(trade_date_text)
+    parsed_action_type = _parse_optional_task_action_type(action_type_text)
+    tasks = _sort_tasks_for_display(
+        list_runtime_tasks(
+        Path(runtime_db),
+        trade_date=parsed_trade_date,
+        status=TaskStatus(task_status) if task_status else None,
+        action_type=parsed_action_type,
+        scope_type=scope_type or None,
+        scope_key=scope_key or None,
+        )
+    )
+    paged_tasks, pagination = _paginate_items(tasks, page)
+    selected_task = None
+    task_history = []
+    related_reviews = []
+    related_notifications = []
+    execution_logs = []
+    if selected_task_id:
+        db_path = Path(runtime_db)
+        selected_task = get_runtime_task(db_path, selected_task_id)
+        if selected_task is not None:
+            task_history = list_runtime_task_history(db_path, selected_task.task_id)
+            related_reviews = [
+                review
+                for review in list_runtime_review_tasks(db_path)
+                if review.source_task_id == selected_task.task_id
+            ]
+            direct_notifications = list_runtime_notification_logs(
+                db_path,
+                related_task_id=selected_task.task_id,
+            )
+            review_notifications = []
+            seen_notification_ids = {log.notification_id for log in direct_notifications}
+            for review in related_reviews:
+                for log in list_runtime_notification_logs(
+                    db_path,
+                    related_review_task_id=review.review_task_id,
+                ):
+                    if log.notification_id not in seen_notification_ids:
+                        review_notifications.append(log)
+                        seen_notification_ids.add(log.notification_id)
+            related_notifications = [
+                (log, UI_TEXT["ops_task_notification_direct"]) for log in direct_notifications
+            ] + [
+                (log, UI_TEXT["ops_task_notification_via_review"]) for log in review_notifications
+            ]
+            execution_logs = list_runtime_execution_logs(db_path, task_id=selected_task.task_id)
+    return render_tasks_page(
+        runtime_db=runtime_db,
+        session_user=session_user,
+        tasks=paged_tasks,
+        pagination=pagination,
+        task_status=task_status,
+        trade_date_filter=trade_date_text,
+        action_type_filter=action_type_text,
+        scope_type_filter=scope_type,
+        scope_key_filter=scope_key,
+        selected_task_id=selected_task_id,
+        selected_task=selected_task,
+        task_history=task_history,
+        related_reviews=related_reviews,
+        related_notifications=related_notifications,
+        execution_logs=execution_logs,
+    )
+
+
+def _handle_reviews_page(method: str, environ) -> str | tuple[str, str, list[tuple[str, str]]]:
+    query = _parse_query(environ)
+    runtime_db = _runtime_db_for_request(environ)
+    review_status = _first(query, "review_status", "")
+    due_filter = _first(query, "due", "")
+    selected_review_task_id = _first(query, "review_task_id", "")
+    page = _parse_page_number(_first(query, "page", "1"))
+    message = _first(query, "message", "")
+    level = _first(query, "level", "info" if message else "info")
+    session_user = _get_runtime_session_user(environ)
+    if session_user is None:
+        return _render_login_required_page(
+            title=UI_TEXT["ops_reviews_title"],
+            description="复核中心是 Web 人工复核主入口。",
+            active_path="/reviews",
+            runtime_db=runtime_db,
+            next_path=_append_query_to_path("/reviews", {"runtime_db": runtime_db}),
+            message=UI_TEXT["ops_login_required"],
+        )
+
+    if method == "POST":
+        parsed = _parse_body(environ)
+        action = _first(parsed, "action", "")
+        if action == "resolve_review":
+            selected_review_task_id = _first(parsed, "review_task_id", "")
+            review_status = _first(parsed, "review_status_filter", review_status)
+            due_filter = _first(parsed, "due", due_filter)
+            try:
+                db_path = Path(runtime_db)
+                review = get_runtime_review_task(db_path, selected_review_task_id)
+                if review is None:
+                    raise ValidationError(f"review task not found: {selected_review_task_id}")
+                if review.review_status != ReviewTaskStatus.PENDING:
+                    raise ValidationError(UI_TEXT["runtime_already_handled"])
+                review_action = ReviewTaskStatus(_first(parsed, "review_status", ""))
+                if review_action == ReviewTaskStatus.EXPIRED:
+                    raise ValidationError("expired 只能由超时流程触发，不能由 Web 手动提交。")
+                if review_action not in {
+                    ReviewTaskStatus.APPROVED,
+                    ReviewTaskStatus.REJECTED,
+                    ReviewTaskStatus.ADJUSTED,
+                    ReviewTaskStatus.CANCELLED,
+                }:
+                    raise ValidationError(f"不支持的复核动作: {review_action.value}")
+                resolution_payload = _parse_mobile_resolution_payload(
+                    _first(parsed, "resolution_payload_json", "")
+                )
+                source_task_status = None
+                source_followup_message = ""
+                if review.source_task_id:
+                    source_task = get_runtime_task(db_path, review.source_task_id)
+                    source_task_status = source_task_status_for_review_resolution(source_task, review_action)
+                    if source_task_status is None:
+                        source_followup_message = UI_TEXT["runtime_source_not_advanced"]
+                resolved = resolve_runtime_review_task(
+                    RuntimeReviewResolutionInputs(
+                        db_path=db_path,
+                        review_task_id=review.review_task_id,
+                        status=review_action,
+                        actor=session_user,
+                        actor_source="session_user",
+                        note=_first(parsed, "resolution_note", ""),
+                        source_task_status=source_task_status,
+                        resolution_payload=resolution_payload,
+                    )
+                )
+                success_message = UI_TEXT["runtime_review_resolved"].format(
+                    review_task_id=resolved.review_task_id,
+                    status=resolved.review_status.value,
+                )
+                if review_action == ReviewTaskStatus.ADJUSTED:
+                    success_message = f"{success_message} {UI_TEXT['runtime_adjusted_followup']}"
+                if source_followup_message:
+                    success_message = f"{success_message} {source_followup_message}"
+                return _redirect_response(
+                    _append_query_to_path(
+                        "/reviews",
+                        {
+                            "review_task_id": resolved.review_task_id,
+                            "review_status": review_status,
+                            "due": due_filter,
+                            "message": success_message,
+                            "level": "success",
+                        },
+                    )
+                )
+            except (ValidationError, ValueError, FileNotFoundError) as exc:
+                message = str(exc)
+                level = "error"
+        else:
+            message = "不支持的复核操作。"
+            level = "error"
+
+    reviews = _sort_reviews_for_display(list_runtime_review_tasks(
+        Path(runtime_db),
+        status=ReviewTaskStatus(review_status) if review_status else None,
+    ))
+    if due_filter == "soon":
+        now = datetime.now()
+        reviews = [review for review in reviews if _is_review_due_soon(review, now)]
+    paged_reviews, pagination = _paginate_items(reviews, page)
+    selected_review = None
+    source_task = None
+    task_history = []
+    related_notifications = []
+    review_tokens = []
+    if selected_review_task_id:
+        db_path = Path(runtime_db)
+        selected_review = get_runtime_review_task(db_path, selected_review_task_id)
+        if selected_review is not None:
+            if selected_review.source_task_id:
+                source_task = get_runtime_task(db_path, selected_review.source_task_id)
+                if source_task is not None:
+                    task_history = list_runtime_task_history(db_path, source_task.task_id)
+            related_notifications = list_runtime_notification_logs(
+                db_path,
+                related_review_task_id=selected_review.review_task_id,
+            )
+            review_tokens = SQLiteRuntimeRepository(db_path).list_review_tokens_by_review_task_id(
+                selected_review.review_task_id
+            )
+    return render_reviews_page(
+        runtime_db=runtime_db,
+        session_user=session_user,
+        reviews=paged_reviews,
+        pagination=pagination,
+        review_status=review_status,
+        due_filter=due_filter,
+        selected_review=selected_review,
+        source_task=source_task,
+        task_history=task_history,
+        related_notifications=related_notifications,
+        review_tokens=review_tokens,
+        message=message,
+        message_level=level,
+    )
+
+
+def _handle_notifications_page(environ) -> str:
+    query = _parse_query(environ)
+    runtime_db = _runtime_db_for_request(environ)
+    send_status = _first(query, "send_status", "")
+    related_review_task_id = _first(query, "related_review_task_id", "")
+    channel = _first(query, "channel", "")
+    notification_id = _first(query, "notification_id", "")
+    page = _parse_page_number(_first(query, "page", "1"))
+    session_user = _get_runtime_session_user(environ)
+    if session_user is None:
+        return _render_login_required_page(
+            title=UI_TEXT["ops_notifications_title"],
+            description="查看 review 主流程生成的通知记录和发送状态。",
+            active_path="/notifications",
+            runtime_db=runtime_db,
+            next_path=_append_query_to_path("/notifications", {"runtime_db": runtime_db}),
+            message=UI_TEXT["ops_login_required"],
+        )
+    db_path = Path(runtime_db)
+    notifications = _sort_notifications_for_display(list_runtime_notification_logs(
+        db_path,
+        related_review_task_id=related_review_task_id or None,
+        send_status=send_status or None,
+        channel=channel or None,
+    ))
+    paged_notifications, pagination = _paginate_items(notifications, page)
+    selected_notification = get_runtime_notification_log(db_path, notification_id) if notification_id else None
+    selected_review = None
+    selected_task = None
+    if selected_notification is not None:
+        if selected_notification.related_review_task_id:
+            selected_review = get_runtime_review_task(db_path, selected_notification.related_review_task_id)
+        task_id = selected_notification.related_task_id or (
+            selected_review.source_task_id if selected_review is not None else ""
+        )
+        if task_id:
+            selected_task = get_runtime_task(db_path, task_id)
+    return render_notifications_page(
+        runtime_db=runtime_db,
+        session_user=session_user,
+        notifications=paged_notifications,
+        pagination=pagination,
+        send_status=send_status,
+        related_review_task_id=related_review_task_id,
+        channel=channel,
+        notification_id=notification_id,
+        selected_notification=selected_notification,
+        selected_review=selected_review,
+        selected_task=selected_task,
+    )
+
+
+def _handle_execution_logs_page(method: str, environ) -> str | tuple[str, str, list[tuple[str, str]]]:
+    query = _parse_query(environ)
+    runtime_db = _runtime_db_for_request(environ)
+    page = _parse_page_number(_first(query, "page", "1"))
+    message = _first(query, "message", "")
+    level = _first(query, "level", "info" if message else "info")
+    session_user = _get_runtime_session_user(environ)
+    if session_user is None:
+        return _render_login_required_page(
+            title=UI_TEXT["ops_execution_logs_title"],
+            description="查看 SQLite 运行态执行日志；旧 /execution 保留 mock 执行兼容入口。",
+            active_path="/execution-logs",
+            runtime_db=runtime_db,
+            next_path=_append_query_to_path("/execution-logs", {"runtime_db": runtime_db}),
+            message=UI_TEXT["ops_login_required"],
+        )
+    if method == "POST":
+        parsed = _parse_body(environ)
+        action = _first(parsed, "action", "")
+        operation_id = _first(parsed, "operation_id", "")
+        try:
+            executor = ShadowBotExecutor(
+                SQLiteRuntimeRepository(Path(runtime_db)),
+                build_shadowbot_task_runner_from_environment(),
+            )
+            if action == "start_shadowbot_reconcile":
+                execution_attempt_id = _first(parsed, "execution_attempt_id", "") or f"RECONCILE-{uuid4().hex[:12]}"
+                result = executor.start_reconcile_attempt(
+                    operation_id=operation_id,
+                    execution_attempt_id=execution_attempt_id,
+                    runner_payload={"triggered_by": session_user, "triggered_from": "web_execution_logs"},
+                )
+                return _redirect_response(
+                    _append_query_to_path(
+                        "/execution-logs",
+                        {
+                            "runtime_db": runtime_db,
+                            "message": f"已启动只读对账：{result.execution_attempt_id}",
+                            "level": "success",
+                        },
+                    )
+                )
+            if action == "confirm_shadowbot_manual_handled":
+                executor.confirm_manual_handled(
+                    operation_id=operation_id,
+                    actor=session_user,
+                    note=_first(parsed, "manual_note", ""),
+                )
+                return _redirect_response(
+                    _append_query_to_path(
+                        "/execution-logs",
+                        {
+                            "runtime_db": runtime_db,
+                            "message": f"已确认人工处理完成：{operation_id}",
+                            "level": "success",
+                        },
+                    )
+                )
+            message = "不支持的 ShadowBot 操作。"
+            level = "error"
+        except (ValidationError, FileNotFoundError, OSError) as exc:
+            message = str(exc)
+            level = "error"
+    try:
+        execution_logs = _sort_execution_logs_for_display(list_runtime_execution_logs(Path(runtime_db)))
+    except FileNotFoundError:
+        execution_logs = []
+    paged_logs, pagination = _paginate_items(execution_logs, page)
+    return render_execution_logs_page(
+        runtime_db=runtime_db,
+        session_user=session_user,
+        execution_logs=paged_logs,
+        pagination=pagination,
+        message=message,
+        message_level=level,
+        shadowbot_queue_status=_load_shadowbot_queue_status(),
+    )
+
+
+def _handle_business_inputs_page(method: str, environ) -> str | tuple[str, str, list[tuple[str, str]]]:
+    query = _parse_query(environ)
+    runtime_db = _runtime_db_for_request(environ)
+    products_path = _first(query, "products_path", str(DEFAULT_PRODUCTS))
+    price_rules_path = _first(query, "price_rules_path", str(DEFAULT_PRICE_RULES))
+    listing_rules_path = _first(query, "listing_rules_path", str(DEFAULT_LISTING_RULES))
+    capacity_plans_path = _first(query, "capacity_plans_path", str(DEFAULT_CAPACITY_PLANS))
+    cold_storage_status_path = _first(query, "cold_storage_status_path", str(DEFAULT_COLD_STORAGE_STATUS))
+    platform_mappings_path = _first(query, "platform_mappings_path", str(DEFAULT_PLATFORM_MAPPINGS))
+    active_input_tab = _normalize_business_input_tab(_first(query, "input_tab", "inventory"))
+    message = _first(query, "message", "")
+    level = _first(query, "level", "info" if message else "info")
+    session_user = _get_runtime_session_user(environ)
+    if session_user is None:
+        return _render_login_required_page(
+            title=UI_TEXT["ops_business_inputs_title"],
+            description="业务数据页用于维护商品资料、录入可销售库存，并生成后续待处理任务。",
+            active_path="/business-inputs",
+            runtime_db=runtime_db,
+            next_path=_append_query_to_path(
+                "/business-inputs",
+                {
+                    "runtime_db": runtime_db,
+                    "products_path": products_path,
+                    "price_rules_path": price_rules_path,
+                    "listing_rules_path": listing_rules_path,
+                    "capacity_plans_path": capacity_plans_path,
+                    "cold_storage_status_path": cold_storage_status_path,
+                    "platform_mappings_path": platform_mappings_path,
+                    "input_tab": active_input_tab,
+                },
+            ),
+            message=UI_TEXT["ops_login_required"],
+        )
+    if method == "POST":
+        parsed = _parse_body(environ)
+        products_path = _first(parsed, "products_path", products_path)
+        price_rules_path = _first(parsed, "price_rules_path", price_rules_path)
+        listing_rules_path = _first(parsed, "listing_rules_path", listing_rules_path)
+        capacity_plans_path = _first(parsed, "capacity_plans_path", capacity_plans_path)
+        cold_storage_status_path = _first(parsed, "cold_storage_status_path", cold_storage_status_path)
+        platform_mappings_path = _first(parsed, "platform_mappings_path", platform_mappings_path)
+        active_input_tab = _normalize_business_input_tab(_first(parsed, "input_tab", active_input_tab))
+        action = _first(parsed, "action", "")
+        try:
+            if action == "add_inventory":
+                active_input_tab = "inventory"
+                path = Path(products_path)
+                rows = load_product_input_rows(path)
+                form = validate_inventory_form({key: _first(parsed, key, "") for key in parsed})
+                result = apply_inventory_input(rows, form)
+                persist_product_rows(path, result.rows)
+            elif action == "edit_product":
+                active_input_tab = "inventory"
+                path = Path(products_path)
+                rows = load_product_input_rows(path)
+                form = validate_product_edit_form({key: _first(parsed, key, "") for key in parsed})
+                result = apply_product_edit(rows, form)
+                persist_product_rows(path, result.rows)
+            elif action == "add_price_rule":
+                active_input_tab = "price_rules"
+                path = Path(price_rules_path)
+                rows = load_price_rule_input_rows(path)
+                platform_rows, platform_warning = _load_platform_rows_for_business_inputs(platform_mappings_path)
+                form = validate_price_rule_form(
+                    {key: _first(parsed, key, "") for key in parsed},
+                    existing_rows=rows,
+                    is_edit=False,
+                    allowed_varieties=extract_variety_options(load_product_input_rows(Path(products_path))),
+                    allowed_platforms=platform_options_from_rows(platform_rows),
+                )
+                result = apply_price_rule_input(rows, form)
+                if platform_warning:
+                    result.message = f"{result.message} {platform_warning}"
+                persist_price_rule_rows(path, result.rows)
+            elif action == "edit_price_rule":
+                active_input_tab = "price_rules"
+                path = Path(price_rules_path)
+                rows = load_price_rule_input_rows(path)
+                platform_rows, platform_warning = _load_platform_rows_for_business_inputs(platform_mappings_path)
+                form = validate_price_rule_form(
+                    {key: _first(parsed, key, "") for key in parsed},
+                    existing_rows=rows,
+                    is_edit=True,
+                    allowed_varieties=extract_variety_options(load_product_input_rows(Path(products_path))),
+                    allowed_platforms=platform_options_from_rows(platform_rows),
+                )
+                result = apply_price_rule_edit(rows, form)
+                if platform_warning:
+                    result.message = f"{result.message} {platform_warning}"
+                persist_price_rule_rows(path, result.rows)
+            elif action == "add_listing_rule":
+                active_input_tab = "listing_rules"
+                path = Path(listing_rules_path)
+                rows = load_listing_rule_input_rows(path)
+                platform_rows, platform_warning = _load_platform_rows_for_business_inputs(platform_mappings_path)
+                form = validate_listing_rule_form(
+                    {key: _first(parsed, key, "") for key in parsed},
+                    existing_rows=rows,
+                    is_edit=False,
+                    allowed_varieties=extract_variety_options(load_product_input_rows(Path(products_path))),
+                    allowed_platforms=platform_options_from_rows(platform_rows),
+                )
+                result = apply_listing_rule_input(rows, form)
+                if platform_warning:
+                    result.message = f"{result.message} {platform_warning}"
+                persist_listing_rule_rows(path, result.rows)
+            elif action == "edit_listing_rule":
+                active_input_tab = "listing_rules"
+                path = Path(listing_rules_path)
+                rows = load_listing_rule_input_rows(path)
+                platform_rows, platform_warning = _load_platform_rows_for_business_inputs(platform_mappings_path)
+                form = validate_listing_rule_form(
+                    {key: _first(parsed, key, "") for key in parsed},
+                    existing_rows=rows,
+                    is_edit=True,
+                    allowed_varieties=extract_variety_options(load_product_input_rows(Path(products_path))),
+                    allowed_platforms=platform_options_from_rows(platform_rows),
+                )
+                result = apply_listing_rule_edit(rows, form)
+                if platform_warning:
+                    result.message = f"{result.message} {platform_warning}"
+                persist_listing_rule_rows(path, result.rows)
+            elif action == "add_capacity_plan":
+                active_input_tab = "capacity_plans"
+                path = Path(capacity_plans_path)
+                rows = load_capacity_plan_input_rows(path)
+                form = validate_capacity_plan_form(
+                    {key: _first(parsed, key, "") for key in parsed},
+                    existing_rows=rows,
+                    is_edit=False,
+                )
+                result = apply_capacity_plan_input(rows, form)
+                persist_capacity_plan_rows(path, result.rows)
+            elif action == "edit_capacity_plan":
+                active_input_tab = "capacity_plans"
+                path = Path(capacity_plans_path)
+                rows = load_capacity_plan_input_rows(path)
+                form_values = {key: _first(parsed, key, "") for key in parsed}
+                form = validate_capacity_plan_form(
+                    form_values,
+                    existing_rows=rows,
+                    is_edit=True,
+                )
+                row_index_text = _first(parsed, "current_row_index", "")
+                current_row_index = int(row_index_text) if row_index_text.isdigit() else None
+                result = apply_capacity_plan_edit(rows, _first(parsed, "current_trade_date", ""), form, current_row_index)
+                persist_capacity_plan_rows(path, result.rows)
+            elif action == "add_cold_storage_status":
+                active_input_tab = "cold_storage_status"
+                path = Path(cold_storage_status_path)
+                rows = load_cold_storage_input_rows(path)
+                form = validate_cold_storage_form(
+                    {key: _first(parsed, key, "") for key in parsed},
+                    existing_rows=rows,
+                    is_edit=False,
+                )
+                result = apply_cold_storage_input(rows, form)
+                persist_cold_storage_rows(path, result.rows)
+            elif action == "edit_cold_storage_status":
+                active_input_tab = "cold_storage_status"
+                path = Path(cold_storage_status_path)
+                rows = load_cold_storage_input_rows(path)
+                form_values = {key: _first(parsed, key, "") for key in parsed}
+                form = validate_cold_storage_form(
+                    form_values,
+                    existing_rows=rows,
+                    is_edit=True,
+                )
+                row_index_text = _first(parsed, "current_row_index", "")
+                current_row_index = int(row_index_text) if row_index_text.isdigit() else None
+                result = apply_cold_storage_edit(
+                    rows,
+                    _first(parsed, "current_trade_date", ""),
+                    form,
+                    current_row_index,
+                )
+                persist_cold_storage_rows(path, result.rows)
+            elif action == "add_platform":
+                active_input_tab = "inventory"
+                path = Path(platform_mappings_path)
+                ensure_platform_mappings_workbook(path)
+                rows = load_platform_mapping_rows(path)
+                result = apply_platform_input(rows, {key: _first(parsed, key, "") for key in parsed})
+                persist_platform_mapping_rows(path, result.rows)
+            else:
+                raise ProductInventoryInputError("未知操作，请重新提交。")
+            return _redirect_response(
+                _append_query_to_path(
+                    "/business-inputs",
+                    {
+                        "runtime_db": runtime_db,
+                        "products_path": products_path,
+                        "price_rules_path": price_rules_path,
+                        "listing_rules_path": listing_rules_path,
+                        "capacity_plans_path": capacity_plans_path,
+                        "cold_storage_status_path": cold_storage_status_path,
+                        "platform_mappings_path": platform_mappings_path,
+                        "input_tab": active_input_tab,
+                        "message": result.message,
+                        "level": result.level,
+                    },
+                )
+            )
+        except (
+            ProductInventoryInputError,
+            PriceRuleInputError,
+            ListingRuleInputError,
+            CapacityPlanInputError,
+            ColdStorageInputError,
+            PlatformMappingInputError,
+            ValidationError,
+            FileNotFoundError,
+        ) as exc:
+            message = str(exc)
+            level = "error"
+
+    try:
+        product_rows = load_product_input_rows(Path(products_path))
+    except (ValidationError, FileNotFoundError) as exc:
+        product_rows = []
+        message = message or str(exc)
+        level = "error"
+    try:
+        price_rule_rows = load_price_rule_input_rows(Path(price_rules_path))
+    except (ValidationError, FileNotFoundError) as exc:
+        price_rule_rows = []
+        message = message or str(exc)
+        level = "error"
+    try:
+        listing_rule_rows = load_listing_rule_input_rows(Path(listing_rules_path))
+    except (ValidationError, FileNotFoundError) as exc:
+        listing_rule_rows = []
+        message = message or str(exc)
+        level = "error"
+    try:
+        capacity_plan_rows = load_capacity_plan_input_rows(Path(capacity_plans_path))
+    except (ValidationError, FileNotFoundError) as exc:
+        capacity_plan_rows = []
+        message = message or str(exc)
+        level = "error"
+    try:
+        cold_storage_rows = load_cold_storage_input_rows(Path(cold_storage_status_path))
+    except (ValidationError, FileNotFoundError) as exc:
+        cold_storage_rows = []
+        message = message or str(exc)
+        level = "error"
+    platform_rows, platform_warning = _load_platform_rows_for_business_inputs(platform_mappings_path)
+    if platform_warning:
+        message = message or platform_warning
+        level = "info" if level != "error" else level
+    return render_business_inputs_page(
+        runtime_db=runtime_db,
+        session_user=session_user,
+        products_path=products_path,
+        price_rules_path=price_rules_path,
+        listing_rules_path=listing_rules_path,
+        capacity_plans_path=capacity_plans_path,
+        cold_storage_status_path=cold_storage_status_path,
+        platform_mappings_path=platform_mappings_path,
+        product_rows=product_rows,
+        variety_options=extract_variety_options(product_rows),
+        price_rule_rows=price_rule_rows,
+        listing_rule_rows=listing_rule_rows,
+        capacity_plan_rows=capacity_plan_rows,
+        cold_storage_rows=cold_storage_rows,
+        platform_options=platform_options_from_rows(platform_rows),
+        active_input_tab=active_input_tab,
+        message=message,
+        message_level=level,
+    )
+
+
+def _load_platform_rows_for_business_inputs(platform_mappings_path: str) -> tuple[list[dict[str, object]], str]:
+    try:
+        platform_path = Path(platform_mappings_path)
+        ensure_platform_mappings_workbook(platform_path)
+        platform_rows = load_platform_mapping_rows(platform_path)
+    except (ValidationError, FileNotFoundError) as exc:
+        return [], f"平台映射表读取失败，页面已使用默认平台列表。原因：{exc}"
+    if not platform_rows:
+        return [], "平台映射表为空，页面已使用默认平台列表。"
+    return platform_rows, ""
+
+
+def _handle_system_page(environ) -> str:
+    query = _parse_query(environ)
+    runtime_db = _runtime_db_for_request(environ)
+    message = _first(query, "message", "")
+    level = _first(query, "level", "info" if message else "info")
+    session_user = _get_runtime_session_user(environ)
+    if session_user is None:
+        return _render_login_required_page(
+            title=UI_TEXT["ops_system_title"],
+            description=UI_TEXT["ops_system_config_only"],
+            active_path="/system",
+            runtime_db=runtime_db,
+            next_path=_append_query_to_path("/system", {"runtime_db": runtime_db}),
+            message=UI_TEXT["ops_login_required"],
+        )
+    return render_system_page(runtime_db=runtime_db, session_user=session_user, message=message, level=level)
+
+
+def _handle_system_test_feishu_notification(method: str, environ) -> str | tuple[str, str, list[tuple[str, str]]]:
+    runtime_db = _runtime_db_for_request(environ)
+    session_user = _get_runtime_session_user(environ)
+    if method != "POST":
+        return _redirect_response(
+            _append_query_to_path(
+                "/system",
+                {
+                    "runtime_db": runtime_db,
+                    "message": "飞书测试通知必须通过 POST 触发。",
+                    "level": "error",
+                },
+            )
+        )
+    if session_user is None:
+        return _render_login_required_page(
+            title=UI_TEXT["ops_system_title"],
+            description=UI_TEXT["ops_system_config_only"],
+            active_path="/system",
+            runtime_db=runtime_db,
+            next_path=_append_query_to_path("/system", {"runtime_db": runtime_db}),
+            message=UI_TEXT["ops_login_required"],
+        )
+    success, result_message = _send_system_feishu_test_notification(Path(runtime_db), actor=session_user)
+    return _redirect_response(
+        _append_query_to_path(
+            "/system",
+            {
+                "runtime_db": runtime_db,
+                "message": result_message,
+                "level": "success" if success else "error",
+            },
+        )
     )
 
 
@@ -896,6 +2004,7 @@ def render_dashboard_page(
   <main class="shell">
     {_hero(UI_TEXT["dashboard_title"], UI_TEXT["dashboard_lede"])}
     {navigation("/")}
+    {_compat_notice(UI_TEXT["legacy_root_notice"])}
     {_banner(message, message_level)}
     <div class="layout">
       <section class="panel">
@@ -1007,6 +2116,7 @@ def render_table_editor_page(
   <main class="shell wide-shell">
     {_hero(UI_TEXT["table_editor_title"], UI_TEXT["table_editor_lede"])}
     {navigation("/tables")}
+    {_compat_notice(UI_TEXT["legacy_tables_notice"])}
     {_banner(message, message_level)}
     <section class="panel">
       <h2>{escape(UI_TEXT["table_picker"])}</h2>
@@ -1127,6 +2237,7 @@ def render_execution_page(
   <main class="shell">
     {_hero(UI_TEXT["execution_panel_title"], UI_TEXT["dashboard_lede"])}
     {navigation("/execution")}
+    {_compat_notice(UI_TEXT["legacy_execution_notice"])}
     {_banner(message, message_level)}
     <section class="panel">
       <h2>{escape(UI_TEXT["execution_panel_title"])}</h2>
@@ -1191,6 +2302,7 @@ def render_manual_intervention_page(
   <main class="shell wide-shell">
     {_hero(UI_TEXT["manual_panel_title"], UI_TEXT["dashboard_lede"])}
     {navigation("/manual-intervention")}
+    {_compat_notice(UI_TEXT["legacy_manual_notice"])}
     {_banner(message, message_level)}
     <section class="panel">
       <h2>{escape(UI_TEXT["manual_panel_title"])}</h2>
@@ -1241,12 +2353,16 @@ def render_manual_intervention_page(
 """
 
 
-def render_mobile_review_page(*, detail, runtime_db: str, raw_token: str) -> str:
+def render_mobile_review_page(*, detail, raw_token: str) -> str:
     review = detail.review_task
-    source_status = detail.source_task.task_status.value if detail.source_task is not None else "-"
+    source_status = (
+        display_enum_label("task_status", detail.source_task.task_status.value)
+        if detail.source_task is not None
+        else "-"
+    )
     payload_rows = _mobile_payload_summary_rows(review.review_payload)
     actions_html = "".join(
-        f"<button class='primary' type='submit' name='action' value='{escape(action)}'>{escape(action)}</button>"
+        f"<button class='primary' type='submit' name='action' value='{escape(action)}'>{escape(display_enum_label('review_status', action))}</button>"
         for action in detail.allowed_actions
     )
     if not actions_html:
@@ -1264,14 +2380,14 @@ def render_mobile_review_page(*, detail, runtime_db: str, raw_token: str) -> str
   <main class="shell">
     {_hero(UI_TEXT["mobile_review_title"], UI_TEXT["mobile_review_lede"])}
     <section class="panel">
-      <h2>{escape(str(review.review_type))}</h2>
+      <h2>{escape(display_enum_label("review_type", review.review_type))}</h2>
       <div class="metrics">
-        <div class="metric"><span class="label">trade_date</span><strong>{escape(str(review.trade_date or "-"))}</strong></div>
-        <div class="metric"><span class="label">status</span><strong>{escape(review.review_status.value)}</strong></div>
+        <div class="metric"><span class="label">业务日期</span><strong>{escape(str(review.trade_date or "-"))}</strong></div>
+        <div class="metric"><span class="label">当前状态</span><strong>{escape(display_enum_label("review_status", review.review_status.value))}</strong></div>
       </div>
-      <p class="subtle">scope: {escape(str(review.scope_type))} / {escape(review.scope_key or "-")}</p>
-      <p class="subtle">reason: {escape(review.reason or "-")}</p>
-      <p class="subtle">required_by: {escape(str(review.required_by) if review.required_by else "-")}</p>
+      <p class="subtle">处理对象：{escape(format_object_scope(review.scope_type, review.scope_key))}</p>
+      <p class="subtle">原因：{escape(review.reason or "-")}</p>
+      <p class="subtle">截止时间：{escape(format_display_datetime(review.required_by))}</p>
       <p class="subtle">{escape(UI_TEXT["mobile_review_source_status"])}: {escape(source_status)}</p>
     </section>
     <section class="panel">
@@ -1287,7 +2403,6 @@ def render_mobile_review_page(*, detail, runtime_db: str, raw_token: str) -> str
       <h2>{escape(UI_TEXT["mobile_review_submit"])}</h2>
       <form method="post" action="/mobile/review/{escape(review.review_task_id)}/resolve" class="grid">
         <input type="hidden" name="token" value="{escape(raw_token)}">
-        <input type="hidden" name="runtime_db" value="{escape(runtime_db)}">
         <div class="field">
           <label for="resolution_note">{escape(UI_TEXT["mobile_review_note"])}</label>
           <textarea id="resolution_note" name="resolution_note"></textarea>
@@ -1394,7 +2509,8 @@ def render_runtime_page(
 <body>
   <main class="shell wide-shell">
     {_hero(UI_TEXT["runtime_panel_title"], UI_TEXT["dashboard_lede"])}
-    {navigation("/runtime")}
+    {navigation("/runtime", params["runtime_db"])}
+    {_compat_notice(UI_TEXT["legacy_runtime_notice"])}
     {_banner(message, message_level)}
     {login_panel}
   </main>
@@ -1417,7 +2533,7 @@ def render_runtime_page(
         f"<td>{escape(task.internal_sku or '-')}</td>"
         f"<td>{escape(task.platform_name or '-')}</td>"
         "</tr>"
-        for task in tasks[:100]
+        for task in tasks[:PAGE_SIZE]
     ) or "<tr><td colspan='7'>-</td></tr>"
     review_rows = "".join(
         "<tr>"
@@ -1429,7 +2545,7 @@ def render_runtime_page(
         f"<td>{escape(review.source_task_id or '-')}</td>"
         f"<td>{escape(review.reason)}</td>"
         "</tr>"
-        for review in reviews[:100]
+        for review in reviews[:PAGE_SIZE]
     ) or "<tr><td colspan='7'>-</td></tr>"
     notification_rows = "".join(
         "<tr>"
@@ -1442,16 +2558,12 @@ def render_runtime_page(
         f"<td>{escape(log.sent_at.isoformat() if log.sent_at else '-')}</td>"
         f"<td>{escape(log.message)}</td>"
         "</tr>"
-        for log in notifications[:100]
+        for log in notifications[:PAGE_SIZE]
     ) or "<tr><td colspan='8'>-</td></tr>"
 
     selected_review_html = ""
     if selected_review is not None:
-        next_source_status = (
-            "approved->pending / rejected->skipped / adjusted->skipped / cancelled->cancelled"
-            if selected_review.source_task_id
-            else "-"
-        )
+        next_source_status = _review_source_status_hint(selected_task)
         details = [
             ("review_task_id", selected_review.review_task_id),
             ("review_type", selected_review.review_type),
@@ -1542,7 +2654,7 @@ def render_runtime_page(
           <label for="resolution_payload_json">{escape(UI_TEXT["runtime_resolution_payload"])}</label>
           <textarea id="resolution_payload_json" name="resolution_payload_json" rows="8">{{}}</textarea>
         </div>
-        <p class="subtle">source_task_status: {escape(next_source_status)}（仅当源任务当前处于 manual_review 时自动推动）</p>
+        <p class="subtle">来源任务后续状态：{escape(next_source_status)}</p>
         <div class="actions">
           <button class="primary" type="submit">{escape(UI_TEXT["runtime_submit_review"])}</button>
         </div>
@@ -1586,7 +2698,8 @@ def render_runtime_page(
 <body>
   <main class="shell wide-shell">
     {_hero(UI_TEXT["runtime_panel_title"], UI_TEXT["dashboard_lede"])}
-    {navigation("/runtime")}
+    {navigation("/runtime", params["runtime_db"])}
+    {_compat_notice(UI_TEXT["legacy_runtime_notice"])}
     {_banner(message, message_level)}
     <section class="panel">
       <h2>{escape(UI_TEXT["runtime_panel_title"])}</h2>
@@ -1711,7 +2824,7 @@ def render_runtime_page(
         f"<td>{escape(task.internal_sku or '-')}</td>"
         f"<td>{escape(task.platform_name or '-')}</td>"
         "</tr>"
-        for task in tasks[:100]
+        for task in tasks[:PAGE_SIZE]
     ) or "<tr><td colspan='7'>-</td></tr>"
     review_rows = "".join(
         "<tr>"
@@ -1723,7 +2836,7 @@ def render_runtime_page(
         f"<td>{escape(review.source_task_id or '-')}</td>"
         f"<td>{escape(review.reason)}</td>"
         "</tr>"
-        for review in reviews[:100]
+        for review in reviews[:PAGE_SIZE]
     ) or "<tr><td colspan='7'>-</td></tr>"
     notification_rows = "".join(
         "<tr>"
@@ -1736,16 +2849,12 @@ def render_runtime_page(
         f"<td>{escape(log.sent_at.isoformat() if log.sent_at else '-')}</td>"
         f"<td>{escape(log.message)}</td>"
         "</tr>"
-        for log in notifications[:100]
+        for log in notifications[:PAGE_SIZE]
     ) or f"<tr><td colspan='8'>{escape(UI_TEXT['runtime_notification_none'])}</td></tr>"
 
     selected_review_html = ""
     if selected_review is not None:
-        next_source_status = (
-            "approved->pending / rejected->skipped / adjusted->skipped / cancelled->cancelled"
-            if selected_review.source_task_id
-            else "-"
-        )
+        next_source_status = _review_source_status_hint(selected_task)
         details = [
             ("review_task_id", selected_review.review_task_id),
             ("review_type", selected_review.review_type),
@@ -1835,7 +2944,7 @@ def render_runtime_page(
           <label for="resolution_payload_json">{escape(UI_TEXT["runtime_resolution_payload"])}</label>
           <textarea id="resolution_payload_json" name="resolution_payload_json" rows="8">{{}}</textarea>
         </div>
-        <p class="subtle">source_task_status: {escape(next_source_status)}（仅当源任务当前处于 manual_review 时自动推动）</p>
+        <p class="subtle">来源任务后续状态：{escape(next_source_status)}</p>
         <div class="actions">
           <button class="primary" type="submit">{escape(UI_TEXT["runtime_submit_review"])}</button>
         </div>
@@ -2008,26 +3117,3865 @@ def render_runtime_page(
 """
 
 
-def navigation(active_path: str) -> str:
-    dashboard_class = "nav-link active" if active_path == "/" else "nav-link"
-    tables_class = "nav-link active" if active_path == "/tables" else "nav-link"
-    execution_class = "nav-link active" if active_path == "/execution" else "nav-link"
-    manual_class = "nav-link active" if active_path == "/manual-intervention" else "nav-link"
-    runtime_class = "nav-link active" if active_path == "/runtime" else "nav-link"
-    return (
-        "<nav class='nav-strip'>"
-        f"<a class='{dashboard_class}' href='/'>{escape(UI_TEXT['dashboard_tab'])}</a>"
-        f"<a class='{tables_class}' href='/tables'>{escape(UI_TEXT['tables_tab'])}</a>"
-        f"<a class='{execution_class}' href='/execution'>{escape(UI_TEXT['execution_tab'])}</a>"
-        f"<a class='{manual_class}' href='/manual-intervention'>{escape(UI_TEXT['manual_tab'])}</a>"
-        f"<a class='{runtime_class}' href='/runtime'>{escape(UI_TEXT['runtime_tab'])}</a>"
-        "</nav>"
+def render_ops_dashboard_page(
+    *,
+    runtime_db: str,
+    session_user: str,
+    tasks,
+    reviews,
+    notifications,
+    execution_logs,
+    now: datetime,
+) -> str:
+    metrics = _build_dashboard_metrics(tasks, reviews, notifications, now)
+    cards_html = "".join(
+        _render_dashboard_metric_card(runtime_db, metric)
+        for metric in metrics
     )
+    body = f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["dashboard_tab"])}</h2>
+      <p class="subtle">{escape(UI_TEXT["ops_dashboard_lede"])}</p>
+      <div class="metrics">{cards_html}</div>
+    </section>
+    <section class="panel">
+      <h2>{escape(UI_TEXT["ops_business_inputs_title"])}</h2>
+      <div class="actions">
+        <a class="nav-link utility-link" href="/business-inputs">{escape(UI_TEXT["ops_link_to_generator"])}</a>
+      </div>
+    </section>
+    """
+    return _render_ops_page(
+        title=UI_TEXT["ops_dashboard_title"],
+        description=UI_TEXT["ops_dashboard_lede"],
+        active_path="/dashboard",
+        runtime_db=runtime_db,
+        session_user=session_user,
+        body_html=body,
+    )
+
+
+def render_tasks_page(
+    *,
+    runtime_db: str,
+    session_user: str,
+    tasks,
+    pagination=None,
+    task_status: str = "",
+    trade_date_filter: str = "",
+    action_type_filter: str = "",
+    scope_type_filter: str = "",
+    scope_key_filter: str = "",
+    selected_task_id: str = "",
+    selected_task=None,
+    task_history=None,
+    related_reviews=None,
+    related_notifications=None,
+    execution_logs=None,
+) -> str:
+    rows = "".join(
+        "<tr>"
+        f"<td>{escape(task.trade_date.isoformat() if task.trade_date else '-')}</td>"
+        f"<td>{escape(display_enum_label('action_type', task.action_type.value))}</td>"
+        f"<td>{escape(format_task_object(task))}</td>"
+        f"<td>{escape(task.platform_name or '-')}</td>"
+        f"<td>{_status_badge(task.task_status.value, 'task_status')}</td>"
+        f"<td>{escape(format_task_target(task))}</td>"
+        f"<td>{escape(format_display_datetime(task.required_by))}</td>"
+        f"<td>{escape(_task_reason_summary(task))}</td>"
+        f"<td><a href='{escape(_append_query_to_path('/tasks', {'task_id': task.task_id, 'task_status': task_status, 'trade_date': trade_date_filter, 'action_type': action_type_filter, 'scope_type': scope_type_filter, 'scope_key': scope_key_filter}))}'>{escape(UI_TEXT['ops_review_detail_link'])}</a></td>"
+        "</tr>"
+        for task in tasks
+    )
+    detail_html = _render_task_center_detail(
+        selected_task_id=selected_task_id,
+        selected_task=selected_task,
+        task_history=task_history or [],
+        related_reviews=related_reviews or [],
+        related_notifications=related_notifications or [],
+        execution_logs=execution_logs or [],
+    )
+    body = _task_center_tabs("tasks") + _task_filter_panel(
+        runtime_db,
+        task_status,
+        trade_date_filter,
+        action_type_filter,
+        scope_type_filter,
+        scope_key_filter,
+    ) + (
+        _render_table_panel(
+            UI_TEXT["ops_tasks_title"],
+            [
+                "trade_date",
+                "action_type",
+                "business_object",
+                "platform_name",
+                "task_status",
+                "target_action_or_price",
+                "required_by",
+                "reason_summary",
+                "action",
+            ],
+            rows,
+            empty_message=UI_TEXT["ops_empty_tasks"],
+        )
+        if tasks
+        else _render_empty_state(UI_TEXT["ops_tasks_title"], UI_TEXT["ops_empty_tasks"])
+    ) + _render_pagination(
+        "/tasks",
+        pagination,
+        {
+            "task_status": task_status,
+            "trade_date": trade_date_filter,
+            "action_type": action_type_filter,
+            "scope_type": scope_type_filter,
+            "scope_key": scope_key_filter,
+        },
+    ) + detail_html
+    return _render_ops_page(
+        title=UI_TEXT["ops_tasks_title"],
+        description="任务中心用于查看系统准备执行或等待处理的改价、上架、下架和运营提醒任务。",
+        active_path="/tasks",
+        runtime_db=runtime_db,
+        session_user=session_user,
+        body_html=body,
+    )
+
+
+def render_tasks_automation_page(
+    *,
+    runtime_db: str,
+    session_user: str,
+    script_runs,
+    pagination=None,
+    selected_script_run=None,
+    script_run_items=None,
+) -> str:
+    rows = "".join(
+        "<tr>"
+        f"<td>{escape(run.script_run_id)}</td>"
+        f"<td>{escape(run.evaluator_name)}</td>"
+        f"<td>{escape(run.description)}</td>"
+        f"<td>{escape(format_display_datetime(run.started_at))}</td>"
+        f"<td>{_status_badge(run.run_status, 'script_run_status')}</td>"
+        f"<td>{escape(run.run_mode)}</td>"
+        f"<td>{escape(str(run.summary.get('inserted_tasks_count', 0)))}</td>"
+        f"<td>{escape(str(run.summary.get('inserted_review_tasks_count', 0)))}</td>"
+        f"<td>{escape(str(run.summary.get('inserted_notification_logs_count', 0)))}</td>"
+        f"<td>{escape(_truncate_text(_sanitize_display_text(run.error_message or '-'), 160))}</td>"
+        f"<td><a href='{escape(_append_query_to_path('/tasks', {'task_tab': 'automation', 'script_run_id': run.script_run_id}))}'>查看详情</a></td>"
+        "</tr>"
+        for run in script_runs
+    )
+    body = _task_center_tabs("automation")
+    body += """
+    <section class="panel">
+      <p class="subtle">脚本状态用于查看自动规则评估的 dry-run/apply 运行记录。第一版仅展示记录，不提供 apply 按钮；apply 只能通过命令行执行。</p>
+    </section>
+    """
+    body += (
+        _render_table_panel(
+            "脚本状态",
+            [
+                "script_run_id",
+                "evaluator_name",
+                "description",
+                "started_at",
+                "run_status",
+                "run_mode",
+                "inserted_tasks_count",
+                "inserted_review_tasks_count",
+                "inserted_notification_logs_count",
+                "error_message",
+                "action",
+            ],
+            rows,
+            empty_message="当前还没有自动规则评估运行记录。可以先通过命令行 dry-run 生成预览记录。",
+        )
+        if script_runs
+        else _render_empty_state("脚本状态", "当前还没有自动规则评估运行记录。可以先通过命令行 dry-run 生成预览记录。")
+    )
+    body += _render_pagination("/tasks", pagination, {"task_tab": "automation"})
+    body += _render_script_run_detail(selected_script_run, script_run_items or [])
+    return _render_ops_page(
+        title=UI_TEXT["ops_tasks_title"],
+        description="任务中心用于查看待执行任务，也用于追踪自动规则评估脚本的运行状态。",
+        active_path="/tasks",
+        runtime_db=runtime_db,
+        session_user=session_user,
+        body_html=body,
+    )
+
+
+def render_tasks_mock_platform_page(
+    *,
+    runtime_db: str,
+    session_user: str,
+    states,
+    pagination=None,
+    platform_filter: str = "",
+    sku_filter: str = "",
+) -> str:
+    rows = "".join(
+        "<tr>"
+        f"<td>{escape(state.platform_name)}</td>"
+        f"<td>{escape(state.internal_sku)}</td>"
+        f"<td>{escape(state.platform_sku)}</td>"
+        f"<td>{escape(state.product_name)}</td>"
+        f"<td>{escape(state.grade)}</td>"
+        f"<td>{escape('-' if state.platform_price is None else str(state.platform_price))}</td>"
+        f"<td>{escape(_mock_platform_status_label(state.platform_online_status))}</td>"
+        f"<td>{escape(str(state.platform_stock_qty))}</td>"
+        f"<td>{escape(format_display_datetime(state.last_synced_at))}</td>"
+        f"<td>{escape(format_display_datetime(state.last_platform_update_at))}</td>"
+        f"<td>{escape(_truncate_text(_sanitize_display_text(state.last_error or '-'), 120))}</td>"
+        "</tr>"
+        for state in states
+    )
+    body = _task_center_tabs("mock_platform")
+    body += f"""
+    <section class="panel">
+      <p class="subtle">Mock 平台测试台只用于本地验证改价、上下架和平台状态同步链路。这里展示的是测试平台实际状态，不代表真实销售平台，也不会回写商品公共库存。</p>
+      <p class="subtle">执行测试请使用命令行 <code>python scripts/run_mock_platform_executor.py --dry-run</code> 或确认后使用 <code>--apply</code>；本页第一版不提供执行按钮。</p>
+      <form method="get" action="/tasks" class="grid two-col">
+        <input type="hidden" name="task_tab" value="mock_platform">
+        <div class="field">
+          <label for="platform">{escape(_field_label("platform_name"))}</label>
+          <input id="platform" name="platform" type="text" value="{escape(platform_filter)}" placeholder="default_platform">
+        </div>
+        <div class="field">
+          <label for="internal_sku">{escape(_field_label("internal_sku"))}</label>
+          <input id="internal_sku" name="internal_sku" type="text" value="{escape(sku_filter)}" placeholder="SKU-001">
+        </div>
+        <div class="actions"><button type="submit">筛选</button></div>
+      </form>
+    </section>
+    """
+    body += (
+        _render_table_panel(
+            "Mock 平台状态",
+            [
+                "platform_name",
+                "internal_sku",
+                "platform_sku",
+                "product_name",
+                "grade",
+                "platform_price",
+                "platform_online_status",
+                "platform_stock_qty",
+                "last_synced_at",
+                "last_platform_update_at",
+                "last_error",
+            ],
+            rows,
+            empty_message="当前还没有 Mock 平台状态。可以先运行命令行初始化测试平台数据。",
+        )
+        if states
+        else _render_empty_state("Mock 平台状态", "当前还没有 Mock 平台状态。可以先运行命令行初始化测试平台数据。")
+    )
+    body += _render_pagination(
+        "/tasks",
+        pagination,
+        {
+            "task_tab": "mock_platform",
+            "platform": platform_filter,
+            "internal_sku": sku_filter,
+        },
+    )
+    return _render_ops_page(
+        title=UI_TEXT["ops_tasks_title"],
+        description="任务中心用于查看待执行任务、自动规则运行记录，也可以查看本地 Mock 平台测试台状态。",
+        active_path="/tasks",
+        runtime_db=runtime_db,
+        session_user=session_user,
+        body_html=body,
+    )
+
+
+def render_reviews_page(
+    *,
+    runtime_db: str,
+    session_user: str,
+    reviews,
+    pagination=None,
+    review_status: str = "",
+    due_filter: str = "",
+    selected_review=None,
+    source_task=None,
+    task_history=None,
+    related_notifications=None,
+    review_tokens=None,
+    message: str = "",
+    message_level: str = "info",
+) -> str:
+    rows = "".join(
+        "<tr>"
+        f"<td>{escape(display_enum_label('review_type', review.review_type))}</td>"
+        f"<td>{escape(format_object_scope(review.scope_type, review.scope_key))}</td>"
+        f"<td>{escape(_sanitize_display_text(review.reason or '-'))}</td>"
+        f"<td>{escape(format_display_datetime(review.required_by))}</td>"
+        f"<td>{_status_badge(review.review_status.value, 'review_status')}</td>"
+        f"<td>{escape(review.source_task_id or '-')}</td>"
+        f"<td>{_review_action_hint(review, review_status, due_filter)}</td>"
+        "</tr>"
+        for review in reviews
+    )
+    detail_html = _render_review_center_detail(
+        runtime_db=runtime_db,
+        session_user=session_user,
+        selected_review=selected_review,
+        source_task=source_task,
+        task_history=task_history or [],
+        related_notifications=related_notifications or [],
+        review_tokens=review_tokens or [],
+        review_status=review_status,
+        due_filter=due_filter,
+    )
+    intro = "<p class='subtle'>复核中心用于处理需要人工确认的事项。通过这里处理后，系统会记录处理人、处理时间和后续任务状态。</p>"
+    body = intro + _review_filter_panel(runtime_db, review_status, due_filter) + (
+        _render_table_panel(
+            UI_TEXT["ops_reviews_title"],
+            [
+                "review_type",
+                "business_object",
+                "reason",
+                "required_by",
+                "review_status",
+                "source_task_id",
+                "action",
+            ],
+            rows,
+            empty_message=UI_TEXT["ops_empty_reviews"],
+        )
+        if reviews
+        else _render_empty_state(UI_TEXT["ops_reviews_title"], UI_TEXT["ops_empty_reviews"])
+    ) + _render_pagination(
+        "/reviews",
+        pagination,
+        {
+            "review_status": review_status,
+            "due": due_filter,
+        },
+    ) + detail_html
+    return _render_ops_page(
+        title=UI_TEXT["ops_reviews_title"],
+        description="复核中心用于处理需要人工确认的事项，例如产能预警、临时工确认、低于保本价复核等。",
+        active_path="/reviews",
+        runtime_db=runtime_db,
+        session_user=session_user,
+        body_html=body,
+        message=message,
+        message_level=message_level,
+    )
+
+
+def render_notifications_page(
+    *,
+    runtime_db: str,
+    session_user: str,
+    notifications,
+    pagination=None,
+    send_status: str = "",
+    related_review_task_id: str = "",
+    channel: str = "",
+    notification_id: str = "",
+    selected_notification=None,
+    selected_review=None,
+    selected_task=None,
+) -> str:
+    rows = "".join(
+        "<tr>"
+        f"<td>{escape(format_display_datetime(log.sent_at))}</td>"
+        f"<td>{escape(display_enum_label('channel', log.channel))}</td>"
+        f"<td>{_status_badge(log.send_status, 'send_status')}</td>"
+        f"<td>{escape(log.related_review_task_id or '-')}</td>"
+        f"<td>{escape(_truncate_text(_sanitize_notification_text(log.message), 180))}</td>"
+        f"<td>{escape(_truncate_text(_sanitize_notification_text(log.error_message or '-'), 180))}</td>"
+        f"<td><a href='{escape(_append_query_to_path('/notifications', {'notification_id': log.notification_id, 'send_status': send_status, 'related_review_task_id': related_review_task_id, 'channel': channel}))}'>{escape(UI_TEXT['ops_notification_view_detail'])}</a></td>"
+        "</tr>"
+        for log in notifications
+    )
+    detail_html = _render_notification_center_detail(
+        notification_id=notification_id,
+        selected_notification=selected_notification,
+        selected_review=selected_review,
+        selected_task=selected_task,
+    )
+    body = _notification_filter_panel(
+        runtime_db,
+        send_status,
+        related_review_task_id,
+        channel,
+    ) + (
+        _render_table_panel(
+            UI_TEXT["ops_notifications_title"],
+            [
+                "sent_at",
+                "channel",
+                "send_status",
+                "related_review_task_id",
+                "message",
+                "error_message",
+                "action",
+            ],
+            rows,
+            empty_message=UI_TEXT["ops_empty_notifications"],
+        )
+        if notifications
+        else _render_empty_state(UI_TEXT["ops_notifications_title"], UI_TEXT["ops_empty_notifications"])
+    ) + _render_pagination(
+        "/notifications",
+        pagination,
+        {
+            "send_status": send_status,
+            "related_review_task_id": related_review_task_id,
+            "channel": channel,
+        },
+    ) + detail_html
+    return _render_ops_page(
+        title=UI_TEXT["ops_notifications_title"],
+        description="通知中心用于查看飞书或系统通知是否发送成功，以及对应哪个复核事项。",
+        active_path="/notifications",
+        runtime_db=runtime_db,
+        session_user=session_user,
+        body_html=body,
+    )
+
+
+def render_execution_logs_page(
+    *,
+    runtime_db: str,
+    session_user: str,
+    execution_logs,
+    pagination=None,
+    message: str = "",
+    message_level: str = "info",
+    shadowbot_queue_status=None,
+) -> str:
+    rows = "".join(
+        "<tr>"
+        f"<td>{escape(log.log_id)}</td>"
+        f"<td>{escape(log.task_id)}</td>"
+        f"<td>{escape(log.executor_name)}</td>"
+        f"<td>{_status_badge('success' if log.success_flag else 'failed' if log.success_flag is False else 'pending', 'task_status')}</td>"
+        f"<td>{escape(format_display_datetime(log.start_time))}</td>"
+        f"<td>{escape(format_display_datetime(log.end_time))}</td>"
+        f"<td>{escape(_sanitize_display_text(log.error_message or '-'))}</td>"
+        f"<td>{_render_shadowbot_log_summary(log)}</td>"
+        "</tr>"
+        for log in execution_logs
+    )
+    body = _banner(message, message_level) + _render_shadowbot_queue_status(shadowbot_queue_status) + f"<p class='subtle'>{escape(UI_TEXT['ops_execution_logs_note'])}</p>" + (
+        _render_table_panel(
+            UI_TEXT["ops_execution_logs_title"],
+            [
+                "log_id",
+                "task_id",
+                "executor_name",
+                "success_flag",
+                "start_time",
+                "end_time",
+                "error_message",
+                "shadowbot",
+            ],
+            rows,
+            empty_message=UI_TEXT["ops_empty_execution_logs"],
+        )
+        if execution_logs
+        else _render_empty_state(UI_TEXT["ops_execution_logs_title"], UI_TEXT["ops_empty_execution_logs"])
+    ) + _render_pagination("/execution-logs", pagination, {})
+    return _render_ops_page(
+        title=UI_TEXT["ops_execution_logs_title"],
+        description="执行记录用于查看系统或执行器实际执行后的结果。",
+        active_path="/execution-logs",
+        runtime_db=runtime_db,
+        session_user=session_user,
+        body_html=body,
+    )
+
+
+def render_business_inputs_page(
+    *,
+    runtime_db: str,
+    session_user: str,
+    products_path: str,
+    price_rules_path: str,
+    listing_rules_path: str,
+    capacity_plans_path: str,
+    cold_storage_status_path: str,
+    platform_mappings_path: str,
+    product_rows: list[dict[str, object]],
+    variety_options: list[str],
+    price_rule_rows: list[dict[str, object]],
+    listing_rule_rows: list[dict[str, object]],
+    capacity_plan_rows: list[dict[str, object]],
+    cold_storage_rows: list[dict[str, object]],
+    platform_options: list[str],
+    active_input_tab: str = "inventory",
+    message: str = "",
+    message_level: str = "info",
+) -> str:
+    active_input_tab = _normalize_business_input_tab(active_input_tab)
+    if active_input_tab == "price_rules":
+        active_panel = _render_price_rule_management(price_rules_path, product_rows, price_rule_rows, platform_options)
+    elif active_input_tab == "listing_rules":
+        active_panel = _render_listing_rule_management(
+            listing_rules_path,
+            product_rows,
+            listing_rule_rows,
+            platform_options,
+        )
+    elif active_input_tab == "capacity_plans":
+        active_panel = _render_capacity_plan_management(capacity_plans_path, capacity_plan_rows)
+    elif active_input_tab == "cold_storage_status":
+        active_panel = _render_cold_storage_management(cold_storage_status_path, cold_storage_rows)
+    else:
+        active_panel = (
+            _render_inventory_input_form(products_path, platform_mappings_path, variety_options)
+            + _render_product_inventory_list(products_path, product_rows, variety_options)
+        )
+    body = f"""
+    <section class="panel">
+      <h2>商品资料与库存录入</h2>
+      <p class="subtle">这里用于维护商品资料并录入可销售库存。系统会优先补充同类型库存；如果没有对应商品，才会新增商品资料。保存后请重新生成运行态任务，任务中心才会使用最新数据。</p>
+      <p class="subtle">初始录入库存是公共库存，不绑定特定平台；平台销售统计属于后续销售或转化记录。</p>
+      <div class="actions">
+        <a class="nav-link utility-link" href="/tables">{escape(UI_TEXT["ops_link_to_tables"])}</a>
+        <a class="nav-link utility-link" href="{escape('/')}">{escape(UI_TEXT["ops_link_to_generator"])}</a>
+      </div>
+      <p class="subtle"><a href="/system">{escape(UI_TEXT["ops_system_title"])}</a></p>
+    </section>
+    {_render_business_input_tabs(active_input_tab, runtime_db, products_path, price_rules_path, listing_rules_path, capacity_plans_path, cold_storage_status_path, platform_mappings_path)}
+    {active_panel}
+    {_render_inventory_feedback_dialog(message, message_level)}
+    """
+    return _render_ops_page(
+        title=UI_TEXT["ops_business_inputs_title"],
+        description="业务数据用于维护商品资料、录入可销售库存，并生成后续待处理任务。",
+        active_path="/business-inputs",
+        runtime_db=runtime_db,
+        session_user=session_user,
+        body_html=body,
+        message=message,
+        message_level=message_level,
+    )
+
+
+def _normalize_business_input_tab(value: str | None) -> str:
+    if value in BUSINESS_INPUT_TABS:
+        return str(value)
+    return "inventory"
+
+
+def _render_business_input_tabs(
+    active_input_tab: str,
+    runtime_db: str,
+    products_path: str,
+    price_rules_path: str,
+    listing_rules_path: str,
+    capacity_plans_path: str,
+    cold_storage_status_path: str,
+    platform_mappings_path: str,
+) -> str:
+    links = []
+    for tab_key, label in BUSINESS_INPUT_TABS.items():
+        href = _append_query_to_path(
+            "/business-inputs",
+            {
+                "runtime_db": runtime_db,
+                "products_path": products_path,
+                "price_rules_path": price_rules_path,
+                "listing_rules_path": listing_rules_path,
+                "capacity_plans_path": capacity_plans_path,
+                "cold_storage_status_path": cold_storage_status_path,
+                "platform_mappings_path": platform_mappings_path,
+                "input_tab": tab_key,
+            },
+        )
+        css_class = "business-input-tab active" if tab_key == active_input_tab else "business-input-tab"
+        aria_current = " aria-current=\"page\"" if tab_key == active_input_tab else ""
+        links.append(f"<a class=\"{css_class}\" href=\"{escape(href)}\"{aria_current}>{escape(label)}</a>")
+    return f"""
+    <section class="panel business-input-tab-panel" aria-label="业务输入分页">
+      <div class="business-input-tabs">
+        {''.join(links)}
+      </div>
+      <p class="subtle">请选择当前要维护的业务输入模块。库存录入和价格规则管理会分别保存到对应表格，保存后请重新生成待处理任务。</p>
+    </section>
+    """
+
+
+def _render_inventory_input_form(products_path: str, platform_mappings_path: str, variety_options: list[str]) -> str:
+    return f"""
+    <section class="panel product-input-panel">
+      <h2>录入库存</h2>
+      <p class="subtle">如果已有同类型商品，本次数量会累加到当前库存。同类型商品已存在时，本次保存会补充库存，并将基础成本、是否允许销售更新为本次填写值。</p>
+      <form method="post" class="inventory-form">
+        <input type="hidden" name="products_path" value="{escape(products_path)}">
+        <input type="hidden" name="platform_mappings_path" value="{escape(platform_mappings_path)}">
+        <input type="hidden" name="input_tab" value="inventory">
+        <input type="hidden" id="variety_code" name="variety_code" value="">
+        <div class="inventory-row">
+          <div class="field">
+            <div class="field-title-row">
+              <label for="product_name">品种</label>
+              <button class="mini-button" type="button" id="open_new_platform_dialog">新增平台</button>
+              <button class="mini-button" type="button" id="open_new_variety_dialog">新增品种</button>
+            </div>
+            <select id="product_name" name="product_name" required>
+              <option value="">请选择品种</option>
+              {_options_html(variety_options, "")}
+            </select>
+            <p class="help">选择鲜花品种。若列表中没有，请点击“新增品种”填写新品种名称和代码。</p>
+          </div>
+          <div class="field align-with-primary-control">
+            <label for="grade">等级</label>
+            <select id="grade" name="grade">{_options_html(GRADE_OPTIONS, "B")}</select>
+            <p class="help help-placeholder">&nbsp;</p>
+          </div>
+        </div>
+        <div class="inventory-row">
+          <div class="field">
+            <label for="quantity">本次入库数量</label>
+            <input id="quantity" name="quantity" type="number" min="1" step="1" required>
+            <p class="help">如果已有同类型商品，本次数量会累加到当前库存。</p>
+          </div>
+          <div class="field align-with-primary-control">
+            <label for="stem_length">枝长/规格</label>
+            <select id="stem_length" name="stem_length">{_options_html(STEM_LENGTH_OPTIONS, FOLLOW_GRADE_VALUE)}</select>
+            <p class="help">选择“跟随等级”时，会按 {_follow_grade_rule_text()} 保存。</p>
+          </div>
+        </div>
+        <div class="inventory-row">
+          <div class="field">
+            <label for="unit">单位</label>
+            <select id="unit" name="unit">{_options_html(UNIT_OPTIONS, "扎")}</select>
+            <p class="help help-placeholder">&nbsp;</p>
+          </div>
+          <div class="field align-with-primary-control">
+            <label for="base_cost">基础成本</label>
+            <input id="base_cost" name="base_cost" type="number" min="0" step="0.01" value="6" required>
+            <p class="help">用于系统判断低价风险，不会直接展示给销售平台。</p>
+          </div>
+        </div>
+        <div class="inventory-row">
+          <div class="field">
+            <label for="sale_enabled">是否允许销售</label>
+            <select id="sale_enabled" name="sale_enabled">
+              <option value="true" selected>是</option>
+              <option value="false">否</option>
+            </select>
+            <p class="help">关闭后，系统不会为该商品生成上架或改价任务。</p>
+          </div>
+          <div class="field inventory-submit-field">
+            <div class="submit-label-spacer" aria-hidden="true"></div>
+            <div class="inventory-submit-control">
+              <button class="primary" type="submit" name="action" value="add_inventory">补充库存</button>
+            </div>
+            <p class="help help-placeholder">&nbsp;</p>
+          </div>
+        </div>
+      </form>
+      {_render_new_platform_dialog(platform_mappings_path)}
+      {_render_new_variety_dialog()}
+      {_new_platform_dialog_script()}
+      {_new_variety_dialog_script()}
+    </section>
+    """
+
+
+def _render_inventory_feedback_dialog(message: str, message_level: str) -> str:
+    if not message or message_level != "success":
+        return ""
+    safe_message = escape(message)
+    alert_message = json.dumps(message, ensure_ascii=False)
+    return f"""
+    <dialog id="inventory_feedback_dialog" class="modal-card feedback-dialog" aria-labelledby="inventory_feedback_title">
+      <form method="dialog" class="grid">
+        <h3 id="inventory_feedback_title">保存成功</h3>
+        <p>{safe_message}</p>
+        <div class="actions">
+          <button class="primary" type="submit" value="confirm">确认</button>
+        </div>
+      </form>
+    </dialog>
+    <script>
+      (function () {{
+        const dialog = document.getElementById("inventory_feedback_dialog");
+        if (!dialog) {{
+          return;
+        }}
+        if (typeof dialog.showModal === "function") {{
+          dialog.showModal();
+        }} else {{
+          window.alert({alert_message});
+        }}
+      }})();
+    </script>
+    """
+
+
+def _render_product_inventory_list(
+    products_path: str,
+    product_rows: list[dict[str, object]],
+    variety_options: list[str],
+) -> str:
+    if not product_rows:
+        return _render_empty_state("商品资料", "当前还没有商品资料。请先录入库存，系统会自动创建商品资料。")
+    rows_html = "".join(_render_product_inventory_row(products_path, row, variety_options) for row in product_rows)
+    return _render_table_panel(
+        "商品资料",
+        ["product_name", "grade", "stem_length", "unit", "base_cost", "current_stock", "sale_enabled", "internal_sku", "action"],
+        rows_html,
+        empty_message="当前还没有商品资料。请先录入库存，系统会自动创建商品资料。",
+    )
+
+
+def _render_price_rule_management(
+    price_rules_path: str,
+    product_rows: list[dict[str, object]],
+    price_rule_rows: list[dict[str, object]],
+    platform_options: list[str],
+) -> str:
+    return f"""
+    <section class="panel product-input-panel">
+      <h2>价格规则管理</h2>
+      <p class="subtle">这里维护的是价格规则。保存后不会直接修改已生成任务；如需应用到任务中心，请重新生成运行态任务。</p>
+      <p class="subtle">当前表单严格保存回现有价格规则表字段：适用范围、价格类型、改价值、最低价、取整方式、是否启用和优先级。不新增数据库结构。</p>
+      {_render_price_rule_form(price_rules_path, product_rows, platform_options)}
+    </section>
+    {_render_price_rule_list(price_rules_path, product_rows, price_rule_rows, platform_options)}
+    """
+
+
+def _render_listing_rule_management(
+    listing_rules_path: str,
+    product_rows: list[dict[str, object]],
+    listing_rule_rows: list[dict[str, object]],
+    platform_options: list[str],
+) -> str:
+    return f"""
+    <section class="panel product-input-panel">
+      <h2>上下架规则管理</h2>
+      <p class="subtle">这里维护的是上下架判断规则。保存规则不会直接操作销售平台；如需影响任务中心，请重新生成运行态任务或运行对应规则评估。</p>
+      <p class="subtle">上下架规则由品种、等级、平台三个条件共同决定。“不限制”表示该维度不参与筛选。</p>
+      {_render_listing_rule_form(listing_rules_path, product_rows, platform_options)}
+    </section>
+    {_render_listing_rule_list(listing_rules_path, product_rows, listing_rule_rows, platform_options)}
+    """
+
+
+def _render_capacity_plan_management(capacity_plans_path: str, capacity_plan_rows: list[dict[str, object]]) -> str:
+    return f"""
+    <section class="panel product-input-panel">
+      <h2>包装产能计划</h2>
+      <p class="subtle">这里维护每日包装能力。系统会用确认包装能力与预测采收数量对比，判断是否需要产能预警或临时工确认。保存后如需影响脚本状态和复核，请运行对应自动规则评估。</p>
+      {_render_capacity_plan_form(capacity_plans_path)}
+    </section>
+    {_render_capacity_plan_list(capacity_plans_path, capacity_plan_rows)}
+    """
+
+
+def _render_capacity_plan_form(capacity_plans_path: str) -> str:
+    computed_capacity = 250
+    return f"""
+      <form method="post" class="inventory-form">
+        <input type="hidden" name="capacity_plans_path" value="{escape(capacity_plans_path)}">
+        <input type="hidden" name="input_tab" value="capacity_plans">
+        <input type="hidden" name="allocation_rule" value="proportional_by_forecast">
+        <div class="inventory-row">
+          <div class="field">
+            <label for="capacity_trade_date">业务日期</label>
+            <input id="capacity_trade_date" name="trade_date" type="date" required>
+            <p class="help">选择这条包装产能计划对应的业务日期。</p>
+          </div>
+          <div class="field">
+            <label for="capacity_active">是否启用</label>
+            <select id="capacity_active" name="active">
+              <option value="true" selected>是</option>
+              <option value="false">否</option>
+            </select>
+            <p class="help">同一业务日期只能保留一条启用的产能计划。</p>
+          </div>
+        </div>
+        <div class="inventory-row">
+          <div class="field">
+            <label for="normal_packing_capacity_qty">基础包装产能</label>
+            <input id="normal_packing_capacity_qty" name="normal_packing_capacity_qty" type="number" min="0" step="1" value="250" required>
+            <p class="help">基地不额外安排临时工时的默认包装能力。</p>
+          </div>
+          <div class="field">
+            <label for="confirmed_temp_worker_count">临时工人数</label>
+            <input id="confirmed_temp_worker_count" name="confirmed_temp_worker_count" type="number" min="0" step="1" value="0" required>
+            <p class="help">已确认会参与包装的临时工人数。</p>
+          </div>
+        </div>
+        <div class="inventory-row">
+          <div class="field">
+            <label for="temp_worker_capacity_qty">单人临时工产能</label>
+            <input id="temp_worker_capacity_qty" name="temp_worker_capacity_qty" type="number" min="0" step="1" value="100" required>
+            <p class="help">每名临时工当天预计可增加的包装能力。</p>
+          </div>
+          <div class="field">
+            <label for="confirmed_packing_capacity_qty">确认包装能力</label>
+            <input id="confirmed_packing_capacity_qty" name="confirmed_packing_capacity_qty" type="number" min="0" step="1" value="{computed_capacity}" required>
+            <p class="help">默认等于基础产能 + 临时工人数 × 单人产能，也可以人工确认。</p>
+          </div>
+        </div>
+        <div class="field">
+          <label for="capacity_note">备注</label>
+          <textarea id="capacity_note" name="note" rows="3"></textarea>
+        </div>
+        <div class="actions">
+          <button class="primary" type="submit" name="action" value="add_capacity_plan">新增包装产能计划</button>
+        </div>
+      </form>
+      {_capacity_plan_auto_capacity_script()}
+    """
+
+
+def _render_capacity_plan_list(capacity_plans_path: str, capacity_plan_rows: list[dict[str, object]]) -> str:
+    if not capacity_plan_rows:
+        return _render_empty_state("包装产能计划", "当前还没有包装产能计划。请先新增某个业务日期的包装能力。")
+    rows_html = "".join(
+        _render_capacity_plan_row(capacity_plans_path, row, row_index) for row_index, row in enumerate(capacity_plan_rows)
+    )
+    return _render_table_panel(
+        "包装产能计划",
+        [
+            "trade_date",
+            "normal_packing_capacity_qty",
+            "confirmed_temp_worker_count",
+            "temp_worker_capacity_qty",
+            "confirmed_packing_capacity_qty",
+            "active",
+            "note",
+            "action",
+        ],
+        rows_html,
+        empty_message="当前还没有包装产能计划。请先新增某个业务日期的包装能力。",
+    )
+
+
+def _render_capacity_plan_row(capacity_plans_path: str, row: dict[str, object], row_index: int) -> str:
+    trade_date = _capacity_trade_date_value(row)
+    confirmed_capacity = computed_capacity_from_row(row)
+    return f"""
+      <tr>
+        <td>{escape(trade_date or '-')}</td>
+        <td>{escape(format_capacity_number(row.get('normal_packing_capacity_qty')))}</td>
+        <td>{escape(format_capacity_number(row.get('confirmed_temp_worker_count')))}</td>
+        <td>{escape(format_capacity_number(row.get('temp_worker_capacity_qty')))}</td>
+        <td>{escape(format_capacity_number(confirmed_capacity))}</td>
+        <td>{escape(capacity_active_display(row.get('active')))}</td>
+        <td>{escape(str(row.get('note') or '-'))}</td>
+        <td>{_render_capacity_plan_edit_form(capacity_plans_path, row, row_index)}</td>
+      </tr>
+    """
+
+
+def _render_capacity_plan_edit_form(capacity_plans_path: str, row: dict[str, object], row_index: int) -> str:
+    trade_date = _capacity_trade_date_value(row)
+    active = "true" if capacity_active_display(row.get("active")) == "是" else "false"
+    confirmed_capacity = computed_capacity_from_row(row)
+    return f"""
+      <details>
+        <summary>编辑</summary>
+        <form method="post" class="grid product-edit-form">
+          <input type="hidden" name="capacity_plans_path" value="{escape(capacity_plans_path)}">
+          <input type="hidden" name="input_tab" value="capacity_plans">
+          <input type="hidden" name="current_trade_date" value="{escape(trade_date)}">
+          <input type="hidden" name="current_row_index" value="{row_index}">
+          <input type="hidden" name="allocation_rule" value="{escape(str(row.get('allocation_rule') or 'proportional_by_forecast'))}">
+          <p class="help">保存后如需影响脚本状态和复核，请运行对应自动规则评估。</p>
+          <div class="two-col">
+            <div class="field">
+              <label>业务日期</label>
+              <input name="trade_date" type="date" value="{escape(trade_date)}" required>
+            </div>
+            <div class="field">
+              <label>是否启用</label>
+              <select name="active">
+                <option value="true" {'selected' if active == 'true' else ''}>是</option>
+                <option value="false" {'selected' if active == 'false' else ''}>否</option>
+              </select>
+            </div>
+          </div>
+          <div class="two-col">
+            <div class="field">
+              <label>基础包装产能</label>
+              <input name="normal_packing_capacity_qty" type="number" min="0" step="1" value="{escape(str(row.get('normal_packing_capacity_qty') or '250'))}" required>
+            </div>
+            <div class="field">
+              <label>临时工人数</label>
+              <input name="confirmed_temp_worker_count" type="number" min="0" step="1" value="{escape(str(row.get('confirmed_temp_worker_count') or '0'))}" required>
+            </div>
+          </div>
+          <div class="two-col">
+            <div class="field">
+              <label>单人临时工产能</label>
+              <input name="temp_worker_capacity_qty" type="number" min="0" step="1" value="{escape(str(row.get('temp_worker_capacity_qty') or '100'))}" required>
+            </div>
+            <div class="field">
+              <label>确认包装能力</label>
+              <input name="confirmed_packing_capacity_qty" type="number" min="0" step="1" value="{escape(str(confirmed_capacity))}" required>
+            </div>
+          </div>
+          <div class="field">
+            <label>备注</label>
+            <textarea name="note" rows="3">{escape(str(row.get('note') or ''))}</textarea>
+          </div>
+          <button class="primary" type="submit" name="action" value="edit_capacity_plan">保存包装产能计划</button>
+        </form>
+      </details>
+    """
+
+
+def _capacity_trade_date_value(row: dict[str, object]) -> str:
+    value = row.get("trade_date")
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value or "").strip()
+
+
+def _capacity_plan_auto_capacity_script() -> str:
+    return """
+      <script>
+        (function () {
+          const form = document.currentScript && document.currentScript.previousElementSibling;
+          if (!form || !form.matches("form")) {
+            return;
+          }
+          const base = form.querySelector("#normal_packing_capacity_qty");
+          const workers = form.querySelector("#confirmed_temp_worker_count");
+          const workerCapacity = form.querySelector("#temp_worker_capacity_qty");
+          const confirmed = form.querySelector("#confirmed_packing_capacity_qty");
+          if (!base || !workers || !workerCapacity || !confirmed) {
+            return;
+          }
+          const update = function () {
+            const baseValue = Number(base.value || 0);
+            const workerCount = Number(workers.value || 0);
+            const workerCapacityValue = Number(workerCapacity.value || 0);
+            if (document.activeElement === confirmed) {
+              return;
+            }
+            confirmed.value = String(Math.max(0, baseValue + workerCount * workerCapacityValue));
+          };
+          base.addEventListener("input", update);
+          workers.addEventListener("input", update);
+          workerCapacity.addEventListener("input", update);
+        })();
+      </script>
+    """
+
+
+def _render_listing_rule_form(listing_rules_path: str, product_rows: list[dict[str, object]], platform_options: list[str]) -> str:
+    return f"""
+      <form method="post" class="inventory-form">
+        <input type="hidden" name="listing_rules_path" value="{escape(listing_rules_path)}">
+        <input type="hidden" name="input_tab" value="listing_rules">
+        <div class="inventory-row">
+          <div class="field">
+            <label for="listing_rule_name">规则名称</label>
+            <input id="listing_rule_name" name="rule_name" type="text" required>
+            <p class="help">例如：低库存下架、B级艾莎允许上架。</p>
+          </div>
+          <div class="field">
+            <label for="listing_rule_active">是否启用</label>
+            <select id="listing_rule_active" name="active">
+              <option value="true" selected>是</option>
+              <option value="false">否</option>
+            </select>
+            <p class="help">关闭后，任务生成不会使用这条上下架规则。</p>
+          </div>
+        </div>
+        {_render_listing_filter_picker(product_rows, platform_options, "*", "*", "*", "new")}
+        <div class="inventory-row">
+          <div class="field">
+            <label for="listing_strategy">规则策略</label>
+            <select id="listing_strategy" name="listing_strategy">{_labeled_options(LISTING_STRATEGY_OPTIONS, "stock_below_offline", "listing_strategy")}</select>
+            <p class="help">策略只决定是否建议上架或下架，不直接操作平台。</p>
+          </div>
+          <div class="field">
+            <label for="stock_threshold">库存阈值</label>
+            <input id="stock_threshold" name="stock_threshold" type="number" min="0" step="1" value="0" required>
+            <p class="help">库存低于或高于阈值时触发对应策略；禁止/允许上架策略也保留该值用于说明。</p>
+          </div>
+        </div>
+        <div class="inventory-row">
+          <div class="field">
+            <label for="listing_priority">优先级</label>
+            <input id="listing_priority" name="priority" type="number" min="0" step="1" value="10" required>
+            <p class="help">数字越小越先应用；下架建议优先于上架建议。</p>
+          </div>
+          <div class="field">
+            <label for="listing_rule_remark">备注</label>
+            <textarea id="listing_rule_remark" name="remark" rows="3"></textarea>
+          </div>
+        </div>
+        <div class="actions">
+          <button class="primary" type="submit" name="action" value="add_listing_rule">新增上下架规则</button>
+        </div>
+      </form>
+    """
+
+
+def _render_listing_rule_list(
+    listing_rules_path: str,
+    product_rows: list[dict[str, object]],
+    listing_rule_rows: list[dict[str, object]],
+    platform_options: list[str],
+) -> str:
+    if not listing_rule_rows:
+        return _render_empty_state("上下架规则", "当前还没有上下架规则。请先新增一条规则，或使用高级表格入口批量维护。")
+    rows_html = "".join(
+        _render_listing_rule_row(listing_rules_path, product_rows, platform_options, row) for row in listing_rule_rows
+    )
+    return _render_table_panel(
+        "上下架规则",
+        ["rule_name", "listing_rule_scope", "listing_strategy", "stock_threshold", "active", "priority", "remark", "action"],
+        rows_html,
+        empty_message="当前还没有上下架规则。请先新增一条规则，或使用高级表格入口批量维护。",
+    )
+
+
+def _render_listing_rule_row(
+    listing_rules_path: str,
+    product_rows: list[dict[str, object]],
+    platform_options: list[str],
+    row: dict[str, object],
+) -> str:
+    listing_strategy = str(row.get("listing_strategy") or "").strip()
+    return f"""
+      <tr>
+        <td>{escape(str(row.get('rule_name') or '-'))}</td>
+        <td>{escape(format_listing_rule_scope(row))}</td>
+        <td>{escape(display_enum_label('listing_strategy', listing_strategy))}</td>
+        <td>{escape(format_listing_rule_number(row.get('stock_threshold')))}</td>
+        <td>{escape(listing_active_display(row.get('active')))}</td>
+        <td>{escape(format_listing_rule_number(row.get('priority')))}</td>
+        <td>{escape(str(row.get('remark') or '-'))}</td>
+        <td>{_render_listing_rule_edit_form(listing_rules_path, product_rows, platform_options, row)}</td>
+      </tr>
+    """
+
+
+def _render_listing_rule_edit_form(
+    listing_rules_path: str,
+    product_rows: list[dict[str, object]],
+    platform_options: list[str],
+    row: dict[str, object],
+) -> str:
+    rule_id = str(row.get("rule_id") or "").strip()
+    active = "true" if listing_active_display(row.get("active")) == "是" else "false"
+    return f"""
+      <details>
+        <summary>编辑</summary>
+        <form method="post" class="grid product-edit-form">
+          <input type="hidden" name="listing_rules_path" value="{escape(listing_rules_path)}">
+          <input type="hidden" name="input_tab" value="listing_rules">
+          <input type="hidden" name="rule_id" value="{escape(rule_id)}">
+          <p class="help">规则编号：{escape(rule_id)}。保存后请重新生成运行态任务或运行对应规则评估。</p>
+          <div class="field">
+            <label>规则名称</label>
+            <input name="rule_name" type="text" value="{escape(str(row.get('rule_name') or ''))}" required>
+          </div>
+          {_render_listing_filter_picker(product_rows, platform_options, str(row.get('variety_filter') or '*'), str(row.get('grade_filter') or '*'), str(row.get('platform_filter') or '*'), rule_id)}
+          <div class="two-col">
+            <div class="field">
+              <label>规则策略</label>
+              <select name="listing_strategy">{_labeled_options(LISTING_STRATEGY_OPTIONS, str(row.get('listing_strategy') or 'stock_below_offline'), 'listing_strategy')}</select>
+            </div>
+            <div class="field">
+              <label>库存阈值</label>
+              <input name="stock_threshold" type="number" min="0" step="1" value="{escape(str(row.get('stock_threshold') or '0'))}" required>
+            </div>
+          </div>
+          <div class="two-col">
+            <div class="field">
+              <label>是否启用</label>
+              <select name="active">
+                <option value="true" {'selected' if active == 'true' else ''}>是</option>
+                <option value="false" {'selected' if active == 'false' else ''}>否</option>
+              </select>
+            </div>
+            <div class="field">
+              <label>优先级</label>
+              <input name="priority" type="number" min="0" step="1" value="{escape(str(row.get('priority') or '10'))}" required>
+            </div>
+          </div>
+          <div class="field">
+            <label>备注</label>
+            <textarea name="remark" rows="3">{escape(str(row.get('remark') or ''))}</textarea>
+          </div>
+          <button class="primary" type="submit" name="action" value="edit_listing_rule">保存上下架规则</button>
+        </form>
+      </details>
+    """
+
+
+def _render_price_rule_form(price_rules_path: str, product_rows: list[dict[str, object]], platform_options: list[str]) -> str:
+    return f"""
+      <form method="post" class="inventory-form">
+        <input type="hidden" name="price_rules_path" value="{escape(price_rules_path)}">
+        <input type="hidden" name="input_tab" value="price_rules">
+        <div class="inventory-row">
+          <div class="field">
+            <label for="price_rule_name">规则名称</label>
+            <input id="price_rule_name" name="rule_name" type="text" required>
+            <p class="help">例如：A级百分比改价、全局最低价保护。</p>
+          </div>
+          <div class="field">
+            <label for="price_rule_active">是否启用</label>
+            <select id="price_rule_active" name="active">
+              <option value="true" selected>是</option>
+              <option value="false">否</option>
+            </select>
+            <p class="help">关闭后，任务生成不会使用这条价格规则。</p>
+          </div>
+        </div>
+        {_render_price_filter_picker(product_rows, platform_options, "*", "*", "*", "new")}
+        <div class="inventory-row">
+          <div class="field">
+            <label for="pricing_method">价格类型</label>
+            <select id="pricing_method" name="pricing_method">{_labeled_options(PRICING_METHOD_OPTIONS, "fixed_markup", "pricing_method")}</select>
+            <p class="help">固定改价按金额调整；百分比改价按当前价格比例调整。</p>
+          </div>
+          <div class="field">
+            <label for="markup_value">改价值</label>
+            <input id="markup_value" name="markup_value" type="number" step="0.01" required>
+            <p class="help">输入正数表示涨价，输入负数表示降价；不能为 0。</p>
+          </div>
+        </div>
+        <div class="inventory-row">
+          <div class="field">
+            <label for="min_price">最低价</label>
+            <input id="min_price" name="min_price" type="number" min="0" step="0.01">
+            <p class="help">用于低价风险和价格底线保护，不能为负数。</p>
+          </div>
+          <div class="field">
+            <label for="priority">优先级</label>
+            <input id="priority" name="priority" type="number" min="0" step="1" value="10" required>
+            <p class="help">数字越小越先应用。</p>
+          </div>
+        </div>
+        <div class="inventory-row">
+          <div class="field">
+            <label for="rounding_rule">取整规则</label>
+            <select id="rounding_rule" name="rounding_rule">{_labeled_options(ROUNDING_RULE_OPTIONS, "none", "rounding_rule")}</select>
+            <p class="help">按步长取整时，需要填写取整步长。</p>
+          </div>
+          <div class="field">
+            <label for="rounding_step">取整步长</label>
+            <input id="rounding_step" name="rounding_step" type="number" min="0" step="0.01">
+            <p class="help">例如 `0.5` 表示按 0.5 元向上取整。</p>
+          </div>
+        </div>
+        <div class="field">
+          <label for="price_rule_remark">备注</label>
+          <textarea id="price_rule_remark" name="remark" rows="3"></textarea>
+        </div>
+        <div class="actions">
+          <button class="primary" type="submit" name="action" value="add_price_rule">新增价格规则</button>
+        </div>
+      </form>
+    """
+
+
+def _render_price_rule_list(
+    price_rules_path: str,
+    product_rows: list[dict[str, object]],
+    price_rule_rows: list[dict[str, object]],
+    platform_options: list[str],
+) -> str:
+    if not price_rule_rows:
+        return _render_empty_state("价格规则", "当前还没有价格规则。请先新增一条价格规则，或使用高级表格入口批量维护。")
+    rows_html = "".join(_render_price_rule_row(price_rules_path, product_rows, platform_options, row) for row in price_rule_rows)
+    return _render_table_panel(
+        "价格规则",
+        ["rule_name", "price_rule_scope", "pricing_method", "markup_value", "min_price", "rounding_rule", "active", "priority", "action"],
+        rows_html,
+        empty_message="当前还没有价格规则。请先新增一条价格规则，或使用高级表格入口批量维护。",
+    )
+
+
+def _render_price_rule_row(
+    price_rules_path: str,
+    product_rows: list[dict[str, object]],
+    platform_options: list[str],
+    row: dict[str, object],
+) -> str:
+    rule_id = str(row.get("rule_id") or "").strip()
+    pricing_method = str(row.get("pricing_method") or "").strip()
+    rounding_rule = str(row.get("rounding_rule") or "").strip()
+    return f"""
+      <tr>
+        <td>{escape(str(row.get('rule_name') or '-'))}</td>
+        <td>{escape(format_price_rule_scope(row))}</td>
+        <td>{escape(display_enum_label('pricing_method', pricing_method))}</td>
+        <td>{escape(format_price_rule_number(row.get('markup_value')))}</td>
+        <td>{escape(format_price_rule_number(row.get('min_price')))}</td>
+        <td>{escape(display_enum_label('rounding_rule', rounding_rule))}</td>
+        <td>{escape(active_display(row.get('active')))}</td>
+        <td>{escape(format_price_rule_number(row.get('priority')))}</td>
+        <td>{_render_price_rule_edit_form(price_rules_path, product_rows, platform_options, row)}</td>
+      </tr>
+    """
+
+
+def _render_price_rule_edit_form(
+    price_rules_path: str,
+    product_rows: list[dict[str, object]],
+    platform_options: list[str],
+    row: dict[str, object],
+) -> str:
+    rule_id = str(row.get("rule_id") or "").strip()
+    active = "true" if active_display(row.get("active")) == "是" else "false"
+    return f"""
+      <details>
+        <summary>编辑</summary>
+        <form method="post" class="grid product-edit-form">
+          <input type="hidden" name="price_rules_path" value="{escape(price_rules_path)}">
+          <input type="hidden" name="input_tab" value="price_rules">
+          <input type="hidden" name="rule_id" value="{escape(rule_id)}">
+          <p class="help">规则编号：{escape(rule_id)}。保存后请重新生成运行态任务，任务中心才会使用最新价格规则。</p>
+          <div class="field">
+            <label>规则名称</label>
+            <input name="rule_name" type="text" value="{escape(str(row.get('rule_name') or ''))}" required>
+          </div>
+          {_render_price_filter_picker(product_rows, platform_options, str(row.get('variety_filter') or '*'), str(row.get('grade_filter') or '*'), str(row.get('platform_filter') or '*'), rule_id)}
+          <div class="two-col">
+            <div class="field">
+              <label>价格类型</label>
+              <select name="pricing_method">{_labeled_options(PRICING_METHOD_OPTIONS, str(row.get('pricing_method') or 'fixed_markup'), 'pricing_method')}</select>
+            </div>
+            <div class="field">
+              <label>改价值</label>
+              <input name="markup_value" type="number" step="0.01" value="{escape(str(row.get('markup_value') or '0'))}" required>
+            </div>
+          </div>
+          <div class="two-col">
+            <div class="field">
+              <label>最低价</label>
+              <input name="min_price" type="number" min="0" step="0.01" value="{escape(str(row.get('min_price') or ''))}">
+            </div>
+            <div class="field">
+              <label>优先级</label>
+              <input name="priority" type="number" min="0" step="1" value="{escape(str(row.get('priority') or '10'))}" required>
+            </div>
+          </div>
+          <div class="two-col">
+            <div class="field">
+              <label>取整规则</label>
+              <select name="rounding_rule">{_labeled_options(ROUNDING_RULE_OPTIONS, str(row.get('rounding_rule') or 'none'), 'rounding_rule')}</select>
+            </div>
+            <div class="field">
+              <label>取整步长</label>
+              <input name="rounding_step" type="number" min="0" step="0.01" value="{escape(str(row.get('rounding_step') or ''))}">
+            </div>
+          </div>
+          <div class="field">
+            <label>是否启用</label>
+            <select name="active">
+              <option value="true" {'selected' if active == 'true' else ''}>是</option>
+              <option value="false" {'selected' if active == 'false' else ''}>否</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>备注</label>
+            <textarea name="remark" rows="3">{escape(str(row.get('remark') or ''))}</textarea>
+          </div>
+          <button class="primary" type="submit" name="action" value="edit_price_rule">保存价格规则</button>
+        </form>
+      </details>
+    """
+
+
+def _render_price_filter_picker(
+    product_rows: list[dict[str, object]],
+    platform_options: list[str],
+    selected_variety: str,
+    selected_grade: str,
+    selected_platform: str,
+    suffix: str,
+) -> str:
+    safe_suffix = re.sub(r"[^A-Za-z0-9_-]+", "-", suffix or "new").strip("-") or "new"
+    variety_options = ["*", *extract_variety_options(product_rows)]
+    grade_options = ["*", *GRADE_OPTIONS]
+    platform_options = ["*", *(platform_options or PLATFORM_OPTIONS)]
+    return f"""
+        <div class="inventory-row price-filter-picker">
+          <div class="field">
+            <label for="variety_filter_{escape(safe_suffix)}">品种</label>
+            <select id="variety_filter_{escape(safe_suffix)}" name="variety_filter">
+              {_price_filter_options(variety_options, selected_variety or "*", "全部品种")}
+            </select>
+            <p class="help">不限制表示该维度不参与筛选。</p>
+          </div>
+          <div class="field">
+            <label for="grade_filter_{escape(safe_suffix)}">等级</label>
+            <select id="grade_filter_{escape(safe_suffix)}" name="grade_filter">
+              {_price_filter_options(grade_options, selected_grade or "*", "全部等级", grade_suffix=True)}
+            </select>
+            <p class="help">等级 0 会按字符串保存，不会被当成空值。</p>
+          </div>
+        </div>
+        <div class="inventory-row price-filter-picker">
+          <div class="field">
+            <label for="platform_filter_{escape(safe_suffix)}">平台</label>
+            <select id="platform_filter_{escape(safe_suffix)}" name="platform_filter">
+              {_price_filter_options(platform_options, selected_platform or "*", "全部平台")}
+            </select>
+            <p class="help">平台只用于价格规则命中，不改变库存归属。</p>
+          </div>
+          <div class="field">
+            <label>筛选说明</label>
+            <p class="help">价格规则由品种、等级、平台三个条件共同决定。“不限制”表示该维度不参与筛选。例如：品种=艾莎、等级=B、平台=蚂蚁，表示只对蚂蚁平台上的 B 级艾莎生效。</p>
+          </div>
+        </div>
+    """
+
+
+def _render_listing_filter_picker(
+    product_rows: list[dict[str, object]],
+    platform_options: list[str],
+    selected_variety: str,
+    selected_grade: str,
+    selected_platform: str,
+    suffix: str,
+) -> str:
+    safe_suffix = re.sub(r"[^A-Za-z0-9_-]+", "-", suffix or "new").strip("-") or "new"
+    variety_options = ["*", *extract_variety_options(product_rows)]
+    grade_options = ["*", *GRADE_OPTIONS]
+    platform_options = ["*", *(platform_options or PLATFORM_OPTIONS)]
+    return f"""
+        <div class="inventory-row price-filter-picker">
+          <div class="field">
+            <label for="listing_variety_filter_{escape(safe_suffix)}">品种</label>
+            <select id="listing_variety_filter_{escape(safe_suffix)}" name="variety_filter">
+              {_price_filter_options(variety_options, selected_variety or "*", "全部品种")}
+            </select>
+            <p class="help">不限制表示该维度不参与筛选。</p>
+          </div>
+          <div class="field">
+            <label for="listing_grade_filter_{escape(safe_suffix)}">等级</label>
+            <select id="listing_grade_filter_{escape(safe_suffix)}" name="grade_filter">
+              {_price_filter_options(grade_options, selected_grade or "*", "全部等级", grade_suffix=True)}
+            </select>
+            <p class="help">等级 0 会按字符串保存，不会被当成空值。</p>
+          </div>
+        </div>
+        <div class="inventory-row price-filter-picker">
+          <div class="field">
+            <label for="listing_platform_filter_{escape(safe_suffix)}">平台</label>
+            <select id="listing_platform_filter_{escape(safe_suffix)}" name="platform_filter">
+              {_price_filter_options(platform_options, selected_platform or "*", "全部平台")}
+            </select>
+            <p class="help">平台只用于上下架规则命中，不改变库存归属。</p>
+          </div>
+          <div class="field">
+            <label>筛选说明</label>
+            <p class="help">上下架规则由品种、等级、平台三个条件共同决定。“不限制”表示该维度不参与筛选。保存规则不会直接操作平台。</p>
+          </div>
+        </div>
+    """
+
+
+def _price_filter_options(options: list[str], selected: str, wildcard_label: str, *, grade_suffix: bool = False) -> str:
+    unique_options: list[str] = []
+    seen: set[str] = set()
+    for option in options:
+        if option in seen:
+            continue
+        seen.add(option)
+        unique_options.append(option)
+    selected = selected or "*"
+    html_options = []
+    for option in unique_options:
+        if option == "*":
+            label = f"不限制（{wildcard_label}）"
+        elif grade_suffix:
+            label = f"{option}级"
+        else:
+            label = option
+        html_options.append(f"<option value='{escape(option)}' {'selected' if option == selected else ''}>{escape(label)}</option>")
+    return "".join(html_options)
+
+
+def format_price_rule_scope(row: dict[str, object]) -> str:
+    variety = str(row.get("variety_filter") or "*").strip() or "*"
+    grade = str(row.get("grade_filter") or "*").strip().upper() or "*"
+    platform = str(row.get("platform_filter") or "*").strip() or "*"
+    if variety == "*" and grade == "*" and platform == "*":
+        return "全部商品"
+    variety_label = "全部品种" if variety == "*" else variety
+    grade_label = "全部等级" if grade == "*" else f"{grade}级"
+    platform_label = "全部平台" if platform == "*" else platform
+    return f"{variety_label} / {grade_label} / {platform_label}"
+
+
+def _render_product_inventory_row(products_path: str, row: dict[str, object], variety_options: list[str]) -> str:
+    sku = str(row.get("internal_sku") or "")
+    edit_form = _render_product_edit_form(products_path, row, variety_options)
+    return (
+        "<tr>"
+        f"<td>{escape(str(row.get('product_name') or '-'))}</td>"
+        f"<td>{escape(str(row.get('grade') or '-'))}</td>"
+        f"<td>{escape(_display_stem_length(row.get('stem_length')))}</td>"
+        f"<td>{escape(str(row.get('unit') or '-'))}</td>"
+        f"<td>{escape(format_product_number(row.get('base_cost')))}</td>"
+        f"<td>{escape(format_product_number(row.get('current_stock')))}</td>"
+        f"<td>{escape(sale_enabled_display(row.get('sale_enabled')))}</td>"
+        f"<td><code>{escape(sku or '-')}</code></td>"
+        f"<td>{edit_form}</td>"
+        "</tr>"
+    )
+
+
+def _render_product_edit_form(products_path: str, row: dict[str, object], variety_options: list[str]) -> str:
+    sku = str(row.get("internal_sku") or "")
+    sale_enabled = "true" if sale_enabled_display(row.get("sale_enabled")) == "是" else "false"
+    return f"""
+    <details class="inline-details">
+      <summary>编辑</summary>
+      {_product_variety_datalist(variety_options, suffix=sku)}
+      <form method="post" class="grid two-col compact-form product-edit-form">
+        <input type="hidden" name="products_path" value="{escape(products_path)}">
+        <input type="hidden" name="input_tab" value="inventory">
+        <input type="hidden" name="internal_sku" value="{escape(sku)}">
+        <div class="field">
+          <label>内部 SKU</label>
+          <input type="text" value="{escape(sku)}" readonly>
+          <p class="help">SKU 用于系统识别商品和关联任务，通常不建议修改。</p>
+        </div>
+        <div class="field">
+          <label>品种</label>
+          <input name="product_name" list="product_variety_options_{escape(sku)}" type="text" value="{escape(str(row.get('product_name') or ''))}" required>
+        </div>
+        <div class="field">
+          <label>等级</label>
+          <select name="grade">{_options_html(GRADE_OPTIONS, str(row.get('grade') or 'B'))}</select>
+        </div>
+        <div class="field">
+          <label>枝长/规格</label>
+          <select name="stem_length">{_options_html(STEM_LENGTH_OPTIONS, _display_stem_length(row.get('stem_length')))}</select>
+        </div>
+        <div class="field">
+          <label>单位</label>
+          <select name="unit">{_options_html(UNIT_OPTIONS, str(row.get('unit') or '扎'))}</select>
+        </div>
+        <div class="field">
+          <label>基础成本</label>
+          <input name="base_cost" type="number" min="0" step="0.01" value="{escape(format_product_number(row.get('base_cost')))}" required>
+        </div>
+        <div class="field">
+          <label>当前库存</label>
+          <input name="current_stock" type="number" min="0" step="1" value="{escape(format_product_number(row.get('current_stock')))}" required>
+        </div>
+        <div class="field">
+          <label>是否允许销售</label>
+          <select name="sale_enabled">
+            <option value="true" {'selected' if sale_enabled == 'true' else ''}>是</option>
+            <option value="false" {'selected' if sale_enabled == 'false' else ''}>否</option>
+          </select>
+        </div>
+        <p class="subtle">修改品种、等级、枝长或单位可能影响后续任务生成。为避免破坏历史任务和统计，默认保留原 SKU。</p>
+        <div class="actions">
+          <button class="secondary" type="submit" name="action" value="edit_product">保存商品资料</button>
+        </div>
+      </form>
+    </details>
+    """
+
+
+def _product_variety_datalist(variety_options: list[str], suffix: str = "") -> str:
+    datalist_id = f"product_variety_options_{suffix}" if suffix else "product_variety_options"
+    options = "".join(f"<option value='{escape(option)}'></option>" for option in variety_options)
+    return f"<datalist id='{escape(datalist_id)}'>{options}</datalist>"
+
+
+def _render_new_variety_dialog() -> str:
+    return """
+    <dialog id="new_variety_dialog" class="modal-card">
+      <form method="dialog" class="grid">
+        <h3>新增品种</h3>
+        <p class="subtle">新品种需要同时维护品种名称和品种代码。品种代码用于生成 SKU，不会包含平台信息。</p>
+        <div class="field">
+          <label for="new_variety_name">新品种名称</label>
+          <input id="new_variety_name" type="text" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="new_variety_code">品种代码</label>
+          <input id="new_variety_code" type="text" autocomplete="off" placeholder="例如 AISHA">
+        </div>
+        <p class="help" id="new_variety_error" role="alert"></p>
+        <div class="actions">
+          <button class="primary" type="button" id="confirm_new_variety">加入品种列表</button>
+          <button class="secondary" type="button" id="cancel_new_variety">取消</button>
+        </div>
+      </form>
+    </dialog>
+    """
+
+
+def _render_new_platform_dialog(platform_mappings_path: str) -> str:
+    return f"""
+    <dialog id="new_platform_dialog" class="modal-card">
+      <form method="post" class="grid">
+        <input type="hidden" name="platform_mappings_path" value="{escape(platform_mappings_path)}">
+        <input type="hidden" name="input_tab" value="inventory">
+        <h3>新增平台</h3>
+        <p class="subtle">这里维护的是销售平台选项。初始库存仍是公共库存，不会因为新增平台而拆分为平台库存。</p>
+        <div class="field">
+          <label for="new_platform_name">平台名称</label>
+          <input id="new_platform_name" name="platform_name" type="text" autocomplete="off" required>
+        </div>
+        <div class="actions">
+          <button class="primary" type="submit" name="action" value="add_platform">保存平台</button>
+          <button class="secondary" type="button" id="cancel_new_platform">取消</button>
+        </div>
+      </form>
+    </dialog>
+    """
+
+
+def _new_platform_dialog_script() -> str:
+    return """
+    <script>
+      (() => {
+        const dialog = document.getElementById("new_platform_dialog");
+        const openButton = document.getElementById("open_new_platform_dialog");
+        const cancelButton = document.getElementById("cancel_new_platform");
+        if (!dialog || !openButton) return;
+        openButton.addEventListener("click", () => {
+          if (typeof dialog.showModal === "function") {
+            dialog.showModal();
+          } else {
+            dialog.setAttribute("open", "open");
+          }
+        });
+        if (cancelButton) {
+          cancelButton.addEventListener("click", () => {
+            if (typeof dialog.close === "function") {
+              dialog.close();
+            } else {
+              dialog.removeAttribute("open");
+            }
+          });
+        }
+      })();
+    </script>
+    """
+
+
+def _render_cold_storage_management(cold_storage_status_path: str, cold_storage_rows: list[dict[str, object]]) -> str:
+    return f"""
+    <section class="panel product-input-panel">
+      <h2>冷库状态</h2>
+      <p class="subtle">这里维护每日冷库占用情况。系统会用预计占用量和剩余容量判断是否需要冷库预警或人工复核。保存后如需影响脚本状态和复核，请运行对应自动规则评估。</p>
+      {_render_cold_storage_form(cold_storage_status_path)}
+    </section>
+    {_render_cold_storage_list(cold_storage_status_path, cold_storage_rows)}
+    """
+
+
+def _render_cold_storage_form(cold_storage_status_path: str) -> str:
+    return f"""
+      <form method="post" class="inventory-form cold-storage-form">
+        <input type="hidden" name="cold_storage_status_path" value="{escape(cold_storage_status_path)}">
+        <input type="hidden" name="input_tab" value="cold_storage_status">
+        <div class="inventory-row">
+          <div class="field">
+            <label for="cold_trade_date">业务日期</label>
+            <input id="cold_trade_date" name="trade_date" type="date" required>
+            <p class="help">选择这条冷库状态对应的业务日期。</p>
+          </div>
+          <div class="field">
+            <label for="cold_active">是否启用</label>
+            <select id="cold_active" name="active">
+              <option value="true" selected>是</option>
+              <option value="false">否</option>
+            </select>
+            <p class="help">同一业务日期只能保留一条启用的冷库状态。</p>
+          </div>
+        </div>
+        <div class="inventory-row">
+          <div class="field">
+            <label for="total_capacity_qty">冷库总容量</label>
+            <input id="total_capacity_qty" name="total_capacity_qty" type="number" min="1" step="1" value="500" required>
+            <p class="help">全场共享冷库容量，默认 500 扎。</p>
+          </div>
+          <div class="field">
+            <label for="current_occupied_qty">当前占用量</label>
+            <input id="current_occupied_qty" name="current_occupied_qty" type="number" min="0" step="1" value="0" required>
+            <p class="help">当前已经占用冷库的数量。</p>
+          </div>
+        </div>
+        <div class="inventory-row">
+          <div class="field">
+            <label for="expected_inbound_qty">预计入库量</label>
+            <input id="expected_inbound_qty" name="expected_inbound_qty" type="number" min="0" step="1" value="0" required>
+            <p class="help">预计当天还会进入冷库的数量。</p>
+          </div>
+          <div class="field">
+            <label for="expected_outbound_qty">预计出库量</label>
+            <input id="expected_outbound_qty" name="expected_outbound_qty" type="number" min="0" step="1" value="0" required>
+            <p class="help">预计当天会从冷库移出的数量。</p>
+          </div>
+        </div>
+        <div class="inventory-row">
+          <div class="field">
+            <label for="warning_threshold_qty">预警阈值</label>
+            <input id="warning_threshold_qty" name="warning_threshold_qty" type="number" min="0" step="1" value="50" required>
+            <p class="help">剩余容量小于或等于该值时，系统会建议冷库预警。</p>
+          </div>
+          <div class="field">
+            <label for="projected_occupied_qty">预计占用量</label>
+            <input id="projected_occupied_qty" name="projected_occupied_qty" type="number" min="0" step="1" value="0" required>
+            <p class="help">默认 = 当前占用量 + 预计入库量 - 预计出库量，可人工确认。</p>
+          </div>
+        </div>
+        <div class="inventory-row">
+          <div class="field">
+            <label for="remaining_capacity_qty">剩余容量</label>
+            <input id="remaining_capacity_qty" name="remaining_capacity_qty" type="number" step="1" value="500" required>
+            <p class="help">默认 = 冷库总容量 - 预计占用量，可人工确认。</p>
+          </div>
+          <div class="field">
+            <label for="cold_note">备注</label>
+            <textarea id="cold_note" name="note" rows="3"></textarea>
+          </div>
+        </div>
+        <div class="actions">
+          <button class="primary" type="submit" name="action" value="add_cold_storage_status">新增冷库状态</button>
+        </div>
+      </form>
+      {_cold_storage_auto_capacity_script()}
+    """
+
+
+def _render_cold_storage_list(cold_storage_status_path: str, cold_storage_rows: list[dict[str, object]]) -> str:
+    if not cold_storage_rows:
+        return _render_empty_state("冷库状态", "当前还没有冷库状态。请先新增某个业务日期的冷库容量与占用情况。")
+    rows_html = "".join(
+        _render_cold_storage_row(cold_storage_status_path, row, row_index)
+        for row_index, row in enumerate(cold_storage_rows)
+    )
+    return _render_table_panel(
+        "冷库状态",
+        [
+            "trade_date",
+            "total_capacity_qty",
+            "current_occupied_qty",
+            "expected_inbound_qty",
+            "expected_outbound_qty",
+            "projected_occupied_qty",
+            "remaining_capacity_qty",
+            "warning_threshold_qty",
+            "active",
+            "note",
+            "action",
+        ],
+        rows_html,
+        empty_message="当前还没有冷库状态。请先新增某个业务日期的冷库容量与占用情况。",
+    )
+
+
+def _render_cold_storage_row(cold_storage_status_path: str, row: dict[str, object], row_index: int) -> str:
+    trade_date = _cold_storage_trade_date_value(row)
+    projected = computed_projected_occupied_from_row(row)
+    remaining = computed_remaining_capacity_from_row(row)
+    return f"""
+      <tr>
+        <td>{escape(trade_date or '-')}</td>
+        <td>{escape(format_cold_storage_number(row.get('total_capacity_qty')))}</td>
+        <td>{escape(format_cold_storage_number(row.get('current_occupied_qty')))}</td>
+        <td>{escape(format_cold_storage_number(row.get('expected_inbound_qty')))}</td>
+        <td>{escape(format_cold_storage_number(row.get('expected_outbound_qty')))}</td>
+        <td>{escape(format_cold_storage_number(projected))}</td>
+        <td>{escape(format_cold_storage_number(remaining))}</td>
+        <td>{escape(format_cold_storage_number(row.get('warning_threshold_qty')))}</td>
+        <td>{escape(cold_storage_active_display(row.get('active')))}</td>
+        <td>{escape(str(row.get('note') or '-'))}</td>
+        <td>{_render_cold_storage_edit_form(cold_storage_status_path, row, row_index)}</td>
+      </tr>
+    """
+
+
+def _render_cold_storage_edit_form(cold_storage_status_path: str, row: dict[str, object], row_index: int) -> str:
+    trade_date = _cold_storage_trade_date_value(row)
+    active = "true" if cold_storage_active_display(row.get("active")) == "是" else "false"
+    projected = computed_projected_occupied_from_row(row)
+    remaining = computed_remaining_capacity_from_row(row)
+    return f"""
+      <details>
+        <summary>编辑</summary>
+        <form method="post" class="grid product-edit-form cold-storage-edit-form">
+          <input type="hidden" name="cold_storage_status_path" value="{escape(cold_storage_status_path)}">
+          <input type="hidden" name="input_tab" value="cold_storage_status">
+          <input type="hidden" name="current_trade_date" value="{escape(trade_date)}">
+          <input type="hidden" name="current_row_index" value="{row_index}">
+          <p class="help">保存后如需影响脚本状态和复核，请运行对应自动规则评估。</p>
+          <div class="two-col">
+            <div class="field">
+              <label>业务日期</label>
+              <input name="trade_date" type="date" value="{escape(trade_date)}" required>
+            </div>
+            <div class="field">
+              <label>是否启用</label>
+              <select name="active">
+                <option value="true" {'selected' if active == 'true' else ''}>是</option>
+                <option value="false" {'selected' if active == 'false' else ''}>否</option>
+              </select>
+            </div>
+          </div>
+          <div class="two-col">
+            <div class="field">
+              <label>冷库总容量</label>
+              <input name="total_capacity_qty" type="number" min="1" step="1" value="{escape(str(row.get('total_capacity_qty') or '500'))}" required>
+            </div>
+            <div class="field">
+              <label>当前占用量</label>
+              <input name="current_occupied_qty" type="number" min="0" step="1" value="{escape(str(row.get('current_occupied_qty') or '0'))}" required>
+            </div>
+          </div>
+          <div class="two-col">
+            <div class="field">
+              <label>预计入库量</label>
+              <input name="expected_inbound_qty" type="number" min="0" step="1" value="{escape(str(row.get('expected_inbound_qty') or '0'))}" required>
+            </div>
+            <div class="field">
+              <label>预计出库量</label>
+              <input name="expected_outbound_qty" type="number" min="0" step="1" value="{escape(str(row.get('expected_outbound_qty') or '0'))}" required>
+            </div>
+          </div>
+          <div class="two-col">
+            <div class="field">
+              <label>预警阈值</label>
+              <input name="warning_threshold_qty" type="number" min="0" step="1" value="{escape(str(row.get('warning_threshold_qty') or '50'))}" required>
+            </div>
+            <div class="field">
+              <label>预计占用量</label>
+              <input name="projected_occupied_qty" type="number" min="0" step="1" value="{escape(str(projected))}" required>
+            </div>
+          </div>
+          <div class="two-col">
+            <div class="field">
+              <label>剩余容量</label>
+              <input name="remaining_capacity_qty" type="number" step="1" value="{escape(str(remaining))}" required>
+            </div>
+            <div class="field">
+              <label>备注</label>
+              <textarea name="note" rows="2">{escape(str(row.get('note') or ''))}</textarea>
+            </div>
+          </div>
+          <button class="primary" type="submit" name="action" value="edit_cold_storage_status">保存冷库状态</button>
+        </form>
+      </details>
+    """
+
+
+def _cold_storage_trade_date_value(row: dict[str, object]) -> str:
+    value = row.get("trade_date")
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value or "").strip()
+
+
+def _cold_storage_auto_capacity_script() -> str:
+    return """
+    <script>
+      (function () {
+        const form = document.querySelector(".cold-storage-form");
+        if (!form) {
+          return;
+        }
+        const total = form.querySelector("#total_capacity_qty");
+        const current = form.querySelector("#current_occupied_qty");
+        const inbound = form.querySelector("#expected_inbound_qty");
+        const outbound = form.querySelector("#expected_outbound_qty");
+        const projected = form.querySelector("#projected_occupied_qty");
+        const remaining = form.querySelector("#remaining_capacity_qty");
+        function toNumber(input) {
+          const value = Number(input.value || 0);
+          return Number.isFinite(value) ? value : 0;
+        }
+        function update() {
+          const projectedValue = Math.max(0, toNumber(current) + toNumber(inbound) - toNumber(outbound));
+          projected.value = String(projectedValue);
+          remaining.value = String(toNumber(total) - projectedValue);
+        }
+        [total, current, inbound, outbound].forEach((input) => input.addEventListener("input", update));
+        update();
+      })();
+    </script>
+    """
+
+
+def _new_variety_dialog_script() -> str:
+    return """
+    <script>
+      (() => {
+        const dialog = document.getElementById("new_variety_dialog");
+        const openButton = document.getElementById("open_new_variety_dialog");
+        const cancelButton = document.getElementById("cancel_new_variety");
+        const confirmButton = document.getElementById("confirm_new_variety");
+        const nameInput = document.getElementById("new_variety_name");
+        const codeInput = document.getElementById("new_variety_code");
+        const error = document.getElementById("new_variety_error");
+        const productSelect = document.getElementById("product_name");
+        const varietyCode = document.getElementById("variety_code");
+        if (!dialog || !openButton || !cancelButton || !confirmButton || !nameInput || !codeInput || !productSelect || !varietyCode) {
+          return;
+        }
+        const openDialog = () => {
+          error.textContent = "";
+          nameInput.value = "";
+          codeInput.value = "";
+          if (typeof dialog.showModal === "function") {
+            dialog.showModal();
+          } else {
+            dialog.setAttribute("open", "open");
+          }
+          nameInput.focus();
+        };
+        const closeDialog = () => {
+          if (typeof dialog.close === "function") {
+            dialog.close();
+          } else {
+            dialog.removeAttribute("open");
+          }
+        };
+        openButton.addEventListener("click", openDialog);
+        cancelButton.addEventListener("click", closeDialog);
+        confirmButton.addEventListener("click", () => {
+          const name = nameInput.value.trim();
+          const code = codeInput.value.trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+          if (!name) {
+            error.textContent = "请输入新品种名称。";
+            return;
+          }
+          if (!code) {
+            error.textContent = "请输入品种代码，只能包含英文字母和数字。";
+            return;
+          }
+          let option = Array.from(productSelect.options).find((item) => item.value === name);
+          if (!option) {
+            option = new Option(name, name);
+            productSelect.add(option);
+          }
+          productSelect.value = name;
+          varietyCode.value = code;
+          closeDialog();
+        });
+        productSelect.addEventListener("change", () => {
+          varietyCode.value = "";
+        });
+      })();
+    </script>
+    """
+
+
+def _options_html(options: list[str], selected: str) -> str:
+    return "".join(
+        f"<option value='{escape(option)}' {'selected' if option == selected else ''}>{escape(option)}</option>"
+        for option in options
+    )
+
+
+def _labeled_options(options: list[str], selected: str, category: str) -> str:
+    return "".join(
+        f"<option value='{escape(option)}' {'selected' if option == selected else ''}>{escape(display_enum_label(category, option))}</option>"
+        for option in options
+    )
+
+
+def _display_stem_length(value: object) -> str:
+    text = str(value or "").strip()
+    if text.lower() in {"follow_grade", "fg"}:
+        return FOLLOW_GRADE_VALUE
+    return text or "-"
+
+
+def _follow_grade_rule_text() -> str:
+    return "、".join(f"{grade}={length}" for grade, length in GRADE_STEM_LENGTH_MAP.items())
+
+
+def render_system_page(*, runtime_db: str, session_user: str, message: str = "", level: str = "info") -> str:
+    db_path = Path(runtime_db)
+    config_checks = _build_system_config_checks()
+    db_checks = _build_runtime_db_checks(db_path)
+    count_checks = _build_runtime_table_count_checks(db_path)
+    runtime_summary = _build_system_runtime_summary(db_path)
+    body = f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["ops_system_title"])}</h2>
+      <p class="subtle">{escape(UI_TEXT["ops_system_config_only"])}</p>
+    </section>
+    {_render_system_feishu_test_panel(runtime_db)}
+    {_render_system_checks_table(UI_TEXT["ops_system_config_checks"], config_checks)}
+    {_render_system_checks_table(UI_TEXT["ops_system_db_checks"], db_checks)}
+    {_render_system_checks_table(UI_TEXT["ops_system_runtime_counts"], count_checks)}
+    {_render_system_checks_table(UI_TEXT["ops_system_runtime_summary"], runtime_summary)}
+    <section class="panel">
+      <h2>{escape(UI_TEXT["ops_system_connectivity"])}</h2>
+      <p class="subtle">{escape(UI_TEXT["ops_system_external_note"])}</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>{escape(UI_TEXT["ops_system_item"])}</th><th>{escape(UI_TEXT["ops_system_status"])}</th><th>{escape(UI_TEXT["ops_system_value"])}</th></tr></thead>
+          <tbody>
+            <tr><td>Feishu Webhook</td><td>{_system_status_badge("not_configured", UI_TEXT["ops_system_not_verified"])}</td><td>{escape(_mask_config_value("FEISHU_WEBHOOK_URL", os.getenv("FEISHU_WEBHOOK_URL", "")))}</td></tr>
+            <tr><td>Mobile Review Base URL</td><td>{_system_status_badge("not_configured", UI_TEXT["ops_system_not_verified"])}</td><td>{escape(_mask_config_value("MOBILE_REVIEW_BASE_URL", os.getenv("MOBILE_REVIEW_BASE_URL", "")))}</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+    """
+    return _render_ops_page(
+        title=UI_TEXT["ops_system_title"],
+        description=UI_TEXT["ops_system_config_only"],
+        active_path="/system",
+        runtime_db=runtime_db,
+        session_user=session_user,
+        body_html=body,
+        message=_sanitize_notification_text(message),
+        message_level=level,
+    )
+
+
+def _render_login_required_page(
+    *,
+    title: str,
+    description: str,
+    active_path: str,
+    runtime_db: str,
+    next_path: str,
+    message: str,
+) -> str:
+    login_panel = f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["runtime_login_title"])}</h2>
+      <form method="post" action="/runtime/login" class="grid two-col">
+        <input type="hidden" name="runtime_db" value="{escape(runtime_db)}">
+        <input type="hidden" name="next" value="{escape(next_path)}">
+        <div class="field">
+          <label for="runtime_username">{escape(UI_TEXT["runtime_login_user"])}</label>
+          <input id="runtime_username" name="username" type="text" value="{escape(_runtime_admin_user())}">
+        </div>
+        <div class="field">
+          <label for="runtime_password">{escape(UI_TEXT["runtime_login_password"])}</label>
+          <input id="runtime_password" name="password" type="password" value="">
+        </div>
+        <div class="actions">
+          <button class="primary" type="submit">{escape(UI_TEXT["runtime_login_button"])}</button>
+        </div>
+      </form>
+    </section>
+    """
+    return _render_ops_page(
+        title=title,
+        description=description,
+        active_path=active_path,
+        runtime_db=runtime_db,
+        session_user=None,
+        body_html=login_panel,
+        message=message,
+        message_level="error",
+    )
+
+
+def _render_ops_page(
+    *,
+    title: str,
+    description: str,
+    active_path: str,
+    runtime_db: str,
+    session_user: str | None,
+    body_html: str,
+    message: str = "",
+    message_level: str = "info",
+) -> str:
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{escape(title)}</title>
+  {common_styles()}
+</head>
+<body>
+  <main class="shell wide-shell">
+    {_hero(title, description)}
+    {navigation(active_path)}
+    {_session_toolbar(runtime_db, session_user, active_path)}
+    {_banner(message, message_level)}
+    {body_html}
+  </main>
+</body>
+</html>
+"""
+
+
+def _render_table_panel(title: str, headers: list[str], rows_html: str, *, empty_message: str) -> str:
+    header_html = "".join(f"<th>{escape(_field_label(name))}</th>" for name in headers)
+    body_html = rows_html or f"<tr><td colspan='{len(headers)}'>{escape(empty_message)}</td></tr>"
+    return f"""
+    <section class="panel">
+      <h2>{escape(title)}</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr>{header_html}</tr></thead>
+          <tbody>{body_html}</tbody>
+        </table>
+      </div>
+    </section>
+    """
+
+
+def _render_empty_state(title: str, message: str) -> str:
+    return f"""
+    <section class="panel">
+      <h2>{escape(title)}</h2>
+      <p class="subtle">{escape(message)}</p>
+    </section>
+    """
+
+
+def _render_pagination(path: str, pagination: dict[str, int] | None, query_params: dict[str, str]) -> str:
+    if not pagination:
+        return ""
+    total = pagination["total"]
+    page = pagination["page"]
+    total_pages = pagination["total_pages"]
+    start = pagination["start"]
+    end = pagination["end"]
+    if total == 0:
+        return ""
+    summary = f"显示 {start}-{end} / {total} 条，每页最多 {PAGE_SIZE} 条"
+    links = ""
+    clean_params = {key: value for key, value in query_params.items() if value}
+    if page > 1:
+        links += (
+            f"<a class='nav-link utility-link' href='{escape(_append_query_to_path(path, clean_params | {'page': str(page - 1)}))}'>上一页</a>"
+        )
+    if page < total_pages:
+        links += (
+            f"<a class='nav-link utility-link' href='{escape(_append_query_to_path(path, clean_params | {'page': str(page + 1)}))}'>下一页</a>"
+        )
+    return f"""
+    <section class="panel pagination-panel">
+      <div class="toolbar-row">
+        <span class="subtle">{escape(summary)}；第 {page} / {total_pages} 页</span>
+        <div class="actions">{links}</div>
+      </div>
+    </section>
+    """
+
+
+def _parse_page_number(raw: str) -> int:
+    try:
+        page = int(str(raw).strip() or "1")
+    except ValueError:
+        return 1
+    return max(1, page)
+
+
+def _paginate_items(items: list, page: int) -> tuple[list, dict[str, int]]:
+    total = len(items)
+    total_pages = max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    resolved_page = min(max(1, page), total_pages)
+    start_index = (resolved_page - 1) * PAGE_SIZE
+    end_index = min(start_index + PAGE_SIZE, total)
+    return items[start_index:end_index], {
+        "total": total,
+        "page": resolved_page,
+        "total_pages": total_pages,
+        "start": start_index + 1 if total else 0,
+        "end": end_index,
+    }
+
+
+def _sort_tasks_for_display(tasks: list) -> list:
+    return sorted(
+        tasks,
+        key=lambda task: (
+            1 if task.task_status.value in TERMINAL_TASK_STATUS_VALUES else 0,
+            -_datetime_sort_value(task.created_at),
+            task.task_id,
+        ),
+    )
+
+
+def _sort_reviews_for_display(reviews: list) -> list:
+    return sorted(
+        reviews,
+        key=lambda review: (
+            0 if review.review_status == ReviewTaskStatus.PENDING else 1,
+            -_datetime_sort_value(review.created_at or review.resolved_at),
+            review.review_task_id,
+        ),
+    )
+
+
+def _sort_notifications_for_display(notifications: list) -> list:
+    return sorted(
+        notifications,
+        key=lambda log: (
+            -_datetime_sort_value(log.created_at or log.sent_at),
+            log.notification_id,
+        ),
+    )
+
+
+def _sort_execution_logs_for_display(logs: list) -> list:
+    return sorted(
+        logs,
+        key=lambda log: (
+            -_datetime_sort_value(log.created_at or log.start_time),
+            log.log_id,
+        ),
+    )
+
+
+def _datetime_sort_value(value) -> float:
+    if not isinstance(value, datetime):
+        return 0.0
+    try:
+        return value.timestamp()
+    except (OverflowError, OSError, ValueError):
+        return 0.0
+
+
+def _task_center_tabs(active_tab: str) -> str:
+    links = [
+        ("tasks", "任务状态", "/tasks"),
+        ("automation", "脚本状态", _append_query_to_path("/tasks", {"task_tab": "automation"})),
+        ("mock_platform", "Mock 平台测试台", _append_query_to_path("/tasks", {"task_tab": "mock_platform"})),
+    ]
+    items = "".join(
+        f"<a class='nav-link {'active' if tab == active_tab else ''}' href='{escape(href)}'>{escape(label)}</a>"
+        for tab, label, href in links
+    )
+    return f"""
+    <section class="panel task-center-tabs">
+      <div class="actions">{items}</div>
+    </section>
+    """
+
+
+def _mock_platform_status_label(value: str) -> str:
+    labels = {
+        "online": "已上架",
+        "offline": "已下架",
+    }
+    return labels.get(value, value or "-")
+
+
+def _task_filter_panel(
+    runtime_db: str,
+    task_status: str,
+    trade_date_filter: str = "",
+    action_type_filter: str = "",
+    scope_type_filter: str = "",
+    scope_key_filter: str = "",
+) -> str:
+    options = _status_options(TaskStatus, task_status, "task_status")
+    action_options = _status_options(TaskActionType, action_type_filter, "action_type")
+    return f"""
+    <section class="panel">
+      <form method="get" action="/tasks" class="grid two-col">
+        <input type="hidden" name="task_tab" value="tasks">
+        <div class="field">
+          <label for="task_status">{escape(FIELD_LABELS.get("task_status", "task_status"))}</label>
+          <select id="task_status" name="task_status">{options}</select>
+        </div>
+        <div class="field">
+          <label for="trade_date">{escape(_field_label("trade_date"))}</label>
+          <input id="trade_date" name="trade_date" type="text" value="{escape(trade_date_filter)}" placeholder="YYYY-MM-DD">
+        </div>
+        <div class="field">
+          <label for="action_type">{escape(_field_label("action_type"))}</label>
+          <select id="action_type" name="action_type">{action_options}</select>
+        </div>
+        <div class="field">
+          <label for="scope_type">{escape(_field_label("scope_type"))}</label>
+          <input id="scope_type" name="scope_type" type="text" value="{escape(scope_type_filter)}">
+        </div>
+        <div class="field">
+          <label for="scope_key">{escape(_field_label("scope_key"))}</label>
+          <input id="scope_key" name="scope_key" type="text" value="{escape(scope_key_filter)}">
+        </div>
+        <div class="actions">
+          <button class="secondary" type="submit">{escape(UI_TEXT["ops_filter_apply"])}</button>
+        </div>
+      </form>
+    </section>
+    """
+
+
+def _review_filter_panel(runtime_db: str, review_status: str, due_filter: str) -> str:
+    options = _status_options(ReviewTaskStatus, review_status, "review_status")
+    checked = " checked" if due_filter == "soon" else ""
+    return f"""
+    <section class="panel">
+      <form method="get" action="/reviews" class="grid two-col">
+        <div class="field">
+          <label for="review_status">{escape(FIELD_LABELS.get("review_status", "review_status"))}</label>
+          <select id="review_status" name="review_status">{options}</select>
+        </div>
+        <label class="checkbox">
+          <input type="checkbox" name="due" value="soon"{checked}>
+          {escape(UI_TEXT["ops_filter_due_soon"])}
+        </label>
+        <div class="actions">
+          <button class="secondary" type="submit">{escape(UI_TEXT["ops_filter_apply"])}</button>
+        </div>
+      </form>
+    </section>
+    """
+
+
+def _notification_filter_panel(
+    runtime_db: str,
+    send_status: str,
+    related_review_task_id: str = "",
+    channel: str = "",
+) -> str:
+    options = _status_options(NotificationSendStatus, send_status, "send_status")
+    return f"""
+    <section class="panel">
+      <form method="get" action="/notifications" class="grid two-col">
+        <div class="field">
+          <label for="send_status">{escape(FIELD_LABELS.get("send_status", "send_status"))}</label>
+          <select id="send_status" name="send_status">{options}</select>
+        </div>
+        <div class="field">
+          <label for="related_review_task_id">{escape(_field_label("related_review_task_id"))}</label>
+          <input id="related_review_task_id" name="related_review_task_id" type="text" value="{escape(related_review_task_id)}">
+        </div>
+        <div class="field">
+          <label for="channel">{escape(_field_label("channel"))}</label>
+          <input id="channel" name="channel" type="text" value="{escape(channel)}">
+        </div>
+        <div class="actions">
+          <button class="secondary" type="submit">{escape(UI_TEXT["ops_filter_apply"])}</button>
+        </div>
+      </form>
+    </section>
+    """
+
+
+def _render_notification_center_detail(
+    *,
+    notification_id: str,
+    selected_notification,
+    selected_review,
+    selected_task,
+) -> str:
+    if not notification_id:
+        return ""
+    if selected_notification is None:
+        return f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["ops_notification_detail_title"])}</h2>
+      <p class="subtle">{escape(UI_TEXT["ops_notification_not_found"])}</p>
+    </section>
+    """
+    notification_details = [
+        ("notification_id", selected_notification.notification_id),
+        ("related_review_task_id", selected_notification.related_review_task_id or "-"),
+        ("related_task_id", selected_notification.related_task_id or "-"),
+        ("recipient_type", selected_notification.recipient_type),
+        ("recipient", selected_notification.recipient),
+        ("channel", display_enum_label("channel", selected_notification.channel)),
+        ("send_status", display_enum_label("send_status", selected_notification.send_status)),
+        ("sent_at", format_display_datetime(selected_notification.sent_at)),
+        ("created_at", format_display_datetime(selected_notification.created_at)),
+        ("dedupe_key", selected_notification.dedupe_key),
+        ("message", _truncate_text(_sanitize_notification_text(selected_notification.message), 4000)),
+        ("error_message", _truncate_text(_sanitize_notification_text(selected_notification.error_message or "-"), 4000)),
+    ]
+    if selected_notification.channel == "feishu":
+        notification_details.extend(
+            [
+                ("current_feishu_message_type", _current_feishu_message_type()),
+                ("note", UI_TEXT["ops_notification_config_snapshot_note"]),
+            ]
+        )
+    detail_rows = "".join(
+        f"<tr><th>{escape(_field_label(label))}</th><td>{escape(str(value))}</td></tr>"
+        for label, value in notification_details
+    )
+    return f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["ops_notification_detail_title"])}</h2>
+      <div class="table-wrap"><table><tbody>{detail_rows}</tbody></table></div>
+    </section>
+    {_render_notification_related_review_panel(selected_review, selected_notification.related_review_task_id)}
+    {_render_notification_related_task_panel(selected_task, selected_notification.related_task_id)}
+    """
+
+
+def _render_notification_related_review_panel(selected_review, related_review_task_id: str | None) -> str:
+    if selected_review is None:
+        content = f"<p class='subtle'>{escape(UI_TEXT['ops_notification_no_related_review'])}</p>"
+    else:
+        href = _append_query_to_path("/reviews", {"review_task_id": selected_review.review_task_id})
+        rows = "".join(
+            f"<tr><th>{escape(_field_label(label))}</th><td>{value}</td></tr>"
+            for label, value in [
+                ("review_task_id", f"<a href='{escape(href)}'>{escape(selected_review.review_task_id)}</a>"),
+                ("review_type", escape(display_enum_label("review_type", selected_review.review_type))),
+                ("review_status", _status_badge(selected_review.review_status.value, "review_status")),
+                ("trade_date", escape(selected_review.trade_date.isoformat() if selected_review.trade_date else "-")),
+                ("scope", escape(format_object_scope(selected_review.scope_type, selected_review.scope_key))),
+                ("reason", escape(_truncate_text(_sanitize_notification_text(selected_review.reason or "-"), 240))),
+            ]
+        )
+        content = f"<div class='table-wrap'><table><tbody>{rows}</tbody></table></div>"
+    return f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["ops_notification_related_review_title"])}</h2>
+      {content}
+    </section>
+    """
+
+
+def _render_notification_related_task_panel(selected_task, related_task_id: str | None) -> str:
+    if selected_task is None:
+        content = f"<p class='subtle'>{escape(UI_TEXT['ops_notification_no_related_task'])}</p>"
+    else:
+        rows = "".join(
+            f"<tr><th>{escape(_field_label(label))}</th><td>{value}</td></tr>"
+            for label, value in [
+                ("task_id", escape(selected_task.task_id)),
+                ("task_status", _status_badge(selected_task.task_status.value, "task_status")),
+                ("action_type", escape(display_enum_label("action_type", selected_task.action_type.value))),
+                ("trade_date", escape(selected_task.trade_date.isoformat() if selected_task.trade_date else "-")),
+                ("scope", escape(format_object_scope(selected_task.scope_type, selected_task.scope_key))),
+                ("required_by", escape(format_display_datetime(selected_task.required_by))),
+            ]
+        )
+        content = f"<div class='table-wrap'><table><tbody>{rows}</tbody></table></div>"
+    return f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["ops_notification_related_task_title"])}</h2>
+      {content}
+    </section>
+    """
+
+
+def _render_task_center_detail(
+    *,
+    selected_task_id: str,
+    selected_task,
+    task_history,
+    related_reviews,
+    related_notifications,
+    execution_logs,
+) -> str:
+    if not selected_task_id:
+        return ""
+    if selected_task is None:
+        return f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["ops_task_detail_title"])}</h2>
+      <p class="subtle">{escape(UI_TEXT["ops_task_not_found"])}</p>
+    </section>
+    """
+    task_details = [
+        ("task_id", selected_task.task_id),
+        ("trade_date", selected_task.trade_date.isoformat() if selected_task.trade_date else "-"),
+        ("scope_type", display_enum_label("scope_type", selected_task.scope_type)),
+        ("scope_key", selected_task.scope_key),
+        ("dedupe_key", selected_task.dedupe_key),
+        ("internal_sku", selected_task.internal_sku or "-"),
+        ("platform_name", selected_task.platform_name or "-"),
+        ("action_type", display_enum_label("action_type", selected_task.action_type.value)),
+        ("task_status", display_enum_label("task_status", selected_task.task_status.value)),
+        ("priority", selected_task.priority),
+        ("target_price", selected_task.target_price if selected_task.target_price is not None else "-"),
+        ("target_status", selected_task.target_status or "-"),
+        ("pricing_source", selected_task.pricing_source.value if selected_task.pricing_source else "-"),
+        ("scheduled_at", format_display_datetime(selected_task.scheduled_at)),
+        ("expires_at", format_display_datetime(selected_task.expires_at)),
+        ("required_by", format_display_datetime(selected_task.required_by)),
+        ("created_at", format_display_datetime(selected_task.created_at)),
+        ("updated_at", format_display_datetime(selected_task.updated_at)),
+        ("result_message", _sanitize_notification_text(selected_task.result_message or "-")),
+    ]
+    detail_rows = "".join(
+        f"<tr><th>{escape(_field_label(label))}</th><td>{escape(str(value))}</td></tr>"
+        for label, value in task_details
+    )
+    return f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["ops_task_detail_title"])}</h2>
+      <div class="table-wrap"><table><tbody>{detail_rows}</tbody></table></div>
+      {_json_preview_block("decision_trace_json", selected_task.decision_trace)}
+    </section>
+    {_render_review_history_panel(task_history)}
+    {_render_task_related_reviews_panel(related_reviews)}
+    {_render_task_related_notifications_panel(related_notifications)}
+    {_render_task_execution_logs_panel(execution_logs)}
+    """
+
+
+def _render_script_run_detail(selected_script_run, script_run_items) -> str:
+    if selected_script_run is None:
+        return ""
+    details = [
+        ("script_run_id", selected_script_run.script_run_id),
+        ("evaluator_name", selected_script_run.evaluator_name),
+        ("description", selected_script_run.description),
+        ("run_mode", selected_script_run.run_mode),
+        ("run_status", selected_script_run.run_status),
+        ("trade_date", selected_script_run.trade_date.isoformat() if selected_script_run.trade_date else "-"),
+        ("started_at", format_display_datetime(selected_script_run.started_at)),
+        ("finished_at", format_display_datetime(selected_script_run.finished_at)),
+        ("created_by", selected_script_run.created_by),
+        ("error_message", _sanitize_display_text(selected_script_run.error_message or "-")),
+    ]
+    detail_rows = "".join(
+        f"<tr><th>{escape(_field_label(label))}</th><td>{escape(str(value))}</td></tr>"
+        for label, value in details
+    )
+    item_rows = "".join(
+        "<tr>"
+        f"<td>{escape(item.item_id)}</td>"
+        f"<td>{escape(item.proposal_type)}</td>"
+        f"<td>{escape(item.severity)}</td>"
+        f"<td>{_status_badge(item.item_status, 'script_run_item_status')}</td>"
+        f"<td>{escape(_truncate_text(_sanitize_display_text(item.message), 200))}</td>"
+        f"<td>{escape(item.related_task_id or '-')}</td>"
+        f"<td>{escape(item.related_review_task_id or '-')}</td>"
+        f"<td>{escape(item.related_notification_id or '-')}</td>"
+        f"<td>{escape(_truncate_text(_sanitize_display_text(item.error_message or '-'), 160))}</td>"
+        "</tr>"
+        for item in script_run_items
+    ) or "<tr><td colspan='9'>该脚本运行暂无明细。</td></tr>"
+    return f"""
+    <section class="panel">
+      <h2>脚本运行详情</h2>
+      <div class="table-wrap"><table><tbody>{detail_rows}</tbody></table></div>
+      {_json_preview_block("summary_json", selected_script_run.summary)}
+    </section>
+    <section class="panel">
+      <h2>脚本运行明细</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>item_id</th><th>proposal_type</th><th>severity</th><th>item_status</th><th>message</th><th>related_task_id</th><th>related_review_task_id</th><th>related_notification_id</th><th>error_message</th></tr></thead>
+          <tbody>{item_rows}</tbody>
+        </table>
+      </div>
+      {_render_script_run_item_json_blocks(script_run_items)}
+    </section>
+    """
+
+
+def _render_script_run_item_json_blocks(items) -> str:
+    if not items:
+        return ""
+    blocks = []
+    for item in items[:20]:
+        blocks.append(
+            f"<h3>{escape(item.item_id)}</h3>"
+            f"{_json_preview_block('payload_json', item.payload)}"
+            f"{_json_preview_block('decision_trace_json', item.decision_trace)}"
+        )
+    return "".join(blocks)
+
+
+def _render_task_related_reviews_panel(related_reviews) -> str:
+    rows = "".join(
+        "<tr>"
+        f"<td><a href='{escape(_append_query_to_path('/reviews', {'review_task_id': review.review_task_id}))}'>{escape(review.review_task_id)}</a></td>"
+        f"<td>{escape(display_enum_label('review_type', review.review_type))}</td>"
+        f"<td>{_status_badge(review.review_status.value, 'review_status')}</td>"
+        f"<td>{escape(review.reason or '-')}</td>"
+        f"<td>{escape(format_display_datetime(review.required_by))}</td>"
+        "</tr>"
+        for review in related_reviews[:50]
+    ) or f"<tr><td colspan='5'>{escape(UI_TEXT['ops_task_no_related_reviews'])}</td></tr>"
+    return f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["ops_task_related_reviews_title"])}</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>review_task_id</th><th>review_type</th><th>review_status</th><th>reason</th><th>required_by</th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>
+    </section>
+    """
+
+
+def _render_task_related_notifications_panel(related_notifications) -> str:
+    rows = "".join(
+        "<tr>"
+        f"<td><a href='{escape(_append_query_to_path('/notifications', {'notification_id': log.notification_id}))}'>{escape(log.notification_id)}</a></td>"
+        f"<td>{escape(relation_label)}</td>"
+        f"<td>{escape(log.related_review_task_id or '-')}</td>"
+        f"<td>{escape(display_enum_label('channel', log.channel))}</td>"
+        f"<td>{_status_badge(log.send_status, 'send_status')}</td>"
+        f"<td>{escape(format_display_datetime(log.sent_at))}</td>"
+        f"<td>{escape(_truncate_text(_sanitize_notification_text(log.message), 180))}</td>"
+        "</tr>"
+        for log, relation_label in related_notifications[:50]
+    ) or f"<tr><td colspan='7'>{escape(UI_TEXT['ops_task_no_related_notifications'])}</td></tr>"
+    return f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["ops_task_related_notifications_title"])}</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>notification_id</th><th>relation</th><th>related_review_task_id</th><th>channel</th><th>send_status</th><th>sent_at</th><th>message</th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>
+    </section>
+    """
+
+
+def _render_task_execution_logs_panel(execution_logs) -> str:
+    rows = "".join(
+        "<tr>"
+        f"<td>{escape(log.log_id)}</td>"
+        f"<td>{escape(log.executor_name)}</td>"
+        f"<td>{escape(str(log.success_flag))}</td>"
+        f"<td>{escape(format_display_datetime(log.start_time))}</td>"
+        f"<td>{escape(format_display_datetime(log.end_time))}</td>"
+        f"<td>{escape(_truncate_text(_sanitize_task_sensitive_text(log.error_message or '-'), 180))}</td>"
+        f"<td>{_render_shadowbot_log_summary(log)}{_json_details_block({'raw_output': _truncate_text(_sanitize_task_sensitive_text(log.raw_output or '-'), 4000)})}</td>"
+        "</tr>"
+        for log in execution_logs[:50]
+    ) or f"<tr><td colspan='7'>{escape(UI_TEXT['ops_task_no_execution_logs'])}</td></tr>"
+    return f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["ops_task_related_execution_logs_title"])}</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>log_id</th><th>executor_name</th><th>success_flag</th><th>start_time</th><th>end_time</th><th>error_message</th><th>raw_output</th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>
+    </section>
+    """
+
+
+def _render_review_center_detail(
+    *,
+    runtime_db: str,
+    session_user: str,
+    selected_review,
+    source_task,
+    task_history,
+    related_notifications,
+    review_tokens,
+    review_status: str,
+    due_filter: str,
+) -> str:
+    if selected_review is None:
+        return ""
+    details = [
+        ("review_task_id", selected_review.review_task_id),
+        ("trade_date", selected_review.trade_date.isoformat() if selected_review.trade_date else "-"),
+        ("review_type", display_enum_label("review_type", selected_review.review_type)),
+        ("review_status", display_enum_label("review_status", selected_review.review_status.value)),
+        ("scope", format_object_scope(selected_review.scope_type, selected_review.scope_key)),
+        ("source_task_id", selected_review.source_task_id or "-"),
+        ("reason", selected_review.reason or "-"),
+        ("required_by", format_display_datetime(selected_review.required_by)),
+        ("resolved_by", selected_review.resolved_by or "-"),
+        ("resolved_at", format_display_datetime(selected_review.resolved_at)),
+        ("resolution_note", selected_review.resolution_note or "-"),
+    ]
+    detail_rows = "".join(
+        f"<tr><th>{escape(_field_label(label))}</th><td>{escape(str(value))}</td></tr>"
+        for label, value in details
+    )
+    review_payload_html = _json_preview_block("review_payload_json", selected_review.review_payload)
+    resolution_payload_html = _json_preview_block("resolution_payload_json", selected_review.resolution_payload)
+    source_html = _render_review_source_task_panel(source_task)
+    history_html = _render_review_history_panel(task_history)
+    notifications_html = _render_review_notifications_panel(related_notifications)
+    tokens_html = _render_review_tokens_panel(review_tokens)
+    resolve_html = _render_review_resolution_form(
+        selected_review=selected_review,
+        source_task=source_task,
+        review_status=review_status,
+        due_filter=due_filter,
+    )
+    return f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["ops_review_detail_title"])}</h2>
+      <div class="table-wrap"><table><tbody>{detail_rows}</tbody></table></div>
+      <div class="grid two-col">
+        {review_payload_html}
+        {resolution_payload_html}
+      </div>
+    </section>
+    {source_html}
+    {history_html}
+    {notifications_html}
+    {tokens_html}
+    {resolve_html}
+    """
+
+
+def _render_review_source_task_panel(source_task) -> str:
+    if source_task is None:
+        rows = "<tr><td colspan='2'>-</td></tr>"
+    else:
+        details = [
+            ("task_id", source_task.task_id),
+            ("task_status", display_enum_label("task_status", source_task.task_status.value)),
+            ("action_type", display_enum_label("action_type", source_task.action_type.value)),
+            ("scope", format_object_scope(source_task.scope_type, source_task.scope_key)),
+            ("target_price", source_task.target_price if source_task.target_price is not None else "-"),
+            ("target_status", source_task.target_status or "-"),
+            ("required_by", format_display_datetime(source_task.required_by)),
+            ("result_message", source_task.result_message or "-"),
+        ]
+        rows = "".join(
+            f"<tr><th>{escape(_field_label(label))}</th><td>{escape(str(value))}</td></tr>"
+            for label, value in details
+        )
+    return f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["ops_review_source_task_title"])}</h2>
+      <div class="table-wrap"><table><tbody>{rows}</tbody></table></div>
+    </section>
+    """
+
+
+def _render_review_history_panel(task_history) -> str:
+    rows = "".join(
+        "<tr>"
+        f"<td>{escape(format_display_datetime(item.changed_at))}</td>"
+        f"<td>{escape(display_enum_label('task_status', item.from_status.value if item.from_status else ''))}</td>"
+        f"<td>{escape(display_enum_label('task_status', item.to_status.value))}</td>"
+        f"<td>{escape(item.changed_by)}</td>"
+        f"<td>{escape(item.reason)}</td>"
+        f"<td>{_metadata_summary_rows(item.metadata)}{_json_details_block(item.metadata)}</td>"
+        "</tr>"
+        for item in task_history
+    ) or f"<tr><td colspan='6'>{escape(UI_TEXT['runtime_history_empty'])}</td></tr>"
+    return f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["ops_review_history_title"])}</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>changed_at</th><th>from</th><th>to</th><th>changed_by</th><th>reason</th><th>metadata_json</th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>
+    </section>
+    """
+
+
+def _render_review_notifications_panel(notifications) -> str:
+    rows = "".join(
+        "<tr>"
+        f"<td>{escape(log.notification_id)}</td>"
+        f"<td>{escape(log.related_task_id or '-')}</td>"
+        f"<td>{escape(display_enum_label('channel', log.channel))}</td>"
+        f"<td>{_status_badge(log.send_status, 'send_status')}</td>"
+        f"<td>{escape(format_display_datetime(log.sent_at))}</td>"
+        f"<td>{escape(_sanitize_display_text(log.message or '-'))}</td>"
+        f"<td>{escape(_sanitize_display_text(log.error_message or '-'))}</td>"
+        "</tr>"
+        for log in notifications[:50]
+    ) or "<tr><td colspan='7'>-</td></tr>"
+    return f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["ops_review_related_notifications_title"])}</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>notification_id</th><th>related_task_id</th><th>channel</th><th>send_status</th><th>sent_at</th><th>message</th><th>error_message</th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>
+    </section>
+    """
+
+
+def _render_review_tokens_panel(tokens) -> str:
+    rows = "".join(
+        "<tr>"
+        f"<td>{escape(token.token_id)}</td>"
+        f"<td>{escape(token.token_subject)}</td>"
+        f"<td>{escape(', '.join(token.allowed_actions))}</td>"
+        f"<td>{escape(format_display_datetime(token.expires_at))}</td>"
+        f"<td>{escape(format_display_datetime(token.used_at))}</td>"
+        f"<td>{escape(format_display_datetime(token.revoked_at))}</td>"
+        f"<td>{escape(format_display_datetime(token.last_used_at))}</td>"
+        "</tr>"
+        for token in tokens[:50]
+    ) or "<tr><td colspan='7'>-</td></tr>"
+    return f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["ops_review_tokens_title"])}</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>token_id</th><th>token_subject</th><th>allowed_actions</th><th>expires_at</th><th>used_at</th><th>revoked_at</th><th>last_used_at</th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>
+    </section>
+    """
+
+
+def _render_review_resolution_form(*, selected_review, source_task, review_status: str, due_filter: str) -> str:
+    if selected_review.review_status != ReviewTaskStatus.PENDING:
+        return f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["ops_review_handle_title"])}</h2>
+      <p class="subtle">{escape(UI_TEXT["ops_review_handled_hint"])}</p>
+    </section>
+    """
+    resolve_status_options = "".join(
+        f"<option value='{escape(option.value)}'>{escape(display_enum_label('review_status', option.value))}</option>"
+        for option in (
+            ReviewTaskStatus.APPROVED,
+            ReviewTaskStatus.REJECTED,
+            ReviewTaskStatus.ADJUSTED,
+            ReviewTaskStatus.CANCELLED,
+        )
+    )
+    next_source_status = _review_source_status_hint(source_task)
+    return f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["ops_review_handle_title"])}</h2>
+      <form method="post" action="/reviews" class="grid">
+        <input type="hidden" name="action" value="resolve_review">
+        <input type="hidden" name="review_task_id" value="{escape(selected_review.review_task_id)}">
+        <input type="hidden" name="review_status_filter" value="{escape(review_status)}">
+        <input type="hidden" name="due" value="{escape(due_filter)}">
+        <div class="field">
+          <label for="review_status">{escape(_field_label("review_status"))}</label>
+          <select id="review_status" name="review_status">{resolve_status_options}</select>
+        </div>
+        <div class="field">
+          <label for="resolution_note">{escape(UI_TEXT["runtime_resolution_note"])}</label>
+          <input id="resolution_note" name="resolution_note" type="text" value="">
+        </div>
+        <div class="field">
+          <label for="resolution_payload_json">{escape(UI_TEXT["runtime_resolution_payload"])}</label>
+          <textarea id="resolution_payload_json" name="resolution_payload_json" rows="8">{{}}</textarea>
+        </div>
+        <p class="subtle">source_task_status: {escape(next_source_status)}</p>
+        <div class="actions">
+          <button class="primary" type="submit">{escape(UI_TEXT["runtime_submit_review"])}</button>
+        </div>
+      </form>
+    </section>
+    """
+
+
+def _review_source_status_hint(source_task) -> str:
+    if source_task is None:
+        return "-"
+    if source_task.task_status == TaskStatus.MANUAL_REVIEW:
+        return "通过后转为待处理；拒绝或调整后跳过；取消后取消"
+    if source_task.task_status == TaskStatus.PENDING and source_task.action_type in {
+        TaskActionType.CAPACITY_WARNING,
+        TaskActionType.LABOR_REQUIRED,
+        TaskActionType.MANUAL_PRICE_REVIEW,
+        TaskActionType.BELOW_BREAK_EVEN_REVIEW,
+        TaskActionType.SHORTAGE_WARNING,
+        TaskActionType.COLD_STORAGE_WARNING,
+        TaskActionType.CLEARANCE_WARNING,
+        TaskActionType.MANUAL_REVIEW,
+    }:
+        return "通过、拒绝或调整后跳过；取消后取消"
+    return "-"
+
+
+def _review_action_hint(review, review_status: str, due_filter: str) -> str:
+    href = _append_query_to_path(
+        "/reviews",
+        {
+            "review_task_id": review.review_task_id,
+            "review_status": review_status,
+            "due": due_filter,
+        },
+    )
+    status_hint = "可处理" if review.review_status == ReviewTaskStatus.PENDING else "已处理"
+    return (
+        f"<a href='{escape(href)}'>{escape(UI_TEXT['ops_review_detail_link'])}</a>"
+        f"<br><span class='subtle'>{escape(status_hint)}</span>"
+    )
+
+
+SHADOWBOT_WARNING_STATUSES = {
+    "NEEDS_RECONCILIATION",
+    "POST_SUBMIT_PRICE_MISMATCH",
+    "OLD_PRICE_CHANGED",
+    "EVIDENCE_UPLOAD_FAILED",
+}
+
+
+def _load_shadowbot_queue_status() -> dict[str, object]:
+    queue_dir = Path(
+        os.environ.get("SHADOWBOT_QUEUE_DIR")
+        or os.environ.get("SHADOWBOT_REQUEST_DIR")
+        or "data/runtime/shadowbot_queue"
+    )
+    heartbeat_path = queue_dir / "heartbeat.json"
+    heartbeat = {}
+    if heartbeat_path.exists():
+        heartbeat = _parse_json_object(heartbeat_path.read_text(encoding="utf-8-sig"))
+    phases = []
+    working_dir = queue_dir / "working"
+    if working_dir.exists():
+        for phase_path in sorted(working_dir.glob("*.phase.json"))[:20]:
+            phase = _parse_json_object(phase_path.read_text(encoding="utf-8-sig"))
+            if phase:
+                phases.append(phase)
+    return {
+        "queue_dir": str(queue_dir),
+        "heartbeat": heartbeat,
+        "phases": phases,
+        "quarantine_count": len(list((queue_dir / "quarantine").glob("*"))) if (queue_dir / "quarantine").exists() else 0,
+    }
+
+
+def _render_shadowbot_queue_status(status) -> str:
+    if not isinstance(status, dict):
+        return ""
+    heartbeat = status.get("heartbeat") if isinstance(status.get("heartbeat"), dict) else {}
+    phases = status.get("phases") if isinstance(status.get("phases"), list) else []
+    phase_rows = "".join(
+        "<tr>"
+        f"<td>{escape(str(item.get('execution_attempt_id') or '-'))}</td>"
+        f"<td>{escape(str(item.get('execution_mode') or '-'))}</td>"
+        f"<td>{escape(str(item.get('phase') or '-'))}</td>"
+        f"<td>{escape(str(item.get('side_effect_state') or '-'))}</td>"
+        f"<td>{escape(str(item.get('updated_at') or '-'))}</td>"
+        "</tr>"
+        for item in phases
+        if isinstance(item, dict)
+    ) or "<tr><td colspan='5'>当前没有 working attempt。</td></tr>"
+    return f"""
+    <section class="panel">
+      <h2>ShadowBot 队列状态</h2>
+      <p class="subtle">队列目录：{escape(str(status.get('queue_dir') or '-'))}</p>
+      <p>Worker：{escape(str(heartbeat.get('worker_id') or '-'))} · 状态：{escape(str(heartbeat.get('status') or '未启动'))} · 心跳：{escape(str(heartbeat.get('updated_at') or '-'))} · 隔离文件：{escape(str(status.get('quarantine_count') or 0))}</p>
+      <div class="table-wrap"><table><thead><tr><th>attempt</th><th>模式</th><th>phase</th><th>副作用</th><th>更新时间</th></tr></thead><tbody>{phase_rows}</tbody></table></div>
+    </section>
+    """
+
+
+def _render_shadowbot_log_summary(log) -> str:
+    if log.executor_name != "shadowbot_executor":
+        return "<span class='subtle'>-</span>"
+    payload = _parse_json_object(log.raw_output)
+    if not payload:
+        return "<span class='subtle'>ShadowBot raw_output 为空或不是 JSON</span>"
+
+    status = str(payload.get("status") or "-")
+    error_code = str(payload.get("error_code") or log.error_code or "")
+    side_effect_state = str(payload.get("side_effect_state") or "-")
+    warning_keys = {status, error_code, side_effect_state} & SHADOWBOT_WARNING_STATUSES
+    warning_html = ""
+    if warning_keys:
+        warning_html = (
+            "<div class='banner warning'>"
+            f"{escape(' / '.join(sorted(warning_keys)))}：需要人工关注或只读对账"
+            "</div>"
+        )
+
+    fields = [
+        ("operation_id", payload.get("operation_id")),
+        ("execution_attempt_id", payload.get("execution_attempt_id")),
+        ("shadowbot_run_id", payload.get("shadowbot_run_id")),
+        ("execution_mode", payload.get("execution_mode")),
+        ("worker_id", payload.get("worker_id")),
+        ("queue_phase", payload.get("queue_phase") or payload.get("recovered_phase")),
+        ("worker_heartbeat_at", payload.get("worker_heartbeat_at")),
+        ("status", status),
+        ("side_effect_state", side_effect_state),
+        ("old_price", payload.get("old_price") or payload.get("expected_old_price")),
+        ("target_price", payload.get("target_price")),
+        ("actual_price", payload.get("actual_price") or payload.get("verified_price")),
+        ("evidence_status", payload.get("evidence_status")),
+        ("approved_payload_hash", payload.get("approved_payload_hash")),
+        ("instruction_hash", payload.get("instruction_hash")),
+        ("request_file_sha256", payload.get("request_file_sha256")),
+        ("queue_request_path", payload.get("queue_request_path")),
+        ("quarantine_reason", payload.get("quarantine_reason")),
+        ("automatic_reconcile_attempt_id", payload.get("automatic_reconcile_attempt_id")),
+    ]
+    rows = "".join(
+        "<tr>"
+        f"<th>{escape(label)}</th>"
+        f"<td>{escape(str(value if value not in (None, '') else '-'))}</td>"
+        "</tr>"
+        for label, value in fields
+    )
+    return (
+        f"{warning_html}"
+        "<details class='json-details' open>"
+        "<summary>ShadowBot</summary>"
+        f"<table><tbody>{rows}</tbody></table>"
+        f"{_render_shadowbot_evidence(payload.get('evidence'))}"
+        f"{_render_shadowbot_manual_actions(payload)}"
+        "</details>"
+    )
+
+
+def _render_shadowbot_evidence(evidence) -> str:
+    if not isinstance(evidence, list) or not evidence:
+        return "<p class='subtle'>共享截图：-</p>"
+    items = []
+    for item in evidence[:6]:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("type") or item.get("evidence_id") or "evidence")
+        uri = str(item.get("storage_uri") or item.get("local_path") or "")
+        sha256 = str(item.get("sha256") or item.get("storage_sha256") or "")
+        upload_status = str(item.get("upload_status") or "")
+        if uri.startswith(("http://", "https://")):
+            uri_html = f"<a href='{escape(uri)}' target='_blank' rel='noreferrer'>{escape(uri)}</a>"
+        else:
+            uri_html = f"<code>{escape(uri or '-')}</code>"
+        items.append(
+            "<li>"
+            f"<strong>{escape(label)}</strong> {uri_html}"
+            f"<br><span class='subtle'>upload_status={escape(upload_status or '-')} sha256={escape(sha256 or '-')}</span>"
+            "</li>"
+        )
+    if not items:
+        return "<p class='subtle'>共享截图：-</p>"
+    return f"<div><p class='subtle'>共享截图</p><ul>{''.join(items)}</ul></div>"
+
+
+def _render_shadowbot_manual_actions(payload: dict[str, object]) -> str:
+    status = str(payload.get("status") or "")
+    error_code = str(payload.get("error_code") or "")
+    operation_id = str(payload.get("operation_id") or "")
+    actions: list[str] = []
+    if status == "NEEDS_RECONCILIATION":
+        actions.append("启动只读对账")
+    if status == "NEEDS_RECONCILIATION" or error_code in SHADOWBOT_WARNING_STATUSES:
+        actions.append("确认人工处理完成")
+    actions.append("查看证据")
+    forms = ""
+    if operation_id and status == "NEEDS_RECONCILIATION":
+        forms += f"""
+        <form method="post" action="/execution-logs" class="inline-form">
+          <input type="hidden" name="action" value="start_shadowbot_reconcile">
+          <input type="hidden" name="operation_id" value="{escape(operation_id)}">
+          <button type="submit">启动只读对账</button>
+        </form>
+        """
+    if operation_id and (status == "NEEDS_RECONCILIATION" or error_code in SHADOWBOT_WARNING_STATUSES):
+        forms += f"""
+        <form method="post" action="/execution-logs" class="inline-form">
+          <input type="hidden" name="action" value="confirm_shadowbot_manual_handled">
+          <input type="hidden" name="operation_id" value="{escape(operation_id)}">
+          <input type="hidden" name="manual_note" value="confirmed from execution log">
+          <button type="submit">确认人工处理完成</button>
+        </form>
+        """
+    return (
+        "<p class='subtle'>人工操作："
+        + " / ".join(escape(action) for action in actions)
+        + "</p>"
+        + forms
+    )
+
+
+def _parse_json_object(raw_value: object) -> dict[str, object]:
+    if isinstance(raw_value, dict):
+        return raw_value
+    if not raw_value:
+        return {}
+    try:
+        parsed = json.loads(str(raw_value))
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _json_preview_block(label: str, value: object) -> str:
+    rows = _json_summary_rows(value)
+    return f"""
+    <div class="field">
+      <label>{escape(_field_label(label))}</label>
+      <div class="table-wrap"><table><tbody>{rows}</tbody></table></div>
+      {_json_details_block(value)}
+    </div>
+    """
+
+
+def _json_summary_rows(value: object) -> str:
+    if not isinstance(value, dict) or not value:
+        return "<tr><td colspan='2'>-</td></tr>"
+    rows = []
+    for index, (key, item) in enumerate(value.items()):
+        if index >= 8:
+            rows.append("<tr><td colspan='2'>...</td></tr>")
+            break
+        rows.append(
+            "<tr>"
+            f"<th>{escape(str(key))}</th>"
+            f"<td>{escape(_json_compact_value(item, 180))}</td>"
+            "</tr>"
+        )
+    return "".join(rows) or "<tr><td colspan='2'>-</td></tr>"
+
+
+def _metadata_summary_rows(value: object) -> str:
+    if not isinstance(value, dict) or not value:
+        return "-"
+    selected = []
+    for key in ("review_task_id", "review_status", "actor", "actor_source", "timeout_policy"):
+        if key in value:
+            selected.append(f"{key}={_json_compact_value(value[key], 80)}")
+    if not selected:
+        selected = [f"{key}={_json_compact_value(item, 80)}" for key, item in list(value.items())[:3]]
+    return escape("; ".join(selected))
+
+
+def _json_details_block(value: object) -> str:
+    json_text = _json_pretty_text(value)
+    truncated_text = _truncate_text(json_text, 4000)
+    return (
+        "<details class='json-details'>"
+        f"<summary>{escape(UI_TEXT['ops_json_full'])}</summary>"
+        f"<pre>{escape(truncated_text)}</pre>"
+        "</details>"
+    )
+
+
+def _json_pretty_text(value: object) -> str:
+    try:
+        return json.dumps(value if value is not None else {}, ensure_ascii=False, indent=2, sort_keys=True)
+    except TypeError:
+        return str(value)
+
+
+def _json_compact_value(value: object, max_chars: int) -> str:
+    if isinstance(value, dict):
+        keys = ", ".join(str(key) for key in list(value.keys())[:8])
+        suffix = "..." if len(value) > 8 else ""
+        text = f"object({keys}{suffix})"
+    elif isinstance(value, list):
+        text = f"array(len={len(value)})"
+    elif value is None:
+        text = "-"
+    else:
+        text = str(value)
+    return _truncate_text(text, max_chars)
+
+
+def _enum_raw_value(value: object) -> str:
+    if value is None:
+        return ""
+    raw = getattr(value, "value", value)
+    return str(raw)
+
+
+def display_enum_label(category: str, value: object) -> str:
+    raw = _enum_raw_value(value)
+    if not raw:
+        return "-"
+    return DISPLAY_ENUM_LABELS.get(category, {}).get(raw, raw)
+
+
+def display_status_label(value: object) -> str:
+    raw = _enum_raw_value(value)
+    for category in ("task_status", "review_status", "send_status"):
+        label = DISPLAY_ENUM_LABELS.get(category, {}).get(raw)
+        if label:
+            return label
+    return raw or "-"
+
+
+def format_display_datetime(value: object) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, datetime):
+        display_value = value
+        if value.tzinfo is not None and value.utcoffset() is not None:
+            display_value = value.astimezone(DISPLAY_TIMEZONE)
+        return display_value.strftime("%Y-%m-%d %H:%M")
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value)
+
+
+def format_object_scope(scope_type: object, scope_key: object) -> str:
+    return f"{display_enum_label('scope_type', scope_type)}：{scope_key or '-'}"
+
+
+def format_task_object(task) -> str:
+    if getattr(task, "internal_sku", None):
+        return f"单个商品：{task.internal_sku}"
+    return format_object_scope(getattr(task, "scope_type", ""), getattr(task, "scope_key", ""))
+
+
+def format_task_target(task) -> str:
+    parts = []
+    target_status = getattr(task, "target_status", None)
+    if target_status:
+        parts.append(str(target_status))
+    target_price = getattr(task, "target_price", None)
+    if target_price is not None:
+        parts.append(f"目标价 {target_price}")
+    return " / ".join(parts) if parts else "-"
+
+
+def _task_reason_summary(task) -> str:
+    if getattr(task, "result_message", None):
+        return _truncate_text(_sanitize_notification_text(task.result_message), 120)
+    decision_trace = getattr(task, "decision_trace", None)
+    if isinstance(decision_trace, dict):
+        for key in ("reason", "review_reason", "message"):
+            if decision_trace.get(key):
+                return _truncate_text(_sanitize_notification_text(str(decision_trace[key])), 120)
+    return "-"
+
+
+def _truncate_text(value: str, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    return value[:max_chars] + "...（已截断）"
+
+
+def _status_options(enum_type, current: str, category: str = "status") -> str:
+    option_html = f"<option value=''>{escape(UI_TEXT['ops_filter_all'])}</option>"
+    option_html += "".join(
+        f"<option value='{escape(option.value)}'{' selected' if current == option.value else ''}>{escape(display_enum_label(category, option.value))}</option>"
+        for option in enum_type
+    )
+    return option_html
+
+
+def _session_toolbar(runtime_db: str, session_user: str | None, active_path: str) -> str:
+    if session_user is None:
+        return ""
+    return f"""
+    <section class="panel toolbar-panel">
+      <div class="toolbar-row">
+        <span class="subtle">{escape(UI_TEXT["runtime_session_user"])}: {escape(session_user)}</span>
+        <form method="post" action="/runtime/logout">
+          <input type="hidden" name="next" value="{escape(active_path)}">
+          <button class="secondary" type="submit">{escape(UI_TEXT["runtime_logout_button"])}</button>
+        </form>
+      </div>
+    </section>
+    """
+
+
+def _status_badge(value: object, category: str = "status") -> str:
+    raw = _enum_raw_value(value)
+    normalized = raw.lower()
+    badge_class = "status-badge"
+    if normalized in {"failed", "rejected"}:
+        badge_class += " status-error"
+    elif normalized in {"expired", "cancelled"}:
+        badge_class += " status-muted"
+    elif normalized in {"pending", "manual_review", "adjusted"}:
+        badge_class += " status-warn"
+    elif normalized in {"success", "approved"}:
+        badge_class += " status-success"
+    label = display_enum_label(category, raw) if category != "status" else display_status_label(raw)
+    return f"<span class='{badge_class}'>{escape(label)}</span>"
+
+
+def _build_dashboard_metrics(tasks, reviews, notifications, now: datetime) -> list[dict[str, object]]:
+    pending_reviews = [review for review in reviews if review.review_status == ReviewTaskStatus.PENDING]
+    due_soon_reviews = [review for review in pending_reviews if _is_review_due_soon(review, now)]
+    failed_notifications = [log for log in notifications if log.send_status == NotificationSendStatus.FAILED.value]
+    pending_tasks = [task for task in tasks if task.task_status == TaskStatus.PENDING]
+    expired_tasks = [task for task in tasks if task.task_status == TaskStatus.EXPIRED]
+    expired_reviews = [review for review in reviews if review.review_status == ReviewTaskStatus.EXPIRED]
+    return [
+        {
+            "label": UI_TEXT["ops_dashboard_pending_reviews"],
+            "value": len(pending_reviews),
+            "href": "/reviews",
+            "params": {"review_status": ReviewTaskStatus.PENDING.value},
+            "tone": "warn",
+            "note": "",
+        },
+        {
+            "label": UI_TEXT["ops_dashboard_due_soon_reviews"],
+            "value": len(due_soon_reviews),
+            "href": "/reviews",
+            "params": {"review_status": ReviewTaskStatus.PENDING.value, "due": "soon"},
+            "tone": "urgent",
+            "note": "",
+        },
+        {
+            "label": UI_TEXT["ops_dashboard_failed_notifications"],
+            "value": len(failed_notifications),
+            "href": "/notifications",
+            "params": {"send_status": NotificationSendStatus.FAILED.value},
+            "tone": "error",
+            "note": "",
+        },
+        {
+            "label": UI_TEXT["ops_dashboard_pending_tasks"],
+            "value": len(pending_tasks),
+            "href": "/tasks",
+            "params": {"task_status": TaskStatus.PENDING.value},
+            "tone": "warn",
+            "note": "",
+        },
+        {
+            "label": UI_TEXT["ops_dashboard_expired_total"],
+            "value": len(expired_tasks) + len(expired_reviews),
+            "href": "",
+            "params": {},
+            "tone": "muted",
+            "note": UI_TEXT["ops_dashboard_expired_breakdown"].format(
+                tasks=len(expired_tasks),
+                reviews=len(expired_reviews),
+            ),
+            "links": [
+                (
+                    UI_TEXT["ops_dashboard_view_tasks"],
+                    "/tasks",
+                    {"task_status": TaskStatus.EXPIRED.value},
+                ),
+                (
+                    UI_TEXT["ops_dashboard_view_reviews"],
+                    "/reviews",
+                    {"review_status": ReviewTaskStatus.EXPIRED.value},
+                ),
+            ],
+        },
+    ]
+
+
+def _render_dashboard_metric_card(runtime_db: str, metric: dict[str, object]) -> str:
+    href = str(metric.get("href", ""))
+    params = dict(metric.get("params", {}))
+    classes = f"metric metric-link dashboard-metric metric-{escape(str(metric.get('tone', 'neutral')))}"
+    note = str(metric.get("note", ""))
+    note_html = f"<span class='metric-note'>{escape(note)}</span>" if note else ""
+    links = metric.get("links", [])
+    if href:
+        return (
+            f"<a class='{classes}' href='{escape(_append_query_to_path(href, params))}'>"
+            f"<span class='label'>{escape(str(metric['label']))}</span>"
+            f"<strong>{escape(str(metric['value']))}</strong>"
+            f"{note_html}</a>"
+        )
+    link_html = "".join(
+        f"<a href='{escape(_append_query_to_path(path, link_params))}'>{escape(label)}</a>"
+        for label, path, link_params in links
+    )
+    return (
+        f"<div class='{classes}'>"
+        f"<span class='label'>{escape(str(metric['label']))}</span>"
+        f"<strong>{escape(str(metric['value']))}</strong>"
+        f"{note_html}<span class='metric-links'>{link_html}</span></div>"
+    )
+
+
+def _is_review_due_soon(review, now: datetime) -> bool:
+    return (
+        review.review_status == ReviewTaskStatus.PENDING
+        and review.required_by is not None
+        and now <= review.required_by <= now + timedelta(hours=2)
+    )
+
+
+def _field_label(name: str) -> str:
+    if name == "action":
+        return "\u5904\u7406\u5165\u53e3"
+    if name == "current_feishu_message_type":
+        return UI_TEXT["ops_notification_current_feishu_type"]
+    if name == "note":
+        return "\u5907\u6ce8"
+    return FIELD_LABELS.get(name, name)
+
+
+def _sanitize_display_text(value: str) -> str:
+    return _sanitize_notification_text(value)
+
+
+def _sanitize_notification_text(value: str) -> str:
+    text = value or ""
+    text = re.sub(r"https?://[^\s\"'<>]*webhook[^\s\"'<>]*", "[webhook_redacted]", text, flags=re.IGNORECASE)
+    text = re.sub(
+        r"https?://[^\s\"'<>]*open\.feishu\.cn/open-apis/bot/v2/hook[^\s\"'<>]*",
+        "[webhook_redacted]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"https?://[^\s\"'<>]*/mobile/review/[^\s\"'<>]+",
+        "[mobile_review_url_redacted]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"/mobile/review/[^\s\"'<>]+",
+        "[mobile_review_url_redacted]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        r"mobile_review_url\s*[:=]\s*[^\s\"'<>]+",
+        "mobile_review_url=[mobile_review_url_redacted]",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return re.sub(r"token=[^&\s\"'<>]+", "token=***", text, flags=re.IGNORECASE)
+
+
+def _sanitize_task_sensitive_text(value: str) -> str:
+    return _sanitize_notification_text(value).replace("token=***", "[token_redacted]")
+
+
+def _current_feishu_message_type() -> str:
+    configured = os.getenv("FEISHU_MESSAGE_TYPE", "post").strip().lower()
+    return configured if configured in {"post", "text"} else f"{configured or 'post'} (invalid)"
+
+
+def _parse_optional_date(value: str) -> date | None:
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _parse_optional_task_action_type(value: str) -> TaskActionType | None:
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return TaskActionType(text)
+    except ValueError:
+        return None
+
+
+def _review_runtime_action_link(runtime_db: str, review) -> str:
+    if review.review_status != ReviewTaskStatus.PENDING:
+        return "-"
+    href = _append_query_to_path(
+        "/runtime",
+        {
+            "review_task_id": review.review_task_id,
+            "task_id": review.source_task_id or "",
+        },
+    )
+    return f"<a href='{escape(href)}'>/runtime</a>"
+
+
+def _render_system_feishu_test_panel(runtime_db: str) -> str:
+    channel = _env_value("DEFAULT_NOTIFICATION_CHANNEL", "mock").lower()
+    webhook_configured = bool(_env_value("FEISHU_WEBHOOK_URL"))
+    disabled = channel != "feishu" or not webhook_configured
+    if channel != "feishu":
+        hint = UI_TEXT["ops_system_test_feishu_not_feishu"]
+    elif not webhook_configured:
+        hint = "FEISHU_WEBHOOK_URL 未配置，提交后无法发送测试通知。"
+    else:
+        hint = "将发送一条不含 token、mobile_review_url、webhook、secret 或 runtime DB 路径的系统测试消息。"
+    disabled_attr = " disabled" if disabled else ""
+    return f"""
+    <section class="panel">
+      <h2>{escape(UI_TEXT["ops_system_test_feishu_title"])}</h2>
+      <p class="subtle">{escape(UI_TEXT["ops_system_test_feishu_note"])}</p>
+      <p class="subtle">{escape(hint)}</p>
+      <form method="post" action="/system/test-feishu-notification" class="actions">
+        <button class="primary" type="submit"{disabled_attr}>{escape(UI_TEXT["ops_system_test_feishu_button"])}</button>
+      </form>
+    </section>
+    """
+
+
+def _send_system_feishu_test_notification(db_path: Path, *, actor: str) -> tuple[bool, str]:
+    channel = _env_value("DEFAULT_NOTIFICATION_CHANNEL", "mock").lower()
+    if channel != "feishu":
+        return False, UI_TEXT["ops_system_test_feishu_not_feishu"]
+
+    now = datetime.now()
+    message = "PRA 系统测试通知"
+    log = NotificationLog(
+        notification_id=uuid4().hex[:12],
+        related_task_id=None,
+        related_review_task_id=None,
+        recipient_type="system",
+        recipient="system_test",
+        channel="feishu",
+        sent_at=None,
+        send_status=NotificationSendStatus.PENDING.value,
+        dedupe_key=f"system_test:feishu:{now.strftime('%Y%m%d%H%M%S')}:{uuid4().hex[:8]}",
+        message=message,
+        created_at=now,
+    )
+    payload = _build_system_feishu_test_payload(now=now, actor=actor)
+    result = NotificationSenderFactory().build("feishu").send(log, payload)
+    error_message = _sanitize_notification_text(result.error_message)
+    persisted_log = NotificationLog(
+        notification_id=log.notification_id,
+        related_task_id=None,
+        related_review_task_id=None,
+        recipient_type=log.recipient_type,
+        recipient=log.recipient,
+        channel="feishu",
+        sent_at=result.sent_at,
+        send_status=result.send_status,
+        dedupe_key=log.dedupe_key,
+        message=message,
+        error_message=error_message,
+        created_at=log.created_at,
+    )
+    try:
+        NotificationLogService(SQLiteRuntimeRepository(db_path)).append(persisted_log)
+    except Exception as exc:
+        error_message = _sanitize_notification_text(f"{error_message}; log write failed: {type(exc).__name__}")
+    if result.send_status == NotificationSendStatus.SUCCESS.value:
+        return True, UI_TEXT["ops_system_test_feishu_success"]
+    return False, UI_TEXT["ops_system_test_feishu_failed"].format(error=error_message or "unknown error")
+
+
+def _build_system_feishu_test_payload(*, now: datetime, actor: str) -> dict[str, object]:
+    triggered_at = format_display_datetime(now)
+    text = "\n".join(
+        [
+            "PRA 系统测试通知",
+            "这是由 /system 手动触发的测试消息。",
+            "不关联任何复核任务，不包含手机复核链接。",
+            f"触发时间：{triggered_at}",
+            "当前通知模式：飞书",
+        ]
+    )
+    return {
+        "title": "PRA 系统测试通知",
+        "text": text,
+        "review_type": "system_test",
+        "review_type_label": "系统测试",
+        "trade_date": "-",
+        "scope_type": "system",
+        "scope_key": "manual_feishu_test",
+        "required_by": "-",
+        "reason": "这是由 /system 手动触发的测试消息；不关联任何复核任务，不包含手机复核链接。",
+        "system_test": True,
+        "triggered_at": triggered_at,
+        "notification_mode": "feishu",
+        "actor": actor,
+    }
+
+
+def _render_system_checks_table(title: str, checks: list[dict[str, str]]) -> str:
+    rows = "".join(
+        "<tr>"
+        f"<td>{escape(check.get('module', ''))}</td>"
+        f"<td>{escape(check.get('item', ''))}</td>"
+        f"<td>{_system_status_badge(check.get('status', 'not_configured'))}</td>"
+        f"<td>{escape(check.get('value', ''))}</td>"
+        f"<td>{escape(check.get('recommendation', ''))}</td>"
+        "</tr>"
+        for check in checks
+    )
+    if not rows:
+        rows = f"<tr><td colspan='5'>{escape(UI_TEXT['ops_empty_execution_logs'])}</td></tr>"
+    return f"""
+    <section class="panel">
+      <h2>{escape(title)}</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>{escape(UI_TEXT["ops_system_module"])}</th>
+              <th>{escape(UI_TEXT["ops_system_item"])}</th>
+              <th>{escape(UI_TEXT["ops_system_status"])}</th>
+              <th>{escape(UI_TEXT["ops_system_value"])}</th>
+              <th>{escape(UI_TEXT["ops_system_recommendation"])}</th>
+            </tr>
+          </thead>
+          <tbody>{rows}</tbody>
+        </table>
+      </div>
+    </section>
+    """
+
+
+def _system_status_badge(status: str, label: str | None = None) -> str:
+    normalized = status.strip().lower() or "not_configured"
+    class_map = {
+        "ok": "status-success",
+        "info": "status-info",
+        "warning": "status-warn",
+        "error": "status-error",
+        "not_configured": "status-muted",
+    }
+    display = label or UI_TEXT.get(f"ops_system_status_{normalized}", normalized)
+    return f"<span class='status-badge {class_map.get(normalized, 'status-muted')}'>{escape(display)}</span>"
+
+
+def _build_system_config_checks() -> list[dict[str, str]]:
+    channel = _env_value("DEFAULT_NOTIFICATION_CHANNEL", "mock").lower()
+    dev_mode = _env_value("DEV_MODE", "false").lower()
+    message_type = _env_value("FEISHU_MESSAGE_TYPE", "post").lower()
+    timeout = _env_value("FEISHU_WEBHOOK_TIMEOUT_SECONDS", "5")
+    checks: list[dict[str, str]] = []
+
+    checks.append(_system_check("后台登录", "RUNTIME_ADMIN_USER", *_check_optional_default("RUNTIME_ADMIN_USER", "admin")))
+    checks.append(_system_check("后台登录", "RUNTIME_ADMIN_PASSWORD", *_check_required_secret("RUNTIME_ADMIN_PASSWORD", min_length=12)))
+    checks.append(_system_check("Review Token", "REVIEW_TOKEN_SECRET", *_check_required_secret("REVIEW_TOKEN_SECRET", min_length=32)))
+
+    if dev_mode == "true":
+        dev_status = "info"
+        dev_recommendation = "仅用于本地调试；公网或生产场景请使用 DEV_MODE=false。"
+    elif dev_mode == "false":
+        dev_status = "ok"
+        dev_recommendation = "当前为非开发模式。"
+    else:
+        dev_status = "warning"
+        dev_recommendation = "DEV_MODE 建议只使用 true 或 false。"
+    checks.append(_system_check("通知渠道", "DEV_MODE", dev_status, dev_mode or "false", dev_recommendation))
+
+    if channel == "mock":
+        if dev_mode == "true":
+            channel_status = "info"
+            channel_recommendation = "DEV_MODE=true 时 mock 适合本地调试，不会发送真实通知。"
+        else:
+            channel_status = "warning"
+            channel_recommendation = "DEV_MODE=false 且 channel=mock 不会发送真实通知；运营验收建议切换 feishu。"
+    elif channel == "feishu":
+        missing = [
+            name
+            for name in ("FEISHU_WEBHOOK_URL", "MOBILE_REVIEW_BASE_URL")
+            if not os.getenv(name, "").strip()
+        ]
+        channel_status = "error" if missing else "ok"
+        channel_recommendation = (
+            f"缺少 {', '.join(missing)}，飞书通知或手机复核链接不可用。"
+            if missing
+            else "飞书通知关键配置已具备；真实连通性仍需手动验证。"
+        )
+    else:
+        channel_status = "error"
+        channel_recommendation = "DEFAULT_NOTIFICATION_CHANNEL 仅支持 mock 或 feishu。"
+    checks.append(_system_check("通知渠道", "DEFAULT_NOTIFICATION_CHANNEL", channel_status, channel or "mock", channel_recommendation))
+
+    if message_type in {"post", "text"}:
+        message_status = "ok"
+        message_recommendation = "post 为推荐富文本；text 可作为回退。"
+    else:
+        message_status = "error"
+        message_recommendation = "FEISHU_MESSAGE_TYPE 仅支持 post 或 text。"
+    checks.append(_system_check("飞书配置", "FEISHU_MESSAGE_TYPE", message_status, message_type or "post", message_recommendation))
+
+    checks.append(_system_check("飞书配置", "FEISHU_WEBHOOK_URL", *_check_optional_or_required_url("FEISHU_WEBHOOK_URL", required=channel == "feishu")))
+    checks.append(_system_check("飞书配置", "FEISHU_WEBHOOK_SECRET", *_check_optional_secret("FEISHU_WEBHOOK_SECRET", "未开启签名时可留空；开启签名建议配置。")))
+    checks.append(_system_check("飞书配置", "FEISHU_WEBHOOK_TIMEOUT_SECONDS", *_check_positive_number(timeout)))
+    checks.append(_system_check("Mobile Review", "MOBILE_REVIEW_BASE_URL", *_check_optional_or_required_url("MOBILE_REVIEW_BASE_URL", required=channel == "feishu")))
+    return checks
+
+
+def _build_runtime_db_checks(db_path: Path) -> list[dict[str, str]]:
+    versions = _safe_schema_versions(db_path)
+    latest_version = max(versions) if versions else 0
+    version_value = ", ".join(str(version) for version in versions) if versions else "-"
+    return [
+        _system_check(
+            "运行态数据库",
+            UI_TEXT["ops_runtime_db_path"],
+            "ok" if str(db_path).strip() else "error",
+            _runtime_db_summary(str(db_path)),
+            "仅显示文件名，避免在公网页面暴露本地完整路径。",
+        ),
+        _system_check(
+            "运行态数据库",
+            UI_TEXT["ops_system_db_exists"],
+            "ok" if db_path.exists() else "error",
+            UI_TEXT["ops_config_present"] if db_path.exists() else UI_TEXT["ops_config_missing"],
+            "DB 缺失时请使用 init-runtime-db 初始化；本页不会自动创建数据库。",
+        ),
+        _system_check(
+            "运行态数据库",
+            UI_TEXT["ops_system_db_readable"],
+            "ok" if _is_runtime_db_readable(db_path) else "error",
+            UI_TEXT["ops_config_present"] if _is_runtime_db_readable(db_path) else UI_TEXT["ops_config_missing"],
+            "需要能够只读打开 SQLite 文件。",
+        ),
+        _system_check(
+            "运行态数据库",
+            UI_TEXT["ops_schema_versions"],
+            "ok" if latest_version >= CURRENT_RUNTIME_SCHEMA_VERSION else "error",
+            version_value,
+            f"{UI_TEXT['ops_system_latest_schema']} >= {CURRENT_RUNTIME_SCHEMA_VERSION}；未来 v3/v4 会按最新版本继续扩展。",
+        ),
+    ]
+
+
+def _build_runtime_table_count_checks(db_path: Path) -> list[dict[str, str]]:
+    table_labels = {
+        "tasks": "tasks",
+        "review_tasks": "review_tasks",
+        "notification_logs": "notification_logs",
+        "execution_logs": "execution_logs",
+        "review_tokens": "review_tokens",
+        "script_runs": "script_runs",
+        "script_run_items": "script_run_items",
+    }
+    checks: list[dict[str, str]] = []
+    for table_name, label in table_labels.items():
+        count, error = _safe_table_count(db_path, table_name)
+        checks.append(
+            _system_check(
+                UI_TEXT["ops_system_table_count"],
+                label,
+                "error" if error else "ok",
+                str(count) if error is None else "-",
+                error or "该表可读。",
+            )
+        )
+    return checks
+
+
+def _build_system_runtime_summary(db_path: Path) -> list[dict[str, str]]:
+    pending_tasks, pending_tasks_error = _safe_filtered_table_count(db_path, "tasks", "task_status", TaskStatus.PENDING.value)
+    expired_tasks, expired_tasks_error = _safe_filtered_table_count(db_path, "tasks", "task_status", TaskStatus.EXPIRED.value)
+    pending_reviews, pending_reviews_error = _safe_filtered_table_count(
+        db_path,
+        "review_tasks",
+        "review_status",
+        ReviewTaskStatus.PENDING.value,
+    )
+    expired_reviews, expired_reviews_error = _safe_filtered_table_count(
+        db_path,
+        "review_tasks",
+        "review_status",
+        ReviewTaskStatus.EXPIRED.value,
+    )
+    failed_notifications, failed_notifications_error = _safe_filtered_table_count(
+        db_path,
+        "notification_logs",
+        "send_status",
+        NotificationSendStatus.FAILED.value,
+    )
+    notification_mode = _env_value("DEFAULT_NOTIFICATION_CHANNEL", "mock").lower()
+    message_type = _env_value("FEISHU_MESSAGE_TYPE", "post").lower()
+    return [
+        _runtime_summary_check("运行状态", UI_TEXT["ops_dashboard_pending_reviews"], pending_reviews, pending_reviews_error),
+        _runtime_summary_check("运行状态", UI_TEXT["ops_dashboard_failed_notifications"], failed_notifications, failed_notifications_error),
+        _runtime_summary_check(
+            "运行状态",
+            UI_TEXT["ops_dashboard_expired_total"],
+            (expired_tasks or 0) + (expired_reviews or 0) if expired_tasks_error is None and expired_reviews_error is None else None,
+            expired_tasks_error or expired_reviews_error,
+            note=f"tasks={expired_tasks if expired_tasks_error is None else '-'}, reviews={expired_reviews if expired_reviews_error is None else '-'}",
+        ),
+        _runtime_summary_check("运行状态", UI_TEXT["ops_dashboard_pending_tasks"], pending_tasks, pending_tasks_error),
+        _system_check("通知模式", "DEFAULT_NOTIFICATION_CHANNEL", "ok" if notification_mode in {"mock", "feishu"} else "error", notification_mode, "当前通知 sender 选择。"),
+        _system_check("通知模式", "FEISHU_MESSAGE_TYPE", "ok" if message_type in {"post", "text"} else "error", message_type, "飞书消息展示模式；不代表历史通知持久化字段。"),
+    ]
+
+
+def _runtime_summary_check(
+    module: str,
+    item: str,
+    count: int | None,
+    error: str | None,
+    *,
+    note: str = "",
+) -> dict[str, str]:
+    recommendation = error or note or "来自运行态 SQLite 的只读计数。"
+    return _system_check(module, item, "error" if error else "ok", str(count) if error is None else "-", recommendation)
+
+
+def _system_check(module: str, item: str, status: str, value: str, recommendation: str) -> dict[str, str]:
+    return {
+        "module": module,
+        "item": item,
+        "status": status,
+        "value": value,
+        "recommendation": recommendation,
+    }
+
+
+def _env_value(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+
+def _check_optional_default(name: str, default: str) -> tuple[str, str, str]:
+    value = _env_value(name)
+    if not value:
+        return "warning", default, f"未配置时默认使用 {default}。"
+    if _looks_placeholder(value):
+        return "error", "[placeholder]", "当前值像占位符，请替换为真实配置。"
+    return "ok", value, "已配置。"
+
+
+def _check_required_secret(name: str, *, min_length: int) -> tuple[str, str, str]:
+    value = _env_value(name)
+    if not value:
+        return "error", UI_TEXT["ops_config_missing"], "该配置为必填。"
+    if _looks_placeholder(value):
+        return "error", UI_TEXT["ops_config_present"], "当前值像占位符，请替换为真实密钥。"
+    if len(value) < min_length:
+        return "warning", UI_TEXT["ops_config_present"], f"建议长度不少于 {min_length} 个字符。"
+    return "ok", UI_TEXT["ops_config_present"], "已配置且长度满足建议。"
+
+
+def _check_optional_secret(name: str, recommendation: str) -> tuple[str, str, str]:
+    value = _env_value(name)
+    if not value:
+        return "not_configured", UI_TEXT["ops_config_missing"], recommendation
+    if _looks_placeholder(value):
+        return "error", UI_TEXT["ops_config_present"], "当前值像占位符，请替换为真实配置。"
+    return "ok", UI_TEXT["ops_config_present"], "已配置；页面不会显示明文。"
+
+
+def _check_optional_or_required_url(name: str, *, required: bool) -> tuple[str, str, str]:
+    value = _env_value(name)
+    if not value:
+        status = "error" if required else "not_configured"
+        recommendation = "当前通知模式需要该配置。" if required else "当前模式下可留空。"
+        return status, UI_TEXT["ops_config_missing"], recommendation
+    if _looks_placeholder(value):
+        return "error", _mask_config_value(name, value), "当前值像占位符，请替换为真实 URL。"
+    return "ok", _mask_config_value(name, value), "已配置；仅展示脱敏主机名。"
+
+
+def _check_positive_number(value: str) -> tuple[str, str, str]:
+    try:
+        numeric = float(value)
+    except ValueError:
+        return "error", value or "-", "必须是数字，默认建议 5 秒。"
+    if numeric <= 0:
+        return "error", value, "必须大于 0。"
+    return "ok", value, "HTTP 超时时间配置有效。"
+
+
+def _looks_placeholder(value: str) -> bool:
+    lowered = value.lower()
+    markers = (
+        "replace-with",
+        "your-fixed-domain",
+        "replace-me",
+        "your-",
+        "example.com",
+        "你的",
+        "请换成",
+        "璇锋崲",
+        "浣犵殑",
+    )
+    return any(marker.lower() in lowered for marker in markers)
+
+
+def _is_runtime_db_readable(db_path: Path) -> bool:
+    if not db_path.exists():
+        return False
+    try:
+        connection = sqlite3.connect(_sqlite_readonly_uri(db_path), uri=True)
+        try:
+            connection.execute("SELECT 1").fetchone()
+        finally:
+            connection.close()
+        return True
+    except sqlite3.Error:
+        return False
+
+
+def _safe_table_count(db_path: Path, table_name: str) -> tuple[int | None, str | None]:
+    return _safe_count_query(db_path, f"SELECT COUNT(*) FROM {table_name}", ())
+
+
+def _safe_filtered_table_count(db_path: Path, table_name: str, column_name: str, value: str) -> tuple[int | None, str | None]:
+    return _safe_count_query(db_path, f"SELECT COUNT(*) FROM {table_name} WHERE {column_name} = ?", (value,))
+
+
+def _safe_count_query(db_path: Path, sql: str, params: tuple[str, ...]) -> tuple[int | None, str | None]:
+    if not db_path.exists():
+        return None, "DB 文件不存在。"
+    try:
+        connection = sqlite3.connect(_sqlite_readonly_uri(db_path), uri=True)
+        try:
+            row = connection.execute(sql, params).fetchone()
+        finally:
+            connection.close()
+        return int(row[0]) if row else 0, None
+    except sqlite3.Error as exc:
+        return None, f"查询失败：{type(exc).__name__}"
+
+
+def _sqlite_readonly_uri(db_path: Path) -> str:
+    return f"{db_path.resolve().as_uri()}?mode=ro"
+
+
+def _present_or_missing(value: str) -> str:
+    return UI_TEXT["ops_config_present"] if value.strip() else UI_TEXT["ops_config_missing"]
+
+
+def _mask_config_value(name: str, value: str) -> str:
+    cleaned = value.strip()
+    if not cleaned:
+        return UI_TEXT["ops_config_missing"]
+    if name in {"MOBILE_REVIEW_BASE_URL", "FEISHU_WEBHOOK_URL"}:
+        parsed = urlparse(cleaned)
+        host = parsed.netloc or parsed.path
+        if host:
+            return f"{UI_TEXT['ops_config_present']} ({host})"
+    return UI_TEXT["ops_config_present"]
+
+
+def _runtime_db_summary(runtime_db: str) -> str:
+    path = Path(runtime_db)
+    if runtime_db.strip():
+        return f"{UI_TEXT['ops_config_present']} ({path.name or 'runtime database'})"
+    return UI_TEXT["ops_config_missing"]
+
+
+def _safe_schema_versions(db_path: Path) -> list[int]:
+    if not db_path.exists():
+        return []
+    try:
+        repository = SQLiteRuntimeRepository(db_path)
+        return repository.schema_versions()
+    except Exception:
+        return []
+
+
+def _compat_notice(message: str) -> str:
+    return f"""
+    <section class="panel notice-panel">
+      <p class="subtle">{escape(message)}</p>
+    </section>
+    """
+
+
+def navigation(active_path: str, runtime_db: str | None = None) -> str:
+    normalized_active = {
+        "/": "/business-inputs",
+        "/tables": "/business-inputs",
+        "/execution": "/execution-logs",
+        "/manual-intervention": "/reviews",
+    }.get(active_path, active_path)
+    items = [
+        ("/dashboard", UI_TEXT["dashboard_tab"]),
+        ("/tasks", UI_TEXT["tasks_tab"]),
+        ("/reviews", UI_TEXT["reviews_tab"]),
+        ("/notifications", UI_TEXT["notifications_tab"]),
+        ("/execution-logs", UI_TEXT["execution_logs_tab"]),
+        ("/business-inputs", UI_TEXT["business_inputs_tab"]),
+    ]
+    links = "".join(
+        f"<a class='{'nav-link active' if normalized_active == path else 'nav-link'}' href='{escape(path)}'>{escape(label)}</a>"
+        for path, label in items
+    )
+    return f"<nav class='nav-strip'>{links}</nav>"
 
 
 def common_styles() -> str:
     return """
   <style>
+    /* business-inputs-layout-v2 */
     :root {
       --bg: #f2ecdf;
       --panel: rgba(255,255,255,0.92);
@@ -2115,6 +7063,32 @@ def common_styles() -> str:
       color: white;
       border-color: transparent;
     }
+    .business-input-tab-panel {
+      padding: 16px 18px;
+    }
+    .business-input-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+    }
+    .business-input-tab {
+      min-width: 150px;
+      text-align: center;
+      text-decoration: none;
+      color: var(--ink);
+      padding: 12px 18px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.82);
+      box-shadow: 0 10px 28px rgba(91, 67, 49, 0.09);
+      font-weight: 700;
+    }
+    .business-input-tab.active {
+      background: var(--accent);
+      color: white;
+      border-color: transparent;
+    }
     .layout {
       display: grid;
       grid-template-columns: 1.2fr 0.8fr;
@@ -2138,6 +7112,35 @@ def common_styles() -> str:
       grid-template-columns: 1fr 1.6fr;
       align-items: end;
     }
+    .inventory-form {
+      display: grid;
+      gap: 16px;
+      margin-top: 24px;
+    }
+    .inventory-row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+      align-items: stretch;
+      min-height: 118px;
+    }
+    .inventory-row .field {
+      align-content: start;
+    }
+    .inventory-row .align-with-primary-control {
+      padding-top: 0;
+    }
+    .inventory-submit-field {
+      align-content: start;
+    }
+    .submit-label-spacer {
+      min-height: 34px;
+    }
+    .inventory-submit-control {
+      min-height: 50px;
+      display: flex;
+      align-items: center;
+    }
     .field {
       display: grid;
       gap: 8px;
@@ -2148,7 +7151,49 @@ def common_styles() -> str:
       letter-spacing: 0.04em;
       text-transform: uppercase;
     }
-    input[type="text"], input[type="password"], select, textarea {
+    .product-input-panel .field label,
+    .product-edit-form .field label {
+      font-size: 16px;
+      font-weight: 800;
+      color: var(--ink);
+      letter-spacing: 0;
+      text-transform: none;
+    }
+    .product-input-panel .help,
+    .product-edit-form .help {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.35;
+      margin: 0;
+    }
+    .product-input-panel .help-placeholder {
+      min-height: 18px;
+      visibility: hidden;
+    }
+    .field-title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 34px;
+    }
+    .product-input-panel .field > label,
+    .product-edit-form .field > label {
+      display: flex;
+      align-items: center;
+      min-height: 34px;
+    }
+    .mini-button {
+      padding: 7px 12px;
+      font-size: 13px;
+      font-weight: 700;
+      background: var(--accent-soft);
+      color: var(--ink);
+      border: 1px solid rgba(176,88,51,0.2);
+      box-shadow: none;
+      white-space: nowrap;
+    }
+    input[type="text"], input[type="password"], input[type="number"], select, textarea {
       width: 100%;
       padding: 14px 16px;
       border: 1px solid var(--line);
@@ -2156,6 +7201,31 @@ def common_styles() -> str:
       font: inherit;
       color: var(--ink);
       background: rgba(255,255,255,0.95);
+    }
+    input[type="text"], input[type="password"], input[type="number"], select {
+      min-height: 50px;
+    }
+    .modal-card {
+      width: min(520px, calc(100% - 32px));
+      border: 1px solid var(--line);
+      border-radius: 22px;
+      padding: 22px;
+      color: var(--ink);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+    .modal-card::backdrop {
+      background: rgba(31,42,48,0.28);
+      backdrop-filter: blur(2px);
+    }
+    .feedback-dialog h3 {
+      margin: 0;
+      font-size: 22px;
+    }
+    .feedback-dialog p {
+      margin: 0;
+      line-height: 1.65;
+      color: var(--ink);
     }
     textarea {
       resize: vertical;
@@ -2244,6 +7314,48 @@ def common_styles() -> str:
       margin-top: 6px;
       font-size: 28px;
       line-height: 1;
+    }
+    .metric-link {
+      display: block;
+      color: inherit;
+      text-decoration: none;
+      transition: transform 140ms ease, box-shadow 140ms ease;
+    }
+    .metric-link:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 12px 30px rgba(91, 67, 49, 0.12);
+    }
+    .dashboard-metric {
+      min-height: 122px;
+    }
+    .metric-warn {
+      background: rgba(176,88,51,0.14);
+      border-color: rgba(176,88,51,0.24);
+    }
+    .metric-urgent {
+      background: rgba(211,113,35,0.18);
+      border-color: rgba(211,113,35,0.3);
+    }
+    .metric-error {
+      background: var(--error-bg);
+      border-color: rgba(138,47,47,0.2);
+    }
+    .metric-muted {
+      background: rgba(95,109,115,0.14);
+      border-color: rgba(95,109,115,0.2);
+    }
+    .metric-note {
+      display: block;
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .metric-links {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+      font-size: 13px;
     }
     .subtle {
       color: var(--muted);
@@ -2338,8 +7450,61 @@ def common_styles() -> str:
       white-space: pre-wrap;
       word-break: break-word;
     }
+    .toolbar-panel {
+      padding: 14px 18px;
+    }
+    .toolbar-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .utility-link {
+      box-shadow: none;
+      background: rgba(255,248,243,0.92);
+    }
+    .notice-panel {
+      border-style: dashed;
+      background: rgba(236, 230, 218, 0.85);
+    }
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 88px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      line-height: 1.2;
+      background: rgba(31,42,48,0.08);
+      color: var(--ink);
+    }
+    .status-success {
+      background: var(--success-bg);
+      color: var(--success);
+    }
+    .status-info {
+      background: var(--info-bg);
+      color: var(--ink);
+    }
+    .status-error {
+      background: var(--error-bg);
+      color: var(--error);
+    }
+    .status-muted {
+      background: rgba(95,109,115,0.16);
+      color: var(--muted);
+    }
+    .status-warn {
+      background: rgba(176,88,51,0.14);
+      color: var(--accent);
+    }
     @media (max-width: 960px) {
-      .layout, .two-col { grid-template-columns: 1fr; }
+      .layout, .two-col, .inventory-row { grid-template-columns: 1fr; }
+      .inventory-row { min-height: auto; }
+      .inventory-row .align-with-primary-control { padding-top: 0; }
+      .submit-label-spacer { display: none; }
       .shell, .wide-shell {
         width: min(100% - 18px, 1380px);
         margin-top: 18px;
@@ -2376,6 +7541,46 @@ def _parse_query(environ) -> dict[str, list[str]]:
     return parse_qs(environ.get("QUERY_STRING", ""), keep_blank_values=True)
 
 
+def _safe_internal_path(path: str) -> str:
+    cleaned = path.strip()
+    if not cleaned:
+        return ""
+    parsed = urlparse(cleaned)
+    if parsed.scheme or parsed.netloc:
+        return ""
+    if not parsed.path.startswith("/") or parsed.path.startswith("//"):
+        return ""
+    query = urlencode(
+        {
+            key: values[-1]
+            for key, values in parse_qs(parsed.query, keep_blank_values=True).items()
+            if values
+        }
+    )
+    if query:
+        return f"{parsed.path}?{query}"
+    return parsed.path
+
+
+def _append_query_to_path(path: str, params: dict[str, str | None]) -> str:
+    parsed = urlparse(path)
+    existing = {
+        key: values[-1]
+        for key, values in parse_qs(parsed.query, keep_blank_values=True).items()
+        if values
+    }
+    for key, value in params.items():
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            existing[key] = text
+    query = urlencode(existing)
+    if query:
+        return f"{parsed.path}?{query}"
+    return parsed.path
+
+
 def _parse_body(environ) -> dict[str, list[str]]:
     size = int(environ.get("CONTENT_LENGTH") or 0)
     body = environ["wsgi.input"].read(size).decode("utf-8")
@@ -2390,11 +7595,15 @@ def _dev_mode() -> bool:
     return os.getenv("DEV_MODE", "").strip().lower() == "true"
 
 
-def _session_cookie_headers(session_user: str) -> list[tuple[str, str]]:
+def _session_cookie_headers(session_user: str, *, runtime_db: str | None = None) -> list[tuple[str, str]]:
     _cleanup_runtime_sessions()
     session_id = token_urlsafe(24)
     expires_at = datetime.now() + timedelta(seconds=RUNTIME_SESSION_TTL_SECONDS)
-    _RUNTIME_SESSIONS[session_id] = {"user": session_user, "expires_at": expires_at}
+    _RUNTIME_SESSIONS[session_id] = {
+        "user": session_user,
+        "expires_at": expires_at,
+        "runtime_db": runtime_db or str(DEFAULT_RUNTIME_DB),
+    }
     cookie = SimpleCookie()
     cookie[RUNTIME_SESSION_COOKIE] = session_id
     cookie[RUNTIME_SESSION_COOKIE]["path"] = "/"
@@ -2416,6 +7625,22 @@ def _clear_session_cookie_headers() -> list[tuple[str, str]]:
 
 
 def _get_runtime_session_user(environ) -> str | None:
+    session = _get_runtime_session(environ)
+    if session is None:
+        return None
+    user = session.get("user")
+    return str(user) if user else None
+
+
+def _runtime_db_for_request(environ) -> str:
+    session = _get_runtime_session(environ)
+    if session is not None and session.get("runtime_db"):
+        return str(session["runtime_db"])
+    query = _parse_query(environ)
+    return _first(query, "runtime_db", str(DEFAULT_RUNTIME_DB))
+
+
+def _get_runtime_session(environ) -> dict[str, object] | None:
     _cleanup_runtime_sessions()
     cookie_header = environ.get("HTTP_COOKIE", "")
     if not cookie_header:
@@ -2432,8 +7657,7 @@ def _get_runtime_session_user(environ) -> str | None:
     if not isinstance(expires_at, datetime) or expires_at <= datetime.now():
         _RUNTIME_SESSIONS.pop(session_cookie.value, None)
         return None
-    user = session.get("user")
-    return str(user) if user else None
+    return session
 
 
 def _cleanup_runtime_sessions() -> None:
@@ -2445,16 +7669,6 @@ def _cleanup_runtime_sessions() -> None:
     ]
     for session_id in expired:
         _RUNTIME_SESSIONS.pop(session_id, None)
-
-
-def _map_review_to_source_task_status(status: ReviewTaskStatus) -> TaskStatus:
-    mapping = {
-        ReviewTaskStatus.APPROVED: TaskStatus.PENDING,
-        ReviewTaskStatus.REJECTED: TaskStatus.SKIPPED,
-        ReviewTaskStatus.ADJUSTED: TaskStatus.SKIPPED,
-        ReviewTaskStatus.CANCELLED: TaskStatus.CANCELLED,
-    }
-    return mapping[status]
 
 
 def _parse_resolution_payload(payload_text: str) -> dict[str, object]:
@@ -2602,9 +7816,11 @@ def _metadata_summary_rows(metadata: object) -> str:
     for key in sorted(metadata.keys()):
         value = metadata[key]
         if isinstance(value, dict):
-            value_text = ", ".join(f"{sub_key}={value[sub_key]}" for sub_key in sorted(value.keys()))
+            value_text = ", ".join(
+                f"{sub_key}={_json_compact_value(value[sub_key], 80)}" for sub_key in sorted(value.keys())
+            )
         else:
-            value_text = str(value)
+            value_text = _json_compact_value(value, 120)
         parts.append(f"{key}: {value_text}")
     return "<br>".join(escape(part) for part in parts)
 

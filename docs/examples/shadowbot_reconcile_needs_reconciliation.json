@@ -1,0 +1,38 @@
+{
+  "schema_version": "vertical-slice-1.5",
+  "task_id": "TASK-RECONCILE-003",
+  "execution_attempt_id": "ATTEMPT-RECONCILE-003",
+  "execution_mode": "RECONCILE",
+  "status": "NEEDS_RECONCILIATION",
+  "run_success_flag": null,
+  "business_operation_completed": null,
+  "current_step": "COMPLETE",
+  "window_title": "蚂蚁花团供应商",
+  "product_keyword": "C级艾莎",
+  "product_name": "艾莎",
+  "grade": "C级",
+  "old_price": "20.00",
+  "expected_old_price": "19.00",
+  "target_price": "19.50",
+  "actual_price": "20.00",
+  "side_effect_state": "UNKNOWN",
+  "error_code": "POST_SUBMIT_PRICE_MISMATCH",
+  "error_message": "实际价格=20.00，既不是审批旧价=19.00，也不是目标价=19.50",
+  "retryable": false,
+  "evidence": [
+    {
+      "evidence_id": "EVD-RECONCILE-UNKNOWN",
+      "type": "RECONCILE",
+      "local_path": "C:/Users/etere/AppData/Local/ShadowBot/evidence/vertical_slice/ATTEMPT-RECONCILE-003_reconcile.png",
+      "storage_uri": "\\\\pra-share\\evidence/ATTEMPT-RECONCILE-003/ATTEMPT-RECONCILE-003_reconcile.png",
+      "storage_path": "\\\\pra-share\\evidence\\ATTEMPT-RECONCILE-003\\ATTEMPT-RECONCILE-003_reconcile.png",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "storage_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "hash_verified": true,
+      "size_bytes": 123456,
+      "captured_at": "2026-06-23T12:10:00+08:00",
+      "upload_status": "SUCCESS",
+      "upload_error": ""
+    }
+  ]
+}

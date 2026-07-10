@@ -1,0 +1,37 @@
+{
+  "schema_version": "vertical-slice-1.5",
+  "task_id": "TASK-READ-001",
+  "execution_attempt_id": "ATTEMPT-READ-001",
+  "execution_mode": "READ_ONLY",
+  "status": "READ_COMPLETED",
+  "run_success_flag": true,
+  "business_operation_completed": false,
+  "current_step": "COMPLETE",
+  "window_title": "蚂蚁花团供应商",
+  "product_keyword": "C级艾莎",
+  "product_name": "艾莎",
+  "grade": "C级",
+  "old_price": "19.00",
+  "actual_price": "19.00",
+  "side_effect_state": "NOT_STARTED",
+  "evidence_status": "COMPLETE",
+  "error_code": "",
+  "error_message": "",
+  "retryable": false,
+  "evidence": [
+    {
+      "evidence_id": "EVD-READ-001",
+      "type": "READ_OLD_PRICE",
+      "local_path": "C:/Users/etere/AppData/Local/ShadowBot/evidence/vertical_slice/ATTEMPT-READ-001_supply_price.png",
+      "storage_uri": "\\\\pra-share\\evidence/ATTEMPT-READ-001/ATTEMPT-READ-001_supply_price.png",
+      "storage_path": "\\\\pra-share\\evidence\\ATTEMPT-READ-001\\ATTEMPT-READ-001_supply_price.png",
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "storage_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "hash_verified": true,
+      "size_bytes": 123456,
+      "captured_at": "2026-06-23T12:20:00+08:00",
+      "upload_status": "SUCCESS",
+      "upload_error": ""
+    }
+  ]
+}

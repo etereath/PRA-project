@@ -1,0 +1,7 @@
+{
+  "queue_dir": "D:\\PRA_Runtime\\shadowbot_queue",
+  "poll_seconds": 3,
+  "max_hours": 8,
+  "max_tasks": 50,
+  "heartbeat_seconds": 5
+}

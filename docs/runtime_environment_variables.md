@@ -4,6 +4,8 @@
 
 真实密钥、Webhook、密码不要写入仓库。推荐把真实配置放在 `scripts/local_env.ps1`，该文件已加入 `.gitignore`。
 
+当前项目状态总览见 [project_current_status.md](project_current_status.md)。
+
 ## 1. 推荐文件结构
 
 - `scripts/start_local.ps1`：可提交的启动脚本。
@@ -18,6 +20,19 @@ Copy-Item scripts/local_env.example.ps1 scripts/local_env.ps1
 ```
 
 然后编辑 `scripts/local_env.ps1`，替换所有占位值。
+
+加载本机真实配置时使用：
+
+```powershell
+. .\scripts\local_env.ps1
+```
+
+若 PowerShell 返回 `running scripts is disabled on this system`，可只对当前终端进程临时放开执行策略后再加载，避免修改系统级策略：
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+. .\scripts\local_env.ps1
+```
 
 ## 2. 必填变量
 
@@ -165,6 +180,160 @@ powershell -ExecutionPolicy Bypass -File scripts/start_local.ps1 -Port 8877
 ```powershell
 python scripts/check_runtime_env.py
 ```
+
+## 6.1 影刀 OpenAPI Runner 变量
+
+这些变量用于 `ShadowBotExecutor` 通过影刀开放 API `JOB运行/启动应用` 启动 `test2` 或后续正式影刀应用。真实密钥只允许写入本机 `scripts/local_env.ps1`，不得提交到仓库。
+
+### `SHADOWBOT_RUNNER_TYPE`
+
+可选值：
+
+- `filequeue`：默认生产候选值，将请求和 SHA-256 checksum 原子发布到 `SHADOWBOT_QUEUE_DIR`。
+- `filedrop`：`filequeue` 的兼容名称；`SHADOWBOT_REQUEST_DIR` 仅作为旧配置回退。
+- `yingdao_openapi`：调用影刀开放 API 启动应用，返回 `yingdao-job:{jobUuid}`。
+
+### `SHADOWBOT_QUEUE_DIR`
+
+用途：常驻 Worker、Result Importer 和 Queue Watchdog 共用的队列根目录。同机部署建议使用本地 NTFS 绝对路径，跨机器部署使用 UNC。
+
+### `SHADOWBOT_EVIDENCE_DIR`
+
+用途：PRA 与机器人均可访问的证据目录。当前环境使用 `\\LAPTOP-O9O76RQV\pra-evidence`。
+
+### `SHADOWBOT_WORKER_POLL_SECONDS` / `SHADOWBOT_WORKER_MAX_HOURS` / `SHADOWBOT_WORKER_MAX_TASKS`
+
+用途：控制影刀 Worker 轮询间隔和有界常驻生命周期；默认分别为 3 秒、8 小时和 50 个任务。
+
+### `YINGDAO_API_BASE_URL`
+
+用途：影刀开放 API 根地址。
+
+默认值：`https://api.yingdao.com`
+
+专有云企业应改为对应专有云地址。
+
+### `YINGDAO_ACCESS_KEY_ID` / `YINGDAO_ACCESS_KEY_SECRET`
+
+用途：调用 `/oapi/token/v2/token/create` 获取 accessToken。
+
+要求：
+
+- `SHADOWBOT_RUNNER_TYPE=yingdao_openapi` 时必填。
+- 必须由具备调度权限的影刀企业管理员在控制台创建。
+- 不得提交到 git。
+
+### `YINGDAO_ROBOT_UUID`
+
+用途：影刀应用 UUID，即开放 API `job/start` 的 `robotUuid`。
+
+要求：
+
+- `SHADOWBOT_RUNNER_TYPE=yingdao_openapi` 时必填。
+- 在影刀控制台应用详情中复制。
+
+### `YINGDAO_ACCOUNT_NAME` / `YINGDAO_ROBOT_CLIENT_GROUP_UUID`
+
+用途：指定执行机器人账号或机器人分组。
+
+要求：
+
+- 二者至少填写一个。
+- 二者同时填写时，代码优先使用 `YINGDAO_ROBOT_CLIENT_GROUP_UUID`。
+- 对应机器人需要处于可调度状态。
+
+### `YINGDAO_REQUEST_PARAM_NAME`
+
+用途：传递完整 PRA 请求 JSON 的影刀主流程字符串参数名。
+
+默认值：`request_json`
+
+影刀应用中应创建同名字符串入参；如果主流程暂时读取扁平字段，也可保留默认值并使用下面的扁平字段开关。
+
+影刀应用运行完成后，建议输出字符串参数 `shadowbot_result_json`，内容为规范化 ShadowBot 结果 JSON。PRA 可通过：
+
+```powershell
+python scripts/run_shadowbot_executor.py poll-yingdao-result --job-uuid <jobUuid>
+```
+
+查询影刀 `job/query` 并导入该出参。若实际出参名称不同，使用 `--result-param-name` 指定。
+
+配置真实影刀 OpenAPI 变量后，启动真实 job 前先做只读参数预检：
+
+```powershell
+python scripts/run_shadowbot_executor.py check-yingdao-app-params
+```
+
+该命令会查询影刀 `queryRobotParam`，确认应用主流程存在入参 `request_json` 和出参 `shadowbot_result_json`；不会启动影刀应用。
+
+首条链路建议先准备但不启动：
+
+```powershell
+python scripts/prepare_shadowbot_e2e_chain.py --platform "蚂蚁花团供应商" --sku "SKU-AISHA-C" --product-name "艾莎" --grade "C级" --expected-old-price "19.00" --target-price "19.50"
+```
+
+确认 Web 执行日志和准备数据无误后，再加 `--start` 触发配置的 runner。
+
+实机前可用本地三分支演练确认 Web 展示和审计链路：
+
+```powershell
+python scripts/run_shadowbot_e2e_local_demo.py --runtime-db data/runtime/shadowbot_e2e_demo.sqlite3 --request-dir data/runtime/shadowbot_demo_requests
+```
+
+真实启动前可先做离线就绪检查；该命令只报告 runner 必需环境变量和 runtime DB 状态，不启动影刀、不访问影刀 OpenAPI，也不会输出密钥明文：
+
+```powershell
+python scripts/check_shadowbot_readiness.py
+```
+
+### `YINGDAO_INCLUDE_FLAT_PARAMS`
+
+用途：是否同时传入 `operation_id`、`execution_attempt_id`、`execution_mode`、`target_price`、`product_sku` 等扁平字符串参数。
+
+默认值：`1`
+
+设置为 `0`、`false` 或 `no` 时只传完整 `request_json`。
+
+### `YINGDAO_WAIT_TIMEOUT_SECONDS` / `YINGDAO_RUN_TIMEOUT_SECONDS` / `YINGDAO_PRIORITY`
+
+用途：映射到影刀 `job/start` 的排队等待时间、应用运行超时和排队优先级。
+
+默认值：
+
+- `YINGDAO_WAIT_TIMEOUT_SECONDS=600`
+- `YINGDAO_RUN_TIMEOUT_SECONDS=600`
+- `YINGDAO_PRIORITY=middle`
+
+## 6.2 手动测试飞书通知
+
+启动 Web 后台并登录后，进入：
+
+```text
+/system
+```
+
+点击“发送飞书测试通知”可手动验证：
+
+- `FeishuWebhookNotificationSender`
+- `FEISHU_WEBHOOK_URL`
+- `FEISHU_WEBHOOK_SECRET` 签名配置
+- 当前网络是否能访问飞书 Webhook
+
+该测试具有以下边界：
+
+- 不创建业务 `review_task`。
+- 不创建 `review_token`。
+- 不生成 `mobile_review_url`。
+- 不改变 `tasks / review_tasks` 状态。
+- 不写 `task_status_history`。
+- 会写入一条 `notification_logs` 系统测试记录：
+  - `recipient_type = system`
+  - `recipient = system_test`
+  - `related_task_id = null`
+  - `related_review_task_id = null`
+  - `message = PRA system test notification`
+
+页面和日志仍不得展示完整 webhook、secret、token、mobile review URL 或 runtime DB 完整路径。
 
 ## 7. 不得提交到 git 的内容
 

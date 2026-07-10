@@ -4,7 +4,8 @@ import unittest
 from datetime import datetime
 from decimal import Decimal
 
-from app.enums import ConditionType, ListingAction, PricingMethod, RoundingRule, TaskActionType
+from app.enums import ListingAction, ListingStrategy, PricingMethod, RoundingRule, TaskActionType
+from app.exceptions import ValidationError
 from app.models import ListingRule, PriceRule, Product
 from app.services.ai import NullAISuggestionProvider
 from app.services.listing import ListingService
@@ -50,8 +51,9 @@ class ListingAndTaskTests(unittest.TestCase):
             PriceRule(
                 rule_id="P1",
                 rule_name="fixed",
-                scope_type="all",
-                scope_value="*",
+                variety_filter="*",
+                grade_filter="*",
+                platform_filter="*",
                 pricing_method=PricingMethod.FIXED_MARKUP,
                 markup_value=Decimal("5"),
                 min_price=None,
@@ -65,18 +67,22 @@ class ListingAndTaskTests(unittest.TestCase):
             ListingRule(
                 rule_id="L1",
                 rule_name="offline-on-zero",
-                condition_type=ConditionType.STOCK_LTE,
-                condition_value=Decimal("0"),
-                action=ListingAction.SET_OFFLINE,
+                variety_filter="*",
+                grade_filter="*",
+                platform_filter="*",
+                stock_threshold=Decimal("0"),
+                listing_strategy=ListingStrategy.STOCK_BELOW_OFFLINE,
                 active=True,
                 priority=1,
             ),
             ListingRule(
                 rule_id="L2",
                 rule_name="online-on-restock",
-                condition_type=ConditionType.STOCK_GTE,
-                condition_value=Decimal("10"),
-                action=ListingAction.SET_ONLINE,
+                variety_filter="*",
+                grade_filter="*",
+                platform_filter="*",
+                stock_threshold=Decimal("10"),
+                listing_strategy=ListingStrategy.STOCK_ABOVE_ONLINE,
                 active=True,
                 priority=5,
             ),
@@ -100,20 +106,53 @@ class ListingAndTaskTests(unittest.TestCase):
         self.assertIn(("SKU-DISABLED", TaskActionType.SET_OFFLINE), actions)
         self.assertNotIn(("SKU-DISABLED", TaskActionType.UPDATE_PRICE), actions)
 
-    def test_listing_time_rule_can_force_online_after_threshold(self) -> None:
+    def test_listing_platform_filter_can_force_online_for_matching_platform(self) -> None:
         service = ListingService(now_provider=lambda: datetime(2026, 4, 28, 22, 30, 0))
-        time_rule = ListingRule(
+        platform_rule = ListingRule(
             rule_id="L3",
-            rule_name="time-online",
-            condition_type=ConditionType.TIME_GTE,
-            condition_value="22:00",
-            action=ListingAction.SET_ONLINE,
+            rule_name="platform-online",
+            variety_filter="online",
+            grade_filter="A",
+            platform_filter="蚂蚁",
+            stock_threshold=Decimal("0"),
+            listing_strategy=ListingStrategy.ALLOW_ONLINE,
             active=True,
             priority=0,
         )
-        action, trace = service.evaluate(self.products[0], [time_rule, *self.listing_rules])
+        action, trace = service.evaluate(self.products[0], [platform_rule, *self.listing_rules], "蚂蚁")
         self.assertEqual(action, ListingAction.SET_ONLINE.value)
         self.assertTrue(any("L3" in item for item in trace))
+
+    def test_listing_same_rank_conflict_is_not_silently_swallowed(self) -> None:
+        rules = [
+            ListingRule(
+                rule_id="L-OFF",
+                rule_name="offline",
+                variety_filter="online",
+                grade_filter="A",
+                platform_filter="*",
+                stock_threshold=Decimal("20"),
+                listing_strategy=ListingStrategy.STOCK_BELOW_OFFLINE,
+                active=True,
+                priority=1,
+            ),
+            ListingRule(
+                rule_id="L-ON",
+                rule_name="online",
+                variety_filter="online",
+                grade_filter="A",
+                platform_filter="*",
+                stock_threshold=Decimal("10"),
+                listing_strategy=ListingStrategy.STOCK_ABOVE_ONLINE,
+                active=True,
+                priority=1,
+            ),
+        ]
+
+        with self.assertRaises(ValidationError) as context:
+            ListingService().evaluate(self.products[0], rules)
+
+        self.assertIn("上下架规则冲突", str(context.exception))
 
 
 if __name__ == "__main__":

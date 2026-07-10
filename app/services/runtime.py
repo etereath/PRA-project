@@ -7,7 +7,7 @@ import json
 import secrets
 import time
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 import os
@@ -35,6 +35,7 @@ from app.utils import serialize_decimal, utc_now
 
 
 DEFAULT_RUNTIME_DB = Path("data/runtime/pra_runtime.sqlite3")
+FEISHU_DISPLAY_TIMEZONE = timezone(timedelta(hours=8))
 
 ALLOWED_TASK_TRANSITIONS = {
     TaskStatus.PENDING: {
@@ -94,6 +95,15 @@ FEISHU_REVIEW_TYPE_LABELS = {
     "clearance_warning": "清库存预警",
 }
 
+FEISHU_SCOPE_TYPE_LABELS = {
+    "global": "全局事项",
+    "forecast_group": "预测分组",
+    "sku": "单个商品",
+    "platform": "单个平台",
+    "task": "单个任务",
+    "system": "系统",
+}
+
 
 class RuntimeTaskService:
     def __init__(self, repository: SQLiteRuntimeRepository) -> None:
@@ -103,8 +113,15 @@ class RuntimeTaskService:
         self.repository.init_schema()
 
     def create_tasks(self, tasks: list[Task], *, trade_date: date | None = None) -> int:
-        normalized = [self._normalize_task(task, trade_date=trade_date) for task in tasks]
-        return self.repository.insert_tasks(normalized)
+        return len(self.create_tasks_returning_inserted(tasks, trade_date=trade_date))
+
+    def create_tasks_returning_inserted(self, tasks: list[Task], *, trade_date: date | None = None) -> list[Task]:
+        inserted: list[Task] = []
+        for task in tasks:
+            normalized = self._normalize_task(task, trade_date=trade_date)
+            if self.repository.insert_task(normalized) == 1:
+                inserted.append(normalized)
+        return inserted
 
     def list_tasks(
         self,
@@ -112,8 +129,16 @@ class RuntimeTaskService:
         trade_date: date | None = None,
         status: TaskStatus | None = None,
         action_type: TaskActionType | None = None,
+        scope_type: str | None = None,
+        scope_key: str | None = None,
     ) -> list[Task]:
-        return self.repository.list_tasks(trade_date=trade_date, status=status, action_type=action_type)
+        return self.repository.list_tasks(
+            trade_date=trade_date,
+            status=status,
+            action_type=action_type,
+            scope_type=scope_type,
+            scope_key=scope_key,
+        )
 
     def change_status(
         self,
@@ -129,18 +154,21 @@ class RuntimeTaskService:
         if task is None:
             raise ValidationError(f"task not found: {task_id}")
         self._validate_transition(task.task_status, to_status)
-        self.repository.update_task_status(task_id, to_status, result_message=result_message)
-        self.repository.insert_status_history(
-            TaskStatusHistory(
-                history_id=uuid4().hex[:12],
-                task_id=task_id,
-                from_status=task.task_status,
-                to_status=to_status,
-                changed_by=changed_by,
-                changed_at=datetime.now(),
-                reason=reason,
-                metadata=metadata or {},
-            )
+        history = TaskStatusHistory(
+            history_id=uuid4().hex[:12],
+            task_id=task_id,
+            from_status=task.task_status,
+            to_status=to_status,
+            changed_by=changed_by,
+            changed_at=datetime.now(),
+            reason=reason,
+            metadata=metadata or {},
+        )
+        self.repository.update_task_status_with_history(
+            task_id,
+            to_status,
+            history=history,
+            result_message=result_message,
         )
         updated = self.repository.get_task(task_id)
         if updated is None:
@@ -222,6 +250,10 @@ class ReviewTaskService:
                 continue
             if created is not None:
                 inserted_notification_logs_count += 1
+                if created.send_status == NotificationSendStatus.FAILED.value:
+                    notification_errors.append(
+                        f"{review_task.review_task_id}: notification failed: {created.error_message or 'send_status=failed'}"
+                    )
         return ReviewTaskCreationSummary(
             inserted_review_tasks_count=inserted_review_tasks_count,
             inserted_notification_logs_count=inserted_notification_logs_count,
@@ -269,10 +301,12 @@ class ReviewTaskService:
             resolved_at=now,
             resolution_note=note,
         )
-        self.repository.update_review_task(updated)
+        source_task_id: str | None = None
+        source_history: TaskStatusHistory | None = None
         if source_task_status is not None and review_task.source_task_id:
             source_task = self.runtime_task_service.get_task(review_task.source_task_id)
-            if source_task is not None and source_task.task_status == TaskStatus.MANUAL_REVIEW:
+            if source_task is not None and source_task.task_status in {TaskStatus.MANUAL_REVIEW, TaskStatus.PENDING}:
+                self.runtime_task_service._validate_transition(source_task.task_status, source_task_status)
                 metadata = {
                     "review_task_id": review_task_id,
                     "review_status": status.value,
@@ -283,14 +317,24 @@ class ReviewTaskService:
                 }
                 if source_task_metadata_extra:
                     metadata.update(source_task_metadata_extra)
-                self.runtime_task_service.change_status(
-                    task_id=review_task.source_task_id,
+                source_task_id = review_task.source_task_id
+                source_history = TaskStatusHistory(
+                    history_id=uuid4().hex[:12],
+                    task_id=source_task_id,
+                    from_status=source_task.task_status,
                     to_status=source_task_status,
                     changed_by=actor,
+                    changed_at=datetime.now(),
                     reason=f"review_task:{review_task_id}:{status.value}",
                     metadata=metadata,
-                    result_message=note,
                 )
+        self.repository.update_review_task_with_optional_task_status(
+            updated,
+            task_id=source_task_id,
+            task_status=source_task_status if source_task_id else None,
+            history=source_history,
+            result_message=note,
+        )
         return updated
 
     def expire_pending_review_tasks(
@@ -562,10 +606,12 @@ class NotificationLogService:
         *,
         related_review_task_id: str | None = None,
         send_status: str | None = None,
+        channel: str | None = None,
     ) -> list[NotificationLog]:
         return self.repository.list_notification_logs(
             related_review_task_id=related_review_task_id,
             send_status=send_status,
+            channel=channel,
         )
 
     def get_log(self, notification_id: str) -> NotificationLog | None:
@@ -1041,6 +1087,7 @@ def _build_feishu_review_notification_payload(review_task: ReviewTask, mobile_re
         "trade_date": review_task.trade_date.isoformat() if review_task.trade_date else "-",
         "scope_type": review_task.scope_type,
         "scope_key": review_task.scope_key,
+        "scope_label": _feishu_scope_label(review_task.scope_type, review_task.scope_key),
         "required_by": _format_feishu_datetime(review_task.required_by),
         "reason": _truncate_for_feishu(review_task.reason, 200),
         "mobile_review_url": mobile_review_url,
@@ -1063,18 +1110,39 @@ def _build_feishu_review_notification_post_body(
     payload: dict[str, object] | None,
 ) -> dict[str, object]:
     values = payload or {}
+    title = str(values.get("title") or "PRA 复核通知")
+    if values.get("system_test"):
+        content: list[list[dict[str, str]]] = [
+            [{"tag": "text", "text": "说明：这是由 /system 手动触发的测试消息。"}],
+            [{"tag": "text", "text": "说明：不关联任何复核任务，不包含手机复核链接。"}],
+            [{"tag": "text", "text": f"触发时间：{values.get('triggered_at') or '-'}"}],
+            [{"tag": "text", "text": f"当前通知模式：{values.get('notification_mode') or 'feishu'}"}],
+        ]
+        return {
+            "msg_type": "post",
+            "content": {
+                "post": {
+                    "zh_cn": {
+                        "title": title,
+                        "content": content,
+                    }
+                }
+            },
+        }
     review_type = str(values.get("review_type") or "-")
     review_type_label = str(values.get("review_type_label") or _feishu_review_type_label(review_type))
     trade_date = str(values.get("trade_date") or "-")
-    scope_type = str(values.get("scope_type") or "-")
-    scope_key = str(values.get("scope_key") or "-")
+    scope_label = str(
+        values.get("scope_label")
+        or _feishu_scope_label(str(values.get("scope_type") or "-"), str(values.get("scope_key") or "-"))
+    )
     required_by = str(values.get("required_by") or "-")
     reason = _truncate_for_feishu(values.get("reason") or log.message, 200)
     mobile_review_url = str(values.get("mobile_review_url") or "")
     content: list[list[dict[str, str]]] = [
-        [{"tag": "text", "text": f"复核类型：{review_type_label} ({review_type})"}],
-        [{"tag": "text", "text": f"交易日：{trade_date}"}],
-        [{"tag": "text", "text": f"对象：{scope_type}/{scope_key}"}],
+        [{"tag": "text", "text": f"需要处理：{review_type_label}"}],
+        [{"tag": "text", "text": f"业务日期：{trade_date}"}],
+        [{"tag": "text", "text": f"处理对象：{scope_label}"}],
         [{"tag": "text", "text": f"截止时间：{required_by}"}],
         [{"tag": "text", "text": f"原因：{reason}"}],
     ]
@@ -1085,7 +1153,7 @@ def _build_feishu_review_notification_post_body(
         "content": {
             "post": {
                 "zh_cn": {
-                    "title": "PRA 复核通知",
+                    "title": title,
                     "content": content,
                 }
             }
@@ -1100,12 +1168,12 @@ def _build_feishu_review_notification_text(review_task: ReviewTask, mobile_revie
     return "\n".join(
         [
             "PRA 复核通知",
-            f"review_type: {_feishu_review_type_label(review_task.review_type)} ({review_task.review_type})",
-            f"trade_date: {trade_date}",
-            f"scope: {review_task.scope_type}/{review_task.scope_key}",
-            f"required_by: {required_by}",
-            f"reason: {reason}",
-            f"mobile_review_url: {mobile_review_url}",
+            f"需要处理：{_feishu_review_type_label(review_task.review_type)}",
+            f"业务日期：{trade_date}",
+            f"处理对象：{_feishu_scope_label(review_task.scope_type, review_task.scope_key)}",
+            f"截止时间：{required_by}",
+            f"原因：{reason}",
+            f"{FEISHU_POST_REVIEW_LINK_TEXT}：{mobile_review_url}",
         ]
     )
 
@@ -1114,10 +1182,17 @@ def _feishu_review_type_label(review_type: str) -> str:
     return FEISHU_REVIEW_TYPE_LABELS.get(review_type, review_type)
 
 
+def _feishu_scope_label(scope_type: str, scope_key: str | None) -> str:
+    return f"{FEISHU_SCOPE_TYPE_LABELS.get(scope_type, scope_type)}：{scope_key or '-'}"
+
+
 def _format_feishu_datetime(value: datetime | None) -> str:
     if value is None:
         return "-"
-    return value.strftime("%Y-%m-%d %H:%M")
+    display_value = value
+    if value.tzinfo is not None and value.utcoffset() is not None:
+        display_value = value.astimezone(FEISHU_DISPLAY_TIMEZONE)
+    return display_value.strftime("%Y-%m-%d %H:%M")
 
 
 def _truncate_for_feishu(value: object, max_length: int) -> str:
@@ -1129,22 +1204,22 @@ def _truncate_for_feishu(value: object, max_length: int) -> str:
 
 def _build_review_notification_message(review_task: ReviewTask) -> str:
     trade_date = review_task.trade_date.isoformat() if review_task.trade_date else "-"
-    required_by = review_task.required_by.isoformat() if review_task.required_by else "-"
+    required_by = _format_feishu_datetime(review_task.required_by)
     reason = (review_task.reason or "-").strip()
     if len(reason) > 80:
         reason = f"{reason[:77]}..."
     return (
-        f"{review_task.review_type} | trade_date={trade_date} | "
-        f"scope={review_task.scope_type}:{review_task.scope_key} | "
-        f"required_by={required_by} | reason={reason}"
+        f"{_feishu_review_type_label(review_task.review_type)} | 业务日期={trade_date} | "
+        f"对象={_feishu_scope_label(review_task.scope_type, review_task.scope_key)} | "
+        f"截止时间={required_by} | 原因={reason}"
     )
 
 
 def _build_expired_review_notification_message(review_task: ReviewTask, *, timeout_at: datetime) -> str:
     trade_date = review_task.trade_date.isoformat() if review_task.trade_date else "-"
-    required_by = review_task.required_by.isoformat() if review_task.required_by else "-"
+    required_by = _format_feishu_datetime(review_task.required_by)
     return (
-        f"{review_task.review_type} expired | trade_date={trade_date} | "
-        f"scope={review_task.scope_type}:{review_task.scope_key} | "
-        f"required_by={required_by} | timeout_at={timeout_at.isoformat()}"
+        f"{_feishu_review_type_label(review_task.review_type)} 已过期 | 业务日期={trade_date} | "
+        f"对象={_feishu_scope_label(review_task.scope_type, review_task.scope_key)} | "
+        f"截止时间={required_by} | 过期处理时间={_format_feishu_datetime(timeout_at)}"
     )

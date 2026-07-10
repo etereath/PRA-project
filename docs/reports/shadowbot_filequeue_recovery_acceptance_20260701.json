@@ -1,0 +1,40 @@
+{
+  "active_files": [],
+  "checks": {
+    "no_active_queue_files": true,
+    "one_deterministic_reconcile": true,
+    "operation_not_applied": true,
+    "reconcile_archived": true,
+    "reconcile_not_applied": true,
+    "reconcile_result_imported": true,
+    "source_archived": true,
+    "source_needs_reconciliation": true,
+    "source_result_imported": true,
+    "watchdog_wrote_unknown_result": true
+  },
+  "import_events": [
+    {
+      "archive_dir": "D:\\PRA_Runtime\\shadowbot_recovery_acceptance_20260701\\archive\\ATTEMPT-RECOVERY-UNKNOWN",
+      "execution_attempt_id": "ATTEMPT-RECOVERY-UNKNOWN",
+      "status": "IMPORTED"
+    }
+  ],
+  "ok": true,
+  "reconcile_execution_attempt_id": "RECONCILE-75f5a222adc99a5f8a58",
+  "reconcile_import_events": [
+    {
+      "archive_dir": "D:\\PRA_Runtime\\shadowbot_recovery_acceptance_20260701\\archive\\RECONCILE-75f5a222adc99a5f8a58",
+      "execution_attempt_id": "RECONCILE-75f5a222adc99a5f8a58",
+      "status": "IMPORTED"
+    }
+  ],
+  "schema_version": "shadowbot-filequeue-recovery-acceptance-1.0",
+  "source_execution_attempt_id": "ATTEMPT-RECOVERY-UNKNOWN",
+  "watchdog_events": [
+    {
+      "execution_attempt_id": "ATTEMPT-RECOVERY-UNKNOWN",
+      "result_path": "D:\\PRA_Runtime\\shadowbot_recovery_acceptance_20260701\\results\\ATTEMPT-RECOVERY-UNKNOWN.result.json",
+      "status": "RECOVERY_RESULT_WRITTEN"
+    }
+  ]
+}

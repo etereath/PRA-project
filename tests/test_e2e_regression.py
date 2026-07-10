@@ -49,16 +49,16 @@ class EndToEndRegressionTests(unittest.TestCase):
             self.price_rules_path,
             PRICE_RULE_HEADERS,
             [
-                ["RULE-ALL-1", "全局固定加价", "all", "*", "fixed_markup", 5, 14, "round", "", True, 10, ""],
-                ["RULE-A", "A级加价", "grade", "A", "percentage_markup", 10, "", "step", 0.5, True, 20, ""],
+                ["RULE-ALL-1", "全局固定加价", "*", "*", "*", "fixed_markup", 5, 14, "round", "", True, 10, ""],
+                ["RULE-A", "A级加价", "*", "A", "*", "percentage_markup", 10, "", "step", 0.5, True, 20, ""],
             ],
         )
         _write_workbook(
             self.listing_rules_path,
             LISTING_RULE_HEADERS,
             [
-                ["LIST-LOW", "库存小于等于0下架", "stock_lte", 0, "set_offline", True, 1, ""],
-                ["LIST-RESTOCK", "库存大于等于10上架", "stock_gte", 10, "set_online", True, 5, ""],
+                ["LIST-LOW", "库存不足下架", "*", "*", "*", 0, "stock_below_offline", True, 1, ""],
+                ["LIST-RESTOCK", "库存恢复允许上架", "*", "*", "*", 10, "stock_above_online", True, 5, ""],
             ],
         )
 

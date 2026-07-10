@@ -62,7 +62,7 @@ class RuntimePersistenceTests(unittest.TestCase):
 
     def test_schema_initializes_version_and_partial_unique_index(self) -> None:
         self.task_service.init_schema()
-        self.assertEqual(self.repository.schema_versions(), [1, 2])
+        self.assertEqual(self.repository.schema_versions(), [1, 2, 3, 4, 5])
         connection = sqlite3.connect(self.db_path)
         try:
             indexes = connection.execute("PRAGMA index_list(tasks)").fetchall()
@@ -73,8 +73,10 @@ class RuntimePersistenceTests(unittest.TestCase):
             connection.close()
         self.assertTrue(any(row[1] == "ux_tasks_open_dedupe" and row[4] for row in indexes))
         self.assertIn(("review_tokens",), tables)
+        self.assertIn(("script_runs",), tables)
+        self.assertIn(("script_run_items",), tables)
 
-    def test_schema_migrates_v1_database_to_v2(self) -> None:
+    def test_schema_migrates_v1_database_to_latest(self) -> None:
         legacy_path = Path(self.temp_dir.name) / "legacy_runtime.sqlite3"
         connection = sqlite3.connect(legacy_path)
         try:
@@ -99,15 +101,23 @@ class RuntimePersistenceTests(unittest.TestCase):
 
         repository = SQLiteRuntimeRepository(legacy_path)
         repository.init_schema()
-        self.assertEqual(repository.schema_versions(), [1, 2])
+        self.assertEqual(repository.schema_versions(), [1, 2, 3, 4, 5])
         connection = sqlite3.connect(legacy_path)
         try:
             token_table = connection.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'review_tokens'"
             ).fetchone()
+            script_run_table = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'script_runs'"
+            ).fetchone()
+            shadowbot_operation_table = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'shadowbot_operations'"
+            ).fetchone()
         finally:
             connection.close()
         self.assertIsNotNone(token_table)
+        self.assertIsNotNone(script_run_table)
+        self.assertIsNotNone(shadowbot_operation_table)
 
     def test_dedupe_key_only_blocks_open_tasks(self) -> None:
         first = _runtime_task("TASK-1")
@@ -424,7 +434,7 @@ class RuntimePersistenceTests(unittest.TestCase):
         self.assertEqual(logs[0].related_task_id, source.task_id)
         self.assertEqual(logs[0].send_status, NotificationSendStatus.SUCCESS.value)
         self.assertIsNotNone(logs[0].sent_at)
-        self.assertIn(review.review_type, logs[0].message)
+        self.assertIn("产能预警", logs[0].message)
         self.assertNotIn("decision_trace", logs[0].message)
 
     def test_feishu_notification_flow_sends_url_but_does_not_persist_raw_token(self) -> None:
@@ -519,7 +529,7 @@ class RuntimePersistenceTests(unittest.TestCase):
         self.assertEqual(summary.inserted_notification_logs_count, 1)
         self.assertEqual(captured["body"]["msg_type"], "text")
         sent_text = captured["body"]["content"]["text"]
-        self.assertIn("mobile_review_url: https://pra.example/mobile/review/", sent_text)
+        self.assertIn("👉 点击处理复核：https://pra.example/mobile/review/", sent_text)
         self.assertIn("token=", sent_text)
 
     def test_feishu_notification_fails_when_review_url_cannot_be_created(self) -> None:
@@ -611,6 +621,31 @@ class RuntimePersistenceTests(unittest.TestCase):
         self.assertEqual(resolved.review_status, ReviewTaskStatus.REJECTED)
         task = self.task_service.list_tasks()[0]
         self.assertEqual(task.task_status, TaskStatus.CANCELLED)
+
+    def test_review_task_can_close_pending_operational_source_task(self) -> None:
+        source = _runtime_task(
+            "TASK-OPS-1",
+            status=TaskStatus.PENDING,
+            action_type=TaskActionType.LABOR_REQUIRED,
+        )
+        self.task_service.create_tasks([source])
+        review_service = ReviewTaskService(self.repository, runtime_task_service=self.task_service)
+        review_service.create_from_tasks([source])
+
+        review = review_service.list_review_tasks(status=ReviewTaskStatus.PENDING)[0]
+        review_service.resolve_review_task(
+            review_task_id=review.review_task_id,
+            status=ReviewTaskStatus.APPROVED,
+            actor="alice",
+            actor_source="session_user",
+            source_task_status=TaskStatus.SKIPPED,
+        )
+
+        task = self.task_service.get_task(source.task_id)
+        history = self.task_service.list_status_history(source.task_id)
+        self.assertEqual(task.task_status, TaskStatus.SKIPPED)
+        self.assertEqual(history[-1].from_status, TaskStatus.PENDING)
+        self.assertEqual(history[-1].to_status, TaskStatus.SKIPPED)
 
     def test_review_task_requires_pending_and_writes_metadata_to_history(self) -> None:
         source = _runtime_task("TASK-1", status=TaskStatus.MANUAL_REVIEW)

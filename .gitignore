@@ -10,3 +10,11 @@ data/runtime/
 
 __pycache__/
 *.pyc
+
+.tmp_shadowbot_executor_tests/
+test_runtime_tmp/
+
+# Local test artifacts and disposable workbook snapshots
+.tmp/
+.tmp_*/
+*_backup_before_*.xlsx

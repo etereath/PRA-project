@@ -1,0 +1,217 @@
+{
+  "checks": [
+    {
+      "detail": "ATTEMPT-UNKNOWN-PRECHECK-20260709-001",
+      "name": "attempt_exists",
+      "ok": true
+    },
+    {
+      "detail": "READ_ONLY",
+      "name": "execution_mode_matches",
+      "ok": true
+    },
+    {
+      "detail": "2026-07-09 08:48:32.143286+00:00",
+      "name": "attempt_finished",
+      "ok": true
+    },
+    {
+      "detail": "sha256:7f8a59b0f81e50a8f17e284e7c42cd6383fbc86b21e8920ac02db97d6943e8bb",
+      "name": "instruction_hash_recorded",
+      "ok": true
+    },
+    {
+      "detail": "257496c8711b06b8087c3ce4dca308f37dae6e6a94355a3dfe3d7522d013e11d",
+      "name": "request_sha256_recorded",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\inbox\\ATTEMPT-UNKNOWN-PRECHECK-20260709-001.ready.json",
+      "name": "queue_request_path_recorded",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-UNKNOWN-PRECHECK-20260709-001",
+      "name": "archive_directory_exists",
+      "ok": true
+    },
+    {
+      "detail": [
+        "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-UNKNOWN-PRECHECK-20260709-001\\ATTEMPT-UNKNOWN-PRECHECK-20260709-001.request.json"
+      ],
+      "name": "one_archived_request",
+      "ok": true
+    },
+    {
+      "detail": [
+        "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-UNKNOWN-PRECHECK-20260709-001\\ATTEMPT-UNKNOWN-PRECHECK-20260709-001.result.json"
+      ],
+      "name": "one_archived_result",
+      "ok": true
+    },
+    {
+      "detail": [
+        "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-UNKNOWN-PRECHECK-20260709-001\\ATTEMPT-UNKNOWN-PRECHECK-20260709-001.phase.json"
+      ],
+      "name": "one_archived_phase",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-UNKNOWN-PRECHECK-20260709-001\\ATTEMPT-UNKNOWN-PRECHECK-20260709-001.request.json",
+      "name": "request_checksum_valid",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-UNKNOWN-PRECHECK-20260709-001\\ATTEMPT-UNKNOWN-PRECHECK-20260709-001.result.json",
+      "name": "result_checksum_valid",
+      "ok": true
+    },
+    {
+      "detail": "257496c8711b06b8087c3ce4dca308f37dae6e6a94355a3dfe3d7522d013e11d",
+      "name": "request_hash_matches_database",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "TASK-UNKNOWN-PRECHECK-20260709-001",
+        "result": "TASK-UNKNOWN-PRECHECK-20260709-001"
+      },
+      "name": "binding_task_id",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "OP-UNKNOWN-PRECHECK-20260709-001",
+        "result": "OP-UNKNOWN-PRECHECK-20260709-001"
+      },
+      "name": "binding_operation_id",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "ATTEMPT-UNKNOWN-PRECHECK-20260709-001",
+        "result": "ATTEMPT-UNKNOWN-PRECHECK-20260709-001"
+      },
+      "name": "binding_execution_attempt_id",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "READ_ONLY",
+        "result": "READ_ONLY"
+      },
+      "name": "binding_execution_mode",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "sha256:7f8a59b0f81e50a8f17e284e7c42cd6383fbc86b21e8920ac02db97d6943e8bb",
+        "result": "sha256:7f8a59b0f81e50a8f17e284e7c42cd6383fbc86b21e8920ac02db97d6943e8bb"
+      },
+      "name": "binding_instruction_hash",
+      "ok": true
+    },
+    {
+      "detail": "257496c8711b06b8087c3ce4dca308f37dae6e6a94355a3dfe3d7522d013e11d",
+      "name": "result_request_hash_matches",
+      "ok": true
+    },
+    {
+      "detail": "READ_ONLY",
+      "name": "result_mode_matches",
+      "ok": true
+    },
+    {
+      "detail": "READ_COMPLETED",
+      "name": "result_status_accepted",
+      "ok": true
+    },
+    {
+      "detail": true,
+      "name": "technical_run_succeeded",
+      "ok": true
+    },
+    {
+      "detail": "12.50",
+      "name": "actual_price_recorded",
+      "ok": true
+    },
+    {
+      "detail": false,
+      "name": "no_business_completion",
+      "ok": true
+    },
+    {
+      "detail": "NOT_STARTED",
+      "name": "no_side_effect",
+      "ok": true
+    },
+    {
+      "detail": "RESULT_WRITTEN",
+      "name": "phase_result_written",
+      "ok": true
+    },
+    {
+      "detail": "LAPTOP-O9O76RQV",
+      "name": "phase_worker_recorded",
+      "ok": true
+    },
+    {
+      "detail": 1,
+      "name": "evidence_present",
+      "ok": true
+    },
+    {
+      "detail": "7fb350213b3ae67fdca29089e4d76cdcb39529129947dcd190899188594b4b56",
+      "name": "evidence_1_sha256",
+      "ok": true
+    },
+    {
+      "detail": "2026-07-09T16:47:34+08:00",
+      "name": "evidence_1_captured_at",
+      "ok": true
+    },
+    {
+      "detail": "SUCCESS",
+      "name": "evidence_1_upload_success",
+      "ok": true
+    },
+    {
+      "detail": true,
+      "name": "evidence_1_hash_verified",
+      "ok": true
+    },
+    {
+      "detail": "\\\\LAPTOP-O9O76RQV\\pra-evidence\\ATTEMPT-UNKNOWN-PRECHECK-20260709-001\\ATTEMPT-UNKNOWN-PRECHECK-20260709-001_supply_price.png",
+      "name": "evidence_1_storage_exists",
+      "ok": true
+    },
+    {
+      "detail": "7fb350213b3ae67fdca29089e4d76cdcb39529129947dcd190899188594b4b56",
+      "name": "evidence_1_storage_hash",
+      "ok": true
+    },
+    {
+      "detail": [],
+      "name": "no_active_queue_files",
+      "ok": true
+    },
+    {
+      "detail": [],
+      "name": "not_quarantined",
+      "ok": true
+    },
+    {
+      "detail": 1,
+      "name": "execution_log_written",
+      "ok": true
+    }
+  ],
+  "execution_attempt_id": "ATTEMPT-UNKNOWN-PRECHECK-20260709-001",
+  "execution_mode": "READ_ONLY",
+  "failed_checks": [],
+  "ok": true,
+  "profile": "NORMAL",
+  "schema_version": "shadowbot-filequeue-acceptance-1.0",
+  "status": "READ_COMPLETED"
+}

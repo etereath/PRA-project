@@ -1,0 +1,197 @@
+{
+  "checks": [
+    {
+      "detail": "ATTEMPT-UNKNOWN-COMMIT-20260709-002",
+      "name": "attempt_exists",
+      "ok": true
+    },
+    {
+      "detail": "COMMIT",
+      "name": "execution_mode_matches",
+      "ok": true
+    },
+    {
+      "detail": "2026-07-09 09:17:34.899349+00:00",
+      "name": "attempt_finished",
+      "ok": true
+    },
+    {
+      "detail": "sha256:04f26e68d0c15c693e7829c91e78da793673fe5faba1d182b2dccd4b7dc64916",
+      "name": "instruction_hash_recorded",
+      "ok": true
+    },
+    {
+      "detail": "8b5753149c069cbb5e79e0952374f8aa7da8dc090b18bd148d9ddf885b88ed9f",
+      "name": "request_sha256_recorded",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\inbox\\ATTEMPT-UNKNOWN-COMMIT-20260709-002.ready.json",
+      "name": "queue_request_path_recorded",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-UNKNOWN-COMMIT-20260709-002",
+      "name": "archive_directory_exists",
+      "ok": true
+    },
+    {
+      "detail": [
+        "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-UNKNOWN-COMMIT-20260709-002\\ATTEMPT-UNKNOWN-COMMIT-20260709-002.request.json"
+      ],
+      "name": "one_archived_request",
+      "ok": true
+    },
+    {
+      "detail": [
+        "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-UNKNOWN-COMMIT-20260709-002\\ATTEMPT-UNKNOWN-COMMIT-20260709-002.result.json"
+      ],
+      "name": "one_archived_result",
+      "ok": true
+    },
+    {
+      "detail": [
+        "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-UNKNOWN-COMMIT-20260709-002\\ATTEMPT-UNKNOWN-COMMIT-20260709-002.phase.json"
+      ],
+      "name": "one_archived_phase",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-UNKNOWN-COMMIT-20260709-002\\ATTEMPT-UNKNOWN-COMMIT-20260709-002.request.json",
+      "name": "request_checksum_valid",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-UNKNOWN-COMMIT-20260709-002\\ATTEMPT-UNKNOWN-COMMIT-20260709-002.result.json",
+      "name": "result_checksum_valid",
+      "ok": true
+    },
+    {
+      "detail": "8b5753149c069cbb5e79e0952374f8aa7da8dc090b18bd148d9ddf885b88ed9f",
+      "name": "request_hash_matches_database",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "TASK-UNKNOWN-COMMIT-20260709-002",
+        "result": "TASK-UNKNOWN-COMMIT-20260709-002"
+      },
+      "name": "binding_task_id",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "OP-UNKNOWN-COMMIT-20260709-002",
+        "result": "OP-UNKNOWN-COMMIT-20260709-002"
+      },
+      "name": "binding_operation_id",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "ATTEMPT-UNKNOWN-COMMIT-20260709-002",
+        "result": "ATTEMPT-UNKNOWN-COMMIT-20260709-002"
+      },
+      "name": "binding_execution_attempt_id",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "COMMIT",
+        "result": "COMMIT"
+      },
+      "name": "binding_execution_mode",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "sha256:04f26e68d0c15c693e7829c91e78da793673fe5faba1d182b2dccd4b7dc64916",
+        "result": "sha256:04f26e68d0c15c693e7829c91e78da793673fe5faba1d182b2dccd4b7dc64916"
+      },
+      "name": "binding_instruction_hash",
+      "ok": true
+    },
+    {
+      "detail": "8b5753149c069cbb5e79e0952374f8aa7da8dc090b18bd148d9ddf885b88ed9f",
+      "name": "result_request_hash_matches",
+      "ok": true
+    },
+    {
+      "detail": "COMMIT",
+      "name": "result_mode_matches",
+      "ok": true
+    },
+    {
+      "detail": "NEEDS_RECONCILIATION",
+      "name": "result_status_accepted",
+      "ok": false
+    },
+    {
+      "detail": null,
+      "name": "technical_run_succeeded",
+      "ok": false
+    },
+    {
+      "detail": null,
+      "name": "business_completed",
+      "ok": false
+    },
+    {
+      "detail": "UNKNOWN",
+      "name": "side_effect_verified",
+      "ok": false
+    },
+    {
+      "detail": {
+        "request": "13.00",
+        "result": "8.00"
+      },
+      "name": "commit_actual_price_matches_target",
+      "ok": false
+    },
+    {
+      "detail": "RESULT_WRITTEN",
+      "name": "phase_result_written",
+      "ok": true
+    },
+    {
+      "detail": "LAPTOP-O9O76RQV",
+      "name": "phase_worker_recorded",
+      "ok": true
+    },
+    {
+      "detail": 0,
+      "name": "evidence_present",
+      "ok": false
+    },
+    {
+      "detail": [],
+      "name": "no_active_queue_files",
+      "ok": true
+    },
+    {
+      "detail": [],
+      "name": "not_quarantined",
+      "ok": true
+    },
+    {
+      "detail": 1,
+      "name": "execution_log_written",
+      "ok": true
+    }
+  ],
+  "execution_attempt_id": "ATTEMPT-UNKNOWN-COMMIT-20260709-002",
+  "execution_mode": "COMMIT",
+  "failed_checks": [
+    "result_status_accepted",
+    "technical_run_succeeded",
+    "business_completed",
+    "side_effect_verified",
+    "commit_actual_price_matches_target",
+    "evidence_present"
+  ],
+  "ok": false,
+  "profile": "NORMAL",
+  "schema_version": "shadowbot-filequeue-acceptance-1.0",
+  "status": "NEEDS_RECONCILIATION"
+}

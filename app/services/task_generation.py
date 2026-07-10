@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from uuid import uuid4
 
@@ -77,7 +78,7 @@ class TaskGenerationService:
 
         for product in products:
             pricing_decision = self.pricing_service.calculate(product, platform_name, price_rules)
-            listing_action, listing_trace = self.listing_service.evaluate(product, listing_rules)
+            listing_action, listing_trace = self.listing_service.evaluate(product, listing_rules, platform_name)
 
             if product.sale_enabled and product.current_stock > 0:
                 update_key = (product.internal_sku, TaskActionType.UPDATE_PRICE.value, platform_name)
@@ -124,6 +125,8 @@ class TaskGenerationService:
         resolved_trade_date = self._resolve_trade_date(trade_date, harvest_forecasts, price_forecasts, capacity_plan)
         trade_window = self.trade_window_service.build(resolved_trade_date, now=now)
         capacity_plan = capacity_plan or PackingCapacityPlan(trade_date=resolved_trade_date)
+        if capacity_plan.trade_date != resolved_trade_date:
+            capacity_plan = replace(capacity_plan, trade_date=resolved_trade_date)
         harvest_by_group = self.harvest_forecast_service.index_by_group(harvest_forecasts)
         price_by_group = {forecast.forecast_group_key: forecast for forecast in price_forecasts}
         allocations = self.capacity_planning_service.allocate_capacity(harvest_forecasts, capacity_plan)

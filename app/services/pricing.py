@@ -3,6 +3,7 @@ from __future__ import annotations
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
 
 from app.enums import PricingMethod, PricingSource, RoundingRule
+from app.exceptions import ValidationError
 from app.models import (
     AISuggestionInput,
     FinalPricingDecision,
@@ -63,16 +64,21 @@ class PricingService:
         applicable = [
             rule
             for rule in request.rules
-            if rule.active and self._matches_scope(request.product, request.platform_name, rule)
+            if rule.active and price_rule_matches(rule, request.product, request.platform_name)
         ]
-        applicable.sort(key=lambda item: item.priority)
+        selected_rule = self._select_winning_rule(applicable)
         matched_rule_ids: list[str] = []
         matched_rule_names: list[str] = []
         steps: list[str] = [f"base_cost={request.product.base_cost}"]
         price = request.product.base_cost
-        for rule in applicable:
+        if selected_rule is not None:
+            rule = selected_rule
             matched_rule_ids.append(rule.rule_id)
             matched_rule_names.append(rule.rule_name)
+            steps.append(
+                "winning_rule:"
+                f"{rule.rule_id}:priority={rule.priority}:specificity={price_rule_specificity(rule)}"
+            )
             price = self._apply_method(price, rule)
             steps.append(f"rule:{rule.rule_id}:{rule.pricing_method.value}->{price}")
             if rule.min_price is not None and price < rule.min_price:
@@ -87,24 +93,20 @@ class PricingService:
             applied_steps=steps,
         )
 
-    def _matches_scope(self, product: Product, platform_name: str, rule: PriceRule) -> bool:
-        scope = rule.scope_type
-        value = rule.scope_value
-        if scope == "all":
-            return value == "*"
-        if scope == "platform":
-            return value == platform_name
-        if scope == "variety":
-            return value == product.product_name
-        if scope == "product_name":
-            return value == product.product_name
-        if scope == "product":
-            return value == product.product_name
-        if scope == "grade":
-            return value == product.grade
-        if scope == "sku":
-            return value == product.internal_sku
-        return False
+    def _select_winning_rule(self, rules: list[PriceRule]) -> PriceRule | None:
+        if not rules:
+            return None
+        sorted_rules = sorted(rules, key=lambda item: (item.priority, -price_rule_specificity(item), item.rule_id))
+        winner = sorted_rules[0]
+        conflicts = [
+            rule
+            for rule in sorted_rules[1:]
+            if rule.priority == winner.priority and price_rule_specificity(rule) == price_rule_specificity(winner)
+        ]
+        if conflicts:
+            conflict_ids = ", ".join([winner.rule_id, *(rule.rule_id for rule in conflicts)])
+            raise ValidationError(f"价格规则冲突：{conflict_ids} 的优先级和具体度相同，请调整后重新生成任务。")
+        return winner
 
     def _apply_method(self, price: Decimal, rule: PriceRule) -> Decimal:
         if rule.pricing_method == PricingMethod.FIXED_MARKUP:
@@ -127,3 +129,35 @@ class PricingService:
             quotient = (price / step).to_integral_value(rounding=ROUND_CEILING)
             return quotient * step
         return price
+
+
+def price_rule_matches(rule: PriceRule, product: Product, platform_name: str) -> bool:
+    return (
+        _matches_filter(rule.variety_filter, product.product_name, kind="text")
+        and _matches_filter(rule.grade_filter, product.grade, kind="grade")
+        and _matches_filter(rule.platform_filter, platform_name, kind="text")
+    )
+
+
+def price_rule_specificity(rule: PriceRule) -> int:
+    return sum(
+        1
+        for value in (rule.variety_filter, rule.grade_filter, rule.platform_filter)
+        if _normalize_filter_value(value, kind="text") != "*"
+    )
+
+
+def _matches_filter(filter_value: object, actual_value: object, *, kind: str) -> bool:
+    normalized_filter = _normalize_filter_value(filter_value, kind=kind)
+    if normalized_filter == "*":
+        return True
+    return normalized_filter == _normalize_filter_value(actual_value, kind=kind)
+
+
+def _normalize_filter_value(value: object, *, kind: str) -> str:
+    text = str(value if value is not None else "").strip()
+    if text == "*":
+        return "*"
+    if kind == "grade":
+        return text.upper()
+    return text

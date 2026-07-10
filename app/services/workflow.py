@@ -36,7 +36,7 @@ from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.ai import MockAISuggestionProvider, NullAISuggestionProvider
 from app.services.execution import ExecutionSimulationService
 from app.services.listing import ListingService
-from app.services.manual_intervention import ManualInterventionService
+from app.services.manual_intervention import MANUAL_INTERVENTION_ACTIONS, ManualInterventionService
 from app.services.pricing import PricingService
 from app.services.runtime import (
     DEFAULT_RUNTIME_DB,
@@ -218,15 +218,18 @@ def generate_runtime_tasks_from_sources(inputs: WorkflowInputs, *, db_path: Path
     repository = SQLiteRuntimeRepository(db_path)
     runtime_task_service = RuntimeTaskService(repository)
     runtime_task_service.init_schema()
-    inserted_tasks = runtime_task_service.create_tasks(summary.tasks, trade_date=inputs.trade_date)
-    review_summary = ReviewTaskService(repository, runtime_task_service=runtime_task_service).create_from_tasks(
+    inserted_task_rows = runtime_task_service.create_tasks_returning_inserted(
         summary.tasks,
+        trade_date=inputs.trade_date,
+    )
+    review_summary = ReviewTaskService(repository, runtime_task_service=runtime_task_service).create_from_tasks(
+        inserted_task_rows,
         trade_date=inputs.trade_date,
     )
     return RuntimeTaskGenerationSummary(
         validation=summary.validation,
         tasks=summary.tasks,
-        inserted_tasks_count=inserted_tasks,
+        inserted_tasks_count=len(inserted_task_rows),
         inserted_review_tasks_count=review_summary.inserted_review_tasks_count,
         inserted_notification_logs_count=review_summary.inserted_notification_logs_count,
         db_path=db_path,
@@ -240,6 +243,8 @@ def list_runtime_tasks(
     trade_date: date | None = None,
     status: TaskStatus | None = None,
     action_type: TaskActionType | None = None,
+    scope_type: str | None = None,
+    scope_key: str | None = None,
 ) -> list[Task]:
     repository = SQLiteRuntimeRepository(db_path)
     RuntimeTaskService(repository).init_schema()
@@ -247,6 +252,8 @@ def list_runtime_tasks(
         trade_date=trade_date,
         status=status,
         action_type=action_type,
+        scope_type=scope_type,
+        scope_key=scope_key,
     )
 
 
@@ -347,9 +354,7 @@ def resolve_mobile_review(
         if validation.review_task.source_task_id
         else None
     )
-    source_task_status = None
-    if source_task is not None and source_task.task_status == TaskStatus.MANUAL_REVIEW:
-        source_task_status = _source_task_status_for_mobile_review(review_status)
+    source_task_status = source_task_status_for_review_resolution(source_task, review_status)
 
     resolved_review = ReviewTaskService(
         repository,
@@ -372,7 +377,19 @@ def resolve_mobile_review(
     )
 
 
-def _source_task_status_for_mobile_review(status: ReviewTaskStatus) -> TaskStatus:
+def source_task_status_for_review_resolution(source_task: Task | None, status: ReviewTaskStatus) -> TaskStatus | None:
+    if source_task is None:
+        return None
+    if source_task.task_status == TaskStatus.MANUAL_REVIEW:
+        return _source_task_status_for_manual_review_source(status)
+    if source_task.task_status == TaskStatus.PENDING and source_task.action_type in MANUAL_INTERVENTION_ACTIONS:
+        if status == ReviewTaskStatus.CANCELLED:
+            return TaskStatus.CANCELLED
+        return TaskStatus.SKIPPED
+    return None
+
+
+def _source_task_status_for_manual_review_source(status: ReviewTaskStatus) -> TaskStatus:
     if status == ReviewTaskStatus.APPROVED:
         return TaskStatus.PENDING
     if status == ReviewTaskStatus.CANCELLED:
@@ -394,21 +411,38 @@ def expire_runtime_review_tasks(inputs: ExpireReviewTasksInputs) -> ExpireReview
 def list_runtime_notification_logs(
     db_path: Path = DEFAULT_RUNTIME_DB,
     *,
+    related_task_id: str | None = None,
     related_review_task_id: str | None = None,
     send_status: str | None = None,
+    channel: str | None = None,
 ) -> list[NotificationLog]:
     repository = SQLiteRuntimeRepository(db_path)
     RuntimeTaskService(repository).init_schema()
-    return NotificationLogService(repository).list_logs(
+    logs = NotificationLogService(repository).list_logs(
         related_review_task_id=related_review_task_id,
         send_status=send_status,
+        channel=channel,
     )
+    if related_task_id:
+        logs = [log for log in logs if log.related_task_id == related_task_id]
+    return logs
 
 
 def get_runtime_notification_log(db_path: Path, notification_id: str) -> NotificationLog | None:
     repository = SQLiteRuntimeRepository(db_path)
     RuntimeTaskService(repository).init_schema()
     return NotificationLogService(repository).get_log(notification_id)
+
+
+def list_runtime_execution_logs(
+    db_path: Path = DEFAULT_RUNTIME_DB,
+    *,
+    task_id: str | None = None,
+    limit: int | None = None,
+) -> list[ExecutionLog]:
+    repository = SQLiteRuntimeRepository(db_path)
+    RuntimeTaskService(repository).init_schema()
+    return repository.list_execution_logs(task_id=task_id, limit=limit)
 
 
 def validate_sources(inputs: WorkflowInputs) -> ValidationSummary:

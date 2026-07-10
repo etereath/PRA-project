@@ -1,81 +1,172 @@
-# PRA MVP 项目说明
+# PRA 运行态运营后台
 
-这是一个面向鲜花多平台销售自动化场景的后端 MVP。当前阶段聚焦“平台无关的业务核心”，已经打通以下链路：
+PRA 是面向鲜切花预测性销售与多平台执行任务的运行态运营系统。当前项目仍以 Excel 作为商品、规则、预测等业务输入来源，以 SQLite 作为运行态事实来源，负责生成、追踪、复核和通知运营任务。
 
-- Excel 主数据导入与校验
-- 价格规则与上下架规则计算
-- AI 定价建议接口预留
-- 任务预览、任务生成与 Excel 导出
-- Web 管理页与表格编辑页
-- 模拟执行与执行日志回写
+当前已完成的主线能力包括：SQLite 运行态任务系统、人工复核闭环、Mobile Review、飞书 Webhook 真实通知、飞书 post 富文本消息、cpolar 外网访问链路，以及 Web 运行态运营后台。
 
-## 文档入口
+## 当前状态
 
-项目说明文本以中文为主，相关规范见 [项目注意事项.md](/D:/PRA%20project/项目注意事项.md)。
+已完成：
 
-- 字段说明文档：[Excel表格字段说明.md](/D:/PRA%20project/doc/Excel表格字段说明.md)
-- 运行与排错手册：[运行与排错手册.md](/D:/PRA%20project/doc/运行与排错手册.md)
-- 阶段验收清单：[阶段验收清单.md](/D:/PRA%20project/doc/阶段验收清单.md)
-- 项目背景与设计说明：[project_overview.md](/D:/PRA%20project/doc/project_overview.md)
+- Excel 业务输入：商品、规则、预测、产能、冷库等输入仍保留为 Excel。
+- 商品资料与库存录入：`Business Inputs` 已支持通过运营表单补充公共库存、维护商品基础资料，并保存回 `products.xlsx`。
+- 价格规则管理：`Business Inputs` 已支持通过运营表单新增、编辑和查看价格规则，并保存回 `price_rules.xlsx`。
+- SQLite 运行态：保存 `tasks`、`review_tasks`、`notification_logs`、`execution_logs`、`task_status_history`、`review_tokens`。
+- Web 运营后台：`Dashboard`、`Tasks`、`Reviews`、`Notifications`、`Execution Logs`、`Business Inputs`、`System`。
+- 人工复核：Web Session 复核与 Mobile Review token 复核均已跑通。
+- 飞书通知：支持真实飞书 Webhook，默认使用 post 富文本消息。
+- 系统检查：`/system` 可检查配置、schema、运行态表计数，并可手动发送飞书测试通知。
 
-## 快速开始
+当前未做：
 
-安装依赖：
+- 尚未形成真实销售平台的无人值守生产改价闭环；影刀微信小程序已完成真实平台 UI 自动化实验。
+- 尚未完成生产级真实 RPA 调度闭环；当前已有 `ShadowBotExecutor` 骨架、文件投递 runner 和结果回灌脚本。
+- 不引入 AI Agent 自动决策。
+- 不迁移 Excel 主数据。
+- 不引入 React/Vue 或前后端分离。
+- 不做完整权限系统。
 
-```bash
+更完整的状态说明见 [docs/project_current_status.md](docs/project_current_status.md)。
+
+## 快速启动
+
+安装项目：
+
+```powershell
 pip install -e .
 ```
 
-生成模板与样例工作簿：
+准备本地环境变量：
 
-```bash
-python scripts/create_sample_workbooks.py
+```powershell
+Copy-Item scripts/local_env.example.ps1 scripts/local_env.ps1
+notepad scripts/local_env.ps1
 ```
 
-运行测试：
+编辑 `scripts/local_env.ps1` 后启动 Web：
 
-```bash
-python -m unittest discover -s tests -v
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/start_local.ps1
 ```
 
-启动 Web 管理页：
+默认地址：
 
-```bash
-python -m app.cli serve-web --host 127.0.0.1 --port 8765
+```text
+http://127.0.0.1:8765
 ```
 
-Windows 一键启动：
+也可以使用：
 
 ```bat
 start_web.bat
 ```
 
-## CLI 命令
+## 环境变量
 
-- `templates`：创建空模板工作簿
-- `validate`：校验输入工作簿
-- `import-data`：校验并输出输入数据摘要
-- `preview-tasks`：预览任务但不写出文件
-- `generate-tasks`：生成任务工作簿
-- `mock-ai-decision`：预览单个 SKU 的 Mock AI 定价决策
-- `simulate-execution`：模拟执行任务并写出执行日志
-- `serve-web`：启动简易 Web 管理页
+核心必填项：
 
-## Web 页面
+- `RUNTIME_ADMIN_USER`：Web 后台账号，默认 `admin`。
+- `RUNTIME_ADMIN_PASSWORD`：Web 后台密码，必须本地配置。
+- `REVIEW_TOKEN_SECRET`：Mobile Review token HMAC 密钥，必须本地配置。
 
-当前内置 3 个页面：
+飞书与手机端复核：
 
-1. `任务面板`：校验数据、预览任务、确认导出任务
-2. `Excel 表格管理`：直接编辑 `products`、`price_rules`、`listing_rules`
-3. `执行回写`：读取任务文件，模拟执行并写出执行日志
+- `DEFAULT_NOTIFICATION_CHANNEL=feishu`
+- `FEISHU_WEBHOOK_URL`
+- `FEISHU_WEBHOOK_SECRET`：如果飞书机器人未开启签名，可留空。
+- `FEISHU_MESSAGE_TYPE=post`
+- `MOBILE_REVIEW_BASE_URL=https://你的固定公网地址`
 
-## 当前阶段边界
+详细说明见 [docs/runtime_environment_variables.md](docs/runtime_environment_variables.md)。
 
-当前版本仍属于 MVP，暂不包含：
+## cpolar / Mobile Review
 
-- 真实平台登录与页面操作
-- 真正的 RPA 执行器接入
-- AI 模型训练与在线预测闭环
-- 数据库持久化与完整权限系统
+Mobile Review 需要手机能访问本地 Web 服务。当前已验证的方式是使用 cpolar 将本地 `127.0.0.1:8765` 暴露为公网地址，然后把公网地址写入：
 
-当前建议把它作为“规则验证、任务生成、流程演示”的基础版本继续推进。
+```powershell
+$env:MOBILE_REVIEW_BASE_URL = "https://你的固定地址.cpolar.cn"
+```
+
+飞书通知中会携带 Mobile Review 链接，用户在手机打开后可处理对应 `review_task`。系统不会在 `notification_logs.message` 中保存完整 `token=` 链接。
+
+## 飞书测试通知
+
+登录 Web 后台后进入：
+
+```text
+/system
+```
+
+点击“发送飞书测试通知”即可验证：
+
+- `FeishuWebhookNotificationSender`
+- 飞书 Webhook URL
+- 飞书签名配置
+- 当前网络连通性
+
+该测试不会创建业务 `review_task`，不会创建 `review_token`，不会生成 `mobile_review_url`，也不会改变任何任务或复核状态。测试结果会以 `recipient_type=system`、`recipient=system_test` 写入 `notification_logs`，便于后续在通知中心排障。
+
+## 常用命令
+
+初始化运行态数据库：
+
+```powershell
+python -m app.cli init-runtime-db
+```
+
+生成运行态任务：
+
+```powershell
+python -m app.cli generate-runtime-tasks
+```
+
+查看运行态任务：
+
+```powershell
+python -m app.cli list-tasks
+```
+
+过期超时复核任务：
+
+```powershell
+python -m app.cli expire-review-tasks --apply
+```
+
+## 运行测试
+
+```powershell
+python scripts/run_system_smoke_tests.py
+python -m unittest discover -s tests
+```
+
+当前建议在 Code Review 前先运行系统冒烟测试脚本和完整单元测试，确认主控流程基线稳定。
+
+## 安全边界
+
+不得提交到 git：
+
+- `.env.local`
+- `.env`
+- `.env.*`
+- `scripts/local_env.ps1`
+- `REVIEW_TOKEN_SECRET`
+- `RUNTIME_ADMIN_PASSWORD`
+- `FEISHU_WEBHOOK_URL`
+- `FEISHU_WEBHOOK_SECRET`
+- 带 `token=` 的 Mobile Review URL
+- `data/runtime/`
+- `*.sqlite3`
+- `*.db`
+
+Web 页面与日志要求：
+
+- 不展示 secret。
+- 不展示 raw token。
+- 不展示完整 webhook。
+- 不展示完整 `mobile_review_url`。
+- `notification_logs.message` 不应保存 `token=`。
+- Web 后台运行态页面必须登录后访问。
+
+## 文档入口
+
+文档索引见 [docs/index.md](docs/index.md)。

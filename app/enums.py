@@ -26,6 +26,13 @@ class ListingAction(str, Enum):
     SET_OFFLINE = "set_offline"
 
 
+class ListingStrategy(str, Enum):
+    ALLOW_ONLINE = "allow_online"
+    PROHIBIT_ONLINE = "prohibit_online"
+    STOCK_BELOW_OFFLINE = "stock_below_offline"
+    STOCK_ABOVE_ONLINE = "stock_above_online"
+
+
 class TaskActionType(str, Enum):
     UPDATE_PRICE = "update_price"
     SET_ONLINE = "set_online"

@@ -198,13 +198,15 @@
 
 ## 6. 下一步建议（按当前进度）
 
-建议下一阶段从“可用 MVP”推进到“可运营增强”，顺序如下：
+当前 Mobile Review、飞书真实通知、飞书 post 富文本消息、Web 复核闭环、`/system` 飞书测试通知和系统冒烟测试脚本均已完成 MVP 落地。下一阶段不建议立刻接真实 RPA 或 AI Agent，而应保持验收基线稳定并进入 Code Review。
 
-1. Mobile 页面体验优化：更清晰的摘要、错误页、状态页和适合手机操作的表单。
-2. 飞书 `post` 消息继续优化：按 `review_type` 调整字段顺序、增加风险等级摘要，必要时再评估交互卡片。
-3. 细化 `review_type -> allowed_actions` 动作矩阵，减少误操作空间。
-4. 引入短链/一次性 code 或 POST 交换流程，降低 token 泄露面。
-5. 结合运营策略，增加 token 轮转、批量撤销、通知限流和重试治理策略。
+推荐顺序：
+
+1. 持续运行 `python scripts/run_system_smoke_tests.py`，覆盖环境变量、runtime DB、Web 登录、飞书测试通知和 Mobile Review 关键路径。
+2. 持续运行完整单元测试，保持 `Excel -> tasks -> review_tasks -> notification_logs -> Web/Mobile review -> task_status_history` 主控基线稳定。
+3. 在测试基线稳定后进行 Code Review。
+4. 根据 Code Review 结果修复明显风险和测试缺口。
+5. 再评估 Mobile 页面体验优化、短链/一次性 code、通知限流和 token 轮转等运营增强。
 
 ---
 

@@ -219,6 +219,35 @@ class PredictiveDecisionTests(unittest.TestCase):
         labor_task = next(task for task in tasks if task.action_type == TaskActionType.LABOR_REQUIRED)
         self.assertEqual(labor_task.required_by, datetime(2026, 5, 3, 20, 0))
 
+    def test_trade_date_override_controls_capacity_review_deadline(self) -> None:
+        product = _product("SKU-A", grade="A")
+        harvest_forecasts = [
+            HarvestForecast(
+                forecast_id="HF-A",
+                forecast_date=date(2026, 5, 3),
+                target_trade_date=date(2026, 5, 4),
+                forecast_group_key="rose::A",
+                variety="rose",
+                grade="A",
+                predicted_harvest_qty=300,
+            )
+        ]
+
+        tasks = TaskGenerationService(PricingService(), ListingService()).generate(
+            [product],
+            price_rules=[],
+            listing_rules=[],
+            harvest_forecasts=harvest_forecasts,
+            capacity_plan=PackingCapacityPlan(trade_date=date(2026, 5, 4)),
+            trade_date=date(2026, 5, 6),
+            now=datetime(2026, 5, 5, 10, 0),
+        )
+
+        labor_task = next(task for task in tasks if task.action_type == TaskActionType.LABOR_REQUIRED)
+        capacity_task = next(task for task in tasks if task.action_type == TaskActionType.CAPACITY_WARNING)
+        self.assertEqual(labor_task.required_by, datetime(2026, 5, 5, 20, 0))
+        self.assertEqual(capacity_task.required_by, datetime(2026, 5, 5, 20, 0))
+
     def test_closed_trade_window_only_generates_offline_not_online_or_price(self) -> None:
         product = _product("SKU-A", grade="A")
         forecast = HarvestForecast(

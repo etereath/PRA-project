@@ -54,17 +54,16 @@ def main() -> None:
         SAMPLES_DIR / "price_rules.xlsx",
         PRICE_RULE_HEADERS,
         [
-            ["RULE-ALL-1", "全局固定加价", "all", "*", "fixed_markup", 5, 14, "round", "", True, 10, ""],
-            ["RULE-ROSE-A", "A级加价10%", "grade", "A", "percentage_markup", 10, "", "step", 0.5, True, 20, ""],
+            ["RULE-ALL-1", "全局固定加价", "*", "*", "*", "fixed_markup", 5, 14, "round", "", True, 10, ""],
+            ["RULE-ROSE-A", "A级加价10%", "*", "A", "*", "percentage_markup", 10, "", "step", 0.5, True, 20, ""],
         ],
     )
     write_workbook(
         SAMPLES_DIR / "listing_rules.xlsx",
         LISTING_RULE_HEADERS,
         [
-            ["LIST-LOW", "库存小于等于0下架", "stock_lte", 0, "set_offline", True, 1, ""],
-            ["LIST-RESTOCK", "库存大于等于10上架", "stock_gte", 10, "set_online", True, 5, ""],
-            ["LIST-time", "固定时间上架", "time_gte", "22:00", "set_online", True, 0, ""],
+            ["LIST-LOW", "库存不足下架", "*", "*", "*", 0, "stock_below_offline", True, 1, ""],
+            ["LIST-RESTOCK", "库存恢复允许上架", "*", "*", "*", 10, "stock_above_online", True, 5, ""],
         ],
     )
     write_workbook(
@@ -88,12 +87,12 @@ def main() -> None:
     write_workbook(
         SAMPLES_DIR / "capacity_plans.xlsx",
         CAPACITY_PLAN_HEADERS,
-        [["2026-05-04", 250, 100, 0, "proportional_by_forecast", "default sample"]],
+        [["2026-05-04", 250, 100, 0, 250, "proportional_by_forecast", True, "default sample"]],
     )
     write_workbook(
         SAMPLES_DIR / "cold_storage_status.xlsx",
         COLD_STORAGE_STATUS_HEADERS,
-        [["2026-05-04", 500, 120, "default sample"]],
+        [["2026-05-04", 500, 120, 0, 0, 50, 120, 380, True, "default sample"]],
     )
     print("Sample and template workbooks created.")
 

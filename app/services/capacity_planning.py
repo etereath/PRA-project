@@ -15,6 +15,8 @@ class CapacityPlanningService:
         extra_packing_qty = max(0, predicted_total_harvest_qty - plan.normal_packing_capacity_qty)
         if extra_packing_qty == 0:
             return 0
+        if plan.temp_worker_capacity_qty <= 0:
+            return plan.confirmed_temp_worker_count + 1
         return ceil(extra_packing_qty / plan.temp_worker_capacity_qty)
 
     def build_capacity_reviews(
@@ -24,23 +26,21 @@ class CapacityPlanningService:
     ) -> list[ReviewRequirement]:
         predicted_total = self.predicted_total_harvest_qty(forecasts)
         required_workers = self.required_temp_workers(predicted_total, plan)
-        if required_workers <= plan.confirmed_temp_worker_count:
+        if predicted_total <= plan.confirmed_packing_capacity_qty:
             return []
 
-        required_by = None
-        if forecasts:
-            import datetime as _dt
+        import datetime as _dt
 
-            trade_date = forecasts[0].target_trade_date
-            required_by = _dt.datetime.combine(
-                trade_date - _dt.timedelta(days=1),
-                _dt.time(hour=20, minute=0),
-            )
+        required_by = _dt.datetime.combine(
+            plan.trade_date - _dt.timedelta(days=1),
+            _dt.time(hour=20, minute=0),
+        )
 
         details = {
             "predicted_total_harvest_qty": predicted_total,
             "normal_packing_capacity_qty": plan.normal_packing_capacity_qty,
             "confirmed_temp_worker_count": plan.confirmed_temp_worker_count,
+            "confirmed_packing_capacity_qty": plan.confirmed_packing_capacity_qty,
             "required_temp_workers": required_workers,
         }
         return [

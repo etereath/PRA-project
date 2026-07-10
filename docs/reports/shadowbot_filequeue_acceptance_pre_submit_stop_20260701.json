@@ -1,0 +1,187 @@
+{
+  "checks": [
+    {
+      "detail": "ATTEMPT-ACCEPT-STOP-PRESUBMIT-20260701-002",
+      "name": "attempt_exists",
+      "ok": true
+    },
+    {
+      "detail": "READ_ONLY",
+      "name": "execution_mode_matches",
+      "ok": true
+    },
+    {
+      "detail": "2026-07-01 15:15:45.482967+00:00",
+      "name": "attempt_finished",
+      "ok": true
+    },
+    {
+      "detail": "sha256:8ec93f38423172afde59918949d2f506247a19e842cbbe92ac7e1e07c98a669d",
+      "name": "instruction_hash_recorded",
+      "ok": true
+    },
+    {
+      "detail": "63d857ca4659b4216fe08697ba64172196a8e2785aa901620721b4e4a4f3586b",
+      "name": "request_sha256_recorded",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\inbox\\ATTEMPT-ACCEPT-STOP-PRESUBMIT-20260701-002.ready.json",
+      "name": "queue_request_path_recorded",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-ACCEPT-STOP-PRESUBMIT-20260701-002",
+      "name": "archive_directory_exists",
+      "ok": true
+    },
+    {
+      "detail": [
+        "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-ACCEPT-STOP-PRESUBMIT-20260701-002\\ATTEMPT-ACCEPT-STOP-PRESUBMIT-20260701-002.request.json"
+      ],
+      "name": "one_archived_request",
+      "ok": true
+    },
+    {
+      "detail": [
+        "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-ACCEPT-STOP-PRESUBMIT-20260701-002\\ATTEMPT-ACCEPT-STOP-PRESUBMIT-20260701-002.result.json"
+      ],
+      "name": "one_archived_result",
+      "ok": true
+    },
+    {
+      "detail": [
+        "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-ACCEPT-STOP-PRESUBMIT-20260701-002\\ATTEMPT-ACCEPT-STOP-PRESUBMIT-20260701-002.phase.json"
+      ],
+      "name": "one_archived_phase",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-ACCEPT-STOP-PRESUBMIT-20260701-002\\ATTEMPT-ACCEPT-STOP-PRESUBMIT-20260701-002.request.json",
+      "name": "request_checksum_valid",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-ACCEPT-STOP-PRESUBMIT-20260701-002\\ATTEMPT-ACCEPT-STOP-PRESUBMIT-20260701-002.result.json",
+      "name": "result_checksum_valid",
+      "ok": true
+    },
+    {
+      "detail": "63d857ca4659b4216fe08697ba64172196a8e2785aa901620721b4e4a4f3586b",
+      "name": "request_hash_matches_database",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "TASK-ACCEPT-STOP-PRESUBMIT-20260701-002",
+        "result": "TASK-ACCEPT-STOP-PRESUBMIT-20260701-002"
+      },
+      "name": "binding_task_id",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "OP-ACCEPT-STOP-PRESUBMIT-20260701-002",
+        "result": "OP-ACCEPT-STOP-PRESUBMIT-20260701-002"
+      },
+      "name": "binding_operation_id",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "ATTEMPT-ACCEPT-STOP-PRESUBMIT-20260701-002",
+        "result": "ATTEMPT-ACCEPT-STOP-PRESUBMIT-20260701-002"
+      },
+      "name": "binding_execution_attempt_id",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "READ_ONLY",
+        "result": "READ_ONLY"
+      },
+      "name": "binding_execution_mode",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "sha256:8ec93f38423172afde59918949d2f506247a19e842cbbe92ac7e1e07c98a669d",
+        "result": "sha256:8ec93f38423172afde59918949d2f506247a19e842cbbe92ac7e1e07c98a669d"
+      },
+      "name": "binding_instruction_hash",
+      "ok": true
+    },
+    {
+      "detail": "63d857ca4659b4216fe08697ba64172196a8e2785aa901620721b4e4a4f3586b",
+      "name": "result_request_hash_matches",
+      "ok": true
+    },
+    {
+      "detail": "READ_ONLY",
+      "name": "result_mode_matches",
+      "ok": true
+    },
+    {
+      "detail": "FAILED",
+      "name": "result_status_accepted",
+      "ok": true
+    },
+    {
+      "detail": false,
+      "name": "technical_run_stopped",
+      "ok": true
+    },
+    {
+      "detail": "WORKER_STOP_REQUESTED",
+      "name": "stop_error_code",
+      "ok": true
+    },
+    {
+      "detail": true,
+      "name": "stop_is_retryable",
+      "ok": true
+    },
+    {
+      "detail": false,
+      "name": "no_business_completion",
+      "ok": true
+    },
+    {
+      "detail": "NOT_STARTED",
+      "name": "no_side_effect",
+      "ok": true
+    },
+    {
+      "detail": "RESULT_WRITTEN",
+      "name": "phase_result_written",
+      "ok": true
+    },
+    {
+      "detail": "LAPTOP-O9O76RQV",
+      "name": "phase_worker_recorded",
+      "ok": true
+    },
+    {
+      "detail": [],
+      "name": "no_active_queue_files",
+      "ok": true
+    },
+    {
+      "detail": [],
+      "name": "not_quarantined",
+      "ok": true
+    },
+    {
+      "detail": 1,
+      "name": "execution_log_written",
+      "ok": true
+    }
+  ],
+  "execution_attempt_id": "ATTEMPT-ACCEPT-STOP-PRESUBMIT-20260701-002",
+  "execution_mode": "READ_ONLY",
+  "failed_checks": [],
+  "ok": true,
+  "profile": "PRE_SUBMIT_STOP",
+  "schema_version": "shadowbot-filequeue-acceptance-1.0",
+  "status": "FAILED"
+}

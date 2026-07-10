@@ -8,6 +8,7 @@ from typing import Any
 from app.enums import (
     ConditionType,
     ListingAction,
+    ListingStrategy,
     PricingMethod,
     PricingSource,
     ReviewTaskStatus,
@@ -39,8 +40,9 @@ class Product:
 class PriceRule:
     rule_id: str
     rule_name: str
-    scope_type: str
-    scope_value: str
+    variety_filter: str
+    grade_filter: str
+    platform_filter: str
     pricing_method: PricingMethod
     markup_value: Decimal
     min_price: Decimal | None
@@ -55,9 +57,11 @@ class PriceRule:
 class ListingRule:
     rule_id: str
     rule_name: str
-    condition_type: ConditionType
-    condition_value: Decimal | str | None
-    action: ListingAction
+    variety_filter: str
+    grade_filter: str
+    platform_filter: str
+    stock_threshold: Decimal
+    listing_strategy: ListingStrategy
     active: bool
     priority: int
     remark: str = ""
@@ -121,7 +125,9 @@ class PackingCapacityPlan:
     normal_packing_capacity_qty: int = 250
     temp_worker_capacity_qty: int = 100
     confirmed_temp_worker_count: int = 0
+    confirmed_packing_capacity_qty_override: int | None = None
     allocation_rule: str = "proportional_by_forecast"
+    active: bool = True
     listing_quota: dict[str, int] = field(default_factory=dict)
     note: str = ""
 
@@ -131,19 +137,47 @@ class PackingCapacityPlan:
 
     @property
     def confirmed_packing_capacity_qty(self) -> int:
+        if self.confirmed_packing_capacity_qty_override is not None:
+            return self.confirmed_packing_capacity_qty_override
         return self.normal_packing_capacity_qty + self.confirmed_temp_labor_capacity_qty
 
 
 @dataclass(slots=True)
 class ColdStorageStatus:
     trade_date: date
-    cold_storage_total_capacity_qty: int = 500
-    cold_storage_current_qty: int = 0
+    total_capacity_qty: int = 500
+    current_occupied_qty: int = 0
+    expected_inbound_qty: int = 0
+    expected_outbound_qty: int = 0
+    warning_threshold_qty: int = 50
+    projected_occupied_qty_override: int | None = None
+    remaining_capacity_qty_override: int | None = None
+    active: bool = True
     note: str = ""
 
     @property
+    def projected_occupied_qty(self) -> int:
+        if self.projected_occupied_qty_override is not None:
+            return self.projected_occupied_qty_override
+        return self.current_occupied_qty + self.expected_inbound_qty - self.expected_outbound_qty
+
+    @property
+    def remaining_capacity_qty(self) -> int:
+        if self.remaining_capacity_qty_override is not None:
+            return self.remaining_capacity_qty_override
+        return self.total_capacity_qty - self.projected_occupied_qty
+
+    @property
+    def cold_storage_total_capacity_qty(self) -> int:
+        return self.total_capacity_qty
+
+    @property
+    def cold_storage_current_qty(self) -> int:
+        return self.projected_occupied_qty
+
+    @property
     def cold_storage_available_capacity(self) -> int:
-        return self.cold_storage_total_capacity_qty - self.cold_storage_current_qty
+        return self.remaining_capacity_qty
 
 
 @dataclass(slots=True)
@@ -312,6 +346,61 @@ class ExecutionLog:
 
 
 @dataclass(slots=True)
+class ShadowBotOperationLedger:
+    operation_id: str
+    task_id: str
+    platform: str
+    product_identity: dict[str, Any]
+    expected_old_price: Decimal
+    target_price: Decimal
+    status: str
+    lock_owner: str = ""
+    approved_payload_hash: str = ""
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+@dataclass(slots=True)
+class ShadowBotExecutionAttempt:
+    execution_attempt_id: str
+    operation_id: str
+    execution_mode: str
+    shadowbot_run_id: str
+    status: str
+    side_effect_state: str
+    started_at: datetime
+    instruction_hash: str = ""
+    request_file_sha256: str = ""
+    queue_request_path: str = ""
+    ended_at: datetime | None = None
+    raw_output: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ShadowBotSideEffectCheckpoint:
+    operation_id: str
+    execution_attempt_id: str
+    side_effect_state: str
+    checkpoint_at: datetime
+    version: int
+
+
+@dataclass(slots=True)
+class MockPlatformProductState:
+    platform_name: str
+    internal_sku: str
+    platform_sku: str
+    product_name: str
+    grade: str
+    platform_price: Decimal | None
+    platform_online_status: str
+    platform_stock_qty: int
+    last_synced_at: datetime | None = None
+    last_platform_update_at: datetime | None = None
+    last_error: str = ""
+
+
+@dataclass(slots=True)
 class ReviewTask:
     review_task_id: str
     trade_date: date | None
@@ -362,6 +451,40 @@ class NotificationLog:
     send_status: str
     dedupe_key: str
     message: str
+    error_message: str = ""
+    created_at: datetime | None = None
+
+
+@dataclass(slots=True)
+class ScriptRun:
+    script_run_id: str
+    evaluator_id: str
+    evaluator_name: str
+    description: str
+    run_mode: str
+    run_status: str
+    trade_date: date | None
+    started_at: datetime
+    finished_at: datetime | None = None
+    summary: dict[str, Any] = field(default_factory=dict)
+    error_message: str = ""
+    created_by: str = "system"
+
+
+@dataclass(slots=True)
+class ScriptRunItem:
+    item_id: str
+    script_run_id: str
+    proposal_type: str
+    dedupe_key: str
+    severity: str
+    item_status: str
+    message: str
+    payload: dict[str, Any] = field(default_factory=dict)
+    decision_trace: dict[str, Any] = field(default_factory=dict)
+    related_task_id: str | None = None
+    related_review_task_id: str | None = None
+    related_notification_id: str | None = None
     error_message: str = ""
     created_at: datetime | None = None
 

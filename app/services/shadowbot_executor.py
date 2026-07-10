@@ -1,0 +1,1231 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import subprocess
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from decimal import Decimal
+from pathlib import Path
+from typing import Any, Protocol
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+from uuid import uuid4
+
+from app.enums import TaskStatus
+from app.enums import ReviewTaskStatus
+from app.exceptions import ValidationError
+from app.models import ExecutionLog, ShadowBotExecutionAttempt, ShadowBotOperationLedger
+from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.services.runtime import RuntimeTaskService
+from app.utils import serialize_decimal, utc_now
+
+
+SHADOWBOT_EXECUTOR_NAME = "shadowbot_executor"
+
+EXECUTION_MODE_READ_ONLY = "READ_ONLY"
+EXECUTION_MODE_FILL_PREVIEW = "FILL_PREVIEW"
+EXECUTION_MODE_COMMIT = "COMMIT"
+EXECUTION_MODE_RECONCILE = "RECONCILE"
+
+STATUS_PENDING = "PENDING"
+STATUS_STARTING = "STARTING"
+STATUS_RUNNING = "RUNNING"
+STATUS_SUCCESS = "SUCCESS"
+STATUS_ALREADY_APPLIED = "ALREADY_APPLIED"
+STATUS_READ_COMPLETED = "READ_COMPLETED"
+STATUS_PREVIEW_COMPLETED = "PREVIEW_COMPLETED"
+STATUS_VERIFIED = "VERIFIED"
+STATUS_NOT_APPLIED = "NOT_APPLIED"
+STATUS_FAILED = "FAILED"
+STATUS_NEEDS_RECONCILIATION = "NEEDS_RECONCILIATION"
+
+SIDE_EFFECT_NOT_STARTED = "NOT_STARTED"
+SIDE_EFFECT_SUBMIT_INTENT_RECORDED = "SUBMIT_INTENT_RECORDED"
+SIDE_EFFECT_SUBMIT_CLICKED = "SUBMIT_CLICKED"
+SIDE_EFFECT_VERIFIED = "VERIFIED"
+SIDE_EFFECT_UNKNOWN = "UNKNOWN"
+SIDE_EFFECT_NOT_APPLIED = "NOT_APPLIED"
+
+SIDE_EFFECT_RECONCILE_REQUIRED = {
+    SIDE_EFFECT_SUBMIT_INTENT_RECORDED,
+    SIDE_EFFECT_SUBMIT_CLICKED,
+    SIDE_EFFECT_UNKNOWN,
+}
+
+ALLOWED_EXECUTION_MODES = {
+    EXECUTION_MODE_READ_ONLY,
+    EXECUTION_MODE_FILL_PREVIEW,
+    EXECUTION_MODE_COMMIT,
+    EXECUTION_MODE_RECONCILE,
+}
+ALLOWED_RESULT_STATUSES = {
+    STATUS_SUCCESS,
+    STATUS_ALREADY_APPLIED,
+    STATUS_READ_COMPLETED,
+    STATUS_PREVIEW_COMPLETED,
+    STATUS_VERIFIED,
+    STATUS_NOT_APPLIED,
+    STATUS_FAILED,
+    STATUS_NEEDS_RECONCILIATION,
+}
+ALLOWED_SIDE_EFFECT_STATES = {
+    SIDE_EFFECT_NOT_STARTED,
+    SIDE_EFFECT_SUBMIT_INTENT_RECORDED,
+    SIDE_EFFECT_SUBMIT_CLICKED,
+    SIDE_EFFECT_VERIFIED,
+    SIDE_EFFECT_UNKNOWN,
+    SIDE_EFFECT_NOT_APPLIED,
+}
+
+
+@dataclass(slots=True)
+class ShadowBotApprovedPayload:
+    operation_id: str
+    task_id: str
+    platform: str
+    product_identity: dict[str, Any]
+    expected_old_price: Decimal
+    target_price: Decimal
+
+
+@dataclass(slots=True)
+class ShadowBotApproval:
+    approval_id: str
+    approval_status: str
+    approved_payload: ShadowBotApprovedPayload
+    approved_payload_hash: str
+    approved_at: datetime
+    expires_at: datetime | None = None
+
+
+@dataclass(slots=True)
+class ShadowBotExecutionRequest:
+    operation_id: str
+    execution_attempt_id: str
+    execution_mode: str
+    approval: ShadowBotApproval
+    lock_owner: str = SHADOWBOT_EXECUTOR_NAME
+    runner_payload: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ShadowBotStartResult:
+    shadowbot_run_id: str
+    raw_output: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ShadowBotExecutorStartResult:
+    operation_id: str
+    execution_attempt_id: str
+    shadowbot_run_id: str
+    status: str
+    side_effect_state: str
+    next_execution_mode: str | None = None
+
+
+@dataclass(slots=True)
+class ShadowBotResultContract:
+    execution_attempt_id: str
+    status: str
+    run_success_flag: bool | None
+    business_operation_completed: bool | None
+    side_effect_state: str
+    retryable: bool
+    error_code: str = ""
+    operation_id: str = ""
+    task_id: str = ""
+    execution_mode: str = ""
+    instruction_hash: str = ""
+    request_file_sha256: str = ""
+    worker_id: str = ""
+    raw_output: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ShadowBotTimeoutClassification:
+    operation_id: str
+    status: str
+    side_effect_state: str
+    retryable: bool
+    next_execution_mode: str
+
+
+class ShadowBotTaskRunner(Protocol):
+    def start(self, payload: dict[str, Any]) -> ShadowBotStartResult:
+        ...
+
+
+JsonHttpRequester = Callable[[Request, float], dict[str, Any]]
+
+
+class ShadowBotFileQueueRunner:
+    def __init__(self, queue_dir: Path, *, command: str = "") -> None:
+        self.queue_dir = queue_dir
+        self.command = command
+
+    @classmethod
+    def from_environment(cls) -> "ShadowBotFileQueueRunner":
+        queue_dir = Path(
+            os.environ.get("SHADOWBOT_QUEUE_DIR")
+            or os.environ.get("SHADOWBOT_REQUEST_DIR")
+            or "data/runtime/shadowbot_queue"
+        )
+        return cls(queue_dir, command=os.environ.get("SHADOWBOT_RUNNER_COMMAND", ""))
+
+    def start(self, payload: dict[str, Any]) -> ShadowBotStartResult:
+        _validate_queue_request(payload)
+        execution_attempt_id = str(payload["execution_attempt_id"])
+        instruction_hash = compute_instruction_hash(payload)
+        supplied_instruction_hash = str(payload.get("instruction_hash") or "")
+        if supplied_instruction_hash and supplied_instruction_hash != instruction_hash:
+            raise ValidationError("instruction_hash does not match the execution instruction.")
+        request_payload = dict(payload)
+        request_payload["instruction_hash"] = instruction_hash
+
+        inbox_dir = self.queue_dir / "inbox"
+        for name in ("inbox", "working", "results", "archive", "quarantine", "evidence", "control"):
+            (self.queue_dir / name).mkdir(parents=True, exist_ok=True)
+        request_path = inbox_dir / f"{execution_attempt_id}.ready.json"
+        checksum_path = request_path.with_suffix(request_path.suffix + ".sha256")
+        if request_path.exists() or checksum_path.exists():
+            raise ValidationError("execution_attempt_id already exists in the ShadowBot queue.")
+        request_bytes = _canonical_file_json(request_payload)
+        request_file_sha256 = hashlib.sha256(request_bytes).hexdigest()
+        _atomic_publish(checksum_path, (request_file_sha256 + "\n").encode("ascii"))
+        _atomic_publish(request_path, request_bytes)
+        if self.command:
+            subprocess.Popen(  # noqa: S603
+                [self.command, str(request_path)],
+                cwd=str(Path.cwd()),
+                close_fds=True,
+            )
+        return ShadowBotStartResult(
+            shadowbot_run_id=f"filequeue:{execution_attempt_id}",
+            raw_output={
+                "queue_request_path": str(request_path),
+                "request_file_sha256": request_file_sha256,
+                "instruction_hash": instruction_hash,
+                "runner": "file_queue",
+                "command_started": bool(self.command),
+            },
+        )
+
+
+class FileDropShadowBotTaskRunner(ShadowBotFileQueueRunner):
+    """Compatibility name for the file queue runner."""
+
+    def __init__(
+        self,
+        request_dir: Path | None = None,
+        *,
+        queue_dir: Path | None = None,
+        command: str = "",
+    ) -> None:
+        super().__init__(queue_dir or request_dir or Path("data/runtime/shadowbot_queue"), command=command)
+
+
+class YingdaoOpenApiJobRunner:
+    """Start a ShadowBot app through Yingdao OpenAPI JOB运行/启动应用."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        access_key_id: str,
+        access_key_secret: str,
+        robot_uuid: str,
+        account_name: str = "",
+        robot_client_group_uuid: str = "",
+        wait_timeout_seconds: int = 600,
+        run_timeout_seconds: int = 600,
+        priority: str = "middle",
+        request_param_name: str = "request_json",
+        include_flat_params: bool = True,
+        http_requester: JsonHttpRequester | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.access_key_id = access_key_id
+        self.access_key_secret = access_key_secret
+        self.robot_uuid = robot_uuid
+        self.account_name = account_name
+        self.robot_client_group_uuid = robot_client_group_uuid
+        self.wait_timeout_seconds = wait_timeout_seconds
+        self.run_timeout_seconds = run_timeout_seconds
+        self.priority = priority
+        self.request_param_name = request_param_name
+        self.include_flat_params = include_flat_params
+        self.http_requester = http_requester or _request_json
+
+    @classmethod
+    def from_environment(cls) -> "YingdaoOpenApiJobRunner":
+        return cls(
+            base_url=os.environ.get("YINGDAO_API_BASE_URL", "https://api.yingdao.com"),
+            access_key_id=os.environ.get("YINGDAO_ACCESS_KEY_ID", ""),
+            access_key_secret=os.environ.get("YINGDAO_ACCESS_KEY_SECRET", ""),
+            robot_uuid=os.environ.get("YINGDAO_ROBOT_UUID", ""),
+            account_name=os.environ.get("YINGDAO_ACCOUNT_NAME", ""),
+            robot_client_group_uuid=os.environ.get("YINGDAO_ROBOT_CLIENT_GROUP_UUID", ""),
+            wait_timeout_seconds=_int_from_env("YINGDAO_WAIT_TIMEOUT_SECONDS", 600),
+            run_timeout_seconds=_int_from_env("YINGDAO_RUN_TIMEOUT_SECONDS", 600),
+            priority=os.environ.get("YINGDAO_PRIORITY", "middle"),
+            request_param_name=os.environ.get("YINGDAO_REQUEST_PARAM_NAME", "request_json"),
+            include_flat_params=os.environ.get("YINGDAO_INCLUDE_FLAT_PARAMS", "1").strip().lower()
+            not in {"0", "false", "no"},
+        )
+
+    def start(self, payload: dict[str, Any]) -> ShadowBotStartResult:
+        self._validate_config()
+        access_token = self._create_access_token()
+        request_body = self._build_start_job_body(payload)
+        response = self._post_json("/oapi/dispatch/v2/job/start", request_body, access_token)
+        data = _require_response_data(response, endpoint="job/start")
+        job_uuid = str(data.get("jobUuid") or "")
+        if not job_uuid:
+            raise ValidationError("Yingdao job/start response did not include jobUuid.")
+        return ShadowBotStartResult(
+            shadowbot_run_id=f"yingdao-job:{job_uuid}",
+            raw_output={
+                "runner": "yingdao_openapi_job",
+                "jobUuid": job_uuid,
+                "idempotentFlag": bool(data.get("idempotentFlag", False)),
+                "robotUuid": self.robot_uuid,
+                "request": _redact_yingdao_request_body(request_body),
+                "response": response,
+            },
+        )
+
+    def query_job(self, job_uuid: str) -> dict[str, Any]:
+        if not job_uuid:
+            raise ValidationError("jobUuid is required.")
+        self._validate_config()
+        access_token = self._create_access_token()
+        return self._post_json("/oapi/dispatch/v2/job/query", {"jobUuid": job_uuid}, access_token)
+
+    def query_robot_params(self) -> dict[str, Any]:
+        self._validate_config()
+        access_token = self._create_access_token()
+        query = urlencode({"robotUuid": self.robot_uuid})
+        request = Request(
+            f"{self.base_url}/oapi/robot/v2/queryRobotParam?{query}",
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Accept": "application/json",
+            },
+            method="GET",
+        )
+        return self.http_requester(request, 30.0)
+
+    def _validate_config(self) -> None:
+        if not self.access_key_id:
+            raise ValidationError("YINGDAO_ACCESS_KEY_ID is required for YingdaoOpenApiJobRunner.")
+        if not self.access_key_secret:
+            raise ValidationError("YINGDAO_ACCESS_KEY_SECRET is required for YingdaoOpenApiJobRunner.")
+        if not self.robot_uuid:
+            raise ValidationError("YINGDAO_ROBOT_UUID is required for YingdaoOpenApiJobRunner.")
+        if not self.account_name and not self.robot_client_group_uuid:
+            raise ValidationError(
+                "YINGDAO_ACCOUNT_NAME or YINGDAO_ROBOT_CLIENT_GROUP_UUID is required for YingdaoOpenApiJobRunner."
+            )
+
+    def _create_access_token(self) -> str:
+        query = urlencode({"accessKeyId": self.access_key_id, "accessKeySecret": self.access_key_secret})
+        response = self.http_requester(Request(f"{self.base_url}/oapi/token/v2/token/create?{query}"), 30.0)
+        data = _require_response_data(response, endpoint="token/create")
+        access_token = str(data.get("accessToken") or "")
+        if not access_token:
+            raise ValidationError("Yingdao token/create response did not include accessToken.")
+        return access_token
+
+    def _post_json(self, path: str, body: dict[str, Any], access_token: str) -> dict[str, Any]:
+        encoded = json.dumps(body, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        request = Request(
+            f"{self.base_url}{path}",
+            data=encoded,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        return self.http_requester(request, 30.0)
+
+    def _build_start_job_body(self, payload: dict[str, Any]) -> dict[str, Any]:
+        execution_attempt_id = str(payload.get("execution_attempt_id") or "")
+        body: dict[str, Any] = {
+            "robotUuid": self.robot_uuid,
+            "idempotentUuid": _to_yingdao_idempotent_uuid(execution_attempt_id or uuid4().hex),
+            "waitTimeoutSeconds": self.wait_timeout_seconds,
+            "runTimeout": self.run_timeout_seconds,
+            "priority": self.priority,
+            "params": self._build_params(payload),
+        }
+        if self.robot_client_group_uuid:
+            body["robotClientGroupUuid"] = self.robot_client_group_uuid
+            body["executeScope"] = "any"
+        else:
+            body["accountName"] = self.account_name
+        return body
+
+    def _build_params(self, payload: dict[str, Any]) -> list[dict[str, str]]:
+        params = [
+            {
+                "name": self.request_param_name,
+                "value": json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
+                "type": "str",
+            }
+        ]
+        if self.include_flat_params:
+            for key in (
+                "operation_id",
+                "task_id",
+                "execution_attempt_id",
+                "execution_mode",
+                "platform",
+                "expected_old_price",
+                "target_price",
+            ):
+                value = payload.get(key)
+                if value is not None:
+                    params.append({"name": key, "value": str(value), "type": "str"})
+            product_identity = payload.get("product_identity")
+            if isinstance(product_identity, dict):
+                for key in ("sku", "internal_sku", "name", "grade", "spec"):
+                    value = product_identity.get(key)
+                    if value is not None:
+                        params.append({"name": f"product_{key}", "value": str(value), "type": "str"})
+        return params
+
+
+def build_shadowbot_task_runner_from_environment() -> ShadowBotTaskRunner:
+    runner_type = os.environ.get("SHADOWBOT_RUNNER_TYPE", "filedrop").strip().lower()
+    if runner_type in {"filequeue", "file_queue", "filedrop", "file_drop", ""}:
+        return ShadowBotFileQueueRunner.from_environment()
+    if runner_type in {"yingdao_openapi", "yingdao_job", "openapi_job"}:
+        return YingdaoOpenApiJobRunner.from_environment()
+    raise ValidationError(f"unsupported SHADOWBOT_RUNNER_TYPE: {runner_type}")
+
+
+class ShadowBotExecutor:
+    def __init__(
+        self,
+        repository: SQLiteRuntimeRepository,
+        runner: ShadowBotTaskRunner,
+    ) -> None:
+        self.repository = repository
+        self.runner = runner
+        self.runtime_task_service = RuntimeTaskService(repository)
+
+    def start_execution(self, request: ShadowBotExecutionRequest) -> ShadowBotExecutorStartResult:
+        self.repository.init_schema()
+        _validate_execution_mode(request.execution_mode)
+        _reject_fault_injection(request.runner_payload)
+        payload = self._validate_approval(request)
+        self._ensure_operation(payload, request.approval.approved_payload_hash)
+        existing_operation = self.repository.get_shadowbot_operation(payload.operation_id)
+        if (
+            request.execution_mode == EXECUTION_MODE_COMMIT
+            and existing_operation is not None
+            and existing_operation.status in {STATUS_SUCCESS, STATUS_ALREADY_APPLIED, STATUS_VERIFIED}
+        ):
+            return ShadowBotExecutorStartResult(
+                operation_id=payload.operation_id,
+                execution_attempt_id=request.execution_attempt_id,
+                shadowbot_run_id="",
+                status=STATUS_ALREADY_APPLIED,
+                side_effect_state=SIDE_EFFECT_VERIFIED,
+            )
+
+        if request.execution_mode == EXECUTION_MODE_COMMIT and self._requires_reconciliation(payload.operation_id):
+            return ShadowBotExecutorStartResult(
+                operation_id=payload.operation_id,
+                execution_attempt_id=request.execution_attempt_id,
+                shadowbot_run_id="",
+                status=STATUS_NEEDS_RECONCILIATION,
+                side_effect_state=SIDE_EFFECT_UNKNOWN,
+                next_execution_mode=EXECUTION_MODE_RECONCILE,
+            )
+
+        if not self.repository.acquire_shadowbot_operation_lock(payload.operation_id, request.lock_owner):
+            raise ValidationError("ShadowBot operation is already locked by another executor.")
+
+        runner_payload = _build_queue_request_payload(
+            operation_id=payload.operation_id,
+            task_id=payload.task_id,
+            execution_attempt_id=request.execution_attempt_id,
+            execution_mode=request.execution_mode,
+            platform_name=payload.platform,
+            product_identity=payload.product_identity,
+            expected_old_price=payload.expected_old_price,
+            target_price=payload.target_price,
+            approved_payload_hash=request.approval.approved_payload_hash,
+            approval_id=request.approval.approval_id,
+            approval_expires_at=request.approval.expires_at,
+            overrides=request.runner_payload,
+        )
+        instruction_hash = str(runner_payload["instruction_hash"])
+        attempt = ShadowBotExecutionAttempt(
+            execution_attempt_id=request.execution_attempt_id,
+            operation_id=payload.operation_id,
+            execution_mode=request.execution_mode,
+            shadowbot_run_id="",
+            status=STATUS_STARTING,
+            side_effect_state=SIDE_EFFECT_NOT_STARTED,
+            started_at=utc_now(),
+            instruction_hash=instruction_hash,
+            raw_output={},
+        )
+        if self.repository.insert_shadowbot_execution_attempt(attempt) != 1:
+            raise ValidationError("execution_attempt_id already exists.")
+
+        start_result = self.runner.start(runner_payload)
+        if not start_result.shadowbot_run_id:
+            raise ValidationError("ShadowBot runner did not return shadowbot_run_id.")
+
+        self.repository.update_shadowbot_execution_attempt(
+            request.execution_attempt_id,
+            shadowbot_run_id=start_result.shadowbot_run_id,
+            status=STATUS_RUNNING,
+            instruction_hash=str(start_result.raw_output.get("instruction_hash") or instruction_hash),
+            request_file_sha256=str(start_result.raw_output.get("request_file_sha256") or ""),
+            queue_request_path=str(start_result.raw_output.get("queue_request_path") or ""),
+            raw_output=start_result.raw_output,
+        )
+        self.repository.update_shadowbot_operation_status(payload.operation_id, STATUS_RUNNING)
+        self._move_task_to_running(payload.task_id, request.execution_attempt_id)
+        return ShadowBotExecutorStartResult(
+            operation_id=payload.operation_id,
+            execution_attempt_id=request.execution_attempt_id,
+            shadowbot_run_id=start_result.shadowbot_run_id,
+            status=STATUS_RUNNING,
+            side_effect_state=SIDE_EFFECT_NOT_STARTED,
+        )
+
+    def record_side_effect_checkpoint(
+        self,
+        *,
+        operation_id: str,
+        execution_attempt_id: str,
+        side_effect_state: str,
+    ):
+        _validate_side_effect_state(side_effect_state)
+        return self.repository.insert_shadowbot_side_effect_checkpoint(
+            operation_id=operation_id,
+            execution_attempt_id=execution_attempt_id,
+            side_effect_state=side_effect_state,
+            checkpoint_at=utc_now(),
+        )
+
+    def record_result(
+        self,
+        result: ShadowBotResultContract,
+        *,
+        automatic_reconcile_payload: dict[str, Any] | None = None,
+    ) -> None:
+        self.repository.init_schema()
+        _validate_result_contract(result)
+        attempt = self.repository.get_shadowbot_execution_attempt(result.execution_attempt_id)
+        if attempt is None:
+            raise ValidationError("execution_attempt_id does not exist.")
+        self._validate_result_binding(attempt, result)
+        self.record_side_effect_checkpoint(
+            operation_id=attempt.operation_id,
+            execution_attempt_id=attempt.execution_attempt_id,
+            side_effect_state=result.side_effect_state,
+        )
+        merged_raw_output = dict(attempt.raw_output)
+        merged_raw_output.update(result.raw_output)
+        self.repository.update_shadowbot_execution_attempt(
+            result.execution_attempt_id,
+            status=result.status,
+            side_effect_state=result.side_effect_state,
+            ended_at=utc_now(),
+            raw_output=merged_raw_output,
+        )
+        operation_status = _operation_status_from_result(result)
+        self.repository.update_shadowbot_operation_status(
+            attempt.operation_id,
+            operation_status,
+            lock_owner="",
+        )
+        operation = self.repository.get_shadowbot_operation(attempt.operation_id)
+        if operation is None:
+            raise ValidationError("operation_id does not exist.")
+        if result.status == STATUS_NEEDS_RECONCILIATION and attempt.execution_mode == EXECUTION_MODE_COMMIT:
+            try:
+                reconcile = self.ensure_reconcile_attempt(
+                    operation_id=operation.operation_id,
+                    source_execution_attempt_id=attempt.execution_attempt_id,
+                    runner_payload=automatic_reconcile_payload,
+                )
+                if reconcile is not None:
+                    result.raw_output["automatic_reconcile_attempt_id"] = reconcile.execution_attempt_id
+                    merged_raw_output["automatic_reconcile_attempt_id"] = reconcile.execution_attempt_id
+            except (ValidationError, OSError) as exc:
+                result.raw_output["automatic_reconcile_error"] = str(exc)
+                merged_raw_output["automatic_reconcile_error"] = str(exc)
+                self.repository.update_shadowbot_operation_status(
+                    operation.operation_id,
+                    STATUS_NEEDS_RECONCILIATION,
+                    lock_owner="",
+                )
+            self.repository.update_shadowbot_execution_attempt(
+                result.execution_attempt_id,
+                raw_output=merged_raw_output,
+            )
+        self._insert_execution_log(operation=operation, attempt=attempt, result=result)
+        self._update_task_after_result(operation=operation, result=result)
+
+    def _validate_result_binding(
+        self,
+        attempt: ShadowBotExecutionAttempt,
+        result: ShadowBotResultContract,
+    ) -> None:
+        if result.operation_id and result.operation_id != attempt.operation_id:
+            raise ValidationError("RESULT_CONTRACT_INVALID: operation_id mismatch.")
+        if result.execution_mode and result.execution_mode != attempt.execution_mode:
+            raise ValidationError("RESULT_CONTRACT_INVALID: execution_mode mismatch.")
+        if attempt.request_file_sha256 and result.instruction_hash != attempt.instruction_hash:
+            raise ValidationError("RESULT_CONTRACT_INVALID: instruction_hash mismatch.")
+        if attempt.request_file_sha256 and result.request_file_sha256 != attempt.request_file_sha256:
+            raise ValidationError("RESULT_CONTRACT_INVALID: request_file_sha256 mismatch.")
+        operation = self.repository.get_shadowbot_operation(attempt.operation_id)
+        if operation is not None and result.task_id and result.task_id != operation.task_id:
+            raise ValidationError("RESULT_CONTRACT_INVALID: task_id mismatch.")
+
+    def start_reconcile_attempt(
+        self,
+        *,
+        operation_id: str,
+        execution_attempt_id: str,
+        lock_owner: str = SHADOWBOT_EXECUTOR_NAME,
+        runner_payload: dict[str, Any] | None = None,
+    ) -> ShadowBotExecutorStartResult:
+        self.repository.init_schema()
+        _reject_fault_injection(runner_payload or {})
+        operation = self.repository.get_shadowbot_operation(operation_id)
+        if operation is None:
+            raise ValidationError("operation_id does not exist.")
+        if operation.status != STATUS_NEEDS_RECONCILIATION:
+            raise ValidationError("operation does not require reconciliation.")
+        if not self.repository.acquire_shadowbot_operation_lock(operation_id, lock_owner):
+            raise ValidationError("ShadowBot operation is already locked by another executor.")
+        payload = _build_queue_request_payload(
+            operation_id=operation.operation_id,
+            task_id=operation.task_id,
+            execution_attempt_id=execution_attempt_id,
+            execution_mode=EXECUTION_MODE_RECONCILE,
+            platform_name=operation.platform,
+            product_identity=operation.product_identity,
+            expected_old_price=operation.expected_old_price,
+            target_price=operation.target_price,
+            approved_payload_hash=operation.approved_payload_hash,
+            approval_id="",
+            approval_expires_at=None,
+            overrides=runner_payload or {},
+        )
+        instruction_hash = str(payload["instruction_hash"])
+        attempt = ShadowBotExecutionAttempt(
+            execution_attempt_id=execution_attempt_id,
+            operation_id=operation_id,
+            execution_mode=EXECUTION_MODE_RECONCILE,
+            shadowbot_run_id="",
+            status=STATUS_STARTING,
+            side_effect_state=SIDE_EFFECT_NOT_STARTED,
+            started_at=utc_now(),
+            instruction_hash=instruction_hash,
+            raw_output={},
+        )
+        if self.repository.insert_shadowbot_execution_attempt(attempt) != 1:
+            raise ValidationError("execution_attempt_id already exists.")
+        try:
+            start_result = self.runner.start(payload)
+        except (ValidationError, OSError) as exc:
+            self.repository.update_shadowbot_execution_attempt(
+                execution_attempt_id,
+                status=STATUS_FAILED,
+                ended_at=utc_now(),
+                raw_output={"error_code": "RECONCILE_START_FAILED", "error_message": str(exc)},
+            )
+            self.repository.update_shadowbot_operation_status(
+                operation_id,
+                STATUS_NEEDS_RECONCILIATION,
+                lock_owner="",
+            )
+            raise
+        if not start_result.shadowbot_run_id:
+            raise ValidationError("ShadowBot runner did not return shadowbot_run_id.")
+        self.repository.update_shadowbot_execution_attempt(
+            execution_attempt_id,
+            shadowbot_run_id=start_result.shadowbot_run_id,
+            status=STATUS_RUNNING,
+            instruction_hash=str(start_result.raw_output.get("instruction_hash") or instruction_hash),
+            request_file_sha256=str(start_result.raw_output.get("request_file_sha256") or ""),
+            queue_request_path=str(start_result.raw_output.get("queue_request_path") or ""),
+            raw_output=start_result.raw_output,
+        )
+        self.repository.update_shadowbot_operation_status(operation_id, STATUS_RUNNING)
+        return ShadowBotExecutorStartResult(
+            operation_id=operation_id,
+            execution_attempt_id=execution_attempt_id,
+            shadowbot_run_id=start_result.shadowbot_run_id,
+            status=STATUS_RUNNING,
+            side_effect_state=SIDE_EFFECT_NOT_STARTED,
+        )
+
+    def ensure_reconcile_attempt(
+        self,
+        *,
+        operation_id: str,
+        source_execution_attempt_id: str,
+        runner_payload: dict[str, Any] | None = None,
+    ) -> ShadowBotExecutorStartResult | None:
+        digest = hashlib.sha256(source_execution_attempt_id.encode("utf-8")).hexdigest()[:20]
+        execution_attempt_id = f"RECONCILE-{digest}"
+        existing = self.repository.get_shadowbot_execution_attempt(execution_attempt_id)
+        if existing is not None:
+            return ShadowBotExecutorStartResult(
+                operation_id=existing.operation_id,
+                execution_attempt_id=existing.execution_attempt_id,
+                shadowbot_run_id=existing.shadowbot_run_id,
+                status=existing.status,
+                side_effect_state=existing.side_effect_state,
+            )
+        operation = self.repository.get_shadowbot_operation(operation_id)
+        if operation is None:
+            raise ValidationError("operation_id does not exist.")
+        if operation.status != STATUS_NEEDS_RECONCILIATION:
+            return None
+        return self.start_reconcile_attempt(
+            operation_id=operation_id,
+            execution_attempt_id=execution_attempt_id,
+            runner_payload={
+                "source_execution_attempt_id": source_execution_attempt_id,
+                "triggered_by": SHADOWBOT_EXECUTOR_NAME,
+                "triggered_from": "automatic_reconciliation",
+                **(runner_payload or {}),
+            },
+        )
+
+    def confirm_manual_handled(self, *, operation_id: str, actor: str, note: str = "") -> None:
+        self.repository.init_schema()
+        operation = self.repository.get_shadowbot_operation(operation_id)
+        if operation is None:
+            raise ValidationError("operation_id does not exist.")
+        self.repository.update_shadowbot_operation_status(operation_id, "MANUAL_HANDLED", lock_owner="")
+        now = utc_now()
+        self.repository.insert_execution_logs(
+            [
+                ExecutionLog(
+                    log_id=f"shadowbot-manual-{uuid4().hex[:12]}",
+                    task_id=operation.task_id,
+                    executor_name=SHADOWBOT_EXECUTOR_NAME,
+                    start_time=now,
+                    end_time=now,
+                    success_flag=True,
+                    error_code="",
+                    error_message="manual handling confirmed",
+                    raw_output=json.dumps(
+                        {
+                            "operation_id": operation_id,
+                            "status": "MANUAL_HANDLED",
+                            "manual_actor": actor,
+                            "manual_note": note,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    created_at=now,
+                )
+            ]
+        )
+
+    def classify_timeout(self, operation_id: str) -> ShadowBotTimeoutClassification:
+        checkpoint = self.repository.latest_shadowbot_side_effect_checkpoint(operation_id)
+        side_effect_state = checkpoint.side_effect_state if checkpoint is not None else SIDE_EFFECT_NOT_STARTED
+        if side_effect_state in SIDE_EFFECT_RECONCILE_REQUIRED:
+            status = STATUS_NEEDS_RECONCILIATION
+            retryable = False
+            next_mode = EXECUTION_MODE_RECONCILE
+        else:
+            status = STATUS_FAILED
+            retryable = True
+            next_mode = EXECUTION_MODE_COMMIT
+        self.repository.update_shadowbot_operation_status(operation_id, status, lock_owner="")
+        return ShadowBotTimeoutClassification(
+            operation_id=operation_id,
+            status=status,
+            side_effect_state=side_effect_state,
+            retryable=retryable,
+            next_execution_mode=next_mode,
+        )
+
+    def _validate_approval(self, request: ShadowBotExecutionRequest) -> ShadowBotApprovedPayload:
+        approval = request.approval
+        if not approval.approval_id:
+            raise ValidationError("approval_id is required.")
+        if approval.approval_status != "APPROVED":
+            raise ValidationError("approval is not approved.")
+        if approval.expires_at is not None and approval.expires_at <= utc_now():
+            raise ValidationError("approval has expired.")
+        payload = approval.approved_payload
+        if payload.operation_id != request.operation_id:
+            raise ValidationError("approval does not belong to this operation.")
+        actual_hash = compute_approved_payload_hash(payload)
+        if actual_hash != approval.approved_payload_hash:
+            raise ValidationError("approved payload hash mismatch.")
+        review_task = self.repository.get_review_task(approval.approval_id)
+        if review_task is None:
+            raise ValidationError("approval record does not exist.")
+        if review_task.review_status != ReviewTaskStatus.APPROVED:
+            raise ValidationError("approval record is not approved.")
+        if review_task.source_task_id and review_task.source_task_id != payload.task_id:
+            raise ValidationError("approval record does not belong to this task.")
+        if review_task.platform_name and review_task.platform_name != payload.platform:
+            raise ValidationError("approval record does not belong to this platform.")
+        approved_sku = str(payload.product_identity.get("sku") or payload.product_identity.get("internal_sku") or "")
+        if review_task.internal_sku and approved_sku and review_task.internal_sku != approved_sku:
+            raise ValidationError("approval record does not belong to this SKU.")
+        task = self.repository.get_task(payload.task_id)
+        if task is None:
+            raise ValidationError("approved task does not exist.")
+        if task.platform_name and task.platform_name != payload.platform:
+            raise ValidationError("approved task platform does not match payload.")
+        if task.internal_sku and approved_sku and task.internal_sku != approved_sku:
+            raise ValidationError("approved task SKU does not match payload.")
+        stored_hash = str(
+            review_task.resolution_payload.get("approved_payload_hash")
+            or review_task.review_payload.get("approved_payload_hash")
+            or ""
+        )
+        if stored_hash != approval.approved_payload_hash:
+            raise ValidationError("approval record hash does not match approved payload.")
+        return payload
+
+    def _ensure_operation(self, payload: ShadowBotApprovedPayload, approved_payload_hash: str) -> None:
+        existing = self.repository.get_shadowbot_operation(payload.operation_id)
+        if existing is None:
+            inserted = self.repository.insert_shadowbot_operation(
+                ShadowBotOperationLedger(
+                    operation_id=payload.operation_id,
+                    task_id=payload.task_id,
+                    platform=payload.platform,
+                    product_identity=payload.product_identity,
+                    expected_old_price=payload.expected_old_price,
+                    target_price=payload.target_price,
+                    status=STATUS_PENDING,
+                    approved_payload_hash=approved_payload_hash,
+                    created_at=utc_now(),
+                    updated_at=utc_now(),
+                )
+            )
+            if inserted != 1:
+                raise ValidationError("operation_id already exists.")
+            return
+        if existing.approved_payload_hash != approved_payload_hash:
+            raise ValidationError("operation_id already exists with a different approved payload.")
+
+    def _requires_reconciliation(self, operation_id: str) -> bool:
+        checkpoint = self.repository.latest_shadowbot_side_effect_checkpoint(operation_id)
+        return checkpoint is not None and checkpoint.side_effect_state in SIDE_EFFECT_RECONCILE_REQUIRED
+
+    def _move_task_to_running(self, task_id: str, execution_attempt_id: str) -> None:
+        task = self.repository.get_task(task_id)
+        if task is None:
+            raise ValidationError("approved task does not exist.")
+        if task.task_status == TaskStatus.RUNNING:
+            return
+        if task.task_status == TaskStatus.PENDING:
+            self.runtime_task_service.change_status(
+                task_id=task_id,
+                to_status=TaskStatus.RUNNING,
+                changed_by=SHADOWBOT_EXECUTOR_NAME,
+                reason="shadowbot_start",
+                metadata={"execution_attempt_id": execution_attempt_id},
+            )
+
+    def _insert_execution_log(
+        self,
+        *,
+        operation: ShadowBotOperationLedger,
+        attempt: ShadowBotExecutionAttempt,
+        result: ShadowBotResultContract,
+    ) -> None:
+        raw_output = dict(result.raw_output)
+        raw_output.setdefault("operation_id", operation.operation_id)
+        raw_output.setdefault("execution_attempt_id", result.execution_attempt_id)
+        raw_output.setdefault("shadowbot_run_id", attempt.shadowbot_run_id)
+        raw_output.setdefault("execution_mode", attempt.execution_mode)
+        raw_output.setdefault("instruction_hash", attempt.instruction_hash)
+        raw_output.setdefault("request_file_sha256", attempt.request_file_sha256)
+        raw_output.setdefault("queue_request_path", attempt.queue_request_path)
+        raw_output.setdefault("status", result.status)
+        raw_output.setdefault("side_effect_state", result.side_effect_state)
+        raw_output.setdefault("expected_old_price", serialize_decimal(operation.expected_old_price))
+        raw_output.setdefault("target_price", serialize_decimal(operation.target_price))
+        raw_output.setdefault("approved_payload_hash", operation.approved_payload_hash)
+        self.repository.insert_execution_logs(
+            [
+                ExecutionLog(
+                    log_id=f"shadowbot-{uuid4().hex[:12]}",
+                    task_id=operation.task_id,
+                    executor_name=SHADOWBOT_EXECUTOR_NAME,
+                    start_time=attempt.started_at,
+                    end_time=utc_now(),
+                    success_flag=result.run_success_flag,
+                    error_code=result.error_code,
+                    error_message=str(raw_output.get("error_message") or result.error_code or result.status),
+                    raw_output=json.dumps(raw_output, ensure_ascii=False, sort_keys=True, default=str),
+                    created_at=utc_now(),
+                )
+            ]
+        )
+
+    def _update_task_after_result(self, *, operation: ShadowBotOperationLedger, result: ShadowBotResultContract) -> None:
+        task = self.repository.get_task(operation.task_id)
+        if task is None:
+            return
+        if result.business_operation_completed is True:
+            if task.task_status != TaskStatus.SUCCESS:
+                if task.task_status == TaskStatus.PENDING:
+                    self._move_task_to_running(operation.task_id, result.execution_attempt_id)
+                self.runtime_task_service.change_status(
+                    task_id=operation.task_id,
+                    to_status=TaskStatus.SUCCESS,
+                    changed_by=SHADOWBOT_EXECUTOR_NAME,
+                    reason="shadowbot_business_completed",
+                    metadata={
+                        "operation_id": operation.operation_id,
+                        "execution_attempt_id": result.execution_attempt_id,
+                        "shadowbot_status": result.status,
+                        "side_effect_state": result.side_effect_state,
+                    },
+                    result_message=f"ShadowBot {result.status}",
+                )
+            return
+        if result.status == STATUS_FAILED and result.side_effect_state == SIDE_EFFECT_NOT_STARTED:
+            if task.task_status == TaskStatus.RUNNING:
+                self.runtime_task_service.change_status(
+                    task_id=operation.task_id,
+                    to_status=TaskStatus.FAILED,
+                    changed_by=SHADOWBOT_EXECUTOR_NAME,
+                    reason="shadowbot_pre_submit_failed",
+                    metadata={
+                        "operation_id": operation.operation_id,
+                        "execution_attempt_id": result.execution_attempt_id,
+                        "error_code": result.error_code,
+                        "retryable": result.retryable,
+                    },
+                    result_message=result.error_code or "ShadowBot FAILED",
+                )
+
+
+def compute_approved_payload_hash(payload: ShadowBotApprovedPayload) -> str:
+    canonical = {
+        "operation_id": payload.operation_id,
+        "task_id": payload.task_id,
+        "platform": payload.platform,
+        "product_identity": payload.product_identity,
+        "expected_old_price": serialize_decimal(payload.expected_old_price),
+        "target_price": serialize_decimal(payload.target_price),
+    }
+    encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+INSTRUCTION_HASH_FIELDS = (
+    "task_id",
+    "operation_id",
+    "execution_attempt_id",
+    "execution_mode",
+    "platform_name",
+    "platform_sku",
+    "product_keyword",
+    "expected_product_name",
+    "expected_grade",
+    "expected_spec",
+    "spec_verification_required",
+    "expected_old_price",
+    "target_price",
+    "applet_uri",
+)
+
+
+def compute_instruction_hash(payload: dict[str, Any]) -> str:
+    canonical = {field_name: payload.get(field_name, "") for field_name in INSTRUCTION_HASH_FIELDS}
+    encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _build_queue_request_payload(
+    *,
+    operation_id: str,
+    task_id: str,
+    execution_attempt_id: str,
+    execution_mode: str,
+    platform_name: str,
+    product_identity: dict[str, Any],
+    expected_old_price: Decimal,
+    target_price: Decimal,
+    approved_payload_hash: str,
+    approval_id: str,
+    approval_expires_at: datetime | None,
+    overrides: dict[str, Any],
+) -> dict[str, Any]:
+    _reject_fault_injection(overrides)
+    platform_sku = str(product_identity.get("platform_sku") or product_identity.get("sku") or "").strip()
+    expected_name = str(
+        product_identity.get("expected_product_name") or product_identity.get("name") or ""
+    ).strip()
+    expected_grade = str(product_identity.get("expected_grade") or product_identity.get("grade") or "").strip()
+    expected_spec = str(product_identity.get("expected_spec") or product_identity.get("spec") or "").strip()
+    product_keyword = str(overrides.get("product_keyword") or f"{expected_grade}{expected_name}").strip()
+    now = utc_now()
+    default_expiry = now + timedelta(minutes=30)
+    expires_at = min(approval_expires_at, default_expiry) if approval_expires_at else default_expiry
+    payload: dict[str, Any] = {
+        "schema_version": "shadowbot-request-1.0",
+        "task_id": task_id,
+        "operation_id": operation_id,
+        "execution_attempt_id": execution_attempt_id,
+        "execution_mode": execution_mode,
+        "platform_name": platform_name,
+        "platform_sku": platform_sku,
+        "product_keyword": product_keyword,
+        "expected_product_name": expected_name,
+        "expected_grade": expected_grade,
+        "expected_spec": expected_spec,
+        "spec_verification_required": bool(overrides.get("spec_verification_required", False)),
+        "expected_old_price": serialize_decimal(expected_old_price),
+        "target_price": serialize_decimal(target_price),
+        "approved_payload_hash": approved_payload_hash,
+        "approval_id": approval_id,
+        "applet_uri": str(overrides.get("applet_uri") or os.environ.get("SHADOWBOT_APPLET_URI", "")).strip(),
+        "evidence_share_dir": str(
+            overrides.get("evidence_share_dir") or os.environ.get("SHADOWBOT_EVIDENCE_DIR", "")
+        ).strip(),
+        "created_at": now.isoformat(),
+        "expires_at": expires_at.isoformat(),
+    }
+    immutable_fields = {
+        "task_id",
+        "operation_id",
+        "execution_attempt_id",
+        "execution_mode",
+        "platform_name",
+        "platform_sku",
+        "expected_product_name",
+        "expected_grade",
+        "expected_old_price",
+        "target_price",
+        "approved_payload_hash",
+    }
+    for key, value in overrides.items():
+        if key in immutable_fields:
+            if str(value) != str(payload[key]):
+                raise ValidationError(f"runner payload cannot override approved field: {key}")
+            continue
+        if key not in {"fault_injection", "instruction_hash"}:
+            payload[key] = value
+    payload["instruction_hash"] = compute_instruction_hash(payload)
+    return payload
+
+
+def _reject_fault_injection(payload: dict[str, Any]) -> None:
+    if str(payload.get("fault_injection") or "").strip():
+        raise ValidationError("UNSAFE_TEST_PARAMETER_REJECTED: fault_injection is not allowed by production Executor.")
+
+
+def _validate_queue_request(payload: dict[str, Any]) -> None:
+    _reject_fault_injection(payload)
+    required = (
+        "task_id",
+        "operation_id",
+        "execution_attempt_id",
+        "execution_mode",
+        "platform_name",
+        "platform_sku",
+        "product_keyword",
+        "expected_product_name",
+        "expected_grade",
+        "expected_old_price",
+        "target_price",
+        "approved_payload_hash",
+        "created_at",
+        "expires_at",
+    )
+    missing = [field_name for field_name in required if not str(payload.get(field_name) or "").strip()]
+    if missing:
+        raise ValidationError("ShadowBot queue request is missing required fields: " + ", ".join(missing))
+    _validate_execution_mode(str(payload["execution_mode"]))
+    if bool(payload.get("spec_verification_required")):
+        raise ValidationError("INPUT_INVALID: current platform adapter cannot verify expected_spec.")
+    try:
+        expires_at = datetime.fromisoformat(str(payload["expires_at"]))
+    except ValueError as exc:
+        raise ValidationError("ShadowBot queue expires_at must be ISO-8601.") from exc
+    if expires_at.tzinfo is None:
+        raise ValidationError("ShadowBot queue expires_at must include a timezone.")
+    if expires_at <= utc_now():
+        raise ValidationError("ShadowBot queue request has expired.")
+
+
+def _canonical_file_json(payload: dict[str, Any]) -> bytes:
+    return (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2, default=str) + "\n").encode("utf-8")
+
+
+def _atomic_publish(path: Path, content: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + f".tmp-{uuid4().hex}")
+    with temporary.open("xb") as file_obj:
+        file_obj.write(content)
+        file_obj.flush()
+        os.fsync(file_obj.fileno())
+    os.replace(temporary, path)
+
+
+def _validate_execution_mode(execution_mode: str) -> None:
+    if execution_mode not in ALLOWED_EXECUTION_MODES:
+        raise ValidationError(f"unsupported ShadowBot execution_mode: {execution_mode}")
+
+
+def _validate_side_effect_state(side_effect_state: str) -> None:
+    if side_effect_state not in ALLOWED_SIDE_EFFECT_STATES:
+        raise ValidationError(f"unsupported ShadowBot side_effect_state: {side_effect_state}")
+
+
+def _validate_result_contract(result: ShadowBotResultContract) -> None:
+    if result.status not in ALLOWED_RESULT_STATUSES:
+        raise ValidationError(f"unsupported ShadowBot status: {result.status}")
+    _validate_side_effect_state(result.side_effect_state)
+    expected_flags = {
+        STATUS_SUCCESS: (True, True),
+        STATUS_ALREADY_APPLIED: (True, True),
+        STATUS_READ_COMPLETED: (True, False),
+        STATUS_PREVIEW_COMPLETED: (True, False),
+        STATUS_VERIFIED: (True, True),
+        STATUS_NOT_APPLIED: (True, False),
+        STATUS_FAILED: (False, False),
+        STATUS_NEEDS_RECONCILIATION: (None, None),
+    }
+    expected = expected_flags[result.status]
+    if (result.run_success_flag, result.business_operation_completed) != expected:
+        raise ValidationError("ShadowBot result flags do not match status contract.")
+    if result.status == STATUS_FAILED and not result.error_code:
+        raise ValidationError("FAILED ShadowBot result requires error_code.")
+    if result.status == STATUS_NEEDS_RECONCILIATION:
+        if result.side_effect_state != SIDE_EFFECT_UNKNOWN:
+            raise ValidationError("NEEDS_RECONCILIATION requires side_effect_state=UNKNOWN.")
+        if result.retryable:
+            raise ValidationError("NEEDS_RECONCILIATION must not be retryable.")
+    if result.status == STATUS_VERIFIED and result.side_effect_state != SIDE_EFFECT_VERIFIED:
+        raise ValidationError("VERIFIED requires side_effect_state=VERIFIED.")
+    if result.status == STATUS_NOT_APPLIED and result.side_effect_state != SIDE_EFFECT_NOT_APPLIED:
+        raise ValidationError("NOT_APPLIED requires side_effect_state=NOT_APPLIED.")
+
+
+def shadowbot_result_contract_from_data(data: dict[str, Any]) -> ShadowBotResultContract:
+    return ShadowBotResultContract(
+        execution_attempt_id=_required_contract_text(data, "execution_attempt_id"),
+        status=_required_contract_text(data, "status"),
+        run_success_flag=_nullable_contract_bool(data.get("run_success_flag")),
+        business_operation_completed=_nullable_contract_bool(data.get("business_operation_completed")),
+        side_effect_state=_required_contract_text(data, "side_effect_state"),
+        retryable=bool(_nullable_contract_bool(data.get("retryable", False))),
+        error_code=str(data.get("error_code") or ""),
+        operation_id=str(data.get("operation_id") or ""),
+        task_id=str(data.get("task_id") or ""),
+        execution_mode=str(data.get("execution_mode") or ""),
+        instruction_hash=str(data.get("instruction_hash") or ""),
+        request_file_sha256=str(data.get("request_file_sha256") or ""),
+        worker_id=str(data.get("worker_id") or ""),
+        raw_output=data,
+    )
+
+
+def _required_contract_text(data: dict[str, Any], name: str) -> str:
+    value = str(data.get(name) or "").strip()
+    if not value:
+        raise ValidationError(f"ShadowBot result is missing required field: {name}")
+    return value
+
+
+def _nullable_contract_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1", "yes"}:
+        return True
+    if normalized in {"false", "0", "no"}:
+        return False
+    raise ValidationError("ShadowBot result flag must be true, false, or null.")
+
+
+def _operation_status_from_result(result: ShadowBotResultContract) -> str:
+    if result.status in {STATUS_SUCCESS, STATUS_ALREADY_APPLIED, STATUS_VERIFIED}:
+        return STATUS_VERIFIED
+    if result.status == STATUS_NOT_APPLIED:
+        return STATUS_NOT_APPLIED
+    if result.status == STATUS_FAILED and result.side_effect_state in SIDE_EFFECT_RECONCILE_REQUIRED:
+        return STATUS_NEEDS_RECONCILIATION
+    return result.status
+
+
+def _request_json(request: Request, timeout: float) -> dict[str, Any]:
+    with urlopen(request, timeout=timeout) as response:  # noqa: S310
+        raw = response.read().decode("utf-8")
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        raise ValidationError("Yingdao OpenAPI response must be a JSON object.")
+    return data
+
+
+def _require_response_data(response: dict[str, Any], *, endpoint: str) -> dict[str, Any]:
+    if not bool(response.get("success")):
+        message = str(response.get("msg") or response.get("message") or "unknown error")
+        code = response.get("code", "")
+        raise ValidationError(f"Yingdao {endpoint} failed: {code} {message}".strip())
+    data = response.get("data")
+    if not isinstance(data, dict):
+        raise ValidationError(f"Yingdao {endpoint} response did not include data object.")
+    return data
+
+
+def _int_from_env(name: str, default: int) -> int:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValidationError(f"{name} must be an integer.") from exc
+
+
+def _to_yingdao_idempotent_uuid(value: str) -> str:
+    normalized = value.strip()
+    if len(normalized) <= 36:
+        return normalized
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:36]
+
+
+def _redact_yingdao_request_body(body: dict[str, Any]) -> dict[str, Any]:
+    redacted = dict(body)
+    params = redacted.get("params")
+    if isinstance(params, list):
+        redacted["params"] = [
+            {
+                "name": item.get("name"),
+                "type": item.get("type"),
+                "value_length": len(str(item.get("value") or "")),
+            }
+            if isinstance(item, dict)
+            else item
+            for item in params
+        ]
+    return redacted
