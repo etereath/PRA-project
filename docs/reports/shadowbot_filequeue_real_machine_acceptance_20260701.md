@@ -10,6 +10,8 @@
 
 本结论表示 PRA 可以按标准流程准备请求、由影刀 Worker 执行、由 Result Importer 导入、由 Queue Watchdog 恢复、由自动校验器核对证据；不表示已经完成 8 小时连续运行和所有真实故障长期样本。
 
+> 后续同步（2026-07-11）：8 小时 READ_ONLY 连续运行、提交意图后停止、真实商品 UNKNOWN→自动 RECONCILE、登录失效、网络异常以及证据不可写/hash 不一致均已完成验收。本文其余内容保留为 2026-07-01 时点报告，当前状态以 [../project_current_status.md](../project_current_status.md) 为准。
+
 ## 2. 实机环境
 
 - 平台：蚂蚁花团供应商微信桌面小程序。

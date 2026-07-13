@@ -5,7 +5,7 @@ import json
 import os
 import subprocess
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -17,9 +17,9 @@ from uuid import uuid4
 from app.enums import TaskStatus
 from app.enums import ReviewTaskStatus
 from app.exceptions import ValidationError
-from app.models import ExecutionLog, ShadowBotExecutionAttempt, ShadowBotOperationLedger
+from app.models import ExecutionLog, NotificationLog, NotificationSendResult, ReviewTask, ShadowBotExecutionAttempt, ShadowBotOperationLedger
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.services.runtime import RuntimeTaskService
+from app.services.runtime import NotificationLogService, NotificationSenderFactory, RuntimeTaskService
 from app.utils import serialize_decimal, utc_now
 
 
@@ -48,6 +48,7 @@ SIDE_EFFECT_SUBMIT_CLICKED = "SUBMIT_CLICKED"
 SIDE_EFFECT_VERIFIED = "VERIFIED"
 SIDE_EFFECT_UNKNOWN = "UNKNOWN"
 SIDE_EFFECT_NOT_APPLIED = "NOT_APPLIED"
+LOGIN_VERIFICATION_REVIEW_TYPE = "shadowbot_login_verification"
 
 SIDE_EFFECT_RECONCILE_REQUIRED = {
     SIDE_EFFECT_SUBMIT_INTENT_RECORDED,
@@ -555,6 +556,10 @@ class ShadowBotExecutor:
         operation = self.repository.get_shadowbot_operation(attempt.operation_id)
         if operation is None:
             raise ValidationError("operation_id does not exist.")
+        self._resolve_login_verification_handoff(
+            execution_attempt_id=attempt.execution_attempt_id,
+            result=result,
+        )
         if result.status == STATUS_NEEDS_RECONCILIATION and attempt.execution_mode == EXECUTION_MODE_COMMIT:
             try:
                 reconcile = self.ensure_reconcile_attempt(
@@ -579,6 +584,133 @@ class ShadowBotExecutor:
             )
         self._insert_execution_log(operation=operation, attempt=attempt, result=result)
         self._update_task_after_result(operation=operation, result=result)
+
+    def open_login_verification_handoff(self, phase_data: dict[str, Any]) -> str:
+        """Create one auditable manual-verification record for a waiting Worker attempt."""
+        execution_attempt_id = str(phase_data.get("execution_attempt_id") or "").strip()
+        if not execution_attempt_id:
+            raise ValidationError("LOGIN_VERIFICATION_REQUIRED phase has no execution_attempt_id.")
+        attempt = self.repository.get_shadowbot_execution_attempt(execution_attempt_id)
+        if attempt is None:
+            raise ValidationError("LOGIN_VERIFICATION_REQUIRED attempt does not exist.")
+        review_task_id = _login_verification_review_id(execution_attempt_id)
+        existing = self.repository.get_review_task(review_task_id)
+        if existing is not None:
+            return review_task_id
+        operation = self.repository.get_shadowbot_operation(attempt.operation_id)
+        if operation is None:
+            raise ValidationError("LOGIN_VERIFICATION_REQUIRED operation does not exist.")
+        login = phase_data.get("login") if isinstance(phase_data.get("login"), dict) else {}
+        now = utc_now()
+        deadline = _parse_optional_datetime(login.get("verification_deadline_at")) or (now + timedelta(minutes=5))
+        review = ReviewTask(
+            review_task_id=review_task_id,
+            trade_date=now.date(),
+            scope_type="task",
+            scope_key=attempt.execution_attempt_id,
+            dedupe_key="shadowbot-login-verification|" + attempt.execution_attempt_id,
+            source_task_id=operation.task_id,
+            review_type=LOGIN_VERIFICATION_REVIEW_TYPE,
+            review_status=ReviewTaskStatus.PENDING,
+            internal_sku=str(operation.product_identity.get("internal_sku") or "") or None,
+            platform_name=operation.platform,
+            reason="ShadowBot is waiting for manual phone verification in the desktop mini program.",
+            review_payload={
+                "operation_id": operation.operation_id,
+                "execution_attempt_id": attempt.execution_attempt_id,
+                "execution_mode": attempt.execution_mode,
+                "verification_detected_at": str(login.get("verification_detected_at") or ""),
+                "verification_deadline_at": deadline.isoformat(),
+                "verification_markers": list(login.get("verification_markers") or [])[:5],
+            },
+            required_by=deadline,
+            created_at=now,
+            updated_at=now,
+        )
+        if self.repository.insert_review_tasks([review]) != 1:
+            return review_task_id
+        self._send_login_verification_notification(review)
+        return review_task_id
+
+    def _send_login_verification_notification(self, review: ReviewTask) -> None:
+        channel = os.environ.get("DEFAULT_NOTIFICATION_CHANNEL", "mock").strip() or "mock"
+        recipient_type = os.environ.get("DEFAULT_NOTIFICATION_RECIPIENT_TYPE", "role").strip() or "role"
+        recipient = os.environ.get("DEFAULT_NOTIFICATION_RECIPIENT", "operations").strip() or "operations"
+        deadline = review.required_by.isoformat(timespec="minutes") if review.required_by else "-"
+        message = (
+            "ShadowBot 登录验证码人工接管 | "
+            f"平台={review.platform_name or '-'} | attempt={review.scope_key} | 截止={deadline}"
+        )
+        payload = {
+            "notification_kind": "shadowbot_login_verification",
+            "title": "ShadowBot 登录验证码人工接管",
+            "platform_name": review.platform_name or "-",
+            "execution_attempt_id": review.scope_key,
+            "required_by": deadline,
+            "action": "请在已打开的桌面端微信小程序中完成手机验证码；完成后 Worker 将继续原任务。",
+        }
+        sender = NotificationSenderFactory().build(channel)
+        log = NotificationLog(
+            notification_id=uuid4().hex[:12],
+            related_task_id=review.source_task_id,
+            related_review_task_id=review.review_task_id,
+            recipient_type=recipient_type,
+            recipient=recipient,
+            channel=sender.channel,
+            sent_at=None,
+            send_status="pending",
+            dedupe_key=f"shadowbot-login-verification:{review.scope_key}:{sender.channel}:{recipient}",
+            message=message,
+            created_at=utc_now(),
+        )
+        try:
+            send_result = sender.send(log, payload)
+        except Exception as exc:
+            send_result = NotificationSendResult(
+                send_status="failed",
+                sent_at=None,
+                error_message=type(exc).__name__,
+            )
+        persisted = replace(
+            log,
+            send_status=send_result.send_status,
+            sent_at=send_result.sent_at,
+            error_message=send_result.error_message,
+        )
+        NotificationLogService(self.repository).append(persisted)
+
+    def _resolve_login_verification_handoff(
+        self,
+        *,
+        execution_attempt_id: str,
+        result: ShadowBotResultContract,
+    ) -> None:
+        review = self.repository.get_review_task(_login_verification_review_id(execution_attempt_id))
+        if review is None or review.review_status != ReviewTaskStatus.PENDING:
+            return
+        login = result.raw_output.get("login") if isinstance(result.raw_output.get("login"), dict) else {}
+        if login.get("verification_completed"):
+            status = ReviewTaskStatus.APPROVED
+            note = "phone verification observed as completed by ShadowBot"
+        elif result.error_code == "LOGIN_VERIFICATION_TIMEOUT":
+            status = ReviewTaskStatus.EXPIRED
+            note = "phone verification timed out"
+        elif result.error_code == "WORKER_STOP_REQUESTED":
+            status = ReviewTaskStatus.CANCELLED
+            note = "Worker stopped while waiting for phone verification"
+        else:
+            return
+        self.repository.update_review_task(
+            replace(
+                review,
+                review_status=status,
+                resolution_payload={"execution_attempt_id": execution_attempt_id, "error_code": result.error_code},
+                updated_at=utc_now(),
+                resolved_by=SHADOWBOT_EXECUTOR_NAME,
+                resolved_at=utc_now(),
+                resolution_note=note,
+            )
+        )
 
     def _validate_result_binding(
         self,
@@ -1165,6 +1297,23 @@ def _nullable_contract_bool(value: Any) -> bool | None:
     if normalized in {"false", "0", "no"}:
         return False
     raise ValidationError("ShadowBot result flag must be true, false, or null.")
+
+
+def _login_verification_review_id(execution_attempt_id: str) -> str:
+    digest = hashlib.sha256(execution_attempt_id.encode("utf-8")).hexdigest()[:20]
+    return "LOGIN-VERIFY-" + digest
+
+
+def _parse_optional_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=utc_now().tzinfo)
+    return parsed
 
 
 def _operation_status_from_result(result: ShadowBotResultContract) -> str:

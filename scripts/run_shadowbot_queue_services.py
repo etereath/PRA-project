@@ -16,7 +16,12 @@ from app.exceptions import ValidationError
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.runtime import DEFAULT_RUNTIME_DB
 from app.services.shadowbot_executor import build_shadowbot_task_runner_from_environment
-from app.services.shadowbot_queue import ShadowBotQueuePaths, ShadowBotQueueWatchdog, ShadowBotResultImporter
+from app.services.shadowbot_queue import (
+    ShadowBotLoginVerificationMonitor,
+    ShadowBotQueuePaths,
+    ShadowBotQueueWatchdog,
+    ShadowBotResultImporter,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -32,8 +37,20 @@ def build_parser() -> argparse.ArgumentParser:
 def run_cycle(
     importer: ShadowBotResultImporter,
     watchdog: ShadowBotQueueWatchdog,
+    login_monitor: ShadowBotLoginVerificationMonitor | None = None,
 ) -> list[dict[str, object]]:
     events: list[dict[str, object]] = []
+    if login_monitor is not None:
+        try:
+            events.extend(login_monitor.inspect())
+        except (OSError, ValidationError, ValueError, json.JSONDecodeError) as exc:
+            events.append(
+                {
+                    "status": "RETRY_PENDING",
+                    "error_code": "LOGIN_VERIFICATION_MONITOR_FAILED",
+                    "error_message": str(exc),
+                }
+            )
     events.extend(importer.import_available())
     try:
         events.extend(watchdog.inspect())
@@ -66,6 +83,7 @@ def main() -> int:
     repository.init_schema()
     runner = build_shadowbot_task_runner_from_environment()
     importer = ShadowBotResultImporter(repository, runner, queue_dir)
+    login_monitor = ShadowBotLoginVerificationMonitor(repository, runner, queue_dir)
     watchdog = ShadowBotQueueWatchdog(queue_dir, stale_seconds=args.stale_seconds)
     with lock_path.open("a+b") as lock_file:
         try:
@@ -74,7 +92,7 @@ def main() -> int:
             print(json.dumps({"status": "ALREADY_RUNNING", "lock_path": str(lock_path)}, ensure_ascii=False))
             return 2
         while True:
-            for event in run_cycle(importer, watchdog):
+            for event in run_cycle(importer, watchdog, login_monitor):
                 print(json.dumps(event, ensure_ascii=False, sort_keys=True), flush=True)
             if args.once:
                 return 0

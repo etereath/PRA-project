@@ -1,6 +1,6 @@
 # Business Decision Specification
 
-> SQLite 运行态持久化的详细进度说明已拆分到 `docs/sqlite_runtime_persistence_plan.md`。后续任务系统、人工复核、通知记录和状态历史的实现与评估，应以该文档为准。
+> 本文保留业务规则和阶段演进记录。项目范围的当前进度与下一步以 [project_current_status.md](project_current_status.md) 为准；SQLite 运行态持久化细节见 [sqlite_runtime_persistence_plan.md](sqlite_runtime_persistence_plan.md)。
 
 ## 0. 当前进度更新
 
@@ -149,10 +149,9 @@
 
 当前仍未完成的重点在于：
 
-- notification_logs 已接入 review 主流程 MVP，但真实通知渠道仍未接入
-- 旧 Excel 人工介入链路完全收口
-- review token 与手机端复核入口
-- 真实平台和真实 RPA 执行闭环
+- 长期通知限流、复杂重试和外部响应审计
+- 真实平台/RPA 的生产调度、长期告警、证据保留和服务账号运维
+- 完整权限与身份系统
 
 因此，当前阶段不再是“先补文档再进入代码改造”，而是已经进入：
 
@@ -1221,13 +1220,13 @@ confirmed_packing_capacity_qty 是 trade_date 维度的全场共享包装能力�
 
 1. 旧 Excel 人工介入入口进一步弱化，例如移出主导航或仅保留内部兼容入口
 2. 扩展运行态 Web 的更多筛选、搜索、批量处理和可视化能力
-3. 为真实通知渠道补 sender 实现，例如企业微信、Bark、飞书
-4. 为 `review_token` 与手机端 review 页面保留并逐步实现稳定接口
-5. 在后续阶段再推进真实平台、真实 RPA、完整权限系统
+3. 在已落地飞书 Webhook、Review Token 和 Mobile Review MVP 的基础上补长期通知运维能力
+4. 在已完成 ShadowBot 文件队列实机闭环的基础上补长期告警、证据保留和服务账号运维，不扩大无人值守范围
+5. 后续再评估企业微信/Bark 等渠道与完整权限系统
 
 当前仍保持不变的边界：
 
-- 暂不接真实平台
+- 已完成单平台、单窗口、单测试商品的真实 ShadowBot 实验，但暂不承诺无人值守生产改价
 - 暂不接真实 RPA
 - 暂不做完整权限系统
 - 暂不迁移 Excel 主数据

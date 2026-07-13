@@ -70,6 +70,12 @@ def _instruction_hash(payload):
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
+def _as_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() not in {"", "0", "false", "no", "off"}
+
+
 def _load_config(args):
     config_path = Path(__file__).with_name("shadowbot_worker_config.json")
     config = {}
@@ -88,6 +94,16 @@ def _load_config(args):
     config.setdefault("max_tasks", int(os.environ.get("SHADOWBOT_WORKER_MAX_TASKS", "50")))
     config.setdefault("heartbeat_seconds", 5)
     config.setdefault("allow_fault_injection", False)
+    config.setdefault("login_auto_enabled", True)
+    config.setdefault("login_credential_target", "ShadowBot/AntFlowerSupplier")
+    config.setdefault("login_employee_mode_required", True)
+    config.setdefault("login_employee_mode_selector", "登录页_员工按钮")
+    config.setdefault("login_employee_mode_wait_seconds", 1)
+    config.setdefault("login_account_selector", "登录页_账号输入框")
+    config.setdefault("login_password_selector", "登录页_密码输入框")
+    config.setdefault("login_submit_selector", "登录页_登录按钮")
+    config.setdefault("login_verification_wait_seconds", 600)
+    config.setdefault("login_post_submit_wait_seconds", 8)
     return config
 
 
@@ -110,6 +126,19 @@ class QueueWorker:
         self.heartbeat_error_log = self.control / "heartbeat_errors.jsonl"
         self.stop_signal = self.control / "stop.signal"
         self.allow_fault_injection = bool(config.get("allow_fault_injection", False))
+        self.login_config = {
+            "auto_enabled": _as_bool(config.get("login_auto_enabled", True)),
+            "employee_mode_required": _as_bool(config.get("login_employee_mode_required", True)),
+            "employee_mode_selector": str(config.get("login_employee_mode_selector") or "").strip(),
+            "employee_mode_wait_seconds": max(float(config.get("login_employee_mode_wait_seconds", 1)), 0.0),
+            "account_selector": str(config.get("login_account_selector") or "").strip(),
+            "password_selector": str(config.get("login_password_selector") or "").strip(),
+            "submit_selector": str(config.get("login_submit_selector") or "").strip(),
+            "verification_wait_seconds": max(float(config.get("login_verification_wait_seconds", 600)), 1.0),
+            "post_submit_wait_seconds": max(float(config.get("login_post_submit_wait_seconds", 8)), 1.0),
+        }
+        self.login_credential_target = str(config.get("login_credential_target") or "").strip()
+        self.credential_provider = self._build_credential_provider()
         self._stop_heartbeat = threading.Event()
         self._heartbeat_write_failures = 0
         self._heartbeat_consecutive_failures = 0
@@ -276,8 +305,8 @@ class QueueWorker:
 
     def _execute_claimed(self, request, request_sha256, working_request, phase_path):
         attempt_id = str(request["execution_attempt_id"])
-        request = dict(request)
-        request.update(
+        runtime_request = dict(request)
+        runtime_request.update(
             {
                 "request_file_sha256": request_sha256,
                 "worker_id": self.worker_id,
@@ -291,7 +320,13 @@ class QueueWorker:
             else:
                 import vertical_slice_read_price
 
-            raw_result = vertical_slice_read_price.main({"request_json": json.dumps(request, ensure_ascii=False)})
+            raw_result = vertical_slice_read_price.main(
+                {
+                    "request_json": json.dumps(runtime_request, ensure_ascii=False),
+                    "_credential_provider": self.credential_provider,
+                    "_login_config": self.login_config,
+                }
+            )
             result = json.loads(raw_result) if isinstance(raw_result, str) else dict(raw_result)
         except Exception as exc:
             result = {
@@ -300,7 +335,9 @@ class QueueWorker:
                 "business_operation_completed": False,
                 "side_effect_state": "NOT_STARTED",
                 "error_code": "WORKER_EXECUTION_FAILED",
-                "error_message": str(exc),
+                # A lower-level UI exception can echo the text that was passed
+                # to a credential field. Keep queue results free of secrets.
+                "error_message": "worker execution failed: " + type(exc).__name__,
                 "retryable": False,
             }
         result.update(
@@ -322,6 +359,16 @@ class QueueWorker:
         _atomic_write(result_path.with_suffix(result_path.suffix + ".sha256"), (hashlib.sha256(content).hexdigest() + "\n").encode("ascii"))
         _atomic_write(result_path, content)
         self._write_phase(request, phase_path, "RESULT_WRITTEN", str(result.get("side_effect_state") or "NOT_STARTED"), request_sha256)
+
+    def _build_credential_provider(self):
+        try:
+            if __package__:
+                from .shadowbot_credentials import WindowsCredentialManagerProvider
+            else:
+                from shadowbot_credentials import WindowsCredentialManagerProvider
+            return WindowsCredentialManagerProvider(self.login_credential_target)
+        except Exception:
+            return None
 
     def _write_phase(self, request, phase_path, phase, side_effect_state, request_sha256):
         payload = {

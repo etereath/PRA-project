@@ -20,12 +20,51 @@
 $env:SHADOWBOT_RUNNER_TYPE = "filequeue"
 $env:SHADOWBOT_QUEUE_DIR = "D:\PRA_Runtime\shadowbot_queue"
 $env:SHADOWBOT_EVIDENCE_DIR = "\\LAPTOP-O9O76RQV\pra-evidence"
+$env:SHADOWBOT_APPLET_URI = "weixin://launchapplet/?app_id=<目标小程序AppID>"
 $env:SHADOWBOT_WORKER_POLL_SECONDS = "3"
 $env:SHADOWBOT_WORKER_MAX_HOURS = "8"
 $env:SHADOWBOT_WORKER_MAX_TASKS = "50"
 ```
 
 `filedrop` 和 `SHADOWBOT_REQUEST_DIR` 仅作为兼容名称保留。跨机器部署时可将 `SHADOWBOT_QUEUE_DIR` 改为 UNC，不能使用映射盘符。
+
+`SHADOWBOT_APPLET_URI` 是蚂蚁花团供应商小程序的已验证微信 URI，不含账号或密码。Worker 先尝试复用已有“蚂蚁花团供应商”窗口；仅在窗口不存在时才启动此 URI，并在最长 20 秒内轮询目标窗口。URI 必须以 `weixin://launchapplet/` 开头；缺失或前缀不符合时，Worker 在提交前返回 `APPLET_URI_MISSING` 或 `APPLET_URI_INVALID`。URI 已启动但窗口仍未出现时返回可重试的 `WINDOW_NOT_AVAILABLE`，启动协议本身失败时返回 `APPLET_URI_OPEN_FAILED`。
+
+无论窗口来自复用还是 URI 启动，流程顺序固定为：准备窗口 -> 检查/恢复登录 -> 强制刷新商品管理列表 -> 读取价格。登录页上不尝试点击“商品管理”；若需要员工模式、账号密码或手机验证码，必须先完成登录恢复后才进入列表刷新。
+
+### 登录凭据与手机验证码
+
+账号密码不属于 PRA 请求参数。Worker 只在本机运行时通过 Windows Credential Manager 读取 Generic Credential；默认目标名为 `ShadowBot/AntFlowerSupplier`，`UserName` 保存平台账号，`CredentialBlob` 保存密码。不得把账号或密码写入 `local_env.ps1`、请求、结果、phase、日志、截图、SQLite 或证据目录。
+
+影刀 `shadowbot_worker_config.json` 必须在人工捕获后配置以下三个元素名称：
+
+```json
+{
+  "login_auto_enabled": true,
+  "login_credential_target": "ShadowBot/AntFlowerSupplier",
+  "login_employee_mode_required": true,
+  "login_employee_mode_selector": "登录页_员工按钮",
+  "login_account_selector": "登录页_账号输入框",
+  "login_password_selector": "登录页_密码输入框",
+  "login_submit_selector": "登录页_登录按钮",
+  "login_verification_wait_seconds": 600
+}
+```
+
+蚂蚁花团供应商的员工账号需要先点击“员工”模式按钮，再填写账号密码；该点击仅记录无敏感状态，失败时返回 `LOGIN_AUTOFILL_FAILED`，不会尝试其他登录模式。Worker 每个 attempt 最多提交一次账号密码登录。账号和密码仅使用元素原生输入方法，禁止走剪贴板输入，避免进入 Windows 剪贴板历史。识别到手机验证码后写 `LOGIN_VERIFICATION_REQUIRED` phase；PRA 队列服务创建唯一人工介入 review 和通知。该通知使用专用标题“ShadowBot 登录验证码人工接管”，仅展示平台、执行尝试、截止时间和操作提示，不复用通用业务复核的业务日期、处理对象和原因字段。操作员只在由 Worker 打开或此前已存在的小程序中完成验证码，不向 PRA、影刀请求或飞书回复验证码。首页“商品管理”入口重新出现后，Worker 继续同一 attempt。等待超时返回 `FAILED/LOGIN_VERIFICATION_TIMEOUT/NOT_STARTED`；账号密码错误返回 `LOGIN_CREDENTIALS_REJECTED`，均不自动重试。
+
+默认验证码人工接管窗口为 10 分钟（`600` 秒）。验证码等待到期时，Worker 会额外执行一次无副作用的首页入口检查，避免操作员恰好在最后一轮轮询后完成验证而被误判超时。该检查不延长等待时限，也不重新提交账号密码。
+
+实机验收约定：
+
+- 投递实机请求前必须加载 `scripts\local_env.ps1`；否则请求会进入项目内开发队列 `data\runtime\shadowbot_queue`，不会被 `D:\PRA_Runtime\shadowbot_queue` 的影刀 Worker 领取。
+- 当前在售测试商品为“艾莎 B级”。请求中的 `expected_grade` 必须使用 `B级`；传入 `C级` 得到 `PRODUCT_NOT_FOUND` 是业务条件不匹配，不代表登录、刷新或元素定位失败。
+- 验证码测试需要留出足够时间让小程序跳转回首页；验收通过的标志是同一 `execution_attempt_id` 从 `LOGIN_VERIFICATION_REQUIRED` 继续到 `READ_COMPLETED`，而不是另起 attempt 的后续读取成功。
+- 验收结束后，必须让 Result Importer 导入结果并确认 `working/`、`results/` 没有该 attempt 的活动文件，随后再停止 Worker 并关闭影刀残留运行窗口。
+- 商品管理页的 WebView 页面实例 ID（如 `page-103`）会在登录后变化。适配器会优先使用人工捕获的列表容器选择器；未命中时自动移除 `page-*` 临时 ID 后再次查找，稳定的结构属性仍保留。不要把这种容器未命中直接归类为小程序白屏。
+- 2026-07-12 实机验证：`ATTEMPT-DYNAMIC-CONTAINER-20260712-114222` 在同一 attempt 内完成员工模式、账号密码单次提交、验证码人工接管、回到首页、商品管理刷新及“艾莎 B级”价格读取；结果为 `READ_COMPLETED`、`old_price=11.80`、`side_effect_state=NOT_STARTED`。
+- 2026-07-12 实机停止验证：`ATTEMPT-LOGIN-STOP-20260712-115208` 在 `LOGIN_VERIFICATION_REQUIRED` 阶段收到 `stop.signal` 后写出 `FAILED/WORKER_STOP_REQUESTED/NOT_STARTED`，Result Importer 归档完成后 Worker 心跳变为 `STOPPED`。预提交停止验收的请求绑定、checksum、执行日志、无副作用与队列清空检查均通过。
+- 2026-07-13 URI 冷启动验收：`ATTEMPT-URI-FINAL-READ-20260713-154700` 在目标窗口关闭时返回 `applet_launch.source=URI_LAUNCHED`，约 1 秒后获取窗口；随后先完成登录检查，再刷新商品管理列表并读取第 `38` 行“艾莎 B级”价格 `10.00`。最终 `READ_COMPLETED/NOT_STARTED`，证据已复制到共享目录且 SHA-256 一致，完整文件队列验收通过。
 
 ## 3. 目录与文件
 
@@ -57,7 +96,9 @@ python scripts\run_shadowbot_queue_services.py
 
 `--queue-dir` 是队列服务的显式运行边界。服务会同步覆盖 `SHADOWBOT_QUEUE_DIR` 与兼容别名 `SHADOWBOT_REQUEST_DIR`，因此 Executor 自动创建的 `RECONCILE` 会回到同一队列。自动对账从已校验的源请求继承 `evidence_share_dir`、`applet_uri` 和 `window_title`；仍需先加载 `SHADOWBOT_EVIDENCE_DIR`，以便共享证据可用。
 
-影刀代码同步后必须关闭并重新打开 `test2`。主流程只调用 `module1.py`；影刀自动执行其中的 `main(args)`，该薄入口再委托 `shadowbot_queue_worker.main(args)`。Worker 将复用 `vertical_slice_read_price.main` 的现有元素逻辑。
+主流程只调用 `module1.py`；影刀自动执行其中的 `main(args)`，该薄入口再委托 `shadowbot_queue_worker.main(args)`。Worker 将复用 `vertical_slice_read_price.main` 的现有元素逻辑。
+
+外部同步 Python 后，首选在影刀“应用”主页面选中 `test2`，点击其行内圆形“运行应用”图标直接启动主流程。不要为了运行而进入编辑页面：已打开的设计器可能保留旧代码缓存，甚至把旧内容写回磁盘。只有人工录制或改元素时才进入编辑器；外部同步前必须先退出编辑器，随后恢复使用应用列表直接运行。
 
 请求安全停止：
 
@@ -119,4 +160,4 @@ python scripts\sync_shadowbot_test2.py --check
 python scripts\sync_shadowbot_test2.py
 ```
 
-同步后关闭并重新打开影刀应用，否则影刀可能继续使用内存中的旧代码。
+同步后确认编辑器处于关闭状态，并从影刀“应用”主页面的 `test2` 行内“运行应用”图标直接启动。该路径是外部 Python 同步后的默认测试方式；运行完成后仍需关闭影刀残留运行窗口。

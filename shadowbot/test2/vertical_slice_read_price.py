@@ -22,6 +22,8 @@ WINDOW_Y_DEFAULT = 0
 WINDOW_WIDTH_DEFAULT = 562
 WINDOW_HEIGHT_DEFAULT = 1056
 ELEMENT_TIMEOUT_DEFAULT = 15
+APPLET_LAUNCH_TIMEOUT_DEFAULT = 20
+APPLET_URI_PREFIXES = ("weixin://launchapplet/",)
 
 ROW_INDEX_START = 1
 ROW_INDEX_STEP = 16
@@ -100,6 +102,8 @@ def _write_phase(request, result, phase, include_result_snapshot=False):
     }
     if include_result_snapshot:
         payload["result_snapshot"] = dict(result)
+    if isinstance(result.get("login"), dict):
+        payload["login"] = dict(result["login"])
     os.makedirs(os.path.dirname(phase_path), exist_ok=True)
     temporary = phase_path + ".tmp_" + uuid.uuid4().hex
     with open(temporary, "w", encoding="utf-8") as file_obj:
@@ -193,6 +197,8 @@ def _request_payload(args):
         "evidence_dir",
         "evidence_share_dir",
         "evidence_storage_uri_prefix",
+        "applet_uri",
+        "applet_launch_timeout_seconds",
     ):
         value = _get_arg(args, name, None)
         if value is not None and str(value).strip():
@@ -274,9 +280,25 @@ def _set_path_attribute(node, attribute_name, value, operator="Equal"):
     )
 
 
+def _remove_dynamic_page_id_constraints(value):
+    """Page instances are regenerated after login; keep their stable class path only."""
+    for node in value.get("path", []):
+        attributes = node.get("attributes", [])
+        node["attributes"] = [
+            attribute
+            for attribute in attributes
+            if not (
+                attribute.get("name") == "id"
+                and re.fullmatch(r"page-\d+", str(attribute.get("value") or ""))
+            )
+        ]
+    return value
+
+
 def _clone_row_selector(base_name, inferred_name, parent_index, static_text_index):
     base = package.selector(base_name)
     value = copy.deepcopy(base.__dict__["value"])
+    _remove_dynamic_page_id_constraints(value)
     value["id"] = str(uuid.uuid4())
     value["name"] = inferred_name
     value["screenshot"] = ""
@@ -318,6 +340,7 @@ def _clone_row_selector(base_name, inferred_name, parent_index, static_text_inde
 def _generic_product_name_selector():
     base = package.selector(SELECTOR_TEMPLATES["name"])
     value = copy.deepcopy(base.__dict__["value"])
+    _remove_dynamic_page_id_constraints(value)
     value["id"] = str(uuid.uuid4())
     value["name"] = "动态_全部商品名称"
     value["screenshot"] = ""
@@ -409,6 +432,7 @@ def _row_field_selector(row_parent_index, field):
 def _generic_acc_node_selector(node_name, selector_name):
     base = package.selector(SELECTOR_TEMPLATES["name"])
     value = copy.deepcopy(base.__dict__["value"])
+    _remove_dynamic_page_id_constraints(value)
     value["id"] = str(uuid.uuid4())
     value["name"] = selector_name
     value["screenshot"] = ""
@@ -466,6 +490,18 @@ LOGIN_REQUIRED_MARKERS = (
     "欢迎使用蚂蚁花团供应商端",
     "请输入您的账号",
     "请输入您的密码",
+)
+LOGIN_VERIFICATION_MARKERS = (
+    "验证码",
+    "短信验证码",
+    "请输入验证码",
+    "获取验证码",
+)
+LOGIN_CREDENTIAL_REJECTED_MARKERS = (
+    "账号或密码错误",
+    "账号密码错误",
+    "密码错误",
+    "账号不存在",
 )
 NETWORK_OR_LOAD_ERROR_MARKERS = (
     "网络异常",
@@ -543,6 +579,24 @@ def _classify_unavailable_ui(labels):
     return "", []
 
 
+def _login_page_state(labels):
+    normalized = [_normalize_text(label) for label in labels if str(label).strip()]
+    rejected = [
+        marker for marker in LOGIN_CREDENTIAL_REJECTED_MARKERS
+        if any(_normalize_text(marker) in label for label in normalized)
+    ]
+    if rejected:
+        return "CREDENTIALS_REJECTED", rejected
+    verification = [
+        marker for marker in LOGIN_VERIFICATION_MARKERS
+        if any(_normalize_text(marker) in label for label in normalized)
+    ]
+    if verification:
+        return "VERIFICATION_REQUIRED", verification
+    login_required, markers = _login_required_from_labels(labels)
+    return ("ACCOUNT_PASSWORD", markers) if login_required else ("", [])
+
+
 def _collect_ui_state_labels(window):
     labels = []
     for node_name in UI_STATE_NODE_NAMES:
@@ -577,6 +631,176 @@ def _raise_classified_ui_error(window):
         + str(labels_seen[:30]),
         retryable=ui_error_code != "LOGIN_REQUIRED",
     )
+
+
+def _login_config_value(login_config, name, default=""):
+    if isinstance(login_config, dict):
+        return login_config.get(name, default)
+    return default
+
+
+def _safe_login_markers(markers):
+    return [str(marker)[:80] for marker in markers[:5]]
+
+
+def _wait_for_manual_login_verification(window, request, result, timeout_seconds, login_config, markers):
+    wait_seconds = max(float(_login_config_value(login_config, "verification_wait_seconds", 600)), 1.0)
+    deadline = time.time() + wait_seconds
+    login_state = result.setdefault("login", {})
+    login_state.update(
+        {
+            "verification_required": True,
+            "verification_detected_at": _now_iso(),
+            "verification_deadline_at": datetime.fromtimestamp(
+                deadline, TZ_SHANGHAI
+            ).isoformat(timespec="seconds"),
+            "verification_markers": _safe_login_markers(markers),
+        }
+    )
+    _write_phase(request, result, "LOGIN_VERIFICATION_REQUIRED")
+    while time.time() < deadline:
+        _check_stop_before_submit(request, result)
+        labels = _collect_ui_state_labels(window)
+        state, state_markers = _login_page_state(labels)
+        if state == "CREDENTIALS_REJECTED":
+            raise SliceError(
+                "LOGIN_CREDENTIALS_REJECTED",
+                "login credentials were rejected; markers=" + str(_safe_login_markers(state_markers)),
+                retryable=False,
+            )
+        try:
+            _find_element(window, ELEMENTS["product_management"], 0.5)
+        except SliceError:
+            sleep(2)
+            continue
+        login_state["verification_completed_at"] = _now_iso()
+        login_state["verification_completed"] = True
+        return True
+    # Do one last safe homepage check after the deadline.  A user can finish
+    # the OTP between the final polling sleep and the loop condition.
+    _check_stop_before_submit(request, result)
+    try:
+        _find_element(window, ELEMENTS["product_management"], 0.5)
+    except SliceError:
+        pass
+    else:
+        login_state["verification_completed_at"] = _now_iso()
+        login_state["verification_completed"] = True
+        return True
+    raise SliceError(
+        "LOGIN_VERIFICATION_TIMEOUT",
+        "manual phone verification did not complete before timeout",
+        retryable=False,
+    )
+
+
+def _attempt_automatic_login(window, request, result, timeout_seconds, login_config, credential_provider, markers):
+    if not bool(_login_config_value(login_config, "auto_enabled", True)):
+        raise SliceError("LOGIN_REQUIRED", "automatic login is disabled", retryable=False)
+    if credential_provider is None:
+        raise SliceError("LOGIN_CREDENTIALS_UNAVAILABLE", "credential provider is unavailable", retryable=False)
+    employee_mode_required = bool(_login_config_value(login_config, "employee_mode_required", False))
+    employee_mode_selector = str(_login_config_value(login_config, "employee_mode_selector", "")).strip()
+    account_selector = str(_login_config_value(login_config, "account_selector", "")).strip()
+    password_selector = str(_login_config_value(login_config, "password_selector", "")).strip()
+    submit_selector = str(_login_config_value(login_config, "submit_selector", "")).strip()
+    if not account_selector or not password_selector or not submit_selector or (employee_mode_required and not employee_mode_selector):
+        raise SliceError("LOGIN_AUTOMATION_NOT_CONFIGURED", "login selectors are not configured", retryable=False)
+    if bool(result.get("login", {}).get("account_password_submitted")):
+        raise SliceError(
+            "LOGIN_CREDENTIALS_REJECTED",
+            "account/password login was already submitted for this attempt",
+            retryable=False,
+        )
+    try:
+        credentials = credential_provider.get_login_credentials()
+    except Exception as exc:
+        raise SliceError(
+            "LOGIN_CREDENTIALS_UNAVAILABLE",
+            "credential provider failed: " + type(exc).__name__,
+            retryable=False,
+        ) from exc
+    try:
+        if employee_mode_selector:
+            _find_element(window, employee_mode_selector, timeout_seconds).click()
+            sleep(max(float(_login_config_value(login_config, "employee_mode_wait_seconds", 1)), 0.0))
+            result.setdefault("login", {}).update(
+                {
+                    "employee_mode_clicked": True,
+                    "employee_mode_clicked_at": _now_iso(),
+                }
+            )
+        _set_login_input_value(_find_element(window, account_selector, timeout_seconds), credentials.account)
+        _set_login_input_value(_find_element(window, password_selector, timeout_seconds), credentials.password)
+        _find_element(window, submit_selector, timeout_seconds).click()
+    except Exception as exc:
+        raise SliceError(
+            "LOGIN_AUTOFILL_FAILED",
+            "account/password login autofill failed: " + type(exc).__name__,
+            retryable=False,
+        ) from exc
+    result.setdefault("login", {}).update(
+        {
+            "account_password_submitted": True,
+            "account_password_submitted_at": _now_iso(),
+            "login_markers": _safe_login_markers(markers),
+        }
+    )
+    _write_phase(request, result, "LOGIN_ACCOUNT_PASSWORD_SUBMITTED")
+    deadline = time.time() + max(float(_login_config_value(login_config, "post_submit_wait_seconds", 8)), 1.0)
+    while time.time() < deadline:
+        _check_stop_before_submit(request, result)
+        labels = _collect_ui_state_labels(window)
+        state, state_markers = _login_page_state(labels)
+        if state == "VERIFICATION_REQUIRED":
+            return _wait_for_manual_login_verification(
+                window, request, result, timeout_seconds, login_config, state_markers
+            )
+        if state == "CREDENTIALS_REJECTED":
+            raise SliceError(
+                "LOGIN_CREDENTIALS_REJECTED",
+                "login credentials were rejected; markers=" + str(_safe_login_markers(state_markers)),
+                retryable=False,
+            )
+        try:
+            _find_element(window, ELEMENTS["product_management"], 0.5)
+            result.setdefault("login", {})["login_completed_at"] = _now_iso()
+            return True
+        except SliceError:
+            sleep(1)
+    # A challenge can be rendered above the original account/password form, or
+    # arrive after the short post-submit observation window.  Only an explicit
+    # rejection marker is evidence that the credentials are wrong.  In every
+    # other unresolved post-submit state, preserve the attempt and hand it to
+    # the manual verification path instead of making an irreversible diagnosis.
+    return _wait_for_manual_login_verification(
+        window,
+        request,
+        result,
+        timeout_seconds,
+        login_config,
+        ["ACCOUNT_PASSWORD_FORM_REMAINS_AFTER_SUBMIT"],
+    )
+
+
+def _recover_login_if_needed(window, request, result, timeout_seconds, login_config, credential_provider):
+    labels = _collect_ui_state_labels(window)
+    state, markers = _login_page_state(labels)
+    if state == "ACCOUNT_PASSWORD":
+        return _attempt_automatic_login(
+            window, request, result, timeout_seconds, login_config, credential_provider, markers
+        )
+    if state == "VERIFICATION_REQUIRED":
+        return _wait_for_manual_login_verification(
+            window, request, result, timeout_seconds, login_config, markers
+        )
+    if state == "CREDENTIALS_REJECTED":
+        raise SliceError(
+            "LOGIN_CREDENTIALS_REJECTED",
+            "login credentials were rejected; markers=" + str(_safe_login_markers(markers)),
+            retryable=False,
+        )
+    return False
 
 
 def _find_button_by_exact_label(window, labels, timeout_seconds):
@@ -670,6 +894,85 @@ def _get_and_prepare_window(window_title, x, y, width, height, max_attempts=3):
         "无法获取或准备小程序窗口 %s: %s" % (window_title, str(last_error)),
         retryable=True,
     )
+
+
+def _validate_applet_uri(applet_uri):
+    uri = str(applet_uri or "").strip()
+    if not uri:
+        raise SliceError(
+            "APPLET_URI_MISSING",
+            "target mini program window is not available and applet_uri is missing",
+            retryable=False,
+        )
+    if not uri.lower().startswith(APPLET_URI_PREFIXES):
+        raise SliceError(
+            "APPLET_URI_INVALID",
+            "applet_uri must start with an allowed WeChat launchapplet prefix",
+            retryable=False,
+        )
+    return uri
+
+
+def _launch_applet_uri(applet_uri, uri_launcher=None):
+    uri = _validate_applet_uri(applet_uri)
+    launcher = uri_launcher or getattr(os, "startfile", None)
+    if not callable(launcher):
+        raise SliceError(
+            "APPLET_URI_OPEN_FAILED",
+            "Windows URI launcher is unavailable",
+            retryable=True,
+        )
+    try:
+        launcher(uri)
+    except Exception as exc:
+        raise SliceError(
+            "APPLET_URI_OPEN_FAILED",
+            "failed to open target mini program URI: " + str(exc),
+            retryable=True,
+        )
+    return uri
+
+
+def _get_or_open_and_prepare_window(
+    window_title,
+    x,
+    y,
+    width,
+    height,
+    applet_uri,
+    launch_timeout_seconds=APPLET_LAUNCH_TIMEOUT_DEFAULT,
+    uri_launcher=None,
+):
+    try:
+        window = _get_and_prepare_window(window_title, x, y, width, height, max_attempts=1)
+        return window, {
+            "source": "EXISTING_WINDOW",
+            "uri_opened": False,
+            "window_ready_at": _now_iso(),
+        }
+    except SliceError as existing_window_error:
+        if existing_window_error.code != "WINDOW_NOT_AVAILABLE":
+            raise
+
+    uri = _launch_applet_uri(applet_uri, uri_launcher=uri_launcher)
+    opened_at = _now_iso()
+    attempts = max(1, int(float(launch_timeout_seconds) / 0.5))
+    try:
+        window = _get_and_prepare_window(window_title, x, y, width, height, max_attempts=attempts)
+    except SliceError as exc:
+        if exc.code == "WINDOW_NOT_AVAILABLE":
+            raise SliceError(
+                "WINDOW_NOT_AVAILABLE",
+                "target mini program window did not appear after URI launch: " + str(exc.message),
+                retryable=True,
+            )
+        raise
+    return window, {
+        "source": "URI_LAUNCHED",
+        "uri_opened": True,
+        "uri_opened_at": opened_at,
+        "window_ready_at": _now_iso(),
+    }
 
 
 def _read_text(window, selector_or_name, timeout_seconds):
@@ -1114,6 +1417,36 @@ def _set_input_value(element, value):
     )
 
 
+def _set_login_input_value(element, value):
+    """Fill a credential field without exposing it through the clipboard."""
+    try:
+        element.click()
+        sleep(0.2)
+    except Exception:
+        pass
+
+    # Clipboard input is intentionally excluded here: Clipboard History and
+    # other local observers are outside the protected CredentialProvider path.
+    for method_name in ("set_value", "set_text", "input_text", "input"):
+        method = getattr(element, method_name, None)
+        if not callable(method):
+            continue
+        for method_args in ((value,), (value, True), (value, False)):
+            try:
+                method(*method_args)
+                sleep(0.3)
+                return
+            except TypeError:
+                continue
+            except Exception:
+                break
+    raise SliceError(
+        "LOGIN_AUTOFILL_FAILED",
+        "credential field does not support a native input method",
+        retryable=False,
+    )
+
+
 def _read_price_input(element):
     raw = _element_text_or_value(element)
     if not raw:
@@ -1122,6 +1455,75 @@ def _read_price_input(element):
         return _parse_price(raw)
     except SliceError:
         return str(raw).strip()
+
+
+def _refresh_product_list(window, timeout_seconds, result, stage):
+    """Force the mini-program list to fetch current platform data before a list price read."""
+    event = {
+        "stage": stage,
+        "started_at": _now_iso(),
+        "refresh_entry": ELEMENTS["product_management"],
+        "status": "STARTED",
+    }
+    result.setdefault("product_list_refreshes", []).append(event)
+    try:
+        # Refreshing while a price dialog is open can discard an uncommitted draft.
+        try:
+            _find_element(window, ELEMENTS["price_popup"], 0.2)
+        except SliceError:
+            pass
+        else:
+            raise SliceError(
+                "PRODUCT_LIST_REFRESH_FAILED",
+                "price dialog is still open; refusing to refresh product list",
+                retryable=True,
+            )
+
+        _find_element(window, ELEMENTS["product_management"], timeout_seconds).click()
+        sleep(1)
+        # Require two independent observations so the first stale WebView frame is not accepted.
+        _find_product_list_container(window, timeout_seconds)
+        sleep(0.5)
+        _find_product_list_container(window, timeout_seconds)
+    except SliceError as exc:
+        event.update(
+            {
+                "status": "FAILED",
+                "error_code": "PRODUCT_LIST_REFRESH_FAILED",
+                "error_message": exc.message,
+                "ended_at": _now_iso(),
+            }
+        )
+        raise SliceError(
+            "PRODUCT_LIST_REFRESH_FAILED",
+            "product list refresh failed: " + exc.message,
+            retryable=exc.retryable,
+        )
+    event.update({"status": "SUCCESS", "ended_at": _now_iso()})
+    return event
+
+
+def _find_product_list_container(window, timeout_seconds):
+    try:
+        return _find_element(window, ELEMENTS["target_container"], timeout_seconds)
+    except SliceError as captured_error:
+        base = package.selector(ELEMENTS["target_container"])
+        value = copy.deepcopy(base.__dict__["value"])
+        _remove_dynamic_page_id_constraints(value)
+        value["id"] = str(uuid.uuid4())
+        value["name"] = "动态_商品管理列表容器"
+        value["screenshot"] = ""
+        try:
+            return _find_element(window, Selector(value), timeout_seconds)
+        except SliceError as dynamic_error:
+            raise SliceError(
+                "ELEMENT_NOT_FOUND",
+                "商品管理列表容器未出现；captured="
+                + captured_error.message
+                + "; dynamic="
+                + dynamic_error.message,
+                retryable=True,
+            )
 
 
 def _open_price_dialog(window, row_index, timeout_seconds):
@@ -1279,6 +1681,8 @@ def main(args):
         "expected_old_price": "",
         "target_price": "",
         "actual_price": "",
+        "applet_launch": {},
+        "product_list_refreshes": [],
         "side_effect_state": "NOT_STARTED",
         "selector_model": {
             "row_index_start": ROW_INDEX_START,
@@ -1325,9 +1729,18 @@ def main(args):
             )
 
         fault_injection = str(_get_arg(request, "fault_injection", "")).strip().upper()
+        login_config = _get_arg(args, "_login_config", {})
+        credential_provider = _get_arg(args, "_credential_provider", None)
         window_title = str(_get_arg(request, "window_title", WINDOW_TITLE_DEFAULT)).strip()
+        applet_uri = str(_get_arg(request, "applet_uri", "")).strip()
         timeout_seconds = _as_int(
             request, "element_timeout_seconds", ELEMENT_TIMEOUT_DEFAULT, minimum=1
+        )
+        applet_launch_timeout_seconds = _as_int(
+            request,
+            "applet_launch_timeout_seconds",
+            APPLET_LAUNCH_TIMEOUT_DEFAULT,
+            minimum=1,
         )
         max_product_rows = _as_int(
             request, "max_product_rows", DEFAULT_MAX_PRODUCT_ROWS, minimum=1
@@ -1355,6 +1768,7 @@ def main(args):
         result.update(
             {
                 "window_title": window_title,
+                "applet_uri": applet_uri,
                 "product_keyword": product_keyword,
                 "execution_mode": execution_mode,
                 "expected_old_price": expected_old_price,
@@ -1371,36 +1785,44 @@ def main(args):
         _write_phase(request, result, "UI_STARTED")
         _check_stop_before_submit(request, result)
 
-        current_step = "GET_AND_PREPARE_WINDOW"
+        current_step = "OPEN_APPLET"
         result["current_step"] = current_step
-        window = _get_and_prepare_window(
+        window, applet_launch = _get_or_open_and_prepare_window(
             window_title,
             window_x,
             window_y,
             window_width,
             window_height,
+            applet_uri,
+            applet_launch_timeout_seconds,
         )
+        result["applet_launch"] = applet_launch
         sleep(1)
+
+        current_step = "GET_AND_PREPARE_WINDOW"
+        result["current_step"] = current_step
+        current_step = "CHECK_LOGIN"
+        result["current_step"] = current_step
+        _recover_login_if_needed(
+            window,
+            request,
+            result,
+            timeout_seconds,
+            login_config,
+            credential_provider,
+        )
 
         current_step = "OPEN_PRODUCT_MANAGEMENT"
         result["current_step"] = current_step
+        current_step = "REFRESH_PRODUCT_LIST"
+        result["current_step"] = current_step
         try:
-            _find_element(window, ELEMENTS["target_container"], 2)
-        except SliceError:
-            try:
-                product_management = _find_element(
-                    window, ELEMENTS["product_management"], timeout_seconds
-                )
-            except SliceError as exc:
-                _raise_classified_ui_error(window)
-                raise exc
-            product_management.click()
-            sleep(1)
-            try:
-                _find_element(window, ELEMENTS["target_container"], timeout_seconds)
-            except SliceError as exc:
-                _raise_classified_ui_error(window)
-                raise exc
+            refresh_event = _refresh_product_list(
+                window, timeout_seconds, result, "BEFORE_PRICE_READ"
+            )
+        except SliceError as exc:
+            _raise_classified_ui_error(window)
+            raise exc
 
         current_step = "LOCATE_PRODUCT"
         result["current_step"] = current_step
@@ -1416,6 +1838,9 @@ def main(args):
                 "matched_row_index": row_index,
             }
         )
+        refresh_event["matched_row_index"] = row_index
+        refresh_event["matched_product_name"] = list_name
+        refresh_event["matched_grade"] = list_grade
 
         current_step = "READ_OLD_PRICE"
         result["current_step"] = current_step
@@ -1573,6 +1998,24 @@ def main(args):
 
                 current_step = "VERIFY_AFTER_SUBMIT"
                 result["current_step"] = current_step
+                current_step = "REFRESH_PRODUCT_LIST"
+                result["current_step"] = current_step
+                refresh_event = _refresh_product_list(
+                    window, timeout_seconds, result, "AFTER_SUBMIT_VERIFY"
+                )
+                current_step = "LOCATE_PRODUCT"
+                result["current_step"] = current_step
+                row_index, list_name, list_grade = _locate_product_row(
+                    window, expected_name, expected_grade, max_product_rows, timeout_seconds
+                )
+                _assert_list_name(list_name, expected_name, expected_grade)
+                _assert_identity("商品等级", list_grade, expected_grade)
+                refresh_event["matched_row_index"] = row_index
+                refresh_event["matched_product_name"] = list_name
+                refresh_event["matched_grade"] = list_grade
+
+                current_step = "VERIFY_AFTER_SUBMIT"
+                result["current_step"] = current_step
                 after_price, after_price_read_error = _wait_after_submit_price(
                     window, row_index, timeout_seconds, target_price
                 )
@@ -1700,7 +2143,7 @@ def main(args):
                     "business_operation_completed": False,
                     "current_step": current_step,
                     "error_code": "UNKNOWN_ERROR",
-                    "error_message": str(exc),
+                    "error_message": "unexpected runtime error: " + type(exc).__name__,
                     "retryable": False,
                 }
             )

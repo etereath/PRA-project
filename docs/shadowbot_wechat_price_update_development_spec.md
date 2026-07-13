@@ -120,6 +120,16 @@ PRA 负责生成任务、计算 `target_price`、业务审批、调度和结果�
   "old_price": "8.50",
   "target_price": "9.00",
   "verified_price": "9.00",
+  "product_list_refreshes": [
+    {
+      "stage": "BEFORE_PRICE_READ",
+      "refresh_entry": "蚂蚁_首页_商品管理_入口",
+      "status": "SUCCESS",
+      "matched_row_index": 17,
+      "started_at": "2026-06-20T10:00:05+08:00",
+      "ended_at": "2026-06-20T10:00:07+08:00"
+    }
+  ],
   "error_code": "",
   "error_message": "",
   "retryable": false,
@@ -280,18 +290,28 @@ PRA 负责生成任务、计算 `target_price`、业务审批、调度和结果�
    - 未登录：出现“登录”“微信授权”“手机号登录”或二维码等元素。
    - 异常页：出现“网络错误”“加载失败”“重新加载”等元素。
 3. 已登录时记录 `LOGIN_OK` 并继续。
-4. 未登录时允许点击非敏感的“登录/授权”入口，但不得在流程中保存或填写账号密码。
-5. 若需要扫码、验证码、账号选择或隐私授权，截图并进入人工登录等待循环；每 2 秒检查一次首页业务元素，最长等待 `login_wait_seconds`。
-6. 人工完成登录且首页业务元素出现后继续；超时返回 `LOGIN_REQUIRED`，`retryable=false`。人工恢复登录后由 PRA 创建新的 attempt，不在登录状态未知时自动重试。
-7. 网络错误可点击一次“重新加载”；仍失败返回 `NETWORK_OR_LOAD_ERROR`。
+4. 识别到账户密码页时，Worker 先按平台适配配置点击员工账号模式，再通过本机 `CredentialProvider` 自动读取 Windows Credential Manager 的账号密码并填写；凭据不得进入请求、结果、phase、日志、截图、数据库或证据，也不得通过剪贴板输入。
+5. 每个 attempt 最多点击一次登录提交。账号密码错误或提交后仍停留在登录页时返回 `LOGIN_CREDENTIALS_REJECTED`，不得自动重复尝试。
+6. 若出现手机验证码页，写入 `LOGIN_VERIFICATION_REQUIRED` phase；PRA 队列服务调用 `ShadowBotExecutor` 创建幂等人工介入 review，并用既有 `NotificationSender` 通知操作员。
+7. Worker 每 2 秒检查首页“商品管理”入口，操作员仅在小程序内完成验证码；首页出现后继续同一 attempt。等待超过 `login_verification_wait_seconds` 返回 `FAILED/LOGIN_VERIFICATION_TIMEOUT/NOT_STARTED`。
+8. 登录等待阶段检测到 `stop.signal` 时返回 `FAILED/WORKER_STOP_REQUESTED/NOT_STARTED`，不触及价格输入、确认或保存动作。
+9. 网络错误可点击一次“重新加载”；仍失败返回 `NETWORK_OR_LOAD_ERROR`。
 
 ### 7.5 进入商品管理
 
 1. 将 `step_name` 设置为 `OPEN_PRODUCT_MANAGEMENT`。
-2. 若商品管理页标志已经存在，直接进入下一步，避免重复点击。
-3. 否则等待“商品管理”入口可用，再通过元素点击。
+2. 纯导航时可复用已打开的商品管理页；但任何列表价格读取前不得据此跳过刷新。
+3. 价格读取流程必须进入 `REFRESH_PRODUCT_LIST`：等待“商品管理”入口可用并通过元素点击，即使商品列表容器已经存在。
 4. 元素定位失败时依次尝试：深度模式元素、CV 文本/图像锚点、基于稳定锚点的相对位置。
 5. 不允许使用无页面校验的绝对屏幕坐标直接提交业务动作。
+
+### 7.5.1 强制刷新商品列表
+
+1. `READ_ONLY`、`FILL_PREVIEW`、`COMMIT` 和 `RECONCILE` 在首次读取列表价格前必须点击一次“商品管理”，以重新拉取平台数据。
+2. 刷新前必须确认价格弹窗未打开；若存在未清理草稿，返回 `PRODUCT_LIST_REFRESH_FAILED`，不得通过导航丢弃草稿。
+3. 点击后等待列表容器连续两次可见、加载态消失，再重新定位商品行；刷新前的 `row_index` 不得复用。
+4. 刷新事件写入 `product_list_refreshes`，至少记录阶段、开始/结束时间、刷新入口、结果和刷新后匹配行索引。
+5. 提交前刷新失败返回 `FAILED / PRODUCT_LIST_REFRESH_FAILED / NOT_STARTED`；达到 `SUBMIT_INTENT_RECORDED` 后的刷新失败按既有副作用规则进入 `NEEDS_RECONCILIATION / UNKNOWN`。
 
 ### 7.6 等待并验证商品管理页面
 
@@ -399,8 +419,8 @@ PRA 负责生成任务、计算 `target_price`、业务审批、调度和结果�
 ### 7.16 返回列表并复核实际价格
 
 1. 将 `step_name` 设置为 `VERIFY_LIST_PRICE`。
-2. 等待商品管理列表稳定；必要时使用同一 SKU 再搜索。
-3. 再次核对商品身份，并读取该商品行的实际供货价格。
+2. 点击一次“商品管理”执行 `REFRESH_PRODUCT_LIST`，重新定位目标商品并等待列表稳定；同一复核阶段的后续轮询不得重复导航。
+3. 再次核对商品身份，并读取刷新后商品行的实际供货价格。
 4. `verified_price == target_price` 时设置 `side_effect_state=VERIFIED`，截图 `03_after_submit.png`，返回 `SUCCESS`。
 5. 若仍为旧价，刷新一次后复核；仍未更新则设置 `side_effect_state=NOT_APPLIED`，返回 `status=NOT_APPLIED`、`error_code=SUBMIT_NOT_APPLIED`。
 6. 若显示其他价格，设置 `side_effect_state=UNKNOWN`，返回 `POST_SUBMIT_PRICE_MISMATCH`，标记为高优先级人工检查，不自动重试提交。
@@ -695,11 +715,11 @@ python scripts/run_shadowbot_e2e_local_demo.py `
 
 演练结果可通过 Web `/execution-logs` 查看字段、告警、共享证据链接和人工操作入口。该脚本仍使用 `ShadowBotExecutor` 与 `FileDropShadowBotTaskRunner`，不是绕过生产边界的独立模拟器。
 
-仍待完成：
+影刀 OpenAPI 可选路径仍待完成，但不再是当前文件队列方案的上线前置条件：
 
 1. 在真实环境配置影刀 OpenAPI 密钥、应用 `robotUuid` 和机器人账号或机器人分组，并确认机器人处于调度模式。
-2. 真实联调首条链路只执行单个已审批测试商品，并在启动前人工核对审批载荷、旧价和目标价。
-3. 将首条测试商品链路接入真实运行环境做一次完整人工验收。
+2. 若未来启用 OpenAPI，首条联调仍只执行单个已审批测试商品，并在启动前人工核对审批载荷、旧价和目标价。
+3. 若未来启用 OpenAPI，单独完成其 job 启动、终态查询和结果导入验收；当前文件队列实机闭环已经完成。
 4. 影刀主流程需要新增字符串出参 `shadowbot_result_json`，内容为规范中的 ShadowBot 结果 JSON；若实际参数名不同，调用 `poll-yingdao-result --result-param-name ...` 时必须显式传入。
 5. 如采用影刀回调或轮询，应在 `jobUuid` 终态后只负责导入影刀输出 JSON，不得由影刀自动发起 `RECONCILE`。
 
@@ -791,9 +811,9 @@ python scripts\run_shadowbot_executor.py import-result `
 6. 完成证据共享目录/统一存储、SHA-256 计算和目标端复核。
 7. 已在测试商品上验证 `COMMIT` 开发测试版和 `RECONCILE` 只读对账。
 8. 已完成核心故障注入：提交前失败、输入回读失败、提交后结果未知和只读对账。
-9. 接入 PRA 触发、终态查询/回调、证据清单和 `execution_logs` 回写。
-10. 扩展登录、网络、元素失效、证据上传失败等故障注入。
-11. 增加冒烟测试、运行监控和元素版本维护。
+9. 已完成 PRA 文件队列触发、Result Importer、证据清单和 `execution_logs` 回写；OpenAPI 终态查询/回调保留为可选路径。
+10. 已完成登录、网络和证据上传失败实机注入；白屏保留分类单元测试，元素版本漂移仍需专用可重复夹具。
+11. 已完成冒烟测试、heartbeat/phase 监控和 8 小时观察；长期告警、磁盘清理、证据保留和元素版本维护仍需运营样本。
 
 ## 15. 测试用例
 
@@ -873,19 +893,17 @@ python scripts\run_shadowbot_executor.py import-result `
 
 ### 17.1 影刀代码缓存与测试前置要求
 
-影刀设计器不会即时同步外部来源对 `.py` 代码流文件的修改。若使用 Codex、IDE、脚本或其他外部工具修改了影刀应用目录中的 `.py` 文件，并且需要在影刀中测试，必须完整关闭当前影刀应用，再重新打开该应用后运行。
-
-仅关闭流程标签页、重新打开流程树节点、点击保存或直接在当前设计器窗口中测试，均不能视为已经刷新代码。此时影刀可能继续执行旧缓存代码，也可能在保存或运行时把旧缓存内容写回磁盘，覆盖外部工具刚刚写入的新版本。
+影刀设计器不会即时同步外部来源对 `.py` 代码流文件的修改。若使用 Codex、IDE、脚本或其他外部工具修改了影刀应用目录中的 `.py` 文件，不应为了运行测试重新进入编辑器；已打开的设计器可能继续使用旧缓存，也可能在保存或运行时把旧缓存内容写回磁盘，覆盖外部工具刚写入的新版本。
 
 外部修改 `.py` 后的标准测试步骤为：
 
-1. 保存外部代码文件。
-2. 完整关闭当前影刀应用。
-3. 重新打开该影刀应用。
-4. 打开目标流程，确认代码段内容已经刷新。
-5. 再运行测试。
+1. 保存外部代码文件并完成 `sync_shadowbot_test2.py` 同步。
+2. 确认 `test2` 编辑器未打开；若已打开，先完整退出编辑器，不在其中保存或运行。
+3. 回到影刀“应用”主页面，确认目标行名为 `test2`。
+4. 点击该行内圆形“运行应用”图标，直接启动主流程；不以顶部“运行”或编辑器运行作为默认入口。
+5. 流程结束后检查并关闭影刀残留运行窗口，再读取队列结果。
 
-若测试后发现磁盘文件被旧内容覆盖，应立即停止继续运行，从版本记录或备份恢复最新代码，然后按上述步骤重新打开应用验证。
+只有人工捕获元素、修改 `.flow` 或录制时才允许进入编辑器。此类人工修改完成后保存并退出编辑器；下次外部 Python 同步后仍回到应用列表直接运行。若发现磁盘文件被旧内容覆盖，应停止继续运行，从版本记录或备份恢复最新代码，并在编辑器关闭状态下重新同步。
 
 ## 18. 20 步主流程摘要
 
@@ -893,10 +911,10 @@ python scripts\run_shadowbot_executor.py import-result `
 2. 初始化运行日志、业务操作 ID、执行尝试 ID 和证据目录。
 3. 通过 URI 启动小程序，获取、还原并规范化微信窗口。
 4. 判断登录/加载/异常状态，必要时等待人工完成登录。
-5. 进入商品管理；若已在目标页则跳过点击。
-6. 通过多个页面标志等待并验证商品管理页。
-7. 优先按 SKU 搜索，按名称搜索时要求结果唯一。
-8. 在列表中核对名称、等级、规格、SKU 和商品状态。
+5. 进入商品管理；纯导航可复用当前页。
+6. 在每个列表价格读取阶段点击“商品管理”强制刷新并验证稳定页面。
+7. 刷新后重新定位商品；优先按 SKU 搜索，按名称搜索时要求结果唯一。
+8. 在刷新后的列表中核对名称、等级、规格、SKU 和商品状态。
 9. 从已核对商品行进入编辑页。
 10. 验证编辑页并再次核对商品上下文。
 11. 读取供货价格，解析并检查预期旧价。
@@ -906,6 +924,6 @@ python scripts\run_shadowbot_executor.py import-result `
 15. 将提交前截图归档为带存储 URI 和 SHA-256 的证据对象。
 16. `READ_ONLY/FILL_PREVIEW` 返回技术结果，不创建第二次审批；`RECONCILE` 只读核对实际价格。
 17. `COMMIT` 复查不可变指令和 UI 业务值，在最早潜在副作用动作前持久化提交意图，再执行内层确认，并按平台适配配置执行后续保存（如存在）；审批真实性已由 Executor 验证。
-18. 回到列表，按同一 SKU 复核平台实际价格。
+18. 回到列表，点击“商品管理”刷新一次并重新定位同一 SKU，再轮询复核平台实际价格。
 19. 输出统一 JSON；数据库 `success_flag` 仅映射技术运行结果，业务任务只按明确允许完成的状态集合和 `business_operation_completed` 更新。
 20. 异常按副作用阶段分类；保存结果未知时进入 `NEEDS_RECONCILIATION`，返回错误码、证据清单和只读对账建议。

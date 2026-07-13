@@ -338,6 +338,64 @@ class RuntimePersistenceTests(unittest.TestCase):
         self.assertIn({"tag": "a", "text": "👉 点击处理复核", "href": payload["mobile_review_url"]}, flattened)
         self.assertTrue(any("人工复核" in part.get("text", "") for part in flattened))
 
+    def test_feishu_sender_uses_specialized_shadowbot_login_handoff_layout(self) -> None:
+        captured: dict[str, object] = {}
+
+        class FakeResponse:
+            def getcode(self):
+                return 200
+
+            def read(self):
+                return b'{"code":0,"msg":"success"}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+        def fake_urlopen(request, timeout):
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            return FakeResponse()
+
+        log = NotificationLog(
+            notification_id="N-shadowbot-login",
+            related_task_id="TASK-1",
+            related_review_task_id="LOGIN-VERIFY-1",
+            recipient_type="role",
+            recipient="operations",
+            channel="feishu",
+            sent_at=None,
+            send_status=NotificationSendStatus.PENDING.value,
+            dedupe_key="shadowbot-login|1",
+            message="ShadowBot 登录验证码人工接管",
+        )
+        payload = {
+            "notification_kind": "shadowbot_login_verification",
+            "title": "ShadowBot 登录验证码人工接管",
+            "platform_name": "蚂蚁花团供应商",
+            "execution_attempt_id": "ATTEMPT-LOGIN-1",
+            "required_by": "2026-07-12T12:00+08:00",
+            "action": "请在已打开的桌面端微信小程序中完成手机验证码；完成后 Worker 将继续原任务。",
+        }
+        with patch.dict(
+            "os.environ",
+            {"FEISHU_WEBHOOK_URL": "https://open.feishu.test/webhook", "FEISHU_MESSAGE_TYPE": "post"},
+            clear=False,
+        ), patch("app.services.runtime.urlopen", side_effect=fake_urlopen):
+            result = FeishuWebhookNotificationSender().send(log, payload)
+
+        self.assertEqual(result.send_status, NotificationSendStatus.SUCCESS.value)
+        post = captured["body"]["content"]["post"]["zh_cn"]
+        self.assertEqual(post["title"], "ShadowBot 登录验证码人工接管")
+        lines = [part["text"] for row in post["content"] for part in row]
+        self.assertIn("平台：蚂蚁花团供应商", lines)
+        self.assertIn("执行尝试：ATTEMPT-LOGIN-1", lines)
+        self.assertIn("截止时间：2026-07-12T12:00+08:00", lines)
+        self.assertFalse(any(line.startswith("业务日期：") for line in lines))
+        self.assertFalse(any(line.startswith("处理对象：") for line in lines))
+        self.assertFalse(any(line.startswith("原因：") for line in lines))
+
     def test_feishu_sender_failed_response_and_http_exception(self) -> None:
         class FailedResponse:
             def getcode(self):

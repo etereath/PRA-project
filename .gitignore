@@ -18,3 +18,6 @@ test_runtime_tmp/
 .tmp/
 .tmp_*/
 *_backup_before_*.xlsx
+
+# Machine-local credentials for the ShadowBot worker
+shadowbot/test2/shadowbot_credentials.py

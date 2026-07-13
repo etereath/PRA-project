@@ -38,8 +38,8 @@ data/runtime/shadowbot_acceptance.sqlite3
 3. `SHADOWBOT_QUEUE_DIR` 与影刀 `shadowbot_worker_config.json` 指向同一目录。
 4. 共享证据目录可写，并能从 PRA 进程读取。
 5. `inbox/working/results` 没有不明遗留文件，`control/stop.signal` 不存在。
-6. 同步影刀代码后关闭并重新打开 `test2`，避免使用内存中的旧代码。
-7. 影刀应用列表中先选中 `test2`，再点击顶部“运行”或行内“运行应用”。未选中应用时不得根据固定坐标点击。
+6. 同步影刀代码前确认 `test2` 编辑器已关闭；同步后保持在影刀“应用”主页面，避免重新进入编辑器加载旧缓存。
+7. 在应用列表中确认行名为 `test2`，点击该行内圆形“运行应用”图标直接启动主流程。不要使用固定坐标，且不把顶部“运行”作为外部 Python 同步后的默认入口。
 
 ## 4. 标准运行顺序
 

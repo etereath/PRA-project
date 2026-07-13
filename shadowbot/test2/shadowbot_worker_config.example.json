@@ -3,5 +3,15 @@
   "poll_seconds": 3,
   "max_hours": 8,
   "max_tasks": 50,
-  "heartbeat_seconds": 5
+  "heartbeat_seconds": 5,
+  "login_auto_enabled": true,
+  "login_credential_target": "ShadowBot/AntFlowerSupplier",
+  "login_employee_mode_required": true,
+  "login_employee_mode_selector": "登录页_员工按钮",
+  "login_employee_mode_wait_seconds": 1,
+  "login_account_selector": "登录页_账号输入框",
+  "login_password_selector": "登录页_密码输入框",
+  "login_submit_selector": "登录页_登录按钮",
+  "login_verification_wait_seconds": 600,
+  "login_post_submit_wait_seconds": 8
 }

@@ -1098,7 +1098,19 @@ def _build_feishu_review_notification_text_body(
     log: NotificationLog,
     payload: dict[str, object] | None,
 ) -> dict[str, object]:
-    text = str((payload or {}).get("text") or log.message)
+    values = payload or {}
+    if values.get("notification_kind") == "shadowbot_login_verification":
+        text = "\n".join(
+            [
+                str(values.get("title") or "ShadowBot 登录验证码人工接管"),
+                f"平台：{values.get('platform_name') or '-'}",
+                f"执行尝试：{values.get('execution_attempt_id') or '-'}",
+                f"截止时间：{values.get('required_by') or '-'}",
+                str(values.get("action") or "请在已打开的小程序中完成手机验证码。"),
+            ]
+        )
+    else:
+        text = str(values.get("text") or log.message)
     return {
         "msg_type": "text",
         "content": {"text": text},
@@ -1111,6 +1123,17 @@ def _build_feishu_review_notification_post_body(
 ) -> dict[str, object]:
     values = payload or {}
     title = str(values.get("title") or "PRA 复核通知")
+    if values.get("notification_kind") == "shadowbot_login_verification":
+        content: list[list[dict[str, str]]] = [
+            [{"tag": "text", "text": f"平台：{values.get('platform_name') or '-'}"}],
+            [{"tag": "text", "text": f"执行尝试：{values.get('execution_attempt_id') or '-'}"}],
+            [{"tag": "text", "text": f"截止时间：{values.get('required_by') or '-'}"}],
+            [{"tag": "text", "text": str(values.get("action") or "请在已打开的小程序中完成手机验证码。")}],
+        ]
+        return {
+            "msg_type": "post",
+            "content": {"post": {"zh_cn": {"title": title, "content": content}}},
+        }
     if values.get("system_test"):
         content: list[list[dict[str, str]]] = [
             [{"tag": "text", "text": "说明：这是由 /system 手动触发的测试消息。"}],

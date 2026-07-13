@@ -74,7 +74,7 @@ Operation `OP-UNKNOWN-COMMIT-20260709-002` 最终归并为 `VERIFIED`。
 2. Result Importer 从已校验的源请求提取 `evidence_share_dir`、`applet_uri` 与 `window_title`，并作为受限运行上下文传给 Executor 创建的 RECONCILE；Worker、Importer 和 Watchdog 仍不自行创建对账任务。
 3. 手工回归已验证显式 `--queue-dir` 会覆盖冲突的旧环境变量，且自动 RECONCILE 请求会继承 `\\TEST-HOST\pra-evidence`。生产运行仍应从 `local_env.ps1` 加载真实 `SHADOWBOT_EVIDENCE_DIR`。
 
-由于当前 Windows pytest 临时目录权限异常，新增针对性 pytest 未能形成绿色退出码；这是测试运行环境问题，不是通过测试替代实机结论。下一次非副作用 `READ_ONLY` 或独立对账演练应再确认真实共享目录证据上传。
+后续已修复 `.pytest_cache` 和 `%TEMP%\pytest-of-etere` 的 ACL，并在普通 Windows 用户环境完成 4 项定向回归，结果为 `4 passed`。下一次非副作用 `READ_ONLY` 或独立对账演练仍应再确认自动 RECONCILE 在真实共享目录上的证据上传。
 
 ## 最终收尾状态
 

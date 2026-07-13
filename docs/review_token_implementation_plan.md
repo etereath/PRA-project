@@ -15,7 +15,7 @@
 当前仍保持以下边界不变：
 
 - 不接除飞书自定义机器人 Webhook 以外的真实通知渠道
-- 不接真实平台 / RPA
+- Review Token 模块不直接触发真实平台 / RPA；项目层已完成 ShadowBot 文件队列实机实验，当前状态以 [project_current_status.md](project_current_status.md) 为准
 - 不引入 AI Agent 自动复核
 - 不做完整权限系统
 

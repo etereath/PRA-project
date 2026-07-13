@@ -204,6 +204,36 @@ class ShadowBotResultImporter:
         return destination
 
 
+class ShadowBotLoginVerificationMonitor:
+    """Observes active login-verification phases and delegates handoff creation to Executor."""
+
+    def __init__(
+        self,
+        repository: SQLiteRuntimeRepository,
+        runner: ShadowBotTaskRunner,
+        queue_dir: Path,
+    ) -> None:
+        self.executor = ShadowBotExecutor(repository, runner)
+        self.paths = ShadowBotQueuePaths(queue_dir)
+        self.paths.ensure()
+
+    def inspect(self) -> list[dict[str, Any]]:
+        events: list[dict[str, Any]] = []
+        for phase_path in sorted(self.paths.working.glob("*.phase.json")):
+            phase_data = _read_json_object(phase_path)
+            if str(phase_data.get("phase") or "") != "LOGIN_VERIFICATION_REQUIRED":
+                continue
+            review_task_id = self.executor.open_login_verification_handoff(phase_data)
+            events.append(
+                {
+                    "status": "LOGIN_VERIFICATION_HANDOFF_OPEN",
+                    "execution_attempt_id": str(phase_data.get("execution_attempt_id") or ""),
+                    "review_task_id": review_task_id,
+                }
+            )
+        return events
+
+
 class ShadowBotQueueWatchdog:
     """Classify stale workers and working attempts. It never imports result files."""
 

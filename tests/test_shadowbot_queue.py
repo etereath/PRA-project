@@ -23,6 +23,7 @@ from app.services.shadowbot_executor import (
     compute_instruction_hash,
 )
 from app.services.shadowbot_queue import (
+    ShadowBotLoginVerificationMonitor,
     ShadowBotQueueWatchdog,
     ShadowBotResultImporter,
     _read_json_object,
@@ -100,6 +101,43 @@ class ShadowBotQueueTests(unittest.TestCase):
         reason = json.loads(reason_paths[0].read_text(encoding="utf-8"))
         self.assertEqual(reason["error_code"], "RESULT_CONTRACT_INVALID")
         self.assertIn("operation_id mismatch", reason["error_message"])
+
+    def test_login_verification_monitor_creates_one_review_and_notification(self) -> None:
+        prepared, repository, runner, request, _ = self._prepare_attempt("LOGIN-HANDOFF")
+        phase_path = self.queue_dir / "working" / f"{prepared.execution_attempt_id}.phase.json"
+        phase_path.write_text(
+            json.dumps(
+                {
+                    "task_id": request["task_id"],
+                    "operation_id": request["operation_id"],
+                    "execution_attempt_id": prepared.execution_attempt_id,
+                    "execution_mode": request["execution_mode"],
+                    "phase": "LOGIN_VERIFICATION_REQUIRED",
+                    "side_effect_state": "NOT_STARTED",
+                    "login": {
+                        "verification_detected_at": "2026-07-11T12:00:00+08:00",
+                        "verification_deadline_at": "2026-07-11T12:05:00+08:00",
+                        "verification_markers": ["验证码"],
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        monitor = ShadowBotLoginVerificationMonitor(repository, runner, self.queue_dir)
+
+        with patch.dict(os.environ, {"DEFAULT_NOTIFICATION_CHANNEL": "mock"}, clear=False):
+            first_events = monitor.inspect()
+            second_events = monitor.inspect()
+
+        review_task_id = first_events[0]["review_task_id"]
+        review = repository.get_review_task(review_task_id)
+        notifications = repository.list_notification_logs(related_review_task_id=review_task_id)
+        self.assertEqual(first_events[0]["status"], "LOGIN_VERIFICATION_HANDOFF_OPEN")
+        self.assertEqual(second_events[0]["review_task_id"], review_task_id)
+        self.assertEqual(review.review_status.value, "pending")
+        self.assertEqual(len(notifications), 1)
+        self.assertNotIn("password", json.dumps(review.review_payload).lower())
 
     def test_result_importer_retries_transient_io_error_without_quarantine(self) -> None:
         _, repository, runner, request, request_path = self._prepare_attempt("IO-RETRY")

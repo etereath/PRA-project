@@ -73,3 +73,13 @@ Worker 最终 heartbeat 为 `STOPPED`、`processed=3`。按自动停止时间与
 3. 更长周期的告警、磁盘清理、证据保留和服务账号运维验证。
 
 在这些项目完成前，继续保持人工审批、单商品串行、旧价强校验、提交后只读对账和禁止自动重试 COMMIT 的边界。
+
+## 7. 后续同步（2026-07-11）
+
+本节第 6 节是 2026-07-03 验收结束时的历史快照。后续进展如下：
+
+- 提交意图后收到 `stop.signal` 的真实商品样本已于 2026-07-06 完成，COMMIT 未在副作用区退出并最终 `SUCCESS/VERIFIED`。
+- 真实商品 COMMIT 后 UNKNOWN→RECONCILE 全链路已于 2026-07-09 完成，自动对账最终 `VERIFIED`。
+- 仍未完成的项目仅保留更长周期的告警、磁盘清理、证据保留和服务账号运维验证。
+
+当前状态以 [../project_current_status.md](../project_current_status.md) 为准。

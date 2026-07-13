@@ -212,6 +212,37 @@ class ShadowBotExecutorTests(unittest.TestCase):
         self.assertEqual(self.runner.calls, [])
         self.assertIsNone(self.repository.get_shadowbot_operation("OP-1"))
 
+    def test_login_verification_handoff_is_idempotent_and_notifies_without_credentials(self) -> None:
+        self.executor.start_execution(
+            ShadowBotExecutionRequest(
+                operation_id="OP-1",
+                execution_attempt_id="ATTEMPT-LOGIN-1",
+                execution_mode=EXECUTION_MODE_COMMIT,
+                approval=_approval(),
+            )
+        )
+        phase = {
+            "execution_attempt_id": "ATTEMPT-LOGIN-1",
+            "phase": "LOGIN_VERIFICATION_REQUIRED",
+            "login": {
+                "verification_detected_at": "2026-07-11T10:00:00+08:00",
+                "verification_deadline_at": "2026-07-11T10:05:00+08:00",
+                "verification_markers": ["验证码"],
+            },
+        }
+        with patch.dict(os.environ, {"DEFAULT_NOTIFICATION_CHANNEL": "mock"}, clear=False):
+            first = self.executor.open_login_verification_handoff(phase)
+            second = self.executor.open_login_verification_handoff(phase)
+
+        review = self.repository.get_review_task(first)
+        notifications = self.repository.list_notification_logs(related_review_task_id=first)
+        self.assertEqual(first, second)
+        self.assertEqual(review.review_status, ReviewTaskStatus.PENDING)
+        self.assertEqual(len(notifications), 1)
+        self.assertNotIn("password", str(review.review_payload).lower())
+        self.assertIn("ShadowBot 登录验证码人工接管", notifications[0].message)
+        self.assertNotIn("Please complete", notifications[0].message)
+
     def test_start_execution_requires_persisted_approved_review_task(self) -> None:
         approval = _approval()
         approval.approval_id = "MISSING-APPROVAL"
