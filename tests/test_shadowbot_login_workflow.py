@@ -131,6 +131,49 @@ def test_single_auto_login_submission_transitions_to_manual_verification_without
     assert result["login"]["verification_completed"] is True
 
 
+def test_provider_error_code_crosses_login_boundary_only_when_allowlisted():
+    class ProviderFailure(Exception):
+        def __init__(self, error_code: str) -> None:
+            super().__init__("secret provider detail must not cross the boundary")
+            self.error_code = error_code
+
+    config = {
+        "auto_enabled": True,
+        "employee_mode_required": False,
+        "account_selector": "account",
+        "password_selector": "password",
+        "submit_selector": "submit",
+        "post_submit_wait_seconds": 1,
+        "verification_wait_seconds": 1,
+    }
+
+    def failing_provider(code: str):
+        def get_login_credentials():
+            raise ProviderFailure(code)
+
+        return SimpleNamespace(get_login_credentials=get_login_credentials)
+
+    for code, expected in (
+        ("CREDENTIAL_NOT_FOUND", "CREDENTIAL_NOT_FOUND"),
+        ("UNSAFE_PROVIDER_DETAIL", None),
+    ):
+        namespace = _load_login_helpers()
+        result: dict[str, object] = {}
+        try:
+            namespace["_attempt_automatic_login"](
+                object(), {}, result, 1, config, failing_provider(code), ["登录"]
+            )
+        except SliceError as exc:
+            assert exc.code == "LOGIN_CREDENTIALS_UNAVAILABLE"
+        else:
+            raise AssertionError("expected provider failure")
+        if expected is None:
+            assert "provider_error_code" not in result
+        else:
+            assert result["provider_error_code"] == expected
+        assert "secret provider detail" not in repr(result)
+
+
 def test_unresolved_post_submit_login_state_uses_manual_verification_not_credential_rejection():
     class SubmitElement:
         def click(self) -> None:
