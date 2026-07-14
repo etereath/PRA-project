@@ -12,6 +12,7 @@ from app.enums import PricingSource, ReviewTaskStatus, TaskActionType, TaskStatu
 from app.models import (
     ExecutionLog,
     NotificationLog,
+    RetryAuthorization,
     ReviewTask,
     ReviewToken,
     ScriptRun,
@@ -22,10 +23,17 @@ from app.models import (
     Task,
     TaskStatusHistory,
 )
+from app.runtime_schema import (
+    LATEST_RUNTIME_SCHEMA_VERSION,
+    REQUIRED_RUNTIME_TABLES,
+    RETRY_AUTHORIZATION_INDEXES,
+    RuntimeSchemaHealth,
+    V5_REQUIRED_COLUMNS,
+    inspect_runtime_schema,
+)
 from app.utils import serialize_decimal
 
 
-SCHEMA_VERSION = 4
 TERMINAL_TASK_STATUSES = ("success", "skipped", "cancelled", "expired")
 
 
@@ -269,6 +277,47 @@ SCHEMA_SQL = [
         FOREIGN KEY(execution_attempt_id) REFERENCES shadowbot_execution_attempts(execution_attempt_id)
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS retry_authorizations (
+        retry_authorization_id TEXT PRIMARY KEY,
+        operation_id TEXT NOT NULL,
+        source_execution_attempt_id TEXT NOT NULL,
+        authorization_type TEXT NOT NULL,
+        authorized_by TEXT NOT NULL,
+        evidence_type TEXT NOT NULL,
+        evidence_hash TEXT NOT NULL,
+        approved_payload_hash TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'CONSUMED', 'EXPIRED', 'REVOKED')),
+        max_uses INTEGER NOT NULL DEFAULT 1 CHECK (max_uses = 1),
+        consumed_by_execution_attempt_id TEXT,
+        expires_at TEXT NOT NULL,
+        reason TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        consumed_at TEXT,
+        FOREIGN KEY(operation_id) REFERENCES shadowbot_operations(operation_id),
+        FOREIGN KEY(source_execution_attempt_id) REFERENCES shadowbot_execution_attempts(execution_attempt_id)
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_retry_authorizations_evidence_hash
+    ON retry_authorizations(evidence_hash)
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_retry_authorizations_consumed_by_execution_attempt_id
+    ON retry_authorizations(consumed_by_execution_attempt_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_retry_authorizations_operation_id
+    ON retry_authorizations(operation_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_retry_authorizations_status
+    ON retry_authorizations(status)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_retry_authorizations_expires_at
+    ON retry_authorizations(expires_at)
+    """,
 ]
 
 
@@ -290,48 +339,56 @@ class SQLiteRuntimeRepository:
             _ensure_column(connection, "shadowbot_execution_attempts", "instruction_hash", "TEXT NOT NULL DEFAULT ''")
             _ensure_column(connection, "shadowbot_execution_attempts", "request_file_sha256", "TEXT NOT NULL DEFAULT ''")
             _ensure_column(connection, "shadowbot_execution_attempts", "queue_request_path", "TEXT NOT NULL DEFAULT ''")
+            migration_notes = {
+                1: "initial runtime schema",
+                2: "review token runtime schema",
+                3: "business rule evaluation runtime schema",
+                4: "shadowbot executor runtime schema",
+                5: "retry authorization persistence and shadowbot file queue audit fields",
+            }
+            for version in range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1):
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO runtime_schema_migrations(schema_version, applied_at, note)
+                    VALUES (?, ?, ?)
+                    """,
+                    (version, _datetime_to_text(datetime.now()), migration_notes[version]),
+                )
+            # Older builds recorded v5 for queue audit columns only.  Keep the
+            # applied timestamp stable while correcting the descriptive record
+            # so migration history reflects the complete physical v5 shape.
             connection.execute(
-                """
-                INSERT OR IGNORE INTO runtime_schema_migrations(schema_version, applied_at, note)
-                VALUES (?, ?, ?)
-                """,
-                (1, _datetime_to_text(datetime.now()), "initial runtime schema"),
-            )
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO runtime_schema_migrations(schema_version, applied_at, note)
-                VALUES (?, ?, ?)
-                """,
-                (2, _datetime_to_text(datetime.now()), "review token runtime schema"),
-            )
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO runtime_schema_migrations(schema_version, applied_at, note)
-                VALUES (?, ?, ?)
-                """,
-                (3, _datetime_to_text(datetime.now()), "business rule evaluation runtime schema"),
-            )
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO runtime_schema_migrations(schema_version, applied_at, note)
-                VALUES (?, ?, ?)
-                """,
-                (4, _datetime_to_text(datetime.now()), "shadowbot executor runtime schema"),
-            )
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO runtime_schema_migrations(schema_version, applied_at, note)
-                VALUES (?, ?, ?)
-                """,
-                (5, _datetime_to_text(datetime.now()), "shadowbot file queue audit fields"),
+                "UPDATE runtime_schema_migrations SET note = ? WHERE schema_version = 5",
+                (migration_notes[5],),
             )
 
     def schema_versions(self) -> list[int]:
+        if not self.db_path.exists():
+            return []
         with closing(self.connect()) as connection:
             rows = connection.execute(
                 "SELECT schema_version FROM runtime_schema_migrations ORDER BY schema_version"
             ).fetchall()
         return [int(row["schema_version"]) for row in rows]
+
+    def check_schema_health(self) -> RuntimeSchemaHealth:
+        """Return a non-mutating exact-v5 schema health report."""
+
+        if not self.db_path.exists():
+            with closing(sqlite3.connect(":memory:")) as connection:
+                return inspect_runtime_schema(connection)
+        with closing(self.connect()) as connection:
+            return inspect_runtime_schema(connection)
+
+    def runtime_schema_health(self) -> RuntimeSchemaHealth:
+        """Alias used by operational callers that name the report directly."""
+
+        return self.check_schema_health()
+
+    def health_check(self) -> RuntimeSchemaHealth:
+        """Alias used by HTTP/CLI health-check adapters."""
+
+        return self.check_schema_health()
 
     def insert_tasks(self, tasks: Iterable[Task]) -> int:
         rows = [_task_to_row(task) for task in tasks]
@@ -979,6 +1036,48 @@ class SQLiteRuntimeRepository:
             ).fetchone()
         return _row_to_shadowbot_checkpoint(row) if row is not None else None
 
+    def insert_retry_authorization(self, authorization: RetryAuthorization) -> int:
+        row = _retry_authorization_to_row(authorization)
+        with closing(self.connect()) as connection, connection:
+            before = connection.total_changes
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO retry_authorizations(
+                    retry_authorization_id, operation_id, source_execution_attempt_id,
+                    authorization_type, authorized_by, evidence_type, evidence_hash,
+                    approved_payload_hash, status, max_uses, consumed_by_execution_attempt_id,
+                    expires_at, reason, created_at, consumed_at
+                )
+                VALUES(
+                    :retry_authorization_id, :operation_id, :source_execution_attempt_id,
+                    :authorization_type, :authorized_by, :evidence_type, :evidence_hash,
+                    :approved_payload_hash, :status, :max_uses, :consumed_by_execution_attempt_id,
+                    :expires_at, :reason, :created_at, :consumed_at
+                )
+                """,
+                row,
+            )
+            return connection.total_changes - before
+
+    def get_retry_authorization(self, retry_authorization_id: str) -> RetryAuthorization | None:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM retry_authorizations WHERE retry_authorization_id = ?",
+                (retry_authorization_id,),
+            ).fetchone()
+        return _row_to_retry_authorization(row) if row is not None else None
+
+    def list_retry_authorizations(self, *, operation_id: str | None = None) -> list[RetryAuthorization]:
+        query = "SELECT * FROM retry_authorizations"
+        params: tuple[str, ...] = ()
+        if operation_id:
+            query += " WHERE operation_id = ?"
+            params = (operation_id,)
+        query += " ORDER BY created_at, retry_authorization_id"
+        with closing(self.connect()) as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [_row_to_retry_authorization(row) for row in rows]
+
     def insert_notification_logs(self, logs: Iterable[NotificationLog]) -> int:
         rows = [_notification_log_to_row(log) for log in logs]
         if not rows:
@@ -1381,6 +1480,52 @@ def _row_to_shadowbot_checkpoint(row: sqlite3.Row) -> ShadowBotSideEffectCheckpo
         side_effect_state=str(row["side_effect_state"]),
         checkpoint_at=_text_to_datetime(row["checkpoint_at"]) or datetime.now(),
         version=int(row["version"]),
+    )
+
+
+def _retry_authorization_to_row(authorization: RetryAuthorization) -> dict[str, Any]:
+    created_at = authorization.created_at or datetime.now()
+    expires_at = authorization.expires_at or created_at
+    return {
+        "retry_authorization_id": authorization.retry_authorization_id,
+        "operation_id": authorization.operation_id,
+        "source_execution_attempt_id": authorization.source_execution_attempt_id,
+        "authorization_type": authorization.authorization_type,
+        "authorized_by": authorization.authorized_by,
+        "evidence_type": authorization.evidence_type,
+        "evidence_hash": authorization.evidence_hash,
+        "approved_payload_hash": authorization.approved_payload_hash,
+        "status": authorization.status,
+        "max_uses": authorization.max_uses,
+        "consumed_by_execution_attempt_id": authorization.consumed_by_execution_attempt_id,
+        "expires_at": _datetime_to_text(expires_at),
+        "reason": authorization.reason,
+        "created_at": _datetime_to_text(created_at),
+        "consumed_at": _datetime_to_text(authorization.consumed_at),
+    }
+
+
+def _row_to_retry_authorization(row: sqlite3.Row) -> RetryAuthorization:
+    return RetryAuthorization(
+        retry_authorization_id=str(row["retry_authorization_id"]),
+        operation_id=str(row["operation_id"]),
+        source_execution_attempt_id=str(row["source_execution_attempt_id"]),
+        authorization_type=str(row["authorization_type"]),
+        authorized_by=str(row["authorized_by"]),
+        evidence_type=str(row["evidence_type"]),
+        evidence_hash=str(row["evidence_hash"]),
+        approved_payload_hash=str(row["approved_payload_hash"]),
+        status=str(row["status"]),
+        max_uses=int(row["max_uses"]),
+        consumed_by_execution_attempt_id=(
+            str(row["consumed_by_execution_attempt_id"])
+            if row["consumed_by_execution_attempt_id"] is not None
+            else None
+        ),
+        expires_at=_text_to_datetime(row["expires_at"]),
+        reason=str(row["reason"] or ""),
+        created_at=_text_to_datetime(row["created_at"]),
+        consumed_at=_text_to_datetime(row["consumed_at"]),
     )
 
 

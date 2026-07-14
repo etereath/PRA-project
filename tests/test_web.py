@@ -98,6 +98,30 @@ class WebTests(unittest.TestCase):
     def setUp(self) -> None:
         _RUNTIME_SESSIONS.clear()
 
+    def test_health_ignores_request_runtime_db_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            healthy_db = root / "trusted.sqlite3"
+            attacker_db = root / "attacker.sqlite3"
+            SQLiteRuntimeRepository(healthy_db).init_schema()
+
+            with patch("app.web.DEFAULT_RUNTIME_DB", healthy_db):
+                status, _, body = self._call_app(
+                    path="/health",
+                    query=urlencode({"runtime_db": str(attacker_db)}),
+                )
+            self.assertEqual(status, "200 OK")
+            self.assertEqual(body, "ok")
+            self.assertFalse(attacker_db.exists())
+
+            with patch("app.web.DEFAULT_RUNTIME_DB", attacker_db):
+                status, _, body = self._call_app(
+                    path="/health",
+                    query=urlencode({"runtime_db": str(healthy_db)}),
+                )
+            self.assertEqual(status, "503 Service Unavailable")
+            self.assertIn("unhealthy", body)
+
     def _runtime_login(self, db_path: Path, *, username: str = "admin", password: str = "secret") -> str:
         status, headers, _ = self._call_app(
             path="/runtime/login",
