@@ -34,14 +34,16 @@ $env:SHADOWBOT_WORKER_MAX_TASKS = "50"
 
 ### 登录凭据与手机验证码
 
-账号密码不属于 PRA 请求参数。Worker 只在本机运行时通过 Windows Credential Manager 读取 Generic Credential；默认目标名为 `ShadowBot/AntFlowerSupplier`，`UserName` 保存平台账号，`CredentialBlob` 保存密码。不得把账号或密码写入 `local_env.ps1`、请求、结果、phase、日志、截图、SQLite 或证据目录。
+账号密码不属于 PRA 请求参数。Worker 只在本机运行时通过受版本控制的 `shadowbot/test2/shadowbot_credentials.py`，按部署配置的单一 target 从 Windows Credential Manager 读取 Generic Credential；仓库不保存真实 target、账号或密码。`UserName` 保存平台账号，`CredentialBlob` 保存密码。不得把账号或密码写入 `local_env.ps1`、请求、结果、phase、日志、截图、SQLite 或证据目录。
+
+provider 使用 Python 标准库 `ctypes` 调用 `CredReadW`/`CredFree`，不依赖影刀运行时是否安装 pywin32，也不会枚举 Credential Manager。读取失败只返回稳定的非敏感错误码：`CREDENTIAL_TARGET_MISSING`、`CREDENTIAL_MANAGER_UNAVAILABLE`、`CREDENTIAL_NOT_FOUND`、`CREDENTIAL_ACCESS_DENIED`、`CREDENTIAL_FORMAT_INVALID` 或 `CREDENTIAL_READ_FAILED`；错误文本不包含 target、账号、密码或 `CredentialBlob`。
 
 影刀 `shadowbot_worker_config.json` 必须在人工捕获后配置以下三个元素名称：
 
 ```json
 {
   "login_auto_enabled": true,
-  "login_credential_target": "ShadowBot/AntFlowerSupplier",
+  "login_credential_target": "",
   "login_employee_mode_required": true,
   "login_employee_mode_selector": "登录页_员工按钮",
   "login_account_selector": "登录页_账号输入框",
@@ -50,6 +52,13 @@ $env:SHADOWBOT_WORKER_MAX_TASKS = "50"
   "login_verification_wait_seconds": 600
 }
 ```
+
+将 `login_credential_target` 仅写入部署机未纳入版本控制的 `shadowbot_worker_config.json`，例如使用组织内部约定的 `ShadowBot/<deployment-target>`（不要把真实 target 回填到仓库、日志或交接记录）。在同一 Windows 用户上下文中创建 Generic Credential，并按以下步骤验证：
+
+1. 先运行 `python scripts\sync_shadowbot_test2.py --check`，确认 provider 与 Worker 源文件哈希一致；需要同步时运行不带 `--check` 的命令。
+2. 在目标 Windows 主机以部署用户执行 `cmdkey /add:<deployment-target> /user:<deployment-user> /pass:<deployment-password>`，随后启动 Worker；实际命令中的 target、用户名和密码不得写入日志或交接记录。
+3. 投递一个脱敏的登录测试请求，确认结果为成功或 `LOGIN_CREDENTIALS_UNAVAILABLE`/`LOGIN_CREDENTIALS_REJECTED` 等稳定登录错误；检查请求 JSON、结果、phase、日志和证据目录均不含账号、密码、`CredentialBlob` 或明文 target。
+4. 测试结束后用 `cmdkey /delete:<deployment-target>` 清理受控测试凭据，并删除部署机上的未跟踪 `shadowbot_worker_config.json` 副本（若不再使用）。
 
 蚂蚁花团供应商的员工账号需要先点击“员工”模式按钮，再填写账号密码；该点击仅记录无敏感状态，失败时返回 `LOGIN_AUTOFILL_FAILED`，不会尝试其他登录模式。Worker 每个 attempt 最多提交一次账号密码登录。账号和密码仅使用元素原生输入方法，禁止走剪贴板输入，避免进入 Windows 剪贴板历史。识别到手机验证码后写 `LOGIN_VERIFICATION_REQUIRED` phase；PRA 队列服务创建唯一人工介入 review 和通知。该通知使用专用标题“ShadowBot 登录验证码人工接管”，仅展示平台、执行尝试、截止时间和操作提示，不复用通用业务复核的业务日期、处理对象和原因字段。操作员只在由 Worker 打开或此前已存在的小程序中完成验证码，不向 PRA、影刀请求或飞书回复验证码。首页“商品管理”入口重新出现后，Worker 继续同一 attempt。等待超时返回 `FAILED/LOGIN_VERIFICATION_TIMEOUT/NOT_STARTED`；账号密码错误返回 `LOGIN_CREDENTIALS_REJECTED`，均不自动重试。
 

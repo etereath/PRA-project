@@ -95,7 +95,9 @@ def _load_config(args):
     config.setdefault("heartbeat_seconds", 5)
     config.setdefault("allow_fault_injection", False)
     config.setdefault("login_auto_enabled", True)
-    config.setdefault("login_credential_target", "ShadowBot/AntFlowerSupplier")
+    # Credential targets are machine-local identifiers.  Keep the repository
+    # default empty so a deployment must configure its own target explicitly.
+    config.setdefault("login_credential_target", "")
     config.setdefault("login_employee_mode_required", True)
     config.setdefault("login_employee_mode_selector", "登录页_员工按钮")
     config.setdefault("login_employee_mode_wait_seconds", 1)
@@ -314,6 +316,14 @@ class QueueWorker:
                 "_stop_signal_path": str(self.stop_signal),
             }
         )
+        # Keep runtime-only objects (provider/config) out of request_json.  The
+        # two underscore-prefixed paths are safe control metadata consumed by
+        # the flow for phase writes and stop checks.
+        runtime_request = {
+            key: value
+            for key, value in runtime_request.items()
+            if not key.startswith("_") or key in {"_phase_file_path", "_stop_signal_path"}
+        }
         try:
             if __package__:
                 from . import vertical_slice_read_price

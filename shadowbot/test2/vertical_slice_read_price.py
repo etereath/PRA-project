@@ -55,6 +55,34 @@ DEFAULT_REQUEST = {
 
 TZ_SHANGHAI = timezone(timedelta(hours=8))
 
+_SAFE_LOGIN_PHASE_FIELDS = frozenset(
+    {
+        "verification_required",
+        "verification_detected_at",
+        "verification_deadline_at",
+        "verification_markers",
+        "verification_completed_at",
+        "verification_completed",
+        "employee_mode_clicked",
+        "employee_mode_clicked_at",
+        "account_password_submitted",
+        "account_password_submitted_at",
+        "login_markers",
+        "login_completed_at",
+    }
+)
+_SENSITIVE_OUTPUT_KEYS = frozenset(
+    {
+        "account",
+        "password",
+        "username",
+        "credentialblob",
+        "credential_target",
+        "credential_provider",
+        "_credential_provider",
+    }
+)
+
 
 class SliceError(Exception):
     def __init__(self, code, message, retryable=False):
@@ -66,6 +94,30 @@ class SliceError(Exception):
 
 def _now_iso():
     return datetime.now(TZ_SHANGHAI).isoformat(timespec="seconds")
+
+
+def _safe_login_phase_snapshot(login_state):
+    """Keep phase files limited to non-secret login state fields."""
+    if not isinstance(login_state, dict):
+        return {}
+    return {
+        key: value
+        for key, value in login_state.items()
+        if key in _SAFE_LOGIN_PHASE_FIELDS
+    }
+
+
+def _safe_output_payload(value):
+    """Recursively remove credential-shaped fields before output/logging."""
+    if isinstance(value, dict):
+        return {
+            key: _safe_output_payload(item)
+            for key, item in value.items()
+            if str(key).lower() not in _SENSITIVE_OUTPUT_KEYS
+        }
+    if isinstance(value, list):
+        return [_safe_output_payload(item) for item in value]
+    return value
 
 
 def _replace_file_with_retry(source, destination, max_attempts=8):
@@ -101,9 +153,9 @@ def _write_phase(request, result, phase, include_result_snapshot=False):
         "updated_at": _now_iso(),
     }
     if include_result_snapshot:
-        payload["result_snapshot"] = dict(result)
+        payload["result_snapshot"] = _safe_output_payload(dict(result))
     if isinstance(result.get("login"), dict):
-        payload["login"] = dict(result["login"])
+        payload["login"] = _safe_login_phase_snapshot(result["login"])
     os.makedirs(os.path.dirname(phase_path), exist_ok=True)
     temporary = phase_path + ".tmp_" + uuid.uuid4().hex
     with open(temporary, "w", encoding="utf-8") as file_obj:
@@ -1644,8 +1696,9 @@ def _result_output_path(execution_attempt_id):
 def _set_result(args, result):
     result_path = _result_output_path(result.get("execution_attempt_id", "result"))
     os.makedirs(os.path.dirname(result_path), exist_ok=True)
-    result["result_path"] = result_path
-    result_json = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    safe_result = _safe_output_payload(dict(result))
+    safe_result["result_path"] = result_path
+    result_json = json.dumps(safe_result, ensure_ascii=False, separators=(",", ":"))
     with open(result_path, "w", encoding="utf-8") as file_obj:
         file_obj.write(result_json)
     if args is not None:

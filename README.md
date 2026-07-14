@@ -26,6 +26,18 @@ PRA 是面向鲜切花预测性销售与多平台执行任务的运行态运营�
 - 不引入 React/Vue 或前后端分离。
 - 不做完整权限系统。
 
+## ShadowBot 凭据与可复部署
+
+ShadowBot 的凭据 provider 位于 `shadowbot/test2/shadowbot_credentials.py`，随仓库提交且只通过 Python 标准库 `ctypes` 按单一 target 调用 Windows Credential Manager 的 `CredReadW`。仓库不保存真实 credential target、账号、密码或 `CredentialBlob`；影刀应用目录中的 `shadowbot_worker_config.json` 必须在部署机本地填写 `login_credential_target`，不要提交该文件。
+
+部署和验证步骤见 [docs/shadowbot_file_queue_operations.md](docs/shadowbot_file_queue_operations.md)。最小的代码同步检查为：
+
+```powershell
+python scripts\sync_shadowbot_test2.py --check
+```
+
+provider 在凭据缺失、权限不足、Credential Manager 不可用或记录格式错误时只返回稳定的非敏感错误码，不把 target、账号、密码或 `CredentialBlob` 写入请求、结果、phase、日志、SQLite、截图或证据目录。登录字段继续使用元素原生输入 API，禁止剪贴板输入。
+
 更完整的状态说明见 [docs/project_current_status.md](docs/project_current_status.md)。
 
 ## 快速启动

@@ -5,7 +5,7 @@
   "max_tasks": 50,
   "heartbeat_seconds": 5,
   "login_auto_enabled": true,
-  "login_credential_target": "ShadowBot/AntFlowerSupplier",
+  "login_credential_target": "",
   "login_employee_mode_required": true,
   "login_employee_mode_selector": "登录页_员工按钮",
   "login_employee_mode_wait_seconds": 1,
