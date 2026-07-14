@@ -12,6 +12,18 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
+SAFE_PROVIDER_ERROR_CODES = frozenset(
+    {
+        "CREDENTIAL_TARGET_MISSING",
+        "CREDENTIAL_MANAGER_UNAVAILABLE",
+        "CREDENTIAL_NOT_FOUND",
+        "CREDENTIAL_ACCESS_DENIED",
+        "CREDENTIAL_FORMAT_INVALID",
+        "CREDENTIAL_READ_FAILED",
+    }
+)
+
+
 INSTRUCTION_HASH_FIELDS = (
     "task_id",
     "operation_id",
@@ -95,7 +107,9 @@ def _load_config(args):
     config.setdefault("heartbeat_seconds", 5)
     config.setdefault("allow_fault_injection", False)
     config.setdefault("login_auto_enabled", True)
-    config.setdefault("login_credential_target", "ShadowBot/AntFlowerSupplier")
+    # Credential targets are machine-local identifiers.  Keep the repository
+    # default empty so a deployment must configure its own target explicitly.
+    config.setdefault("login_credential_target", "")
     config.setdefault("login_employee_mode_required", True)
     config.setdefault("login_employee_mode_selector", "登录页_员工按钮")
     config.setdefault("login_employee_mode_wait_seconds", 1)
@@ -138,6 +152,7 @@ class QueueWorker:
             "post_submit_wait_seconds": max(float(config.get("login_post_submit_wait_seconds", 8)), 1.0),
         }
         self.login_credential_target = str(config.get("login_credential_target") or "").strip()
+        self.credential_provider_error_code = ""
         self.credential_provider = self._build_credential_provider()
         self._stop_heartbeat = threading.Event()
         self._heartbeat_write_failures = 0
@@ -312,8 +327,18 @@ class QueueWorker:
                 "worker_id": self.worker_id,
                 "_phase_file_path": str(phase_path),
                 "_stop_signal_path": str(self.stop_signal),
+                "_provider_error_code": self.credential_provider_error_code,
             }
         )
+        # Keep runtime-only objects (provider/config) out of request_json.  The
+        # two underscore-prefixed paths are safe control metadata consumed by
+        # the flow for phase writes and stop checks.
+        runtime_request = {
+            key: value
+            for key, value in runtime_request.items()
+            if not key.startswith("_")
+            or key in {"_phase_file_path", "_stop_signal_path", "_provider_error_code"}
+        }
         try:
             if __package__:
                 from . import vertical_slice_read_price
@@ -340,6 +365,11 @@ class QueueWorker:
                 "error_message": "worker execution failed: " + type(exc).__name__,
                 "retryable": False,
             }
+        provider_error_code = str(result.get("provider_error_code") or "").strip()
+        if provider_error_code in SAFE_PROVIDER_ERROR_CODES:
+            result["provider_error_code"] = provider_error_code
+        else:
+            result.pop("provider_error_code", None)
         result.update(
             {
                 "schema_version": "shadowbot-result-1.0",
@@ -367,7 +397,10 @@ class QueueWorker:
             else:
                 from shadowbot_credentials import WindowsCredentialManagerProvider
             return WindowsCredentialManagerProvider(self.login_credential_target)
-        except Exception:
+        except Exception as exc:
+            provider_error_code = str(getattr(exc, "error_code", "") or "").strip()
+            if provider_error_code in SAFE_PROVIDER_ERROR_CODES:
+                self.credential_provider_error_code = provider_error_code
             return None
 
     def _write_phase(self, request, phase_path, phase, side_effect_state, request_sha256):

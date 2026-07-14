@@ -55,6 +55,44 @@ DEFAULT_REQUEST = {
 
 TZ_SHANGHAI = timezone(timedelta(hours=8))
 
+_SAFE_LOGIN_PHASE_FIELDS = frozenset(
+    {
+        "verification_required",
+        "verification_detected_at",
+        "verification_deadline_at",
+        "verification_markers",
+        "verification_completed_at",
+        "verification_completed",
+        "employee_mode_clicked",
+        "employee_mode_clicked_at",
+        "account_password_submitted",
+        "account_password_submitted_at",
+        "login_markers",
+        "login_completed_at",
+    }
+)
+_SENSITIVE_OUTPUT_KEYS = frozenset(
+    {
+        "account",
+        "password",
+        "username",
+        "credentialblob",
+        "credential_target",
+        "credential_provider",
+        "_credential_provider",
+    }
+)
+_SAFE_PROVIDER_ERROR_CODES = frozenset(
+    {
+        "CREDENTIAL_TARGET_MISSING",
+        "CREDENTIAL_MANAGER_UNAVAILABLE",
+        "CREDENTIAL_NOT_FOUND",
+        "CREDENTIAL_ACCESS_DENIED",
+        "CREDENTIAL_FORMAT_INVALID",
+        "CREDENTIAL_READ_FAILED",
+    }
+)
+
 
 class SliceError(Exception):
     def __init__(self, code, message, retryable=False):
@@ -66,6 +104,30 @@ class SliceError(Exception):
 
 def _now_iso():
     return datetime.now(TZ_SHANGHAI).isoformat(timespec="seconds")
+
+
+def _safe_login_phase_snapshot(login_state):
+    """Keep phase files limited to non-secret login state fields."""
+    if not isinstance(login_state, dict):
+        return {}
+    return {
+        key: value
+        for key, value in login_state.items()
+        if key in _SAFE_LOGIN_PHASE_FIELDS
+    }
+
+
+def _safe_output_payload(value):
+    """Recursively remove credential-shaped fields before output/logging."""
+    if isinstance(value, dict):
+        return {
+            key: _safe_output_payload(item)
+            for key, item in value.items()
+            if str(key).lower() not in _SENSITIVE_OUTPUT_KEYS
+        }
+    if isinstance(value, list):
+        return [_safe_output_payload(item) for item in value]
+    return value
 
 
 def _replace_file_with_retry(source, destination, max_attempts=8):
@@ -101,9 +163,9 @@ def _write_phase(request, result, phase, include_result_snapshot=False):
         "updated_at": _now_iso(),
     }
     if include_result_snapshot:
-        payload["result_snapshot"] = dict(result)
+        payload["result_snapshot"] = _safe_output_payload(dict(result))
     if isinstance(result.get("login"), dict):
-        payload["login"] = dict(result["login"])
+        payload["login"] = _safe_login_phase_snapshot(result["login"])
     os.makedirs(os.path.dirname(phase_path), exist_ok=True)
     temporary = phase_path + ".tmp_" + uuid.uuid4().hex
     with open(temporary, "w", encoding="utf-8") as file_obj:
@@ -697,7 +759,24 @@ def _wait_for_manual_login_verification(window, request, result, timeout_seconds
 def _attempt_automatic_login(window, request, result, timeout_seconds, login_config, credential_provider, markers):
     if not bool(_login_config_value(login_config, "auto_enabled", True)):
         raise SliceError("LOGIN_REQUIRED", "automatic login is disabled", retryable=False)
+    safe_provider_error_codes = frozenset(
+        {
+            "CREDENTIAL_TARGET_MISSING",
+            "CREDENTIAL_MANAGER_UNAVAILABLE",
+            "CREDENTIAL_NOT_FOUND",
+            "CREDENTIAL_ACCESS_DENIED",
+            "CREDENTIAL_FORMAT_INVALID",
+            "CREDENTIAL_READ_FAILED",
+        }
+    )
+    provider_error_code = ""
+    if isinstance(request, dict):
+        provider_error_code = str(request.get("_provider_error_code", "") or "").strip()
+    if provider_error_code not in safe_provider_error_codes:
+        provider_error_code = ""
     if credential_provider is None:
+        if provider_error_code:
+            result["provider_error_code"] = provider_error_code
         raise SliceError("LOGIN_CREDENTIALS_UNAVAILABLE", "credential provider is unavailable", retryable=False)
     employee_mode_required = bool(_login_config_value(login_config, "employee_mode_required", False))
     employee_mode_selector = str(_login_config_value(login_config, "employee_mode_selector", "")).strip()
@@ -715,6 +794,11 @@ def _attempt_automatic_login(window, request, result, timeout_seconds, login_con
     try:
         credentials = credential_provider.get_login_credentials()
     except Exception as exc:
+        provider_error_code = str(getattr(exc, "error_code", "") or "").strip()
+        if provider_error_code not in safe_provider_error_codes:
+            provider_error_code = ""
+        if provider_error_code:
+            result["provider_error_code"] = provider_error_code
         raise SliceError(
             "LOGIN_CREDENTIALS_UNAVAILABLE",
             "credential provider failed: " + type(exc).__name__,
@@ -1644,8 +1728,9 @@ def _result_output_path(execution_attempt_id):
 def _set_result(args, result):
     result_path = _result_output_path(result.get("execution_attempt_id", "result"))
     os.makedirs(os.path.dirname(result_path), exist_ok=True)
-    result["result_path"] = result_path
-    result_json = json.dumps(result, ensure_ascii=False, separators=(",", ":"))
+    safe_result = _safe_output_payload(dict(result))
+    safe_result["result_path"] = result_path
+    result_json = json.dumps(safe_result, ensure_ascii=False, separators=(",", ":"))
     with open(result_path, "w", encoding="utf-8") as file_obj:
         file_obj.write(result_json)
     if args is not None:

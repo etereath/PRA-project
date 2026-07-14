@@ -2,6 +2,7 @@ from pathlib import Path
 import importlib.util
 import sys
 import ast
+import subprocess
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "shadowbot" / "test2" / "shadowbot_credentials.py"
@@ -50,12 +51,61 @@ def test_windows_credential_provider_returns_safe_failure_when_record_is_missing
         raise AssertionError("expected CredentialProviderError")
 
 
+def test_credential_provider_error_codes_are_stable_and_redacted():
+    module = _module()
+
+    for record in (
+        {"UserName": "seller-account", "CredentialBlob": b"\xff"},
+        {"UserName": "", "CredentialBlob": "secret-password"},
+        {"UserName": "seller-account", "CredentialBlob": b"secret-password", "CredentialBlobSize": 999},
+    ):
+        provider = module.WindowsCredentialManagerProvider("ShadowBot/Test", credential_reader=lambda _target, record=record: record)
+        try:
+            provider.get_login_credentials()
+        except module.CredentialProviderError as exc:
+            assert exc.error_code == "CREDENTIAL_FORMAT_INVALID"
+            assert "seller-account" not in str(exc)
+            assert "secret-password" not in str(exc)
+            assert "CredentialBlob" not in str(exc)
+        else:
+            raise AssertionError("expected stable format error")
+
+    try:
+        module.WindowsCredentialManagerProvider("")
+    except module.CredentialProviderError as exc:
+        assert exc.error_code == "CREDENTIAL_TARGET_MISSING"
+    else:
+        raise AssertionError("expected missing-target error")
+
+    credentials = module.LoginCredentials("seller-account", "secret-password")
+    assert "seller-account" not in repr(credentials)
+    assert "secret-password" not in repr(credentials)
+
+
 def test_credential_provider_has_stdlib_windows_api_fallback_for_embedded_python():
     source = MODULE_PATH.read_text(encoding="utf-8")
 
     assert "CredReadW" in source
     assert 'ctypes.WinDLL("Advapi32"' in source
     assert "win32cred is unavailable" not in source
+
+
+def test_machine_local_worker_config_is_ignored_but_example_remains_visible():
+    root = MODULE_PATH.parents[2]
+    local_config = "shadowbot/test2/shadowbot_worker_config.json"
+    example_config = "shadowbot/test2/shadowbot_worker_config.example.json"
+    ignored = subprocess.run(
+        ["git", "check-ignore", "--no-index", "--quiet", local_config],
+        cwd=root,
+        check=False,
+    )
+    visible_example = subprocess.run(
+        ["git", "check-ignore", "--no-index", "--quiet", example_config],
+        cwd=root,
+        check=False,
+    )
+    assert ignored.returncode == 0
+    assert visible_example.returncode != 0
 
 
 def test_credentials_are_injected_as_runtime_only_objects_not_request_json_fields():
@@ -68,6 +118,33 @@ def test_credentials_are_injected_as_runtime_only_objects_not_request_json_field
     payload_end = flow_source.index("def _as_int", payload_start)
     assert '"_credential_provider"' not in flow_source[payload_start:payload_end]
     assert '"CredentialBlob"' not in worker_source
+    assert '"_provider_error_code": self.credential_provider_error_code' in worker_source
+    assert "SAFE_PROVIDER_ERROR_CODES" in worker_source
+    assert "provider_error_code" in flow_source
+
+
+def test_result_and_phase_snapshots_drop_credential_fields():
+    source = FLOW_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    wanted = {
+        "_safe_login_phase_snapshot",
+        "_safe_output_payload",
+    }
+    nodes = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in wanted]
+    namespace = {
+        "_SAFE_LOGIN_PHASE_FIELDS": frozenset({"account_password_submitted"}),
+        "_SENSITIVE_OUTPUT_KEYS": frozenset({"account", "password", "credentialblob"}),
+    }
+    exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), str(FLOW_PATH), "exec"), namespace)
+
+    login = {
+        "account": "seller-account",
+        "password": "secret-password",
+        "account_password_submitted": True,
+    }
+    assert namespace["_safe_login_phase_snapshot"](login) == {"account_password_submitted": True}
+    safe = namespace["_safe_output_payload"]({"login": login, "CredentialBlob": "secret-password"})
+    assert safe == {"login": {"account_password_submitted": True}}
 
 
 def test_login_input_uses_native_element_apis_and_never_uses_clipboard():
