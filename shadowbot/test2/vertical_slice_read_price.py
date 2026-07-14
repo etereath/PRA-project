@@ -82,6 +82,16 @@ _SENSITIVE_OUTPUT_KEYS = frozenset(
         "_credential_provider",
     }
 )
+_SAFE_PROVIDER_ERROR_CODES = frozenset(
+    {
+        "CREDENTIAL_TARGET_MISSING",
+        "CREDENTIAL_MANAGER_UNAVAILABLE",
+        "CREDENTIAL_NOT_FOUND",
+        "CREDENTIAL_ACCESS_DENIED",
+        "CREDENTIAL_FORMAT_INVALID",
+        "CREDENTIAL_READ_FAILED",
+    }
+)
 
 
 class SliceError(Exception):
@@ -749,7 +759,24 @@ def _wait_for_manual_login_verification(window, request, result, timeout_seconds
 def _attempt_automatic_login(window, request, result, timeout_seconds, login_config, credential_provider, markers):
     if not bool(_login_config_value(login_config, "auto_enabled", True)):
         raise SliceError("LOGIN_REQUIRED", "automatic login is disabled", retryable=False)
+    safe_provider_error_codes = frozenset(
+        {
+            "CREDENTIAL_TARGET_MISSING",
+            "CREDENTIAL_MANAGER_UNAVAILABLE",
+            "CREDENTIAL_NOT_FOUND",
+            "CREDENTIAL_ACCESS_DENIED",
+            "CREDENTIAL_FORMAT_INVALID",
+            "CREDENTIAL_READ_FAILED",
+        }
+    )
+    provider_error_code = ""
+    if isinstance(request, dict):
+        provider_error_code = str(request.get("_provider_error_code", "") or "").strip()
+    if provider_error_code not in safe_provider_error_codes:
+        provider_error_code = ""
     if credential_provider is None:
+        if provider_error_code:
+            result["provider_error_code"] = provider_error_code
         raise SliceError("LOGIN_CREDENTIALS_UNAVAILABLE", "credential provider is unavailable", retryable=False)
     employee_mode_required = bool(_login_config_value(login_config, "employee_mode_required", False))
     employee_mode_selector = str(_login_config_value(login_config, "employee_mode_selector", "")).strip()
@@ -767,6 +794,11 @@ def _attempt_automatic_login(window, request, result, timeout_seconds, login_con
     try:
         credentials = credential_provider.get_login_credentials()
     except Exception as exc:
+        provider_error_code = str(getattr(exc, "error_code", "") or "").strip()
+        if provider_error_code not in safe_provider_error_codes:
+            provider_error_code = ""
+        if provider_error_code:
+            result["provider_error_code"] = provider_error_code
         raise SliceError(
             "LOGIN_CREDENTIALS_UNAVAILABLE",
             "credential provider failed: " + type(exc).__name__,

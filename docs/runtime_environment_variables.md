@@ -155,7 +155,23 @@ $env:DEV_MODE = "false"
 
 只有字符串 `true` 会被识别为开发模式。
 
-## 6. 启动方式
+## 6. 旧版 Web 路由安全开关
+
+旧版 `/`、`/tables`、`/execution`、`/manual-intervention` 路由默认关闭。生产环境未配置 `PRA_PROXY_MODE` 时按 `reverse_proxy` 处理并拒绝访问；cpolar、Nginx 或其他反向代理/公网隧道场景也必须保持 `reverse_proxy`，不能启用旧路由。
+
+只有同时满足以下条件时，旧路由才会进入后台 Session 校验：
+
+- `PRA_ENV` 未配置时按 `production` 处理。
+- `PRA_ENABLE_LEGACY_WEB=1`。
+- `PRA_LEGACY_ACCESS_MODE=direct_loopback`。
+- `PRA_PROXY_MODE=none`，且服务启动时只绑定 `127.0.0.1` 或 `::1`；启动绑定地址由 `serve` 的启动配置记录并作为唯一权威来源。
+- 请求级 `PRA_LISTEN_HOST`、`SERVER_ADDR` 等字段不会被用于证明服务仅监听 loopback；服务没有启动绑定上下文时旧路由保持关闭。
+- 请求 TCP 对端为 `127.0.0.1` 或 `::1`，并且不存在 `Forwarded`、`X-Forwarded-For`、`X-Real-IP` 转发头。
+- 后台运行态 Session 已认证。
+
+转发头不会参与旧路由放行判断；在 `direct_loopback` 模式出现时会记录拓扑异常并拒绝请求。Mobile Review token 路由不套用上述后台 Session。
+
+## 7. 启动方式
 
 配置好 `scripts/local_env.ps1` 后运行：
 
@@ -181,7 +197,7 @@ powershell -ExecutionPolicy Bypass -File scripts/start_local.ps1 -Port 8877
 python scripts/check_runtime_env.py
 ```
 
-## 6.1 影刀 OpenAPI Runner 变量
+## 7.1 影刀 OpenAPI Runner 变量
 
 这些变量用于 `ShadowBotExecutor` 通过影刀开放 API `JOB运行/启动应用` 启动 `test2` 或后续正式影刀应用。真实密钥只允许写入本机 `scripts/local_env.ps1`，不得提交到仓库。
 

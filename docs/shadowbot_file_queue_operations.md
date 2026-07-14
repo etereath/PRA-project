@@ -53,12 +53,12 @@ provider 使用 Python 标准库 `ctypes` 调用 `CredReadW`/`CredFree`，不依
 }
 ```
 
-将 `login_credential_target` 仅写入部署机未纳入版本控制的 `shadowbot_worker_config.json`，例如使用组织内部约定的 `ShadowBot/<deployment-target>`（不要把真实 target 回填到仓库、日志或交接记录）。在同一 Windows 用户上下文中创建 Generic Credential，并按以下步骤验证：
+将 `login_credential_target` 仅写入部署机未纳入版本控制的 `shadowbot_worker_config.json`，例如使用组织内部约定的 `ShadowBot/<deployment-target>`（该路径已由仓库精确忽略，示例文件仍纳入版本控制；不要把真实 target 回填到仓库、日志或交接记录）。在同一 Windows 用户上下文中创建 Generic Credential，并按以下步骤验证：
 
 1. 先运行 `python scripts\sync_shadowbot_test2.py --check`，确认 provider 与 Worker 源文件哈希一致；需要同步时运行不带 `--check` 的命令。
-2. 在目标 Windows 主机以部署用户执行 `cmdkey /add:<deployment-target> /user:<deployment-user> /pass:<deployment-password>`，随后启动 Worker；实际命令中的 target、用户名和密码不得写入日志或交接记录。
-3. 投递一个脱敏的登录测试请求，确认结果为成功或 `LOGIN_CREDENTIALS_UNAVAILABLE`/`LOGIN_CREDENTIALS_REJECTED` 等稳定登录错误；检查请求 JSON、结果、phase、日志和证据目录均不含账号、密码、`CredentialBlob` 或明文 target。
-4. 测试结束后用 `cmdkey /delete:<deployment-target>` 清理受控测试凭据，并删除部署机上的未跟踪 `shadowbot_worker_config.json` 副本（若不再使用）。
+2. 生产部署使用 Windows Credential Manager 图形界面（运行 `control /name Microsoft.CredentialManager`，选择 Windows 凭据并交互填写 Generic Credential）；禁止把密码作为命令行参数传入凭据创建工具。随后启动 Worker；实际 target、用户名和密码不得写入日志或交接记录。
+3. 投递一个脱敏的登录测试请求，确认结果为成功或 `LOGIN_CREDENTIALS_UNAVAILABLE`/`LOGIN_CREDENTIALS_REJECTED` 等稳定登录错误；凭据 provider 失败时，Worker 结果最多保留 allowlist 中的 `provider_error_code`（例如 `CREDENTIAL_NOT_FOUND`），未知异常仍使用安全兜底码。检查请求 JSON、结果、phase、日志和证据目录均不含账号、密码、`CredentialBlob` 或明文 target。
+4. 测试结束后在 Credential Manager 图形界面删除受控测试凭据，并删除部署机上的未跟踪 `shadowbot_worker_config.json` 副本（若不再使用）。
 
 蚂蚁花团供应商的员工账号需要先点击“员工”模式按钮，再填写账号密码；该点击仅记录无敏感状态，失败时返回 `LOGIN_AUTOFILL_FAILED`，不会尝试其他登录模式。Worker 每个 attempt 最多提交一次账号密码登录。账号和密码仅使用元素原生输入方法，禁止走剪贴板输入，避免进入 Windows 剪贴板历史。识别到手机验证码后写 `LOGIN_VERIFICATION_REQUIRED` phase；PRA 队列服务创建唯一人工介入 review 和通知。该通知使用专用标题“ShadowBot 登录验证码人工接管”，仅展示平台、执行尝试、截止时间和操作提示，不复用通用业务复核的业务日期、处理对象和原因字段。操作员只在由 Worker 打开或此前已存在的小程序中完成验证码，不向 PRA、影刀请求或飞书回复验证码。首页“商品管理”入口重新出现后，Worker 继续同一 attempt。等待超时返回 `FAILED/LOGIN_VERIFICATION_TIMEOUT/NOT_STARTED`；账号密码错误返回 `LOGIN_CREDENTIALS_REJECTED`，均不自动重试。
 

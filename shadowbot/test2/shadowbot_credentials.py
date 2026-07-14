@@ -31,6 +31,10 @@ _ERROR_MESSAGES = {
     "CREDENTIAL_READ_FAILED": "credential record could not be read",
 }
 
+# These codes are safe to cross the Worker/flow boundary. They describe the
+# provider state without exposing a target, username, password, or blob.
+SAFE_PROVIDER_ERROR_CODES = frozenset(_ERROR_MESSAGES)
+
 
 class CredentialProviderError(RuntimeError):
     """Stable, deliberately non-sensitive credential provider failure."""
@@ -210,4 +214,9 @@ class WindowsCredentialManagerProvider:
         return LoginCredentials(account=account, password=password)
 
 
-__all__ = ["CredentialProviderError", "LoginCredentials", "WindowsCredentialManagerProvider"]
+__all__ = [
+    "CredentialProviderError",
+    "LoginCredentials",
+    "SAFE_PROVIDER_ERROR_CODES",
+    "WindowsCredentialManagerProvider",
+]

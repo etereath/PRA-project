@@ -2,6 +2,7 @@ from pathlib import Path
 import importlib.util
 import sys
 import ast
+import subprocess
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "shadowbot" / "test2" / "shadowbot_credentials.py"
@@ -89,6 +90,24 @@ def test_credential_provider_has_stdlib_windows_api_fallback_for_embedded_python
     assert "win32cred is unavailable" not in source
 
 
+def test_machine_local_worker_config_is_ignored_but_example_remains_visible():
+    root = MODULE_PATH.parents[2]
+    local_config = "shadowbot/test2/shadowbot_worker_config.json"
+    example_config = "shadowbot/test2/shadowbot_worker_config.example.json"
+    ignored = subprocess.run(
+        ["git", "check-ignore", "--no-index", "--quiet", local_config],
+        cwd=root,
+        check=False,
+    )
+    visible_example = subprocess.run(
+        ["git", "check-ignore", "--no-index", "--quiet", example_config],
+        cwd=root,
+        check=False,
+    )
+    assert ignored.returncode == 0
+    assert visible_example.returncode != 0
+
+
 def test_credentials_are_injected_as_runtime_only_objects_not_request_json_fields():
     worker_source = WORKER_PATH.read_text(encoding="utf-8")
     flow_source = FLOW_PATH.read_text(encoding="utf-8")
@@ -99,6 +118,9 @@ def test_credentials_are_injected_as_runtime_only_objects_not_request_json_field
     payload_end = flow_source.index("def _as_int", payload_start)
     assert '"_credential_provider"' not in flow_source[payload_start:payload_end]
     assert '"CredentialBlob"' not in worker_source
+    assert '"_provider_error_code": self.credential_provider_error_code' in worker_source
+    assert "SAFE_PROVIDER_ERROR_CODES" in worker_source
+    assert "provider_error_code" in flow_source
 
 
 def test_result_and_phase_snapshots_drop_credential_fields():

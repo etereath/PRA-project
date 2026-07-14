@@ -4,6 +4,9 @@
 
 scripts/local_env.ps1
 
+# Machine-local ShadowBot credential target; keep the checked-in example only.
+shadowbot/test2/shadowbot_worker_config.json
+
 data/runtime/
 *.sqlite3
 *.db

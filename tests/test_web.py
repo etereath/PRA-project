@@ -115,6 +115,7 @@ class WebTests(unittest.TestCase):
         query: str = "",
         body: str = "",
         cookie: str = "",
+        environ_overrides: dict[str, str] | None = None,
     ) -> tuple[str, dict[str, str], str]:
         captured: dict[str, object] = {}
 
@@ -133,6 +134,8 @@ class WebTests(unittest.TestCase):
         }
         if cookie:
             environ["HTTP_COOKIE"] = cookie
+        if environ_overrides:
+            environ.update(environ_overrides)
         response = application(environ, start_response)
         response_body = b"".join(response).decode("utf-8")
         headers = {name: value for name, value in captured["headers"]}
@@ -2241,22 +2244,194 @@ class WebTests(unittest.TestCase):
         self.assertNotIn("https://open.feishu.cn/open-apis/bot/v2/hook/secret-webhook", body)
         self.assertNotIn("sign-secret", body)
 
-    def test_legacy_routes_show_phase1_compat_notices(self) -> None:
-        status, _, root_body = self._call_app(path="/", method="GET")
-        self.assertEqual(status, "200 OK")
-        self.assertIn("运行态导航已迁移到 /dashboard", root_body)
+    def test_legacy_routes_are_fail_closed_by_default(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "PRA_ENV": "production",
+                "PRA_ENABLE_LEGACY_WEB": "",
+                "PRA_LEGACY_ACCESS_MODE": "",
+                "PRA_PROXY_MODE": "",
+            },
+            clear=False,
+        ):
+            for path in ("/", "/tables", "/execution", "/manual-intervention"):
+                with self.subTest(path=path):
+                    status, _, body = self._call_app(
+                        path=path,
+                        method="GET",
+                        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+                    )
+                    self.assertEqual(status, "403 Forbidden")
+                    self.assertIn("旧版 Web 路由当前已安全关闭", body)
 
-        tables_status, _, tables_body = self._call_app(path="/tables", method="GET")
-        self.assertEqual(tables_status, "200 OK")
-        self.assertIn("该页已归入业务输入", tables_body)
+    def test_legacy_routes_require_session_after_explicit_loopback_enable(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "PRA_ENV": "production",
+                "PRA_ENABLE_LEGACY_WEB": "1",
+                "PRA_LEGACY_ACCESS_MODE": "direct_loopback",
+                "PRA_PROXY_MODE": "none",
+            },
+            clear=False,
+        ):
+            with patch("app.web._WEB_LISTEN_HOST", "127.0.0.1"):
+                status, headers, _ = self._call_app(
+                    path="/",
+                    method="GET",
+                    environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+                )
+            self.assertEqual(status, "303 See Other")
+            self.assertEqual(urlparse(headers["Location"]).path, "/runtime/login")
+            self.assertEqual(urlparse(headers["Location"]).query, "next=%2F")
 
-        execution_status, _, execution_body = self._call_app(path="/execution", method="GET")
-        self.assertEqual(execution_status, "200 OK")
-        self.assertIn("mock 执行/旧回写兼容", execution_body)
+    def test_legacy_routes_allow_authenticated_direct_loopback_only(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "PRA_ENV": "production",
+                "PRA_ENABLE_LEGACY_WEB": "1",
+                "PRA_LEGACY_ACCESS_MODE": "direct_loopback",
+                "PRA_PROXY_MODE": "none",
+                "RUNTIME_ADMIN_USER": "admin",
+                "RUNTIME_ADMIN_PASSWORD": "secret",
+            },
+            clear=False,
+        ):
+            cookie = self._runtime_login(Path("runtime.sqlite3"))
+            with patch("app.web._WEB_LISTEN_HOST", "127.0.0.1"):
+                for path in ("/", "/tables", "/execution", "/manual-intervention"):
+                    with self.subTest(path=path):
+                        status, _, body = self._call_app(
+                            path=path,
+                            method="GET",
+                            cookie=cookie,
+                            environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+                        )
+                        self.assertEqual(status, "200 OK")
+                        self.assertNotIn("旧版 Web 路由当前已安全关闭", body)
 
-        manual_status, _, manual_body = self._call_app(path="/manual-intervention", method="GET")
-        self.assertEqual(manual_status, "200 OK")
-        self.assertIn("旧 Excel 人工介入只读兼容", manual_body)
+    def test_legacy_routes_ignore_request_bind_overrides(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "PRA_ENV": "production",
+                "PRA_ENABLE_LEGACY_WEB": "1",
+                "PRA_LEGACY_ACCESS_MODE": "direct_loopback",
+                "PRA_PROXY_MODE": "none",
+                "RUNTIME_ADMIN_USER": "admin",
+                "RUNTIME_ADMIN_PASSWORD": "secret",
+            },
+            clear=False,
+        ):
+            cookie = self._runtime_login(Path("runtime.sqlite3"))
+
+            # A wildcard startup bind remains public even if request-scoped
+            # fields claim that it is loopback-only.
+            with patch("app.web._WEB_LISTEN_HOST", "0.0.0.0"):
+                status, _, body = self._call_app(
+                    path="/",
+                    method="GET",
+                    cookie=cookie,
+                    environ_overrides={
+                        "REMOTE_ADDR": "127.0.0.1",
+                        "PRA_LISTEN_HOST": "127.0.0.1",
+                        "SERVER_ADDR": "127.0.0.1",
+                    },
+                )
+            self.assertEqual(status, "403 Forbidden")
+            self.assertIn("0.0.0.0", body)
+
+            # The IPv6 wildcard bind is equally public even when request
+            # fields claim that the service is bound only to ::1.
+            with patch("app.web._WEB_LISTEN_HOST", "::"):
+                status, _, body = self._call_app(
+                    path="/",
+                    method="GET",
+                    cookie=cookie,
+                    environ_overrides={
+                        "REMOTE_ADDR": "::1",
+                        "PRA_LISTEN_HOST": "::1",
+                        "SERVER_ADDR": "::1",
+                    },
+                )
+            self.assertEqual(status, "403 Forbidden")
+            self.assertIn("服务监听地址 ::", body)
+
+            # Without a startup binding context, request fields cannot prove
+            # that the service is loopback-only; the gate fails closed.
+            with patch("app.web._WEB_LISTEN_HOST", None):
+                status, _, body = self._call_app(
+                    path="/",
+                    method="GET",
+                    cookie=cookie,
+                    environ_overrides={
+                        "REMOTE_ADDR": "127.0.0.1",
+                        "PRA_LISTEN_HOST": "127.0.0.1",
+                        "SERVER_ADDR": "127.0.0.1",
+                    },
+                )
+            self.assertEqual(status, "403 Forbidden")
+            self.assertIn("服务监听地址", body)
+
+    def test_legacy_routes_reject_proxy_headers_and_non_loopback_topology(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "PRA_ENV": "production",
+                "PRA_ENABLE_LEGACY_WEB": "1",
+                "PRA_LEGACY_ACCESS_MODE": "direct_loopback",
+                "PRA_PROXY_MODE": "none",
+                "RUNTIME_ADMIN_USER": "admin",
+                "RUNTIME_ADMIN_PASSWORD": "secret",
+            },
+            clear=False,
+        ):
+            cookie = self._runtime_login(Path("runtime.sqlite3"))
+            with patch("app.web._WEB_LISTEN_HOST", "127.0.0.1"):
+                cases = [
+                    {"REMOTE_ADDR": "127.0.0.1", "HTTP_X_FORWARDED_FOR": "127.0.0.1"},
+                    {"REMOTE_ADDR": "203.0.113.10", "HTTP_X_FORWARDED_FOR": "127.0.0.1"},
+                    {"REMOTE_ADDR": "127.0.0.1", "HTTP_FORWARDED": "for=127.0.0.1"},
+                    {"REMOTE_ADDR": "127.0.0.1", "HTTP_X_REAL_IP": "127.0.0.1"},
+                ]
+                for overrides in cases:
+                    with self.subTest(overrides=overrides):
+                        status, _, _ = self._call_app(
+                            path="/",
+                            method="GET",
+                            cookie=cookie,
+                            environ_overrides=overrides,
+                        )
+                        self.assertEqual(status, "403 Forbidden")
+
+                with patch.dict("os.environ", {"PRA_PROXY_MODE": "reverse_proxy"}, clear=False):
+                    status, _, _ = self._call_app(
+                        path="/",
+                        method="GET",
+                        cookie=cookie,
+                        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+                    )
+                self.assertEqual(status, "403 Forbidden")
+
+                with patch.dict("os.environ", {"PRA_PROXY_MODE": ""}, clear=False):
+                    status, _, _ = self._call_app(
+                        path="/",
+                        method="GET",
+                        cookie=cookie,
+                        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+                    )
+                self.assertEqual(status, "403 Forbidden")
+
+            with patch("app.web._WEB_LISTEN_HOST", "::1"):
+                ipv6_status, _, _ = self._call_app(
+                    path="/",
+                    method="GET",
+                    cookie=cookie,
+                    environ_overrides={"REMOTE_ADDR": "::1"},
+                )
+            self.assertEqual(ipv6_status, "200 OK")
 
     def test_mobile_review_get_records_detail_access_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
