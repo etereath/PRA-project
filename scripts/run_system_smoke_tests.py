@@ -296,6 +296,12 @@ class SmokeRunner:
             leaked = [marker for marker in sensitive_markers if marker and marker in body]
             if leaked:
                 raise AssertionError(f"{path} 未登录页面泄露运行态数据：{', '.join(leaked)}")
+        for path in ["/", "/tables", "/execution", "/manual-intervention"]:
+            status, _, body = call_app(path=path)
+            if status != "403 Forbidden":
+                raise AssertionError(f"{path} 旧路由默认未安全关闭：{status}")
+            if "旧版 Web 路由当前已安全关闭" not in body:
+                raise AssertionError(f"{path} 旧路由关闭提示缺失")
 
     def check_system_page_safe(self) -> None:
         _RUNTIME_SESSIONS.clear()
@@ -443,6 +449,10 @@ def smoke_environment():
         "FEISHU_WEBHOOK_SECRET",
         "FEISHU_MESSAGE_TYPE",
         "DEV_MODE",
+        "PRA_ENV",
+        "PRA_ENABLE_LEGACY_WEB",
+        "PRA_LEGACY_ACCESS_MODE",
+        "PRA_PROXY_MODE",
     ]
     original = {key: os.environ.get(key) for key in keys}
     os.environ.update(
@@ -459,6 +469,10 @@ def smoke_environment():
             "FEISHU_WEBHOOK_SECRET": "smoke-feishu-signature-secret",
             "FEISHU_MESSAGE_TYPE": "post",
             "DEV_MODE": "false",
+            "PRA_ENV": "production",
+            "PRA_ENABLE_LEGACY_WEB": "0",
+            "PRA_LEGACY_ACCESS_MODE": "direct_loopback",
+            "PRA_PROXY_MODE": "reverse_proxy",
         }
     )
     _RUNTIME_SESSIONS.clear()

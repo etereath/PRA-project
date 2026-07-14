@@ -14,6 +14,13 @@ $env:RUNTIME_ADMIN_USER = "admin"
 $env:RUNTIME_ADMIN_PASSWORD = "replace-with-a-strong-password"
 $env:DEV_MODE = "false"
 
+# Legacy Web routes stay disabled by default. Do not set PRA_PROXY_MODE=none
+# when the service is exposed through cpolar, Nginx, or another proxy.
+$env:PRA_ENV = "production"
+$env:PRA_ENABLE_LEGACY_WEB = "0"
+$env:PRA_LEGACY_ACCESS_MODE = "direct_loopback"
+$env:PRA_PROXY_MODE = "reverse_proxy"
+
 # ShadowBot local queue. Start test2 manually, then run the PRA queue services process.
 $env:SHADOWBOT_RUNNER_TYPE = "filequeue"
 $env:SHADOWBOT_QUEUE_DIR = "D:\PRA_Runtime\shadowbot_queue"
