@@ -238,13 +238,26 @@ def _check_retry_authorization_constraints(
         errors.append("retry_authorizations.retry_authorization_id is not the primary key")
 
     foreign_keys = connection.execute("PRAGMA foreign_key_list(retry_authorizations)").fetchall()
-    foreign_key_pairs = {(str(row[3]), str(row[2])) for row in foreign_keys}
-    for column, target in (
-        ("operation_id", "shadowbot_operations"),
-        ("source_execution_attempt_id", "shadowbot_execution_attempts"),
+    # SQLite PRAGMA foreign_key_list columns are (id, seq, table, from, to,
+    # on_update, on_delete, match).  The referenced column is part of the
+    # schema contract: accepting only the target table would let a malformed
+    # v5 database point at an unrelated column and still report healthy.
+    foreign_key_specs = {
+        (str(row[3]), str(row[2]), str(row[4]))
+        for row in foreign_keys
+    }
+    for column, target_table, target_column in (
+        ("operation_id", "shadowbot_operations", "operation_id"),
+        (
+            "source_execution_attempt_id",
+            "shadowbot_execution_attempts",
+            "execution_attempt_id",
+        ),
     ):
-        if (column, target) not in foreign_key_pairs:
-            errors.append(f"missing foreign key {column} -> {target}")
+        if (column, target_table, target_column) not in foreign_key_specs:
+            errors.append(
+                f"missing foreign key {column} -> {target_table}({target_column})"
+            )
 
     sql_row = connection.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'retry_authorizations'"
