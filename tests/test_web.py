@@ -2343,6 +2343,22 @@ class WebTests(unittest.TestCase):
             self.assertEqual(status, "403 Forbidden")
             self.assertIn("0.0.0.0", body)
 
+            # The IPv6 wildcard bind is equally public even when request
+            # fields claim that the service is bound only to ::1.
+            with patch("app.web._WEB_LISTEN_HOST", "::"):
+                status, _, body = self._call_app(
+                    path="/",
+                    method="GET",
+                    cookie=cookie,
+                    environ_overrides={
+                        "REMOTE_ADDR": "::1",
+                        "PRA_LISTEN_HOST": "::1",
+                        "SERVER_ADDR": "::1",
+                    },
+                )
+            self.assertEqual(status, "403 Forbidden")
+            self.assertIn("服务监听地址 ::", body)
+
             # Without a startup binding context, request fields cannot prove
             # that the service is loopback-only; the gate fails closed.
             with patch("app.web._WEB_LISTEN_HOST", None):
