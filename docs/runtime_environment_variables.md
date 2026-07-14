@@ -164,7 +164,8 @@ $env:DEV_MODE = "false"
 - `PRA_ENV` 未配置时按 `production` 处理。
 - `PRA_ENABLE_LEGACY_WEB=1`。
 - `PRA_LEGACY_ACCESS_MODE=direct_loopback`。
-- `PRA_PROXY_MODE=none`，且服务只监听 `127.0.0.1` 或 `::1`。
+- `PRA_PROXY_MODE=none`，且服务启动时只绑定 `127.0.0.1` 或 `::1`；启动绑定地址由 `serve` 的启动配置记录并作为唯一权威来源。
+- 请求级 `PRA_LISTEN_HOST`、`SERVER_ADDR` 等字段不会被用于证明服务仅监听 loopback；服务没有启动绑定上下文时旧路由保持关闭。
 - 请求 TCP 对端为 `127.0.0.1` 或 `::1`，并且不存在 `Forwarded`、`X-Forwarded-For`、`X-Real-IP` 转发头。
 - 后台运行态 Session 已认证。
 

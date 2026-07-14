@@ -2276,11 +2276,12 @@ class WebTests(unittest.TestCase):
             },
             clear=False,
         ):
-            status, headers, _ = self._call_app(
-                path="/",
-                method="GET",
-                environ_overrides={"REMOTE_ADDR": "127.0.0.1", "PRA_LISTEN_HOST": "127.0.0.1"},
-            )
+            with patch("app.web._WEB_LISTEN_HOST", "127.0.0.1"):
+                status, headers, _ = self._call_app(
+                    path="/",
+                    method="GET",
+                    environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+                )
             self.assertEqual(status, "303 See Other")
             self.assertEqual(urlparse(headers["Location"]).path, "/runtime/login")
             self.assertEqual(urlparse(headers["Location"]).query, "next=%2F")
@@ -2299,16 +2300,64 @@ class WebTests(unittest.TestCase):
             clear=False,
         ):
             cookie = self._runtime_login(Path("runtime.sqlite3"))
-            for path in ("/", "/tables", "/execution", "/manual-intervention"):
-                with self.subTest(path=path):
-                    status, _, body = self._call_app(
-                        path=path,
-                        method="GET",
-                        cookie=cookie,
-                        environ_overrides={"REMOTE_ADDR": "127.0.0.1", "PRA_LISTEN_HOST": "127.0.0.1"},
-                    )
-                    self.assertEqual(status, "200 OK")
-                    self.assertNotIn("旧版 Web 路由当前已安全关闭", body)
+            with patch("app.web._WEB_LISTEN_HOST", "127.0.0.1"):
+                for path in ("/", "/tables", "/execution", "/manual-intervention"):
+                    with self.subTest(path=path):
+                        status, _, body = self._call_app(
+                            path=path,
+                            method="GET",
+                            cookie=cookie,
+                            environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+                        )
+                        self.assertEqual(status, "200 OK")
+                        self.assertNotIn("旧版 Web 路由当前已安全关闭", body)
+
+    def test_legacy_routes_ignore_request_bind_overrides(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "PRA_ENV": "production",
+                "PRA_ENABLE_LEGACY_WEB": "1",
+                "PRA_LEGACY_ACCESS_MODE": "direct_loopback",
+                "PRA_PROXY_MODE": "none",
+                "RUNTIME_ADMIN_USER": "admin",
+                "RUNTIME_ADMIN_PASSWORD": "secret",
+            },
+            clear=False,
+        ):
+            cookie = self._runtime_login(Path("runtime.sqlite3"))
+
+            # A wildcard startup bind remains public even if request-scoped
+            # fields claim that it is loopback-only.
+            with patch("app.web._WEB_LISTEN_HOST", "0.0.0.0"):
+                status, _, body = self._call_app(
+                    path="/",
+                    method="GET",
+                    cookie=cookie,
+                    environ_overrides={
+                        "REMOTE_ADDR": "127.0.0.1",
+                        "PRA_LISTEN_HOST": "127.0.0.1",
+                        "SERVER_ADDR": "127.0.0.1",
+                    },
+                )
+            self.assertEqual(status, "403 Forbidden")
+            self.assertIn("0.0.0.0", body)
+
+            # Without a startup binding context, request fields cannot prove
+            # that the service is loopback-only; the gate fails closed.
+            with patch("app.web._WEB_LISTEN_HOST", None):
+                status, _, body = self._call_app(
+                    path="/",
+                    method="GET",
+                    cookie=cookie,
+                    environ_overrides={
+                        "REMOTE_ADDR": "127.0.0.1",
+                        "PRA_LISTEN_HOST": "127.0.0.1",
+                        "SERVER_ADDR": "127.0.0.1",
+                    },
+                )
+            self.assertEqual(status, "403 Forbidden")
+            self.assertIn("服务监听地址", body)
 
     def test_legacy_routes_reject_proxy_headers_and_non_loopback_topology(self) -> None:
         with patch.dict(
@@ -2324,47 +2373,48 @@ class WebTests(unittest.TestCase):
             clear=False,
         ):
             cookie = self._runtime_login(Path("runtime.sqlite3"))
-            cases = [
-                {"REMOTE_ADDR": "127.0.0.1", "PRA_LISTEN_HOST": "127.0.0.1", "HTTP_X_FORWARDED_FOR": "127.0.0.1"},
-                {"REMOTE_ADDR": "203.0.113.10", "PRA_LISTEN_HOST": "127.0.0.1", "HTTP_X_FORWARDED_FOR": "127.0.0.1"},
-                {"REMOTE_ADDR": "127.0.0.1", "PRA_LISTEN_HOST": "127.0.0.1", "HTTP_FORWARDED": "for=127.0.0.1"},
-                {"REMOTE_ADDR": "127.0.0.1", "PRA_LISTEN_HOST": "127.0.0.1", "HTTP_X_REAL_IP": "127.0.0.1"},
-                {"REMOTE_ADDR": "127.0.0.1", "PRA_LISTEN_HOST": "0.0.0.0"},
-            ]
-            for overrides in cases:
-                with self.subTest(overrides=overrides):
+            with patch("app.web._WEB_LISTEN_HOST", "127.0.0.1"):
+                cases = [
+                    {"REMOTE_ADDR": "127.0.0.1", "HTTP_X_FORWARDED_FOR": "127.0.0.1"},
+                    {"REMOTE_ADDR": "203.0.113.10", "HTTP_X_FORWARDED_FOR": "127.0.0.1"},
+                    {"REMOTE_ADDR": "127.0.0.1", "HTTP_FORWARDED": "for=127.0.0.1"},
+                    {"REMOTE_ADDR": "127.0.0.1", "HTTP_X_REAL_IP": "127.0.0.1"},
+                ]
+                for overrides in cases:
+                    with self.subTest(overrides=overrides):
+                        status, _, _ = self._call_app(
+                            path="/",
+                            method="GET",
+                            cookie=cookie,
+                            environ_overrides=overrides,
+                        )
+                        self.assertEqual(status, "403 Forbidden")
+
+                with patch.dict("os.environ", {"PRA_PROXY_MODE": "reverse_proxy"}, clear=False):
                     status, _, _ = self._call_app(
                         path="/",
                         method="GET",
                         cookie=cookie,
-                        environ_overrides=overrides,
+                        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
                     )
-                    self.assertEqual(status, "403 Forbidden")
+                self.assertEqual(status, "403 Forbidden")
 
-            with patch.dict("os.environ", {"PRA_PROXY_MODE": "reverse_proxy"}, clear=False):
-                status, _, _ = self._call_app(
+                with patch.dict("os.environ", {"PRA_PROXY_MODE": ""}, clear=False):
+                    status, _, _ = self._call_app(
+                        path="/",
+                        method="GET",
+                        cookie=cookie,
+                        environ_overrides={"REMOTE_ADDR": "127.0.0.1"},
+                    )
+                self.assertEqual(status, "403 Forbidden")
+
+            with patch("app.web._WEB_LISTEN_HOST", "::1"):
+                ipv6_status, _, _ = self._call_app(
                     path="/",
                     method="GET",
                     cookie=cookie,
-                    environ_overrides={"REMOTE_ADDR": "127.0.0.1", "PRA_LISTEN_HOST": "127.0.0.1"},
+                    environ_overrides={"REMOTE_ADDR": "::1"},
                 )
-            self.assertEqual(status, "403 Forbidden")
-
-            with patch.dict("os.environ", {"PRA_PROXY_MODE": ""}, clear=False):
-                status, _, _ = self._call_app(
-                    path="/",
-                    method="GET",
-                    cookie=cookie,
-                    environ_overrides={"REMOTE_ADDR": "127.0.0.1", "PRA_LISTEN_HOST": "127.0.0.1"},
-                )
-            self.assertEqual(status, "403 Forbidden")
-
-            ipv6_status, _, _ = self._call_app(
-                path="/",
-                method="GET",
-                cookie=cookie,
-                environ_overrides={"REMOTE_ADDR": "::1", "PRA_LISTEN_HOST": "::1"},
-            )
             self.assertEqual(ipv6_status, "200 OK")
 
     def test_mobile_review_get_records_detail_access_only(self) -> None:

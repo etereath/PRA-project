@@ -638,11 +638,12 @@ def _legacy_route_denial_reason(environ) -> str | None:
 
 
 def _legacy_listen_host(environ) -> str:
-    # Tests and embedding servers may provide an explicit bind address.  The
-    # normal WSGI server path uses the value captured by ``serve``.
-    explicit = environ.get("PRA_LISTEN_HOST") or environ.get("SERVER_ADDR")
-    if explicit:
-        return str(explicit).strip()
+    # The WSGI request environment does not prove which address the listening
+    # socket was bound to.  In particular, ``SERVER_ADDR`` and the legacy
+    # ``PRA_LISTEN_HOST`` request override are not authoritative and must not
+    # turn a wildcard/public listener into an apparent loopback-only service.
+    # ``serve`` captures the startup binding in the process-level value below;
+    # if no startup binding has been recorded, fail closed.
     return str(_WEB_LISTEN_HOST or "").strip()
 
 
