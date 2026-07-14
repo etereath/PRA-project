@@ -515,9 +515,11 @@ def application(environ, start_response):
             return _respond(start_response, status, content_type, body, headers=headers)
 
     if path == "/health":
-        query = _parse_query(environ)
-        runtime_db = Path(_first(query, "runtime_db", str(DEFAULT_RUNTIME_DB)))
-        health = SQLiteRuntimeRepository(runtime_db).check_schema_health()
+        # Health is an unauthenticated operational probe.  Keep its database
+        # target fixed to the trusted process configuration; accepting a
+        # request-level path would let callers make the service open arbitrary
+        # local SQLite files.
+        health = SQLiteRuntimeRepository(Path(DEFAULT_RUNTIME_DB)).check_schema_health()
         status = "200 OK" if health.ok else "503 Service Unavailable"
         body = "ok" if health.ok else f"unhealthy: {health.summary}"
         return _respond(start_response, status, "text/plain; charset=utf-8", body)

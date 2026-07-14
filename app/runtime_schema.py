@@ -8,6 +8,7 @@ database look healthy when its physical structure is incomplete.
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from dataclasses import dataclass
 from typing import Any, Mapping
@@ -60,15 +61,17 @@ V5_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
 }
 
 RETRY_AUTHORIZATION_STATUS_VALUES = frozenset({"ACTIVE", "CONSUMED", "EXPIRED", "REVOKED"})
-RETRY_AUTHORIZATION_INDEXES = frozenset(
-    {
-        "ix_retry_authorizations_operation_id",
-        "ix_retry_authorizations_status",
-        "ix_retry_authorizations_expires_at",
-        "ux_retry_authorizations_evidence_hash",
-        "ux_retry_authorizations_consumed_by_execution_attempt_id",
-    }
-)
+RETRY_AUTHORIZATION_INDEX_SPECS: Mapping[str, tuple[tuple[str, ...], bool]] = {
+    "ix_retry_authorizations_operation_id": (("operation_id",), False),
+    "ix_retry_authorizations_status": (("status",), False),
+    "ix_retry_authorizations_expires_at": (("expires_at",), False),
+    "ux_retry_authorizations_evidence_hash": (("evidence_hash",), True),
+    "ux_retry_authorizations_consumed_by_execution_attempt_id": (
+        ("consumed_by_execution_attempt_id",),
+        True,
+    ),
+}
+RETRY_AUTHORIZATION_INDEXES = frozenset(RETRY_AUTHORIZATION_INDEX_SPECS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,16 +168,12 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
             if absent:
                 missing_columns[table] = absent
 
-        index_names: set[str] = set()
-        for table in tables:
-            index_names.update(
-                str(row[1]) for row in connection.execute(f"PRAGMA index_list({table})").fetchall()
-            )
-        missing_indexes = tuple(sorted(RETRY_AUTHORIZATION_INDEXES - index_names))
-
         constraint_errors: list[str] = []
+        missing_indexes: tuple[str, ...]
         if "retry_authorizations" in tables and "retry_authorizations" not in missing_tables:
-            _check_retry_authorization_constraints(connection, constraint_errors)
+            missing_indexes = _check_retry_authorization_constraints(connection, constraint_errors)
+        else:
+            missing_indexes = tuple(sorted(RETRY_AUTHORIZATION_INDEXES))
 
         ok = not (
             missing_tables
@@ -231,7 +230,7 @@ def assert_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealth
 def _check_retry_authorization_constraints(
     connection: sqlite3.Connection,
     errors: list[str],
-) -> None:
+) -> tuple[str, ...]:
     table_info = connection.execute("PRAGMA table_info(retry_authorizations)").fetchall()
     by_name = {str(row[1]): row for row in table_info}
     primary_key = by_name.get("retry_authorization_id")
@@ -250,26 +249,51 @@ def _check_retry_authorization_constraints(
     sql_row = connection.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'retry_authorizations'"
     ).fetchone()
-    table_sql = str(sql_row[0] or "").upper() if sql_row else ""
-    if "CHECK (MAX_USES = 1)" not in table_sql.replace("\n", " "):
+    table_sql = str(sql_row[0] or "") if sql_row else ""
+    if not re.search(r"\bCHECK\s*\(\s*max_uses\s*=\s*1\s*\)", table_sql, re.IGNORECASE):
         errors.append("retry_authorizations.max_uses lacks CHECK (max_uses = 1)")
-    for status in sorted(RETRY_AUTHORIZATION_STATUS_VALUES):
-        if status not in table_sql:
-            errors.append(f"retry_authorizations status constraint omits {status}")
 
-    unique_indexes: dict[str, tuple[str, ...]] = {}
-    for row in connection.execute("PRAGMA index_list(retry_authorizations)").fetchall():
-        index_name = str(row[1])
-        if int(row[2]) != 1:
-            continue
-        columns = tuple(
-            str(index_row[2])
-            for index_row in connection.execute(f"PRAGMA index_info({index_name})").fetchall()
-        )
-        unique_indexes[index_name] = columns
-    if unique_indexes.get("ux_retry_authorizations_evidence_hash") != ("evidence_hash",):
-        errors.append("evidence_hash is not uniquely indexed")
-    if unique_indexes.get("ux_retry_authorizations_consumed_by_execution_attempt_id") != (
-        "consumed_by_execution_attempt_id",
+    status_match = re.search(
+        r"\bstatus\b\s+[^,]*?\bCHECK\s*\(\s*status\s+IN\s*\((?P<values>[^)]*)\)\)",
+        table_sql,
+        re.IGNORECASE | re.DOTALL,
+    )
+    status_values = tuple(
+        value.replace("''", "'").upper()
+        for value in re.findall(r"'((?:''|[^'])*)'", status_match.group("values"))
+    ) if status_match else ()
+    expected_status_values = tuple(sorted(RETRY_AUTHORIZATION_STATUS_VALUES))
+    if (
+        not status_match
+        or len(status_values) != len(expected_status_values)
+        or set(status_values) != RETRY_AUTHORIZATION_STATUS_VALUES
     ):
-        errors.append("consumed_by_execution_attempt_id is not uniquely indexed")
+        errors.append(
+            "retry_authorizations.status CHECK must allow exactly "
+            + ", ".join(expected_status_values)
+        )
+
+    index_rows = {
+        str(row[1]): row
+        for row in connection.execute("PRAGMA index_list('retry_authorizations')").fetchall()
+    }
+    missing_indexes: list[str] = []
+    for index_name, (expected_columns, expected_unique) in RETRY_AUTHORIZATION_INDEX_SPECS.items():
+        row = index_rows.get(index_name)
+        if row is None:
+            missing_indexes.append(index_name)
+            continue
+        actual_unique = int(row[2]) == 1
+        if actual_unique != expected_unique:
+            errors.append(
+                f"{index_name} unique={actual_unique}, expected {expected_unique}"
+            )
+        actual_columns = tuple(
+            str(index_row[2])
+            for index_row in connection.execute(f"PRAGMA index_info('{index_name}')").fetchall()
+        )
+        if actual_columns != expected_columns:
+            errors.append(
+                f"{index_name} columns={actual_columns}, expected {expected_columns}"
+            )
+    return tuple(sorted(missing_indexes))
