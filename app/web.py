@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import ipaddress
+import logging
 import os
 import re
 import sqlite3
@@ -169,6 +171,17 @@ CURRENT_RUNTIME_SCHEMA_VERSION = 3
 PAGE_SIZE = 50
 TERMINAL_TASK_STATUS_VALUES = {"success", "skipped", "cancelled", "expired"}
 _RUNTIME_SESSIONS: dict[str, dict[str, object]] = {}
+# The WSGI environ does not expose the address the server socket is bound to.
+# ``serve`` records it here so the legacy safety gate can distinguish a
+# loopback-only listener from a public/non-loopback listener.
+_WEB_LISTEN_HOST: str | None = None
+_LOGGER = logging.getLogger(__name__)
+LEGACY_WEB_ROUTES = frozenset({"/", "/tables", "/execution", "/manual-intervention"})
+LEGACY_FORWARDING_HEADERS = (
+    "HTTP_FORWARDED",
+    "HTTP_X_FORWARDED_FOR",
+    "HTTP_X_REAL_IP",
+)
 DISPLAY_TIMEZONE = timezone(timedelta(hours=8))
 
 DISPLAY_ENUM_LABELS = {
@@ -281,6 +294,7 @@ UI_TEXT = {
     "legacy_execution_notice": "\u8be5\u9875\u7528\u4e8e mock \u6267\u884c/\u65e7\u56de\u5199\u517c\u5bb9\uff0c\u6b63\u5f0f\u67e5\u770b\u8bf7\u8fdb\u5165\u6267\u884c\u65e5\u5fd7\u3002",
     "legacy_manual_notice": "\u65e7 Excel \u4eba\u5de5\u4ecb\u5165\u53ea\u8bfb\u517c\u5bb9\uff0c\u6b63\u5f0f\u590d\u6838\u8bf7\u8fdb\u5165\u590d\u6838\u4e2d\u5fc3\u3002",
     "legacy_runtime_notice": "\u8fd0\u884c\u6001\u80fd\u529b\u5df2\u62c6\u5206\u4e3a\u4efb\u52a1\u4e2d\u5fc3\u3001\u590d\u6838\u4e2d\u5fc3\u548c\u901a\u77e5\u4e2d\u5fc3\uff0c\u8fd9\u91cc\u4fdd\u7559\u805a\u5408\u517c\u5bb9\u5165\u53e3\u3002",
+    "legacy_web_disabled": "\u65e7\u7248 Web \u8def\u7531\u5f53\u524d\u5df2\u5b89\u5168\u5173\u95ed\u3002",
     "task_panel_title": "\u4efb\u52a1\u751f\u6210",
     "ops_tasks_title": "\u4efb\u52a1\u4e2d\u5fc3",
     "ops_reviews_title": "\u590d\u6838\u4e2d\u5fc3",
@@ -476,6 +490,8 @@ class ThreadedWSGIServer(ThreadingMixIn, WSGIServer):
 
 
 def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
+    global _WEB_LISTEN_HOST
+    _WEB_LISTEN_HOST = str(host).strip()
     print(f"{UI_TEXT['site_title']} {host}:{port}")
     with make_server(
         host,
@@ -490,6 +506,13 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
 def application(environ, start_response):
     method = environ.get("REQUEST_METHOD", "GET").upper()
     path = environ.get("PATH_INFO", "/")
+
+    if path in LEGACY_WEB_ROUTES:
+        legacy_guard = _legacy_route_guard(path, environ)
+        if legacy_guard is not None:
+            status, body, headers = legacy_guard
+            content_type = "text/plain; charset=utf-8" if status == "403 Forbidden" else "text/html; charset=utf-8"
+            return _respond(start_response, status, content_type, body, headers=headers)
 
     if path == "/health":
         return _respond(start_response, "200 OK", "text/plain; charset=utf-8", "ok")
@@ -552,6 +575,83 @@ def application(environ, start_response):
             return _respond(start_response, status, "text/html; charset=utf-8", body, headers=headers)
         return _respond(start_response, "200 OK", "text/html; charset=utf-8", result)
     return _respond(start_response, "404 Not Found", "text/plain; charset=utf-8", "Not Found")
+
+
+def _legacy_route_guard(path: str, environ) -> tuple[str, str, list[tuple[str, str]]] | None:
+    """Apply the fail-closed legacy access policy before dispatching a handler.
+
+    Legacy routes are intentionally kept behind a single dispatcher gate.  The
+    gate does not inspect forwarding headers to infer the client address; their
+    presence is itself a topology anomaly in direct-loopback mode.
+    """
+
+    denial_reason = _legacy_route_denial_reason(environ)
+    if denial_reason is not None:
+        return (
+            "403 Forbidden",
+            f"{UI_TEXT['legacy_web_disabled']} {denial_reason}",
+            [],
+        )
+
+    if _get_runtime_session_user(environ) is None:
+        next_path = _safe_internal_path(path) or "/"
+        return _redirect_response(
+            _append_query_to_path("/runtime/login", {"next": next_path})
+        )
+    return None
+
+
+def _legacy_route_denial_reason(environ) -> str | None:
+    if os.getenv("PRA_ENABLE_LEGACY_WEB", "").strip() != "1":
+        return "PRA_ENABLE_LEGACY_WEB 必须显式设置为 1。"
+
+    if os.getenv("PRA_LEGACY_ACCESS_MODE", "").strip().lower() != "direct_loopback":
+        return "PRA_LEGACY_ACCESS_MODE 必须显式设置为 direct_loopback。"
+
+    proxy_mode = os.getenv("PRA_PROXY_MODE", "").strip().lower()
+    pra_env = os.getenv("PRA_ENV", "production").strip().lower() or "production"
+    if not proxy_mode and pra_env == "production":
+        proxy_mode = "reverse_proxy"
+    if proxy_mode != "none":
+        return "PRA_PROXY_MODE 必须显式设置为 none；反向代理或公网隧道模式下旧路由始终关闭。"
+
+    forwarding_headers = [
+        header
+        for header in LEGACY_FORWARDING_HEADERS
+        if header in environ
+    ]
+    if forwarding_headers:
+        _LOGGER.warning(
+            "legacy route rejected: forwarding headers present in direct_loopback mode: %s",
+            ", ".join(forwarding_headers),
+        )
+        return "direct_loopback 模式检测到未经验证的转发头，已拒绝访问。"
+
+    listen_host = _legacy_listen_host(environ)
+    if not _is_exact_loopback_host(listen_host):
+        return f"服务监听地址 {listen_host or '-'} 不是允许的 127.0.0.1/::1。"
+
+    remote_addr = str(environ.get("REMOTE_ADDR", "")).strip()
+    if not _is_exact_loopback_host(remote_addr):
+        return "TCP 对端不是 127.0.0.1/::1，旧路由拒绝访问。"
+    return None
+
+
+def _legacy_listen_host(environ) -> str:
+    # Tests and embedding servers may provide an explicit bind address.  The
+    # normal WSGI server path uses the value captured by ``serve``.
+    explicit = environ.get("PRA_LISTEN_HOST") or environ.get("SERVER_ADDR")
+    if explicit:
+        return str(explicit).strip()
+    return str(_WEB_LISTEN_HOST or "").strip()
+
+
+def _is_exact_loopback_host(value: str) -> bool:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return address.compressed in {"127.0.0.1", "::1"}
 
 
 def _handle_dashboard(method: str, environ) -> str:
@@ -985,8 +1085,9 @@ def _handle_runtime(method: str, environ) -> str | tuple[str, str, list[tuple[st
 
 def _handle_runtime_login(environ) -> tuple[str, str, list[tuple[str, str]]]:
     parsed = _parse_body(environ)
-    runtime_db = _first(parsed, "runtime_db", str(DEFAULT_RUNTIME_DB))
-    next_path = _safe_internal_path(_first(parsed, "next", ""))
+    query = _parse_query(environ)
+    runtime_db = _first(parsed, "runtime_db", _first(query, "runtime_db", str(DEFAULT_RUNTIME_DB)))
+    next_path = _safe_internal_path(_first(parsed, "next", _first(query, "next", "")))
     username = _first(parsed, "username", _runtime_admin_user()).strip() or _runtime_admin_user()
     password = _first(parsed, "password", "")
     redirect_target = next_path or _build_runtime_url(runtime_db)
