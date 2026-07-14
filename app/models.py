@@ -386,6 +386,31 @@ class ShadowBotSideEffectCheckpoint:
 
 
 @dataclass(slots=True)
+class RetryAuthorization:
+    """Persisted authorization envelope for a retry attempt.
+
+    Task 5 owns the storage contract only.  Issuance and consumption semantics
+    remain in the retry service delivered by the dependent task.
+    """
+
+    retry_authorization_id: str
+    operation_id: str
+    source_execution_attempt_id: str
+    authorization_type: str
+    authorized_by: str
+    evidence_type: str
+    evidence_hash: str
+    approved_payload_hash: str
+    status: str
+    max_uses: int = 1
+    consumed_by_execution_attempt_id: str | None = None
+    expires_at: datetime | None = None
+    reason: str = ""
+    created_at: datetime | None = None
+    consumed_at: datetime | None = None
+
+
+@dataclass(slots=True)
 class MockPlatformProductState:
     platform_name: str
     internal_sku: str

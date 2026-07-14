@@ -22,6 +22,7 @@ from app.field_labels import FIELD_LABELS, TABLE_LABELS
 from app.models import NotificationLog
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.mock_platform_repository import DEFAULT_MOCK_PLATFORM_DB, MockPlatformRepository
+from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION
 from app.repositories.workbook_repository import (
     get_table_headers,
     load_table_records,
@@ -167,7 +168,6 @@ TABLE_HEADER_LABELS = FIELD_LABELS
 RUNTIME_SESSION_COOKIE = "pra_runtime_session"
 RUNTIME_SESSION_TTL_SECONDS = 3600
 MOBILE_RESOLUTION_PAYLOAD_MAX_BYTES = 4096
-CURRENT_RUNTIME_SCHEMA_VERSION = 3
 PAGE_SIZE = 50
 TERMINAL_TASK_STATUS_VALUES = {"success", "skipped", "cancelled", "expired"}
 _RUNTIME_SESSIONS: dict[str, dict[str, object]] = {}
@@ -515,7 +515,12 @@ def application(environ, start_response):
             return _respond(start_response, status, content_type, body, headers=headers)
 
     if path == "/health":
-        return _respond(start_response, "200 OK", "text/plain; charset=utf-8", "ok")
+        query = _parse_query(environ)
+        runtime_db = Path(_first(query, "runtime_db", str(DEFAULT_RUNTIME_DB)))
+        health = SQLiteRuntimeRepository(runtime_db).check_schema_health()
+        status = "200 OK" if health.ok else "503 Service Unavailable"
+        body = "ok" if health.ok else f"unhealthy: {health.summary}"
+        return _respond(start_response, status, "text/plain; charset=utf-8", body)
     if path == "/dashboard":
         return _respond(start_response, "200 OK", "text/html; charset=utf-8", _handle_ops_dashboard(environ))
     if path == "/tasks":
@@ -6783,6 +6788,7 @@ def _build_runtime_db_checks(db_path: Path) -> list[dict[str, str]]:
     versions = _safe_schema_versions(db_path)
     latest_version = max(versions) if versions else 0
     version_value = ", ".join(str(version) for version in versions) if versions else "-"
+    health = SQLiteRuntimeRepository(db_path).check_schema_health()
     return [
         _system_check(
             "运行态数据库",
@@ -6808,9 +6814,19 @@ def _build_runtime_db_checks(db_path: Path) -> list[dict[str, str]]:
         _system_check(
             "运行态数据库",
             UI_TEXT["ops_schema_versions"],
-            "ok" if latest_version >= CURRENT_RUNTIME_SCHEMA_VERSION else "error",
+            "ok"
+            if latest_version == LATEST_RUNTIME_SCHEMA_VERSION
+            and versions == list(range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1))
+            else "error",
             version_value,
-            f"{UI_TEXT['ops_system_latest_schema']} >= {CURRENT_RUNTIME_SCHEMA_VERSION}；未来 v3/v4 会按最新版本继续扩展。",
+            f"{UI_TEXT['ops_system_latest_schema']} 必须精确匹配 v{LATEST_RUNTIME_SCHEMA_VERSION}，且迁移记录连续。",
+        ),
+        _system_check(
+            "运行态数据库",
+            "schema 完整性",
+            "ok" if health.ok else "error",
+            "v5 结构完整" if health.ok else "v5 结构缺失或约束不完整",
+            health.summary,
         ),
     ]
 

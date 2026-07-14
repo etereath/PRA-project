@@ -27,7 +27,8 @@ python scripts/run_system_smoke_tests.py
 
 ```text
 [OK] runtime DB 初始化成功
-[OK] schema version >= 3
+[OK] schema version exact v5
+[OK] v5 RetryAuthorization 结构完整
 [FAILED] review token 创建、校验、使用后失效
   原因：REVIEW_TOKEN_SECRET is required
   建议检查模块：ReviewTokenService
@@ -58,7 +59,7 @@ data/runtime/pra_runtime.sqlite3
 - 不接真实平台。
 - 不接真实 RPA。
 - 不引入 AI Agent 自动决策。
-- 不新增 SQLite schema。
+- 只初始化隔离的 smoke SQLite schema，不修改真实运行库。
 - 不修改业务规则。
 - 不打印 secret、raw token、完整 webhook、完整 `mobile_review_url` 或 `token=`。
 
@@ -67,8 +68,9 @@ data/runtime/pra_runtime.sqlite3
 脚本至少覆盖以下主控流程：
 
 - runtime DB 初始化成功。
-- schema version `>= 3`。
-- 关键表存在：`tasks`、`review_tasks`、`notification_logs`、`execution_logs`、`task_status_history`、`review_tokens`、`script_runs`、`script_run_items`。
+- schema version 必须精确为 v5，迁移记录连续包含 `1..5`。
+- 关键表存在：`tasks`、`review_tasks`、`notification_logs`、`execution_logs`、`task_status_history`、`review_tokens`、`script_runs`、`script_run_items`、`shadowbot_operations`、`shadowbot_execution_attempts`、`shadowbot_side_effect_checkpoints`、`retry_authorizations`。
+- v5 RetryAuthorization 表的列、外键、`max_uses=1`、状态约束、两个唯一约束和 operation/status/expires_at 索引完整。
 - 创建 runtime task。
 - `dedupe_key` 去重有效。
 - 创建 `pending review_task`。
@@ -87,7 +89,8 @@ data/runtime/pra_runtime.sqlite3
 按脚本输出的“建议检查模块”优先定位：
 
 - `SQLiteRuntimeRepository / RuntimeTaskService.init_schema`：检查运行态 schema 初始化、测试 DB 路径和表结构。
-- `runtime_schema_migrations`：检查 schema version 是否包含最新版本，当前要求最新版本至少为 `3`。
+- `runtime_schema_migrations`：检查 schema version 是否精确为 `5` 且迁移记录连续。
+- `runtime schema health check`：检查 v5 必需表、列、约束和索引，避免“伪 v5”数据库通过检查。
 - `RuntimeTaskService.create_tasks`：检查 task 模型、状态枚举、`dedupe_key` 和 partial unique index。
 - `ReviewTaskService.create_from_tasks`：检查人工复核任务生成、`MANUAL_INTERVENTION_ACTIONS` 和复核 dedupe。
 - `ReviewNotificationService / MockNotificationSender`：检查 `DEFAULT_NOTIFICATION_CHANNEL=mock` 和通知日志写入。

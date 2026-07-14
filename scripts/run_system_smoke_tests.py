@@ -25,6 +25,7 @@ from app.enums import ReviewTaskStatus, TaskActionType, TaskStatus  # noqa: E402
 from app.exceptions import ValidationError  # noqa: E402
 from app.models import Task  # noqa: E402
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository  # noqa: E402
+from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION, REQUIRED_RUNTIME_TABLES  # noqa: E402
 from app.services.runtime import (  # noqa: E402
     NotificationLogService,
     ReviewTaskService,
@@ -35,16 +36,7 @@ from app.web import _RUNTIME_SESSIONS, application  # noqa: E402
 
 
 TEST_DB = ROOT / "data" / "runtime" / "test_runtime_smoke.sqlite3"
-REQUIRED_TABLES = {
-    "tasks",
-    "review_tasks",
-    "notification_logs",
-    "execution_logs",
-    "task_status_history",
-    "review_tokens",
-    "script_runs",
-    "script_run_items",
-}
+REQUIRED_TABLES = set(REQUIRED_RUNTIME_TABLES)
 SMOKE_SECRET = "smoke-review-token-secret-32-chars-minimum"
 SMOKE_ADMIN_PASSWORD = "smoke-admin-password-only-for-local-smoke"
 SMOKE_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/smoke-placeholder"
@@ -72,8 +64,9 @@ class SmokeRunner:
     def run(self) -> int:
         checks: list[tuple[str, str, Callable[[], None]]] = [
             ("runtime DB 初始化成功", "SQLiteRuntimeRepository / RuntimeTaskService.init_schema", self.check_init_db),
-            ("schema version >= 3", "runtime_schema_migrations", self.check_schema_version),
+            ("schema version exact v5", "runtime_schema_migrations", self.check_schema_version),
             ("关键运行态表存在", "SQLite schema", self.check_required_tables),
+            ("v5 RetryAuthorization 结构完整", "runtime schema health check", self.check_schema_integrity),
             ("创建 runtime task", "RuntimeTaskService.create_tasks", self.check_create_task),
             ("dedupe_key 去重有效", "tasks partial unique index", self.check_task_dedupe),
             ("创建 pending review_task", "ReviewTaskService.create_from_tasks", self.check_create_review_task),
@@ -116,8 +109,9 @@ class SmokeRunner:
 
     def check_schema_version(self) -> None:
         versions = self.context.repository.schema_versions()
-        if not versions or max(versions) < 3:
-            raise AssertionError(f"schema version 不满足要求：{versions}")
+        expected = list(range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1))
+        if versions != expected:
+            raise AssertionError(f"schema version 不满足精确 v{LATEST_RUNTIME_SCHEMA_VERSION} 要求：{versions}")
 
     def check_required_tables(self) -> None:
         with self.context.repository.connect() as connection:
@@ -126,6 +120,11 @@ class SmokeRunner:
         missing = sorted(REQUIRED_TABLES - tables)
         if missing:
             raise AssertionError(f"缺少关键表：{', '.join(missing)}")
+
+    def check_schema_integrity(self) -> None:
+        health = self.context.repository.check_schema_health()
+        if not health.ok:
+            raise AssertionError(health.summary)
 
     def check_create_task(self) -> None:
         task = runtime_task("SMOKE-TASK-APPROVE", status=TaskStatus.MANUAL_REVIEW)

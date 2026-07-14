@@ -6,6 +6,7 @@ from pathlib import Path
 from app.enums import ReviewTaskStatus, TaskActionType, TaskStatus
 from app.exceptions import ValidationError
 from app.repositories.workbook_repository import create_template_workbooks
+from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION
 from app.services.ai import MockAISuggestionProvider
 from app.services.pricing import PricingService
 from app.services.runtime import DEFAULT_RUNTIME_DB
@@ -230,7 +231,10 @@ def main() -> int:
 
         if args.command == "init-runtime-db":
             versions = init_runtime_database(RuntimeDatabaseInputs(db_path=args.runtime_db))
-            print(f"运行态数据库已初始化：{args.runtime_db}，schema_versions={versions}")
+            print(
+                f"运行态数据库已初始化：{args.runtime_db}，schema_versions={versions}，"
+                f"latest_runtime_schema_version={LATEST_RUNTIME_SCHEMA_VERSION}"
+            )
             return 0
 
         if args.command == "generate-runtime-tasks":
