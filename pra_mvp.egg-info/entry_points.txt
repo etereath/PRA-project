@@ -1,3 +1,0 @@
-[console_scripts]
-pra = app.cli:main
-pra-mvp = app.cli:main

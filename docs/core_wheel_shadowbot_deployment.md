@@ -77,7 +77,7 @@ Pop-Location
 
 ## 4. ShadowBot 干净克隆部署
 
-部署机只需要从 GitHub 获取受版本控制源码；不要把 ShadowBot 源码复制进 Python wheel 的安装目录：
+部署机只需要从 GitHub 获取受版本控制源码；不要把 ShadowBot 源码复制进 Python wheel 的安装目录。`--app-dir` 必须指向影刀已经创建或导入的真实 `xbot_robot` 应用目录，不能指向新建的空目录。该目录至少必须包含影刀宿主生成的 `package.py` 和项目选择器资源 `selectorsV2.xml`；运行时还需要影刀提供的 `xbot` 宿主模块。
 
 ```powershell
 git clone https://github.com/etereath/PRA-project.git
@@ -85,10 +85,11 @@ Set-Location PRA-project
 python -m venv .venv
 & ".\.venv\Scripts\python.exe" -m pip install --upgrade pip
 
-$appDir = "C:\ShadowBot\apps\pra-test2"
-New-Item -ItemType Directory -Force -Path $appDir | Out-Null
+$appDir = $env:SHADOWBOT_APP_DIR
+if (-not $appDir) { throw "Set SHADOWBOT_APP_DIR to an existing ShadowBot xbot_robot directory" }
 & ".\.venv\Scripts\python.exe" scripts\sync_shadowbot_test2.py --app-dir $appDir
 & ".\.venv\Scripts\python.exe" scripts\sync_shadowbot_test2.py --app-dir $appDir --check
+& ".\.venv\Scripts\python.exe" scripts\verify_shadowbot_deployment.py --app-dir $appDir
 ```
 
 第二次 `--check` 必须为每个受同步文件报告 `CURRENT`；配置文件只报告 `EXISTS`。在部署机上将 `shadowbot_worker_config.json` 从 example 复制后填写本机配置，但该文件不得回写仓库：
@@ -100,6 +101,22 @@ notepad $appDir\shadowbot_worker_config.json
 
 `login_credential_target` 只填写 Windows Credential Manager 中已创建的 Generic Credential target。密码不得作为命令行参数传递。真实影刀 UI、cpolar、飞书通知和真实账号属于受控手工验收，不是普通干净部署的自动通过条件。
 
+不安装核心 wheel 时，`verify_shadowbot_deployment.py` 只验证 ShadowBot 发行物、宿主文件和 Python 语法，不导入 `app`；实际运行由影刀 `xbot`/`package.py`/选择器资源提供宿主能力。该边界不依赖开发机 `PYTHONPATH`。
+
+构建物、核心源码、ShadowBot 源码、部署目录、结果/证据目录和日志使用同一 secret scan：
+
+```powershell
+python scripts\verify_packaging.py `
+  --scan-dir app `
+  --scan-dir shadowbot `
+  --scan-dir $appDir `
+  --scan-dir D:\PRA_Runtime\shadowbot_queue\results `
+  --scan-dir D:\PRA_Runtime\shadowbot_queue\evidence `
+  --scan-dir D:\PRA_Runtime\shadowbot_queue\logs
+```
+
+扫描区分 provider 中安全的字段名（例如 `CredentialBlob`）和非空的真实账号、密码、target、token 值；缺失目录、真实值或构建物中未知成员都会返回非零退出码。
+
 ## 5. 验收命令
 
 ```powershell
@@ -108,7 +125,9 @@ python -m pytest -q tests/test_shadowbot_credentials.py
 python -m pytest -q tests/test_shadowbot_queue.py -k "login or read_only"
 python -m pytest -q tests -k "schema or health"
 python scripts/run_system_smoke_tests.py
-python scripts/sync_shadowbot_test2.py --check --app-dir C:\ShadowBot\apps\pra-test2
+python scripts/sync_shadowbot_test2.py --check --app-dir $env:SHADOWBOT_APP_DIR
+python scripts/verify_shadowbot_deployment.py --app-dir $env:SHADOWBOT_APP_DIR
+python scripts/verify_packaging.py --scan-dir app --scan-dir shadowbot --scan-dir $env:SHADOWBOT_APP_DIR
 ```
 
 构建产物、ShadowBot 部署目录和日志完成 secret scan 后，才能把任务 6 标记为完成。任务 7 再将这些命令固化到 GitHub Actions；任务 6 不创建 workflow，也不替代任务 4 的 ShadowBot 状态机与 lease 验收。

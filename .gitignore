@@ -17,6 +17,7 @@ __pycache__/
 # Python build outputs
 build/
 dist/
+*.egg-info/
 
 .tmp_shadowbot_executor_tests/
 test_runtime_tmp/

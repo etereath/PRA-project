@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -9,15 +10,16 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_DIR = PROJECT_ROOT / "shadowbot" / "test2"
-DEFAULT_APP_DIR = Path(
-    r"C:\Users\etere\AppData\Local\ShadowBot\users\940455499808497666\apps"
-    r"\fb717589-c95c-4228-935d-c61d54df494c\xbot_robot"
-)
+REQUIRED_HOST_FILES = ("package.py", "selectorsV2.xml")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Synchronize canonical test2 Python code into the ShadowBot app")
-    parser.add_argument("--app-dir", type=Path, default=DEFAULT_APP_DIR)
+    parser.add_argument(
+        "--app-dir",
+        type=Path,
+        help="Existing ShadowBot xbot_robot application directory; defaults to SHADOWBOT_APP_DIR",
+    )
     parser.add_argument("--check", action="store_true", help="Only compare hashes; do not write files")
     return parser
 
@@ -26,9 +28,20 @@ def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def validate_shadowbot_app_dir(app_dir: Path) -> None:
+    if not app_dir.is_dir():
+        raise FileNotFoundError(f"ShadowBot application directory does not exist: {app_dir}")
+    missing = [name for name in REQUIRED_HOST_FILES if not (app_dir / name).is_file()]
+    if missing:
+        missing_text = ", ".join(missing)
+        raise ValueError(
+            f"not a usable ShadowBot xbot_robot directory: missing host files {missing_text}; "
+            "create/import the application in ShadowBot first"
+        )
+
+
 def sync(app_dir: Path, *, check_only: bool) -> list[dict[str, str]]:
-    if not app_dir.exists():
-        raise FileNotFoundError(app_dir)
+    validate_shadowbot_app_dir(app_dir)
     records: list[dict[str, str]] = []
     mappings = (
         (SOURCE_DIR / "module1.py", app_dir / "module1.py"),
@@ -70,7 +83,10 @@ def sync(app_dir: Path, *, check_only: bool) -> list[dict[str, str]]:
 
 def main() -> int:
     args = build_parser().parse_args()
-    records = sync(args.app_dir, check_only=args.check)
+    configured_app_dir = args.app_dir or (Path(os.environ["SHADOWBOT_APP_DIR"]) if os.environ.get("SHADOWBOT_APP_DIR") else None)
+    if configured_app_dir is None:
+        raise SystemExit("--app-dir or SHADOWBOT_APP_DIR is required; refusing an implicit developer path")
+    records = sync(configured_app_dir, check_only=args.check)
     for record in records:
         print(record)
     if args.check and any(record["status"] in {"DIFFERENT", "MISSING"} for record in records):
