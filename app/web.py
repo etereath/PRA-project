@@ -583,6 +583,16 @@ def _application(environ, start_response):
             override_error.public_message,
         )
 
+    # Logout is an explicit state-changing action.  Reject every method
+    # except POST before the CSRF guard or handler can touch the Session.
+    if path == "/runtime/logout" and method != "POST":
+        return _respond(
+            start_response,
+            "405 Method Not Allowed",
+            "text/plain; charset=utf-8",
+            "Method Not Allowed.",
+        )
+
     csrf_failure = _csrf_request_guard(method, path, environ)
     if csrf_failure is not None:
         status, body, headers = csrf_failure
@@ -2436,7 +2446,6 @@ def _handle_business_inputs_page(method: str, environ) -> str | tuple[str, str, 
 def _load_platform_rows_for_business_inputs(platform_mappings_path: str) -> tuple[list[dict[str, object]], str]:
     try:
         platform_path = Path(platform_mappings_path)
-        ensure_platform_mappings_workbook(platform_path)
         platform_rows = load_platform_mapping_rows(platform_path)
     except (ValidationError, FileNotFoundError) as exc:
         return [], f"平台映射表读取失败，页面已使用默认平台列表。原因：{exc}"

@@ -190,13 +190,15 @@ $env:PRA_ALLOWED_DATA_DIRS = "D:\PRA_Runtime\data;D:\PRA_Runtime\imports"
 - `RUNTIME_LOGIN_RATE_LIMIT_COOLDOWN_SECONDS`：触发后的冷却时间，默认 `900` 秒。
 - `RUNTIME_LOGIN_RATE_LIMIT_MAX_KEYS`：最多保存的账号/来源桶数量，默认 `4096`。
 
-达到阈值返回稳定错误码 `RATE_LIMITED`；成功登录只清理同一账号和同一 TCP 对端的桶。
+达到阈值返回稳定错误码 `RATE_LIMITED`；成功登录只清理同一账号和同一 TCP 对端的桶。容量达到上限时优先清理已过期且未封禁的桶；如果剩余桶仍受保护，则对新主体失败关闭，不能淘汰活跃封禁桶来绕过限流。
 
 登录页 GET 只渲染页面，不计入失败次数；登录以外的方法返回 `405`。预登录 CSRF token 绑定有界、带锁的 HttpOnly/SameSite 预登录 Cookie，并且一次性消费；跨浏览器、过期、重放和 query token 均拒绝。
 
-高频登录失败、CSRF、路径拒绝、旧路由拒绝和 Mobile Review token 拒绝的审计日志按主体/路由/原因窗口限速并生成聚合摘要；内存审计队列和限流桶均有容量上限。
+高频登录失败、CSRF、路径拒绝、旧路由拒绝和 Mobile Review token 拒绝的审计日志先按事件类型进行进程级窗口限速，再生成聚合摘要；主体哈希不能通过高基数轮换绕过全局上限。内存审计队列和限流桶均有容量上限。
 
 `/tasks?task_tab=automation` 为只读 GET；数据库初始化/迁移不在 GET 请求中执行，缺失数据库不会被请求自动创建。
+
+`/runtime/logout` 只允许 POST 执行注销并要求 Session CSRF；GET、PUT、PATCH、DELETE 均返回 405，不改变 Session、审计或 Cookie。`/business-inputs` 的 GET 只读已有文件，缺失业务工作簿返回空态，不执行 ensure/create；业务映射创建只能通过受保护的 POST。
 
 ## 6. 旧版 Web 路由安全开关
 

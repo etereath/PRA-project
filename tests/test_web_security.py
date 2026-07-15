@@ -605,6 +605,21 @@ class WebSecurityTests(unittest.TestCase):
                 self.assertNotIn(old_session_id, _RUNTIME_SESSIONS)
                 self.assertNotEqual(old_session_id, rotated_session_id)
 
+                for method in ("GET", "PUT", "DELETE"):
+                    method_status, method_headers, _ = self._call(
+                        path="/runtime/logout",
+                        method=method,
+                        query=urlencode({"runtime_db": str(db_path)}),
+                        cookie=rotated_session_cookie,
+                    )
+                    self.assertEqual(method_status, "405 Method Not Allowed")
+                    self.assertFalse([value for key, value in method_headers if key == "Set-Cookie"])
+                    self.assertIn(rotated_session_id, _RUNTIME_SESSIONS)
+                self.assertNotIn(
+                    "SESSION_LOGOUT",
+                    {event["event_type"] for event in list_security_audit_events()},
+                )
+
                 rotated_csrf_token = str(_RUNTIME_SESSIONS[rotated_session_id]["csrf_token"])
                 logout_status, logout_headers, _ = self._call(
                     path="/runtime/logout",
@@ -676,15 +691,80 @@ class WebSecurityTests(unittest.TestCase):
             self.assertFalse(limiter.is_blocked("admin", "127.0.0.1", now=11.0))
             self.assertFalse(limiter.is_blocked("other", "127.0.0.1", now=4.0))
 
+    def test_login_rate_limiter_never_evicts_active_lockout(self) -> None:
+        limiter = LoginRateLimiter()
+        with patch.dict(
+            "os.environ",
+            {
+                "RUNTIME_LOGIN_RATE_LIMIT_MAX_ATTEMPTS": "1",
+                "RUNTIME_LOGIN_RATE_LIMIT_WINDOW_SECONDS": "100",
+                "RUNTIME_LOGIN_RATE_LIMIT_COOLDOWN_SECONDS": "100",
+                "RUNTIME_LOGIN_RATE_LIMIT_MAX_KEYS": "16",
+            },
+            clear=False,
+        ):
+            self.assertTrue(limiter.record_failure("admin", "127.0.0.1", now=0.0))
+            for index in range(100):
+                limiter.record_failure(f"user-{index}", "127.0.0.1", now=1.0)
+            self.assertTrue(limiter.is_blocked("admin", "127.0.0.1", now=2.0))
+
+    def test_business_inputs_get_does_not_create_missing_workbooks(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "runtime.sqlite3"
+            SQLiteRuntimeRepository(db_path).init_schema()
+            missing_paths = {
+                key: root / filename
+                for key, filename in {
+                    "products_path": "products.xlsx",
+                    "price_rules_path": "price_rules.xlsx",
+                    "listing_rules_path": "listing_rules.xlsx",
+                    "capacity_plans_path": "capacity_plans.xlsx",
+                    "cold_storage_status_path": "cold_storage_status.xlsx",
+                    "platform_mappings_path": "platform_mappings.xlsx",
+                }.items()
+            }
+            before_names = sorted(path.name for path in root.iterdir())
+            with patch.dict(
+                "os.environ",
+                {"PRA_ALLOWED_DATA_DIRS": str(root), "RUNTIME_ADMIN_PASSWORD": "secret"},
+                clear=False,
+            ):
+                login_token, preauth_cookie = self._login_context(db_path)
+                _, headers, _ = self._call(
+                    path="/runtime/login",
+                    method="POST",
+                    cookie=preauth_cookie,
+                    body=urlencode(
+                        {
+                            "runtime_db": str(db_path),
+                            "username": "admin",
+                            "password": "secret",
+                            "csrf_token": login_token,
+                        }
+                    ),
+                )
+                session_cookie = self._header(headers, "Set-Cookie").split(";", 1)[0]
+                status, _, _ = self._call(
+                    path="/business-inputs",
+                    query=urlencode(
+                        {"runtime_db": str(db_path), **{key: str(path) for key, path in missing_paths.items()}}
+                    ),
+                    cookie=session_cookie,
+                )
+            self.assertEqual(status, "200 OK")
+            self.assertEqual(sorted(path.name for path in root.iterdir()), before_names)
+            self.assertTrue(all(not path.exists() for path in missing_paths.values()))
+
     def test_high_frequency_security_audit_logging_is_throttled(self) -> None:
         with patch("app.services.security._LOGGER.info") as logger:
-            for _ in range(100):
+            for index in range(1000):
                 record_security_event(
                     "CSRF_REJECTED",
                     route="/runtime",
                     outcome="rejected",
                     reason_code="SESSION_CSRF_INVALID",
-                    subject="admin",
+                    subject=f"user-{index}",
                 )
         self.assertLessEqual(logger.call_count, 5)
         self.assertLessEqual(len(list_security_audit_events()), 5)

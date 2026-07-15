@@ -59,9 +59,11 @@ def record_security_event(
             _AUDIT_EVENTS.append(event)
             log_events.append(event)
         else:
-            subject_hash = event["subject_hash"] or ""
-            key = f"{event_type}|{subject_hash}|{route}|{reason_code}"
-            throttle = _AUDIT_THROTTLE.get(key)
+            # The global event-type bucket is the first layer.  It prevents
+            # attackers from bypassing the limit by rotating subject hashes;
+            # no attacker-controlled high-cardinality key enters this bucket.
+            global_key = event_type
+            throttle = _AUDIT_THROTTLE.get(global_key)
             if throttle is None:
                 if len(_AUDIT_THROTTLE) >= _AUDIT_MAX_THROTTLE_KEYS:
                     oldest_key = min(
@@ -70,11 +72,12 @@ def record_security_event(
                     )
                     _AUDIT_THROTTLE.pop(oldest_key, None)
                 throttle = _AuditThrottleEntry(window_started=now)
-                _AUDIT_THROTTLE[key] = throttle
+                _AUDIT_THROTTLE[global_key] = throttle
             elif now - throttle.window_started >= _AUDIT_LOG_WINDOW_SECONDS:
                 if throttle.suppressed:
                     summary = {
                         **event,
+                        "subject_hash": None,
                         "timestamp": datetime.now(timezone.utc).isoformat(),
                         "event_type": f"{event_type}_SUMMARY",
                         "outcome": "aggregated",
@@ -179,9 +182,21 @@ class LoginRateLimiter:
         max_attempts, window, cooldown, max_keys = self._config()
         key = self._key(username, remote_addr)
         with self._lock:
+            # Expired, unblocked buckets are safe to remove.  Never evict an
+            # active bucket merely because a new username arrived.
+            for existing_key, existing_entry in list(self._entries.items()):
+                existing_entry.failures = deque(
+                    value for value in existing_entry.failures if current - value < window
+                )
+                if current >= existing_entry.blocked_until:
+                    existing_entry.blocked_until = 0.0
+                if not existing_entry.failures and existing_entry.blocked_until <= current:
+                    self._entries.pop(existing_key, None)
             if key not in self._entries and len(self._entries) >= max_keys:
-                oldest_key = min(self._entries, key=lambda item: self._entries[item].touched_at)
-                self._entries.pop(oldest_key, None)
+                # Fail closed when every remaining bucket still carries
+                # active protection; dropping one would let the attacker
+                # bypass an existing lockout by creating new usernames.
+                return True
             entry = self._entries.setdefault(key, _RateLimitEntry(deque()))
             entry.touched_at = current
             entry.failures = deque(value for value in entry.failures if current - value < window)
