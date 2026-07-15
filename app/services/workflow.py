@@ -340,40 +340,25 @@ def resolve_mobile_review(
     runtime_task_service = RuntimeTaskService(repository)
     runtime_task_service.init_schema()
     token_service = ReviewTokenService(repository)
-    validation = token_service.validate_token(review_task_id, raw_token, action=action)
-    if not validation.is_valid or validation.review_token is None or validation.review_task is None:
-        raise ValidationError("链接已失效或无权访问该复核任务")
-
     try:
         review_status = ReviewTaskStatus(action)
     except ValueError as exc:
         raise ValidationError("链接已失效或无权访问该复核任务") from exc
 
-    source_task = (
-        runtime_task_service.get_task(validation.review_task.source_task_id)
-        if validation.review_task.source_task_id
-        else None
-    )
-    source_task_status = source_task_status_for_review_resolution(source_task, review_status)
-
-    resolved_review = ReviewTaskService(
-        repository,
-        runtime_task_service=runtime_task_service,
-    ).resolve_review_task(
+    token_hash = token_service._hash_raw_token(raw_token)
+    atomic_result = repository.resolve_mobile_review_atomic(
         review_task_id=review_task_id,
+        token_hash=token_hash,
         status=review_status,
-        actor=validation.token_subject,
         actor_source="mobile_review_token",
         note=note,
         resolution_payload=resolution_payload,
-        source_task_status=source_task_status,
     )
-    used_token = token_service.record_resolve_usage(validation.review_token.token_id)
     return MobileReviewResolutionSummary(
-        review_task=resolved_review,
-        review_token=used_token,
-        source_task=source_task,
-        source_task_status=source_task_status,
+        review_task=atomic_result.review_task,
+        review_token=atomic_result.review_token,
+        source_task=atomic_result.source_task,
+        source_task_status=atomic_result.source_task_status,
     )
 
 

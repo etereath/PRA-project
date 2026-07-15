@@ -465,6 +465,16 @@ class ReviewToken:
 
 
 @dataclass(slots=True)
+class MobileReviewAtomicResult:
+    """Committed state returned by the single-transaction Mobile Review flow."""
+
+    review_task: ReviewTask
+    review_token: ReviewToken
+    source_task: Task | None
+    source_task_status: TaskStatus | None
+
+
+@dataclass(slots=True)
 class NotificationLog:
     notification_id: str
     related_task_id: str | None

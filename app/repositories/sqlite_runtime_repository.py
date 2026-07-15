@@ -6,11 +6,14 @@ from contextlib import closing
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
+from uuid import uuid4
 
 from app.enums import PricingSource, ReviewTaskStatus, TaskActionType, TaskStatus
+from app.exceptions import MobileReviewErrorCode, MobileReviewTransactionError
 from app.models import (
     ExecutionLog,
+    MobileReviewAtomicResult,
     NotificationLog,
     RetryAuthorization,
     ReviewTask,
@@ -35,6 +38,40 @@ from app.utils import serialize_decimal
 
 
 TERMINAL_TASK_STATUSES = ("success", "skipped", "cancelled", "expired")
+
+MOBILE_REVIEW_ACTIONS = frozenset({
+    ReviewTaskStatus.APPROVED.value,
+    ReviewTaskStatus.REJECTED.value,
+    ReviewTaskStatus.ADJUSTED.value,
+    ReviewTaskStatus.CANCELLED.value,
+})
+
+MANUAL_REVIEW_SOURCE_ACTIONS = frozenset({
+    TaskActionType.CAPACITY_WARNING,
+    TaskActionType.LABOR_REQUIRED,
+    TaskActionType.MANUAL_PRICE_REVIEW,
+    TaskActionType.BELOW_BREAK_EVEN_REVIEW,
+    TaskActionType.SHORTAGE_WARNING,
+    TaskActionType.COLD_STORAGE_WARNING,
+    TaskActionType.CLEARANCE_WARNING,
+    TaskActionType.MANUAL_REVIEW,
+})
+
+ATOMIC_TASK_TRANSITIONS = {
+    TaskStatus.PENDING: {
+        TaskStatus.RUNNING,
+        TaskStatus.MANUAL_REVIEW,
+        TaskStatus.SKIPPED,
+        TaskStatus.CANCELLED,
+        TaskStatus.EXPIRED,
+    },
+    TaskStatus.MANUAL_REVIEW: {
+        TaskStatus.PENDING,
+        TaskStatus.SKIPPED,
+        TaskStatus.CANCELLED,
+        TaskStatus.EXPIRED,
+    },
+}
 
 
 SCHEMA_SQL = [
@@ -709,6 +746,273 @@ class SQLiteRuntimeRepository:
                     _json_dump(history.metadata),
                 ),
             )
+
+    def resolve_mobile_review_atomic(
+        self,
+        *,
+        review_task_id: str,
+        token_hash: str,
+        status: ReviewTaskStatus,
+        actor_source: str,
+        actor: str | None = None,
+        note: str = "",
+        resolution_payload: dict[str, object] | None = None,
+        now: datetime | None = None,
+        failure_injector: Callable[[str], None] | None = None,
+    ) -> MobileReviewAtomicResult:
+        """Resolve Mobile Review state in one SQLite transaction.
+
+        Parsing and payload-shape validation belong before this method. Every
+        state decision here is made from rows read through the same connection
+        after ``BEGIN IMMEDIATE``.
+        """
+
+        timestamp = now or datetime.now()
+        payload = resolution_payload or {}
+
+        def inject(point: str) -> None:
+            if failure_injector is not None:
+                failure_injector(point)
+
+        with closing(self.connect()) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                token_row = connection.execute(
+                    "SELECT * FROM review_tokens WHERE token_hash = ?",
+                    (token_hash,),
+                ).fetchone()
+                if token_row is None:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.TOKEN_NOT_FOUND,
+                        "链接已失效或无权访问该复核任务",
+                    )
+                if str(token_row["review_task_id"]) != review_task_id:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.TOKEN_REVIEW_MISMATCH,
+                        "链接已失效或无权访问该复核任务",
+                    )
+
+                review_row = connection.execute(
+                    "SELECT * FROM review_tasks WHERE review_task_id = ?",
+                    (review_task_id,),
+                ).fetchone()
+                if review_row is None:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.REVIEW_NOT_FOUND,
+                        "链接已失效或无权访问该复核任务",
+                    )
+
+                expires_at = _text_to_datetime(token_row["expires_at"])
+                if expires_at is not None and expires_at <= timestamp:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.TOKEN_EXPIRED,
+                        "链接已失效或无权访问该复核任务",
+                    )
+                if token_row["revoked_at"] is not None:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.TOKEN_REVOKED,
+                        "链接已失效或无权访问该复核任务",
+                    )
+                if token_row["used_at"] is not None:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.TOKEN_ALREADY_USED,
+                        "链接已失效或无权访问该复核任务",
+                    )
+                if str(review_row["review_status"]) != ReviewTaskStatus.PENDING.value:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.REVIEW_ALREADY_RESOLVED,
+                        "链接已失效或无权访问该复核任务",
+                    )
+
+                action = status.value
+                allowed_actions = _json_list_load(token_row["allowed_actions"])
+                if action not in allowed_actions:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.ACTION_NOT_ALLOWED,
+                        "链接已失效或无权访问该复核任务",
+                    )
+                if action not in MOBILE_REVIEW_ACTIONS:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.ACTION_NOT_ALLOWED_FOR_REVIEW_TYPE,
+                        "链接已失效或无权访问该复核任务",
+                    )
+
+                source_task_id = review_row["source_task_id"]
+                source_row = (
+                    connection.execute(
+                        "SELECT * FROM tasks WHERE task_id = ?",
+                        (source_task_id,),
+                    ).fetchone()
+                    if source_task_id
+                    else None
+                )
+                source_task_status = _atomic_source_task_status(source_row, status)
+                resolved_actor = actor or str(token_row["token_subject"])
+
+                token_updated = connection.execute(
+                    """
+                    UPDATE review_tokens
+                    SET used_at = ?, last_used_at = ?
+                    WHERE token_id = ?
+                      AND review_task_id = ?
+                      AND token_hash = ?
+                      AND allowed_actions = ?
+                      AND used_at IS NULL
+                      AND revoked_at IS NULL
+                      AND expires_at > ?
+                    """,
+                    (
+                        _datetime_to_text(timestamp),
+                        _datetime_to_text(timestamp),
+                        token_row["token_id"],
+                        review_task_id,
+                        token_hash,
+                        token_row["allowed_actions"],
+                        _datetime_to_text(timestamp),
+                    ),
+                ).rowcount
+                if token_updated != 1:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.CONCURRENT_UPDATE,
+                        "复核请求发生并发更新，请重试",
+                    )
+                inject("after_token_update")
+
+                review_updated = connection.execute(
+                    """
+                    UPDATE review_tasks
+                    SET review_status = ?,
+                        resolution_payload_json = ?,
+                        updated_at = ?,
+                        resolved_by = ?,
+                        resolved_at = ?,
+                        resolution_note = ?
+                    WHERE review_task_id = ?
+                      AND review_status = ?
+                    """,
+                    (
+                        action,
+                        _json_dump(payload),
+                        _datetime_to_text(timestamp),
+                        resolved_actor,
+                        _datetime_to_text(timestamp),
+                        note,
+                        review_task_id,
+                        ReviewTaskStatus.PENDING.value,
+                    ),
+                ).rowcount
+                if review_updated != 1:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.REVIEW_ALREADY_RESOLVED,
+                        "复核任务已被其他请求处理",
+                    )
+                inject("after_review_update")
+
+                if source_row is not None and source_task_status is not None:
+                    current_source_status = TaskStatus(str(source_row["task_status"]))
+                    if source_task_status != current_source_status and source_task_status not in ATOMIC_TASK_TRANSITIONS.get(
+                        current_source_status, set()
+                    ):
+                        raise MobileReviewTransactionError(
+                            MobileReviewErrorCode.CONCURRENT_UPDATE,
+                            "源任务状态已变化，复核请求未提交",
+                        )
+                    task_updated = connection.execute(
+                        """
+                        UPDATE tasks
+                        SET task_status = ?,
+                            result_message = COALESCE(NULLIF(?, ''), result_message),
+                            updated_at = ?
+                        WHERE task_id = ?
+                          AND task_status = ?
+                        """,
+                        (
+                            source_task_status.value,
+                            note,
+                            _datetime_to_text(timestamp),
+                            source_task_id,
+                            current_source_status.value,
+                        ),
+                    ).rowcount
+                    if task_updated != 1:
+                        raise MobileReviewTransactionError(
+                            MobileReviewErrorCode.CONCURRENT_UPDATE,
+                            "源任务状态已变化，复核请求未提交",
+                        )
+                    inject("after_task_update")
+
+                    history_metadata = {
+                        "review_task_id": review_task_id,
+                        "review_status": status.value,
+                        "actor": resolved_actor,
+                        "actor_source": actor_source,
+                        "resolution_note": note,
+                        "resolution_payload_summary": _resolution_payload_summary(payload),
+                    }
+                    history_id = uuid4().hex[:12]
+                    inject("before_history_insert")
+                    connection.execute(
+                        """
+                        INSERT INTO task_status_history(
+                            history_id, task_id, from_status, to_status, changed_by, changed_at, reason, metadata_json
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            history_id,
+                            source_task_id,
+                            current_source_status.value,
+                            source_task_status.value,
+                            resolved_actor,
+                            _datetime_to_text(timestamp),
+                            f"review_task:{review_task_id}:{status.value}",
+                            _json_dump(history_metadata),
+                        ),
+                    )
+                    inject("after_history_insert")
+
+                committed_review_row = connection.execute(
+                    "SELECT * FROM review_tasks WHERE review_task_id = ?",
+                    (review_task_id,),
+                ).fetchone()
+                committed_token_row = connection.execute(
+                    "SELECT * FROM review_tokens WHERE token_id = ?",
+                    (token_row["token_id"],),
+                ).fetchone()
+                committed_source_row = (
+                    connection.execute(
+                        "SELECT * FROM tasks WHERE task_id = ?",
+                        (source_task_id,),
+                    ).fetchone()
+                    if source_task_id
+                    else None
+                )
+                if committed_review_row is None or committed_token_row is None:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.CONCURRENT_UPDATE,
+                        "复核结果提交前读取失败",
+                    )
+                connection.commit()
+                return MobileReviewAtomicResult(
+                    review_task=_row_to_review_task(committed_review_row),
+                    review_token=_row_to_review_token(committed_token_row),
+                    source_task=_row_to_task(committed_source_row) if committed_source_row is not None else None,
+                    source_task_status=source_task_status,
+                )
+            except MobileReviewTransactionError:
+                connection.rollback()
+                raise
+            except sqlite3.OperationalError as exc:
+                connection.rollback()
+                if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.CONCURRENT_UPDATE,
+                        "复核请求发生并发更新，请重试",
+                    ) from exc
+                raise
+            except Exception:
+                connection.rollback()
+                raise
 
     def insert_review_token(self, review_token: ReviewToken) -> int:
         row = _review_token_to_row(review_token)
@@ -1646,6 +1950,37 @@ def _row_to_status_history(row: sqlite3.Row) -> TaskStatusHistory:
         reason=str(row["reason"] or ""),
         metadata=_json_load(row["metadata_json"]),
     )
+
+
+def _atomic_source_task_status(
+    source_row: sqlite3.Row | None,
+    status: ReviewTaskStatus,
+) -> TaskStatus | None:
+    if source_row is None:
+        return None
+    current_status = TaskStatus(str(source_row["task_status"]))
+    if current_status == TaskStatus.MANUAL_REVIEW:
+        if status == ReviewTaskStatus.APPROVED:
+            return TaskStatus.PENDING
+        if status == ReviewTaskStatus.CANCELLED:
+            return TaskStatus.CANCELLED
+        return TaskStatus.SKIPPED
+    if current_status == TaskStatus.PENDING:
+        action_type = TaskActionType(str(source_row["action_type"]))
+        if action_type in MANUAL_REVIEW_SOURCE_ACTIONS:
+            return TaskStatus.CANCELLED if status == ReviewTaskStatus.CANCELLED else TaskStatus.SKIPPED
+    return None
+
+
+def _resolution_payload_summary(payload: dict[str, object]) -> dict[str, object]:
+    if not payload:
+        return {}
+    summary: dict[str, object] = {"keys": sorted(payload.keys())}
+    if "reviewer_code" in payload and payload.get("reviewer_code"):
+        summary["reviewer_code_present"] = True
+    if "adjustment" in payload:
+        summary["adjustment"] = payload.get("adjustment")
+    return summary
 
 
 def _date_to_text(value: date | None) -> str | None:
