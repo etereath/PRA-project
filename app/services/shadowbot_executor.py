@@ -774,15 +774,7 @@ class ShadowBotExecutor:
         lease_required = isinstance(attempt.raw_output.get("lease"), dict)
         if lease_required:
             if not result.lease_owner_token or result.lease_version <= 0:
-                lease = attempt.raw_output.get("lease") if isinstance(attempt.raw_output.get("lease"), dict) else {}
-                if not lease:
-                    raise ValidationError("RESULT_CONTRACT_INVALID: lease owner token/version are required.")
-                merged_raw_output["legacy_lease_binding_inferred"] = True
-                result = replace(
-                    result,
-                    lease_owner_token=str(lease.get("owner_token") or ""),
-                    lease_version=int(lease.get("version") or 0),
-                )
+                raise ValidationError("RESULT_CONTRACT_INVALID: lease owner token/version are required.")
             if not self.repository.complete_shadowbot_attempt_with_lease(
                 result.execution_attempt_id,
                 owner_token=result.lease_owner_token,
@@ -1171,18 +1163,37 @@ class ShadowBotExecutor:
             ]
         )
 
-    def classify_timeout(self, operation_id: str) -> ShadowBotTimeoutClassification:
-        checkpoint = self.repository.latest_shadowbot_side_effect_checkpoint(operation_id)
-        side_effect_state = checkpoint.side_effect_state if checkpoint is not None else SIDE_EFFECT_NOT_STARTED
-        if side_effect_state in SIDE_EFFECT_RECONCILE_REQUIRED:
-            status = STATUS_NEEDS_RECONCILIATION
-            retryable = False
-            next_mode = EXECUTION_MODE_RECONCILE
-        else:
-            status = STATUS_FAILED
-            retryable = False
-            next_mode = ""
-        self.repository.update_shadowbot_operation_status(operation_id, status, lock_owner="")
+    def classify_timeout(
+        self,
+        operation_id: str,
+        *,
+        now: datetime | None = None,
+    ) -> ShadowBotTimeoutClassification:
+        """Fence a genuinely expired active attempt; never mutate only the operation."""
+        current = now or utc_now()
+        active = [
+            attempt
+            for attempt in self.repository.list_active_shadowbot_execution_attempts()
+            if attempt.operation_id == operation_id and attempt.execution_mode == EXECUTION_MODE_COMMIT
+        ]
+        if len(active) != 1:
+            raise ValidationError("SHADOWBOT_TIMEOUT_REQUIRES_ONE_ACTIVE_COMMIT_ATTEMPT")
+        attempt = active[0]
+        lease = attempt.raw_output.get("lease") if isinstance(attempt.raw_output.get("lease"), dict) else {}
+        lease_expires_at = _parse_optional_datetime(lease.get("expires_at"))
+        if not lease or lease_expires_at is None:
+            raise ValidationError("SHADOWBOT_TIMEOUT_REQUIRES_LEASE")
+        if lease_expires_at > current:
+            raise ValidationError("SHADOWBOT_LEASE_STILL_ACTIVE")
+        if not self.repository.expire_shadowbot_lease(attempt.execution_attempt_id, now=current):
+            raise ValidationError("SHADOWBOT_TIMEOUT_FENCING_CONFLICT")
+        expired_attempt = self.repository.get_shadowbot_execution_attempt(attempt.execution_attempt_id)
+        if expired_attempt is None:
+            raise ValidationError("execution_attempt_id does not exist.")
+        side_effect_state = expired_attempt.side_effect_state
+        status = STATUS_NEEDS_RECONCILIATION
+        retryable = False
+        next_mode = EXECUTION_MODE_RECONCILE
         return ShadowBotTimeoutClassification(
             operation_id=operation_id,
             status=status,

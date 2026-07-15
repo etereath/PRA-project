@@ -955,13 +955,39 @@ class SQLiteRuntimeRepository:
             for row in rows:
                 raw = _json_load(row["raw_output_json"])
                 raw["frozen_reason"] = "DUPLICATE_ACTIVE_COMMIT_ATTEMPT"
+                raw["frozen_at"] = _datetime_to_text(now)
                 lease = raw.get("lease") if isinstance(raw.get("lease"), dict) else {}
                 lease["active"] = False
                 lease["frozen_at"] = _datetime_to_text(now)
                 raw["lease"] = lease
+                checkpoint = connection.execute(
+                    """
+                    SELECT side_effect_state FROM shadowbot_side_effect_checkpoints
+                    WHERE execution_attempt_id = ? ORDER BY version DESC LIMIT 1
+                    """,
+                    (str(row["execution_attempt_id"]),),
+                ).fetchone()
+                observed_side_effect = (
+                    str(checkpoint["side_effect_state"])
+                    if checkpoint is not None
+                    else str(row["side_effect_state"])
+                )
+                start_unknown = str(row["status"]) == "STARTING" and observed_side_effect == "NOT_STARTED"
+                attempt_status = "START_UNKNOWN" if start_unknown else "SIDE_EFFECT_UNKNOWN"
+                terminal_side_effect = "NOT_STARTED" if start_unknown else "UNKNOWN"
                 connection.execute(
-                    "UPDATE shadowbot_execution_attempts SET raw_output_json = ? WHERE execution_attempt_id = ?",
-                    (_json_dump(raw), str(row["execution_attempt_id"])),
+                    """
+                    UPDATE shadowbot_execution_attempts
+                    SET status = ?, side_effect_state = ?, ended_at = ?, raw_output_json = ?
+                    WHERE execution_attempt_id = ? AND status IN ('STARTING', 'RUNNING')
+                    """,
+                    (
+                        attempt_status,
+                        terminal_side_effect,
+                        _datetime_to_text(now),
+                        _json_dump(raw),
+                        str(row["execution_attempt_id"]),
+                    ),
                 )
             connection.execute(
                 """
@@ -1672,6 +1698,8 @@ class SQLiteRuntimeRepository:
                 connection.rollback()
                 return None
             expires_at = _text_to_datetime(authorization["expires_at"])
+            if expires_at is not None and expires_at.tzinfo is None and consumed_at.tzinfo is not None:
+                expires_at = expires_at.replace(tzinfo=consumed_at.tzinfo)
             if (
                 str(authorization["status"]) != "ACTIVE"
                 or int(authorization["max_uses"]) != 1
@@ -1697,19 +1725,54 @@ class SQLiteRuntimeRepository:
                 """,
                 (attempt.operation_id,),
             ).fetchone()
+            source_raw = _json_load(source["raw_output_json"]) if source is not None else {}
+            source_status = str(source["status"]) if source is not None else ""
+            source_approval_expires_at = _text_to_datetime(source_raw.get("approval_expires_at"))
+            if (
+                source_approval_expires_at is not None
+                and source_approval_expires_at.tzinfo is None
+                and consumed_at.tzinfo is not None
+            ):
+                source_approval_expires_at = source_approval_expires_at.replace(tzinfo=consumed_at.tzinfo)
+            source_approval_valid = bool(
+                source_raw.get("approval_id")
+                and str(source_raw.get("approved_payload_hash") or "") == approved_payload_hash
+                and source_approval_expires_at is not None
+                and source_approval_expires_at > consumed_at
+            )
+            frozen_manual_source = bool(
+                source is not None
+                and str(authorization["authorization_type"]) == "MANUAL"
+                and source_raw.get("frozen_reason") == "DUPLICATE_ACTIVE_COMMIT_ATTEMPT"
+                and (
+                    (
+                        str(authorization["evidence_type"]) == "PRE_PUBLISH_NOT_PUBLISHED"
+                        and source_status == "START_UNKNOWN"
+                        and str(source["side_effect_state"]) == "NOT_STARTED"
+                    )
+                    or (
+                        str(authorization["evidence_type"]) == "NOT_APPLIED_RESULT"
+                        and source_status in {"START_UNKNOWN", "SIDE_EFFECT_UNKNOWN"}
+                    )
+                )
+            )
+            normal_source = bool(
+                source is not None
+                and source_status in {"START_FAILED", "FAILED", "NOT_APPLIED"}
+                and (
+                    (source_status == "START_FAILED" and str(source["side_effect_state"]) == "NOT_STARTED")
+                    or (
+                        source_status in {"FAILED", "NOT_APPLIED"}
+                        and str(source["side_effect_state"]) == "NOT_APPLIED"
+                    )
+                )
+            )
             if (
                 source is None
                 or str(source["operation_id"]) != attempt.operation_id
                 or str(source["execution_mode"]) != "COMMIT"
-                or str(source["status"]) not in {"START_FAILED", "FAILED", "NOT_APPLIED"}
-                or (
-                    str(source["status"]) == "START_FAILED"
-                    and str(source["side_effect_state"]) != "NOT_STARTED"
-                )
-                or (
-                    str(source["status"]) in {"FAILED", "NOT_APPLIED"}
-                    and str(source["side_effect_state"]) != "NOT_APPLIED"
-                )
+                or not source_approval_valid
+                or not (normal_source or frozen_manual_source)
                 or active is not None
             ):
                 connection.rollback()

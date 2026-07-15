@@ -170,6 +170,14 @@ def _lease(attempt: ShadowBotExecutionAttempt) -> dict[str, object]:
     return dict(attempt.raw_output["lease"])
 
 
+def _lease_binding_for_contract(attempt: ShadowBotExecutionAttempt) -> dict[str, object]:
+    lease = _lease(attempt)
+    return {
+        "lease_owner_token": str(lease["owner_token"]),
+        "lease_version": int(lease["version"]),
+    }
+
+
 def _write_json_with_checksum(path: Path, payload: dict[str, object], *, bad_checksum: bool = False) -> None:
     content = (json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2) + "\n").encode("utf-8")
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -218,6 +226,21 @@ def _result_payload(attempt: ShadowBotExecutionAttempt, request: dict[str, objec
         "error_code": flags[3],
         "retryable": False,
     }
+
+
+def _pre_publish_evidence(attempt: ShadowBotExecutionAttempt, *, result_id: str) -> RetryEvidence:
+    return RetryEvidence(
+        evidence_type=EVIDENCE_PRE_PUBLISH_NOT_PUBLISHED,
+        result_id=result_id,
+        instruction_hash=attempt.instruction_hash,
+        request_file_sha256=attempt.request_file_sha256,
+        approved_payload_hash=_approval().approved_payload_hash,
+        side_effect_state=SIDE_EFFECT_NOT_STARTED,
+        checksum_valid=True,
+        ready_published=False,
+        worker_claimed=False,
+        platform_action=False,
+    )
 
 
 def test_f01_before_temp_write_is_start_failed_and_requires_authorization(tmp_path: Path) -> None:
@@ -380,6 +403,55 @@ def test_manual_retry_authorization_records_actor_reason_and_evidence(tmp_path: 
     assert authorization.reason == "controlled manual approval"
 
 
+def test_retry_authorization_rejects_expired_source_approval(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    with pytest.raises(ShadowBotStartBoundaryError):
+        ShadowBotExecutor(repository, BoundaryRunner(published=False)).start_execution(
+            _start_request(attempt_id="ATTEMPT-APPROVAL-EXPIRED")
+        )
+    source = repository.get_shadowbot_execution_attempt("ATTEMPT-APPROVAL-EXPIRED")
+    raw = dict(source.raw_output)
+    raw["approval_expires_at"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+    repository.update_shadowbot_execution_attempt(source.execution_attempt_id, raw_output=raw)
+    source = repository.get_shadowbot_execution_attempt(source.execution_attempt_id)
+    with pytest.raises(ValidationError, match="RETRY_SOURCE_APPROVAL_EXPIRED"):
+        RetryPolicyService(repository).issue_automatic(
+            source_execution_attempt_id=source.execution_attempt_id,
+            evidence=_pre_publish_evidence(source, result_id="EVIDENCE-APPROVAL-EXPIRED"),
+        )
+
+
+def test_retry_authorization_rejects_expired_total_time_window(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    with pytest.raises(ShadowBotStartBoundaryError):
+        ShadowBotExecutor(repository, BoundaryRunner(published=False)).start_execution(
+            _start_request(attempt_id="ATTEMPT-WINDOW-EXPIRED")
+        )
+    source = repository.get_shadowbot_execution_attempt("ATTEMPT-WINDOW-EXPIRED")
+    with pytest.raises(ValidationError, match="RETRY_TOTAL_TIME_WINDOW_EXPIRED"):
+        RetryPolicyService(repository, max_retry_window=timedelta(minutes=5)).issue_automatic(
+            source_execution_attempt_id=source.execution_attempt_id,
+            evidence=_pre_publish_evidence(source, result_id="EVIDENCE-WINDOW-EXPIRED"),
+            now=source.started_at + timedelta(minutes=6),
+        )
+
+
+def test_retry_authorization_accepts_valid_approval_inside_total_window(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    with pytest.raises(ShadowBotStartBoundaryError):
+        ShadowBotExecutor(repository, BoundaryRunner(published=False)).start_execution(
+            _start_request(attempt_id="ATTEMPT-WINDOW-VALID")
+        )
+    source = repository.get_shadowbot_execution_attempt("ATTEMPT-WINDOW-VALID")
+    authorization = RetryPolicyService(repository, max_retry_window=timedelta(minutes=5)).issue_automatic(
+        source_execution_attempt_id=source.execution_attempt_id,
+        evidence=_pre_publish_evidence(source, result_id="EVIDENCE-WINDOW-VALID"),
+        now=source.started_at + timedelta(minutes=4),
+    )
+    assert authorization.status == "ACTIVE"
+    assert authorization.expires_at <= datetime.fromisoformat(str(source.raw_output["approval_expires_at"]))
+
+
 def test_retryable_hint_never_replaces_retry_authorization(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     executor = ShadowBotExecutor(repository, RecordingRunner())
@@ -398,6 +470,7 @@ def test_retryable_hint_never_replaces_retry_authorization(tmp_path: Path) -> No
             task_id="TASK-RECOVERY",
             execution_mode=EXECUTION_MODE_COMMIT,
             instruction_hash=attempt.instruction_hash,
+            **_lease_binding_for_contract(attempt),
         )
     )
     with pytest.raises(ValidationError, match="RETRY_AUTHORIZATION_REQUIRED"):
@@ -466,6 +539,32 @@ def test_f07_result_written_before_import_is_idempotent(tmp_path: Path) -> None:
     assert repository.get_shadowbot_operation("OP-RECOVERY").status == STATUS_VERIFIED
 
 
+def test_f07_same_result_id_with_different_checksum_is_quarantined(tmp_path: Path) -> None:
+    repository, queue_dir, runner, _, attempt, _, request = _file_attempt(
+        tmp_path, attempt_id="ATTEMPT-F07-CONFLICT"
+    )
+    result_path = queue_dir / "results" / "ATTEMPT-F07-CONFLICT.result.json"
+    original = _result_payload(attempt, request)
+    _write_json_with_checksum(result_path, original)
+    importer = ShadowBotResultImporter(repository, runner, queue_dir)
+    first = importer.import_one(result_path)
+    archive = Path(first["archive_dir"])
+    for name, destination in (
+        ("ATTEMPT-F07-CONFLICT.ready.json", queue_dir / "inbox" / "ATTEMPT-F07-CONFLICT.ready.json"),
+        (
+            "ATTEMPT-F07-CONFLICT.ready.json.sha256",
+            queue_dir / "inbox" / "ATTEMPT-F07-CONFLICT.ready.json.sha256",
+        ),
+    ):
+        destination.write_bytes((archive / name).read_bytes())
+    conflict = dict(original)
+    conflict["worker_id"] = "different-worker-same-result-id"
+    _write_json_with_checksum(result_path, conflict)
+    events = importer.import_available()
+    assert events[0]["status"] == "QUARANTINED"
+    assert repository.get_shadowbot_operation("OP-RECOVERY").status == OperationStatus.MANUAL_REVIEW.value
+
+
 def test_f08_memory_success_without_result_becomes_unknown_after_lease_expiry(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     executor = ShadowBotExecutor(repository, RecordingRunner())
@@ -509,6 +608,23 @@ def test_f10_expired_old_lease_cannot_write_back(tmp_path: Path) -> None:
         )
 
 
+def test_f10_expired_old_worker_verified_result_is_late_evidence(tmp_path: Path) -> None:
+    repository, queue_dir, runner, _, attempt, _, request = _file_attempt(
+        tmp_path, attempt_id="ATTEMPT-F10-LATE-RESULT"
+    )
+    lease = _lease(attempt)
+    expires = datetime.fromisoformat(str(lease["expires_at"]))
+    assert repository.expire_shadowbot_lease(attempt.execution_attempt_id, now=expires + timedelta(seconds=1))
+    result_path = queue_dir / "results" / "ATTEMPT-F10-LATE-RESULT.result.json"
+    _write_json_with_checksum(result_path, _result_payload(attempt, request))
+    events = ShadowBotResultImporter(repository, runner, queue_dir).import_available()
+    assert events[0]["status"] == "QUARANTINED"
+    frozen = repository.get_shadowbot_execution_attempt(attempt.execution_attempt_id)
+    assert frozen.status == STATUS_SIDE_EFFECT_UNKNOWN
+    assert not frozen.raw_output.get("result_id")
+    assert repository.get_shadowbot_operation("OP-RECOVERY").status == OperationStatus.MANUAL_REVIEW.value
+
+
 def test_lease_renewal_requires_current_owner_and_version(tmp_path: Path) -> None:
     repository = _repository(tmp_path)
     executor = ShadowBotExecutor(repository, RecordingRunner())
@@ -526,6 +642,48 @@ def test_lease_renewal_requires_current_owner_and_version(tmp_path: Path) -> Non
         lease_version=int(lease["version"]),
         lease_seconds=1800,
     )
+
+
+def test_result_missing_lease_identity_is_rejected(tmp_path: Path) -> None:
+    repository, _, _, executor, attempt, _, request = _file_attempt(
+        tmp_path, attempt_id="ATTEMPT-LEASE-MISSING"
+    )
+    data = _result_payload(attempt, request)
+    data.pop("lease_owner_token")
+    data.pop("lease_version")
+    with pytest.raises(ValidationError, match="lease owner token/version are required"):
+        executor.record_result(shadowbot_result_contract_from_data(data))
+    assert repository.get_shadowbot_execution_attempt(attempt.execution_attempt_id).status == STATUS_RUNNING
+
+
+def test_result_stale_lease_owner_is_rejected(tmp_path: Path) -> None:
+    repository, _, _, executor, attempt, _, request = _file_attempt(
+        tmp_path, attempt_id="ATTEMPT-LEASE-STALE"
+    )
+    data = _result_payload(attempt, request)
+    data["lease_owner_token"] = "stale-owner"
+    with pytest.raises(ValidationError, match="LEASE_LOST_WRITEBACK_REJECTED"):
+        executor.record_result(shadowbot_result_contract_from_data(data))
+    assert repository.get_shadowbot_execution_attempt(attempt.execution_attempt_id).status == STATUS_RUNNING
+
+
+def test_result_wrong_lease_version_is_rejected(tmp_path: Path) -> None:
+    repository, _, _, executor, attempt, _, request = _file_attempt(
+        tmp_path, attempt_id="ATTEMPT-LEASE-WRONG-VERSION"
+    )
+    data = _result_payload(attempt, request)
+    data["lease_version"] = int(data["lease_version"]) + 1
+    with pytest.raises(ValidationError, match="LEASE_LOST_WRITEBACK_REJECTED"):
+        executor.record_result(shadowbot_result_contract_from_data(data))
+    assert repository.get_shadowbot_execution_attempt(attempt.execution_attempt_id).status == STATUS_RUNNING
+
+
+def test_result_current_lease_identity_is_accepted(tmp_path: Path) -> None:
+    repository, _, _, executor, attempt, _, request = _file_attempt(
+        tmp_path, attempt_id="ATTEMPT-LEASE-CURRENT"
+    )
+    executor.record_result(shadowbot_result_contract_from_data(_result_payload(attempt, request)))
+    assert repository.get_shadowbot_execution_attempt(attempt.execution_attempt_id).status == STATUS_VERIFIED
 
 
 def test_f11_read_only_recovery_can_be_retryable_without_commit_semantics(tmp_path: Path) -> None:
@@ -651,6 +809,70 @@ def test_i07_duplicate_active_commit_attempts_are_frozen(tmp_path: Path) -> None
     events = ShadowBotLeaseWatchdog(repository).inspect()
     assert events[0]["error_code"] == "DUPLICATE_ACTIVE_COMMIT_ATTEMPT"
     assert repository.get_shadowbot_operation("OP-RECOVERY").status == OperationStatus.MANUAL_REVIEW.value
+    frozen_attempts = repository.list_shadowbot_execution_attempts(operation_id="OP-RECOVERY")
+    assert {attempt.status for attempt in frozen_attempts} == {STATUS_SIDE_EFFECT_UNKNOWN}
+    assert all(attempt.ended_at is not None for attempt in frozen_attempts)
+    assert ShadowBotLeaseWatchdog(repository).inspect() == []
+
+
+def test_i07_manual_evidence_can_authorize_and_create_fresh_attempt_after_freeze(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    runner = RecordingRunner()
+    ShadowBotExecutor(repository, runner).start_execution(_start_request(attempt_id="ATTEMPT-I07-CLOSE-A"))
+    first = repository.get_shadowbot_execution_attempt("ATTEMPT-I07-CLOSE-A")
+    approval = _approval()
+    repository.insert_shadowbot_execution_attempt(
+        ShadowBotExecutionAttempt(
+            execution_attempt_id="ATTEMPT-I07-CLOSE-B",
+            operation_id=first.operation_id,
+            execution_mode=EXECUTION_MODE_COMMIT,
+            shadowbot_run_id="RUN-I07-CLOSE-B",
+            status=STATUS_RUNNING,
+            side_effect_state=SIDE_EFFECT_NOT_STARTED,
+            started_at=datetime.now(UTC),
+            instruction_hash="instruction-i07-close-b",
+            request_file_sha256="request-i07-close-b",
+            raw_output={
+                "approved_payload_hash": approval.approved_payload_hash,
+                "approval_id": approval.approval_id,
+                "approval_expires_at": approval.expires_at.isoformat(),
+                "lease": {
+                    "owner_token": "other-owner",
+                    "version": 2,
+                    "expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+                    "active": True,
+                },
+            },
+        )
+    )
+    ShadowBotLeaseWatchdog(repository).inspect()
+    source = repository.get_shadowbot_execution_attempt("ATTEMPT-I07-CLOSE-B")
+    evidence = RetryEvidence(
+        evidence_type=EVIDENCE_NOT_APPLIED_RESULT,
+        result_id="MANUAL-EVIDENCE-I07-CLOSE",
+        instruction_hash=source.instruction_hash,
+        request_file_sha256=source.request_file_sha256,
+        approved_payload_hash=approval.approved_payload_hash,
+        side_effect_state=SIDE_EFFECT_NOT_APPLIED,
+        checksum_valid=True,
+        failed_phase="MANUAL_PLATFORM_RECONCILIATION",
+    )
+    authorization = RetryPolicyService(repository).issue_manual(
+        source_execution_attempt_id=source.execution_attempt_id,
+        actor="operator-i07",
+        reason="platform evidence confirms target change was not applied",
+        evidence=evidence,
+    )
+    result = ShadowBotExecutor(repository, runner).start_execution(
+        _start_request(
+            attempt_id="ATTEMPT-I07-CLOSE-RETRY",
+            retry_authorization_id=authorization.retry_authorization_id,
+        )
+    )
+    fresh = repository.get_shadowbot_execution_attempt(result.execution_attempt_id)
+    assert fresh.status == STATUS_RUNNING
+    assert int(_lease(fresh)["version"]) > int(_lease(source)["version"])
+    assert repository.get_retry_authorization(authorization.retry_authorization_id).status == "CONSUMED"
 
 
 def test_i08_running_without_queue_moves_to_reconciliation_on_expiry(tmp_path: Path) -> None:

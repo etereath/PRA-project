@@ -140,7 +140,7 @@ def _review_task_for_payload(review_task_id: str, payload: ShadowBotApprovedPayl
     return review
 
 
-def _result_binding(repository: SQLiteRuntimeRepository, execution_attempt_id: str) -> dict[str, str]:
+def _result_binding(repository: SQLiteRuntimeRepository, execution_attempt_id: str) -> dict[str, object]:
     attempt = repository.get_shadowbot_execution_attempt(execution_attempt_id)
     operation = repository.get_shadowbot_operation(attempt.operation_id)
     return {
@@ -150,6 +150,7 @@ def _result_binding(repository: SQLiteRuntimeRepository, execution_attempt_id: s
         "instruction_hash": attempt.instruction_hash,
         "request_file_sha256": attempt.request_file_sha256,
         "worker_id": "test-worker",
+        **_lease_binding(repository, execution_attempt_id),
     }
 
 
@@ -307,6 +308,7 @@ class ShadowBotExecutorTests(unittest.TestCase):
                 side_effect_state=SIDE_EFFECT_NOT_STARTED,
                 retryable=True,
                 error_code="PRE_SUBMIT_FAILED",
+                **_lease_binding(self.repository, "ATTEMPT-1"),
             )
         )
 
@@ -351,12 +353,23 @@ class ShadowBotExecutorTests(unittest.TestCase):
             **_lease_binding(self.repository, "ATTEMPT-1"),
         )
 
-        classification = self.executor.classify_timeout("OP-1")
+        with self.assertRaisesRegex(ValidationError, "SHADOWBOT_LEASE_STILL_ACTIVE"):
+            self.executor.classify_timeout("OP-1")
+        self.assertEqual(self.repository.get_shadowbot_operation("OP-1").status, STATUS_RUNNING)
+        self.assertEqual(self.repository.get_shadowbot_execution_attempt("ATTEMPT-1").status, STATUS_RUNNING)
+
+        attempt = self.repository.get_shadowbot_execution_attempt("ATTEMPT-1")
+        expires_at = datetime.fromisoformat(str(attempt.raw_output["lease"]["expires_at"]))
+        classification = self.executor.classify_timeout("OP-1", now=expires_at + timedelta(seconds=1))
 
         self.assertEqual(checkpoint.version, 1)
         self.assertEqual(classification.status, STATUS_NEEDS_RECONCILIATION)
         self.assertEqual(classification.next_execution_mode, EXECUTION_MODE_RECONCILE)
         self.assertFalse(classification.retryable)
+        self.assertNotIn(
+            self.repository.get_shadowbot_execution_attempt("ATTEMPT-1").status,
+            {"STARTING", "RUNNING"},
+        )
 
     def test_commit_start_after_submit_intent_checkpoint_does_not_start_new_price_attempt(self) -> None:
         self.executor.start_execution(
@@ -382,6 +395,7 @@ class ShadowBotExecutorTests(unittest.TestCase):
                 side_effect_state=SIDE_EFFECT_UNKNOWN,
                 retryable=False,
                 error_code="SUBMIT_RESULT_UNKNOWN",
+                **_lease_binding(self.repository, "ATTEMPT-1"),
             )
         )
 
@@ -446,6 +460,7 @@ class ShadowBotExecutorTests(unittest.TestCase):
                     "evidence_status": "COMPLETE",
                     "evidence": [{"type": "AFTER_SUBMIT", "storage_uri": r"\\share\after.png"}],
                 },
+                **_lease_binding(self.repository, "ATTEMPT-1"),
             )
         )
 
@@ -479,6 +494,7 @@ class ShadowBotExecutorTests(unittest.TestCase):
                 retryable=True,
                 error_code="PRODUCT_NOT_FOUND",
                 raw_output={"status": STATUS_FAILED, "side_effect_state": SIDE_EFFECT_NOT_STARTED},
+                **_lease_binding(self.repository, "ATTEMPT-1"),
             )
         )
 
@@ -515,6 +531,7 @@ class ShadowBotExecutorTests(unittest.TestCase):
                 retryable=False,
                 error_code="SUBMIT_RESULT_UNKNOWN",
                 raw_output={"status": STATUS_NEEDS_RECONCILIATION, "side_effect_state": SIDE_EFFECT_UNKNOWN},
+                **_lease_binding(self.repository, "ATTEMPT-1"),
             )
         )
 
@@ -554,6 +571,7 @@ class ShadowBotExecutorTests(unittest.TestCase):
                 retryable=False,
                 error_code="SUBMIT_NOT_APPLIED",
                 raw_output={"actual_price": "19.00"},
+                **_lease_binding(self.repository, "ATTEMPT-1"),
             )
         )
 
@@ -586,6 +604,7 @@ class ShadowBotExecutorTests(unittest.TestCase):
                 side_effect_state=SIDE_EFFECT_UNKNOWN,
                 retryable=False,
                 error_code="SUBMIT_RESULT_UNKNOWN",
+                **_lease_binding(self.repository, "ATTEMPT-1"),
             )
         )
 
@@ -742,6 +761,7 @@ class ShadowBotExecutorTests(unittest.TestCase):
                 side_effect_state=SIDE_EFFECT_NOT_STARTED,
                 retryable=False,
                 error_code="PRODUCT_NOT_FOUND",
+                **_lease_binding(self.repository, "ATTEMPT-1"),
             )
         )
 

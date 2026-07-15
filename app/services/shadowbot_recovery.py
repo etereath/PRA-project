@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
+from app.enums import ReviewTaskStatus
 from app.exceptions import ValidationError
 from app.models import RetryAuthorization, ShadowBotExecutionAttempt
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
@@ -23,6 +24,23 @@ AUTHORIZATION_AUTO_POLICY = "AUTO_POLICY"
 AUTHORIZATION_MANUAL = "MANUAL"
 EVIDENCE_NOT_APPLIED_RESULT = "NOT_APPLIED_RESULT"
 EVIDENCE_PRE_PUBLISH_NOT_PUBLISHED = "PRE_PUBLISH_NOT_PUBLISHED"
+
+
+def _as_retry_aware(value: datetime, reference: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=reference.tzinfo)
+    return value
+
+
+def _parse_retry_timestamp(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    reference = utc_now()
+    return _as_retry_aware(parsed, reference)
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,10 +106,12 @@ class RetryPolicyService:
         *,
         max_commit_attempts: int = 3,
         authorization_ttl: timedelta = timedelta(minutes=15),
+        max_retry_window: timedelta = timedelta(hours=1),
     ) -> None:
         self.repository = repository
         self.max_commit_attempts = max_commit_attempts
         self.authorization_ttl = authorization_ttl
+        self.max_retry_window = max_retry_window
 
     def issue_automatic(
         self,
@@ -100,7 +120,7 @@ class RetryPolicyService:
         evidence: RetryEvidence,
         now: datetime | None = None,
     ) -> RetryAuthorization:
-        current = now or utc_now()
+        current = _as_retry_aware(now or utc_now(), utc_now())
         attempt, operation = self._load_source(source_execution_attempt_id)
         self._validate_common(attempt, operation, evidence, current)
         if evidence.evidence_type == EVIDENCE_NOT_APPLIED_RESULT:
@@ -135,13 +155,20 @@ class RetryPolicyService:
     ) -> RetryAuthorization:
         if not actor.strip() or not reason.strip():
             raise ValidationError("MANUAL_RETRY_AUTHORIZATION_REQUIRES_ACTOR_AND_REASON")
-        current = now or utc_now()
+        current = _as_retry_aware(now or utc_now(), utc_now())
         attempt, operation = self._load_source(source_execution_attempt_id)
-        self._validate_common(attempt, operation, evidence, current, allow_manual_review=True)
+        self._validate_common(
+            attempt,
+            operation,
+            evidence,
+            current,
+            allow_manual_review=True,
+            allow_frozen_manual=True,
+        )
         if evidence.evidence_type == EVIDENCE_NOT_APPLIED_RESULT:
-            self._validate_not_applied(attempt, evidence)
+            self._validate_not_applied(attempt, evidence, allow_frozen_manual=True)
         elif evidence.evidence_type == EVIDENCE_PRE_PUBLISH_NOT_PUBLISHED:
-            self._validate_pre_publish(attempt, evidence)
+            self._validate_pre_publish(attempt, evidence, allow_frozen_manual=True)
         else:
             raise ValidationError("RETRY_AUTHORIZATION_EVIDENCE_UNSUPPORTED")
         authorization = self._authorization(
@@ -180,14 +207,26 @@ class RetryPolicyService:
         current: datetime,
         *,
         allow_manual_review: bool = False,
+        allow_frozen_manual: bool = False,
     ) -> None:
-        del current
+        frozen_manual_source = bool(
+            allow_frozen_manual
+            and attempt.raw_output.get("frozen_reason") == "DUPLICATE_ACTIVE_COMMIT_ATTEMPT"
+            and attempt.status in {
+                AttemptStatus.START_UNKNOWN.value,
+                AttemptStatus.SIDE_EFFECT_UNKNOWN.value,
+            }
+        )
         if attempt.execution_mode != "COMMIT" or attempt.status in {
             AttemptStatus.STARTING.value,
             AttemptStatus.RUNNING.value,
-            AttemptStatus.START_UNKNOWN.value,
-            AttemptStatus.SIDE_EFFECT_UNKNOWN.value,
-        }:
+        } or (
+            attempt.status in {
+                AttemptStatus.START_UNKNOWN.value,
+                AttemptStatus.SIDE_EFFECT_UNKNOWN.value,
+            }
+            and not frozen_manual_source
+        ):
             raise ValidationError("RETRY_SOURCE_ATTEMPT_NOT_ELIGIBLE")
         blocked = {
             OperationStatus.VERIFIED.value,
@@ -200,6 +239,25 @@ class RetryPolicyService:
             raise ValidationError("RETRY_OPERATION_FROZEN")
         if evidence.approved_payload_hash != operation.approved_payload_hash:
             raise ValidationError("RETRY_APPROVED_PAYLOAD_MISMATCH")
+        source_approval_id = str(attempt.raw_output.get("approval_id") or "").strip()
+        source_approval_expiry = _parse_retry_timestamp(attempt.raw_output.get("approval_expires_at"))
+        source_payload_hash = str(attempt.raw_output.get("approved_payload_hash") or "")
+        if not source_approval_id or source_approval_expiry is None:
+            raise ValidationError("RETRY_SOURCE_APPROVAL_BINDING_MISSING")
+        if source_approval_expiry <= current:
+            raise ValidationError("RETRY_SOURCE_APPROVAL_EXPIRED")
+        if source_payload_hash != operation.approved_payload_hash:
+            raise ValidationError("RETRY_SOURCE_APPROVAL_PAYLOAD_MISMATCH")
+        review = self.repository.get_review_task(source_approval_id)
+        if review is None or review.review_status != ReviewTaskStatus.APPROVED:
+            raise ValidationError("RETRY_SOURCE_APPROVAL_NOT_APPROVED")
+        stored_payload_hash = str(
+            review.resolution_payload.get("approved_payload_hash")
+            or review.review_payload.get("approved_payload_hash")
+            or ""
+        )
+        if stored_payload_hash != source_payload_hash:
+            raise ValidationError("RETRY_SOURCE_APPROVAL_PAYLOAD_MISMATCH")
         if not evidence.instruction_hash or evidence.instruction_hash != attempt.instruction_hash:
             raise ValidationError("RETRY_INSTRUCTION_HASH_MISMATCH")
         if evidence.evidence_type == EVIDENCE_NOT_APPLIED_RESULT:
@@ -218,12 +276,31 @@ class RetryPolicyService:
         commit_attempts = [item for item in attempts if item.execution_mode == "COMMIT"]
         if len(commit_attempts) >= self.max_commit_attempts:
             raise ValidationError("RETRY_BUDGET_EXHAUSTED")
+        retry_origins = [item.started_at for item in commit_attempts]
+        if operation.created_at is not None:
+            retry_origins.append(operation.created_at)
+        retry_origin = min(_as_retry_aware(value, current) for value in retry_origins)
+        if current > retry_origin + self.max_retry_window:
+            raise ValidationError("RETRY_TOTAL_TIME_WINDOW_EXPIRED")
 
     @staticmethod
-    def _validate_not_applied(attempt, evidence: RetryEvidence) -> None:
-        if attempt.status not in {AttemptStatus.FAILED.value, AttemptStatus.NOT_APPLIED.value}:
+    def _validate_not_applied(
+        attempt,
+        evidence: RetryEvidence,
+        *,
+        allow_frozen_manual: bool = False,
+    ) -> None:
+        frozen_manual_source = bool(
+            allow_frozen_manual
+            and attempt.raw_output.get("frozen_reason") == "DUPLICATE_ACTIVE_COMMIT_ATTEMPT"
+            and attempt.status in {
+                AttemptStatus.START_UNKNOWN.value,
+                AttemptStatus.SIDE_EFFECT_UNKNOWN.value,
+            }
+        )
+        if attempt.status not in {AttemptStatus.FAILED.value, AttemptStatus.NOT_APPLIED.value} and not frozen_manual_source:
             raise ValidationError("RETRY_NOT_APPLIED_SOURCE_STATUS_INVALID")
-        if attempt.side_effect_state != SideEffectState.NOT_APPLIED.value:
+        if not frozen_manual_source and attempt.side_effect_state != SideEffectState.NOT_APPLIED.value:
             raise ValidationError("RETRY_NOT_APPLIED_PROOF_REQUIRED")
         if evidence.side_effect_state != SideEffectState.NOT_APPLIED.value:
             raise ValidationError("RETRY_NOT_APPLIED_PROOF_REQUIRED")
@@ -233,8 +310,18 @@ class RetryPolicyService:
             raise ValidationError("RETRY_TARGET_CLEANUP_PROOF_REQUIRED")
 
     @staticmethod
-    def _validate_pre_publish(attempt, evidence: RetryEvidence) -> None:
-        if attempt.status != AttemptStatus.START_FAILED.value:
+    def _validate_pre_publish(
+        attempt,
+        evidence: RetryEvidence,
+        *,
+        allow_frozen_manual: bool = False,
+    ) -> None:
+        frozen_manual_source = bool(
+            allow_frozen_manual
+            and attempt.raw_output.get("frozen_reason") == "DUPLICATE_ACTIVE_COMMIT_ATTEMPT"
+            and attempt.status == AttemptStatus.START_UNKNOWN.value
+        )
+        if attempt.status != AttemptStatus.START_FAILED.value and not frozen_manual_source:
             raise ValidationError("RETRY_PRE_PUBLISH_SOURCE_STATUS_INVALID")
         if attempt.side_effect_state != SideEffectState.NOT_STARTED.value:
             raise ValidationError("RETRY_PRE_PUBLISH_SIDE_EFFECT_INVALID")
@@ -253,6 +340,9 @@ class RetryPolicyService:
         reason: str,
         current: datetime,
     ) -> RetryAuthorization:
+        approval_expires_at = _parse_retry_timestamp(attempt.raw_output.get("approval_expires_at"))
+        if approval_expires_at is None:
+            raise ValidationError("RETRY_SOURCE_APPROVAL_BINDING_MISSING")
         return RetryAuthorization(
             retry_authorization_id=f"RETRY-{uuid4().hex}",
             operation_id=attempt.operation_id,
@@ -267,7 +357,7 @@ class RetryPolicyService:
             approved_payload_hash=evidence.approved_payload_hash,
             status=AUTHORIZATION_ACTIVE,
             max_uses=1,
-            expires_at=current + self.authorization_ttl,
+            expires_at=min(current + self.authorization_ttl, approval_expires_at),
             reason=reason,
             created_at=current,
         )

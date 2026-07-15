@@ -659,7 +659,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_shadowbot_evidence_share.
 6. 影刀启动通过 `ShadowBotTaskRunner` 接口抽象；当前已提供 fake runner 测试替身、`FileDropShadowBotTaskRunner` 文件投递实现，以及 `YingdaoOpenApiJobRunner` 影刀开放 API `JOB运行/启动应用` 实现。
 7. `record_result(...)` 校验影刀结果契约，拒绝 `READ_COMPLETED/PREVIEW_COMPLETED` 被错误解释为业务完成，也拒绝 `FAILED` 缺少 `error_code`、`NEEDS_RECONCILIATION` 可重试等矛盾组合。
 8. `record_side_effect_checkpoint(...)` 写入副作用检查点并同步更新执行尝试的 `side_effect_state`。
-9. `classify_timeout(...)` 根据最后检查点分类：若已达到 `SUBMIT_INTENT_RECORDED/SUBMIT_CLICKED/UNKNOWN`，状态进入 `NEEDS_RECONCILIATION`，`retryable=false`，下一步只能 `RECONCILE`；否则可按提交前失败处理。
+9. `classify_timeout(...)` 只接受具有唯一活动 COMMIT attempt 且 lease 已实际过期的 operation，并委托 lease/attempt-aware 原子终结路径：attempt 进入 `START_UNKNOWN` 或 `SIDE_EFFECT_UNKNOWN`，operation 同步进入 `NEEDS_RECONCILIATION`，`retryable=false`，下一步只能 `RECONCILE`。lease 尚有效、缺少 lease 或活动 attempt 数量异常时拒绝分类；不得产生“operation=FAILED 但 attempt 仍活动”的状态旁路。
 10. 若已有业务操作达到 `SUBMIT_INTENT_RECORDED` 后再次收到 `COMMIT` 启动请求，Executor 不会创建新的改价执行尝试，也不会调用影刀 runner，只返回 `NEEDS_RECONCILIATION` 和 `next_execution_mode=RECONCILE`。
 11. `start_execution(...)` 成功启动后会把源 task 推进到 `running`。
 12. `record_result(...)` 会写入 `execution_logs.raw_output`，保留 `operation_id`、`execution_attempt_id`、`shadowbot_run_id`、`execution_mode`、状态、价格和证据字段。

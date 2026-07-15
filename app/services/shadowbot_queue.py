@@ -140,10 +140,12 @@ class ShadowBotResultImporter:
         request_data = json.loads(request_bytes.decode("utf-8-sig"))
         result_file_sha256 = hashlib.sha256(result_bytes).hexdigest()
         data.setdefault("result_id", f"RESULT-{result_file_sha256[:24]}")
+        lease_required = isinstance(attempt.raw_output.get("lease"), dict)
         for lease_field in ("lease_owner_token", "lease_version"):
+            if lease_required and lease_field not in data:
+                raise ValidationError(f"RESULT_CONTRACT_INVALID: {lease_field} is required for leased attempt.")
             if lease_field in data and str(data.get(lease_field)) != str(request_data.get(lease_field)):
                 raise ValidationError(f"RESULT_CONTRACT_INVALID: {lease_field} mismatch.")
-            data.setdefault(lease_field, request_data.get(lease_field))
         data["result_file_sha256"] = result_file_sha256
         contract = shadowbot_result_contract_from_data(data)
         if contract.request_file_sha256 != request_sha256:
@@ -158,8 +160,13 @@ class ShadowBotResultImporter:
             )
         else:
             imported_result_id = str(attempt.raw_output.get("result_id") or "")
-            if imported_result_id and imported_result_id != contract.result_id:
-                raise ValidationError("RESULT_CONTRACT_INVALID: conflicting result_id for completed attempt.")
+            imported_result_sha256 = str(attempt.raw_output.get("result_file_sha256") or "")
+            if not imported_result_id or not imported_result_sha256:
+                raise ValidationError(
+                    "RESULT_CONTRACT_INVALID: late result for terminal attempt without persisted result identity."
+                )
+            if imported_result_id != contract.result_id or imported_result_sha256 != result_file_sha256:
+                raise ValidationError("RESULT_CONTRACT_INVALID: conflicting result evidence for completed attempt.")
         archive_dir = self._archive_attempt(contract.execution_attempt_id, request_path, result_path)
         return {
             "status": "IMPORTED" if attempt.ended_at is None else "ALREADY_IMPORTED",
@@ -189,6 +196,12 @@ class ShadowBotResultImporter:
             result_path,
             result_path.with_suffix(result_path.suffix + ".sha256"),
         )
+        for source in related:
+            destination = archive_dir / source.name
+            if source.exists() and destination.exists() and source.read_bytes() != destination.read_bytes():
+                raise ValidationError(
+                    f"RESULT_CONTRACT_INVALID: archive evidence conflict for {source.name}."
+                )
         for source in related:
             if source.exists():
                 destination = archive_dir / source.name
