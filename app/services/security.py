@@ -16,6 +16,17 @@ from datetime import datetime, timezone
 _LOGGER = logging.getLogger("app.security")
 _AUDIT_EVENTS: deque[dict[str, object]] = deque(maxlen=1000)
 _AUDIT_LOCK = threading.Lock()
+_AUDIT_THROTTLED_EVENT_TYPES = frozenset({
+    "LOGIN_FAILED",
+    "LOGIN_RATE_LIMITED",
+    "CSRF_REJECTED",
+    "WEB_PATH_REJECTED",
+    "LEGACY_ACCESS_REJECTED",
+    "MOBILE_REVIEW_TOKEN_REJECTED",
+})
+_AUDIT_LOG_WINDOW_SECONDS = 60.0
+_AUDIT_LOG_BURST = 5
+_AUDIT_MAX_THROTTLE_KEYS = 4096
 
 
 def _stable_hash(value: str) -> str:
@@ -39,10 +50,53 @@ def record_security_event(
         "route": route,
         "outcome": outcome,
         "reason_code": reason_code,
+        "suppressed_count": 0,
     }
+    log_events: list[dict[str, object]] = []
+    now = time.monotonic()
     with _AUDIT_LOCK:
-        _AUDIT_EVENTS.append(event)
-    _LOGGER.info("security_event=%s", json.dumps(event, ensure_ascii=False, sort_keys=True))
+        if event_type not in _AUDIT_THROTTLED_EVENT_TYPES:
+            _AUDIT_EVENTS.append(event)
+            log_events.append(event)
+        else:
+            subject_hash = event["subject_hash"] or ""
+            key = f"{event_type}|{subject_hash}|{route}|{reason_code}"
+            throttle = _AUDIT_THROTTLE.get(key)
+            if throttle is None:
+                if len(_AUDIT_THROTTLE) >= _AUDIT_MAX_THROTTLE_KEYS:
+                    oldest_key = min(
+                        _AUDIT_THROTTLE,
+                        key=lambda item: _AUDIT_THROTTLE[item].window_started,
+                    )
+                    _AUDIT_THROTTLE.pop(oldest_key, None)
+                throttle = _AuditThrottleEntry(window_started=now)
+                _AUDIT_THROTTLE[key] = throttle
+            elif now - throttle.window_started >= _AUDIT_LOG_WINDOW_SECONDS:
+                if throttle.suppressed:
+                    summary = {
+                        **event,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "event_type": f"{event_type}_SUMMARY",
+                        "outcome": "aggregated",
+                        "reason_code": "SUPPRESSED",
+                        "suppressed_count": throttle.suppressed,
+                    }
+                    _AUDIT_EVENTS.append(summary)
+                    log_events.append(summary)
+                throttle.window_started = now
+                throttle.emitted = 0
+                throttle.suppressed = 0
+            if throttle.emitted < _AUDIT_LOG_BURST:
+                throttle.emitted += 1
+                _AUDIT_EVENTS.append(event)
+                log_events.append(event)
+            else:
+                throttle.suppressed += 1
+    for log_event in log_events:
+        _LOGGER.info(
+            "security_event=%s",
+            json.dumps(log_event, ensure_ascii=False, sort_keys=True),
+        )
 
 
 def list_security_audit_events() -> list[dict[str, object]]:
@@ -53,6 +107,7 @@ def list_security_audit_events() -> list[dict[str, object]]:
 def clear_security_audit_events() -> None:
     with _AUDIT_LOCK:
         _AUDIT_EVENTS.clear()
+        _AUDIT_THROTTLE.clear()
 
 
 @dataclass(slots=True)
@@ -60,6 +115,16 @@ class _RateLimitEntry:
     failures: deque[float]
     blocked_until: float = 0.0
     touched_at: float = 0.0
+
+
+@dataclass(slots=True)
+class _AuditThrottleEntry:
+    window_started: float
+    emitted: int = 0
+    suppressed: int = 0
+
+
+_AUDIT_THROTTLE: dict[str, _AuditThrottleEntry] = {}
 
 
 class LoginRateLimiter:

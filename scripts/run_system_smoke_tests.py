@@ -304,10 +304,14 @@ class SmokeRunner:
 
     def check_system_page_safe(self) -> None:
         _RUNTIME_SESSIONS.clear()
-        _, _, login_page = call_app(path="/runtime/login")
+        _, login_headers, login_page = call_app(
+            path="/runtime/login",
+            query=urlencode({"runtime_db": str(TEST_DB)}),
+        )
         login_csrf_match = re.search(r'name="csrf_token" value="([^"]+)"', login_page)
         if login_csrf_match is None:
             raise AssertionError("登录页未提供一次性 CSRF token")
+        preauth_cookie = login_headers.get("Set-Cookie", "").split(";", 1)[0]
         login_body = urlencode(
             {
                 "runtime_db": str(TEST_DB),
@@ -317,7 +321,12 @@ class SmokeRunner:
                 "csrf_token": login_csrf_match.group(1),
             }
         )
-        status, headers, _ = call_app(path="/runtime/login", method="POST", body=login_body)
+        status, headers, _ = call_app(
+            path="/runtime/login",
+            method="POST",
+            cookie=preauth_cookie,
+            body=login_body,
+        )
         if status != "303 See Other":
             raise AssertionError(f"登录失败：{status}")
         cookie = headers.get("Set-Cookie", "").split(";", 1)[0]

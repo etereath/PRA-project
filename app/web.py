@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 import ipaddress
 import io
-import logging
 import os
 import re
 import sqlite3
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 from html import escape
 from hmac import compare_digest
@@ -14,6 +14,7 @@ from http.cookies import SimpleCookie
 from pathlib import Path
 from secrets import token_urlsafe
 from socketserver import ThreadingMixIn
+from threading import Lock
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 from uuid import uuid4
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
@@ -175,7 +176,15 @@ MOBILE_RESOLUTION_PAYLOAD_MAX_BYTES = 4096
 PAGE_SIZE = 50
 TERMINAL_TASK_STATUS_VALUES = {"success", "skipped", "cancelled", "expired"}
 _RUNTIME_SESSIONS: dict[str, dict[str, object]] = {}
-_LOGIN_CSRF_TOKENS: dict[str, datetime] = {}
+LOGIN_CSRF_COOKIE = "pra_login_csrf"
+LOGIN_CSRF_TTL_SECONDS = 600
+LOGIN_CSRF_MAX_CONTEXTS = 4096
+_LOGIN_CSRF_CONTEXTS: dict[str, tuple[str, datetime]] = {}
+_LOGIN_CSRF_LOCK = Lock()
+_RESPONSE_EXTRA_HEADERS: ContextVar[tuple[tuple[str, str], ...]] = ContextVar(
+    "web_response_extra_headers",
+    default=(),
+)
 _PATH_POLICY: PathAccessPolicy | None = None
 _PATH_POLICY_ENV_SNAPSHOT: str | None = None
 _PATH_POLICY_ERROR: PathPolicyError | None = None
@@ -184,7 +193,6 @@ _PATH_POLICY_LOCKED = False
 # ``serve`` records it here so the legacy safety gate can distinguish a
 # loopback-only listener from a public/non-loopback listener.
 _WEB_LISTEN_HOST: str | None = None
-_LOGGER = logging.getLogger(__name__)
 PATH_POLICY_REQUEST_FIELDS = frozenset({
     "allowed_data_dirs",
     "data_root",
@@ -548,16 +556,18 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
 
 
 def application(environ, start_response):
+    response_context = _RESPONSE_EXTRA_HEADERS.set(())
     try:
         return _application(environ, start_response)
     except PathPolicyError as exc:
-        _LOGGER.warning("web path policy rejected request: code=%s", exc.code)
         return _respond(
             start_response,
             "400 Bad Request",
             "text/plain; charset=utf-8",
             exc.public_message,
         )
+    finally:
+        _RESPONSE_EXTRA_HEADERS.reset(response_context)
 
 
 def _application(environ, start_response):
@@ -641,6 +651,13 @@ def _application(environ, start_response):
             return _respond(start_response, status, "text/html; charset=utf-8", body, headers=headers)
         return _respond(start_response, "200 OK", "text/html; charset=utf-8", result)
     if path == "/runtime/login":
+        if method not in {"GET", "POST"}:
+            return _respond(
+                start_response,
+                "405 Method Not Allowed",
+                "text/plain; charset=utf-8",
+                "Method Not Allowed.",
+            )
         status, body, headers = _handle_runtime_login(environ)
         return _respond(start_response, status, "text/html; charset=utf-8", body, headers=headers)
     if path == "/runtime/logout":
@@ -690,7 +707,6 @@ def _resolve_web_path(
     try:
         return _get_path_policy().resolve(raw_path, purpose=purpose, allow_create=allow_create)
     except PathPolicyError as exc:
-        _LOGGER.warning("web path rejected: purpose=%s code=%s", purpose, exc.code)
         record_security_event(
             "WEB_PATH_REJECTED",
             route="/web-path",
@@ -763,21 +779,71 @@ def _csrf_token_from_request(environ, raw_body: bytes) -> str:
     return _first(parsed, "csrf_token", "").strip()
 
 
+def _queue_response_header(name: str, value: str) -> None:
+    current = _RESPONSE_EXTRA_HEADERS.get()
+    _RESPONSE_EXTRA_HEADERS.set((*current, (name, value)))
+
+
+def _cleanup_login_csrf_contexts(now: datetime | None = None) -> None:
+    current = now or datetime.now(timezone.utc)
+    expired = [
+        context_id
+        for context_id, (_, expires_at) in _LOGIN_CSRF_CONTEXTS.items()
+        if expires_at <= current
+    ]
+    for context_id in expired:
+        _LOGIN_CSRF_CONTEXTS.pop(context_id, None)
+
+
 def _issue_login_csrf_token() -> str:
     now = datetime.now(timezone.utc)
-    expired = [token for token, expires_at in _LOGIN_CSRF_TOKENS.items() if expires_at <= now]
-    for token in expired:
-        _LOGIN_CSRF_TOKENS.pop(token, None)
+    expires_at = now + timedelta(seconds=LOGIN_CSRF_TTL_SECONDS)
+    context_id = token_urlsafe(24)
     token = token_urlsafe(32)
-    _LOGIN_CSRF_TOKENS[token] = now + timedelta(minutes=10)
+    with _LOGIN_CSRF_LOCK:
+        _cleanup_login_csrf_contexts(now)
+        while len(_LOGIN_CSRF_CONTEXTS) >= LOGIN_CSRF_MAX_CONTEXTS:
+            oldest_context_id = min(
+                _LOGIN_CSRF_CONTEXTS,
+                key=lambda item: _LOGIN_CSRF_CONTEXTS[item][1],
+            )
+            _LOGIN_CSRF_CONTEXTS.pop(oldest_context_id, None)
+        _LOGIN_CSRF_CONTEXTS[context_id] = (token, expires_at)
+
+    cookie = SimpleCookie()
+    cookie[LOGIN_CSRF_COOKIE] = context_id
+    cookie[LOGIN_CSRF_COOKIE]["path"] = "/runtime/login"
+    cookie[LOGIN_CSRF_COOKIE]["httponly"] = True
+    cookie[LOGIN_CSRF_COOKIE]["samesite"] = "Lax"
+    cookie[LOGIN_CSRF_COOKIE]["max-age"] = str(LOGIN_CSRF_TTL_SECONDS)
+    if _secure_cookie_enabled():
+        cookie[LOGIN_CSRF_COOKIE]["secure"] = True
+    _queue_response_header("Set-Cookie", cookie.output(header="").strip())
     return token
 
 
-def _consume_login_csrf_token(token: str) -> bool:
+def _consume_login_csrf_token(environ, token: str) -> bool:
     if not token:
         return False
-    expires_at = _LOGIN_CSRF_TOKENS.pop(token, None)
-    return expires_at is not None and expires_at > datetime.now(timezone.utc)
+    cookie = SimpleCookie()
+    cookie.load(environ.get("HTTP_COOKIE", ""))
+    context_cookie = cookie.get(LOGIN_CSRF_COOKIE)
+    if context_cookie is None:
+        return False
+    context_id = context_cookie.value
+    now = datetime.now(timezone.utc)
+    with _LOGIN_CSRF_LOCK:
+        context = _LOGIN_CSRF_CONTEXTS.get(context_id)
+        if context is None:
+            return False
+        expected_token, expires_at = context
+        if expires_at <= now:
+            _LOGIN_CSRF_CONTEXTS.pop(context_id, None)
+            return False
+        if not compare_digest(expected_token, token):
+            return False
+        _LOGIN_CSRF_CONTEXTS.pop(context_id, None)
+        return True
 
 
 def _csrf_failure_response() -> tuple[str, str, list[tuple[str, str]]]:
@@ -787,9 +853,11 @@ def _csrf_failure_response() -> tuple[str, str, list[tuple[str, str]]]:
 def _csrf_request_guard(method: str, path: str, environ):
     if method not in {"POST", "PUT", "PATCH", "DELETE"} or path.startswith("/mobile/review/"):
         return None
+    if path == "/runtime/login" and method != "POST":
+        return None
     raw_body = _read_request_body_preserving(environ)
     if path == "/runtime/login":
-        if _consume_login_csrf_token(_csrf_token_from_request(environ, raw_body)):
+        if _consume_login_csrf_token(environ, _csrf_token_from_request(environ, raw_body)):
             return None
         record_security_event(
             "CSRF_REJECTED",
@@ -868,10 +936,6 @@ def _legacy_route_denial_reason(environ) -> str | None:
         if header in environ
     ]
     if forwarding_headers:
-        _LOGGER.warning(
-            "legacy route rejected: forwarding headers present in direct_loopback mode: %s",
-            ", ".join(forwarding_headers),
-        )
         return "direct_loopback 模式检测到未经验证的转发头，已拒绝访问。"
 
     listen_host = _legacy_listen_host(environ)
@@ -1427,8 +1491,45 @@ def _handle_runtime(method: str, environ) -> str | tuple[str, str, list[tuple[st
 
 
 def _handle_runtime_login(environ) -> tuple[str, str, list[tuple[str, str]]]:
-    parsed = _parse_body(environ)
+    method = environ.get("REQUEST_METHOD", "GET").upper()
     query = _parse_query(environ)
+    if method == "GET":
+        runtime_db_value = _first(query, "runtime_db", "")
+        runtime_db = str(_resolve_request_or_trusted_default(
+            runtime_db_value,
+            Path(DEFAULT_RUNTIME_DB),
+            purpose="runtime_db",
+            allow_create=False,
+        ))
+        login_csrf_token = _issue_login_csrf_token()
+        body = render_runtime_page(
+            params={
+                "runtime_db": runtime_db,
+                "review_task_id": "",
+                "task_id": "",
+                "notification_id": "",
+                "task_trade_date": "",
+                "task_status": "",
+                "review_trade_date": "",
+                "review_status": "",
+                "notification_related_review_task_id": "",
+                "notification_send_status": "",
+            },
+            message="",
+            message_level="info",
+            tasks=[],
+            reviews=[],
+            notifications=[],
+            session_user=None,
+            selected_review=None,
+            selected_task=None,
+            selected_notification=None,
+            task_history=[],
+            login_csrf_token=login_csrf_token,
+        )
+        return "200 OK", body, []
+
+    parsed = _parse_body(environ)
     runtime_db_value = _first(parsed, "runtime_db", _first(query, "runtime_db", ""))
     runtime_db = str(_resolve_request_or_trusted_default(
         runtime_db_value,
@@ -1500,6 +1601,13 @@ def _handle_runtime_login(environ) -> tuple[str, str, list[tuple[str, str]]]:
     )
     status = "200 OK"
     if blocked:
+        record_security_event(
+            "LOGIN_RATE_LIMITED",
+            route="/runtime/login",
+            outcome="rejected",
+            reason_code="RATE_LIMITED",
+            subject=username,
+        )
         message = "登录尝试过于频繁，请稍后再试（RATE_LIMITED）。"
         status = "429 Too Many Requests"
     return _runtime_login_error_response(runtime_db, message, status=status)
@@ -1552,6 +1660,10 @@ def _handle_runtime_logout(environ) -> tuple[str, str, list[tuple[str, str]]]:
     next_path = _safe_internal_path(_first(parsed, "next", ""))
     cookie = SimpleCookie()
     cookie.load(environ.get("HTTP_COOKIE", ""))
+    login_csrf_cookie = cookie.get(LOGIN_CSRF_COOKIE)
+    if login_csrf_cookie is not None:
+        with _LOGIN_CSRF_LOCK:
+            _LOGIN_CSRF_CONTEXTS.pop(login_csrf_cookie.value, None)
     session_cookie = cookie.get(RUNTIME_SESSION_COOKIE)
     if session_cookie is not None:
         session = _RUNTIME_SESSIONS.pop(session_cookie.value, None)
@@ -1635,7 +1747,11 @@ def _handle_tasks_page(environ) -> str:
         mock_platform_path = (
             _resolve_web_path(mock_platform_db_value, purpose="mock_platform_db", allow_create=False)
             if mock_platform_db_value.strip()
-            else _trusted_project_path(DEFAULT_MOCK_PLATFORM_DB)
+            else _resolve_web_path(
+                _trusted_project_path(DEFAULT_MOCK_PLATFORM_DB),
+                purpose="mock_platform_db",
+                allow_create=False,
+            )
         )
         states = []
         if mock_platform_path.exists():
@@ -1658,16 +1774,30 @@ def _handle_tasks_page(environ) -> str:
         )
     if task_tab == "automation":
         db_path = Path(runtime_db)
-        repository = SQLiteRuntimeRepository(db_path)
-        repository.init_schema()
-        script_runs = repository.list_script_runs(limit=200)
         selected_script_run_id = _first(query, "script_run_id", "")
-        selected_script_run = repository.get_script_run(selected_script_run_id) if selected_script_run_id else None
-        script_run_items = (
-            repository.list_script_run_items(selected_script_run.script_run_id)
-            if selected_script_run is not None
-            else []
-        )
+        if not db_path.exists():
+            empty_runs, pagination = _paginate_items([], page)
+            return render_tasks_automation_page(
+                runtime_db=runtime_db,
+                session_user=session_user,
+                script_runs=empty_runs,
+                pagination=pagination,
+                selected_script_run=None,
+                script_run_items=[],
+            )
+        repository = SQLiteRuntimeRepository(db_path)
+        try:
+            script_runs = repository.list_script_runs(limit=200)
+            selected_script_run = repository.get_script_run(selected_script_run_id) if selected_script_run_id else None
+            script_run_items = (
+                repository.list_script_run_items(selected_script_run.script_run_id)
+                if selected_script_run is not None
+                else []
+            )
+        except sqlite3.Error:
+            script_runs = []
+            selected_script_run = None
+            script_run_items = []
         paged_script_runs, pagination = _paginate_items(script_runs, page)
         return render_tasks_automation_page(
             runtime_db=runtime_db,
@@ -8243,9 +8373,19 @@ def _clear_session_cookie_headers() -> list[tuple[str, str]]:
     csrf_cookie["pra_runtime_csrf"]["expires"] = "Thu, 01 Jan 1970 00:00:00 GMT"
     if _secure_cookie_enabled():
         csrf_cookie["pra_runtime_csrf"]["secure"] = True
+    login_csrf_cookie = SimpleCookie()
+    login_csrf_cookie[LOGIN_CSRF_COOKIE] = ""
+    login_csrf_cookie[LOGIN_CSRF_COOKIE]["path"] = "/runtime/login"
+    login_csrf_cookie[LOGIN_CSRF_COOKIE]["httponly"] = True
+    login_csrf_cookie[LOGIN_CSRF_COOKIE]["samesite"] = "Lax"
+    login_csrf_cookie[LOGIN_CSRF_COOKIE]["max-age"] = "0"
+    login_csrf_cookie[LOGIN_CSRF_COOKIE]["expires"] = "Thu, 01 Jan 1970 00:00:00 GMT"
+    if _secure_cookie_enabled():
+        login_csrf_cookie[LOGIN_CSRF_COOKIE]["secure"] = True
     return [
         ("Set-Cookie", cookie.output(header="").strip()),
         ("Set-Cookie", csrf_cookie.output(header="").strip()),
+        ("Set-Cookie", login_csrf_cookie.output(header="").strip()),
     ]
 
 
@@ -8284,7 +8424,11 @@ def _runtime_db_for_request(environ) -> str:
             purpose="runtime_db",
             allow_create=False,
         ))
-    return str(_trusted_default_runtime_db())
+    return str(_resolve_web_path(
+        _trusted_default_runtime_db(),
+        purpose="runtime_db",
+        allow_create=False,
+    ))
 
 
 def _trusted_default_runtime_db() -> Path:
@@ -8325,7 +8469,11 @@ def _resolve_request_or_trusted_default(
 ) -> Path:
     text = os.fspath(requested) if isinstance(requested, os.PathLike) else str(requested)
     if not text.strip():
-        return _trusted_project_path(default_path)
+        return _resolve_web_path(
+            _trusted_project_path(default_path),
+            purpose=purpose,
+            allow_create=allow_create,
+        )
     # A request-supplied spelling is never trusted merely because it names an
     # application default.  Only an omitted value may use that default.
     return _resolve_web_path(text, purpose=purpose, allow_create=allow_create)
@@ -8568,6 +8716,7 @@ def _extract_table_rows(parsed: dict[str, list[str]], headers: list[str]) -> lis
 def _respond(start_response, status: str, content_type: str, body: str, *, headers: list[tuple[str, str]] | None = None):
     payload = body.encode("utf-8")
     response_headers = [("Content-Type", content_type), ("Content-Length", str(len(payload)))]
+    response_headers.extend(_RESPONSE_EXTRA_HEADERS.get())
     if headers:
         response_headers.extend(headers)
     start_response(status, response_headers)

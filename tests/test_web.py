@@ -111,6 +111,12 @@ class WebTests(unittest.TestCase):
         self._allowed_dirs_patcher.start()
         self.addCleanup(self._allowed_dirs_patcher.stop)
 
+    def _existing_runtime_db(self, label: str) -> Path:
+        path = Path(tempfile.gettempdir()) / f"pra_{label}_{uuid4().hex}.sqlite3"
+        SQLiteRuntimeRepository(path).init_schema()
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        return path
+
     def test_health_ignores_request_runtime_db_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -136,12 +142,17 @@ class WebTests(unittest.TestCase):
             self.assertIn("unhealthy", body)
 
     def _runtime_login(self, db_path: Path, *, username: str = "admin", password: str = "secret") -> str:
-        _, _, login_body = self._call_app(path="/runtime/login")
+        _, login_headers, login_body = self._call_app(
+            path="/runtime/login",
+            query=urlencode({"runtime_db": str(db_path.resolve())}),
+        )
         login_match = re.search(r'name="csrf_token" value="([^"]+)"', login_body)
         self.assertIsNotNone(login_match)
+        preauth_cookie = login_headers["Set-Cookie"].split(";", 1)[0]
         status, headers, _ = self._call_app(
             path="/runtime/login",
             method="POST",
+            cookie=preauth_cookie,
             body=urlencode(
                 {
                     "runtime_db": str(db_path.resolve()),
@@ -2080,6 +2091,7 @@ class WebTests(unittest.TestCase):
             finally:
                 connection.close()
             missing_db_path = Path(temp_dir) / "missing.sqlite3"
+            missing_db_path.touch()
             with patch.dict(
                 "os.environ",
                 {
@@ -2350,7 +2362,7 @@ class WebTests(unittest.TestCase):
             },
             clear=False,
         ):
-            cookie = self._runtime_login(Path("runtime.sqlite3"))
+            cookie = self._runtime_login(self._existing_runtime_db("legacy"))
             with patch("app.web._WEB_LISTEN_HOST", "127.0.0.1"):
                 for path in ("/", "/tables", "/execution", "/manual-intervention"):
                     with self.subTest(path=path):
@@ -2376,7 +2388,7 @@ class WebTests(unittest.TestCase):
             },
             clear=False,
         ):
-            cookie = self._runtime_login(Path("runtime.sqlite3"))
+            cookie = self._runtime_login(self._existing_runtime_db("legacy"))
 
             # A wildcard startup bind remains public even if request-scoped
             # fields claim that it is loopback-only.
@@ -2439,7 +2451,7 @@ class WebTests(unittest.TestCase):
             },
             clear=False,
         ):
-            cookie = self._runtime_login(Path("runtime.sqlite3"))
+            cookie = self._runtime_login(self._existing_runtime_db("legacy"))
             with patch("app.web._WEB_LISTEN_HOST", "127.0.0.1"):
                 cases = [
                     {"REMOTE_ADDR": "127.0.0.1", "HTTP_X_FORWARDED_FOR": "127.0.0.1"},

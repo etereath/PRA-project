@@ -164,7 +164,8 @@ $env:DEV_MODE = "false"
 - 必须填写绝对目录；空项、相对目录、不可解析目录会使路径策略失败关闭。
 - 服务只在启动时读取并固定 allowlist；修改后必须重启服务，并在任务交接记录中说明变更。
 - URL、query、form、JSON body、Cookie 和转发头不能新增或扩大 allowlist。
-- 未配置时仅允许应用默认 `data/runtime` 目录；Web 默认样例文件属于应用内置配置，不代表请求可以访问任意 `data/samples` 子目录。
+- 未配置时仅允许应用默认 `data/runtime` 目录；服务端默认路径也必须经过同一策略。需要使用 `data/samples` 时，必须显式把该目录加入 allowlist。
+- 显式 `.`、`..`、URL 编码/多层编码后的 traversal 组件均拒绝；`allow_create=false` 的缺失目标返回稳定 `PATH_NOT_FOUND`，不会创建文件。
 - 路径会先规范化，再检查盘符、UNC/设备路径、相对路径、符号链接/junction 和最近存在父目录，拒绝逃逸。
 
 示例：
@@ -190,6 +191,12 @@ $env:PRA_ALLOWED_DATA_DIRS = "D:\PRA_Runtime\data;D:\PRA_Runtime\imports"
 - `RUNTIME_LOGIN_RATE_LIMIT_MAX_KEYS`：最多保存的账号/来源桶数量，默认 `4096`。
 
 达到阈值返回稳定错误码 `RATE_LIMITED`；成功登录只清理同一账号和同一 TCP 对端的桶。
+
+登录页 GET 只渲染页面，不计入失败次数；登录以外的方法返回 `405`。预登录 CSRF token 绑定有界、带锁的 HttpOnly/SameSite 预登录 Cookie，并且一次性消费；跨浏览器、过期、重放和 query token 均拒绝。
+
+高频登录失败、CSRF、路径拒绝、旧路由拒绝和 Mobile Review token 拒绝的审计日志按主体/路由/原因窗口限速并生成聚合摘要；内存审计队列和限流桶均有容量上限。
+
+`/tasks?task_tab=automation` 为只读 GET；数据库初始化/迁移不在 GET 请求中执行，缺失数据库不会被请求自动创建。
 
 ## 6. 旧版 Web 路由安全开关
 

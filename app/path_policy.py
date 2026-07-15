@@ -11,6 +11,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import unquote
 
 from app.exceptions import ValidationError
 
@@ -39,6 +40,20 @@ def _reject_windows_special_path(raw: str) -> None:
             continue
         if component.endswith((".", " ")):
             raise PathPolicyError("PATH_AMBIGUOUS_COMPONENT", "不允许带尾随点或空格的路径组件")
+
+
+def _reject_dot_components(raw: str) -> None:
+    """Reject traversal components before any platform normalization."""
+
+    candidate = raw
+    for _ in range(4):
+        components = re.split(r"[\\/]+", candidate)
+        if any(component in {".", ".."} for component in components):
+            raise PathPolicyError("PATH_TRAVERSAL_COMPONENT", "不允许路径包含 . 或 .. 组件")
+        decoded = unquote(candidate)
+        if decoded == candidate:
+            return
+        candidate = decoded
 
 
 def _lexical_absolute(path: Path) -> Path:
@@ -77,6 +92,7 @@ class PathAccessPolicy:
         for raw_root in raw_roots:
             root_text = raw_root.strip()
             _reject_windows_special_path(root_text)
+            _reject_dot_components(root_text)
             root = Path(root_text)
             if not root.is_absolute():
                 raise PathPolicyError("PATH_ALLOWLIST_RELATIVE", "PRA_ALLOWED_DATA_DIRS 只能包含绝对目录")
@@ -125,6 +141,7 @@ class PathAccessPolicy:
         if not isinstance(raw, str) or not raw.strip():
             raise PathPolicyError("PATH_EMPTY", "请求的路径不能为空")
         _reject_windows_special_path(raw)
+        _reject_dot_components(raw)
         candidate = Path(raw)
         if not candidate.is_absolute():
             raise PathPolicyError("PATH_RELATIVE", "请求的路径必须是绝对路径")
@@ -142,12 +159,6 @@ class PathAccessPolicy:
                 raise PathPolicyError("PATH_UNRESOLVABLE", "请求的路径无法安全规范化")
             return strict_resolved
 
-        if not allow_create:
-            # Missing files are still safe to identify when their parent is
-            # allowlisted; the business layer decides whether they may exist.
-            # This supports deterministic, non-leaking not-found errors.
-            pass
-
         existing_parent = candidate.parent
         while not existing_parent.exists() and existing_parent != existing_parent.parent:
             existing_parent = existing_parent.parent
@@ -163,4 +174,6 @@ class PathAccessPolicy:
             _is_within(resolved_candidate.parent, root) for root in self.allowed_roots
         ):
             raise PathPolicyError("PATH_PARENT_ESCAPE", "请求路径的最终父目录超出允许目录")
+        if not allow_create:
+            raise PathPolicyError("PATH_NOT_FOUND", "请求的路径不存在")
         return resolved_candidate
