@@ -14,10 +14,12 @@ from app.exceptions import ValidationError
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.shadowbot_executor import (
     EXECUTION_MODE_COMMIT,
+    SIDE_EFFECT_NOT_APPLIED,
     SIDE_EFFECT_NOT_STARTED,
     SIDE_EFFECT_UNKNOWN,
     STATUS_FAILED,
-    STATUS_NEEDS_RECONCILIATION,
+    STATUS_SIDE_EFFECT_UNKNOWN,
+    STATUS_START_UNKNOWN,
     ShadowBotExecutor,
     ShadowBotTaskRunner,
     shadowbot_result_contract_from_data,
@@ -123,19 +125,31 @@ class ShadowBotResultImporter:
         data = json.loads(result_bytes.decode("utf-8-sig"))
         if not isinstance(data, dict):
             raise ValidationError("RESULT_CONTRACT_INVALID: result JSON must be an object.")
-        contract = shadowbot_result_contract_from_data(data)
-        attempt = self.repository.get_shadowbot_execution_attempt(contract.execution_attempt_id)
+        execution_attempt_id = str(data.get("execution_attempt_id") or "").strip()
+        if not execution_attempt_id:
+            raise ValidationError("RESULT_CONTRACT_INVALID: execution_attempt_id is required.")
+        attempt = self.repository.get_shadowbot_execution_attempt(execution_attempt_id)
         if attempt is None:
             raise ValidationError("RESULT_CONTRACT_INVALID: execution_attempt_id does not exist.")
-        request_path = self._find_request(contract.execution_attempt_id, attempt.queue_request_path)
+        request_path = self._find_request(execution_attempt_id, attempt.queue_request_path)
         request_bytes = request_path.read_bytes()
         request_sha256 = hashlib.sha256(request_bytes).hexdigest()
         _verify_checksum(request_path, request_bytes)
         if request_sha256 != attempt.request_file_sha256:
             raise ValidationError("RESULT_CONTRACT_INVALID: archived request hash does not match attempt.")
+        request_data = json.loads(request_bytes.decode("utf-8-sig"))
+        result_file_sha256 = hashlib.sha256(result_bytes).hexdigest()
+        data.setdefault("result_id", f"RESULT-{result_file_sha256[:24]}")
+        lease_required = isinstance(attempt.raw_output.get("lease"), dict)
+        for lease_field in ("lease_owner_token", "lease_version"):
+            if lease_required and lease_field not in data:
+                raise ValidationError(f"RESULT_CONTRACT_INVALID: {lease_field} is required for leased attempt.")
+            if lease_field in data and str(data.get(lease_field)) != str(request_data.get(lease_field)):
+                raise ValidationError(f"RESULT_CONTRACT_INVALID: {lease_field} mismatch.")
+        data["result_file_sha256"] = result_file_sha256
+        contract = shadowbot_result_contract_from_data(data)
         if contract.request_file_sha256 != request_sha256:
             raise ValidationError("RESULT_CONTRACT_INVALID: result request_file_sha256 mismatch.")
-        request_data = json.loads(request_bytes.decode("utf-8-sig"))
         for field_name in ("operation_id", "task_id", "execution_attempt_id", "execution_mode", "instruction_hash"):
             if str(data.get(field_name) or "") != str(request_data.get(field_name) or ""):
                 raise ValidationError(f"RESULT_CONTRACT_INVALID: {field_name} mismatch.")
@@ -144,6 +158,15 @@ class ShadowBotResultImporter:
                 contract,
                 automatic_reconcile_payload=_automatic_reconcile_payload(request_data),
             )
+        else:
+            imported_result_id = str(attempt.raw_output.get("result_id") or "")
+            imported_result_sha256 = str(attempt.raw_output.get("result_file_sha256") or "")
+            if not imported_result_id or not imported_result_sha256:
+                raise ValidationError(
+                    "RESULT_CONTRACT_INVALID: late result for terminal attempt without persisted result identity."
+                )
+            if imported_result_id != contract.result_id or imported_result_sha256 != result_file_sha256:
+                raise ValidationError("RESULT_CONTRACT_INVALID: conflicting result evidence for completed attempt.")
         archive_dir = self._archive_attempt(contract.execution_attempt_id, request_path, result_path)
         return {
             "status": "IMPORTED" if attempt.ended_at is None else "ALREADY_IMPORTED",
@@ -174,6 +197,12 @@ class ShadowBotResultImporter:
             result_path.with_suffix(result_path.suffix + ".sha256"),
         )
         for source in related:
+            destination = archive_dir / source.name
+            if source.exists() and destination.exists() and source.read_bytes() != destination.read_bytes():
+                raise ValidationError(
+                    f"RESULT_CONTRACT_INVALID: archive evidence conflict for {source.name}."
+                )
+        for source in related:
             if source.exists():
                 destination = archive_dir / source.name
                 if destination.exists():
@@ -186,6 +215,17 @@ class ShadowBotResultImporter:
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
         destination = self.paths.quarantine / f"{stamp}-{result_path.name}"
         os.replace(result_path, destination)
+        try:
+            quarantined_data = json.loads(destination.read_text(encoding="utf-8-sig"))
+            execution_attempt_id = str(quarantined_data.get("execution_attempt_id") or "")
+            if execution_attempt_id:
+                self.repository.quarantine_shadowbot_attempt(
+                    execution_attempt_id,
+                    reason=type(error).__name__ + ":" + str(error),
+                    now=datetime.now(UTC),
+                )
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
         checksum = result_path.with_suffix(result_path.suffix + ".sha256")
         if checksum.exists():
             os.replace(checksum, destination.with_suffix(destination.suffix + ".sha256"))
@@ -237,16 +277,23 @@ class ShadowBotLoginVerificationMonitor:
 class ShadowBotQueueWatchdog:
     """Classify stale workers and working attempts. It never imports result files."""
 
-    def __init__(self, queue_dir: Path, *, stale_seconds: int = 30) -> None:
+    def __init__(
+        self,
+        queue_dir: Path,
+        *,
+        stale_seconds: int = 30,
+        repository: SQLiteRuntimeRepository | None = None,
+    ) -> None:
         self.paths = ShadowBotQueuePaths(queue_dir)
         self.paths.ensure()
         self.stale_seconds = stale_seconds
+        self.repository = repository
         self._last_heartbeat_alert_key = ""
 
     def inspect(self, *, now: datetime | None = None) -> list[dict[str, Any]]:
         current = now or datetime.now(UTC)
         heartbeat_stale = self._heartbeat_stale(current)
-        events: list[dict[str, Any]] = []
+        events = self._inspect_inbox_integrity()
         if not heartbeat_stale:
             self._last_heartbeat_alert_key = ""
             return events
@@ -285,6 +332,65 @@ class ShadowBotQueueWatchdog:
                     self._last_heartbeat_alert_key = alert_key
         return events
 
+    def _inspect_inbox_integrity(self) -> list[dict[str, Any]]:
+        if self.repository is None:
+            return []
+        events: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for request_path in sorted(self.paths.inbox.glob("*.ready.json")):
+            try:
+                request = _read_json_object(request_path)
+                attempt_id = str(request.get("execution_attempt_id") or "").strip()
+                if not attempt_id:
+                    raise ValidationError("ready request has no execution_attempt_id")
+                attempt = self.repository.get_shadowbot_execution_attempt(attempt_id)
+                duplicate = attempt_id in seen or (self.paths.working / f"{attempt_id}.request.json").exists()
+                seen.add(attempt_id)
+                if attempt is None:
+                    reason = "ORPHAN_READY_REQUEST"
+                    target_root = self.paths.quarantine
+                elif duplicate:
+                    reason = "DUPLICATE_READY_REQUEST"
+                    target_root = self.paths.quarantine
+                else:
+                    operation = self.repository.get_shadowbot_operation(attempt.operation_id)
+                    if operation is not None and operation.status in {"VERIFIED", "MANUAL_HANDLED"}:
+                        reason = "STALE_TERMINAL_READY_REQUEST"
+                        target_root = self.paths.archive / attempt_id
+                        target_root.mkdir(parents=True, exist_ok=True)
+                    elif operation is not None and operation.status in {
+                        "NEEDS_RECONCILIATION",
+                        "MANUAL_REVIEW",
+                    }:
+                        reason = "FROZEN_READY_REQUEST"
+                        target_root = self.paths.quarantine
+                    else:
+                        continue
+                destination = target_root / f"{reason.lower()}-{request_path.name}"
+                os.replace(request_path, destination)
+                checksum = request_path.with_suffix(request_path.suffix + ".sha256")
+                if checksum.exists():
+                    os.replace(checksum, destination.with_suffix(destination.suffix + ".sha256"))
+                events.append(
+                    {
+                        "status": "ARCHIVED" if target_root != self.paths.quarantine else "QUARANTINED",
+                        "error_code": reason,
+                        "execution_attempt_id": attempt_id,
+                        "path": str(destination),
+                    }
+                )
+            except (ValidationError, ValueError, json.JSONDecodeError):
+                destination = self.paths.quarantine / f"invalid-ready-{request_path.name}"
+                os.replace(request_path, destination)
+                events.append(
+                    {
+                        "status": "QUARANTINED",
+                        "error_code": "READY_CONTRACT_INVALID",
+                        "path": str(destination),
+                    }
+                )
+        return events
+
     def _heartbeat_stale(self, now: datetime) -> bool:
         if not self.paths.heartbeat.exists():
             return True
@@ -318,7 +424,21 @@ class ShadowBotQueueWatchdog:
             execution_mode == EXECUTION_MODE_COMMIT and str(phase_data.get("side_effect_state") or "") != SIDE_EFFECT_NOT_STARTED
         )
         cleanup_confirmed = bool(phase_data.get("cleanup_confirmed", False))
-        retryable = phase in PRE_SUBMIT_PHASES and (phase != "TARGET_FILLED" or cleanup_confirmed)
+        not_applied_evidence = (
+            str(phase_data.get("side_effect_state") or "") == SIDE_EFFECT_NOT_APPLIED
+            and bool(phase_data.get("evidence_hash"))
+            and (phase != "TARGET_FILLED" or cleanup_confirmed)
+        )
+        if has_submit_risk:
+            result_status = STATUS_SIDE_EFFECT_UNKNOWN
+            side_effect_state = SIDE_EFFECT_UNKNOWN
+        elif execution_mode == EXECUTION_MODE_COMMIT and not not_applied_evidence:
+            result_status = STATUS_START_UNKNOWN
+            side_effect_state = SIDE_EFFECT_NOT_STARTED
+        else:
+            result_status = STATUS_FAILED
+            side_effect_state = SIDE_EFFECT_NOT_APPLIED if not_applied_evidence else SIDE_EFFECT_NOT_STARTED
+        retryable = execution_mode != EXECUTION_MODE_COMMIT and phase in PRE_SUBMIT_PHASES
         result = {
             "schema_version": "shadowbot-result-1.0",
             "task_id": request.get("task_id", ""),
@@ -327,14 +447,16 @@ class ShadowBotQueueWatchdog:
             "execution_mode": execution_mode,
             "instruction_hash": request.get("instruction_hash", ""),
             "request_file_sha256": phase_data.get("request_file_sha256", ""),
+            "lease_owner_token": request.get("lease_owner_token", ""),
+            "lease_version": request.get("lease_version", 0),
             "worker_id": phase_data.get("worker_id", ""),
-            "status": STATUS_NEEDS_RECONCILIATION if has_submit_risk else STATUS_FAILED,
-            "run_success_flag": None if has_submit_risk else False,
-            "business_operation_completed": None if has_submit_risk else False,
-            "side_effect_state": SIDE_EFFECT_UNKNOWN if has_submit_risk else SIDE_EFFECT_NOT_STARTED,
+            "status": result_status,
+            "run_success_flag": None if result_status in {STATUS_START_UNKNOWN, STATUS_SIDE_EFFECT_UNKNOWN} else False,
+            "business_operation_completed": None if result_status in {STATUS_START_UNKNOWN, STATUS_SIDE_EFFECT_UNKNOWN} else False,
+            "side_effect_state": side_effect_state,
             "error_code": "SUBMIT_RESULT_UNKNOWN" if has_submit_risk else "WORKER_INTERRUPTED",
             "error_message": f"stale ShadowBot working attempt recovered at phase {phase}",
-            "retryable": False if has_submit_risk else retryable,
+            "retryable": retryable,
             "recovered_phase": phase,
             "ended_at": datetime.now(UTC).isoformat(),
         }
@@ -343,6 +465,9 @@ class ShadowBotQueueWatchdog:
     def _write_result(self, result: dict[str, Any], execution_attempt_id: str) -> dict[str, Any]:
         if not execution_attempt_id:
             raise ValidationError("cannot recover working attempt without execution_attempt_id.")
+        if not result.get("result_id"):
+            identity = json.dumps(result, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+            result["result_id"] = "RESULT-" + hashlib.sha256(identity).hexdigest()[:24]
         result_path = self.paths.results / f"{execution_attempt_id}.result.json"
         content = _json_bytes(result)
         _atomic_write(result_path.with_suffix(result_path.suffix + ".sha256"), (hashlib.sha256(content).hexdigest() + "\n").encode("ascii"))

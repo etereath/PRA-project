@@ -659,7 +659,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_shadowbot_evidence_share.
 6. 影刀启动通过 `ShadowBotTaskRunner` 接口抽象；当前已提供 fake runner 测试替身、`FileDropShadowBotTaskRunner` 文件投递实现，以及 `YingdaoOpenApiJobRunner` 影刀开放 API `JOB运行/启动应用` 实现。
 7. `record_result(...)` 校验影刀结果契约，拒绝 `READ_COMPLETED/PREVIEW_COMPLETED` 被错误解释为业务完成，也拒绝 `FAILED` 缺少 `error_code`、`NEEDS_RECONCILIATION` 可重试等矛盾组合。
 8. `record_side_effect_checkpoint(...)` 写入副作用检查点并同步更新执行尝试的 `side_effect_state`。
-9. `classify_timeout(...)` 根据最后检查点分类：若已达到 `SUBMIT_INTENT_RECORDED/SUBMIT_CLICKED/UNKNOWN`，状态进入 `NEEDS_RECONCILIATION`，`retryable=false`，下一步只能 `RECONCILE`；否则可按提交前失败处理。
+9. `classify_timeout(...)` 只接受具有唯一活动 COMMIT attempt 且 lease 已实际过期的 operation，并委托 lease/attempt-aware 原子终结路径：attempt 进入 `START_UNKNOWN` 或 `SIDE_EFFECT_UNKNOWN`，operation 同步进入 `NEEDS_RECONCILIATION`，`retryable=false`，下一步只能 `RECONCILE`。lease 尚有效、缺少 lease 或活动 attempt 数量异常时拒绝分类；不得产生“operation=FAILED 但 attempt 仍活动”的状态旁路。
 10. 若已有业务操作达到 `SUBMIT_INTENT_RECORDED` 后再次收到 `COMMIT` 启动请求，Executor 不会创建新的改价执行尝试，也不会调用影刀 runner，只返回 `NEEDS_RECONCILIATION` 和 `next_execution_mode=RECONCILE`。
 11. `start_execution(...)` 成功启动后会把源 task 推进到 `running`。
 12. `record_result(...)` 会写入 `execution_logs.raw_output`，保留 `operation_id`、`execution_attempt_id`、`shadowbot_run_id`、`execution_mode`、状态、价格和证据字段。
@@ -675,6 +675,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_shadowbot_evidence_share.
 22. `check-yingdao-app-params` 可调用影刀 `/oapi/robot/v2/queryRobotParam` 做只读预检，确认主流程存在 `request_json` 入参和 `shadowbot_result_json` 出参；该命令不会启动影刀应用。
 23. `poll-yingdao-result` 可调用影刀 `/oapi/dispatch/v2/job/query` 查询 `jobUuid`，从输出参数 `shadowbot_result_json` 提取结果并回写 PRA；若导入 COMMIT 结果为 `NEEDS_RECONCILIATION`，由 Executor 自动创建唯一的只读对账尝试。
 24. `scripts/check_shadowbot_readiness.py` 提供真实启动前的离线就绪检查，只报告 runner 必需环境变量和 runtime DB 状态，不启动影刀、不访问影刀 OpenAPI，也不会输出密钥明文。
+25. `RetryPolicyService` 的总重试窗口从 operation 创建时间与最早 COMMIT attempt 时间二者较早者起算，并受原审批到期时间进一步收紧。签发事务把 `retry_window_deadline` 和窗口秒数写入 source attempt 审计数据，`RetryAuthorization.expires_at` 不得晚于该截止时间；消费事务会从数据库权威时间重新计算并比对截止时间，超窗时授权保持未消费、不创建 attempt、不改变 operation。
 
 首条链路准备示例：
 

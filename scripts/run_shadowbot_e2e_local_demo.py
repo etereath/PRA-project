@@ -18,7 +18,7 @@ from app.services.shadowbot_executor import (
     SIDE_EFFECT_UNKNOWN,
     SIDE_EFFECT_VERIFIED,
     STATUS_FAILED,
-    STATUS_NEEDS_RECONCILIATION,
+    STATUS_SIDE_EFFECT_UNKNOWN,
     STATUS_NOT_APPLIED,
     STATUS_VERIFIED,
     ShadowBotResultContract,
@@ -123,7 +123,7 @@ def run_local_demo_from_args(args: argparse.Namespace) -> dict[str, object]:
     repository_executor.record_result(
         ShadowBotResultContract(
             execution_attempt_id=branches["post_submit_unknown"].execution_attempt_id,
-            status=STATUS_NEEDS_RECONCILIATION,
+            status=STATUS_SIDE_EFFECT_UNKNOWN,
             run_success_flag=None,
             business_operation_completed=None,
             side_effect_state=SIDE_EFFECT_UNKNOWN,
@@ -132,7 +132,7 @@ def run_local_demo_from_args(args: argparse.Namespace) -> dict[str, object]:
             **_binding_fields(repository, branches["post_submit_unknown"].execution_attempt_id),
             raw_output=_result_payload(
                 branches["post_submit_unknown"],
-                status=STATUS_NEEDS_RECONCILIATION,
+                status=STATUS_SIDE_EFFECT_UNKNOWN,
                 side_effect_state=SIDE_EFFECT_UNKNOWN,
                 old_price=args.expected_old_price,
                 target_price=args.target_price,
@@ -227,13 +227,16 @@ def _executor_for_existing_attempt(repository: SQLiteRuntimeRepository, request_
     return ShadowBotExecutor(repository, FileDropShadowBotTaskRunner(request_dir))
 
 
-def _binding_fields(repository: SQLiteRuntimeRepository, execution_attempt_id: str) -> dict[str, str]:
+def _binding_fields(repository: SQLiteRuntimeRepository, execution_attempt_id: str) -> dict[str, object]:
     attempt = repository.get_shadowbot_execution_attempt(execution_attempt_id)
     if attempt is None:
         raise RuntimeError(f"missing ShadowBot attempt: {execution_attempt_id}")
     operation = repository.get_shadowbot_operation(attempt.operation_id)
     if operation is None:
         raise RuntimeError(f"missing ShadowBot operation: {attempt.operation_id}")
+    lease = attempt.raw_output.get("lease") if isinstance(attempt.raw_output.get("lease"), dict) else None
+    if lease is None:
+        raise RuntimeError(f"missing ShadowBot lease: {execution_attempt_id}")
     return {
         "operation_id": operation.operation_id,
         "task_id": operation.task_id,
@@ -241,6 +244,8 @@ def _binding_fields(repository: SQLiteRuntimeRepository, execution_attempt_id: s
         "instruction_hash": attempt.instruction_hash,
         "request_file_sha256": attempt.request_file_sha256,
         "worker_id": "local-demo",
+        "lease_owner_token": str(lease.get("owner_token") or ""),
+        "lease_version": int(lease.get("version") or 0),
     }
 
 
