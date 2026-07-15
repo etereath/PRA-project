@@ -4,7 +4,7 @@
 
 Mobile Review 的 POST resolve 入口现在只在事务前执行无副作用的动作解析、Token HMAC 计算和请求 payload 格式校验。最终状态判断与写入由 `SQLiteRuntimeRepository.resolve_mobile_review_atomic(...)` 完成：
 
-1. 通过同一 SQLite 连接执行 `BEGIN IMMEDIATE`。
+1. 通过同一 SQLite 连接执行 `BEGIN IMMEDIATE`，并在成功取得写锁后生成本次事务的 timestamp。
 2. 在该连接内重新读取 `review_tokens`、`review_tasks` 和关联 `tasks`。
 3. 校验 Token 绑定关系、未使用、未撤销、未过期、动作许可和 review 仍为 `pending`。
 4. 在消费 Token 前确认 `source_task_id` 非空、关联 task 存在，且当前状态属于该 action 的允许起始状态。
@@ -42,6 +42,9 @@ SQLite 并发错误只依据 `sqlite_errorcode` 和 `sqlite_errorname` 判定
 `410`，已处理/并发为 `409`，动作不允许为 `403`，动作类型或调整 payload 无效为
 `422`；响应正文继续使用统一提示。
 
+Token 的过期预检查、条件消费和所有写入时间统一使用取得写锁后的 timestamp，避免请求在
+等待写锁期间跨过 expires_at 仍被旧时间放行。
+
 ## adjusted payload 与源任务
 
 `adjusted` 必须携带 `adjustment` 对象，只允许 `target_price`、`target_status` 和
@@ -75,6 +78,7 @@ resolution 同时提交。
 - `adjusted` payload 规范化、源 task 字段更新、非法调整拒绝，以及 Web 层 `403/409/410/422` 状态映射。
 - 关联源 task 缺失、源 task 状态不兼容和完全未知 action 均在消费 Token 前拒绝，返回稳定错误码且不产生业务状态变化。
 - 使用不同错误文本但相同 SQLite busy/locked 错误码的分类，以及“文本含 locked 但错误码非并发”的反例。
+- 双连接写锁等待期间 Token 到期的测试：释放锁后返回 `TOKEN_EXPIRED`，且不消费 Token、不关闭 review、不更新 task/history。
 - 重复提交返回 `TOKEN_ALREADY_USED`，不会新增 history。
 
 本任务不扩大为全库 WAL、`busy_timeout` 或通用退避策略；这些仍属于任务 8。

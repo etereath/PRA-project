@@ -4,6 +4,7 @@ import os
 import sqlite3
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
@@ -147,6 +148,56 @@ class MobileReviewAtomicTransactionTests(unittest.TestCase):
         )
         repository = SQLiteRuntimeRepository(self.db_path)
         self.assertEqual(len(repository.list_task_status_history("TASK-ATOMIC")), 1)
+
+    def test_token_expiry_is_checked_after_waiting_for_the_write_lock(self) -> None:
+        repository, review_task_id, raw_token = self._prepare()
+        expires_at = datetime.now() + timedelta(seconds=0.35)
+        with closing(repository.connect()) as connection, connection:
+            connection.execute(
+                "UPDATE review_tokens SET expires_at = ? WHERE review_task_id = ?",
+                (expires_at.isoformat(), review_task_id),
+            )
+
+        lock_connection = repository.connect()
+        lock_connection.execute("BEGIN IMMEDIATE")
+        started = threading.Event()
+        outcome: dict[str, object] = {}
+
+        def submit() -> None:
+            started.set()
+            try:
+                outcome["result"] = resolve_mobile_review(
+                    self.db_path,
+                    review_task_id,
+                    raw_token,
+                    "approved",
+                )
+            except BaseException as exc:  # noqa: BLE001 - preserve the worker failure for the assertion below
+                outcome["error"] = exc
+
+        worker = threading.Thread(target=submit)
+        worker.start()
+        try:
+            self.assertTrue(started.wait(timeout=2))
+            time.sleep(0.75)
+        finally:
+            lock_connection.rollback()
+            lock_connection.close()
+        worker.join(timeout=5)
+
+        self.assertFalse(worker.is_alive())
+        self.assertNotIn("result", outcome)
+        self.assertIsInstance(outcome.get("error"), MobileReviewTransactionError)
+        self.assertEqual(
+            outcome["error"].code,  # type: ignore[union-attr]
+            MobileReviewErrorCode.TOKEN_EXPIRED,
+        )
+        check = SQLiteRuntimeRepository(self.db_path)
+        token_hash = ReviewTokenService(repository)._hash_raw_token(raw_token)
+        self.assertIsNone(check.get_review_token_by_hash(token_hash).used_at)
+        self.assertEqual(check.get_review_task(review_task_id).review_status, ReviewTaskStatus.PENDING)
+        self.assertEqual(check.get_task("TASK-ATOMIC").task_status, TaskStatus.MANUAL_REVIEW)
+        self.assertEqual(check.list_task_status_history("TASK-ATOMIC"), [])
 
     def test_each_mobile_action_uses_the_expected_source_task_transition(self) -> None:
         expected = {

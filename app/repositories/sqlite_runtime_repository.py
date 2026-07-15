@@ -778,7 +778,6 @@ class SQLiteRuntimeRepository:
         after ``BEGIN IMMEDIATE``.
         """
 
-        timestamp = now or datetime.now()
         payload = normalize_mobile_review_resolution_payload(status, resolution_payload)
 
         def inject(point: str) -> None:
@@ -788,6 +787,7 @@ class SQLiteRuntimeRepository:
         with closing(self.connect()) as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
+                timestamp = now if now is not None else datetime.now()
                 token_row = connection.execute(
                     "SELECT * FROM review_tokens WHERE token_hash = ?",
                     (token_hash,),
