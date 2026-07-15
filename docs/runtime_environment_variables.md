@@ -155,6 +155,42 @@ $env:DEV_MODE = "false"
 
 只有字符串 `true` 会被识别为开发模式。
 
+### `PRA_ALLOWED_DATA_DIRS`
+
+用途：配置 Web 请求可以访问或写入的本地数据目录。多个目录使用操作系统路径分隔符；Windows 使用分号（`;`），POSIX 使用冒号（`:`）。
+
+要求：
+
+- 必须填写绝对目录；空项、相对目录、不可解析目录会使路径策略失败关闭。
+- 服务只在启动时读取并固定 allowlist；修改后必须重启服务，并在任务交接记录中说明变更。
+- URL、query、form、JSON body、Cookie 和转发头不能新增或扩大 allowlist。
+- 未配置时仅允许应用默认 `data/runtime` 目录；Web 默认样例文件属于应用内置配置，不代表请求可以访问任意 `data/samples` 子目录。
+- 路径会先规范化，再检查盘符、UNC/设备路径、相对路径、符号链接/junction 和最近存在父目录，拒绝逃逸。
+
+示例：
+
+```powershell
+$env:PRA_ALLOWED_DATA_DIRS = "D:\PRA_Runtime\data;D:\PRA_Runtime\imports"
+```
+
+### `PRA_COOKIE_SECURE`
+
+用途：开发环境本地 HTTP 的 Session Cookie 安全属性显式开关。
+
+- production 或未配置环境默认始终设置 `Secure`、`HttpOnly`、`SameSite=Lax`。
+- development 只有显式设置 `PRA_COOKIE_SECURE=false`（或 `0`/`no`/`off`）才允许本地 HTTP 不带 `Secure`；不得通过任意 `X-Forwarded-Proto` 头降级。
+
+### 登录限流变量
+
+后台登录失败按规范化账号标识和 TCP 对端地址进行有界内存限流；不信任 `Forwarded`、`X-Forwarded-For` 或 `X-Real-IP`。可选配置如下，均有代码内上限：
+
+- `RUNTIME_LOGIN_RATE_LIMIT_MAX_ATTEMPTS`：窗口内失败次数，默认 `5`。
+- `RUNTIME_LOGIN_RATE_LIMIT_WINDOW_SECONDS`：失败窗口，默认 `300` 秒。
+- `RUNTIME_LOGIN_RATE_LIMIT_COOLDOWN_SECONDS`：触发后的冷却时间，默认 `900` 秒。
+- `RUNTIME_LOGIN_RATE_LIMIT_MAX_KEYS`：最多保存的账号/来源桶数量，默认 `4096`。
+
+达到阈值返回稳定错误码 `RATE_LIMITED`；成功登录只清理同一账号和同一 TCP 对端的桶。
+
 ## 6. 旧版 Web 路由安全开关
 
 旧版 `/`、`/tables`、`/execution`、`/manual-intervention` 路由默认关闭。生产环境未配置 `PRA_PROXY_MODE` 时按 `reverse_proxy` 处理并拒绝访问；cpolar、Nginx 或其他反向代理/公网隧道场景也必须保持 `reverse_proxy`，不能启用旧路由。

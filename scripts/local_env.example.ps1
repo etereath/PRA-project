@@ -13,6 +13,12 @@ $env:FEISHU_WEBHOOK_TIMEOUT_SECONDS = "5"
 $env:RUNTIME_ADMIN_USER = "admin"
 $env:RUNTIME_ADMIN_PASSWORD = "replace-with-a-strong-password"
 $env:DEV_MODE = "false"
+$env:PRA_ALLOWED_DATA_DIRS = "D:\PRA_Runtime\data;D:\PRA_Runtime\imports"
+$env:PRA_COOKIE_SECURE = "true"
+$env:RUNTIME_LOGIN_RATE_LIMIT_MAX_ATTEMPTS = "5"
+$env:RUNTIME_LOGIN_RATE_LIMIT_WINDOW_SECONDS = "300"
+$env:RUNTIME_LOGIN_RATE_LIMIT_COOLDOWN_SECONDS = "900"
+$env:RUNTIME_LOGIN_RATE_LIMIT_MAX_KEYS = "4096"
 
 # Legacy Web routes stay disabled by default. Do not set PRA_PROXY_MODE=none
 # when the service is exposed through cpolar, Nginx, or another proxy.

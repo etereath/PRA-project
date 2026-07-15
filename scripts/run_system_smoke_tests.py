@@ -304,12 +304,17 @@ class SmokeRunner:
 
     def check_system_page_safe(self) -> None:
         _RUNTIME_SESSIONS.clear()
+        _, _, login_page = call_app(path="/runtime/login")
+        login_csrf_match = re.search(r'name="csrf_token" value="([^"]+)"', login_page)
+        if login_csrf_match is None:
+            raise AssertionError("登录页未提供一次性 CSRF token")
         login_body = urlencode(
             {
                 "runtime_db": str(TEST_DB),
                 "username": os.environ["RUNTIME_ADMIN_USER"],
                 "password": os.environ["RUNTIME_ADMIN_PASSWORD"],
                 "next": "/system",
+                "csrf_token": login_csrf_match.group(1),
             }
         )
         status, headers, _ = call_app(path="/runtime/login", method="POST", body=login_body)
@@ -404,7 +409,9 @@ def call_app(
         environ["HTTP_COOKIE"] = cookie
     response = application(environ, start_response)
     response_body = b"".join(response).decode("utf-8", errors="replace")
-    headers = {name: value for name, value in captured.get("headers", [])}
+    headers: dict[str, str] = {}
+    for name, value in captured.get("headers", []):
+        headers.setdefault(name, value)
     return str(captured.get("status", "")), headers, response_body
 
 
@@ -452,6 +459,7 @@ def smoke_environment():
         "PRA_ENABLE_LEGACY_WEB",
         "PRA_LEGACY_ACCESS_MODE",
         "PRA_PROXY_MODE",
+        "PRA_ALLOWED_DATA_DIRS",
     ]
     original = {key: os.environ.get(key) for key in keys}
     os.environ.update(
@@ -472,6 +480,7 @@ def smoke_environment():
             "PRA_ENABLE_LEGACY_WEB": "0",
             "PRA_LEGACY_ACCESS_MODE": "direct_loopback",
             "PRA_PROXY_MODE": "reverse_proxy",
+            "PRA_ALLOWED_DATA_DIRS": str(ROOT / "data" / "runtime"),
         }
     )
     _RUNTIME_SESSIONS.clear()
