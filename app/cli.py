@@ -5,6 +5,7 @@ from pathlib import Path
 
 from app.enums import ReviewTaskStatus, TaskActionType, TaskStatus
 from app.exceptions import ValidationError
+from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import create_template_workbooks
 from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION
 from app.services.ai import MockAISuggestionProvider
@@ -80,6 +81,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     init_runtime_parser = subparsers.add_parser("init-runtime-db", help="初始化 SQLite 运行态数据库")
     init_runtime_parser.add_argument("--runtime-db", type=Path, default=DEFAULT_RUNTIME_DB)
+
+    health_parser = subparsers.add_parser(
+        "health",
+        aliases=["check-runtime-health"],
+        help="检查 Runtime Schema v5 健康状态",
+    )
+    health_parser.add_argument("--runtime-db", type=Path, default=DEFAULT_RUNTIME_DB)
 
     generate_runtime_parser = subparsers.add_parser("generate-runtime-tasks", help="生成任务并写入 SQLite 运行态数据库")
     _add_source_args(generate_runtime_parser)
@@ -169,6 +177,16 @@ def main() -> int:
 
             serve(args.host, args.port)
             return 0
+
+        if args.command in {"health", "check-runtime-health"}:
+            repository = SQLiteRuntimeRepository(args.runtime_db)
+            health = repository.check_schema_health()
+            print(
+                f"runtime health: ok={health.ok} "
+                f"schema_versions={repository.schema_versions()} "
+                f"summary={health.summary}"
+            )
+            return 0 if health.ok else 1
 
         if args.command in {"validate", "import-data"}:
             summary = validate_sources(_workflow_inputs(args))

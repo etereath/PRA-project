@@ -48,6 +48,9 @@ provider 在凭据缺失、权限不足、Credential Manager 不可用或记录�
 pip install -e .
 ```
 
+核心发行物和 ShadowBot 的独立部署步骤见
+[docs/core_wheel_shadowbot_deployment.md](docs/core_wheel_shadowbot_deployment.md)。核心 wheel 只包含 `app*`，不包含 `shadowbot`、`tests`、运行态数据库或部署机配置；安装后可使用 `pra-mvp`（或 `pra`）CLI。
+
 准备本地环境变量：
 
 ```powershell
@@ -124,6 +127,12 @@ $env:MOBILE_REVIEW_BASE_URL = "https://你的固定地址.cpolar.cn"
 
 ```powershell
 python -m app.cli init-runtime-db
+```
+
+检查 Runtime Schema v5 健康状态：
+
+```powershell
+pra-mvp health --runtime-db data/runtime/pra_runtime.sqlite3
 ```
 
 生成运行态任务：

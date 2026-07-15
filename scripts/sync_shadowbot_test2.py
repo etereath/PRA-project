@@ -63,13 +63,18 @@ def sync(app_dir: Path, *, check_only: bool) -> list[dict[str, str]]:
         records.append({"source": str(config_source), "destination": str(config_destination), "status": "CREATED"})
     elif config_destination.exists():
         records.append({"source": str(config_source), "destination": str(config_destination), "status": "EXISTS"})
+    else:
+        records.append({"source": str(config_source), "destination": str(config_destination), "status": "MISSING"})
     return records
 
 
 def main() -> int:
     args = build_parser().parse_args()
-    for record in sync(args.app_dir, check_only=args.check):
+    records = sync(args.app_dir, check_only=args.check)
+    for record in records:
         print(record)
+    if args.check and any(record["status"] in {"DIFFERENT", "MISSING"} for record in records):
+        return 1
     return 0
 
 
