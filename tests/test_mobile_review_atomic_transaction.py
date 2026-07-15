@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 from app.enums import ReviewTaskStatus, TaskActionType, TaskStatus
 from app.exceptions import MobileReviewErrorCode, MobileReviewTransactionError
 from app.models import Task
-from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository, _is_sqlite_concurrency_error
 from app.services.runtime import ReviewTaskService, ReviewTokenService, RuntimeTaskService
 from app.services.workflow import resolve_mobile_review
 
@@ -148,18 +151,36 @@ class MobileReviewAtomicTransactionTests(unittest.TestCase):
         expected = {
             "approved": TaskStatus.PENDING,
             "rejected": TaskStatus.SKIPPED,
-            "adjusted": TaskStatus.SKIPPED,
+            "adjusted": TaskStatus.PENDING,
             "cancelled": TaskStatus.CANCELLED,
         }
         for action, expected_task_status in expected.items():
             with self.subTest(action=action):
                 point_db_path = Path(self.temp_dir.name) / f"action-{action}.sqlite3"
                 _, review_task_id, raw_token = self._prepare(point_db_path)
-                resolve_mobile_review(point_db_path, review_task_id, raw_token, action)
-                self.assertEqual(
-                    SQLiteRuntimeRepository(point_db_path).get_task("TASK-ATOMIC").task_status,
-                    expected_task_status,
+                payload = (
+                    {"adjustment": {"target_price": "8.80", "target_status": "online", "result_message": "adjusted"}}
+                    if action == "adjusted"
+                    else None
                 )
+                resolve_mobile_review(
+                    point_db_path,
+                    review_task_id,
+                    raw_token,
+                    action,
+                    resolution_payload=payload,
+                )
+                repository = SQLiteRuntimeRepository(point_db_path)
+                task = repository.get_task("TASK-ATOMIC")
+                self.assertEqual(task.task_status, expected_task_status)
+                if action == "adjusted":
+                    self.assertEqual(task.target_price, Decimal("8.8"))
+                    self.assertEqual(task.target_status, "online")
+                    self.assertEqual(task.result_message, "adjusted")
+                    self.assertEqual(
+                        task.decision_trace["mobile_review_adjustment"]["target_price"],
+                        "8.8",
+                    )
 
     def test_faults_at_each_commit_stage_roll_back_everything(self) -> None:
         for point in (
@@ -168,6 +189,7 @@ class MobileReviewAtomicTransactionTests(unittest.TestCase):
             "after_task_update",
             "before_history_insert",
             "after_history_insert",
+            "before_result_conversion",
         ):
             with self.subTest(point=point):
                 point_db_path = Path(self.temp_dir.name) / f"{point}.sqlite3"
@@ -195,6 +217,84 @@ class MobileReviewAtomicTransactionTests(unittest.TestCase):
                     check.get_review_task(review_task_id).review_status,
                     ReviewTaskStatus.PENDING,
                 )
+                self.assertEqual(check.get_task("TASK-ATOMIC").task_status, TaskStatus.MANUAL_REVIEW)
+                self.assertEqual(check.list_task_status_history("TASK-ATOMIC"), [])
+
+    def test_adjusted_requires_a_valid_normalized_payload(self) -> None:
+        repository, review_task_id, raw_token = self._prepare(
+            Path(self.temp_dir.name) / "invalid-adjustment.sqlite3"
+        )
+        token_hash = ReviewTokenService(repository)._hash_raw_token(raw_token)
+
+        with self.assertRaises(MobileReviewTransactionError) as context:
+            repository.resolve_mobile_review_atomic(
+                review_task_id=review_task_id,
+                token_hash=token_hash,
+                status=ReviewTaskStatus.ADJUSTED,
+                actor_source="mobile_review_token",
+                resolution_payload={},
+            )
+
+        self.assertEqual(context.exception.code, MobileReviewErrorCode.INVALID_ADJUSTMENT)
+        check = SQLiteRuntimeRepository(Path(self.temp_dir.name) / "invalid-adjustment.sqlite3")
+        self.assertEqual(check.get_review_task(review_task_id).review_status, ReviewTaskStatus.PENDING)
+        self.assertEqual(check.get_task("TASK-ATOMIC").task_status, TaskStatus.MANUAL_REVIEW)
+
+    def test_sqlite_concurrency_classification_uses_codes_not_localized_text(self) -> None:
+        class CodedOperationalError(sqlite3.OperationalError):
+            def __init__(self, message: str, code: int, name: str):
+                super().__init__(message)
+                self.sqlite_errorcode = code
+                self.sqlite_errorname = name
+
+        self.assertTrue(
+            _is_sqlite_concurrency_error(
+                CodedOperationalError("数据库正忙", sqlite3.SQLITE_BUSY, "SQLITE_BUSY")
+            )
+        )
+        self.assertTrue(
+            _is_sqlite_concurrency_error(
+                CodedOperationalError("snapshot verrouillé", sqlite3.SQLITE_BUSY_SNAPSHOT, "SQLITE_BUSY_SNAPSHOT")
+            )
+        )
+        self.assertTrue(
+            _is_sqlite_concurrency_error(
+                CodedOperationalError(
+                    "共享缓存被占用",
+                    sqlite3.SQLITE_LOCKED_SHAREDCACHE,
+                    "SQLITE_LOCKED_SHAREDCACHE",
+                )
+            )
+        )
+        self.assertFalse(
+            _is_sqlite_concurrency_error(
+                CodedOperationalError("database is locked", sqlite3.SQLITE_ERROR, "SQLITE_ERROR")
+            )
+        )
+        self.assertFalse(_is_sqlite_concurrency_error(sqlite3.OperationalError("database is locked")))
+
+    def test_result_conversion_failure_rolls_back_before_commit(self) -> None:
+        for converter_name in ("_row_to_review_task", "_row_to_review_token", "_row_to_task"):
+            with self.subTest(converter=converter_name):
+                point_db_path = Path(self.temp_dir.name) / f"conversion-{converter_name}.sqlite3"
+                repository, review_task_id, raw_token = self._prepare(point_db_path)
+                token_hash = ReviewTokenService(repository)._hash_raw_token(raw_token)
+
+                with patch(
+                    f"app.repositories.sqlite_runtime_repository.{converter_name}",
+                    side_effect=ValueError(f"damaged row in {converter_name}"),
+                ):
+                    with self.assertRaises(ValueError):
+                        repository.resolve_mobile_review_atomic(
+                            review_task_id=review_task_id,
+                            token_hash=token_hash,
+                            status=ReviewTaskStatus.APPROVED,
+                            actor_source="mobile_review_token",
+                        )
+
+                check = SQLiteRuntimeRepository(point_db_path)
+                self.assertIsNone(check.get_review_token_by_hash(token_hash).used_at)
+                self.assertEqual(check.get_review_task(review_task_id).review_status, ReviewTaskStatus.PENDING)
                 self.assertEqual(check.get_task("TASK-ATOMIC").task_status, TaskStatus.MANUAL_REVIEW)
                 self.assertEqual(check.list_task_status_history("TASK-ATOMIC"), [])
 

@@ -2552,7 +2552,7 @@ class WebTests(unittest.TestCase):
 
             self.assertEqual(first_status, "303 See Other")
             self.assertIn("resolved=1", first_headers["Location"])
-            self.assertEqual(second_status, "200 OK")
+            self.assertEqual(second_status, "410 Gone")
             self.assertIn("链接已失效或无权访问该复核任务", second_body)
 
             stored_token = repository.get_review_token(token_result.review_token.token_id)
@@ -2646,8 +2646,45 @@ class WebTests(unittest.TestCase):
 
             self.assertEqual(invalid_json_status, "200 OK")
             self.assertIn("JSON object", invalid_json_body)
-            self.assertEqual(expired_status, "200 OK")
+            self.assertEqual(expired_status, "422 Unprocessable Entity")
             self.assertIn("链接已失效或无权访问该复核任务", expired_body)
+
+    def test_mobile_review_action_not_allowed_returns_forbidden_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "runtime.sqlite3"
+            repository = SQLiteRuntimeRepository(db_path)
+            task_service = RuntimeTaskService(repository)
+            task_service.init_schema()
+            task = _runtime_task("TASK-M3-ACTION", status=TaskStatus.MANUAL_REVIEW)
+            task_service.create_tasks([task])
+            review_service = ReviewTaskService(repository, runtime_task_service=task_service)
+            review_service.create_from_tasks([task])
+            review = review_service.list_review_tasks()[0]
+
+            with patch("app.web.DEFAULT_RUNTIME_DB", db_path), patch.dict("os.environ", {"REVIEW_TOKEN_SECRET": "unit-test-secret"}, clear=False):
+                token_result = ReviewTokenService(repository).create_token(
+                    review.review_task_id,
+                    token_subject="mobile_reviewer",
+                    allowed_actions=["approved"],
+                )
+                status, _, body = self._call_app(
+                    path=f"/mobile/review/{review.review_task_id}/resolve",
+                    method="POST",
+                    body=urlencode(
+                        {
+                            "token": token_result.raw_token,
+                            "action": "rejected",
+                            "resolution_payload_json": "{}",
+                        }
+                    ),
+                )
+
+            self.assertEqual(status, "403 Forbidden")
+            self.assertIn("链接已失效或无权访问该复核任务", body)
+            self.assertIsNone(repository.get_review_token(token_result.review_token.token_id).used_at)
+            self.assertEqual(repository.get_review_task(review.review_task_id).review_status, ReviewTaskStatus.PENDING)
+            self.assertEqual(repository.get_task(task.task_id).task_status, TaskStatus.MANUAL_REVIEW)
+            self.assertEqual(repository.list_task_status_history(task.task_id), [])
 
     def test_mobile_review_token_fails_after_web_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2685,7 +2722,7 @@ class WebTests(unittest.TestCase):
                     ),
                 )
 
-            self.assertEqual(status, "200 OK")
+            self.assertEqual(status, "409 Conflict")
             self.assertIn("链接已失效或无权访问该复核任务", body)
 
     def test_execution_logs_page_displays_shadowbot_summary_evidence_and_warnings(self) -> None:

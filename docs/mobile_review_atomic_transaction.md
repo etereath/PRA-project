@@ -10,7 +10,9 @@ Mobile Review 的 POST resolve 入口现在只在事务前执行无副作用的�
 4. 用条件 `UPDATE` 消费 Token，并要求 `rowcount = 1`。
 5. 用条件 `UPDATE ... WHERE review_status = 'pending'` 写入 review resolution。
 6. 用条件 `UPDATE ... WHERE task_status = 当前状态` 推进源 task，并要求 `rowcount = 1`。
-7. 在同一连接写入 `task_status_history`，然后统一提交。
+7. 在同一连接写入 `task_status_history`。
+8. 在提交前把事务内读取的行转换为领域对象；转换失败也会回滚。
+9. 领域对象转换成功后统一提交。
 
 任何异常都会回滚 Token、review、task 和 history。事务内部不调用会自行打开新连接的旧 service/repository 方法。
 
@@ -27,9 +29,25 @@ Mobile Review 的 POST resolve 入口现在只在事务前执行无副作用的�
 | `REVIEW_ALREADY_RESOLVED` | review 已被处理或被并发请求先处理 |
 | `ACTION_NOT_ALLOWED` | 动作不在 Token 的 `allowed_actions` 中 |
 | `ACTION_NOT_ALLOWED_FOR_REVIEW_TYPE` | 动作不属于 Mobile Review 支持集合 |
+| `INVALID_ADJUSTMENT` | `adjusted` payload 不符合调整字段约束 |
 | `CONCURRENT_UPDATE` | 条件更新失败或 SQLite 写锁竞争 |
 
 错误码通过 `MobileReviewTransactionError.code` 暴露；Web 页面仍使用现有统一失效提示，避免向移动端泄露内部数据库细节。
+
+SQLite 并发错误只依据 `sqlite_errorcode` 和 `sqlite_errorname` 判定
+`SQLITE_BUSY*` / `SQLITE_LOCKED*`，不依赖本地化异常文本。其他 `OperationalError`
+继续原样抛出。Web POST 会把业务错误映射为 HTTP 状态：Token 失效类为 `403` 或
+`410`，已处理/并发为 `409`，动作不允许为 `403`，动作类型或调整 payload 无效为
+`422`；响应正文继续使用统一提示。
+
+## adjusted payload 与源任务
+
+`adjusted` 必须携带 `adjustment` 对象，只允许 `target_price`、`target_status` 和
+`result_message`。其中至少需要调整价格或状态；价格会规范化为非负十进制字符串，文本
+字段会去除首尾空白并限制长度。规范化后的 payload 写入 review，同时在同一事务内更新源
+task 的目标字段和 `decision_trace.mobile_review_adjustment`，并将源 task 保持/推进为
+`pending`，使后续流程可以继续执行。状态历史和这些字段更新与 Token 消费、review
+resolution 同时提交。
 
 ## 调用链变化
 
@@ -51,6 +69,9 @@ Mobile Review 的 POST resolve 入口现在只在事务前执行无副作用的�
 - 两个独立 `sqlite3.Connection` 竞争同一 Token，只允许一个成功。
 - 两个不同 Token 竞争同一 review，只允许一个 resolution 成功。
 - Token 更新后、review 更新后、task 更新后、history 插入前/后故障注入，均证明全量回滚。
+- 结果对象转换前故障注入，证明提交前转换失败也会全量回滚。
+- `adjusted` payload 规范化、源 task 字段更新、非法调整拒绝，以及 Web 层 `403/409/410/422` 状态映射。
+- 使用不同错误文本但相同 SQLite busy/locked 错误码的分类，以及“文本含 locked 但错误码非并发”的反例。
 - 重复提交返回 `TOKEN_ALREADY_USED`，不会新增 history。
 
 本任务不扩大为全库 WAL、`busy_timeout` 或通用退避策略；这些仍属于任务 8。

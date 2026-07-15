@@ -17,7 +17,7 @@ from uuid import uuid4
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 from app.enums import NotificationSendStatus, ReviewTaskStatus, TaskActionType, TaskStatus
-from app.exceptions import TableValidationError, ValidationError
+from app.exceptions import MobileReviewErrorCode, MobileReviewTransactionError, TableValidationError, ValidationError
 from app.field_labels import FIELD_LABELS, TABLE_LABELS
 from app.models import NotificationLog
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
@@ -183,6 +183,20 @@ LEGACY_FORWARDING_HEADERS = (
     "HTTP_X_REAL_IP",
 )
 DISPLAY_TIMEZONE = timezone(timedelta(hours=8))
+
+MOBILE_REVIEW_HTTP_STATUS = {
+    MobileReviewErrorCode.TOKEN_NOT_FOUND.value: "403 Forbidden",
+    MobileReviewErrorCode.TOKEN_REVIEW_MISMATCH.value: "403 Forbidden",
+    MobileReviewErrorCode.TOKEN_EXPIRED.value: "410 Gone",
+    MobileReviewErrorCode.TOKEN_REVOKED.value: "410 Gone",
+    MobileReviewErrorCode.TOKEN_ALREADY_USED.value: "410 Gone",
+    MobileReviewErrorCode.REVIEW_NOT_FOUND.value: "404 Not Found",
+    MobileReviewErrorCode.REVIEW_ALREADY_RESOLVED.value: "409 Conflict",
+    MobileReviewErrorCode.ACTION_NOT_ALLOWED.value: "403 Forbidden",
+    MobileReviewErrorCode.ACTION_NOT_ALLOWED_FOR_REVIEW_TYPE.value: "422 Unprocessable Entity",
+    MobileReviewErrorCode.INVALID_ADJUSTMENT.value: "422 Unprocessable Entity",
+    MobileReviewErrorCode.CONCURRENT_UPDATE.value: "409 Conflict",
+}
 
 DISPLAY_ENUM_LABELS = {
     "task_status": {
@@ -897,6 +911,8 @@ def _handle_mobile_review(method: str, path: str, environ) -> str | tuple[str, s
             return _redirect_response(
                 f"/mobile/review/{review_task_id}?{urlencode({'resolved': '1'})}"
             )
+        except MobileReviewTransactionError as exc:
+            return _mobile_review_error_response(exc)
         except ValidationError as exc:
             message = (
                 str(exc)
@@ -7928,6 +7944,11 @@ def _redirect_response(location: str, headers: list[tuple[str, str]] | None = No
     if headers:
         response_headers.extend(headers)
     return ("303 See Other", "", response_headers)
+
+
+def _mobile_review_error_response(error: MobileReviewTransactionError) -> tuple[str, str, list[tuple[str, str]]]:
+    status = MOBILE_REVIEW_HTTP_STATUS.get(error.code, "409 Conflict")
+    return status, render_mobile_review_error_page(UI_TEXT["mobile_review_invalid"]), []
 
 
 def _to_pretty_json(value: object) -> str:

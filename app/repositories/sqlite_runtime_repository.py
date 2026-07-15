@@ -11,6 +11,7 @@ from uuid import uuid4
 
 from app.enums import PricingSource, ReviewTaskStatus, TaskActionType, TaskStatus
 from app.exceptions import MobileReviewErrorCode, MobileReviewTransactionError
+from app.mobile_review import normalize_mobile_review_resolution_payload
 from app.models import (
     ExecutionLog,
     MobileReviewAtomicResult,
@@ -69,6 +70,19 @@ ATOMIC_TASK_TRANSITIONS = {
         TaskStatus.EXPIRED,
     },
 }
+
+SQLITE_CONCURRENCY_ERROR_CODES = frozenset(
+    getattr(sqlite3, name)
+    for name in (
+        "SQLITE_BUSY",
+        "SQLITE_BUSY_RECOVERY",
+        "SQLITE_BUSY_SNAPSHOT",
+        "SQLITE_LOCKED",
+        "SQLITE_LOCKED_SHAREDCACHE",
+        "SQLITE_LOCKED_VTAB",
+    )
+    if hasattr(sqlite3, name)
+)
 
 
 SCHEMA_SQL = [
@@ -765,7 +779,7 @@ class SQLiteRuntimeRepository:
         """
 
         timestamp = now or datetime.now()
-        payload = resolution_payload or {}
+        payload = normalize_mobile_review_resolution_payload(status, resolution_payload)
 
         def inject(point: str) -> None:
             if failure_injector is not None:
@@ -845,6 +859,19 @@ class SQLiteRuntimeRepository:
                 )
                 source_task_status = _atomic_source_task_status(source_row, status)
                 resolved_actor = actor or str(token_row["token_subject"])
+                adjustment = payload.get("adjustment") if status == ReviewTaskStatus.ADJUSTED else None
+                adjusted_target_price = None
+                adjusted_target_status = None
+                adjusted_result_message = note
+                adjusted_decision_trace_json = None
+                if isinstance(adjustment, dict):
+                    adjusted_target_price = adjustment.get("target_price")
+                    adjusted_target_status = adjustment.get("target_status")
+                    adjusted_result_message = str(adjustment.get("result_message") or note)
+                    if source_row is not None:
+                        decision_trace = _json_load(source_row["decision_trace_json"])
+                        decision_trace["mobile_review_adjustment"] = adjustment
+                        adjusted_decision_trace_json = _json_dump(decision_trace)
 
                 token_updated = connection.execute(
                     """
@@ -918,6 +945,9 @@ class SQLiteRuntimeRepository:
                         """
                         UPDATE tasks
                         SET task_status = ?,
+                            target_price = COALESCE(?, target_price),
+                            target_status = COALESCE(?, target_status),
+                            decision_trace_json = COALESCE(?, decision_trace_json),
                             result_message = COALESCE(NULLIF(?, ''), result_message),
                             updated_at = ?
                         WHERE task_id = ?
@@ -925,7 +955,10 @@ class SQLiteRuntimeRepository:
                         """,
                         (
                             source_task_status.value,
-                            note,
+                            adjusted_target_price,
+                            adjusted_target_status,
+                            adjusted_decision_trace_json,
+                            adjusted_result_message,
                             _datetime_to_text(timestamp),
                             source_task_id,
                             current_source_status.value,
@@ -989,19 +1022,21 @@ class SQLiteRuntimeRepository:
                         MobileReviewErrorCode.CONCURRENT_UPDATE,
                         "复核结果提交前读取失败",
                     )
-                connection.commit()
-                return MobileReviewAtomicResult(
+                inject("before_result_conversion")
+                result = MobileReviewAtomicResult(
                     review_task=_row_to_review_task(committed_review_row),
                     review_token=_row_to_review_token(committed_token_row),
                     source_task=_row_to_task(committed_source_row) if committed_source_row is not None else None,
                     source_task_status=source_task_status,
                 )
+                connection.commit()
+                return result
             except MobileReviewTransactionError:
                 connection.rollback()
                 raise
             except sqlite3.OperationalError as exc:
                 connection.rollback()
-                if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                if _is_sqlite_concurrency_error(exc):
                     raise MobileReviewTransactionError(
                         MobileReviewErrorCode.CONCURRENT_UPDATE,
                         "复核请求发生并发更新，请重试",
@@ -2837,6 +2872,19 @@ def _row_to_status_history(row: sqlite3.Row) -> TaskStatusHistory:
     )
 
 
+def _is_sqlite_concurrency_error(error: sqlite3.OperationalError) -> bool:
+    """Classify SQLite busy/locked errors without inspecting localized text."""
+
+    error_code = getattr(error, "sqlite_errorcode", None)
+    error_name = getattr(error, "sqlite_errorname", "")
+    if error_code in SQLITE_CONCURRENCY_ERROR_CODES:
+        return True
+    return bool(
+        isinstance(error_name, str)
+        and (error_name.startswith("SQLITE_BUSY") or error_name.startswith("SQLITE_LOCKED"))
+    )
+
+
 def _atomic_source_task_status(
     source_row: sqlite3.Row | None,
     status: ReviewTaskStatus,
@@ -2845,7 +2893,7 @@ def _atomic_source_task_status(
         return None
     current_status = TaskStatus(str(source_row["task_status"]))
     if current_status == TaskStatus.MANUAL_REVIEW:
-        if status == ReviewTaskStatus.APPROVED:
+        if status in {ReviewTaskStatus.APPROVED, ReviewTaskStatus.ADJUSTED}:
             return TaskStatus.PENDING
         if status == ReviewTaskStatus.CANCELLED:
             return TaskStatus.CANCELLED
@@ -2853,7 +2901,11 @@ def _atomic_source_task_status(
     if current_status == TaskStatus.PENDING:
         action_type = TaskActionType(str(source_row["action_type"]))
         if action_type in MANUAL_REVIEW_SOURCE_ACTIONS:
-            return TaskStatus.CANCELLED if status == ReviewTaskStatus.CANCELLED else TaskStatus.SKIPPED
+            if status == ReviewTaskStatus.CANCELLED:
+                return TaskStatus.CANCELLED
+            if status == ReviewTaskStatus.ADJUSTED:
+                return TaskStatus.PENDING
+            return TaskStatus.SKIPPED
     return None
 
 

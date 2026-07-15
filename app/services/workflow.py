@@ -370,12 +370,14 @@ def source_task_status_for_review_resolution(source_task: Task | None, status: R
     if source_task.task_status == TaskStatus.PENDING and source_task.action_type in MANUAL_INTERVENTION_ACTIONS:
         if status == ReviewTaskStatus.CANCELLED:
             return TaskStatus.CANCELLED
+        if status == ReviewTaskStatus.ADJUSTED:
+            return TaskStatus.PENDING
         return TaskStatus.SKIPPED
     return None
 
 
 def _source_task_status_for_manual_review_source(status: ReviewTaskStatus) -> TaskStatus:
-    if status == ReviewTaskStatus.APPROVED:
+    if status in {ReviewTaskStatus.APPROVED, ReviewTaskStatus.ADJUSTED}:
         return TaskStatus.PENDING
     if status == ReviewTaskStatus.CANCELLED:
         return TaskStatus.CANCELLED
