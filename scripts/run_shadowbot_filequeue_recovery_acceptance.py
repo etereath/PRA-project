@@ -158,7 +158,7 @@ def run_recovery_acceptance(runtime_db: Path, queue_dir: Path) -> dict[str, obje
     checks = {
         "watchdog_wrote_unknown_result": bool(watchdog_events) and watchdog_events[0].get("status") == "RECOVERY_RESULT_WRITTEN",
         "source_result_imported": bool(import_events) and import_events[0].get("status") == "IMPORTED",
-        "source_needs_reconciliation": source_attempt is not None and source_attempt.status == "NEEDS_RECONCILIATION" and source_attempt.side_effect_state == "UNKNOWN",
+        "source_needs_reconciliation": source_attempt is not None and source_attempt.status == "SIDE_EFFECT_UNKNOWN" and source_attempt.side_effect_state == "UNKNOWN",
         "one_deterministic_reconcile": reconcile_attempt is not None and len(reconcile_attempts) == 1,
         "reconcile_result_imported": bool(reconcile_import_events) and reconcile_import_events[0].get("status") == "IMPORTED",
         "reconcile_not_applied": final_reconcile is not None and final_reconcile.status == "NOT_APPLIED" and final_reconcile.side_effect_state == "NOT_APPLIED",
