@@ -675,6 +675,7 @@ powershell -ExecutionPolicy Bypass -File scripts\setup_shadowbot_evidence_share.
 22. `check-yingdao-app-params` 可调用影刀 `/oapi/robot/v2/queryRobotParam` 做只读预检，确认主流程存在 `request_json` 入参和 `shadowbot_result_json` 出参；该命令不会启动影刀应用。
 23. `poll-yingdao-result` 可调用影刀 `/oapi/dispatch/v2/job/query` 查询 `jobUuid`，从输出参数 `shadowbot_result_json` 提取结果并回写 PRA；若导入 COMMIT 结果为 `NEEDS_RECONCILIATION`，由 Executor 自动创建唯一的只读对账尝试。
 24. `scripts/check_shadowbot_readiness.py` 提供真实启动前的离线就绪检查，只报告 runner 必需环境变量和 runtime DB 状态，不启动影刀、不访问影刀 OpenAPI，也不会输出密钥明文。
+25. `RetryPolicyService` 的总重试窗口从 operation 创建时间与最早 COMMIT attempt 时间二者较早者起算，并受原审批到期时间进一步收紧。签发事务把 `retry_window_deadline` 和窗口秒数写入 source attempt 审计数据，`RetryAuthorization.expires_at` 不得晚于该截止时间；消费事务会从数据库权威时间重新计算并比对截止时间，超窗时授权保持未消费、不创建 attempt、不改变 operation。
 
 首条链路准备示例：
 

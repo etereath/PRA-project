@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import closing
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Iterable
@@ -1598,6 +1598,8 @@ class SQLiteRuntimeRepository:
         authorization: RetryAuthorization,
         *,
         allowed_operation_statuses: Iterable[str],
+        retry_window_deadline: datetime,
+        max_retry_window_seconds: int,
     ) -> bool:
         """Persist one authorization and expose RETRY_AUTHORIZED atomically."""
         allowed = tuple(dict.fromkeys(str(value) for value in allowed_operation_statuses))
@@ -1614,6 +1616,44 @@ class SQLiteRuntimeRepository:
                 "SELECT * FROM shadowbot_execution_attempts WHERE execution_attempt_id = ?",
                 (authorization.source_execution_attempt_id,),
             ).fetchone()
+            reference_time = authorization.created_at or datetime.now(retry_window_deadline.tzinfo)
+            source_raw = _json_load(source["raw_output_json"]) if source is not None else {}
+            approval_expires_at = _text_to_datetime(source_raw.get("approval_expires_at"))
+            if approval_expires_at is not None and approval_expires_at.tzinfo is None and reference_time.tzinfo is not None:
+                approval_expires_at = approval_expires_at.replace(tzinfo=reference_time.tzinfo)
+            operation_created_at = _text_to_datetime(operation["created_at"]) if operation is not None else None
+            if operation_created_at is not None and operation_created_at.tzinfo is None and reference_time.tzinfo is not None:
+                operation_created_at = operation_created_at.replace(tzinfo=reference_time.tzinfo)
+            commit_rows = connection.execute(
+                """
+                SELECT started_at FROM shadowbot_execution_attempts
+                WHERE operation_id = ? AND execution_mode = 'COMMIT'
+                """,
+                (authorization.operation_id,),
+            ).fetchall()
+            retry_origins = [
+                value
+                for value in (
+                    operation_created_at,
+                    *(_text_to_datetime(row["started_at"]) for row in commit_rows),
+                )
+                if value is not None
+            ]
+            retry_origins = [
+                value.replace(tzinfo=reference_time.tzinfo)
+                if value.tzinfo is None and reference_time.tzinfo is not None
+                else value
+                for value in retry_origins
+            ]
+            recomputed_deadline = (
+                min(
+                    min(retry_origins) + timedelta(seconds=max_retry_window_seconds),
+                    approval_expires_at,
+                )
+                if retry_origins and approval_expires_at is not None and max_retry_window_seconds > 0
+                else None
+            )
+            authorization_expires_at = authorization.expires_at
             if (
                 operation is None
                 or source is None
@@ -1622,6 +1662,11 @@ class SQLiteRuntimeRepository:
                 or str(operation["approved_payload_hash"]) != authorization.approved_payload_hash
                 or str(source["operation_id"]) != authorization.operation_id
                 or str(source["status"]) in {"STARTING", "RUNNING"}
+                or recomputed_deadline is None
+                or recomputed_deadline != retry_window_deadline
+                or authorization_expires_at is None
+                or authorization_expires_at > retry_window_deadline
+                or reference_time > retry_window_deadline
             ):
                 connection.rollback()
                 return False
@@ -1636,6 +1681,13 @@ class SQLiteRuntimeRepository:
             if active is not None:
                 connection.rollback()
                 return False
+            source_raw["retry_window_deadline"] = _datetime_to_text(retry_window_deadline)
+            source_raw["max_retry_window_seconds"] = max_retry_window_seconds
+            source_raw["retry_window_authorization_id"] = authorization.retry_authorization_id
+            connection.execute(
+                "UPDATE shadowbot_execution_attempts SET raw_output_json = ? WHERE execution_attempt_id = ?",
+                (_json_dump(source_raw), authorization.source_execution_attempt_id),
+            )
             connection.execute(
                 """
                 INSERT INTO retry_authorizations(
@@ -1734,6 +1786,54 @@ class SQLiteRuntimeRepository:
                 and consumed_at.tzinfo is not None
             ):
                 source_approval_expires_at = source_approval_expires_at.replace(tzinfo=consumed_at.tzinfo)
+            retry_window_deadline = _text_to_datetime(source_raw.get("retry_window_deadline"))
+            if (
+                retry_window_deadline is not None
+                and retry_window_deadline.tzinfo is None
+                and consumed_at.tzinfo is not None
+            ):
+                retry_window_deadline = retry_window_deadline.replace(tzinfo=consumed_at.tzinfo)
+            try:
+                max_retry_window_seconds = int(source_raw.get("max_retry_window_seconds") or 0)
+            except (TypeError, ValueError):
+                max_retry_window_seconds = 0
+            operation_created_at = _text_to_datetime(operation["created_at"])
+            if operation_created_at is not None and operation_created_at.tzinfo is None and consumed_at.tzinfo is not None:
+                operation_created_at = operation_created_at.replace(tzinfo=consumed_at.tzinfo)
+            commit_rows = connection.execute(
+                """
+                SELECT started_at FROM shadowbot_execution_attempts
+                WHERE operation_id = ? AND execution_mode = 'COMMIT'
+                """,
+                (attempt.operation_id,),
+            ).fetchall()
+            retry_origins = [
+                value
+                for value in (
+                    operation_created_at,
+                    *(_text_to_datetime(row["started_at"]) for row in commit_rows),
+                )
+                if value is not None
+            ]
+            retry_origins = [
+                value.replace(tzinfo=consumed_at.tzinfo)
+                if value.tzinfo is None and consumed_at.tzinfo is not None
+                else value
+                for value in retry_origins
+            ]
+            recomputed_retry_window_deadline = (
+                min(
+                    min(retry_origins) + timedelta(seconds=max_retry_window_seconds),
+                    source_approval_expires_at,
+                )
+                if retry_origins and source_approval_expires_at is not None and max_retry_window_seconds > 0
+                else None
+            )
+            retry_window_valid = bool(
+                retry_window_deadline is not None
+                and recomputed_retry_window_deadline == retry_window_deadline
+                and consumed_at <= retry_window_deadline
+            )
             source_approval_valid = bool(
                 source_raw.get("approval_id")
                 and str(source_raw.get("approved_payload_hash") or "") == approved_payload_hash
@@ -1772,6 +1872,7 @@ class SQLiteRuntimeRepository:
                 or str(source["operation_id"]) != attempt.operation_id
                 or str(source["execution_mode"]) != "COMMIT"
                 or not source_approval_valid
+                or not retry_window_valid
                 or not (normal_source or frozen_manual_source)
                 or active is not None
             ):

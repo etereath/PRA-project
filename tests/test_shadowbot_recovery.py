@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -450,6 +451,92 @@ def test_retry_authorization_accepts_valid_approval_inside_total_window(tmp_path
     )
     assert authorization.status == "ACTIVE"
     assert authorization.expires_at <= datetime.fromisoformat(str(source.raw_output["approval_expires_at"]))
+
+
+def test_retry_authorization_cannot_be_consumed_after_total_window(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    with pytest.raises(ShadowBotStartBoundaryError):
+        ShadowBotExecutor(repository, BoundaryRunner(published=False)).start_execution(
+            _start_request(attempt_id="ATTEMPT-WINDOW-CONSUME-LATE")
+        )
+    source = repository.get_shadowbot_execution_attempt("ATTEMPT-WINDOW-CONSUME-LATE")
+    operation = repository.get_shadowbot_operation(source.operation_id)
+    approval_expiry = datetime.fromisoformat(str(source.raw_output["approval_expires_at"]))
+    retry_window_deadline = min(operation.created_at, source.started_at) + timedelta(minutes=5)
+    retry_window_deadline = min(retry_window_deadline, approval_expiry)
+    authorization = RetryPolicyService(
+        repository,
+        authorization_ttl=timedelta(minutes=15),
+        max_retry_window=timedelta(minutes=5),
+    ).issue_automatic(
+        source_execution_attempt_id=source.execution_attempt_id,
+        evidence=_pre_publish_evidence(source, result_id="EVIDENCE-WINDOW-CONSUME-LATE"),
+        now=retry_window_deadline - timedelta(seconds=10),
+    )
+    assert authorization.expires_at == retry_window_deadline
+    source = repository.get_shadowbot_execution_attempt(source.execution_attempt_id)
+    assert datetime.fromisoformat(str(source.raw_output["retry_window_deadline"])) == retry_window_deadline
+    assert source.raw_output["max_retry_window_seconds"] == 300
+
+    # Fault-inject a longer ordinary TTL: consumption must still reject the persisted/recomputed window.
+    with repository.connect() as connection:
+        connection.execute(
+            "UPDATE retry_authorizations SET expires_at = ? WHERE retry_authorization_id = ?",
+            (
+                (retry_window_deadline + timedelta(minutes=10)).isoformat(),
+                authorization.retry_authorization_id,
+            ),
+        )
+        connection.commit()
+    with patch(
+        "app.services.shadowbot_executor.utc_now",
+        return_value=retry_window_deadline + timedelta(seconds=1),
+    ):
+        with pytest.raises(ValidationError, match="RETRY_AUTHORIZATION_CONSUME_CONFLICT"):
+            ShadowBotExecutor(repository, RecordingRunner()).start_execution(
+                _start_request(
+                    attempt_id="ATTEMPT-WINDOW-CONSUME-LATE-RETRY",
+                    retry_authorization_id=authorization.retry_authorization_id,
+                )
+            )
+    assert repository.get_retry_authorization(authorization.retry_authorization_id).status == "ACTIVE"
+    assert repository.get_shadowbot_execution_attempt("ATTEMPT-WINDOW-CONSUME-LATE-RETRY") is None
+    assert repository.get_shadowbot_operation(source.operation_id).status == OperationStatus.RETRY_AUTHORIZED.value
+
+
+def test_retry_authorization_consumes_inside_total_window(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    with pytest.raises(ShadowBotStartBoundaryError):
+        ShadowBotExecutor(repository, BoundaryRunner(published=False)).start_execution(
+            _start_request(attempt_id="ATTEMPT-WINDOW-CONSUME-VALID")
+        )
+    source = repository.get_shadowbot_execution_attempt("ATTEMPT-WINDOW-CONSUME-VALID")
+    operation = repository.get_shadowbot_operation(source.operation_id)
+    approval_expiry = datetime.fromisoformat(str(source.raw_output["approval_expires_at"]))
+    retry_window_deadline = min(
+        min(operation.created_at, source.started_at) + timedelta(minutes=5),
+        approval_expiry,
+    )
+    authorization = RetryPolicyService(
+        repository,
+        max_retry_window=timedelta(minutes=5),
+    ).issue_automatic(
+        source_execution_attempt_id=source.execution_attempt_id,
+        evidence=_pre_publish_evidence(source, result_id="EVIDENCE-WINDOW-CONSUME-VALID"),
+        now=retry_window_deadline - timedelta(seconds=10),
+    )
+    with patch(
+        "app.services.shadowbot_executor.utc_now",
+        return_value=retry_window_deadline - timedelta(seconds=1),
+    ):
+        result = ShadowBotExecutor(repository, RecordingRunner()).start_execution(
+            _start_request(
+                attempt_id="ATTEMPT-WINDOW-CONSUME-VALID-RETRY",
+                retry_authorization_id=authorization.retry_authorization_id,
+            )
+        )
+    assert result.status == STATUS_RUNNING
+    assert repository.get_retry_authorization(authorization.retry_authorization_id).status == "CONSUMED"
 
 
 def test_retryable_hint_never_replaces_retry_authorization(tmp_path: Path) -> None:

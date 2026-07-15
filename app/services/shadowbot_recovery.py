@@ -122,7 +122,7 @@ class RetryPolicyService:
     ) -> RetryAuthorization:
         current = _as_retry_aware(now or utc_now(), utc_now())
         attempt, operation = self._load_source(source_execution_attempt_id)
-        self._validate_common(attempt, operation, evidence, current)
+        retry_window_deadline = self._validate_common(attempt, operation, evidence, current)
         if evidence.evidence_type == EVIDENCE_NOT_APPLIED_RESULT:
             self._validate_not_applied(attempt, evidence)
         elif evidence.evidence_type == EVIDENCE_PRE_PUBLISH_NOT_PUBLISHED:
@@ -136,10 +136,13 @@ class RetryPolicyService:
             authorized_by="RetryPolicyService",
             reason="automatic policy authorization from verified retry evidence",
             current=current,
+            retry_window_deadline=retry_window_deadline,
         )
         if not self.repository.issue_retry_authorization(
             authorization,
             allowed_operation_statuses=(OperationStatus.FAILED.value, OperationStatus.NOT_APPLIED.value),
+            retry_window_deadline=retry_window_deadline,
+            max_retry_window_seconds=int(self.max_retry_window.total_seconds()),
         ):
             raise ValidationError("RETRY_AUTHORIZATION_CONFLICT")
         return authorization
@@ -157,7 +160,7 @@ class RetryPolicyService:
             raise ValidationError("MANUAL_RETRY_AUTHORIZATION_REQUIRES_ACTOR_AND_REASON")
         current = _as_retry_aware(now or utc_now(), utc_now())
         attempt, operation = self._load_source(source_execution_attempt_id)
-        self._validate_common(
+        retry_window_deadline = self._validate_common(
             attempt,
             operation,
             evidence,
@@ -178,6 +181,7 @@ class RetryPolicyService:
             authorized_by=actor.strip(),
             reason=reason.strip(),
             current=current,
+            retry_window_deadline=retry_window_deadline,
         )
         if not self.repository.issue_retry_authorization(
             authorization,
@@ -186,6 +190,8 @@ class RetryPolicyService:
                 OperationStatus.NOT_APPLIED.value,
                 OperationStatus.MANUAL_REVIEW.value,
             ),
+            retry_window_deadline=retry_window_deadline,
+            max_retry_window_seconds=int(self.max_retry_window.total_seconds()),
         ):
             raise ValidationError("RETRY_AUTHORIZATION_CONFLICT")
         return authorization
@@ -208,7 +214,7 @@ class RetryPolicyService:
         *,
         allow_manual_review: bool = False,
         allow_frozen_manual: bool = False,
-    ) -> None:
+    ) -> datetime:
         frozen_manual_source = bool(
             allow_frozen_manual
             and attempt.raw_output.get("frozen_reason") == "DUPLICATE_ACTIVE_COMMIT_ATTEMPT"
@@ -279,9 +285,16 @@ class RetryPolicyService:
         retry_origins = [item.started_at for item in commit_attempts]
         if operation.created_at is not None:
             retry_origins.append(operation.created_at)
+        if self.max_retry_window <= timedelta(0):
+            raise ValidationError("RETRY_TOTAL_TIME_WINDOW_INVALID")
         retry_origin = min(_as_retry_aware(value, current) for value in retry_origins)
-        if current > retry_origin + self.max_retry_window:
+        retry_window_deadline = min(
+            retry_origin + self.max_retry_window,
+            source_approval_expiry,
+        )
+        if current > retry_window_deadline:
             raise ValidationError("RETRY_TOTAL_TIME_WINDOW_EXPIRED")
+        return retry_window_deadline
 
     @staticmethod
     def _validate_not_applied(
@@ -339,6 +352,7 @@ class RetryPolicyService:
         authorized_by: str,
         reason: str,
         current: datetime,
+        retry_window_deadline: datetime,
     ) -> RetryAuthorization:
         approval_expires_at = _parse_retry_timestamp(attempt.raw_output.get("approval_expires_at"))
         if approval_expires_at is None:
@@ -357,7 +371,11 @@ class RetryPolicyService:
             approved_payload_hash=evidence.approved_payload_hash,
             status=AUTHORIZATION_ACTIVE,
             max_uses=1,
-            expires_at=min(current + self.authorization_ttl, approval_expires_at),
+            expires_at=min(
+                current + self.authorization_ttl,
+                approval_expires_at,
+                retry_window_deadline,
+            ),
             reason=reason,
             created_at=current,
         )
