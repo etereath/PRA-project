@@ -1,0 +1,19 @@
+include README.md
+include pyproject.toml
+recursive-include app *.py
+
+prune .agents
+prune build
+prune data
+prune doc
+prune docs
+prune dist
+prune pra_mvp.egg-info
+prune scripts
+prune shadowbot
+prune tests
+
+global-exclude *.db
+global-exclude *.sqlite3
+global-exclude *.pyc
+global-exclude __pycache__

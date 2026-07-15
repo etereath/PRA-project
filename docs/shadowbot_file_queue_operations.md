@@ -55,7 +55,7 @@ provider 使用 Python 标准库 `ctypes` 调用 `CredReadW`/`CredFree`，不依
 
 将 `login_credential_target` 仅写入部署机未纳入版本控制的 `shadowbot_worker_config.json`，例如使用组织内部约定的 `ShadowBot/<deployment-target>`（该路径已由仓库精确忽略，示例文件仍纳入版本控制；不要把真实 target 回填到仓库、日志或交接记录）。在同一 Windows 用户上下文中创建 Generic Credential，并按以下步骤验证：
 
-1. 先运行 `python scripts\sync_shadowbot_test2.py --check`，确认 provider 与 Worker 源文件哈希一致；需要同步时运行不带 `--check` 的命令。
+1. 先把 `SHADOWBOT_APP_DIR` 设置为影刀已创建的真实 `xbot_robot` 应用目录，并运行 `python scripts\sync_shadowbot_test2.py --app-dir $env:SHADOWBOT_APP_DIR --check`，确认 provider 与 Worker 源文件哈希一致；需要同步时运行同一目录的不带 `--check` 命令。
 2. 生产部署使用 Windows Credential Manager 图形界面（运行 `control /name Microsoft.CredentialManager`，选择 Windows 凭据并交互填写 Generic Credential）；禁止把密码作为命令行参数传入凭据创建工具。随后启动 Worker；实际 target、用户名和密码不得写入日志或交接记录。
 3. 投递一个脱敏的登录测试请求，确认结果为成功或 `LOGIN_CREDENTIALS_UNAVAILABLE`/`LOGIN_CREDENTIALS_REJECTED` 等稳定登录错误；凭据 provider 失败时，Worker 结果最多保留 allowlist 中的 `provider_error_code`（例如 `CREDENTIAL_NOT_FOUND`），未知异常仍使用安全兜底码。检查请求 JSON、结果、phase、日志和证据目录均不含账号、密码、`CredentialBlob` 或明文 target。
 4. 测试结束后在 Credential Manager 图形界面删除受控测试凭据，并删除部署机上的未跟踪 `shadowbot_worker_config.json` 副本（若不再使用）。
@@ -160,13 +160,15 @@ Watchdog 读取 `heartbeat.json`、phase 或 request 时同样可能遇到 Windo
 只读比较：
 
 ```powershell
-python scripts\sync_shadowbot_test2.py --check
+$env:SHADOWBOT_APP_DIR = "C:\ShadowBot\users\<user>\apps\<app-id>\xbot_robot"
+python scripts\sync_shadowbot_test2.py --app-dir $env:SHADOWBOT_APP_DIR --check
+python scripts\verify_shadowbot_deployment.py --app-dir $env:SHADOWBOT_APP_DIR
 ```
 
 实际同步会先备份影刀应用目录中的旧 Python 文件：
 
 ```powershell
-python scripts\sync_shadowbot_test2.py
+python scripts\sync_shadowbot_test2.py --app-dir $env:SHADOWBOT_APP_DIR
 ```
 
 同步后确认编辑器处于关闭状态，并从影刀“应用”主页面的 `test2` 行内“运行应用”图标直接启动。该路径是外部 Python 同步后的默认测试方式；运行完成后仍需关闭影刀残留运行窗口。

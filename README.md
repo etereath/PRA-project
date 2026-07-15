@@ -30,10 +30,12 @@ PRA 是面向鲜切花预测性销售与多平台执行任务的运行态运营�
 
 ShadowBot 的凭据 provider 位于 `shadowbot/test2/shadowbot_credentials.py`，随仓库提交且只通过 Python 标准库 `ctypes` 按单一 target 调用 Windows Credential Manager 的 `CredReadW`。仓库不保存真实 credential target、账号、密码或 `CredentialBlob`；影刀应用目录中的 `shadowbot_worker_config.json` 必须在部署机本地填写 `login_credential_target`，该路径已由 `.gitignore` 精确保护而示例文件仍可跟踪。生产凭据创建使用 Credential Manager 图形界面，不把密码作为命令行参数传入工具。
 
-部署和验证步骤见 [docs/shadowbot_file_queue_operations.md](docs/shadowbot_file_queue_operations.md)。最小的代码同步检查为：
+部署和验证步骤见 [docs/shadowbot_file_queue_operations.md](docs/shadowbot_file_queue_operations.md)。必须先在影刀中创建或导入 `test2` 应用，再把其真实 `xbot_robot` 目录通过 `--app-dir` 或 `SHADOWBOT_APP_DIR` 显式传入；不再使用开发机默认路径：
 
 ```powershell
-python scripts\sync_shadowbot_test2.py --check
+$env:SHADOWBOT_APP_DIR = "C:\ShadowBot\users\<user>\apps\<app-id>\xbot_robot"
+python scripts\sync_shadowbot_test2.py --app-dir $env:SHADOWBOT_APP_DIR --check
+python scripts\verify_shadowbot_deployment.py --app-dir $env:SHADOWBOT_APP_DIR
 ```
 
 provider 在凭据缺失、权限不足、Credential Manager 不可用或记录格式错误时只返回稳定的非敏感错误码，不把 target、账号、密码或 `CredentialBlob` 写入请求、结果、phase、日志、SQLite、截图或证据目录。登录字段继续使用元素原生输入 API，禁止剪贴板输入。
@@ -47,6 +49,9 @@ provider 在凭据缺失、权限不足、Credential Manager 不可用或记录�
 ```powershell
 pip install -e .
 ```
+
+核心发行物和 ShadowBot 的独立部署步骤见
+[docs/core_wheel_shadowbot_deployment.md](docs/core_wheel_shadowbot_deployment.md)。核心 wheel 只包含 `app*`，不包含 `shadowbot`、`tests`、运行态数据库或部署机配置；安装后可使用 `pra-mvp`（或 `pra`）CLI。
 
 准备本地环境变量：
 
@@ -124,6 +129,12 @@ $env:MOBILE_REVIEW_BASE_URL = "https://你的固定地址.cpolar.cn"
 
 ```powershell
 python -m app.cli init-runtime-db
+```
+
+检查 Runtime Schema v5 健康状态：
+
+```powershell
+pra-mvp health --runtime-db data/runtime/pra_runtime.sqlite3
 ```
 
 生成运行态任务：
