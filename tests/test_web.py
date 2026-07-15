@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import re
 import shutil
 import tempfile
 import unittest
@@ -97,6 +99,23 @@ def _runtime_task(
 class WebTests(unittest.TestCase):
     def setUp(self) -> None:
         _RUNTIME_SESSIONS.clear()
+        self._allowed_dirs_patcher = patch.dict(
+            "os.environ",
+            {
+                "PRA_ALLOWED_DATA_DIRS": os.pathsep.join(
+                    (tempfile.gettempdir(), str(Path.cwd()))
+                )
+            },
+            clear=False,
+        )
+        self._allowed_dirs_patcher.start()
+        self.addCleanup(self._allowed_dirs_patcher.stop)
+
+    def _existing_runtime_db(self, label: str) -> Path:
+        path = Path(tempfile.gettempdir()) / f"pra_{label}_{uuid4().hex}.sqlite3"
+        SQLiteRuntimeRepository(path).init_schema()
+        self.addCleanup(lambda: path.unlink(missing_ok=True))
+        return path
 
     def test_health_ignores_request_runtime_db_path(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -123,10 +142,25 @@ class WebTests(unittest.TestCase):
             self.assertIn("unhealthy", body)
 
     def _runtime_login(self, db_path: Path, *, username: str = "admin", password: str = "secret") -> str:
+        _, login_headers, login_body = self._call_app(
+            path="/runtime/login",
+            query=urlencode({"runtime_db": str(db_path.resolve())}),
+        )
+        login_match = re.search(r'name="csrf_token" value="([^"]+)"', login_body)
+        self.assertIsNotNone(login_match)
+        preauth_cookie = login_headers["Set-Cookie"].split(";", 1)[0]
         status, headers, _ = self._call_app(
             path="/runtime/login",
             method="POST",
-            body=urlencode({"runtime_db": str(db_path), "username": username, "password": password}),
+            cookie=preauth_cookie,
+            body=urlencode(
+                {
+                    "runtime_db": str(db_path.resolve()),
+                    "username": username,
+                    "password": password,
+                    "csrf_token": login_match.group(1),
+                }
+            ),
         )
         self.assertEqual(status, "303 See Other")
         return headers["Set-Cookie"].split(";", 1)[0]
@@ -160,9 +194,28 @@ class WebTests(unittest.TestCase):
             environ["HTTP_COOKIE"] = cookie
         if environ_overrides:
             environ.update(environ_overrides)
+        if (
+            cookie
+            and method.upper() in {"POST", "PUT", "PATCH", "DELETE"}
+            and not path.startswith("/mobile/review/")
+            and path != "/runtime/login"
+            and "csrf_token=" not in body
+        ):
+            session_id = cookie.split("=", 1)[1].split(";", 1)[0]
+            session = _RUNTIME_SESSIONS.get(session_id)
+            csrf_token = str(session.get("csrf_token", "")) if session else ""
+            if csrf_token:
+                body = f"{body}&{urlencode({'csrf_token': csrf_token})}" if body else urlencode(
+                    {"csrf_token": csrf_token}
+                )
+                payload = body.encode("utf-8")
+                environ["CONTENT_LENGTH"] = str(len(payload))
+                environ["wsgi.input"] = io.BytesIO(payload)
         response = application(environ, start_response)
         response_body = b"".join(response).decode("utf-8")
-        headers = {name: value for name, value in captured["headers"]}
+        headers: dict[str, str] = {}
+        for name, value in captured["headers"]:
+            headers.setdefault(name, value)
         return str(captured["status"]), headers, response_body
 
     def test_render_dashboard_page_contains_console_title(self) -> None:
@@ -284,13 +337,7 @@ class WebTests(unittest.TestCase):
                 self.assertEqual(status, "200 OK")
                 self.assertIn("需要先登录", body)
 
-                login_status, login_headers, _ = self._call_app(
-                    path="/runtime/login",
-                    method="POST",
-                    body=urlencode({"runtime_db": str(db_path), "username": "admin", "password": "secret"}),
-                )
-                self.assertEqual(login_status, "303 See Other")
-                cookie = login_headers["Set-Cookie"].split(";", 1)[0]
+                cookie = self._runtime_login(db_path)
 
                 resolve_status, resolve_headers, _ = self._call_app(
                     path="/runtime",
@@ -348,12 +395,7 @@ class WebTests(unittest.TestCase):
                 {"RUNTIME_ADMIN_USER": "admin", "RUNTIME_ADMIN_PASSWORD": "secret"},
                 clear=False,
             ):
-                _, login_headers, _ = self._call_app(
-                    path="/runtime/login",
-                    method="POST",
-                    body=urlencode({"runtime_db": str(db_path), "username": "admin", "password": "secret"}),
-                )
-                cookie = login_headers["Set-Cookie"].split(";", 1)[0]
+                cookie = self._runtime_login(db_path)
                 resolve_body = urlencode(
                     {
                         "action": "resolve_review",
@@ -401,12 +443,7 @@ class WebTests(unittest.TestCase):
                 {"RUNTIME_ADMIN_USER": "admin", "RUNTIME_ADMIN_PASSWORD": "secret"},
                 clear=False,
             ):
-                _, login_headers, _ = self._call_app(
-                    path="/runtime/login",
-                    method="POST",
-                    body=urlencode({"runtime_db": str(db_path), "username": "admin", "password": "secret"}),
-                )
-                cookie = login_headers["Set-Cookie"].split(";", 1)[0]
+                cookie = self._runtime_login(db_path)
                 status, _, body = self._call_app(
                     path="/runtime",
                     method="GET",
@@ -2054,6 +2091,7 @@ class WebTests(unittest.TestCase):
             finally:
                 connection.close()
             missing_db_path = Path(temp_dir) / "missing.sqlite3"
+            missing_db_path.touch()
             with patch.dict(
                 "os.environ",
                 {
@@ -2063,6 +2101,7 @@ class WebTests(unittest.TestCase):
                     "DEV_MODE": "false",
                     "FEISHU_MESSAGE_TYPE": "invalid",
                     "REVIEW_TOKEN_SECRET": "short",
+                    "PRA_ALLOWED_DATA_DIRS": str(Path(temp_dir)),
                 },
                 clear=True,
             ):
@@ -2323,7 +2362,7 @@ class WebTests(unittest.TestCase):
             },
             clear=False,
         ):
-            cookie = self._runtime_login(Path("runtime.sqlite3"))
+            cookie = self._runtime_login(self._existing_runtime_db("legacy"))
             with patch("app.web._WEB_LISTEN_HOST", "127.0.0.1"):
                 for path in ("/", "/tables", "/execution", "/manual-intervention"):
                     with self.subTest(path=path):
@@ -2349,7 +2388,7 @@ class WebTests(unittest.TestCase):
             },
             clear=False,
         ):
-            cookie = self._runtime_login(Path("runtime.sqlite3"))
+            cookie = self._runtime_login(self._existing_runtime_db("legacy"))
 
             # A wildcard startup bind remains public even if request-scoped
             # fields claim that it is loopback-only.
@@ -2412,7 +2451,7 @@ class WebTests(unittest.TestCase):
             },
             clear=False,
         ):
-            cookie = self._runtime_login(Path("runtime.sqlite3"))
+            cookie = self._runtime_login(self._existing_runtime_db("legacy"))
             with patch("app.web._WEB_LISTEN_HOST", "127.0.0.1"):
                 cases = [
                     {"REMOTE_ADDR": "127.0.0.1", "HTTP_X_FORWARDED_FOR": "127.0.0.1"},

@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import json
 import ipaddress
-import logging
+import io
 import os
 import re
 import sqlite3
+from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 from html import escape
+from hmac import compare_digest
 from http.cookies import SimpleCookie
 from pathlib import Path
 from secrets import token_urlsafe
 from socketserver import ThreadingMixIn
+from threading import Lock
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 from uuid import uuid4
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
@@ -28,6 +31,8 @@ from app.repositories.workbook_repository import (
     load_table_records,
     save_table_records,
 )
+from app.path_policy import PathAccessPolicy, PathPolicyError
+from app.services.security import LOGIN_RATE_LIMITER, record_security_event
 from app.services.workflow import (
     ExecutionSimulationInputs,
     ExecutionSimulationSummary,
@@ -171,11 +176,40 @@ MOBILE_RESOLUTION_PAYLOAD_MAX_BYTES = 4096
 PAGE_SIZE = 50
 TERMINAL_TASK_STATUS_VALUES = {"success", "skipped", "cancelled", "expired"}
 _RUNTIME_SESSIONS: dict[str, dict[str, object]] = {}
+LOGIN_CSRF_COOKIE = "pra_login_csrf"
+LOGIN_CSRF_TTL_SECONDS = 600
+LOGIN_CSRF_MAX_CONTEXTS = 4096
+_LOGIN_CSRF_CONTEXTS: dict[str, tuple[str, datetime]] = {}
+_LOGIN_CSRF_LOCK = Lock()
+_RESPONSE_EXTRA_HEADERS: ContextVar[tuple[tuple[str, str], ...]] = ContextVar(
+    "web_response_extra_headers",
+    default=(),
+)
+_PATH_POLICY: PathAccessPolicy | None = None
+_PATH_POLICY_ENV_SNAPSHOT: str | None = None
+_PATH_POLICY_ERROR: PathPolicyError | None = None
+_PATH_POLICY_LOCKED = False
 # The WSGI environ does not expose the address the server socket is bound to.
 # ``serve`` records it here so the legacy safety gate can distinguish a
 # loopback-only listener from a public/non-loopback listener.
 _WEB_LISTEN_HOST: str | None = None
-_LOGGER = logging.getLogger(__name__)
+PATH_POLICY_REQUEST_FIELDS = frozenset({
+    "allowed_data_dirs",
+    "data_root",
+    "runtime_db_root",
+})
+CSRF_PROTECTED_WRITE_PATHS = frozenset({
+    "/",
+    "/tables",
+    "/execution",
+    "/manual-intervention",
+    "/runtime",
+    "/runtime/logout",
+    "/reviews",
+    "/execution-logs",
+    "/business-inputs",
+    "/system/test-feishu-notification",
+})
 LEGACY_WEB_ROUTES = frozenset({"/", "/tables", "/execution", "/manual-intervention"})
 LEGACY_FORWARDING_HEADERS = (
     "HTTP_FORWARDED",
@@ -507,6 +541,9 @@ class ThreadedWSGIServer(ThreadingMixIn, WSGIServer):
 def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
     global _WEB_LISTEN_HOST
     _WEB_LISTEN_HOST = str(host).strip()
+    _configure_path_policy()
+    global _PATH_POLICY_LOCKED
+    _PATH_POLICY_LOCKED = True
     print(f"{UI_TEXT['site_title']} {host}:{port}")
     with make_server(
         host,
@@ -519,8 +556,47 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
 
 
 def application(environ, start_response):
+    response_context = _RESPONSE_EXTRA_HEADERS.set(())
+    try:
+        return _application(environ, start_response)
+    except PathPolicyError as exc:
+        return _respond(
+            start_response,
+            "400 Bad Request",
+            "text/plain; charset=utf-8",
+            exc.public_message,
+        )
+    finally:
+        _RESPONSE_EXTRA_HEADERS.reset(response_context)
+
+
+def _application(environ, start_response):
     method = environ.get("REQUEST_METHOD", "GET").upper()
     path = environ.get("PATH_INFO", "/")
+
+    override_error = _request_path_policy_override(environ)
+    if override_error is not None:
+        return _respond(
+            start_response,
+            "400 Bad Request",
+            "text/plain; charset=utf-8",
+            override_error.public_message,
+        )
+
+    # Logout is an explicit state-changing action.  Reject every method
+    # except POST before the CSRF guard or handler can touch the Session.
+    if path == "/runtime/logout" and method != "POST":
+        return _respond(
+            start_response,
+            "405 Method Not Allowed",
+            "text/plain; charset=utf-8",
+            "Method Not Allowed.",
+        )
+
+    csrf_failure = _csrf_request_guard(method, path, environ)
+    if csrf_failure is not None:
+        status, body, headers = csrf_failure
+        return _respond(start_response, status, "text/plain; charset=utf-8", body, headers=headers)
 
     if path in LEGACY_WEB_ROUTES:
         legacy_guard = _legacy_route_guard(path, environ)
@@ -585,6 +661,13 @@ def application(environ, start_response):
             return _respond(start_response, status, "text/html; charset=utf-8", body, headers=headers)
         return _respond(start_response, "200 OK", "text/html; charset=utf-8", result)
     if path == "/runtime/login":
+        if method not in {"GET", "POST"}:
+            return _respond(
+                start_response,
+                "405 Method Not Allowed",
+                "text/plain; charset=utf-8",
+                "Method Not Allowed.",
+            )
         status, body, headers = _handle_runtime_login(environ)
         return _respond(start_response, status, "text/html; charset=utf-8", body, headers=headers)
     if path == "/runtime/logout":
@@ -599,6 +682,219 @@ def application(environ, start_response):
     return _respond(start_response, "404 Not Found", "text/plain; charset=utf-8", "Not Found")
 
 
+def _configure_path_policy() -> None:
+    global _PATH_POLICY, _PATH_POLICY_ENV_SNAPSHOT, _PATH_POLICY_ERROR
+    _PATH_POLICY_ENV_SNAPSHOT = os.environ.get("PRA_ALLOWED_DATA_DIRS", "<unset>")
+    try:
+        _PATH_POLICY = PathAccessPolicy.from_environment(
+            default_root=ROOT / "data" / "runtime",
+        )
+        _PATH_POLICY_ERROR = None
+    except PathPolicyError as exc:
+        _PATH_POLICY = None
+        _PATH_POLICY_ERROR = exc
+
+
+def _get_path_policy() -> PathAccessPolicy:
+    global _PATH_POLICY_ERROR
+    snapshot = os.environ.get("PRA_ALLOWED_DATA_DIRS", "<unset>")
+    if _PATH_POLICY is None or _PATH_POLICY_ENV_SNAPSHOT != snapshot:
+        if _PATH_POLICY_LOCKED and _PATH_POLICY_ENV_SNAPSHOT != snapshot:
+            raise PathPolicyError("PATH_POLICY_RESTART_REQUIRED", "允许目录配置变更后必须重启服务")
+        _configure_path_policy()
+    if _PATH_POLICY_ERROR is not None:
+        raise _PATH_POLICY_ERROR
+    assert _PATH_POLICY is not None
+    return _PATH_POLICY
+
+
+def _resolve_web_path(
+    raw_path: str | os.PathLike[str],
+    *,
+    purpose: str,
+    allow_create: bool = False,
+) -> Path:
+    try:
+        return _get_path_policy().resolve(raw_path, purpose=purpose, allow_create=allow_create)
+    except PathPolicyError as exc:
+        record_security_event(
+            "WEB_PATH_REJECTED",
+            route="/web-path",
+            outcome="rejected",
+            reason_code=exc.code,
+        )
+        raise
+
+
+def _read_request_body_preserving(environ) -> bytes:
+    if environ.get("REQUEST_METHOD", "GET").upper() not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return b""
+    try:
+        size = int(environ.get("CONTENT_LENGTH") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    stream = environ.get("wsgi.input")
+    if stream is None:
+        raw = b""
+    else:
+        raw = stream.read(size)
+    environ["wsgi.input"] = io.BytesIO(raw)
+    return raw
+
+
+def _request_path_policy_override(environ) -> PathPolicyError | None:
+    query_keys = set(_parse_query(environ))
+    if query_keys & PATH_POLICY_REQUEST_FIELDS:
+        return PathPolicyError(
+            "PATH_CONFIG_FROM_REQUEST",
+            "允许目录只能来自服务端部署配置",
+        )
+    raw_body = _read_request_body_preserving(environ)
+    if not raw_body:
+        return None
+    content_type = str(environ.get("CONTENT_TYPE", "")).lower()
+    body_keys: set[str] = set()
+    if "json" in content_type:
+        try:
+            loaded = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            loaded = None
+        if isinstance(loaded, dict):
+            body_keys = set(loaded)
+    else:
+        try:
+            body_keys = set(parse_qs(raw_body.decode("utf-8"), keep_blank_values=True))
+        except UnicodeDecodeError:
+            return PathPolicyError("PATH_BODY_ENCODING", "请求体编码无效")
+    if body_keys & PATH_POLICY_REQUEST_FIELDS:
+        return PathPolicyError(
+            "PATH_CONFIG_FROM_REQUEST",
+            "允许目录只能来自服务端部署配置",
+        )
+    return None
+
+
+def _csrf_token_from_request(environ, raw_body: bytes) -> str:
+    header_token = str(environ.get("HTTP_X_CSRF_TOKEN", "")).strip()
+    if header_token:
+        return header_token
+    content_type = str(environ.get("CONTENT_TYPE", "")).lower()
+    if "json" in content_type:
+        try:
+            loaded = json.loads(raw_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return ""
+        return str(loaded.get("csrf_token", "")).strip() if isinstance(loaded, dict) else ""
+    parsed = parse_qs(raw_body.decode("utf-8"), keep_blank_values=True) if raw_body else {}
+    return _first(parsed, "csrf_token", "").strip()
+
+
+def _queue_response_header(name: str, value: str) -> None:
+    current = _RESPONSE_EXTRA_HEADERS.get()
+    _RESPONSE_EXTRA_HEADERS.set((*current, (name, value)))
+
+
+def _cleanup_login_csrf_contexts(now: datetime | None = None) -> None:
+    current = now or datetime.now(timezone.utc)
+    expired = [
+        context_id
+        for context_id, (_, expires_at) in _LOGIN_CSRF_CONTEXTS.items()
+        if expires_at <= current
+    ]
+    for context_id in expired:
+        _LOGIN_CSRF_CONTEXTS.pop(context_id, None)
+
+
+def _issue_login_csrf_token() -> str:
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(seconds=LOGIN_CSRF_TTL_SECONDS)
+    context_id = token_urlsafe(24)
+    token = token_urlsafe(32)
+    with _LOGIN_CSRF_LOCK:
+        _cleanup_login_csrf_contexts(now)
+        while len(_LOGIN_CSRF_CONTEXTS) >= LOGIN_CSRF_MAX_CONTEXTS:
+            oldest_context_id = min(
+                _LOGIN_CSRF_CONTEXTS,
+                key=lambda item: _LOGIN_CSRF_CONTEXTS[item][1],
+            )
+            _LOGIN_CSRF_CONTEXTS.pop(oldest_context_id, None)
+        _LOGIN_CSRF_CONTEXTS[context_id] = (token, expires_at)
+
+    cookie = SimpleCookie()
+    cookie[LOGIN_CSRF_COOKIE] = context_id
+    cookie[LOGIN_CSRF_COOKIE]["path"] = "/runtime/login"
+    cookie[LOGIN_CSRF_COOKIE]["httponly"] = True
+    cookie[LOGIN_CSRF_COOKIE]["samesite"] = "Lax"
+    cookie[LOGIN_CSRF_COOKIE]["max-age"] = str(LOGIN_CSRF_TTL_SECONDS)
+    if _secure_cookie_enabled():
+        cookie[LOGIN_CSRF_COOKIE]["secure"] = True
+    _queue_response_header("Set-Cookie", cookie.output(header="").strip())
+    return token
+
+
+def _consume_login_csrf_token(environ, token: str) -> bool:
+    if not token:
+        return False
+    cookie = SimpleCookie()
+    cookie.load(environ.get("HTTP_COOKIE", ""))
+    context_cookie = cookie.get(LOGIN_CSRF_COOKIE)
+    if context_cookie is None:
+        return False
+    context_id = context_cookie.value
+    now = datetime.now(timezone.utc)
+    with _LOGIN_CSRF_LOCK:
+        context = _LOGIN_CSRF_CONTEXTS.get(context_id)
+        if context is None:
+            return False
+        expected_token, expires_at = context
+        if expires_at <= now:
+            _LOGIN_CSRF_CONTEXTS.pop(context_id, None)
+            return False
+        if not compare_digest(expected_token, token):
+            return False
+        _LOGIN_CSRF_CONTEXTS.pop(context_id, None)
+        return True
+
+
+def _csrf_failure_response() -> tuple[str, str, list[tuple[str, str]]]:
+    return "403 Forbidden", "CSRF validation failed (CSRF_REJECTED).", []
+
+
+def _csrf_request_guard(method: str, path: str, environ):
+    if method not in {"POST", "PUT", "PATCH", "DELETE"} or path.startswith("/mobile/review/"):
+        return None
+    if path == "/runtime/login" and method != "POST":
+        return None
+    raw_body = _read_request_body_preserving(environ)
+    if path == "/runtime/login":
+        if _consume_login_csrf_token(environ, _csrf_token_from_request(environ, raw_body)):
+            return None
+        record_security_event(
+            "CSRF_REJECTED",
+            route="/runtime/login",
+            outcome="rejected",
+            reason_code="LOGIN_CSRF_INVALID",
+        )
+        return _csrf_failure_response()
+    if path not in CSRF_PROTECTED_WRITE_PATHS:
+        return None
+    session = _get_runtime_session(environ)
+    if session is None:
+        return None
+    expected = str(session.get("csrf_token", ""))
+    provided = _csrf_token_from_request(environ, raw_body)
+    if expected and provided and compare_digest(expected, provided):
+        return None
+    record_security_event(
+        "CSRF_REJECTED",
+        route=path,
+        outcome="rejected",
+        reason_code="SESSION_CSRF_INVALID",
+        subject=str(session.get("user", "")),
+    )
+    return _csrf_failure_response()
+
+
 def _legacy_route_guard(path: str, environ) -> tuple[str, str, list[tuple[str, str]]] | None:
     """Apply the fail-closed legacy access policy before dispatching a handler.
 
@@ -609,6 +905,13 @@ def _legacy_route_guard(path: str, environ) -> tuple[str, str, list[tuple[str, s
 
     denial_reason = _legacy_route_denial_reason(environ)
     if denial_reason is not None:
+        record_security_event(
+            "LEGACY_ACCESS_REJECTED",
+            route=path,
+            outcome="rejected",
+            reason_code="LEGACY_POLICY_DENIED",
+            subject=str(environ.get("REMOTE_ADDR", "")),
+        )
         return (
             "403 Forbidden",
             f"{UI_TEXT['legacy_web_disabled']} {denial_reason}",
@@ -643,10 +946,6 @@ def _legacy_route_denial_reason(environ) -> str | None:
         if header in environ
     ]
     if forwarding_headers:
-        _LOGGER.warning(
-            "legacy route rejected: forwarding headers present in direct_loopback mode: %s",
-            ", ".join(forwarding_headers),
-        )
         return "direct_loopback 模式检测到未经验证的转发头，已拒绝访问。"
 
     listen_host = _legacy_listen_host(environ)
@@ -699,11 +998,23 @@ def _handle_dashboard(method: str, environ) -> str:
         action = _first(parsed, "action", "validate")
 
         try:
+            products_path = _resolve_request_or_trusted_default(
+                params["products"], DEFAULT_PRODUCTS, purpose="products", allow_create=False
+            )
+            price_rules_path = _resolve_request_or_trusted_default(
+                params["price_rules"], DEFAULT_PRICE_RULES, purpose="price_rules", allow_create=False
+            )
+            listing_rules_path = _resolve_request_or_trusted_default(
+                params["listing_rules"], DEFAULT_LISTING_RULES, purpose="listing_rules", allow_create=False
+            )
+            output_path = _resolve_request_or_trusted_default(
+                params["output"], DEFAULT_OUTPUT, purpose="task_output", allow_create=True
+            )
             workflow_inputs = WorkflowInputs(
-                products_path=Path(str(params["products"])),
-                price_rules_path=Path(str(params["price_rules"])),
-                listing_rules_path=Path(str(params["listing_rules"])),
-                output_path=Path(str(params["output"])),
+                products_path=products_path,
+                price_rules_path=price_rules_path,
+                listing_rules_path=listing_rules_path,
+                output_path=output_path,
                 platform_name=str(params["platform"]),
                 inventory_strategy=str(params["inventory_strategy"]),
                 use_mock_ai=bool(params["use_mock_ai"]),
@@ -726,6 +1037,10 @@ def _handle_dashboard(method: str, environ) -> str:
                     path=generation_summary.output_path,
                 )
                 level = "success"
+        except PathPolicyError as exc:
+            _redact_rejected_path_values(params, "products", "price_rules", "listing_rules", "output")
+            message = exc.public_message
+            level = "error"
         except (ValidationError, FileNotFoundError) as exc:
             message = str(exc)
             level = "error"
@@ -759,7 +1074,13 @@ def _handle_tables(method: str, environ) -> str:
         headers = get_table_headers(table_name)
 
         try:
-            table_path = Path(str(params["table_path"]))
+            table_path = _resolve_request_or_trusted_default(
+                params["table_path"],
+                Path(TABLE_OPTIONS[table_name]["path"]),
+                purpose=f"table:{table_name}",
+                allow_create=action == "save",
+            )
+            params["table_path"] = str(table_path)
             if action == "save":
                 records = _extract_table_rows(parsed, headers)
                 save_table_records(table_name, table_path, records)
@@ -770,6 +1091,10 @@ def _handle_tables(method: str, environ) -> str:
             if action == "load" and not message:
                 message = UI_TEXT["loaded_rows"].format(count=len(records))
                 level = "success"
+        except PathPolicyError as exc:
+            _redact_rejected_path_values(params, "table_path")
+            message = exc.public_message
+            level = "error"
         except TableValidationError as exc:
             message = UI_TEXT["table_validation_summary"]
             level = "error"
@@ -784,7 +1109,20 @@ def _handle_tables(method: str, environ) -> str:
     else:
         headers = get_table_headers(str(params["table_name"]))
         try:
-            records = load_table_records(str(params["table_name"]), Path(str(params["table_path"])))
+            table_default = Path(TABLE_OPTIONS[str(params["table_name"])]["path"])
+            table_path = _resolve_request_or_trusted_default(
+                params["table_path"],
+                table_default,
+                purpose=f"table:{params['table_name']}",
+                allow_create=False,
+            )
+            params["table_path"] = str(table_path)
+            records = load_table_records(str(params["table_name"]), table_path)
+        except PathPolicyError as exc:
+            _redact_rejected_path_values(params, "table_path")
+            message = exc.public_message
+            level = "error"
+            records = []
         except (ValidationError, FileNotFoundError):
             records = []
 
@@ -814,18 +1152,36 @@ def _handle_execution(method: str, environ) -> str:
             "executor_name": _first(parsed, "executor_name", params["executor_name"]),
         }
         try:
+            tasks_path = _resolve_request_or_trusted_default(
+                params["tasks_path"], DEFAULT_OUTPUT, purpose="execution_tasks", allow_create=False
+            )
+            logs_output_path = _resolve_request_or_trusted_default(
+                params["logs_output"], DEFAULT_EXECUTION_LOGS, purpose="execution_logs", allow_create=True
+            )
+            updated_tasks_output_path = (
+                _resolve_request_or_trusted_default(
+                    params["updated_tasks_output"],
+                    DEFAULT_EXECUTED_TASKS,
+                    purpose="execution_updated_tasks",
+                    allow_create=True,
+                )
+                if str(params["updated_tasks_output"]).strip()
+                else None
+            )
             execution_summary = simulate_execution_from_tasks(
                 ExecutionSimulationInputs(
-                    tasks_path=Path(str(params["tasks_path"])),
-                    logs_output_path=Path(str(params["logs_output"])),
-                    updated_tasks_output_path=Path(str(params["updated_tasks_output"]))
-                    if str(params["updated_tasks_output"]).strip()
-                    else None,
+                    tasks_path=tasks_path,
+                    logs_output_path=logs_output_path,
+                    updated_tasks_output_path=updated_tasks_output_path,
                     executor_name=str(params["executor_name"]),
                 )
             )
             message = UI_TEXT["execution_done"].format(count=len(execution_summary.tasks))
             level = "success"
+        except PathPolicyError as exc:
+            _redact_rejected_path_values(params, "tasks_path", "logs_output", "updated_tasks_output")
+            message = exc.public_message
+            level = "error"
         except (ValidationError, FileNotFoundError) as exc:
             message = str(exc)
             level = "error"
@@ -853,13 +1209,23 @@ def _handle_manual_intervention(method: str, environ) -> str:
             "note": _first(parsed, "note", ""),
         }
         try:
-            tasks = list_manual_intervention_tasks(Path(str(params["tasks_path"])))
+            tasks_path = _resolve_request_or_trusted_default(
+                params["tasks_path"], DEFAULT_MANUAL_TASKS, purpose="manual_tasks", allow_create=False
+            )
+            _resolve_request_or_trusted_default(
+                params["output_path"], DEFAULT_MANUAL_TASKS, purpose="manual_output", allow_create=True
+            )
+            tasks = list_manual_intervention_tasks(tasks_path)
             if _first(parsed, "action", "load") == "resolve":
                 message = "旧 Excel 人工介入入口已弃用，不能再执行正式处理。请改用 SQLite review_tasks 或 /runtime 入口。"
                 level = "error"
             elif not tasks:
                 message = UI_TEXT["manual_empty"]
                 level = "info"
+        except PathPolicyError as exc:
+            _redact_rejected_path_values(params, "tasks_path", "output_path")
+            message = exc.public_message
+            level = "error"
         except (ValidationError, FileNotFoundError) as exc:
             message = str(exc)
             level = "error"
@@ -890,6 +1256,13 @@ def _handle_mobile_review(method: str, path: str, environ) -> str | tuple[str, s
                 raw_token=token,
             )
         except (ValidationError, FileNotFoundError):
+            record_security_event(
+                "MOBILE_REVIEW_TOKEN_REJECTED",
+                route="/mobile/review",
+                outcome="rejected",
+                reason_code="TOKEN_INVALID",
+                subject=review_task_id,
+            )
             return render_mobile_review_error_page(UI_TEXT["mobile_review_invalid"])
 
     if method == "POST" and is_resolve:
@@ -909,12 +1282,26 @@ def _handle_mobile_review(method: str, path: str, environ) -> str | tuple[str, s
                 note=note,
                 resolution_payload=resolution_payload,
             )
+            record_security_event(
+                "MOBILE_REVIEW_TOKEN_CONSUMED",
+                route="/mobile/review",
+                outcome="accepted",
+                reason_code="TOKEN_CONSUMED",
+                subject=review_task_id,
+            )
             return _redirect_response(
                 f"/mobile/review/{review_task_id}?{urlencode({'resolved': '1'})}"
             )
         except MobileReviewTransactionError as exc:
             return _mobile_review_error_response(exc)
         except ValidationError as exc:
+            record_security_event(
+                "MOBILE_REVIEW_TOKEN_REJECTED",
+                route="/mobile/review",
+                outcome="rejected",
+                reason_code="TOKEN_OR_PAYLOAD_INVALID",
+                subject=review_task_id,
+            )
             message = (
                 str(exc)
                 if str(exc) not in {UI_TEXT["mobile_review_invalid"], "链接已失效或无权访问该复核任务"}
@@ -945,7 +1332,7 @@ def _parse_mobile_review_path(path: str) -> tuple[str, bool] | None:
 def _handle_runtime(method: str, environ) -> str | tuple[str, str, list[tuple[str, str]]]:
     params = default_runtime_state()
     query = _parse_query(environ)
-    params["runtime_db"] = _first(query, "runtime_db", params["runtime_db"])
+    params["runtime_db"] = _runtime_db_for_request(environ)
     params["review_task_id"] = _first(query, "review_task_id", "")
     params["task_id"] = _first(query, "task_id", "")
     params["notification_id"] = _first(query, "notification_id", "")
@@ -978,7 +1365,12 @@ def _handle_runtime(method: str, environ) -> str | tuple[str, str, list[tuple[st
                 )
             )
         parsed = _parse_body(environ)
-        params["runtime_db"] = _first(parsed, "runtime_db", params["runtime_db"])
+        params["runtime_db"] = str(_resolve_request_or_trusted_default(
+            _first(parsed, "runtime_db", params["runtime_db"]),
+            Path(DEFAULT_RUNTIME_DB),
+            purpose="runtime_db",
+            allow_create=False,
+        ))
         params["review_task_id"] = _first(parsed, "review_task_id", params["review_task_id"])
         params["task_id"] = _first(parsed, "task_id", params["task_id"])
         params["notification_id"] = _first(parsed, "notification_id", params["notification_id"])
@@ -1109,9 +1501,52 @@ def _handle_runtime(method: str, environ) -> str | tuple[str, str, list[tuple[st
 
 
 def _handle_runtime_login(environ) -> tuple[str, str, list[tuple[str, str]]]:
-    parsed = _parse_body(environ)
+    method = environ.get("REQUEST_METHOD", "GET").upper()
     query = _parse_query(environ)
-    runtime_db = _first(parsed, "runtime_db", _first(query, "runtime_db", str(DEFAULT_RUNTIME_DB)))
+    if method == "GET":
+        runtime_db_value = _first(query, "runtime_db", "")
+        runtime_db = str(_resolve_request_or_trusted_default(
+            runtime_db_value,
+            Path(DEFAULT_RUNTIME_DB),
+            purpose="runtime_db",
+            allow_create=False,
+        ))
+        login_csrf_token = _issue_login_csrf_token()
+        body = render_runtime_page(
+            params={
+                "runtime_db": runtime_db,
+                "review_task_id": "",
+                "task_id": "",
+                "notification_id": "",
+                "task_trade_date": "",
+                "task_status": "",
+                "review_trade_date": "",
+                "review_status": "",
+                "notification_related_review_task_id": "",
+                "notification_send_status": "",
+            },
+            message="",
+            message_level="info",
+            tasks=[],
+            reviews=[],
+            notifications=[],
+            session_user=None,
+            selected_review=None,
+            selected_task=None,
+            selected_notification=None,
+            task_history=[],
+            login_csrf_token=login_csrf_token,
+        )
+        return "200 OK", body, []
+
+    parsed = _parse_body(environ)
+    runtime_db_value = _first(parsed, "runtime_db", _first(query, "runtime_db", ""))
+    runtime_db = str(_resolve_request_or_trusted_default(
+        runtime_db_value,
+        Path(DEFAULT_RUNTIME_DB),
+        purpose="runtime_db",
+        allow_create=False,
+    ))
     next_path = _safe_internal_path(_first(parsed, "next", _first(query, "next", "")))
     username = _first(parsed, "username", _runtime_admin_user()).strip() or _runtime_admin_user()
     password = _first(parsed, "password", "")
@@ -1120,22 +1555,81 @@ def _handle_runtime_login(environ) -> tuple[str, str, list[tuple[str, str]]]:
         redirect_target = _append_query_to_path(next_path, {"runtime_db": runtime_db})
 
     expected_password = os.getenv("RUNTIME_ADMIN_PASSWORD", "")
+    remote_addr = str(environ.get("REMOTE_ADDR", ""))
+    if LOGIN_RATE_LIMITER.is_blocked(username, remote_addr):
+        record_security_event(
+            "LOGIN_RATE_LIMITED",
+            route="/runtime/login",
+            outcome="rejected",
+            reason_code="RATE_LIMITED",
+            subject=username,
+        )
+        return _runtime_login_error_response(
+            runtime_db,
+            "登录尝试过于频繁，请稍后再试（RATE_LIMITED）。",
+            status="429 Too Many Requests",
+        )
     if expected_password and username == _runtime_admin_user() and password == expected_password:
+        LOGIN_RATE_LIMITER.record_success(username, remote_addr)
+        record_security_event(
+            "LOGIN_SUCCESS",
+            route="/runtime/login",
+            outcome="accepted",
+            reason_code="PASSWORD_MATCH",
+            subject=username,
+        )
         return _redirect_response(
             redirect_target,
-            headers=_session_cookie_headers(_runtime_admin_user(), runtime_db=runtime_db),
+            headers=_session_cookie_headers(_runtime_admin_user(), runtime_db=runtime_db, environ=environ),
         )
     if _dev_mode():
         shared_password = os.getenv("RUNTIME_DEV_SHARED_PASSWORD", "")
         if shared_password and password == shared_password:
+            LOGIN_RATE_LIMITER.record_success(username, remote_addr)
+            record_security_event(
+                "LOGIN_SUCCESS",
+                route="/runtime/login",
+                outcome="accepted",
+                reason_code="DEV_PASSWORD_MATCH",
+                subject=username,
+            )
             return _redirect_response(
                 redirect_target,
-                headers=_session_cookie_headers("dev_shared_user", runtime_db=runtime_db),
+                headers=_session_cookie_headers("dev_shared_user", runtime_db=runtime_db, environ=environ),
             )
 
     message = "登录失败：账号或密码不正确。"
     if not expected_password and not (_dev_mode() and os.getenv("RUNTIME_DEV_SHARED_PASSWORD", "")):
         message = "尚未配置 RUNTIME_ADMIN_PASSWORD，无法进行运行态复核登录。"
+    blocked = LOGIN_RATE_LIMITER.record_failure(username, remote_addr)
+    record_security_event(
+        "LOGIN_FAILED",
+        route="/runtime/login",
+        outcome="rejected",
+        reason_code="PASSWORD_NOT_CONFIGURED" if not expected_password else "INVALID_CREDENTIALS",
+        subject=username,
+    )
+    status = "200 OK"
+    if blocked:
+        record_security_event(
+            "LOGIN_RATE_LIMITED",
+            route="/runtime/login",
+            outcome="rejected",
+            reason_code="RATE_LIMITED",
+            subject=username,
+        )
+        message = "登录尝试过于频繁，请稍后再试（RATE_LIMITED）。"
+        status = "429 Too Many Requests"
+    return _runtime_login_error_response(runtime_db, message, status=status)
+
+
+def _runtime_login_error_response(
+    runtime_db: str,
+    message: str,
+    *,
+    status: str = "200 OK",
+) -> tuple[str, str, list[tuple[str, str]]]:
+    login_csrf_token = _issue_login_csrf_token()
     body = render_runtime_page(
         params={
             "runtime_db": runtime_db,
@@ -1159,19 +1653,38 @@ def _handle_runtime_login(environ) -> tuple[str, str, list[tuple[str, str]]]:
         selected_task=None,
         selected_notification=None,
         task_history=[],
+        login_csrf_token=login_csrf_token,
     )
-    return ("200 OK", body, [])
+    return (status, body, [])
 
 
 def _handle_runtime_logout(environ) -> tuple[str, str, list[tuple[str, str]]]:
     parsed = _parse_body(environ)
-    runtime_db = _first(parsed, "runtime_db", str(DEFAULT_RUNTIME_DB))
+    runtime_db_value = _first(parsed, "runtime_db", "")
+    runtime_db = str(_resolve_request_or_trusted_default(
+        runtime_db_value,
+        Path(DEFAULT_RUNTIME_DB),
+        purpose="runtime_db",
+        allow_create=False,
+    ))
     next_path = _safe_internal_path(_first(parsed, "next", ""))
     cookie = SimpleCookie()
     cookie.load(environ.get("HTTP_COOKIE", ""))
+    login_csrf_cookie = cookie.get(LOGIN_CSRF_COOKIE)
+    if login_csrf_cookie is not None:
+        with _LOGIN_CSRF_LOCK:
+            _LOGIN_CSRF_CONTEXTS.pop(login_csrf_cookie.value, None)
     session_cookie = cookie.get(RUNTIME_SESSION_COOKIE)
     if session_cookie is not None:
-        _RUNTIME_SESSIONS.pop(session_cookie.value, None)
+        session = _RUNTIME_SESSIONS.pop(session_cookie.value, None)
+        if session is not None:
+            record_security_event(
+                "SESSION_LOGOUT",
+                route="/runtime/logout",
+                outcome="accepted",
+                reason_code="EXPLICIT_LOGOUT",
+                subject=str(session.get("user", "")),
+            )
     return _redirect_response(
         _append_query_to_path(
             next_path or "/runtime",
@@ -1238,10 +1751,18 @@ def _handle_tasks_page(environ) -> str:
             message=UI_TEXT["ops_login_required"],
         )
     if task_tab == "mock_platform":
-        mock_platform_db = _first(query, "mock_platform_db", str(DEFAULT_MOCK_PLATFORM_DB)) or str(DEFAULT_MOCK_PLATFORM_DB)
+        mock_platform_db_value = _first(query, "mock_platform_db", "")
         platform_filter = _first(query, "platform", "")
         sku_filter = _first(query, "internal_sku", "")
-        mock_platform_path = Path(mock_platform_db)
+        mock_platform_path = (
+            _resolve_web_path(mock_platform_db_value, purpose="mock_platform_db", allow_create=False)
+            if mock_platform_db_value.strip()
+            else _resolve_web_path(
+                _trusted_project_path(DEFAULT_MOCK_PLATFORM_DB),
+                purpose="mock_platform_db",
+                allow_create=False,
+            )
+        )
         states = []
         if mock_platform_path.exists():
             try:
@@ -1263,16 +1784,30 @@ def _handle_tasks_page(environ) -> str:
         )
     if task_tab == "automation":
         db_path = Path(runtime_db)
-        repository = SQLiteRuntimeRepository(db_path)
-        repository.init_schema()
-        script_runs = repository.list_script_runs(limit=200)
         selected_script_run_id = _first(query, "script_run_id", "")
-        selected_script_run = repository.get_script_run(selected_script_run_id) if selected_script_run_id else None
-        script_run_items = (
-            repository.list_script_run_items(selected_script_run.script_run_id)
-            if selected_script_run is not None
-            else []
-        )
+        if not db_path.exists():
+            empty_runs, pagination = _paginate_items([], page)
+            return render_tasks_automation_page(
+                runtime_db=runtime_db,
+                session_user=session_user,
+                script_runs=empty_runs,
+                pagination=pagination,
+                selected_script_run=None,
+                script_run_items=[],
+            )
+        repository = SQLiteRuntimeRepository(db_path)
+        try:
+            script_runs = repository.list_script_runs(limit=200)
+            selected_script_run = repository.get_script_run(selected_script_run_id) if selected_script_run_id else None
+            script_run_items = (
+                repository.list_script_run_items(selected_script_run.script_run_id)
+                if selected_script_run is not None
+                else []
+            )
+        except sqlite3.Error:
+            script_runs = []
+            selected_script_run = None
+            script_run_items = []
         paged_script_runs, pagination = _paginate_items(script_runs, page)
         return render_tasks_automation_page(
             runtime_db=runtime_db,
@@ -1621,12 +2156,12 @@ def _handle_execution_logs_page(method: str, environ) -> str | tuple[str, str, l
 def _handle_business_inputs_page(method: str, environ) -> str | tuple[str, str, list[tuple[str, str]]]:
     query = _parse_query(environ)
     runtime_db = _runtime_db_for_request(environ)
-    products_path = _first(query, "products_path", str(DEFAULT_PRODUCTS))
-    price_rules_path = _first(query, "price_rules_path", str(DEFAULT_PRICE_RULES))
-    listing_rules_path = _first(query, "listing_rules_path", str(DEFAULT_LISTING_RULES))
-    capacity_plans_path = _first(query, "capacity_plans_path", str(DEFAULT_CAPACITY_PLANS))
-    cold_storage_status_path = _first(query, "cold_storage_status_path", str(DEFAULT_COLD_STORAGE_STATUS))
-    platform_mappings_path = _first(query, "platform_mappings_path", str(DEFAULT_PLATFORM_MAPPINGS))
+    products_path = _request_or_default_path(query, "products_path", DEFAULT_PRODUCTS, purpose="products", allow_create=True)
+    price_rules_path = _request_or_default_path(query, "price_rules_path", DEFAULT_PRICE_RULES, purpose="price_rules", allow_create=True)
+    listing_rules_path = _request_or_default_path(query, "listing_rules_path", DEFAULT_LISTING_RULES, purpose="listing_rules", allow_create=True)
+    capacity_plans_path = _request_or_default_path(query, "capacity_plans_path", DEFAULT_CAPACITY_PLANS, purpose="capacity_plans", allow_create=True)
+    cold_storage_status_path = _request_or_default_path(query, "cold_storage_status_path", DEFAULT_COLD_STORAGE_STATUS, purpose="cold_storage_status", allow_create=True)
+    platform_mappings_path = _request_or_default_path(query, "platform_mappings_path", DEFAULT_PLATFORM_MAPPINGS, purpose="platform_mappings", allow_create=True)
     active_input_tab = _normalize_business_input_tab(_first(query, "input_tab", "inventory"))
     message = _first(query, "message", "")
     level = _first(query, "level", "info" if message else "info")
@@ -1654,12 +2189,24 @@ def _handle_business_inputs_page(method: str, environ) -> str | tuple[str, str, 
         )
     if method == "POST":
         parsed = _parse_body(environ)
-        products_path = _first(parsed, "products_path", products_path)
-        price_rules_path = _first(parsed, "price_rules_path", price_rules_path)
-        listing_rules_path = _first(parsed, "listing_rules_path", listing_rules_path)
-        capacity_plans_path = _first(parsed, "capacity_plans_path", capacity_plans_path)
-        cold_storage_status_path = _first(parsed, "cold_storage_status_path", cold_storage_status_path)
-        platform_mappings_path = _first(parsed, "platform_mappings_path", platform_mappings_path)
+        products_path = str(_resolve_web_path(
+            _first(parsed, "products_path", products_path), purpose="products", allow_create=True
+        ))
+        price_rules_path = str(_resolve_web_path(
+            _first(parsed, "price_rules_path", price_rules_path), purpose="price_rules", allow_create=True
+        ))
+        listing_rules_path = str(_resolve_web_path(
+            _first(parsed, "listing_rules_path", listing_rules_path), purpose="listing_rules", allow_create=True
+        ))
+        capacity_plans_path = str(_resolve_web_path(
+            _first(parsed, "capacity_plans_path", capacity_plans_path), purpose="capacity_plans", allow_create=True
+        ))
+        cold_storage_status_path = str(_resolve_web_path(
+            _first(parsed, "cold_storage_status_path", cold_storage_status_path), purpose="cold_storage_status", allow_create=True
+        ))
+        platform_mappings_path = str(_resolve_web_path(
+            _first(parsed, "platform_mappings_path", platform_mappings_path), purpose="platform_mappings", allow_create=True
+        ))
         active_input_tab = _normalize_business_input_tab(_first(parsed, "input_tab", active_input_tab))
         action = _first(parsed, "action", "")
         try:
@@ -1822,6 +2369,11 @@ def _handle_business_inputs_page(method: str, environ) -> str | tuple[str, str, 
                     },
                 )
             )
+        except PathPolicyError as exc:
+            products_path = price_rules_path = listing_rules_path = "[路径已拒绝]"
+            capacity_plans_path = cold_storage_status_path = platform_mappings_path = "[路径已拒绝]"
+            message = exc.public_message
+            level = "error"
         except (
             ProductInventoryInputError,
             PriceRuleInputError,
@@ -1894,7 +2446,6 @@ def _handle_business_inputs_page(method: str, environ) -> str | tuple[str, str, 
 def _load_platform_rows_for_business_inputs(platform_mappings_path: str) -> tuple[list[dict[str, object]], str]:
     try:
         platform_path = Path(platform_mappings_path)
-        ensure_platform_mappings_workbook(platform_path)
         platform_rows = load_platform_mapping_rows(platform_path)
     except (ValidationError, FileNotFoundError) as exc:
         return [], f"平台映射表读取失败，页面已使用默认平台列表。原因：{exc}"
@@ -2886,13 +3437,16 @@ def render_runtime_page(
     selected_task,
     selected_notification,
     task_history,
+    login_csrf_token: str | None = None,
 ) -> str:
     if session_user is None:
+        login_csrf_token = login_csrf_token or _issue_login_csrf_token()
         login_panel = f"""
     <section class="panel">
       <h2>{escape(UI_TEXT["runtime_login_title"])}</h2>
       <form method="post" action="/runtime/login" class="grid two-col">
         <input type="hidden" name="runtime_db" value="{escape(params["runtime_db"])}">
+        <input type="hidden" name="csrf_token" value="{escape(login_csrf_token)}">
         <div class="field">
           <label for="runtime_username">{escape(UI_TEXT["runtime_login_user"])}</label>
           <input id="runtime_username" name="username" type="text" value="{escape(_runtime_admin_user())}">
@@ -5186,12 +5740,14 @@ def _render_login_required_page(
     next_path: str,
     message: str,
 ) -> str:
+    login_csrf_token = _issue_login_csrf_token()
     login_panel = f"""
     <section class="panel">
       <h2>{escape(UI_TEXT["runtime_login_title"])}</h2>
       <form method="post" action="/runtime/login" class="grid two-col">
         <input type="hidden" name="runtime_db" value="{escape(runtime_db)}">
         <input type="hidden" name="next" value="{escape(next_path)}">
+        <input type="hidden" name="csrf_token" value="{escape(login_csrf_token)}">
         <div class="field">
           <label for="runtime_username">{escape(UI_TEXT["runtime_login_user"])}</label>
           <input id="runtime_username" name="username" type="text" value="{escape(_runtime_admin_user())}">
@@ -7663,6 +8219,25 @@ def common_styles() -> str:
       }
     }
   </style>
+  <script>
+    document.addEventListener("DOMContentLoaded", () => {
+      const cookie = document.cookie.split("; ").find((item) => item.startsWith("pra_runtime_csrf="));
+      if (!cookie) return;
+      const token = decodeURIComponent(cookie.substring("pra_runtime_csrf=".length));
+      document.querySelectorAll("form[method='post']").forEach((form) => {
+        const action = form.getAttribute("action") || window.location.pathname;
+        if (action === "/runtime/login" || action.startsWith("/mobile/review/")) return;
+        let input = form.querySelector("input[name='csrf_token']");
+        if (!input) {
+          input = document.createElement("input");
+          input.type = "hidden";
+          input.name = "csrf_token";
+          form.appendChild(input);
+        }
+        input.value = token;
+      });
+    });
+  </script>
 """
 
 
@@ -7739,14 +8314,34 @@ def _dev_mode() -> bool:
     return os.getenv("DEV_MODE", "").strip().lower() == "true"
 
 
-def _session_cookie_headers(session_user: str, *, runtime_db: str | None = None) -> list[tuple[str, str]]:
+def _session_cookie_headers(
+    session_user: str,
+    *,
+    runtime_db: str | None = None,
+    environ=None,
+) -> list[tuple[str, str]]:
     _cleanup_runtime_sessions()
+    if environ is not None:
+        old_cookie = SimpleCookie()
+        old_cookie.load(environ.get("HTTP_COOKIE", ""))
+        old_session = old_cookie.get(RUNTIME_SESSION_COOKIE)
+        if old_session is not None and old_session.value in _RUNTIME_SESSIONS:
+            old_payload = _RUNTIME_SESSIONS.pop(old_session.value)
+            record_security_event(
+                "SESSION_ROTATED",
+                route="/runtime/login",
+                outcome="accepted",
+                reason_code="LOGIN_SESSION_ROTATED",
+                subject=str(old_payload.get("user", "")),
+            )
     session_id = token_urlsafe(24)
+    csrf_token = token_urlsafe(32)
     expires_at = datetime.now() + timedelta(seconds=RUNTIME_SESSION_TTL_SECONDS)
     _RUNTIME_SESSIONS[session_id] = {
         "user": session_user,
         "expires_at": expires_at,
         "runtime_db": runtime_db or str(DEFAULT_RUNTIME_DB),
+        "csrf_token": csrf_token,
     }
     cookie = SimpleCookie()
     cookie[RUNTIME_SESSION_COOKIE] = session_id
@@ -7754,7 +8349,19 @@ def _session_cookie_headers(session_user: str, *, runtime_db: str | None = None)
     cookie[RUNTIME_SESSION_COOKIE]["httponly"] = True
     cookie[RUNTIME_SESSION_COOKIE]["samesite"] = "Lax"
     cookie[RUNTIME_SESSION_COOKIE]["max-age"] = str(RUNTIME_SESSION_TTL_SECONDS)
-    return [("Set-Cookie", cookie.output(header="").strip())]
+    if _secure_cookie_enabled():
+        cookie[RUNTIME_SESSION_COOKIE]["secure"] = True
+    csrf_cookie = SimpleCookie()
+    csrf_cookie["pra_runtime_csrf"] = csrf_token
+    csrf_cookie["pra_runtime_csrf"]["path"] = "/"
+    csrf_cookie["pra_runtime_csrf"]["samesite"] = "Lax"
+    csrf_cookie["pra_runtime_csrf"]["max-age"] = str(RUNTIME_SESSION_TTL_SECONDS)
+    if _secure_cookie_enabled():
+        csrf_cookie["pra_runtime_csrf"]["secure"] = True
+    return [
+        ("Set-Cookie", cookie.output(header="").strip()),
+        ("Set-Cookie", csrf_cookie.output(header="").strip()),
+    ]
 
 
 def _clear_session_cookie_headers() -> list[tuple[str, str]]:
@@ -7765,7 +8372,44 @@ def _clear_session_cookie_headers() -> list[tuple[str, str]]:
     cookie[RUNTIME_SESSION_COOKIE]["samesite"] = "Lax"
     cookie[RUNTIME_SESSION_COOKIE]["max-age"] = "0"
     cookie[RUNTIME_SESSION_COOKIE]["expires"] = "Thu, 01 Jan 1970 00:00:00 GMT"
-    return [("Set-Cookie", cookie.output(header="").strip())]
+    if _secure_cookie_enabled():
+        cookie[RUNTIME_SESSION_COOKIE]["secure"] = True
+    csrf_cookie = SimpleCookie()
+    csrf_cookie["pra_runtime_csrf"] = ""
+    csrf_cookie["pra_runtime_csrf"]["path"] = "/"
+    csrf_cookie["pra_runtime_csrf"]["samesite"] = "Lax"
+    csrf_cookie["pra_runtime_csrf"]["max-age"] = "0"
+    csrf_cookie["pra_runtime_csrf"]["expires"] = "Thu, 01 Jan 1970 00:00:00 GMT"
+    if _secure_cookie_enabled():
+        csrf_cookie["pra_runtime_csrf"]["secure"] = True
+    login_csrf_cookie = SimpleCookie()
+    login_csrf_cookie[LOGIN_CSRF_COOKIE] = ""
+    login_csrf_cookie[LOGIN_CSRF_COOKIE]["path"] = "/runtime/login"
+    login_csrf_cookie[LOGIN_CSRF_COOKIE]["httponly"] = True
+    login_csrf_cookie[LOGIN_CSRF_COOKIE]["samesite"] = "Lax"
+    login_csrf_cookie[LOGIN_CSRF_COOKIE]["max-age"] = "0"
+    login_csrf_cookie[LOGIN_CSRF_COOKIE]["expires"] = "Thu, 01 Jan 1970 00:00:00 GMT"
+    if _secure_cookie_enabled():
+        login_csrf_cookie[LOGIN_CSRF_COOKIE]["secure"] = True
+    return [
+        ("Set-Cookie", cookie.output(header="").strip()),
+        ("Set-Cookie", csrf_cookie.output(header="").strip()),
+        ("Set-Cookie", login_csrf_cookie.output(header="").strip()),
+    ]
+
+
+def _secure_cookie_enabled() -> bool:
+    pra_env = os.getenv("PRA_ENV", "production").strip().lower() or "production"
+    if pra_env == "development":
+        explicit = os.getenv("PRA_COOKIE_SECURE", "").strip().lower()
+        if explicit in {"1", "true", "yes", "on"}:
+            return True
+        if explicit in {"0", "false", "no", "off"}:
+            return False
+        # Development HTTP must be an explicit deployment choice; without
+        # one keep the production-safe Secure behavior.
+        return True
+    return True
 
 
 def _get_runtime_session_user(environ) -> str | None:
@@ -7779,9 +8423,75 @@ def _get_runtime_session_user(environ) -> str | None:
 def _runtime_db_for_request(environ) -> str:
     session = _get_runtime_session(environ)
     if session is not None and session.get("runtime_db"):
-        return str(session["runtime_db"])
+        return str(_resolve_web_path(str(session["runtime_db"]), purpose="runtime_db", allow_create=False))
     query = _parse_query(environ)
-    return _first(query, "runtime_db", str(DEFAULT_RUNTIME_DB))
+    requested = _first(query, "runtime_db", "")
+    if requested.strip():
+        return str(_resolve_request_or_trusted_default(
+            requested,
+            Path(DEFAULT_RUNTIME_DB),
+            purpose="runtime_db",
+            allow_create=False,
+        ))
+    return str(_resolve_web_path(
+        _trusted_default_runtime_db(),
+        purpose="runtime_db",
+        allow_create=False,
+    ))
+
+
+def _trusted_default_runtime_db() -> Path:
+    configured = Path(DEFAULT_RUNTIME_DB)
+    if configured.is_absolute():
+        return configured.resolve(strict=False)
+    return (ROOT / configured).resolve(strict=False)
+
+
+def _trusted_project_path(configured_path: Path) -> Path:
+    path = Path(configured_path)
+    return path.resolve(strict=False) if path.is_absolute() else (ROOT / path).resolve(strict=False)
+
+
+def _request_or_default_path(
+    params: dict[str, list[str]],
+    key: str,
+    default_path: Path,
+    *,
+    purpose: str,
+    allow_create: bool,
+) -> str:
+    requested = _first(params, key, "")
+    return str(_resolve_request_or_trusted_default(
+        requested,
+        default_path,
+        purpose=purpose,
+        allow_create=allow_create,
+    ))
+
+
+def _resolve_request_or_trusted_default(
+    requested: str | os.PathLike[str],
+    default_path: Path,
+    *,
+    purpose: str,
+    allow_create: bool,
+) -> Path:
+    text = os.fspath(requested) if isinstance(requested, os.PathLike) else str(requested)
+    if not text.strip():
+        return _resolve_web_path(
+            _trusted_project_path(default_path),
+            purpose=purpose,
+            allow_create=allow_create,
+        )
+    # A request-supplied spelling is never trusted merely because it names an
+    # application default.  Only an omitted value may use that default.
+    return _resolve_web_path(text, purpose=purpose, allow_create=allow_create)
+
+
+def _redact_rejected_path_values(params: dict[str, object], *keys: str) -> None:
+    for key in keys:
+        if key in params:
+            params[key] = "[路径已拒绝]"
 
 
 def _get_runtime_session(environ) -> dict[str, object] | None:
@@ -7949,6 +8659,12 @@ def _redirect_response(location: str, headers: list[tuple[str, str]] | None = No
 
 def _mobile_review_error_response(error: MobileReviewTransactionError) -> tuple[str, str, list[tuple[str, str]]]:
     status = MOBILE_REVIEW_HTTP_STATUS.get(error.code, "409 Conflict")
+    record_security_event(
+        "MOBILE_REVIEW_TOKEN_REJECTED",
+        route="/mobile/review",
+        outcome="rejected",
+        reason_code=str(error.code),
+    )
     return status, render_mobile_review_error_page(UI_TEXT["mobile_review_invalid"]), []
 
 
@@ -8009,6 +8725,7 @@ def _extract_table_rows(parsed: dict[str, list[str]], headers: list[str]) -> lis
 def _respond(start_response, status: str, content_type: str, body: str, *, headers: list[tuple[str, str]] | None = None):
     payload = body.encode("utf-8")
     response_headers = [("Content-Type", content_type), ("Content-Length", str(len(payload)))]
+    response_headers.extend(_RESPONSE_EXTRA_HEADERS.get())
     if headers:
         response_headers.extend(headers)
     start_response(status, response_headers)
