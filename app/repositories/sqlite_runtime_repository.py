@@ -849,6 +849,11 @@ class SQLiteRuntimeRepository:
                     )
 
                 source_task_id = review_row["source_task_id"]
+                if not source_task_id:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.SOURCE_TASK_NOT_FOUND,
+                        "关联源任务不存在或已失效",
+                    )
                 source_row = (
                     connection.execute(
                         "SELECT * FROM tasks WHERE task_id = ?",
@@ -857,7 +862,17 @@ class SQLiteRuntimeRepository:
                     if source_task_id
                     else None
                 )
+                if source_row is None:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.SOURCE_TASK_NOT_FOUND,
+                        "关联源任务不存在或已失效",
+                    )
                 source_task_status = _atomic_source_task_status(source_row, status)
+                if source_task_status is None:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.CONCURRENT_UPDATE,
+                        "关联源任务状态已变化，复核请求未提交",
+                    )
                 resolved_actor = actor or str(token_row["token_subject"])
                 adjustment = payload.get("adjustment") if status == ReviewTaskStatus.ADJUSTED else None
                 adjusted_target_price = None

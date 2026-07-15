@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -239,6 +240,58 @@ class MobileReviewAtomicTransactionTests(unittest.TestCase):
         check = SQLiteRuntimeRepository(Path(self.temp_dir.name) / "invalid-adjustment.sqlite3")
         self.assertEqual(check.get_review_task(review_task_id).review_status, ReviewTaskStatus.PENDING)
         self.assertEqual(check.get_task("TASK-ATOMIC").task_status, TaskStatus.MANUAL_REVIEW)
+
+    def test_missing_or_incompatible_source_task_fails_before_token_consumption(self) -> None:
+        scenarios = (
+            ("missing-row", "approved", None, MobileReviewErrorCode.SOURCE_TASK_NOT_FOUND),
+            (
+                "null-source-adjusted",
+                "adjusted",
+                {"adjustment": {"target_status": "online"}},
+                MobileReviewErrorCode.SOURCE_TASK_NOT_FOUND,
+            ),
+            ("incompatible-status", "approved", None, MobileReviewErrorCode.CONCURRENT_UPDATE),
+        )
+        for scenario, action, payload, expected_code in scenarios:
+            with self.subTest(scenario=scenario):
+                point_db_path = Path(self.temp_dir.name) / f"source-guard-{scenario}.sqlite3"
+                repository, review_task_id, raw_token = self._prepare(point_db_path)
+                if scenario == "missing-row":
+                    with closing(repository.connect()) as connection:
+                        connection.execute("PRAGMA foreign_keys = OFF")
+                        connection.execute(
+                            "UPDATE review_tasks SET source_task_id = ? WHERE review_task_id = ?",
+                            ("MISSING-SOURCE", review_task_id),
+                        )
+                        connection.commit()
+                elif scenario == "null-source-adjusted":
+                    with closing(repository.connect()) as connection, connection:
+                        connection.execute(
+                            "UPDATE review_tasks SET source_task_id = NULL WHERE review_task_id = ?",
+                            (review_task_id,),
+                        )
+                else:
+                    repository.update_task_status("TASK-ATOMIC", TaskStatus.RUNNING)
+
+                token_hash = ReviewTokenService(repository)._hash_raw_token(raw_token)
+                with self.assertRaises(MobileReviewTransactionError) as context:
+                    resolve_mobile_review(
+                        point_db_path,
+                        review_task_id,
+                        raw_token,
+                        action,
+                        resolution_payload=payload,
+                    )
+
+                self.assertEqual(context.exception.code, expected_code)
+                check = SQLiteRuntimeRepository(point_db_path)
+                self.assertIsNone(check.get_review_token_by_hash(token_hash).used_at)
+                self.assertEqual(check.get_review_task(review_task_id).review_status, ReviewTaskStatus.PENDING)
+                if scenario == "incompatible-status":
+                    self.assertEqual(check.get_task("TASK-ATOMIC").task_status, TaskStatus.RUNNING)
+                else:
+                    self.assertEqual(check.get_task("TASK-ATOMIC").task_status, TaskStatus.MANUAL_REVIEW)
+                self.assertEqual(check.list_task_status_history("TASK-ATOMIC"), [])
 
     def test_sqlite_concurrency_classification_uses_codes_not_localized_text(self) -> None:
         class CodedOperationalError(sqlite3.OperationalError):

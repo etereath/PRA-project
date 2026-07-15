@@ -6,7 +6,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from app.enums import ReviewTaskStatus, TaskActionType, TaskStatus
-from app.exceptions import ValidationError
+from app.exceptions import MobileReviewErrorCode, MobileReviewTransactionError, ValidationError
 from app.models import (
     ColdStorageStatus,
     ExecutionLog,
@@ -343,7 +343,10 @@ def resolve_mobile_review(
     try:
         review_status = ReviewTaskStatus(action)
     except ValueError as exc:
-        raise ValidationError("链接已失效或无权访问该复核任务") from exc
+        raise MobileReviewTransactionError(
+            MobileReviewErrorCode.ACTION_NOT_ALLOWED_FOR_REVIEW_TYPE,
+            "链接已失效或无权访问该复核任务",
+        ) from exc
 
     token_hash = token_service._hash_raw_token(raw_token)
     atomic_result = repository.resolve_mobile_review_atomic(

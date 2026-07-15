@@ -191,6 +191,7 @@ MOBILE_REVIEW_HTTP_STATUS = {
     MobileReviewErrorCode.TOKEN_REVOKED.value: "410 Gone",
     MobileReviewErrorCode.TOKEN_ALREADY_USED.value: "410 Gone",
     MobileReviewErrorCode.REVIEW_NOT_FOUND.value: "404 Not Found",
+    MobileReviewErrorCode.SOURCE_TASK_NOT_FOUND.value: "404 Not Found",
     MobileReviewErrorCode.REVIEW_ALREADY_RESOLVED.value: "409 Conflict",
     MobileReviewErrorCode.ACTION_NOT_ALLOWED.value: "403 Forbidden",
     MobileReviewErrorCode.ACTION_NOT_ALLOWED_FOR_REVIEW_TYPE.value: "422 Unprocessable Entity",

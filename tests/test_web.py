@@ -2686,6 +2686,42 @@ class WebTests(unittest.TestCase):
             self.assertEqual(repository.get_task(task.task_id).task_status, TaskStatus.MANUAL_REVIEW)
             self.assertEqual(repository.list_task_status_history(task.task_id), [])
 
+    def test_mobile_review_unknown_action_returns_422_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "runtime.sqlite3"
+            repository = SQLiteRuntimeRepository(db_path)
+            task_service = RuntimeTaskService(repository)
+            task_service.init_schema()
+            task = _runtime_task("TASK-M3-UNKNOWN", status=TaskStatus.MANUAL_REVIEW)
+            task_service.create_tasks([task])
+            review_service = ReviewTaskService(repository, runtime_task_service=task_service)
+            review_service.create_from_tasks([task])
+            review = review_service.list_review_tasks()[0]
+
+            with patch("app.web.DEFAULT_RUNTIME_DB", db_path), patch.dict("os.environ", {"REVIEW_TOKEN_SECRET": "unit-test-secret"}, clear=False):
+                token_result = ReviewTokenService(repository).create_token(
+                    review.review_task_id,
+                    token_subject="mobile_reviewer",
+                )
+                status, _, body = self._call_app(
+                    path=f"/mobile/review/{review.review_task_id}/resolve",
+                    method="POST",
+                    body=urlencode(
+                        {
+                            "token": token_result.raw_token,
+                            "action": "totally-invalid-action",
+                            "resolution_payload_json": "{}",
+                        }
+                    ),
+                )
+
+            self.assertEqual(status, "422 Unprocessable Entity")
+            self.assertIn("链接已失效或无权访问该复核任务", body)
+            self.assertIsNone(repository.get_review_token(token_result.review_token.token_id).used_at)
+            self.assertEqual(repository.get_review_task(review.review_task_id).review_status, ReviewTaskStatus.PENDING)
+            self.assertEqual(repository.get_task(task.task_id).task_status, TaskStatus.MANUAL_REVIEW)
+            self.assertEqual(repository.list_task_status_history(task.task_id), [])
+
     def test_mobile_review_token_fails_after_web_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "runtime.sqlite3"

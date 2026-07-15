@@ -7,12 +7,13 @@ Mobile Review 的 POST resolve 入口现在只在事务前执行无副作用的�
 1. 通过同一 SQLite 连接执行 `BEGIN IMMEDIATE`。
 2. 在该连接内重新读取 `review_tokens`、`review_tasks` 和关联 `tasks`。
 3. 校验 Token 绑定关系、未使用、未撤销、未过期、动作许可和 review 仍为 `pending`。
-4. 用条件 `UPDATE` 消费 Token，并要求 `rowcount = 1`。
-5. 用条件 `UPDATE ... WHERE review_status = 'pending'` 写入 review resolution。
-6. 用条件 `UPDATE ... WHERE task_status = 当前状态` 推进源 task，并要求 `rowcount = 1`。
-7. 在同一连接写入 `task_status_history`。
-8. 在提交前把事务内读取的行转换为领域对象；转换失败也会回滚。
-9. 领域对象转换成功后统一提交。
+4. 在消费 Token 前确认 `source_task_id` 非空、关联 task 存在，且当前状态属于该 action 的允许起始状态。
+5. 用条件 `UPDATE` 消费 Token，并要求 `rowcount = 1`。
+6. 用条件 `UPDATE ... WHERE review_status = 'pending'` 写入 review resolution。
+7. 用条件 `UPDATE ... WHERE task_status = 当前状态` 推进源 task，并要求 `rowcount = 1`。
+8. 在同一连接写入 `task_status_history`。
+9. 在提交前把事务内读取的行转换为领域对象；转换失败也会回滚。
+10. 领域对象转换成功后统一提交。
 
 任何异常都会回滚 Token、review、task 和 history。事务内部不调用会自行打开新连接的旧 service/repository 方法。
 
@@ -26,6 +27,7 @@ Mobile Review 的 POST resolve 入口现在只在事务前执行无副作用的�
 | `TOKEN_REVOKED` | Token 已撤销 |
 | `TOKEN_ALREADY_USED` | Token 已消费 |
 | `REVIEW_NOT_FOUND` | review 不存在 |
+| `SOURCE_TASK_NOT_FOUND` | review 关联的源 task 不存在或未提供 |
 | `REVIEW_ALREADY_RESOLVED` | review 已被处理或被并发请求先处理 |
 | `ACTION_NOT_ALLOWED` | 动作不在 Token 的 `allowed_actions` 中 |
 | `ACTION_NOT_ALLOWED_FOR_REVIEW_TYPE` | 动作不属于 Mobile Review 支持集合 |
@@ -71,6 +73,7 @@ resolution 同时提交。
 - Token 更新后、review 更新后、task 更新后、history 插入前/后故障注入，均证明全量回滚。
 - 结果对象转换前故障注入，证明提交前转换失败也会全量回滚。
 - `adjusted` payload 规范化、源 task 字段更新、非法调整拒绝，以及 Web 层 `403/409/410/422` 状态映射。
+- 关联源 task 缺失、源 task 状态不兼容和完全未知 action 均在消费 Token 前拒绝，返回稳定错误码且不产生业务状态变化。
 - 使用不同错误文本但相同 SQLite busy/locked 错误码的分类，以及“文本含 locked 但错误码非并发”的反例。
 - 重复提交返回 `TOKEN_ALREADY_USED`，不会新增 history。
 
