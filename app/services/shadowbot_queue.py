@@ -3,12 +3,12 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from uuid import uuid4
 
 from app.exceptions import ValidationError
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
@@ -419,9 +419,19 @@ def _json_bytes(data: dict[str, Any]) -> bytes:
 
 def _atomic_write(path: Path, content: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + f".tmp-{uuid4().hex}")
-    with temporary.open("xb") as file_obj:
-        file_obj.write(content)
-        file_obj.flush()
-        os.fsync(file_obj.fileno())
-    os.replace(temporary, path)
+    # Keep the staging filename short.  A long destination plus the previous
+    # ``<name>.tmp-<uuid>`` suffix can exceed Windows MAX_PATH before the
+    # final replace, even though the destination itself is valid.
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".tmp-", dir=path.parent)
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as file_obj:
+            file_obj.write(content)
+            file_obj.flush()
+            os.fsync(file_obj.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass

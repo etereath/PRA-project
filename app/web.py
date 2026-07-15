@@ -1945,9 +1945,16 @@ def _resolve_table_path(table_name: str, previous_table_name: str, posted_path: 
     current_default = str(TABLE_OPTIONS[table_name]["path"])
     if not posted_path.strip():
         return current_default
-    normalized_posted = os.path.normcase(os.path.normpath(posted_path))
-    normalized_previous_default = os.path.normcase(os.path.normpath(previous_default))
-    if table_name != previous_table_name and normalized_posted == normalized_previous_default:
+    def normalize_path(value: str) -> str:
+        return os.path.normcase(os.path.normpath(value)).replace("\\", "/").rstrip("/")
+
+    normalized_posted = normalize_path(posted_path)
+    normalized_previous_default = normalize_path(previous_default)
+    previous_relative = normalize_path(os.path.relpath(previous_default, ROOT))
+    is_previous_default = normalized_posted == normalized_previous_default or normalized_posted.endswith(
+        "/" + previous_relative
+    )
+    if table_name != previous_table_name and is_previous_default:
         return current_default
     return posted_path
 
