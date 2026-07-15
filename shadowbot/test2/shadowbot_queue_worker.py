@@ -324,6 +324,8 @@ class QueueWorker:
         runtime_request.update(
             {
                 "request_file_sha256": request_sha256,
+                "lease_owner_token": request.get("lease_owner_token", ""),
+                "lease_version": request.get("lease_version", 0),
                 "worker_id": self.worker_id,
                 "_phase_file_path": str(phase_path),
                 "_stop_signal_path": str(self.stop_signal),
@@ -384,6 +386,9 @@ class QueueWorker:
                 "worker_heartbeat_at": _now_iso(),
             }
         )
+        if not result.get("result_id"):
+            result_identity = json.dumps(result, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+            result["result_id"] = "RESULT-" + hashlib.sha256(result_identity).hexdigest()[:24]
         result_path = self.results / (attempt_id + ".result.json")
         content = _json_bytes(result)
         _atomic_write(result_path.with_suffix(result_path.suffix + ".sha256"), (hashlib.sha256(content).hexdigest() + "\n").encode("ascii"))
@@ -414,6 +419,8 @@ class QueueWorker:
             "request_file_sha256": request_sha256,
             "instruction_hash": request.get("instruction_hash", ""),
             "worker_id": self.worker_id,
+            "lease_owner_token": request.get("lease_owner_token", ""),
+            "lease_version": request.get("lease_version", 0),
             "updated_at": _now_iso(),
         }
         _atomic_write(phase_path, _json_bytes(payload))
@@ -441,6 +448,8 @@ class QueueWorker:
             "execution_mode": request["execution_mode"],
             "instruction_hash": request["instruction_hash"],
             "request_file_sha256": request_sha256,
+            "lease_owner_token": request.get("lease_owner_token", ""),
+            "lease_version": request.get("lease_version", 0),
             "worker_id": self.worker_id,
             "status": "FAILED",
             "run_success_flag": False,
@@ -452,6 +461,8 @@ class QueueWorker:
             "queue_phase": "RESULT_WRITTEN",
             "worker_heartbeat_at": _now_iso(),
         }
+        result_identity = json.dumps(result, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+        result["result_id"] = "RESULT-" + hashlib.sha256(result_identity).hexdigest()[:24]
         result_path = self.results / (attempt_id + ".result.json")
         content = _json_bytes(result)
         _atomic_write(

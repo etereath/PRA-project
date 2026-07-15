@@ -25,10 +25,7 @@ from app.models import (
 )
 from app.runtime_schema import (
     LATEST_RUNTIME_SCHEMA_VERSION,
-    REQUIRED_RUNTIME_TABLES,
-    RETRY_AUTHORIZATION_INDEXES,
     RuntimeSchemaHealth,
-    V5_REQUIRED_COLUMNS,
     inspect_runtime_schema,
 )
 from app.utils import serialize_decimal
@@ -929,6 +926,517 @@ class SQLiteRuntimeRepository:
             ).fetchall()
         return [_row_to_shadowbot_attempt(row) for row in rows]
 
+    def list_active_shadowbot_execution_attempts(self) -> list[ShadowBotExecutionAttempt]:
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM shadowbot_execution_attempts
+                WHERE status IN ('STARTING', 'RUNNING')
+                ORDER BY operation_id, started_at, execution_attempt_id
+                """
+            ).fetchall()
+        return [_row_to_shadowbot_attempt(row) for row in rows]
+
+    def freeze_duplicate_active_commit_attempts(self, operation_id: str, *, now: datetime) -> bool:
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT * FROM shadowbot_execution_attempts
+                WHERE operation_id = ? AND execution_mode = 'COMMIT' AND status IN ('STARTING', 'RUNNING')
+                ORDER BY started_at, execution_attempt_id
+                """,
+                (operation_id,),
+            ).fetchall()
+            if len(rows) < 2:
+                connection.rollback()
+                return False
+            for row in rows:
+                raw = _json_load(row["raw_output_json"])
+                raw["frozen_reason"] = "DUPLICATE_ACTIVE_COMMIT_ATTEMPT"
+                lease = raw.get("lease") if isinstance(raw.get("lease"), dict) else {}
+                lease["active"] = False
+                lease["frozen_at"] = _datetime_to_text(now)
+                raw["lease"] = lease
+                connection.execute(
+                    "UPDATE shadowbot_execution_attempts SET raw_output_json = ? WHERE execution_attempt_id = ?",
+                    (_json_dump(raw), str(row["execution_attempt_id"])),
+                )
+            connection.execute(
+                """
+                UPDATE shadowbot_operations
+                SET status = 'MANUAL_REVIEW', lock_owner = '', updated_at = ?
+                WHERE operation_id = ?
+                """,
+                (_datetime_to_text(now), operation_id),
+            )
+            connection.commit()
+            return True
+        finally:
+            connection.close()
+
+    def create_shadowbot_attempt_with_lease(
+        self,
+        attempt: ShadowBotExecutionAttempt,
+        *,
+        owner_token: str,
+        lease_expires_at: datetime,
+        expected_operation_statuses: Iterable[str],
+    ) -> ShadowBotExecutionAttempt | None:
+        """Atomically bind a fresh attempt, lease and RUNNING operation."""
+        expected = tuple(dict.fromkeys(str(value) for value in expected_operation_statuses))
+        if not expected:
+            raise ValueError("expected_operation_statuses must not be empty")
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = connection.execute(
+                "SELECT status, lock_owner FROM shadowbot_operations WHERE operation_id = ?",
+                (attempt.operation_id,),
+            ).fetchone()
+            if operation is None or str(operation["status"]) not in expected or str(operation["lock_owner"] or ""):
+                connection.rollback()
+                return None
+            active = connection.execute(
+                """
+                SELECT 1 FROM shadowbot_execution_attempts
+                WHERE operation_id = ? AND execution_mode = 'COMMIT' AND status IN ('STARTING', 'RUNNING')
+                LIMIT 1
+                """,
+                (attempt.operation_id,),
+            ).fetchone()
+            if active is not None:
+                connection.rollback()
+                return None
+            lease_version = self._next_shadowbot_lease_version(connection, attempt.operation_id)
+            attempt.raw_output = {
+                **attempt.raw_output,
+                "operation_status_before_attempt": str(operation["status"]),
+                "lease": {
+                    "owner_token": owner_token,
+                    "version": lease_version,
+                    "expires_at": _datetime_to_text(lease_expires_at),
+                    "active": True,
+                },
+            }
+            connection.execute(
+                """
+                INSERT INTO shadowbot_execution_attempts(
+                    execution_attempt_id, operation_id, execution_mode, shadowbot_run_id,
+                    status, side_effect_state, started_at, instruction_hash,
+                    request_file_sha256, queue_request_path, ended_at, raw_output_json
+                ) VALUES(
+                    :execution_attempt_id, :operation_id, :execution_mode, :shadowbot_run_id,
+                    :status, :side_effect_state, :started_at, :instruction_hash,
+                    :request_file_sha256, :queue_request_path, :ended_at, :raw_output_json
+                )
+                """,
+                _shadowbot_attempt_to_row(attempt),
+            )
+            placeholders = ",".join("?" for _ in expected)
+            cursor = connection.execute(
+                f"""
+                UPDATE shadowbot_operations
+                SET status = 'RUNNING', lock_owner = ?, updated_at = ?
+                WHERE operation_id = ? AND status IN ({placeholders}) AND lock_owner = ''
+                """,
+                (owner_token, _datetime_to_text(datetime.now()), attempt.operation_id, *expected),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return None
+            connection.commit()
+            return attempt
+        except sqlite3.IntegrityError:
+            connection.rollback()
+            return None
+        finally:
+            connection.close()
+
+    def mark_shadowbot_start_outcome(
+        self,
+        execution_attempt_id: str,
+        *,
+        owner_token: str,
+        lease_version: int,
+        attempt_status: str,
+        operation_status: str,
+        shadowbot_run_id: str = "",
+        instruction_hash: str = "",
+        request_file_sha256: str = "",
+        queue_request_path: str = "",
+        raw_output: dict[str, Any] | None = None,
+        ended_at: datetime | None = None,
+    ) -> bool:
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT a.*, o.lock_owner
+                FROM shadowbot_execution_attempts a
+                JOIN shadowbot_operations o ON o.operation_id = a.operation_id
+                WHERE a.execution_attempt_id = ?
+                """,
+                (execution_attempt_id,),
+            ).fetchone()
+            if row is None or str(row["lock_owner"] or "") != owner_token:
+                connection.rollback()
+                return False
+            current_raw = _json_load(row["raw_output_json"])
+            lease = current_raw.get("lease") if isinstance(current_raw.get("lease"), dict) else {}
+            lease_expires_at = _text_to_datetime(lease.get("expires_at"))
+            lease_now = datetime.now(lease_expires_at.tzinfo) if lease_expires_at is not None else None
+            if (
+                str(lease.get("owner_token") or "") != owner_token
+                or int(lease.get("version") or 0) != lease_version
+                or not bool(lease.get("active", False))
+                or lease_expires_at is None
+                or lease_now is None
+                or lease_expires_at <= lease_now
+            ):
+                connection.rollback()
+                return False
+            merged_raw = {**current_raw, **(raw_output or {})}
+            merged_lease = dict(lease)
+            terminal = attempt_status not in {"STARTING", "RUNNING"}
+            if terminal:
+                merged_lease["active"] = False
+                merged_lease["ended_at"] = _datetime_to_text(ended_at or datetime.now())
+            merged_raw["lease"] = merged_lease
+            connection.execute(
+                """
+                UPDATE shadowbot_execution_attempts
+                SET shadowbot_run_id = ?, status = ?, instruction_hash = ?,
+                    request_file_sha256 = ?, queue_request_path = ?, ended_at = ?, raw_output_json = ?
+                WHERE execution_attempt_id = ?
+                """,
+                (
+                    shadowbot_run_id,
+                    attempt_status,
+                    instruction_hash,
+                    request_file_sha256,
+                    queue_request_path,
+                    _datetime_to_text(ended_at),
+                    _json_dump(merged_raw),
+                    execution_attempt_id,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE shadowbot_operations
+                SET status = ?, lock_owner = ?, updated_at = ?
+                WHERE operation_id = ? AND lock_owner = ?
+                """,
+                (
+                    operation_status,
+                    "" if terminal else owner_token,
+                    _datetime_to_text(datetime.now()),
+                    str(row["operation_id"]),
+                    owner_token,
+                ),
+            )
+            connection.commit()
+            return True
+        finally:
+            connection.close()
+
+    def validate_shadowbot_lease(
+        self,
+        execution_attempt_id: str,
+        *,
+        owner_token: str,
+        lease_version: int,
+        now: datetime,
+    ) -> bool:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT a.raw_output_json, o.lock_owner
+                FROM shadowbot_execution_attempts a
+                JOIN shadowbot_operations o ON o.operation_id = a.operation_id
+                WHERE a.execution_attempt_id = ?
+                """,
+                (execution_attempt_id,),
+            ).fetchone()
+        if row is None or str(row["lock_owner"] or "") != owner_token:
+            return False
+        raw = _json_load(row["raw_output_json"])
+        lease = raw.get("lease") if isinstance(raw.get("lease"), dict) else {}
+        expires_at = _text_to_datetime(lease.get("expires_at"))
+        return bool(
+            lease.get("active", False)
+            and str(lease.get("owner_token") or "") == owner_token
+            and int(lease.get("version") or 0) == lease_version
+            and expires_at is not None
+            and expires_at > now
+        )
+
+    def complete_shadowbot_attempt_with_lease(
+        self,
+        execution_attempt_id: str,
+        *,
+        owner_token: str,
+        lease_version: int,
+        attempt_status: str,
+        operation_status: str,
+        side_effect_state: str,
+        ended_at: datetime,
+        raw_output: dict[str, Any],
+    ) -> bool:
+        """Fence result writeback with owner/version and close lease atomically."""
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT a.*, o.lock_owner
+                FROM shadowbot_execution_attempts a
+                JOIN shadowbot_operations o ON o.operation_id = a.operation_id
+                WHERE a.execution_attempt_id = ? AND a.status IN ('STARTING', 'RUNNING')
+                """,
+                (execution_attempt_id,),
+            ).fetchone()
+            if row is None or str(row["lock_owner"] or "") != owner_token:
+                connection.rollback()
+                return False
+            current_raw = _json_load(row["raw_output_json"])
+            lease = current_raw.get("lease") if isinstance(current_raw.get("lease"), dict) else {}
+            expires_at = _text_to_datetime(lease.get("expires_at"))
+            if (
+                not bool(lease.get("active", False))
+                or str(lease.get("owner_token") or "") != owner_token
+                or int(lease.get("version") or 0) != lease_version
+                or expires_at is None
+                or expires_at <= ended_at
+            ):
+                connection.rollback()
+                return False
+            lease["active"] = False
+            lease["ended_at"] = _datetime_to_text(ended_at)
+            merged_raw = {**current_raw, **raw_output, "lease": lease}
+            next_version = connection.execute(
+                """
+                SELECT COALESCE(MAX(version), 0) + 1 AS next_version
+                FROM shadowbot_side_effect_checkpoints WHERE operation_id = ?
+                """,
+                (str(row["operation_id"]),),
+            ).fetchone()
+            connection.execute(
+                """
+                INSERT INTO shadowbot_side_effect_checkpoints(
+                    operation_id, execution_attempt_id, side_effect_state, checkpoint_at, version
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    str(row["operation_id"]),
+                    execution_attempt_id,
+                    side_effect_state,
+                    _datetime_to_text(ended_at),
+                    int(next_version["next_version"]),
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE shadowbot_execution_attempts
+                SET status = ?, side_effect_state = ?, ended_at = ?, raw_output_json = ?
+                WHERE execution_attempt_id = ?
+                """,
+                (
+                    attempt_status,
+                    side_effect_state,
+                    _datetime_to_text(ended_at),
+                    _json_dump(merged_raw),
+                    execution_attempt_id,
+                ),
+            )
+            updated = connection.execute(
+                """
+                UPDATE shadowbot_operations
+                SET status = ?, lock_owner = '', updated_at = ?
+                WHERE operation_id = ? AND lock_owner = ?
+                """,
+                (operation_status, _datetime_to_text(ended_at), str(row["operation_id"]), owner_token),
+            )
+            if updated.rowcount != 1:
+                connection.rollback()
+                return False
+            connection.commit()
+            return True
+        finally:
+            connection.close()
+
+    def renew_shadowbot_lease(
+        self,
+        execution_attempt_id: str,
+        *,
+        owner_token: str,
+        lease_version: int,
+        now: datetime,
+        new_expires_at: datetime,
+    ) -> bool:
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT a.raw_output_json, a.operation_id, o.lock_owner
+                FROM shadowbot_execution_attempts a
+                JOIN shadowbot_operations o ON o.operation_id = a.operation_id
+                WHERE a.execution_attempt_id = ? AND a.status IN ('STARTING', 'RUNNING')
+                """,
+                (execution_attempt_id,),
+            ).fetchone()
+            if row is None or str(row["lock_owner"] or "") != owner_token:
+                connection.rollback()
+                return False
+            raw = _json_load(row["raw_output_json"])
+            lease = raw.get("lease") if isinstance(raw.get("lease"), dict) else {}
+            current_expires = _text_to_datetime(lease.get("expires_at"))
+            if (
+                not bool(lease.get("active", False))
+                or str(lease.get("owner_token") or "") != owner_token
+                or int(lease.get("version") or 0) != lease_version
+                or current_expires is None
+                or current_expires <= now
+            ):
+                connection.rollback()
+                return False
+            lease["expires_at"] = _datetime_to_text(new_expires_at)
+            raw["lease"] = lease
+            cursor = connection.execute(
+                "UPDATE shadowbot_execution_attempts SET raw_output_json = ? WHERE execution_attempt_id = ?",
+                (_json_dump(raw), execution_attempt_id),
+            )
+            connection.commit()
+            return cursor.rowcount == 1
+        finally:
+            connection.close()
+
+    def expire_shadowbot_lease(self, execution_attempt_id: str, *, now: datetime) -> bool:
+        """F10: fence a stale owner and move the operation to reconciliation."""
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT a.*, o.lock_owner
+                FROM shadowbot_execution_attempts a
+                JOIN shadowbot_operations o ON o.operation_id = a.operation_id
+                WHERE a.execution_attempt_id = ? AND a.status IN ('STARTING', 'RUNNING')
+                """,
+                (execution_attempt_id,),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return False
+            raw = _json_load(row["raw_output_json"])
+            lease = raw.get("lease") if isinstance(raw.get("lease"), dict) else {}
+            expires_at = _text_to_datetime(lease.get("expires_at"))
+            if not bool(lease.get("active", False)) or expires_at is None or expires_at > now:
+                connection.rollback()
+                return False
+            if str(row["lock_owner"] or "") != str(lease.get("owner_token") or ""):
+                connection.rollback()
+                return False
+            lease["active"] = False
+            lease["expired_at"] = _datetime_to_text(now)
+            raw["lease"] = lease
+            attempt_status = "START_UNKNOWN" if str(row["status"]) == "STARTING" else "SIDE_EFFECT_UNKNOWN"
+            connection.execute(
+                """
+                UPDATE shadowbot_execution_attempts
+                SET status = ?, side_effect_state = 'UNKNOWN', ended_at = ?, raw_output_json = ?
+                WHERE execution_attempt_id = ?
+                """,
+                (attempt_status, _datetime_to_text(now), _json_dump(raw), execution_attempt_id),
+            )
+            connection.execute(
+                """
+                UPDATE shadowbot_operations
+                SET status = 'NEEDS_RECONCILIATION', lock_owner = '', updated_at = ?
+                WHERE operation_id = ? AND lock_owner = ?
+                """,
+                (_datetime_to_text(now), str(row["operation_id"]), str(lease.get("owner_token") or "")),
+            )
+            connection.commit()
+            return True
+        finally:
+            connection.close()
+
+    def quarantine_shadowbot_attempt(
+        self,
+        execution_attempt_id: str,
+        *,
+        reason: str,
+        now: datetime,
+    ) -> bool:
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM shadowbot_execution_attempts WHERE execution_attempt_id = ?",
+                (execution_attempt_id,),
+            ).fetchone()
+            if row is None:
+                connection.rollback()
+                return False
+            raw = _json_load(row["raw_output_json"])
+            lease = raw.get("lease") if isinstance(raw.get("lease"), dict) else {}
+            lease["active"] = False
+            lease["quarantined_at"] = _datetime_to_text(now)
+            raw["lease"] = lease
+            raw["quarantine_reason"] = reason
+            terminal = str(row["status"]) not in {"STARTING", "RUNNING"}
+            operation_status = "MANUAL_REVIEW" if terminal else "NEEDS_RECONCILIATION"
+            if terminal:
+                connection.execute(
+                    "UPDATE shadowbot_execution_attempts SET raw_output_json = ? WHERE execution_attempt_id = ?",
+                    (_json_dump(raw), execution_attempt_id),
+                )
+            else:
+                side_effect = str(row["side_effect_state"])
+                attempt_status = "START_UNKNOWN" if side_effect == "NOT_STARTED" else "SIDE_EFFECT_UNKNOWN"
+                connection.execute(
+                    """
+                    UPDATE shadowbot_execution_attempts
+                    SET status = ?, side_effect_state = ?, ended_at = ?, raw_output_json = ?
+                    WHERE execution_attempt_id = ?
+                    """,
+                    (
+                        attempt_status,
+                        "UNKNOWN" if attempt_status == "SIDE_EFFECT_UNKNOWN" else side_effect,
+                        _datetime_to_text(now),
+                        _json_dump(raw),
+                        execution_attempt_id,
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE shadowbot_operations
+                SET status = ?, lock_owner = '', updated_at = ? WHERE operation_id = ?
+                """,
+                (operation_status, _datetime_to_text(now), str(row["operation_id"])),
+            )
+            connection.commit()
+            return True
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _next_shadowbot_lease_version(connection: sqlite3.Connection, operation_id: str) -> int:
+        rows = connection.execute(
+            "SELECT raw_output_json FROM shadowbot_execution_attempts WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchall()
+        versions = []
+        for row in rows:
+            raw = _json_load(row["raw_output_json"])
+            lease = raw.get("lease") if isinstance(raw.get("lease"), dict) else {}
+            versions.append(int(lease.get("version") or 0))
+        return max(versions, default=0) + 1
+
     def update_shadowbot_execution_attempt(
         self,
         execution_attempt_id: str,
@@ -1058,6 +1566,219 @@ class SQLiteRuntimeRepository:
                 row,
             )
             return connection.total_changes - before
+
+    def issue_retry_authorization(
+        self,
+        authorization: RetryAuthorization,
+        *,
+        allowed_operation_statuses: Iterable[str],
+    ) -> bool:
+        """Persist one authorization and expose RETRY_AUTHORIZED atomically."""
+        allowed = tuple(dict.fromkeys(str(value) for value in allowed_operation_statuses))
+        if not allowed:
+            raise ValueError("allowed_operation_statuses must not be empty")
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            operation = connection.execute(
+                "SELECT * FROM shadowbot_operations WHERE operation_id = ?",
+                (authorization.operation_id,),
+            ).fetchone()
+            source = connection.execute(
+                "SELECT * FROM shadowbot_execution_attempts WHERE execution_attempt_id = ?",
+                (authorization.source_execution_attempt_id,),
+            ).fetchone()
+            if (
+                operation is None
+                or source is None
+                or str(operation["status"]) not in allowed
+                or str(operation["lock_owner"] or "")
+                or str(operation["approved_payload_hash"]) != authorization.approved_payload_hash
+                or str(source["operation_id"]) != authorization.operation_id
+                or str(source["status"]) in {"STARTING", "RUNNING"}
+            ):
+                connection.rollback()
+                return False
+            active = connection.execute(
+                """
+                SELECT 1 FROM shadowbot_execution_attempts
+                WHERE operation_id = ? AND execution_mode = 'COMMIT' AND status IN ('STARTING', 'RUNNING')
+                LIMIT 1
+                """,
+                (authorization.operation_id,),
+            ).fetchone()
+            if active is not None:
+                connection.rollback()
+                return False
+            connection.execute(
+                """
+                INSERT INTO retry_authorizations(
+                    retry_authorization_id, operation_id, source_execution_attempt_id,
+                    authorization_type, authorized_by, evidence_type, evidence_hash,
+                    approved_payload_hash, status, max_uses, consumed_by_execution_attempt_id,
+                    expires_at, reason, created_at, consumed_at
+                ) VALUES(
+                    :retry_authorization_id, :operation_id, :source_execution_attempt_id,
+                    :authorization_type, :authorized_by, :evidence_type, :evidence_hash,
+                    :approved_payload_hash, :status, :max_uses, :consumed_by_execution_attempt_id,
+                    :expires_at, :reason, :created_at, :consumed_at
+                )
+                """,
+                _retry_authorization_to_row(authorization),
+            )
+            placeholders = ",".join("?" for _ in allowed)
+            cursor = connection.execute(
+                f"""
+                UPDATE shadowbot_operations
+                SET status = 'RETRY_AUTHORIZED', updated_at = ?
+                WHERE operation_id = ? AND status IN ({placeholders}) AND lock_owner = ''
+                """,
+                (_datetime_to_text(datetime.now()), authorization.operation_id, *allowed),
+            )
+            if cursor.rowcount != 1:
+                connection.rollback()
+                return False
+            connection.commit()
+            return True
+        except sqlite3.IntegrityError:
+            connection.rollback()
+            return False
+        finally:
+            connection.close()
+
+    def consume_retry_authorization_and_create_attempt(
+        self,
+        retry_authorization_id: str,
+        attempt: ShadowBotExecutionAttempt,
+        *,
+        owner_token: str,
+        lease_expires_at: datetime,
+        approved_payload_hash: str,
+        consumed_at: datetime,
+    ) -> ShadowBotExecutionAttempt | None:
+        """Consume ACTIVE authorization and create the new attempt/lease in one transaction."""
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            authorization = connection.execute(
+                "SELECT * FROM retry_authorizations WHERE retry_authorization_id = ?",
+                (retry_authorization_id,),
+            ).fetchone()
+            operation = connection.execute(
+                "SELECT * FROM shadowbot_operations WHERE operation_id = ?",
+                (attempt.operation_id,),
+            ).fetchone()
+            if authorization is None or operation is None:
+                connection.rollback()
+                return None
+            expires_at = _text_to_datetime(authorization["expires_at"])
+            if (
+                str(authorization["status"]) != "ACTIVE"
+                or int(authorization["max_uses"]) != 1
+                or str(authorization["operation_id"]) != attempt.operation_id
+                or str(authorization["approved_payload_hash"]) != approved_payload_hash
+                or expires_at is None
+                or expires_at <= consumed_at
+                or str(operation["status"]) != "RETRY_AUTHORIZED"
+                or str(operation["approved_payload_hash"]) != approved_payload_hash
+                or str(operation["lock_owner"] or "")
+            ):
+                connection.rollback()
+                return None
+            source = connection.execute(
+                "SELECT * FROM shadowbot_execution_attempts WHERE execution_attempt_id = ?",
+                (str(authorization["source_execution_attempt_id"]),),
+            ).fetchone()
+            active = connection.execute(
+                """
+                SELECT 1 FROM shadowbot_execution_attempts
+                WHERE operation_id = ? AND execution_mode = 'COMMIT' AND status IN ('STARTING', 'RUNNING')
+                LIMIT 1
+                """,
+                (attempt.operation_id,),
+            ).fetchone()
+            if (
+                source is None
+                or str(source["operation_id"]) != attempt.operation_id
+                or str(source["execution_mode"]) != "COMMIT"
+                or str(source["status"]) not in {"START_FAILED", "FAILED", "NOT_APPLIED"}
+                or (
+                    str(source["status"]) == "START_FAILED"
+                    and str(source["side_effect_state"]) != "NOT_STARTED"
+                )
+                or (
+                    str(source["status"]) in {"FAILED", "NOT_APPLIED"}
+                    and str(source["side_effect_state"]) != "NOT_APPLIED"
+                )
+                or active is not None
+            ):
+                connection.rollback()
+                return None
+            lease_version = self._next_shadowbot_lease_version(connection, attempt.operation_id)
+            attempt.raw_output = {
+                **attempt.raw_output,
+                "retry_authorization_id": retry_authorization_id,
+                "source_execution_attempt_id": str(authorization["source_execution_attempt_id"]),
+                "operation_status_before_attempt": str(operation["status"]),
+                "lease": {
+                    "owner_token": owner_token,
+                    "version": lease_version,
+                    "expires_at": _datetime_to_text(lease_expires_at),
+                    "active": True,
+                },
+            }
+            connection.execute(
+                """
+                INSERT INTO shadowbot_execution_attempts(
+                    execution_attempt_id, operation_id, execution_mode, shadowbot_run_id,
+                    status, side_effect_state, started_at, instruction_hash,
+                    request_file_sha256, queue_request_path, ended_at, raw_output_json
+                ) VALUES(
+                    :execution_attempt_id, :operation_id, :execution_mode, :shadowbot_run_id,
+                    :status, :side_effect_state, :started_at, :instruction_hash,
+                    :request_file_sha256, :queue_request_path, :ended_at, :raw_output_json
+                )
+                """,
+                _shadowbot_attempt_to_row(attempt),
+            )
+            consumed = connection.execute(
+                """
+                UPDATE retry_authorizations
+                SET status = 'CONSUMED', consumed_by_execution_attempt_id = ?, consumed_at = ?
+                WHERE retry_authorization_id = ? AND status = 'ACTIVE' AND max_uses = 1
+                  AND consumed_by_execution_attempt_id IS NULL AND expires_at > ?
+                """,
+                (
+                    attempt.execution_attempt_id,
+                    _datetime_to_text(consumed_at),
+                    retry_authorization_id,
+                    _datetime_to_text(consumed_at),
+                ),
+            )
+            operation_updated = connection.execute(
+                """
+                UPDATE shadowbot_operations
+                SET status = 'RUNNING', lock_owner = ?, updated_at = ?
+                WHERE operation_id = ? AND status = 'RETRY_AUTHORIZED' AND lock_owner = ''
+                  AND approved_payload_hash = ?
+                """,
+                (
+                    owner_token,
+                    _datetime_to_text(consumed_at),
+                    attempt.operation_id,
+                    approved_payload_hash,
+                ),
+            )
+            if consumed.rowcount != 1 or operation_updated.rowcount != 1:
+                connection.rollback()
+                return None
+            connection.commit()
+            return attempt
+        except sqlite3.IntegrityError:
+            connection.rollback()
+            return None
+        finally:
+            connection.close()
 
     def get_retry_authorization(self, retry_authorization_id: str) -> RetryAuthorization | None:
         with closing(self.connect()) as connection:

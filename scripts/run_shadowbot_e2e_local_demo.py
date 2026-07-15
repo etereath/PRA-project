@@ -18,7 +18,7 @@ from app.services.shadowbot_executor import (
     SIDE_EFFECT_UNKNOWN,
     SIDE_EFFECT_VERIFIED,
     STATUS_FAILED,
-    STATUS_NEEDS_RECONCILIATION,
+    STATUS_SIDE_EFFECT_UNKNOWN,
     STATUS_NOT_APPLIED,
     STATUS_VERIFIED,
     ShadowBotResultContract,
@@ -123,7 +123,7 @@ def run_local_demo_from_args(args: argparse.Namespace) -> dict[str, object]:
     repository_executor.record_result(
         ShadowBotResultContract(
             execution_attempt_id=branches["post_submit_unknown"].execution_attempt_id,
-            status=STATUS_NEEDS_RECONCILIATION,
+            status=STATUS_SIDE_EFFECT_UNKNOWN,
             run_success_flag=None,
             business_operation_completed=None,
             side_effect_state=SIDE_EFFECT_UNKNOWN,
@@ -132,7 +132,7 @@ def run_local_demo_from_args(args: argparse.Namespace) -> dict[str, object]:
             **_binding_fields(repository, branches["post_submit_unknown"].execution_attempt_id),
             raw_output=_result_payload(
                 branches["post_submit_unknown"],
-                status=STATUS_NEEDS_RECONCILIATION,
+                status=STATUS_SIDE_EFFECT_UNKNOWN,
                 side_effect_state=SIDE_EFFECT_UNKNOWN,
                 old_price=args.expected_old_price,
                 target_price=args.target_price,

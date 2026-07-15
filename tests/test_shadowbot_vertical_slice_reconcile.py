@@ -68,7 +68,7 @@ def test_reconcile_needs_reconciliation_when_actual_price_is_other_value():
 
     update = build_update("20.00", "19.00", "19.50")
 
-    assert update["status"] == "NEEDS_RECONCILIATION"
+    assert update["status"] == "SIDE_EFFECT_UNKNOWN"
     assert update["run_success_flag"] is None
     assert update["business_operation_completed"] is None
     assert update["side_effect_state"] == "UNKNOWN"
@@ -87,7 +87,7 @@ def test_reconcile_mode_is_read_only_and_does_not_reference_confirm_selector():
     assert "_build_reconcile_update" in reconcile_block
     assert "_capture_window" in reconcile_block
     assert "_run_fill_preview" not in reconcile_block
-    assert "NEEDS_RECONCILIATION" in source
+    assert "SIDE_EFFECT_UNKNOWN" in source
 
 
 def test_commit_mode_records_submit_intent_and_verifies_after_submit():
@@ -120,7 +120,7 @@ def test_commit_side_effect_exception_is_not_retryable_failed():
     assert "def _has_submit_side_effect(" in source
     assert "def _mark_submit_result_unknown(" in source
     assert 'if execution_mode == "COMMIT" and _has_submit_side_effect(result):' in source
-    assert '"status": "NEEDS_RECONCILIATION"' in source
+    assert '"status": "SIDE_EFFECT_UNKNOWN"' in source
     assert '"error_code": "SUBMIT_RESULT_UNKNOWN"' in source
     assert '"original_error_code": original_error_code' in source
     assert '"retryable": False' in source
@@ -138,7 +138,7 @@ def test_commit_side_effect_exception_helper_marks_reconciliation():
         "list price disappeared",
     )
 
-    assert result["status"] == "NEEDS_RECONCILIATION"
+    assert result["status"] == "SIDE_EFFECT_UNKNOWN"
     assert result["run_success_flag"] is None
     assert result["business_operation_completed"] is None
     assert result["current_step"] == "VERIFY_AFTER_SUBMIT"

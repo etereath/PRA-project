@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 
-import xbot
+import xbot  # noqa: F401 - ShadowBot runtime import initializes host bindings.
 from xbot import print, sleep, win32
 from xbot.selector import Selector
 
@@ -1038,7 +1038,7 @@ def _get_or_open_and_prepare_window(
         if existing_window_error.code != "WINDOW_NOT_AVAILABLE":
             raise
 
-    uri = _launch_applet_uri(applet_uri, uri_launcher=uri_launcher)
+    _launch_applet_uri(applet_uri, uri_launcher=uri_launcher)
     opened_at = _now_iso()
     attempts = max(1, int(float(launch_timeout_seconds) / 0.5))
     try:
@@ -1250,7 +1250,7 @@ def _build_reconcile_update(actual_price, expected_old_price, target_price):
             "retryable": False,
         }
     return {
-        "status": "NEEDS_RECONCILIATION",
+        "status": "SIDE_EFFECT_UNKNOWN",
         "run_success_flag": None,
         "business_operation_completed": None,
         "side_effect_state": "UNKNOWN",
@@ -1277,7 +1277,7 @@ def _has_submit_side_effect(result):
 def _mark_submit_result_unknown(result, current_step, original_error_code, original_error_message):
     result.update(
         {
-            "status": "NEEDS_RECONCILIATION",
+            "status": "SIDE_EFFECT_UNKNOWN",
             "run_success_flag": None,
             "business_operation_completed": None,
             "current_step": current_step,
@@ -1864,6 +1864,8 @@ def main(args):
                 "expected_spec": expected_spec,
                 "instruction_hash": str(_get_arg(request, "instruction_hash", "")),
                 "request_file_sha256": str(_get_arg(request, "request_file_sha256", "")),
+                "lease_owner_token": str(_get_arg(request, "lease_owner_token", "")),
+                "lease_version": int(_get_arg(request, "lease_version", 0) or 0),
                 "worker_id": str(_get_arg(request, "worker_id", "")),
             }
         )
@@ -2122,7 +2124,7 @@ def main(args):
                 if not after_price:
                     result.update(
                         {
-                            "status": "NEEDS_RECONCILIATION",
+                            "status": "SIDE_EFFECT_UNKNOWN",
                             "run_success_flag": None,
                             "business_operation_completed": None,
                             "side_effect_state": "UNKNOWN",
@@ -2135,7 +2137,7 @@ def main(args):
                 elif after_price == target_price:
                     result.update(
                         {
-                            "status": "SUCCESS",
+                            "status": "VERIFIED",
                             "run_success_flag": True,
                             "business_operation_completed": True,
                             "side_effect_state": "VERIFIED",
@@ -2160,7 +2162,7 @@ def main(args):
                     else:
                         result.update(
                             {
-                                "status": "NEEDS_RECONCILIATION",
+                                "status": "SIDE_EFFECT_UNKNOWN",
                                 "run_success_flag": None,
                                 "business_operation_completed": None,
                                 "side_effect_state": "UNKNOWN",
@@ -2172,7 +2174,7 @@ def main(args):
                 else:
                     result.update(
                         {
-                            "status": "NEEDS_RECONCILIATION",
+                            "status": "SIDE_EFFECT_UNKNOWN",
                             "run_success_flag": None,
                             "business_operation_completed": None,
                             "side_effect_state": "UNKNOWN",
@@ -2189,7 +2191,7 @@ def main(args):
                         "evidence_status": _summarize_evidence_status(evidence_items),
                     }
                 )
-        if result.get("status") in ("SUCCESS", "ALREADY_APPLIED", "VERIFIED", "READ_COMPLETED", "PREVIEW_COMPLETED", "NOT_APPLIED"):
+        if result.get("status") in ("VERIFIED", "READ_COMPLETED", "PREVIEW_COMPLETED", "NOT_APPLIED"):
             _write_phase(request, result, "VERIFIED", include_result_snapshot=True)
     except SliceError as exc:
         if (
@@ -2234,6 +2236,6 @@ def main(args):
             )
 
     result["ended_at"] = _now_iso()
-    if "request" in locals() and result.get("status") == "NEEDS_RECONCILIATION":
+    if "request" in locals() and result.get("status") == "SIDE_EFFECT_UNKNOWN":
         _write_phase(request, result, "SUBMIT_CLICKED")
     return _set_result(args, result)

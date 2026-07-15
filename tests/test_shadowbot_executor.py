@@ -153,6 +153,15 @@ def _result_binding(repository: SQLiteRuntimeRepository, execution_attempt_id: s
     }
 
 
+def _lease_binding(repository: SQLiteRuntimeRepository, execution_attempt_id: str) -> dict[str, object]:
+    attempt = repository.get_shadowbot_execution_attempt(execution_attempt_id)
+    lease = attempt.raw_output["lease"]
+    return {
+        "lease_owner_token": str(lease["owner_token"]),
+        "lease_version": int(lease["version"]),
+    }
+
+
 def _queue_payload(execution_attempt_id: str) -> dict[str, object]:
     payload = {
         "schema_version": "shadowbot-request-1.0",
@@ -339,6 +348,7 @@ class ShadowBotExecutorTests(unittest.TestCase):
             operation_id="OP-1",
             execution_attempt_id="ATTEMPT-1",
             side_effect_state=SIDE_EFFECT_SUBMIT_INTENT_RECORDED,
+            **_lease_binding(self.repository, "ATTEMPT-1"),
         )
 
         classification = self.executor.classify_timeout("OP-1")
@@ -361,6 +371,7 @@ class ShadowBotExecutorTests(unittest.TestCase):
             operation_id="OP-1",
             execution_attempt_id="ATTEMPT-1",
             side_effect_state=SIDE_EFFECT_SUBMIT_INTENT_RECORDED,
+            **_lease_binding(self.repository, "ATTEMPT-1"),
         )
         self.executor.record_result(
             ShadowBotResultContract(
@@ -492,6 +503,7 @@ class ShadowBotExecutorTests(unittest.TestCase):
             operation_id="OP-1",
             execution_attempt_id="ATTEMPT-1",
             side_effect_state=SIDE_EFFECT_SUBMIT_INTENT_RECORDED,
+            **_lease_binding(self.repository, "ATTEMPT-1"),
         )
         self.executor.record_result(
             ShadowBotResultContract(
@@ -563,6 +575,7 @@ class ShadowBotExecutorTests(unittest.TestCase):
             operation_id="OP-1",
             execution_attempt_id="ATTEMPT-1",
             side_effect_state=SIDE_EFFECT_SUBMIT_INTENT_RECORDED,
+            **_lease_binding(self.repository, "ATTEMPT-1"),
         )
         self.executor.record_result(
             ShadowBotResultContract(
@@ -997,7 +1010,7 @@ class ShadowBotExecutorTests(unittest.TestCase):
         self.assertEqual(reconcile_attempt.execution_mode, EXECUTION_MODE_RECONCILE)
         self.assertIn(f"{reconcile_id}.ready.json", request_files)
         self.assertEqual(summary["reconcile"]["execution_attempt_id"], reconcile_id)
-        self.assertTrue(any('"status": "NEEDS_RECONCILIATION"' in log.raw_output for log in logs))
+        self.assertTrue(any('"status": "SIDE_EFFECT_UNKNOWN"' in log.raw_output for log in logs))
         self.assertTrue(any('"status": "NOT_APPLIED"' in log.raw_output for log in logs))
 
     def test_readiness_report_accepts_complete_openapi_config_and_redacts_secrets(self) -> None:
