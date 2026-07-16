@@ -23,6 +23,7 @@ from app.enums import NotificationSendStatus, ReviewTaskStatus, TaskActionType, 
 from app.exceptions import MobileReviewErrorCode, MobileReviewTransactionError, TableValidationError, ValidationError
 from app.field_labels import FIELD_LABELS, TABLE_LABELS
 from app.models import NotificationLog
+from app.repositories.sqlite_connection import SQLiteConnectionError, SQLiteConnectionFactory
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.mock_platform_repository import DEFAULT_MOCK_PLATFORM_DB, MockPlatformRepository
 from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION
@@ -7573,13 +7574,13 @@ def _is_runtime_db_readable(db_path: Path) -> bool:
     if not db_path.exists():
         return False
     try:
-        connection = sqlite3.connect(_sqlite_readonly_uri(db_path), uri=True)
+        connection = SQLiteConnectionFactory(db_path).connect_read()
         try:
             connection.execute("SELECT 1").fetchone()
         finally:
             connection.close()
         return True
-    except sqlite3.Error:
+    except (sqlite3.Error, SQLiteConnectionError):
         return False
 
 
@@ -7595,18 +7596,14 @@ def _safe_count_query(db_path: Path, sql: str, params: tuple[str, ...]) -> tuple
     if not db_path.exists():
         return None, "DB 文件不存在。"
     try:
-        connection = sqlite3.connect(_sqlite_readonly_uri(db_path), uri=True)
+        connection = SQLiteConnectionFactory(db_path).connect_read()
         try:
             row = connection.execute(sql, params).fetchone()
         finally:
             connection.close()
         return int(row[0]) if row else 0, None
-    except sqlite3.Error as exc:
+    except (sqlite3.Error, SQLiteConnectionError) as exc:
         return None, f"查询失败：{type(exc).__name__}"
-
-
-def _sqlite_readonly_uri(db_path: Path) -> str:
-    return f"{db_path.resolve().as_uri()}?mode=ro"
 
 
 def _present_or_missing(value: str) -> str:

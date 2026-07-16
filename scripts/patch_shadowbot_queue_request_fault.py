@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import sqlite3
 import sys
+from contextlib import closing
 from pathlib import Path
+
+from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 
 
 ALLOWED_FAULTS = {
@@ -61,7 +63,7 @@ def main() -> int:
     checksum_path.write_text(request_file_sha256 + "\n", encoding="ascii")
     database_updated = False
     if args.runtime_db is not None:
-        with sqlite3.connect(args.runtime_db) as connection:
+        with closing(SQLiteRuntimeRepository(args.runtime_db).connect()) as connection, connection:
             cursor = connection.execute(
                 """
                 UPDATE shadowbot_execution_attempts
