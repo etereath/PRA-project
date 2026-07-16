@@ -17,9 +17,10 @@ from uuid import uuid4
 from app.enums import TaskStatus
 from app.enums import ReviewTaskStatus
 from app.exceptions import ValidationError
-from app.models import ExecutionLog, NotificationLog, NotificationSendResult, ReviewTask, ShadowBotExecutionAttempt, ShadowBotOperationLedger
+from app.models import ExecutionLog, ReviewTask, ShadowBotExecutionAttempt, ShadowBotOperationLedger
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.services.runtime import NotificationLogService, NotificationSenderFactory, RuntimeTaskService
+from app.services.notification_outbox import OutboxReviewNotificationService
+from app.services.runtime import RuntimeTaskService
 from app.services.shadowbot_state import (
     AttemptStatus,
     OperationStatus,
@@ -497,6 +498,7 @@ class ShadowBotExecutor:
         self.repository = repository
         self.runner = runner
         self.runtime_task_service = RuntimeTaskService(repository)
+        self.notification_outbox_service = OutboxReviewNotificationService(repository)
 
     def start_execution(self, request: ShadowBotExecutionRequest) -> ShadowBotExecutorStartResult:
         self.repository.init_schema()
@@ -876,57 +878,17 @@ class ShadowBotExecutor:
             created_at=now,
             updated_at=now,
         )
-        if self.repository.insert_review_tasks([review]) != 1:
-            return review_task_id
-        self._send_login_verification_notification(review)
+        self.notification_outbox_service.create_verification_review_task_atomically(
+            review,
+            operation_id=operation.operation_id,
+            attempt_id=attempt.execution_attempt_id,
+            payload={
+                "platform_name": review.platform_name or "-",
+                "required_by": deadline.isoformat(),
+                "verification_markers": list(login.get("verification_markers") or [])[:5],
+            },
+        )
         return review_task_id
-
-    def _send_login_verification_notification(self, review: ReviewTask) -> None:
-        channel = os.environ.get("DEFAULT_NOTIFICATION_CHANNEL", "mock").strip() or "mock"
-        recipient_type = os.environ.get("DEFAULT_NOTIFICATION_RECIPIENT_TYPE", "role").strip() or "role"
-        recipient = os.environ.get("DEFAULT_NOTIFICATION_RECIPIENT", "operations").strip() or "operations"
-        deadline = review.required_by.isoformat(timespec="minutes") if review.required_by else "-"
-        message = (
-            "ShadowBot 登录验证码人工接管 | "
-            f"平台={review.platform_name or '-'} | attempt={review.scope_key} | 截止={deadline}"
-        )
-        payload = {
-            "notification_kind": "shadowbot_login_verification",
-            "title": "ShadowBot 登录验证码人工接管",
-            "platform_name": review.platform_name or "-",
-            "execution_attempt_id": review.scope_key,
-            "required_by": deadline,
-            "action": "请在已打开的桌面端微信小程序中完成手机验证码；完成后 Worker 将继续原任务。",
-        }
-        sender = NotificationSenderFactory().build(channel)
-        log = NotificationLog(
-            notification_id=uuid4().hex[:12],
-            related_task_id=review.source_task_id,
-            related_review_task_id=review.review_task_id,
-            recipient_type=recipient_type,
-            recipient=recipient,
-            channel=sender.channel,
-            sent_at=None,
-            send_status="pending",
-            dedupe_key=f"shadowbot-login-verification:{review.scope_key}:{sender.channel}:{recipient}",
-            message=message,
-            created_at=utc_now(),
-        )
-        try:
-            send_result = sender.send(log, payload)
-        except Exception as exc:
-            send_result = NotificationSendResult(
-                send_status="failed",
-                sent_at=None,
-                error_message=type(exc).__name__,
-            )
-        persisted = replace(
-            log,
-            send_status=send_result.send_status,
-            sent_at=send_result.sent_at,
-            error_message=send_result.error_message,
-        )
-        NotificationLogService(self.repository).append(persisted)
 
     def _resolve_login_verification_handoff(
         self,

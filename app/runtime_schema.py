@@ -402,7 +402,7 @@ def _check_notification_outbox_constraints(
     connection: sqlite3.Connection,
     errors: list[str],
 ) -> tuple[str, ...]:
-    """Validate v6 keys, foreign keys, status checks, and named indexes."""
+    """Validate v6 keys, foreign keys, status/numeric checks, and indexes."""
 
     outbox_info = connection.execute("PRAGMA table_info(notification_outbox)").fetchall()
     outbox_columns = {str(row[1]): row for row in outbox_info}
@@ -465,6 +465,17 @@ def _check_notification_outbox_constraints(
                 + ", ".join(sorted(expected))
             )
 
+    numeric_checks = (
+        ("notification_outbox", "attempt_count", r"attempt_count\s*>=\s*0"),
+        ("notification_outbox", "max_attempts", r"max_attempts\s*>\s*0"),
+        ("notification_outbox", "lease_version", r"lease_version\s*>=\s*0"),
+        ("notification_delivery_attempts", "attempt_no", r"attempt_no\s*>\s*0"),
+        ("notification_delivery_attempts", "lease_version", r"lease_version\s*>=\s*0"),
+    )
+    for table, column, pattern in numeric_checks:
+        if not re.search(rf"\bCHECK\s*\(\s*{pattern}\s*\)", table_sql.get(table, ""), re.IGNORECASE):
+            errors.append(f"{table}.{column} lacks required numeric CHECK")
+
     index_rows = {
         str(row[1]): row
         for table in ("notification_outbox", "notification_delivery_attempts")
@@ -485,4 +496,21 @@ def _check_notification_outbox_constraints(
         )
         if actual_columns != expected_columns:
             errors.append(f"{index_name} columns={actual_columns}, expected {expected_columns}")
+
+    unique_attempt_key = False
+    for row in connection.execute("PRAGMA index_list('notification_delivery_attempts')").fetchall():
+        if int(row[2]) != 1:
+            continue
+        index_name = str(row[1])
+        actual_columns = tuple(
+            str(index_row[2])
+            for index_row in connection.execute(f"PRAGMA index_info('{index_name}')").fetchall()
+        )
+        if actual_columns == ("notification_id", "attempt_no"):
+            unique_attempt_key = True
+            break
+    if not unique_attempt_key:
+        errors.append(
+            "notification_delivery_attempts lacks UNIQUE(notification_id, attempt_no)"
+        )
     return tuple(sorted(missing_indexes))

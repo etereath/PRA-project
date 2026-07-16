@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from contextlib import closing
@@ -2601,14 +2602,36 @@ class SQLiteRuntimeRepository:
         """Update the v5 compatibility projection after an Outbox writeback."""
 
         with closing(self.connect_write()) as connection, connection:
-            return connection.execute(
-                """
-                UPDATE notification_logs
-                SET send_status = ?, sent_at = ?, error_message = ?
-                WHERE notification_id = ?
-                """,
-                (send_status, _datetime_to_text(sent_at), str(error_message or "")[:1000], notification_id),
-            ).rowcount == 1
+            return self._update_notification_log_delivery_on_connection(
+                connection,
+                notification_id,
+                send_status=send_status,
+                sent_at=sent_at,
+                error_message=error_message,
+            )
+
+    @staticmethod
+    def _update_notification_log_delivery_on_connection(
+        connection: sqlite3.Connection,
+        notification_id: str,
+        *,
+        send_status: str,
+        sent_at: datetime | None = None,
+        error_message: str = "",
+    ) -> bool:
+        return connection.execute(
+            """
+            UPDATE notification_logs
+            SET send_status = ?, sent_at = ?, error_message = ?
+            WHERE notification_id = ?
+            """,
+            (
+                send_status,
+                _datetime_to_text(sent_at),
+                _sanitize_persisted_error(error_message),
+                notification_id,
+            ),
+        ).rowcount == 1
 
     # ------------------------------------------------------------------
     # Schema v6 durable notification outbox
@@ -2758,6 +2781,7 @@ class SQLiteRuntimeRepository:
         now: datetime | None = None,
         lease_seconds: int = 60,
         limit: int = 1,
+        channel: str | None = None,
     ) -> list[NotificationOutbox]:
         """Claim due notifications using one short BEGIN IMMEDIATE transaction."""
 
@@ -2765,29 +2789,49 @@ class SQLiteRuntimeRepository:
             raise ValueError("lease_seconds must be between 1 and 3600")
         if limit <= 0:
             return []
-        reference_time = now or self._clock()
-        reference_text = _datetime_to_text(reference_time)
         connection = self.connect_write()
         claimed: list[NotificationOutbox] = []
         try:
             connection.execute("BEGIN IMMEDIATE")
+            # Read the authoritative clock only after acquiring the write lock.
+            reference_time = now or self._clock()
+            reference_text = _datetime_to_text(reference_time)
             # A deadline is authoritative even if a worker has not yet claimed
             # the row.  SENDING rows are handled separately by the watchdog.
-            connection.execute(
+            expired_rows = connection.execute(
                 """
-                UPDATE notification_outbox
-                SET status = 'EXPIRED', lease_owner_token = '', lease_expires_at = NULL,
-                    last_error_code = 'DEADLINE_EXPIRED',
-                    last_error_message = 'notification deadline expired before delivery',
-                    updated_at = ?
+                SELECT notification_id FROM notification_outbox
                 WHERE status IN ('PENDING', 'RETRY_WAIT')
-                  AND deadline_at IS NOT NULL
-                  AND deadline_at <= ?
+                  AND deadline_at IS NOT NULL AND deadline_at <= ?
                 """,
-                (reference_text, reference_text),
-            )
+                (reference_text,),
+            ).fetchall()
+            for expired_row in expired_rows:
+                notification_id = str(expired_row["notification_id"])
+                connection.execute(
+                    """
+                    UPDATE notification_outbox
+                    SET status = 'EXPIRED', lease_owner_token = '', lease_expires_at = NULL,
+                        last_error_code = 'DEADLINE_EXPIRED',
+                        last_error_message = 'notification deadline expired before delivery',
+                        updated_at = ?
+                    WHERE notification_id = ? AND status IN ('PENDING', 'RETRY_WAIT')
+                    """,
+                    (reference_text, notification_id),
+                )
+                self._update_notification_log_delivery_on_connection(
+                    connection,
+                    notification_id,
+                    send_status="failed",
+                    error_message="notification deadline expired before delivery",
+                )
+            channel_clause = ""
+            channel_params: list[object] = []
+            if channel:
+                channel_clause = " AND channel = ?"
+                channel_params.append(str(channel).strip().lower())
             rows = connection.execute(
-                """
+                f"""
                 SELECT * FROM notification_outbox
                 WHERE (
                     (
@@ -2799,13 +2843,14 @@ class SQLiteRuntimeRepository:
                         AND lease_expires_at IS NOT NULL
                         AND lease_expires_at <= ?
                     )
-                )
+                  )
                   AND (deadline_at IS NULL OR deadline_at > ?)
+                  {channel_clause}
                 ORDER BY priority DESC, deadline_at IS NULL, deadline_at ASC,
                          created_at ASC, notification_id ASC
                 LIMIT ?
                 """,
-                (reference_text, reference_text, reference_text, int(limit)),
+                [reference_text, reference_text, reference_text, *channel_params, int(limit)],
             ).fetchall()
             for row in rows:
                 owner_token = uuid4().hex
@@ -2866,8 +2911,10 @@ class SQLiteRuntimeRepository:
     ) -> bool:
         if lease_seconds <= 0 or lease_seconds > 3600:
             raise ValueError("lease_seconds must be between 1 and 3600")
-        reference_time = now or self._clock()
-        with closing(self.connect_write()) as connection, connection:
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            reference_time = now or self._clock()
             changed = connection.execute(
                 """
                 UPDATE notification_outbox
@@ -2888,7 +2935,14 @@ class SQLiteRuntimeRepository:
                     _datetime_to_text(reference_time),
                 ),
             ).rowcount
-        return changed == 1
+            connection.commit()
+            return changed == 1
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     renew_notification_lease = renew_notification_outbox_lease
 
@@ -2901,11 +2955,11 @@ class SQLiteRuntimeRepository:
         request_fingerprint: str,
         now: datetime | None = None,
     ) -> NotificationDeliveryAttempt:
-        reference_time = now or self._clock()
-        reference_text = _datetime_to_text(reference_time)
         connection = self.connect_write()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            reference_time = now or self._clock()
+            reference_text = _datetime_to_text(reference_time)
             row = connection.execute(
                 "SELECT * FROM notification_outbox WHERE notification_id = ?",
                 (notification_id,),
@@ -2915,9 +2969,13 @@ class SQLiteRuntimeRepository:
                 or str(row["status"]) != "LEASED"
                 or str(row["lease_owner_token"] or "") != owner_token
                 or int(row["lease_version"] or 0) != int(lease_version)
-                or row["lease_expires_at"] is None
-                or str(row["lease_expires_at"]) <= str(reference_text)
-                or (row["deadline_at"] is not None and str(row["deadline_at"]) <= str(reference_text))
+                or _coerce_datetime_for_comparison(_text_to_datetime(row["lease_expires_at"]), reference_time) is None
+                or _coerce_datetime_for_comparison(_text_to_datetime(row["lease_expires_at"]), reference_time) <= reference_time
+                or (
+                    row["deadline_at"] is not None
+                    and _coerce_datetime_for_comparison(_text_to_datetime(row["deadline_at"]), reference_time) is not None
+                    and _coerce_datetime_for_comparison(_text_to_datetime(row["deadline_at"]), reference_time) <= reference_time
+                )
                 or int(row["attempt_count"] or 0) >= int(row["max_attempts"] or 0)
             ):
                 connection.rollback()
@@ -2992,12 +3050,12 @@ class SQLiteRuntimeRepository:
         classification = str(getattr(result.classification, "value", result.classification)).upper()
         if classification not in {"SUCCESS", "TEMP_FAILED", "PERM_FAILED", "UNKNOWN"}:
             raise ValueError(f"unsupported delivery classification: {result.classification}")
-        reference_time = now or self._clock()
-        reference_text = _datetime_to_text(reference_time)
-        error_message = str(result.error_message or "")[:1000]
         connection = self.connect_write()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            reference_time = now or self._clock()
+            reference_text = _datetime_to_text(reference_time)
+            error_message = _sanitize_persisted_error(result.error_message)
             row = connection.execute(
                 "SELECT * FROM notification_outbox WHERE notification_id = ?",
                 (notification_id,),
@@ -3019,6 +3077,24 @@ class SQLiteRuntimeRepository:
             ):
                 connection.rollback()
                 raise NotificationDeliveryError("notification delivery result was fenced")
+
+            lease_expires_at = _coerce_datetime_for_comparison(
+                _text_to_datetime(row["lease_expires_at"]), reference_time
+            )
+            deadline_at = _coerce_datetime_for_comparison(
+                _text_to_datetime(row["deadline_at"]), reference_time
+            )
+            if (
+                lease_expires_at is None
+                or lease_expires_at <= reference_time
+                or (deadline_at is not None and deadline_at <= reference_time)
+            ):
+                # Leave SENDING + STARTED evidence intact.  The watchdog owns
+                # the safe transition to UNKNOWN_DELIVERY after this point.
+                connection.rollback()
+                raise NotificationDeliveryError(
+                    "notification delivery lease or deadline expired before writeback"
+                )
 
             if classification == "SUCCESS":
                 attempt_status = "ACKNOWLEDGED"
@@ -3043,7 +3119,9 @@ class SQLiteRuntimeRepository:
                 last_error_message = error_message
             else:
                 attempt_status = "TEMP_FAILED"
-                deadline = _text_to_datetime(row["deadline_at"])
+                deadline = _coerce_datetime_for_comparison(
+                    _text_to_datetime(row["deadline_at"]), reference_time
+                )
                 max_attempts_reached = int(row["attempt_count"] or 0) >= int(row["max_attempts"] or 0)
                 if deadline is not None and deadline <= reference_time:
                     outbox_status = "EXPIRED"
@@ -3114,6 +3192,22 @@ class SQLiteRuntimeRepository:
             if changed != 1:
                 connection.rollback()
                 raise NotificationDeliveryError("notification writeback was fenced")
+            if outbox_status == "SENT":
+                compatibility_status = "success"
+                compatibility_sent_at = _text_to_datetime(sent_at)
+            elif outbox_status in {"PENDING", "LEASED", "SENDING", "RETRY_WAIT"}:
+                compatibility_status = "pending"
+                compatibility_sent_at = None
+            else:
+                compatibility_status = "failed"
+                compatibility_sent_at = None
+            self._update_notification_log_delivery_on_connection(
+                connection,
+                notification_id,
+                send_status=compatibility_status,
+                sent_at=compatibility_sent_at,
+                error_message=last_error_message,
+            )
             connection.commit()
             final_row = connection.execute(
                 "SELECT * FROM notification_outbox WHERE notification_id = ?",
@@ -3153,31 +3247,48 @@ class SQLiteRuntimeRepository:
     ) -> list[NotificationOutbox]:
         """Requeue safe LEASED rows and fence expired SENDING rows as UNKNOWN."""
 
-        reference_time = now or self._clock()
-        reference_text = _datetime_to_text(reference_time)
         connection = self.connect_write()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
+            reference_time = now or self._clock()
+            reference_text = _datetime_to_text(reference_time)
+            deadline_rows = connection.execute(
                 """
-                UPDATE notification_outbox
-                SET status = 'EXPIRED', lease_owner_token = '', lease_expires_at = NULL,
-                    last_error_code = 'DEADLINE_EXPIRED',
-                    last_error_message = 'notification deadline expired', updated_at = ?
+                SELECT notification_id FROM notification_outbox
                 WHERE status IN ('LEASED', 'RETRY_WAIT', 'PENDING')
                   AND deadline_at IS NOT NULL AND deadline_at <= ?
                 """,
-                (reference_text, reference_text),
-            )
+                (reference_text,),
+            ).fetchall()
+            for row in deadline_rows:
+                notification_id = str(row["notification_id"])
+                connection.execute(
+                    """
+                    UPDATE notification_outbox
+                    SET status = 'EXPIRED', lease_owner_token = '', lease_expires_at = NULL,
+                        last_error_code = 'DEADLINE_EXPIRED',
+                        last_error_message = 'notification deadline expired', updated_at = ?
+                    WHERE notification_id = ? AND status IN ('LEASED', 'RETRY_WAIT', 'PENDING')
+                    """,
+                    (reference_text, notification_id),
+                )
+                self._update_notification_log_delivery_on_connection(
+                    connection,
+                    notification_id,
+                    send_status="failed",
+                    error_message="notification deadline expired",
+                )
             leased_rows = connection.execute(
                 """
                 SELECT notification_id FROM notification_outbox
                 WHERE status = 'LEASED' AND lease_expires_at IS NOT NULL
                   AND lease_expires_at <= ?
+                  AND (deadline_at IS NULL OR deadline_at > ?)
                 """,
-                (reference_text,),
+                (reference_text, reference_text),
             ).fetchall()
             for row in leased_rows:
+                notification_id = str(row["notification_id"])
                 connection.execute(
                     """
                     UPDATE notification_outbox
@@ -3185,24 +3296,29 @@ class SQLiteRuntimeRepository:
                         updated_at = ?
                     WHERE notification_id = ? AND status = 'LEASED'
                     """,
-                    (reference_text, row["notification_id"]),
+                    (reference_text, notification_id),
+                )
+                self._update_notification_log_delivery_on_connection(
+                    connection,
+                    notification_id,
+                    send_status="pending",
                 )
             sending_rows = connection.execute(
                 """
                 SELECT notification_id, lease_owner_token, lease_version
                 FROM notification_outbox
                 WHERE status = 'SENDING' AND lease_expires_at IS NOT NULL
-                  AND lease_expires_at <= ?
+                  AND (lease_expires_at <= ? OR (deadline_at IS NOT NULL AND deadline_at <= ?))
                 """,
-                (reference_text,),
+                (reference_text, reference_text),
             ).fetchall()
             for row in sending_rows:
                 connection.execute(
                     """
                     UPDATE notification_delivery_attempts
                     SET status = 'UNKNOWN', completed_at = ?,
-                        error_code = 'LEASE_EXPIRED_UNKNOWN_DELIVERY',
-                        error_message = 'worker lease expired while sending'
+                        error_code = 'UNKNOWN_DELIVERY_WATCHDOG',
+                        error_message = 'worker lease or deadline expired while sending'
                     WHERE notification_id = ? AND status = 'STARTED'
                       AND lease_owner_token = ? AND lease_version = ?
                     """,
@@ -3217,15 +3333,22 @@ class SQLiteRuntimeRepository:
                     """
                     UPDATE notification_outbox
                     SET status = 'UNKNOWN_DELIVERY', lease_owner_token = '',
-                        lease_expires_at = NULL, last_error_code = 'LEASE_EXPIRED_UNKNOWN_DELIVERY',
-                        last_error_message = 'worker lease expired while sending', updated_at = ?
+                        lease_expires_at = NULL, last_error_code = 'UNKNOWN_DELIVERY_WATCHDOG',
+                        last_error_message = 'worker lease or deadline expired while sending', updated_at = ?
                     WHERE notification_id = ? AND status = 'SENDING'
                     """,
                     (reference_text, row["notification_id"]),
                 )
+                self._update_notification_log_delivery_on_connection(
+                    connection,
+                    str(row["notification_id"]),
+                    send_status="failed",
+                    error_message="worker lease or deadline expired while sending",
+                )
             changed_ids = [row["notification_id"] for row in leased_rows] + [
                 row["notification_id"] for row in sending_rows
-            ]
+            ] + [row["notification_id"] for row in deadline_rows]
+            changed_ids = list(dict.fromkeys(changed_ids))
             connection.commit()
             if not changed_ids:
                 return []
@@ -3246,9 +3369,12 @@ class SQLiteRuntimeRepository:
     watchdog_notification_leases = recover_expired_notification_leases
 
     def cancel_notification_outbox(self, notification_id: str, *, now: datetime | None = None) -> bool:
-        reference_text = _datetime_to_text(now or self._clock())
-        with closing(self.connect_write()) as connection, connection:
-            return connection.execute(
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            reference_time = now or self._clock()
+            reference_text = _datetime_to_text(reference_time)
+            changed = connection.execute(
                 """
                 UPDATE notification_outbox
                 SET status = 'CANCELLED', lease_owner_token = '', lease_expires_at = NULL,
@@ -3256,7 +3382,22 @@ class SQLiteRuntimeRepository:
                 WHERE notification_id = ? AND status IN ('PENDING', 'RETRY_WAIT', 'LEASED')
                 """,
                 (reference_text, notification_id),
-            ).rowcount == 1
+            ).rowcount
+            if changed == 1:
+                self._update_notification_log_delivery_on_connection(
+                    connection,
+                    notification_id,
+                    send_status="failed",
+                    error_message="notification cancelled",
+                )
+            connection.commit()
+            return changed == 1
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def insert_script_run(self, script_run: ScriptRun) -> int:
         row = _script_run_to_row(script_run)
@@ -3909,6 +4050,32 @@ def _text_to_datetime(value: str | None) -> datetime | None:
     if value in ("", None):
         return None
     return datetime.fromisoformat(str(value))
+
+
+def _coerce_datetime_for_comparison(value: datetime | None, reference: datetime) -> datetime | None:
+    """Compare legacy naive timestamps with current timezone-aware timestamps safely."""
+
+    if value is None:
+        return None
+    if value.tzinfo is None and reference.tzinfo is not None:
+        return value.replace(tzinfo=reference.tzinfo)
+    if value.tzinfo is not None and reference.tzinfo is None:
+        return value.replace(tzinfo=None)
+    return value
+
+
+def _sanitize_persisted_error(value: object) -> str:
+    """Persist only a bounded, credential-free provider error summary."""
+
+    text = str(value or "")
+    text = re.sub(r"(?i)bearer\s+[a-z0-9._~+/=-]+", "Bearer [REDACTED]", text)
+    text = re.sub(
+        r"(?i)(authorization|cookie|password|access[_-]?token|webhook[_-]?url)\s*[:=]\s*\S+",
+        r"\1=[REDACTED]",
+        text,
+    )
+    text = re.sub(r"https?://\S+", "[URL_REDACTED]", text)
+    return text[:1000]
 
 
 def _json_dump(value: Any) -> str:

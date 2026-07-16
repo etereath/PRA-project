@@ -65,3 +65,11 @@ class NotificationLeaseError(NotificationOutboxError):
 
 class NotificationDeliveryError(NotificationOutboxError):
     """The delivery attempt cannot be completed under its current lease."""
+
+
+class NotificationIdempotencyConflictError(NotificationDeliveryError):
+    """A stable notification key was reused for a different immutable event."""
+
+
+class NotificationChannelMismatchError(NotificationDeliveryError):
+    """A provider adapter does not match the persisted notification channel."""

@@ -79,10 +79,12 @@ SQLite 只承接运行态任务系统，不替代 Excel 主数据。
 
 ### 2.5 飞书通知
 
-已完成飞书 Webhook 真实通知：
+已完成飞书 Webhook Outbox 通知链路：
 
-- `NotificationSenderFactory` 支持 `mock / feishu`。
-- `FeishuWebhookNotificationSender` 使用飞书自定义机器人 Webhook。
+- `NotificationChannelRegistry` 按持久化 `channel` 绑定 `fake / scripted / feishu`；默认运行态 review 不再直接调用 provider。
+- ShadowBot 登录验证码人工介入使用 `ReviewTask + verification_code_intervention Outbox` 单事务创建。
+- `FeishuOutboxSender` 使用飞书自定义机器人 Webhook；`notification-worker` CLI 提供一次 Watchdog/Worker 调度入口。
+- `FeishuWebhookNotificationSender` 保留为旧通知接口的兼容测试适配器。
 - 支持可选签名 `FEISHU_WEBHOOK_SECRET`。
 - 默认 `FEISHU_MESSAGE_TYPE=post`，使用飞书富文本消息。
 - `FEISHU_MESSAGE_TYPE=text` 可作为纯文本回退。
