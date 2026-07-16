@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import ctypes.wintypes as wintypes
 import ntpath
 import os
 import sqlite3
@@ -10,6 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, TypeVar
+from urllib.parse import parse_qsl, urlsplit
 
 
 T = TypeVar("T")
@@ -33,6 +35,14 @@ DRIVE_FIXED = 3
 DRIVE_REMOTE = 4
 DRIVE_CDROM = 5
 DRIVE_RAMDISK = 6
+
+FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+FILE_READ_ATTRIBUTES = 0x80
+FILE_SHARE_READ = 0x1
+FILE_SHARE_WRITE = 0x2
+FILE_SHARE_DELETE = 0x4
+OPEN_EXISTING = 3
+FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
 
 SQLITE_CONCURRENCY_ERROR_CODES = frozenset(
     getattr(sqlite3, name)
@@ -258,13 +268,10 @@ class SQLiteConnectionFactory:
         config: SQLiteConnectionConfig | None = None,
     ) -> None:
         self.config = config or SQLiteConnectionConfig.from_environment()
-        raw_path = os.fspath(db_path)
+        raw_path = os.fsdecode(os.fspath(db_path))
         self._is_memory = raw_path == ":memory:"
-        self._is_uri = raw_path.startswith("file:")
-        lowered_path = raw_path.lower()
-        self._is_memory_uri = self._is_uri and (
-            "mode=memory" in lowered_path or lowered_path.startswith("file::memory:")
-        )
+        self._is_uri = raw_path[:5].lower() == "file:"
+        self._is_memory_uri = self._is_uri and _is_memory_uri(raw_path)
         if self._is_memory or self._is_uri:
             self.db_path: Path | str = raw_path
         else:
@@ -383,24 +390,12 @@ def _validate_local_storage_path(db_path: Path) -> None:
 
     if os.name == "nt":
         for candidate in _existing_path_chain(Path(raw)):
-            try:
-                if not candidate.is_symlink():
-                    continue
-                link_target = os.readlink(candidate)
-            except OSError:
-                raise SQLiteStorageLocationError("Unable to verify SQLite reparse-point target") from None
-            if _is_non_local_path_syntax(os.fspath(link_target).replace("/", "\\")):
-                raise SQLiteStorageLocationError("SQLite runtime database must resolve to a local disk")
+            _validate_windows_reparse_target(candidate)
 
     resolved = Path(os.path.realpath(raw))
     if os.name == "nt":
         for candidate in (Path(raw), resolved):
-            drive, _ = ntpath.splitdrive(os.fspath(candidate))
-            if not drive:
-                continue
-            drive_type = _get_windows_drive_type(f"{drive}\\")
-            if drive_type in {DRIVE_REMOTE, DRIVE_UNKNOWN, DRIVE_NO_ROOT_DIR, DRIVE_CDROM}:
-                raise SQLiteStorageLocationError("SQLite runtime database must be on a local disk")
+            _validate_windows_drive_path(os.fspath(candidate))
 
 
 def _existing_path_chain(path: Path):
@@ -416,7 +411,150 @@ def _existing_path_chain(path: Path):
 
 
 def _is_non_local_path_syntax(path: str) -> bool:
-    return path.startswith("\\\\") or path.startswith("\\?\\") or path.startswith("\\.\\")
+    return (
+        path.startswith("\\\\")
+        or path.startswith("\\?\\")
+        or path.startswith("\\.\\")
+        or path.startswith("\\Device\\")
+    )
+
+
+def _is_memory_uri(raw_path: str) -> bool:
+    """Recognize only SQLite's controlled in-memory URI forms."""
+
+    if not raw_path.startswith("file:"):
+        return False
+    try:
+        parsed = urlsplit(raw_path)
+        if parsed.scheme != "file" or parsed.netloc or parsed.fragment:
+            return False
+        if "%" in parsed.path or "%" in parsed.query:
+            return False
+        parameters = parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+    except ValueError:
+        return False
+
+    if parsed.path == ":memory:":
+        return parameters in ([], [("cache", "shared")])
+
+    if not parsed.path or parsed.path in {".", ".."}:
+        return False
+    if parsed.path.startswith(("/", "\\")) or any(char in parsed.path for char in ("/", "\\", ":")):
+        return False
+    if len({key for key, _ in parameters}) != len(parameters):
+        return False
+    if parameters.count(("mode", "memory")) != 1:
+        return False
+    return all(
+        (key, value) in {("mode", "memory"), ("cache", "shared")}
+        for key, value in parameters
+    ) and len(parameters) <= 2
+
+
+def _validate_windows_reparse_target(candidate: Path) -> None:
+    is_symlink = candidate.is_symlink()
+    attributes = _get_windows_file_attributes(candidate)
+    is_reparse_point = bool(attributes is not None and attributes & FILE_ATTRIBUTE_REPARSE_POINT)
+    if not is_symlink and not is_reparse_point:
+        return
+
+    final_path = _get_windows_final_path(candidate)
+    if final_path is None and is_symlink:
+        try:
+            link_target = os.fspath(os.readlink(candidate)).replace("/", "\\")
+        except OSError:
+            raise SQLiteStorageLocationError("Unable to verify SQLite reparse-point target") from None
+        if _is_non_local_path_syntax(link_target):
+            raise SQLiteStorageLocationError("SQLite runtime database must resolve to a local disk")
+        raise SQLiteStorageLocationError("Unable to verify SQLite reparse-point target")
+    if final_path is None:
+        raise SQLiteStorageLocationError("Unable to verify SQLite reparse-point target")
+
+    normalized_final_path = _normalize_windows_final_path(final_path)
+    if _is_non_local_path_syntax(normalized_final_path):
+        raise SQLiteStorageLocationError("SQLite runtime database must resolve to a local disk")
+    _validate_windows_drive_path(normalized_final_path)
+
+
+def _get_windows_file_attributes(path: Path) -> int | None:
+    if os.name != "nt":
+        return None
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_file_attributes = kernel32.GetFileAttributesW
+    get_file_attributes.argtypes = [wintypes.LPCWSTR]
+    get_file_attributes.restype = wintypes.DWORD
+    attributes = int(get_file_attributes(os.fspath(path)))
+    return None if attributes == 0xFFFFFFFF else attributes
+
+
+def _get_windows_final_path(path: Path) -> str | None:
+    if os.name != "nt":
+        return None
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    get_final_path = kernel32.GetFinalPathNameByHandleW
+    get_final_path.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    get_final_path.restype = wintypes.DWORD
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    handle = create_file(
+        os.fspath(path),
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        None,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        None,
+    )
+    if handle == wintypes.HANDLE(-1).value:
+        return None
+    try:
+        buffer_length = 1024
+        while buffer_length <= 32768:
+            buffer = ctypes.create_unicode_buffer(buffer_length)
+            result = int(get_final_path(handle, buffer, buffer_length, 0))
+            if result == 0:
+                return None
+            if result < buffer_length:
+                return buffer.value
+            buffer_length *= 2
+        return None
+    finally:
+        close_handle(handle)
+
+
+def _normalize_windows_final_path(path: str) -> str:
+    normalized = path.replace("/", "\\")
+    unc_prefix = "\\\\?\\UNC\\"
+    dos_prefix = "\\\\?\\"
+    if normalized.startswith(unc_prefix):
+        return "\\\\" + normalized[len(unc_prefix):]
+    if normalized.startswith(dos_prefix):
+        remainder = normalized[len(dos_prefix):]
+        if len(remainder) >= 2 and remainder[1] == ":":
+            return remainder
+    return normalized
+
+
+def _validate_windows_drive_path(path: str) -> None:
+    drive, _ = ntpath.splitdrive(path)
+    if not drive:
+        return
+    drive_type = _get_windows_drive_type(f"{drive}\\")
+    if drive_type in {DRIVE_REMOTE, DRIVE_UNKNOWN, DRIVE_NO_ROOT_DIR, DRIVE_CDROM}:
+        raise SQLiteStorageLocationError("SQLite runtime database must be on a local disk")
 
 
 def _get_windows_drive_type(root: str) -> int | None:

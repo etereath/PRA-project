@@ -127,10 +127,14 @@ def _repository(
     operation_id: str = "OP-RECOVERY",
     *,
     connection_config: SQLiteConnectionConfig | None = None,
+    clock=None,
+    retry_sleep=None,
 ) -> SQLiteRuntimeRepository:
     repository = SQLiteRuntimeRepository(
         tmp_path / "runtime.sqlite3",
         connection_config=connection_config,
+        clock=clock,
+        retry_sleep=retry_sleep,
     )
     RuntimeTaskService(repository).init_schema()
     RuntimeTaskService(repository).create_tasks([_task()])
@@ -203,8 +207,15 @@ def _file_attempt(
     *,
     attempt_id: str = "ATTEMPT-FILE",
     connection_config: SQLiteConnectionConfig | None = None,
+    clock=None,
+    retry_sleep=None,
 ):
-    repository = _repository(tmp_path, connection_config=connection_config)
+    repository = _repository(
+        tmp_path,
+        connection_config=connection_config,
+        clock=clock,
+        retry_sleep=retry_sleep,
+    )
     queue_dir = tmp_path / "queue"
     runner = ShadowBotFileQueueRunner(queue_dir)
     executor = ShadowBotExecutor(repository, runner)
@@ -390,15 +401,23 @@ def test_task8_lease_renewal_retries_a_real_sqlite_lock(tmp_path: Path) -> None:
         retry_max_elapsed_ms=500,
         retry_base_delay_ms=1,
     )
+    retry_started = threading.Event()
+    release_retry_sleep = threading.Event()
+    outcome: dict[str, object] = {}
+
+    def retry_sleep(_seconds: float) -> None:
+        retry_started.set()
+        assert release_retry_sleep.wait(timeout=2)
+
     repository, _, _, _, attempt, _, _ = _file_attempt(
         tmp_path,
         connection_config=config,
+        retry_sleep=retry_sleep,
     )
     lease = _lease(attempt)
     blocker = repository.connect()
     blocker.execute("BEGIN IMMEDIATE")
     started = threading.Event()
-    outcome: dict[str, object] = {}
 
     def renew() -> None:
         started.set()
@@ -407,8 +426,7 @@ def test_task8_lease_renewal_retries_a_real_sqlite_lock(tmp_path: Path) -> None:
                 attempt.execution_attempt_id,
                 owner_token=str(lease["owner_token"]),
                 lease_version=int(lease["version"]),
-                now=datetime.now(UTC),
-                new_expires_at=datetime.now(UTC) + timedelta(minutes=20),
+                lease_seconds=1200,
             )
         except BaseException as exc:  # noqa: BLE001 - preserve thread failure for the assertion
             outcome["error"] = exc
@@ -416,9 +434,10 @@ def test_task8_lease_renewal_retries_a_real_sqlite_lock(tmp_path: Path) -> None:
     worker = threading.Thread(target=renew)
     worker.start()
     assert started.wait(timeout=2)
-    time.sleep(0.15)
+    assert retry_started.wait(timeout=2)
     blocker.rollback()
     blocker.close()
+    release_retry_sleep.set()
     worker.join(timeout=5)
 
     assert not worker.is_alive()
@@ -427,6 +446,75 @@ def test_task8_lease_renewal_retries_a_real_sqlite_lock(tmp_path: Path) -> None:
     renewed = repository.get_shadowbot_execution_attempt(attempt.execution_attempt_id)
     assert renewed is not None
     assert _lease(renewed)["expires_at"] != lease["expires_at"]
+
+
+def test_task8_lease_renewal_rechecks_time_after_lock_wait(tmp_path: Path) -> None:
+    base = datetime(2026, 7, 17, 8, 0, tzinfo=UTC)
+    retry_started = threading.Event()
+    release_retry_sleep = threading.Event()
+
+    def retry_sleep(_seconds: float) -> None:
+        retry_started.set()
+        assert release_retry_sleep.wait(timeout=2)
+
+    repository, _, _, _, attempt, _, _ = _file_attempt(
+        tmp_path,
+        connection_config=SQLiteConnectionConfig(
+            busy_timeout_ms=100,
+            retry_max_attempts=3,
+            retry_max_elapsed_ms=500,
+            retry_base_delay_ms=1,
+        ),
+        clock=lambda: base + timedelta(seconds=2),
+        retry_sleep=retry_sleep,
+    )
+    lease = _lease(attempt)
+    connection = repository.connect()
+    try:
+        raw = json.loads(
+            connection.execute(
+                "SELECT raw_output_json FROM shadowbot_execution_attempts WHERE execution_attempt_id = ?",
+                (attempt.execution_attempt_id,),
+            ).fetchone()[0]
+        )
+        raw["lease"]["expires_at"] = (base + timedelta(seconds=1)).isoformat()
+        connection.execute(
+            "UPDATE shadowbot_execution_attempts SET raw_output_json = ? WHERE execution_attempt_id = ?",
+            (json.dumps(raw), attempt.execution_attempt_id),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    blocker = repository.connect()
+    blocker.execute("BEGIN IMMEDIATE")
+    outcome: dict[str, object] = {}
+
+    def renew() -> None:
+        try:
+            outcome["result"] = repository.renew_shadowbot_lease(
+                attempt.execution_attempt_id,
+                owner_token=str(lease["owner_token"]),
+                lease_version=int(lease["version"]),
+                lease_seconds=900,
+            )
+        except BaseException as exc:  # noqa: BLE001 - preserve thread failure for the assertion
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=renew)
+    worker.start()
+    assert retry_started.wait(timeout=2)
+    blocker.rollback()
+    blocker.close()
+    release_retry_sleep.set()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert "error" not in outcome, outcome.get("error")
+    assert outcome.get("result") is False
+    unchanged = repository.get_shadowbot_execution_attempt(attempt.execution_attempt_id)
+    assert unchanged is not None
+    assert _lease(unchanged)["expires_at"] == (base + timedelta(seconds=1)).isoformat()
 
 
 def test_manual_retry_authorization_records_actor_reason_and_evidence(tmp_path: Path) -> None:

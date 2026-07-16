@@ -726,13 +726,11 @@ class ShadowBotExecutor:
         lease_version: int,
         lease_seconds: int = 900,
     ) -> bool:
-        now = utc_now()
         return self.repository.renew_shadowbot_lease(
             execution_attempt_id,
             owner_token=owner_token,
             lease_version=lease_version,
-            now=now,
-            new_expires_at=now + timedelta(seconds=max(int(lease_seconds), 1)),
+            lease_seconds=max(int(lease_seconds), 1),
         )
 
     def record_result(

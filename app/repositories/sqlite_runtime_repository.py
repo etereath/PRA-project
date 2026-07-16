@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from contextlib import closing
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -42,6 +43,7 @@ from app.runtime_schema import (
     inspect_runtime_schema,
 )
 from app.utils import serialize_decimal
+from app.utils import utc_now
 
 
 TERMINAL_TASK_STATUSES = ("success", "skipped", "cancelled", "expired")
@@ -370,12 +372,16 @@ class SQLiteRuntimeRepository:
         db_path: Path,
         *,
         connection_config: SQLiteConnectionConfig | None = None,
+        clock: Callable[[], datetime] | None = None,
+        retry_sleep: Callable[[float], None] | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.connection_factory = SQLiteConnectionFactory(
             self.db_path,
             config=connection_config,
         )
+        self._clock = clock or utc_now
+        self._retry_sleep = retry_sleep or time.sleep
 
     def connect(self) -> sqlite3.Connection:
         """Backward-compatible writable connection entrypoint."""
@@ -407,6 +413,7 @@ class SQLiteRuntimeRepository:
             max_elapsed_ms=config.retry_max_elapsed_ms or 0,
             base_delay_ms=config.retry_base_delay_ms,
             operation_name=operation_name,
+            sleep=self._retry_sleep,
         )
 
     def init_schema(self) -> None:
@@ -1753,8 +1760,7 @@ class SQLiteRuntimeRepository:
         *,
         owner_token: str,
         lease_version: int,
-        now: datetime,
-        new_expires_at: datetime,
+        lease_seconds: int = 900,
     ) -> bool:
         """Renew a lease with bounded retries for this database-only operation."""
 
@@ -1763,8 +1769,7 @@ class SQLiteRuntimeRepository:
                 execution_attempt_id,
                 owner_token=owner_token,
                 lease_version=lease_version,
-                now=now,
-                new_expires_at=new_expires_at,
+                lease_seconds=lease_seconds,
             ),
             operation_name="renew ShadowBot lease",
         )
@@ -1775,12 +1780,13 @@ class SQLiteRuntimeRepository:
         *,
         owner_token: str,
         lease_version: int,
-        now: datetime,
-        new_expires_at: datetime,
+        lease_seconds: int,
     ) -> bool:
         connection = self.connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            locked_now = self._clock()
+            renewed_expires_at = locked_now + timedelta(seconds=max(int(lease_seconds), 1))
             row = connection.execute(
                 """
                 SELECT a.raw_output_json, a.operation_id, o.lock_owner
@@ -1801,11 +1807,11 @@ class SQLiteRuntimeRepository:
                 or str(lease.get("owner_token") or "") != owner_token
                 or int(lease.get("version") or 0) != lease_version
                 or current_expires is None
-                or current_expires <= now
+                or current_expires <= locked_now
             ):
                 connection.rollback()
                 return False
-            lease["expires_at"] = _datetime_to_text(new_expires_at)
+            lease["expires_at"] = _datetime_to_text(renewed_expires_at)
             raw["lease"] = lease
             cursor = connection.execute(
                 "UPDATE shadowbot_execution_attempts SET raw_output_json = ? WHERE execution_attempt_id = ?",

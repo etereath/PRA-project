@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import subprocess
 import time
 from pathlib import Path
 
@@ -110,6 +111,29 @@ def test_memory_uri_is_only_allowed_as_an_explicit_controlled_test_target() -> N
         SQLiteConnectionFactory("file:task8-memory?mode=memory", config=runtime_config).connect_write()
 
 
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "file:task8-memory?mode=memory&mode=memory",
+        "file:task8-memory?MODE=MEMORY",
+        "file:task8-memory?mode%3Dmemory",
+        "file:task8-memory%3Fmode%3Dmemory?cache=shared",
+        "file://server/share/runtime.sqlite3?mode=memory",
+    ],
+)
+def test_memory_uri_parser_rejects_ambiguous_variants(uri: str) -> None:
+    config = SQLiteConnectionConfig(uri=True, purpose="test")
+    with pytest.raises(SQLiteStorageLocationError):
+        SQLiteConnectionFactory(uri, config=config).connect_write()
+
+
+def test_memory_uri_parser_rejects_mode_lookalike_in_disk_filename(tmp_path: Path) -> None:
+    config = SQLiteConnectionConfig(uri=True, purpose="test")
+    uri = f"file:{(tmp_path / 'mode=memory.sqlite3').as_posix()}"
+    with pytest.raises(SQLiteStorageLocationError):
+        SQLiteConnectionFactory(uri, config=config).connect_write()
+
+
 def test_wal_reader_does_not_block_an_independent_writer(tmp_path: Path) -> None:
     db_path = tmp_path / "concurrent.sqlite3"
     factory = SQLiteConnectionFactory(db_path)
@@ -121,10 +145,13 @@ def test_wal_reader_does_not_block_an_independent_writer(tmp_path: Path) -> None
     reader = factory.connect_read()
     writer = factory.connect_write()
     try:
+        reader.execute("BEGIN")
         assert reader.execute("SELECT COUNT(*) FROM values_table").fetchone()[0] == 0
         writer.execute("BEGIN IMMEDIATE")
         writer.execute("INSERT INTO values_table(value) VALUES (1)")
         writer.commit()
+        assert reader.execute("SELECT COUNT(*) FROM values_table").fetchone()[0] == 0
+        reader.rollback()
         assert reader.execute("SELECT COUNT(*) FROM values_table").fetchone()[0] == 1
     finally:
         reader.close()
@@ -190,6 +217,46 @@ def test_reparse_point_to_remote_target_is_rejected(tmp_path: Path) -> None:
         pytest.skip(f"symlink creation unavailable: {exc}")
     with pytest.raises(SQLiteStorageLocationError):
         SQLiteConnectionFactory(link_path).connect_write()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction validation")
+def test_real_junction_to_local_target_is_resolved_before_drive_check(tmp_path: Path) -> None:
+    target_dir = tmp_path / "junction-target"
+    target_dir.mkdir()
+    junction = tmp_path / "runtime-junction"
+    result = subprocess.run(
+        ["cmd.exe", "/c", f'mklink /J "{junction}" "{target_dir}"'],
+        capture_output=True,
+    )
+    if result.returncode != 0 or not junction.is_dir():
+        pytest.skip("junction creation unavailable")
+
+    db_path = junction / "runtime.sqlite3"
+    with SQLiteConnectionFactory(db_path).connect_write() as connection:
+        connection.execute("CREATE TABLE sample (value INTEGER)")
+    assert (target_dir / "runtime.sqlite3").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction validation")
+def test_real_junction_final_target_still_applies_remote_drive_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import app.repositories.sqlite_connection as sqlite_connection
+
+    target_dir = tmp_path / "junction-target"
+    target_dir.mkdir()
+    junction = tmp_path / "remote-classified-junction"
+    result = subprocess.run(
+        ["cmd.exe", "/c", f'mklink /J "{junction}" "{target_dir}"'],
+        capture_output=True,
+    )
+    if result.returncode != 0 or not junction.is_dir():
+        pytest.skip("junction creation unavailable")
+
+    monkeypatch.setattr(sqlite_connection, "_get_windows_drive_type", lambda _root: DRIVE_REMOTE)
+    with pytest.raises(SQLiteStorageLocationError):
+        SQLiteConnectionFactory(junction / "runtime.sqlite3").connect_write()
 
 
 def test_lock_retry_uses_codes_and_bounded_injected_clock() -> None:
