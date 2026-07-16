@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import argparse
 import io
 import os
 import re
 import sqlite3
 import sys
-from contextlib import contextmanager
+import tempfile
+from contextlib import closing, contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
@@ -36,6 +38,7 @@ from app.web import _RUNTIME_SESSIONS, application  # noqa: E402
 
 
 TEST_DB = ROOT / "data" / "runtime" / "test_runtime_smoke.sqlite3"
+TEST_DB_PARENT = TEST_DB.parent.resolve()
 REQUIRED_TABLES = set(REQUIRED_RUNTIME_TABLES)
 SMOKE_SECRET = "smoke-review-token-secret-32-chars-minimum"
 SMOKE_ADMIN_PASSWORD = "smoke-admin-password-only-for-local-smoke"
@@ -114,7 +117,7 @@ class SmokeRunner:
             raise AssertionError(f"schema version 不满足精确 v{LATEST_RUNTIME_SCHEMA_VERSION} 要求：{versions}")
 
     def check_required_tables(self) -> None:
-        with self.context.repository.connect() as connection:
+        with closing(self.context.repository.connect()) as connection:
             rows = connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
         tables = {str(row["name"]) for row in rows}
         missing = sorted(REQUIRED_TABLES - tables)
@@ -383,7 +386,7 @@ def runtime_task(
 
 def ensure_clean_test_db() -> None:
     resolved = TEST_DB.resolve()
-    expected_parent = (ROOT / "data" / "runtime").resolve()
+    expected_parent = TEST_DB_PARENT
     if resolved.parent != expected_parent or resolved.name != "test_runtime_smoke.sqlite3":
         raise RuntimeError("测试库路径保护失败，拒绝清理")
     if resolved.exists():
@@ -485,11 +488,11 @@ def smoke_environment():
             "FEISHU_WEBHOOK_SECRET": "smoke-feishu-signature-secret",
             "FEISHU_MESSAGE_TYPE": "post",
             "DEV_MODE": "false",
-            "PRA_ENV": "production",
+            "PRA_ENV": os.environ.get("PRA_ENV") or "production",
             "PRA_ENABLE_LEGACY_WEB": "0",
             "PRA_LEGACY_ACCESS_MODE": "direct_loopback",
             "PRA_PROXY_MODE": "reverse_proxy",
-            "PRA_ALLOWED_DATA_DIRS": str(ROOT / "data" / "runtime"),
+            "PRA_ALLOWED_DATA_DIRS": str(TEST_DB.parent),
         }
     )
     _RUNTIME_SESSIONS.clear()
@@ -504,13 +507,35 @@ def smoke_environment():
                 os.environ[key] = value
 
 
-def main() -> int:
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run the PRA core system smoke checks")
+    parser.add_argument(
+        "--temporary-db",
+        action="store_true",
+        help="Create the smoke SQLite database under the operating system temporary directory",
+    )
+    return parser
+
+
+def _run_smoke(database_label: str) -> int:
     print("PRA 系统冒烟测试")
-    print("测试库：data/runtime/test_runtime_smoke.sqlite3")
+    print(f"测试库：{database_label}")
     print("通知模式：mock，不发送真实飞书，不访问 cpolar。")
     print("")
     with smoke_environment():
         return SmokeRunner().run()
+
+
+def main() -> int:
+    args = _build_parser().parse_args()
+    if not args.temporary_db:
+        return _run_smoke("data/runtime/test_runtime_smoke.sqlite3")
+
+    global TEST_DB, TEST_DB_PARENT
+    with tempfile.TemporaryDirectory(prefix="pra-core-smoke-") as temp_dir:
+        TEST_DB = Path(temp_dir) / "test_runtime_smoke.sqlite3"
+        TEST_DB_PARENT = TEST_DB.parent.resolve()
+        return _run_smoke("操作系统临时目录（运行结束自动清理）")
 
 
 if __name__ == "__main__":
