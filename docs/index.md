@@ -19,6 +19,7 @@
 - [sqlite_runtime_persistence_plan.md](sqlite_runtime_persistence_plan.md)：SQLite 运行态持久化设计与落地进度。
 - [runtime_environment_variables.md](runtime_environment_variables.md)：本地运行、飞书、Mobile Review 所需环境变量。
 - [core_wheel_shadowbot_deployment.md](core_wheel_shadowbot_deployment.md)：核心 wheel 构建/审计/隔离安装，以及 ShadowBot 独立部署边界。
+- [core_ci.md](core_ci.md)：Windows Core、最低限度 Linux Core、隔离安装、失败语义与分支保护说明。
 - [system_smoke_test.md](system_smoke_test.md)：系统冒烟测试脚本说明和验收流程。
 - [business_rule_evaluation_framework.md](business_rule_evaluation_framework.md)：自动规则评估框架，说明 evaluator、proposal、runner、dry-run/apply 和 script_runs。
 - [business_rule_script_development_guide.md](business_rule_script_development_guide.md)：新增自动规则脚本的开发规范，约束不得绕过运行态服务和通知服务。

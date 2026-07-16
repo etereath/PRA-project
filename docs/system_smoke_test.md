@@ -21,6 +21,12 @@
 python scripts/run_system_smoke_tests.py
 ```
 
+CI 使用仓库外临时数据库，运行结束自动清理：
+
+```powershell
+python scripts/run_system_smoke_tests.py --temporary-db
+```
+
 输出为中文，每一项会显示 `OK` 或 `FAILED`。如果存在失败项，脚本会显示失败原因、建议检查模块，并以非 0 退出码结束。
 
 示例：
@@ -41,6 +47,8 @@ python scripts/run_system_smoke_tests.py
 ```text
 data/runtime/test_runtime_smoke.sqlite3
 ```
+
+传入 `--temporary-db` 时，测试库改为操作系统临时目录中的一次性文件，不会在 checkout 内创建运行态数据。
 
 运行前会清理并重建该测试库，不会写入或污染真实运行库：
 

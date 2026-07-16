@@ -267,7 +267,7 @@ class WebTests(unittest.TestCase):
             previous_table_name="products",
             posted_path="D:/PRA project/data/samples/products.xlsx",
         )
-        self.assertTrue(resolved.endswith("data\\samples\\listing_rules.xlsx"))
+        self.assertEqual(Path(resolved).parts[-3:], ("data", "samples", "listing_rules.xlsx"))
 
     def test_render_execution_page_contains_form(self) -> None:
         html = render_execution_page(
@@ -2151,7 +2151,7 @@ class WebTests(unittest.TestCase):
                 status, _, body = self._call_app(
                     path="/system/test-feishu-notification",
                     method="POST",
-                    body=urlencode({"runtime_db": str(db_path)}),
+                    query=urlencode({"runtime_db": str(db_path)}),
                 )
                 cookie = self._runtime_login(db_path)
                 post_status, headers, _ = self._call_app(
