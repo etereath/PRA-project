@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from contextlib import closing
 from datetime import date, datetime, timedelta
 from decimal import Decimal
@@ -27,12 +28,22 @@ from app.models import (
     Task,
     TaskStatusHistory,
 )
+from app.repositories.sqlite_connection import (
+    SQLITE_CONCURRENCY_ERROR_CODES,
+    SQLiteConnectionConfig,
+    SQLiteConnectionError,
+    SQLiteConnectionFactory,
+    SQLiteOperationalHealth,
+    _execute_with_sqlite_retry,
+    is_sqlite_concurrency_error,
+)
 from app.runtime_schema import (
     LATEST_RUNTIME_SCHEMA_VERSION,
     RuntimeSchemaHealth,
     inspect_runtime_schema,
 )
 from app.utils import serialize_decimal
+from app.utils import utc_now
 
 
 TERMINAL_TASK_STATUSES = ("success", "skipped", "cancelled", "expired")
@@ -70,20 +81,6 @@ ATOMIC_TASK_TRANSITIONS = {
         TaskStatus.EXPIRED,
     },
 }
-
-SQLITE_CONCURRENCY_ERROR_CODES = frozenset(
-    getattr(sqlite3, name)
-    for name in (
-        "SQLITE_BUSY",
-        "SQLITE_BUSY_RECOVERY",
-        "SQLITE_BUSY_SNAPSHOT",
-        "SQLITE_LOCKED",
-        "SQLITE_LOCKED_SHAREDCACHE",
-        "SQLITE_LOCKED_VTAB",
-    )
-    if hasattr(sqlite3, name)
-)
-
 
 SCHEMA_SQL = [
     """
@@ -370,18 +367,57 @@ SCHEMA_SQL = [
 
 
 class SQLiteRuntimeRepository:
-    def __init__(self, db_path: Path) -> None:
-        self.db_path = db_path
+    def __init__(
+        self,
+        db_path: Path,
+        *,
+        connection_config: SQLiteConnectionConfig | None = None,
+        clock: Callable[[], datetime] | None = None,
+        retry_sleep: Callable[[float], None] | None = None,
+    ) -> None:
+        self.db_path = Path(db_path)
+        self.connection_factory = SQLiteConnectionFactory(
+            self.db_path,
+            config=connection_config,
+        )
+        self._clock = clock or utc_now
+        self._retry_sleep = retry_sleep or time.sleep
 
     def connect(self) -> sqlite3.Connection:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        return connection
+        """Backward-compatible writable connection entrypoint."""
+
+        return self.connect_write()
+
+    def connect_read(self) -> sqlite3.Connection:
+        """Open an existing runtime database without initialization side effects."""
+
+        return self.connection_factory.connect_read()
+
+    def connect_write(self) -> sqlite3.Connection:
+        """Open a configured writable runtime connection."""
+
+        return self.connection_factory.connect_write()
+
+    def _run_sqlite_retry(
+        self,
+        operation: Callable[[], Any],
+        *,
+        operation_name: str = "SQLite runtime operation",
+    ) -> Any:
+        """Run a database-only operation under the configured bounded retry policy."""
+
+        config = self.connection_factory.config
+        return _execute_with_sqlite_retry(
+            operation,
+            max_attempts=config.retry_max_attempts,
+            max_elapsed_ms=config.retry_max_elapsed_ms or 0,
+            base_delay_ms=config.retry_base_delay_ms,
+            operation_name=operation_name,
+            sleep=self._retry_sleep,
+        )
 
     def init_schema(self) -> None:
-        with closing(self.connect()) as connection, connection:
+        def initialize_schema(connection: sqlite3.Connection) -> None:
             for statement in SCHEMA_SQL:
                 connection.execute(statement)
             _ensure_column(connection, "shadowbot_execution_attempts", "instruction_hash", "TEXT NOT NULL DEFAULT ''")
@@ -410,10 +446,12 @@ class SQLiteRuntimeRepository:
                 (migration_notes[5],),
             )
 
+        self.connection_factory.initialize_database(initialize_schema)
+
     def schema_versions(self) -> list[int]:
         if not self.db_path.exists():
             return []
-        with closing(self.connect()) as connection:
+        with closing(self.connection_factory.connect_read()) as connection:
             rows = connection.execute(
                 "SELECT schema_version FROM runtime_schema_migrations ORDER BY schema_version"
             ).fetchall()
@@ -423,10 +461,79 @@ class SQLiteRuntimeRepository:
         """Return a non-mutating exact-v5 schema health report."""
 
         if not self.db_path.exists():
-            with closing(sqlite3.connect(":memory:")) as connection:
+            memory_factory = SQLiteConnectionFactory(":memory:")
+            with closing(memory_factory.connect_write()) as connection:
                 return inspect_runtime_schema(connection)
-        with closing(self.connect()) as connection:
+        with closing(self.connection_factory.connect_read()) as connection:
             return inspect_runtime_schema(connection)
+
+    def check_operational_health(self) -> SQLiteOperationalHealth:
+        """Return non-mutating WAL, PRAGMA, and local-storage health facts."""
+
+        config = self.connection_factory.config
+        database_exists = self.db_path.exists()
+        local_storage = False
+        journal_mode: str | None = None
+        synchronous: str | None = None
+        foreign_keys: int | None = None
+        busy_timeout_ms: int | None = None
+        try:
+            self.connection_factory.validate_storage_location()
+            local_storage = True
+            if not database_exists:
+                return SQLiteOperationalHealth(
+                    ok=False,
+                    database_exists=False,
+                    local_storage=True,
+                    journal_mode=None,
+                    synchronous=None,
+                    foreign_keys=None,
+                    busy_timeout_ms=None,
+                    configured_busy_timeout_ms=config.busy_timeout_ms,
+                    error="SQLite database file does not exist",
+                )
+            with closing(self.connection_factory.connect_read()) as connection:
+                journal_row = connection.execute("PRAGMA journal_mode").fetchone()
+                synchronous_row = connection.execute("PRAGMA synchronous").fetchone()
+                foreign_keys_row = connection.execute("PRAGMA foreign_keys").fetchone()
+                busy_timeout_row = connection.execute("PRAGMA busy_timeout").fetchone()
+            journal_mode = str(journal_row[0]).lower() if journal_row else None
+            synchronous = {
+                0: "OFF",
+                1: "NORMAL",
+                2: "FULL",
+                3: "EXTRA",
+            }.get(int(synchronous_row[0]), "UNKNOWN") if synchronous_row else None
+            foreign_keys = int(foreign_keys_row[0]) if foreign_keys_row else None
+            busy_timeout_ms = int(busy_timeout_row[0]) if busy_timeout_row else None
+            ok = (
+                journal_mode == "wal"
+                and synchronous == "NORMAL"
+                and foreign_keys == 1
+                and busy_timeout_ms == config.busy_timeout_ms
+            )
+            return SQLiteOperationalHealth(
+                ok=ok,
+                database_exists=True,
+                local_storage=True,
+                journal_mode=journal_mode,
+                synchronous=synchronous,
+                foreign_keys=foreign_keys,
+                busy_timeout_ms=busy_timeout_ms,
+                configured_busy_timeout_ms=config.busy_timeout_ms,
+            )
+        except (sqlite3.Error, SQLiteConnectionError) as exc:
+            return SQLiteOperationalHealth(
+                ok=False,
+                database_exists=database_exists,
+                local_storage=local_storage,
+                journal_mode=journal_mode,
+                synchronous=synchronous,
+                foreign_keys=foreign_keys,
+                busy_timeout_ms=busy_timeout_ms,
+                configured_busy_timeout_ms=config.busy_timeout_ms,
+                error=f"SQLite operational check failed: {type(exc).__name__}",
+            )
 
     def runtime_schema_health(self) -> RuntimeSchemaHealth:
         """Alias used by operational callers that name the report directly."""
@@ -1653,12 +1760,33 @@ class SQLiteRuntimeRepository:
         *,
         owner_token: str,
         lease_version: int,
-        now: datetime,
-        new_expires_at: datetime,
+        lease_seconds: int = 900,
+    ) -> bool:
+        """Renew a lease with bounded retries for this database-only operation."""
+
+        return self._run_sqlite_retry(
+            lambda: self._renew_shadowbot_lease_once(
+                execution_attempt_id,
+                owner_token=owner_token,
+                lease_version=lease_version,
+                lease_seconds=lease_seconds,
+            ),
+            operation_name="renew ShadowBot lease",
+        )
+
+    def _renew_shadowbot_lease_once(
+        self,
+        execution_attempt_id: str,
+        *,
+        owner_token: str,
+        lease_version: int,
+        lease_seconds: int,
     ) -> bool:
         connection = self.connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
+            locked_now = self._clock()
+            renewed_expires_at = locked_now + timedelta(seconds=max(int(lease_seconds), 1))
             row = connection.execute(
                 """
                 SELECT a.raw_output_json, a.operation_id, o.lock_owner
@@ -1679,11 +1807,11 @@ class SQLiteRuntimeRepository:
                 or str(lease.get("owner_token") or "") != owner_token
                 or int(lease.get("version") or 0) != lease_version
                 or current_expires is None
-                or current_expires <= now
+                or current_expires <= locked_now
             ):
                 connection.rollback()
                 return False
-            lease["expires_at"] = _datetime_to_text(new_expires_at)
+            lease["expires_at"] = _datetime_to_text(renewed_expires_at)
             raw["lease"] = lease
             cursor = connection.execute(
                 "UPDATE shadowbot_execution_attempts SET raw_output_json = ? WHERE execution_attempt_id = ?",
@@ -2890,14 +3018,7 @@ def _row_to_status_history(row: sqlite3.Row) -> TaskStatusHistory:
 def _is_sqlite_concurrency_error(error: sqlite3.OperationalError) -> bool:
     """Classify SQLite busy/locked errors without inspecting localized text."""
 
-    error_code = getattr(error, "sqlite_errorcode", None)
-    error_name = getattr(error, "sqlite_errorname", "")
-    if error_code in SQLITE_CONCURRENCY_ERROR_CODES:
-        return True
-    return bool(
-        isinstance(error_name, str)
-        and (error_name.startswith("SQLITE_BUSY") or error_name.startswith("SQLITE_LOCKED"))
-    )
+    return is_sqlite_concurrency_error(error)
 
 
 def _atomic_source_task_status(

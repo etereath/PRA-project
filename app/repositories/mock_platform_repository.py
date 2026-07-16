@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Iterable
 
 from app.models import MockPlatformProductState
+from app.repositories.sqlite_connection import SQLiteConnectionFactory
 from app.utils import serialize_decimal
 
 
@@ -41,18 +42,18 @@ SCHEMA_SQL = [
 
 class MockPlatformRepository:
     def __init__(self, db_path: Path = DEFAULT_MOCK_PLATFORM_DB) -> None:
-        self.db_path = db_path
+        self.db_path = Path(db_path)
+        self.connection_factory = SQLiteConnectionFactory(self.db_path, config=None)
 
     def connect(self) -> sqlite3.Connection:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(self.db_path)
-        connection.row_factory = sqlite3.Row
-        return connection
+        return self.connection_factory.connect_write()
 
     def init_schema(self) -> None:
-        with closing(self.connect()) as connection, connection:
+        def initialize_schema(connection: sqlite3.Connection) -> None:
             for statement in SCHEMA_SQL:
                 connection.execute(statement)
+
+        self.connection_factory.initialize_database(initialize_schema)
 
     def reset(self) -> None:
         self.init_schema()

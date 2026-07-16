@@ -85,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     health_parser = subparsers.add_parser(
         "health",
         aliases=["check-runtime-health"],
-        help="检查 Runtime Schema v5 健康状态",
+        help="检查 Runtime Schema v5 与 SQLite operational health",
     )
     health_parser.add_argument("--runtime-db", type=Path, default=DEFAULT_RUNTIME_DB)
 
@@ -180,13 +180,15 @@ def main() -> int:
 
         if args.command in {"health", "check-runtime-health"}:
             repository = SQLiteRuntimeRepository(args.runtime_db)
-            health = repository.check_schema_health()
+            schema_health = repository.check_schema_health()
+            operational_health = repository.check_operational_health()
+            health_ok = schema_health.ok and operational_health.ok
             print(
-                f"runtime health: ok={health.ok} "
+                f"runtime health: ok={health_ok} "
                 f"schema_versions={repository.schema_versions()} "
-                f"summary={health.summary}"
+                f"summary={schema_health.summary}; {operational_health.summary}"
             )
-            return 0 if health.ok else 1
+            return 0 if health_ok else 1
 
         if args.command in {"validate", "import-data"}:
             summary = validate_sources(_workflow_inputs(args))
