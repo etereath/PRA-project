@@ -60,14 +60,14 @@
 - `schema_version = 4`
 - `schema_version = 5`
 
-当前最新 runtime schema 要求为 v5，权威常量为 `app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION`。
+当前最新 runtime schema 要求为 v6，权威常量为 `app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION`。
 
 v5 migration 除了 ShadowBot 队列审计列外，还创建 `retry_authorizations` 持久化结构。该表包含
 `retry_authorization_id`、`operation_id`、`source_execution_attempt_id`、授权/证据字段、
 `status`、`max_uses`、消费尝试、过期时间、原因和创建/消费时间；约束要求主键、两个外键、
 `max_uses = 1`、状态仅允许 `ACTIVE / CONSUMED / EXPIRED / REVOKED`，并对
 `evidence_hash` 与非空消费尝试建立唯一索引，同时建立 operation/status/expires_at 索引。
-运行态 health check 会精确验证 v5 版本、必需表、v5 列、约束和索引，拒绝只写入迁移记录但缺少实际结构的“伪 v5”。
+运行态 health check 会精确验证 v6 版本、必需表、v5/v6 列、约束和索引，拒绝只写入迁移记录但缺少实际结构的“伪 v6”。通知 Outbox 的状态机、lease fencing、delivery attempt 与 UNKNOWN_DELIVERY 语义见 `docs/notification_outbox.md`。
 
 ### 2.2 `tasks` 表已实现
 

@@ -491,6 +491,75 @@ class NotificationLog:
 
 
 @dataclass(slots=True)
+class NotificationOutbox:
+    """Durable notification intent and its fenced delivery lease."""
+
+    notification_id: str
+    notification_key: str
+    notification_type: str
+    recipient_type: str
+    recipient_ref: str
+    channel: str
+    priority: int
+    payload: dict[str, Any] = field(default_factory=dict)
+    related_task_id: str | None = None
+    related_review_task_id: str | None = None
+    status: str = "PENDING"
+    attempt_count: int = 0
+    max_attempts: int = 3
+    next_attempt_at: datetime | None = None
+    deadline_at: datetime | None = None
+    lease_owner_token: str = ""
+    lease_version: int = 0
+    lease_expires_at: datetime | None = None
+    sent_at: datetime | None = None
+    provider_message_id: str = ""
+    last_error_code: str = ""
+    last_error_message: str = ""
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+
+    @property
+    def recipient(self) -> str:
+        """Compatibility alias for the v5 notification log vocabulary."""
+
+        return self.recipient_ref
+
+
+@dataclass(slots=True)
+class NotificationDeliveryAttempt:
+    """One provider call intent/result, fenced by notification lease version."""
+
+    delivery_attempt_id: str
+    notification_id: str
+    attempt_no: int
+    status: str
+    lease_owner_token: str
+    lease_version: int
+    request_fingerprint: str
+    started_at: datetime
+    completed_at: datetime | None = None
+    provider_status_code: str = ""
+    provider_message_id: str = ""
+    response_fingerprint: str = ""
+    error_code: str = ""
+    error_message: str = ""
+
+
+@dataclass(slots=True)
+class NotificationDeliveryResult:
+    """Provider-neutral, bounded result returned by a sender."""
+
+    classification: str
+    provider_status_code: str = ""
+    provider_message_id: str = ""
+    retry_after_seconds: int | None = None
+    error_code: str = ""
+    error_message: str = ""
+    response_fingerprint: str = ""
+
+
+@dataclass(slots=True)
 class ScriptRun:
     script_run_id: str
     evaluator_id: str

@@ -85,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
     health_parser = subparsers.add_parser(
         "health",
         aliases=["check-runtime-health"],
-        help="检查 Runtime Schema v5 与 SQLite operational health",
+        help="检查 Runtime Schema v6 与 SQLite operational health",
     )
     health_parser.add_argument("--runtime-db", type=Path, default=DEFAULT_RUNTIME_DB)
 

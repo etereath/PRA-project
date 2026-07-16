@@ -149,10 +149,10 @@ class BusinessRuleEvaluationTests(unittest.TestCase):
 
         self.assertEqual(summary.inserted_review_tasks_count, 2)
         self.assertTrue(summary.warnings)
-        self.assertTrue(any("notification_errors" in warning for warning in summary.warnings))
+        self.assertFalse(any("notification_errors" in warning for warning in summary.warnings))
         items = self.repository.list_script_run_items(summary.script_run.script_run_id)
-        self.assertTrue(any(item.error_message for item in items))
-        self.assertTrue(all(log.send_status == "failed" for log in self.repository.list_notification_logs()))
+        self.assertTrue(all(not item.error_message for item in items))
+        self.assertTrue(all(log.send_status == "pending" for log in self.repository.list_notification_logs()))
 
     def test_apply_is_idempotent_by_proposal_dedupe_key(self) -> None:
         with patch.dict(os.environ, {"DEFAULT_NOTIFICATION_CHANNEL": "mock"}, clear=False):

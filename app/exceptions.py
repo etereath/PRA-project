@@ -53,3 +53,15 @@ class TableValidationError(ValidationError):
 
 class AIProviderError(Exception):
     """Raised when an AI suggestion provider fails."""
+
+
+class NotificationOutboxError(Exception):
+    """Base error for durable notification workflow failures."""
+
+
+class NotificationLeaseError(NotificationOutboxError):
+    """The notification lease is missing, expired, or fenced by another worker."""
+
+
+class NotificationDeliveryError(NotificationOutboxError):
+    """The delivery attempt cannot be completed under its current lease."""

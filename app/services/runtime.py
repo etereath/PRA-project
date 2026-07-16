@@ -31,6 +31,13 @@ from app.models import (
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.execution import ExecutionSimulationService
 from app.services.manual_intervention import MANUAL_INTERVENTION_ACTIONS
+from app.services.notification_outbox import (
+    FakeSender,
+    NotificationOutboxService,
+    NotificationOutboxWorker,
+    OutboxReviewNotificationService,
+    ScriptedSender,
+)
 from app.utils import serialize_decimal, utc_now
 
 
@@ -219,11 +226,11 @@ class ReviewTaskService:
         repository: SQLiteRuntimeRepository,
         *,
         runtime_task_service: RuntimeTaskService | None = None,
-        notification_service: "ReviewNotificationService | None" = None,
+        notification_service: "ReviewNotificationService | OutboxReviewNotificationService | None" = None,
     ) -> None:
         self.repository = repository
         self.runtime_task_service = runtime_task_service or RuntimeTaskService(repository)
-        self.notification_service = notification_service or ReviewNotificationService(repository)
+        self.notification_service = notification_service or OutboxReviewNotificationService(repository)
 
     def create_from_tasks(self, tasks: list[Task], *, trade_date: date | None = None) -> "ReviewTaskCreationSummary":
         review_tasks = [
@@ -236,6 +243,20 @@ class ReviewTaskService:
         inserted_notification_logs_count = 0
         notification_errors: list[str] = []
         for review_task in review_tasks:
+            if isinstance(self.notification_service, OutboxReviewNotificationService):
+                try:
+                    inserted_count, outbox_count, _ = self.notification_service.create_review_task_atomically(
+                        review_task
+                    )
+                except Exception as exc:
+                    notification_errors.append(f"{review_task.review_task_id}: {exc}")
+                    continue
+                if inserted_count != 1:
+                    continue
+                inserted_review_tasks_count += 1
+                inserted_review_tasks.append(review_task)
+                inserted_notification_logs_count += outbox_count
+                continue
             inserted_count = self.repository.insert_review_tasks([review_task])
             if inserted_count != 1:
                 continue

@@ -11,12 +11,20 @@ from typing import Any, Callable, Iterable
 from uuid import uuid4
 
 from app.enums import PricingSource, ReviewTaskStatus, TaskActionType, TaskStatus
-from app.exceptions import MobileReviewErrorCode, MobileReviewTransactionError
+from app.exceptions import (
+    MobileReviewErrorCode,
+    MobileReviewTransactionError,
+    NotificationDeliveryError,
+    NotificationLeaseError,
+)
 from app.mobile_review import normalize_mobile_review_resolution_payload
 from app.models import (
     ExecutionLog,
     MobileReviewAtomicResult,
     NotificationLog,
+    NotificationDeliveryAttempt,
+    NotificationDeliveryResult,
+    NotificationOutbox,
     RetryAuthorization,
     ReviewTask,
     ReviewToken,
@@ -365,6 +373,83 @@ SCHEMA_SQL = [
     """,
 ]
 
+# Schema v6 is deliberately kept separate from the historical v1-v5 DDL.  The
+# same statements upgrade an existing v5 database and initialize a new one,
+# while preserving the published v5 migration history and notification_logs.
+SCHEMA_V6_SQL = [
+    """
+    CREATE TABLE IF NOT EXISTS notification_outbox (
+        notification_id TEXT PRIMARY KEY,
+        notification_key TEXT NOT NULL UNIQUE,
+        notification_type TEXT NOT NULL,
+        related_task_id TEXT,
+        related_review_task_id TEXT,
+        recipient_type TEXT NOT NULL,
+        recipient_ref TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        priority INTEGER NOT NULL,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN (
+            'PENDING', 'LEASED', 'SENDING', 'RETRY_WAIT', 'SENT',
+            'UNKNOWN_DELIVERY', 'FAILED', 'EXPIRED', 'CANCELLED'
+        )),
+        attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+        max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+        next_attempt_at TEXT,
+        deadline_at TEXT,
+        lease_owner_token TEXT NOT NULL DEFAULT '',
+        lease_version INTEGER NOT NULL DEFAULT 0 CHECK (lease_version >= 0),
+        lease_expires_at TEXT,
+        sent_at TEXT,
+        provider_message_id TEXT NOT NULL DEFAULT '',
+        last_error_code TEXT NOT NULL DEFAULT '',
+        last_error_message TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(related_task_id) REFERENCES tasks(task_id),
+        FOREIGN KEY(related_review_task_id) REFERENCES review_tasks(review_task_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS notification_delivery_attempts (
+        delivery_attempt_id TEXT PRIMARY KEY,
+        notification_id TEXT NOT NULL,
+        attempt_no INTEGER NOT NULL CHECK (attempt_no > 0),
+        status TEXT NOT NULL CHECK (status IN (
+            'STARTED', 'ACKNOWLEDGED', 'TEMP_FAILED', 'PERM_FAILED', 'UNKNOWN'
+        )),
+        lease_owner_token TEXT NOT NULL,
+        lease_version INTEGER NOT NULL CHECK (lease_version >= 0),
+        request_fingerprint TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        provider_status_code TEXT NOT NULL DEFAULT '',
+        provider_message_id TEXT NOT NULL DEFAULT '',
+        response_fingerprint TEXT NOT NULL DEFAULT '',
+        error_code TEXT NOT NULL DEFAULT '',
+        error_message TEXT NOT NULL DEFAULT '',
+        UNIQUE(notification_id, attempt_no),
+        FOREIGN KEY(notification_id) REFERENCES notification_outbox(notification_id)
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_notification_outbox_key
+    ON notification_outbox(notification_key)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_notification_outbox_claim
+    ON notification_outbox(status, priority, next_attempt_at, deadline_at, created_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_notification_outbox_lease_expires_at
+    ON notification_outbox(lease_expires_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_notification_delivery_attempts_notification_id
+    ON notification_delivery_attempts(notification_id)
+    """,
+]
+
 
 class SQLiteRuntimeRepository:
     def __init__(
@@ -429,7 +514,10 @@ class SQLiteRuntimeRepository:
                 3: "business rule evaluation runtime schema",
                 4: "shadowbot executor runtime schema",
                 5: "retry authorization persistence and shadowbot file queue audit fields",
+                6: "durable notification outbox and delivery attempt persistence",
             }
+            for statement in SCHEMA_V6_SQL:
+                connection.execute(statement)
             for version in range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1):
                 connection.execute(
                     """
@@ -2502,6 +2590,674 @@ class SQLiteRuntimeRepository:
             ).fetchone()
         return _row_to_notification_log(row) if row is not None else None
 
+    def update_notification_log_delivery(
+        self,
+        notification_id: str,
+        *,
+        send_status: str,
+        sent_at: datetime | None = None,
+        error_message: str = "",
+    ) -> bool:
+        """Update the v5 compatibility projection after an Outbox writeback."""
+
+        with closing(self.connect_write()) as connection, connection:
+            return connection.execute(
+                """
+                UPDATE notification_logs
+                SET send_status = ?, sent_at = ?, error_message = ?
+                WHERE notification_id = ?
+                """,
+                (send_status, _datetime_to_text(sent_at), str(error_message or "")[:1000], notification_id),
+            ).rowcount == 1
+
+    # ------------------------------------------------------------------
+    # Schema v6 durable notification outbox
+    # ------------------------------------------------------------------
+
+    def insert_notification_outbox(self, notification: NotificationOutbox) -> int:
+        """Insert one logical notification without sending it.
+
+        The unique notification_key makes retries idempotent.  Callers that
+        need the existing row can use get_notification_outbox_by_key().
+        """
+
+        with closing(self.connect()) as connection, connection:
+            return self._insert_notification_outbox_on_connection(connection, notification)
+
+    @staticmethod
+    def _insert_notification_outbox_on_connection(
+        connection: sqlite3.Connection,
+        notification: NotificationOutbox,
+    ) -> int:
+        row = _notification_outbox_to_row(notification)
+        before = connection.total_changes
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO notification_outbox(
+                notification_id, notification_key, notification_type,
+                related_task_id, related_review_task_id, recipient_type, recipient_ref,
+                channel, priority, payload_json, status, attempt_count, max_attempts,
+                next_attempt_at, deadline_at, lease_owner_token, lease_version,
+                lease_expires_at, sent_at, provider_message_id, last_error_code,
+                last_error_message, created_at, updated_at
+            )
+            VALUES(
+                :notification_id, :notification_key, :notification_type,
+                :related_task_id, :related_review_task_id, :recipient_type, :recipient_ref,
+                :channel, :priority, :payload_json, :status, :attempt_count, :max_attempts,
+                :next_attempt_at, :deadline_at, :lease_owner_token, :lease_version,
+                :lease_expires_at, :sent_at, :provider_message_id, :last_error_code,
+                :last_error_message, :created_at, :updated_at
+            )
+            """,
+            row,
+        )
+        return connection.total_changes - before
+
+    def insert_review_task_with_notification_outbox(
+        self,
+        review_task: ReviewTask,
+        notification: NotificationOutbox,
+        *,
+        failure_injector: Callable[[str], None] | None = None,
+    ) -> tuple[int, int]:
+        """Atomically insert a review task and its notification intent."""
+
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            review_row = _review_task_to_row(review_task)
+            before = connection.total_changes
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO review_tasks(
+                    review_task_id, trade_date, scope_type, scope_key, dedupe_key, source_task_id,
+                    review_type, review_status, internal_sku, platform_name, reason, review_payload_json,
+                    resolution_payload_json, required_by, created_at, updated_at, resolved_by,
+                    resolved_at, resolution_note
+                )
+                VALUES(
+                    :review_task_id, :trade_date, :scope_type, :scope_key, :dedupe_key, :source_task_id,
+                    :review_type, :review_status, :internal_sku, :platform_name, :reason, :review_payload_json,
+                    :resolution_payload_json, :required_by, :created_at, :updated_at, :resolved_by,
+                    :resolved_at, :resolution_note
+                )
+                """,
+                review_row,
+            )
+            review_inserted = connection.total_changes - before
+            if review_inserted != 1:
+                connection.rollback()
+                return 0, 0
+            if failure_injector is not None:
+                failure_injector("after_review_insert")
+            outbox_inserted = self._insert_notification_outbox_on_connection(connection, notification)
+            if outbox_inserted != 1:
+                raise ValueError("notification_key already exists for a new review task")
+            if failure_injector is not None:
+                failure_injector("after_outbox_insert")
+            connection.commit()
+            return review_inserted, outbox_inserted
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def get_notification_outbox(self, notification_id: str) -> NotificationOutbox | None:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM notification_outbox WHERE notification_id = ?",
+                (notification_id,),
+            ).fetchone()
+        return _row_to_notification_outbox(row) if row is not None else None
+
+    def get_notification_outbox_by_key(self, notification_key: str) -> NotificationOutbox | None:
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM notification_outbox WHERE notification_key = ?",
+                (notification_key,),
+            ).fetchone()
+        return _row_to_notification_outbox(row) if row is not None else None
+
+    def list_notification_outbox(
+        self,
+        *,
+        status: str | None = None,
+        related_task_id: str | None = None,
+        related_review_task_id: str | None = None,
+        limit: int | None = None,
+    ) -> list[NotificationOutbox]:
+        query = "SELECT * FROM notification_outbox"
+        clauses: list[str] = []
+        params: list[object] = []
+        if status:
+            clauses.append("status = ?")
+            params.append(getattr(status, "value", status))
+        if related_task_id:
+            clauses.append("related_task_id = ?")
+            params.append(related_task_id)
+        if related_review_task_id:
+            clauses.append("related_review_task_id = ?")
+            params.append(related_review_task_id)
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY priority DESC, deadline_at IS NULL, deadline_at ASC, created_at ASC, notification_id ASC"
+        if limit is not None:
+            if limit <= 0:
+                return []
+            query += " LIMIT ?"
+            params.append(int(limit))
+        with closing(self.connect()) as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [_row_to_notification_outbox(row) for row in rows]
+
+    def claim_notification_outbox(
+        self,
+        *,
+        now: datetime | None = None,
+        lease_seconds: int = 60,
+        limit: int = 1,
+    ) -> list[NotificationOutbox]:
+        """Claim due notifications using one short BEGIN IMMEDIATE transaction."""
+
+        if lease_seconds <= 0 or lease_seconds > 3600:
+            raise ValueError("lease_seconds must be between 1 and 3600")
+        if limit <= 0:
+            return []
+        reference_time = now or self._clock()
+        reference_text = _datetime_to_text(reference_time)
+        connection = self.connect_write()
+        claimed: list[NotificationOutbox] = []
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            # A deadline is authoritative even if a worker has not yet claimed
+            # the row.  SENDING rows are handled separately by the watchdog.
+            connection.execute(
+                """
+                UPDATE notification_outbox
+                SET status = 'EXPIRED', lease_owner_token = '', lease_expires_at = NULL,
+                    last_error_code = 'DEADLINE_EXPIRED',
+                    last_error_message = 'notification deadline expired before delivery',
+                    updated_at = ?
+                WHERE status IN ('PENDING', 'RETRY_WAIT')
+                  AND deadline_at IS NOT NULL
+                  AND deadline_at <= ?
+                """,
+                (reference_text, reference_text),
+            )
+            rows = connection.execute(
+                """
+                SELECT * FROM notification_outbox
+                WHERE (
+                    (
+                        status IN ('PENDING', 'RETRY_WAIT')
+                        AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+                    )
+                    OR (
+                        status = 'LEASED'
+                        AND lease_expires_at IS NOT NULL
+                        AND lease_expires_at <= ?
+                    )
+                )
+                  AND (deadline_at IS NULL OR deadline_at > ?)
+                ORDER BY priority DESC, deadline_at IS NULL, deadline_at ASC,
+                         created_at ASC, notification_id ASC
+                LIMIT ?
+                """,
+                (reference_text, reference_text, reference_text, int(limit)),
+            ).fetchall()
+            for row in rows:
+                owner_token = uuid4().hex
+                lease_version = int(row["lease_version"] or 0) + 1
+                lease_expires_at = reference_time + timedelta(seconds=lease_seconds)
+                updated = connection.execute(
+                    """
+                    UPDATE notification_outbox
+                    SET status = 'LEASED', lease_owner_token = ?, lease_version = ?,
+                        lease_expires_at = ?, updated_at = ?
+                    WHERE notification_id = ?
+                      AND lease_version = ?
+                      AND (
+                          (status IN ('PENDING', 'RETRY_WAIT')
+                           AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+                          OR (status = 'LEASED' AND lease_expires_at IS NOT NULL
+                              AND lease_expires_at <= ?)
+                      )
+                    """,
+                    (
+                        owner_token,
+                        lease_version,
+                        _datetime_to_text(lease_expires_at),
+                        reference_text,
+                        row["notification_id"],
+                        row["lease_version"],
+                        reference_text,
+                        reference_text,
+                    ),
+                ).rowcount
+                if updated == 1:
+                    claimed_row = connection.execute(
+                        "SELECT * FROM notification_outbox WHERE notification_id = ?",
+                        (row["notification_id"],),
+                    ).fetchone()
+                    if claimed_row is not None:
+                        claimed.append(_row_to_notification_outbox(claimed_row))
+            connection.commit()
+            return claimed
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    # Short aliases make the repository usable by workers without coupling
+    # them to the historical notification_logs naming.
+    lease_pending_notifications = claim_notification_outbox
+
+    def renew_notification_outbox_lease(
+        self,
+        notification_id: str,
+        *,
+        owner_token: str,
+        lease_version: int,
+        now: datetime | None = None,
+        lease_seconds: int = 60,
+    ) -> bool:
+        if lease_seconds <= 0 or lease_seconds > 3600:
+            raise ValueError("lease_seconds must be between 1 and 3600")
+        reference_time = now or self._clock()
+        with closing(self.connect_write()) as connection, connection:
+            changed = connection.execute(
+                """
+                UPDATE notification_outbox
+                SET lease_expires_at = ?, updated_at = ?
+                WHERE notification_id = ?
+                  AND status IN ('LEASED', 'SENDING')
+                  AND lease_owner_token = ?
+                  AND lease_version = ?
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at > ?
+                """,
+                (
+                    _datetime_to_text(reference_time + timedelta(seconds=lease_seconds)),
+                    _datetime_to_text(reference_time),
+                    notification_id,
+                    owner_token,
+                    int(lease_version),
+                    _datetime_to_text(reference_time),
+                ),
+            ).rowcount
+        return changed == 1
+
+    renew_notification_lease = renew_notification_outbox_lease
+
+    def begin_notification_delivery(
+        self,
+        notification_id: str,
+        *,
+        owner_token: str,
+        lease_version: int,
+        request_fingerprint: str,
+        now: datetime | None = None,
+    ) -> NotificationDeliveryAttempt:
+        reference_time = now or self._clock()
+        reference_text = _datetime_to_text(reference_time)
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM notification_outbox WHERE notification_id = ?",
+                (notification_id,),
+            ).fetchone()
+            if (
+                row is None
+                or str(row["status"]) != "LEASED"
+                or str(row["lease_owner_token"] or "") != owner_token
+                or int(row["lease_version"] or 0) != int(lease_version)
+                or row["lease_expires_at"] is None
+                or str(row["lease_expires_at"]) <= str(reference_text)
+                or (row["deadline_at"] is not None and str(row["deadline_at"]) <= str(reference_text))
+                or int(row["attempt_count"] or 0) >= int(row["max_attempts"] or 0)
+            ):
+                connection.rollback()
+                raise NotificationLeaseError("notification lease is not valid for sending")
+
+            attempt_no = int(row["attempt_count"] or 0) + 1
+            attempt = NotificationDeliveryAttempt(
+                delivery_attempt_id=uuid4().hex,
+                notification_id=notification_id,
+                attempt_no=attempt_no,
+                status="STARTED",
+                lease_owner_token=owner_token,
+                lease_version=int(lease_version),
+                request_fingerprint=str(request_fingerprint),
+                started_at=reference_time,
+            )
+            changed = connection.execute(
+                """
+                UPDATE notification_outbox
+                SET status = 'SENDING', attempt_count = attempt_count + 1,
+                    next_attempt_at = NULL, updated_at = ?
+                WHERE notification_id = ? AND status = 'LEASED'
+                  AND lease_owner_token = ? AND lease_version = ?
+                """,
+                (reference_text, notification_id, owner_token, int(lease_version)),
+            ).rowcount
+            if changed != 1:
+                connection.rollback()
+                raise NotificationLeaseError("notification lease was fenced before sending")
+            connection.execute(
+                """
+                INSERT INTO notification_delivery_attempts(
+                    delivery_attempt_id, notification_id, attempt_no, status,
+                    lease_owner_token, lease_version, request_fingerprint, started_at,
+                    completed_at, provider_status_code, provider_message_id,
+                    response_fingerprint, error_code, error_message
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, '', '', '', '', '')
+                """,
+                (
+                    attempt.delivery_attempt_id,
+                    attempt.notification_id,
+                    attempt.attempt_no,
+                    attempt.status,
+                    attempt.lease_owner_token,
+                    attempt.lease_version,
+                    attempt.request_fingerprint,
+                    reference_text,
+                ),
+            )
+            connection.commit()
+            return attempt
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    start_notification_delivery = begin_notification_delivery
+
+    def complete_notification_delivery(
+        self,
+        notification_id: str,
+        delivery_attempt_id: str,
+        *,
+        owner_token: str,
+        lease_version: int,
+        result: NotificationDeliveryResult,
+        now: datetime | None = None,
+    ) -> NotificationOutbox:
+        classification = str(getattr(result.classification, "value", result.classification)).upper()
+        if classification not in {"SUCCESS", "TEMP_FAILED", "PERM_FAILED", "UNKNOWN"}:
+            raise ValueError(f"unsupported delivery classification: {result.classification}")
+        reference_time = now or self._clock()
+        reference_text = _datetime_to_text(reference_time)
+        error_message = str(result.error_message or "")[:1000]
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM notification_outbox WHERE notification_id = ?",
+                (notification_id,),
+            ).fetchone()
+            attempt = connection.execute(
+                "SELECT * FROM notification_delivery_attempts WHERE delivery_attempt_id = ?",
+                (delivery_attempt_id,),
+            ).fetchone()
+            if (
+                row is None
+                or attempt is None
+                or str(row["status"]) != "SENDING"
+                or str(row["lease_owner_token"] or "") != owner_token
+                or int(row["lease_version"] or 0) != int(lease_version)
+                or str(attempt["notification_id"]) != notification_id
+                or str(attempt["status"]) != "STARTED"
+                or str(attempt["lease_owner_token"]) != owner_token
+                or int(attempt["lease_version"]) != int(lease_version)
+            ):
+                connection.rollback()
+                raise NotificationDeliveryError("notification delivery result was fenced")
+
+            if classification == "SUCCESS":
+                attempt_status = "ACKNOWLEDGED"
+                outbox_status = "SENT"
+                next_attempt_at = None
+                sent_at = reference_text
+                last_error_code = ""
+                last_error_message = ""
+            elif classification == "UNKNOWN":
+                attempt_status = "UNKNOWN"
+                outbox_status = "UNKNOWN_DELIVERY"
+                next_attempt_at = None
+                sent_at = None
+                last_error_code = str(result.error_code or "UNKNOWN_DELIVERY")[:200]
+                last_error_message = error_message
+            elif classification == "PERM_FAILED":
+                attempt_status = "PERM_FAILED"
+                outbox_status = "FAILED"
+                next_attempt_at = None
+                sent_at = None
+                last_error_code = str(result.error_code or "PERM_FAILED")[:200]
+                last_error_message = error_message
+            else:
+                attempt_status = "TEMP_FAILED"
+                deadline = _text_to_datetime(row["deadline_at"])
+                max_attempts_reached = int(row["attempt_count"] or 0) >= int(row["max_attempts"] or 0)
+                if deadline is not None and deadline <= reference_time:
+                    outbox_status = "EXPIRED"
+                    next_attempt_at = None
+                    last_error_code = str(result.error_code or "DEADLINE_EXPIRED")[:200]
+                elif max_attempts_reached:
+                    outbox_status = "FAILED"
+                    next_attempt_at = None
+                    last_error_code = str(result.error_code or "MAX_ATTEMPTS")[:200]
+                else:
+                    outbox_status = "RETRY_WAIT"
+                    retry_seconds = result.retry_after_seconds
+                    if retry_seconds is None:
+                        retry_seconds = min(300, 2 ** max(0, int(row["attempt_count"] or 1) - 1))
+                    retry_seconds = max(0, min(int(retry_seconds), 3600))
+                    next_attempt_at = _datetime_to_text(reference_time + timedelta(seconds=retry_seconds))
+                    last_error_code = str(result.error_code or "TEMP_FAILED")[:200]
+                sent_at = None
+                last_error_message = error_message
+
+            attempt_changed = connection.execute(
+                """
+                UPDATE notification_delivery_attempts
+                SET status = ?, completed_at = ?, provider_status_code = ?,
+                    provider_message_id = ?, response_fingerprint = ?, error_code = ?, error_message = ?
+                WHERE delivery_attempt_id = ? AND notification_id = ? AND status = 'STARTED'
+                  AND lease_owner_token = ? AND lease_version = ?
+                """,
+                (
+                    attempt_status,
+                    reference_text,
+                    str(result.provider_status_code or "")[:100],
+                    str(result.provider_message_id or "")[:200],
+                    str(result.response_fingerprint or "")[:200],
+                    str(result.error_code or "")[:200],
+                    error_message,
+                    delivery_attempt_id,
+                    notification_id,
+                    owner_token,
+                    int(lease_version),
+                ),
+            ).rowcount
+            if attempt_changed != 1:
+                connection.rollback()
+                raise NotificationDeliveryError("notification attempt writeback was fenced")
+            changed = connection.execute(
+                """
+                UPDATE notification_outbox
+                SET status = ?, next_attempt_at = ?, lease_owner_token = '',
+                    lease_expires_at = NULL, sent_at = ?, provider_message_id = ?,
+                    last_error_code = ?, last_error_message = ?, updated_at = ?
+                WHERE notification_id = ? AND status = 'SENDING'
+                  AND lease_owner_token = ? AND lease_version = ?
+                """,
+                (
+                    outbox_status,
+                    next_attempt_at,
+                    sent_at,
+                    str(result.provider_message_id or "")[:200],
+                    last_error_code,
+                    last_error_message,
+                    reference_text,
+                    notification_id,
+                    owner_token,
+                    int(lease_version),
+                ),
+            ).rowcount
+            if changed != 1:
+                connection.rollback()
+                raise NotificationDeliveryError("notification writeback was fenced")
+            connection.commit()
+            final_row = connection.execute(
+                "SELECT * FROM notification_outbox WHERE notification_id = ?",
+                (notification_id,),
+            ).fetchone()
+            if final_row is None:
+                raise NotificationDeliveryError("notification disappeared after writeback")
+            return _row_to_notification_outbox(final_row)
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    record_notification_delivery = complete_notification_delivery
+
+    def list_notification_delivery_attempts(
+        self,
+        notification_id: str,
+    ) -> list[NotificationDeliveryAttempt]:
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM notification_delivery_attempts
+                WHERE notification_id = ?
+                ORDER BY attempt_no ASC
+                """,
+                (notification_id,),
+            ).fetchall()
+        return [_row_to_notification_delivery_attempt(row) for row in rows]
+
+    def recover_expired_notification_leases(
+        self,
+        *,
+        now: datetime | None = None,
+    ) -> list[NotificationOutbox]:
+        """Requeue safe LEASED rows and fence expired SENDING rows as UNKNOWN."""
+
+        reference_time = now or self._clock()
+        reference_text = _datetime_to_text(reference_time)
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                UPDATE notification_outbox
+                SET status = 'EXPIRED', lease_owner_token = '', lease_expires_at = NULL,
+                    last_error_code = 'DEADLINE_EXPIRED',
+                    last_error_message = 'notification deadline expired', updated_at = ?
+                WHERE status IN ('LEASED', 'RETRY_WAIT', 'PENDING')
+                  AND deadline_at IS NOT NULL AND deadline_at <= ?
+                """,
+                (reference_text, reference_text),
+            )
+            leased_rows = connection.execute(
+                """
+                SELECT notification_id FROM notification_outbox
+                WHERE status = 'LEASED' AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at <= ?
+                """,
+                (reference_text,),
+            ).fetchall()
+            for row in leased_rows:
+                connection.execute(
+                    """
+                    UPDATE notification_outbox
+                    SET status = 'PENDING', lease_owner_token = '', lease_expires_at = NULL,
+                        updated_at = ?
+                    WHERE notification_id = ? AND status = 'LEASED'
+                    """,
+                    (reference_text, row["notification_id"]),
+                )
+            sending_rows = connection.execute(
+                """
+                SELECT notification_id, lease_owner_token, lease_version
+                FROM notification_outbox
+                WHERE status = 'SENDING' AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at <= ?
+                """,
+                (reference_text,),
+            ).fetchall()
+            for row in sending_rows:
+                connection.execute(
+                    """
+                    UPDATE notification_delivery_attempts
+                    SET status = 'UNKNOWN', completed_at = ?,
+                        error_code = 'LEASE_EXPIRED_UNKNOWN_DELIVERY',
+                        error_message = 'worker lease expired while sending'
+                    WHERE notification_id = ? AND status = 'STARTED'
+                      AND lease_owner_token = ? AND lease_version = ?
+                    """,
+                    (
+                        reference_text,
+                        row["notification_id"],
+                        row["lease_owner_token"],
+                        row["lease_version"],
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE notification_outbox
+                    SET status = 'UNKNOWN_DELIVERY', lease_owner_token = '',
+                        lease_expires_at = NULL, last_error_code = 'LEASE_EXPIRED_UNKNOWN_DELIVERY',
+                        last_error_message = 'worker lease expired while sending', updated_at = ?
+                    WHERE notification_id = ? AND status = 'SENDING'
+                    """,
+                    (reference_text, row["notification_id"]),
+                )
+            changed_ids = [row["notification_id"] for row in leased_rows] + [
+                row["notification_id"] for row in sending_rows
+            ]
+            connection.commit()
+            if not changed_ids:
+                return []
+            placeholders = ",".join("?" for _ in changed_ids)
+            rows = connection.execute(
+                f"SELECT * FROM notification_outbox WHERE notification_id IN ({placeholders}) "
+                "ORDER BY created_at, notification_id",
+                changed_ids,
+            ).fetchall()
+            return [_row_to_notification_outbox(row) for row in rows]
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    watchdog_notification_leases = recover_expired_notification_leases
+
+    def cancel_notification_outbox(self, notification_id: str, *, now: datetime | None = None) -> bool:
+        reference_text = _datetime_to_text(now or self._clock())
+        with closing(self.connect_write()) as connection, connection:
+            return connection.execute(
+                """
+                UPDATE notification_outbox
+                SET status = 'CANCELLED', lease_owner_token = '', lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE notification_id = ? AND status IN ('PENDING', 'RETRY_WAIT', 'LEASED')
+                """,
+                (reference_text, notification_id),
+            ).rowcount == 1
+
     def insert_script_run(self, script_run: ScriptRun) -> int:
         row = _script_run_to_row(script_run)
         with closing(self.connect()) as connection, connection:
@@ -2927,6 +3683,85 @@ def _row_to_notification_log(row: sqlite3.Row) -> NotificationLog:
         message=str(row["message"] or ""),
         error_message=str(row["error_message"] or ""),
         created_at=_text_to_datetime(row["created_at"]),
+    )
+
+
+def _notification_outbox_to_row(notification: NotificationOutbox) -> dict[str, Any]:
+    created_at = notification.created_at or datetime.now()
+    updated_at = notification.updated_at or created_at
+    return {
+        "notification_id": notification.notification_id,
+        "notification_key": notification.notification_key,
+        "notification_type": notification.notification_type,
+        "related_task_id": notification.related_task_id,
+        "related_review_task_id": notification.related_review_task_id,
+        "recipient_type": notification.recipient_type,
+        "recipient_ref": notification.recipient_ref,
+        "channel": notification.channel,
+        "priority": int(notification.priority),
+        "payload_json": _json_dump(notification.payload),
+        "status": str(getattr(notification.status, "value", notification.status)),
+        "attempt_count": int(notification.attempt_count),
+        "max_attempts": int(notification.max_attempts),
+        "next_attempt_at": _datetime_to_text(notification.next_attempt_at),
+        "deadline_at": _datetime_to_text(notification.deadline_at),
+        "lease_owner_token": notification.lease_owner_token,
+        "lease_version": int(notification.lease_version),
+        "lease_expires_at": _datetime_to_text(notification.lease_expires_at),
+        "sent_at": _datetime_to_text(notification.sent_at),
+        "provider_message_id": notification.provider_message_id,
+        "last_error_code": notification.last_error_code,
+        "last_error_message": notification.last_error_message,
+        "created_at": _datetime_to_text(created_at),
+        "updated_at": _datetime_to_text(updated_at),
+    }
+
+
+def _row_to_notification_outbox(row: sqlite3.Row) -> NotificationOutbox:
+    return NotificationOutbox(
+        notification_id=str(row["notification_id"]),
+        notification_key=str(row["notification_key"]),
+        notification_type=str(row["notification_type"]),
+        related_task_id=row["related_task_id"],
+        related_review_task_id=row["related_review_task_id"],
+        recipient_type=str(row["recipient_type"]),
+        recipient_ref=str(row["recipient_ref"]),
+        channel=str(row["channel"]),
+        priority=int(row["priority"]),
+        payload=_json_load(row["payload_json"]),
+        status=str(row["status"]),
+        attempt_count=int(row["attempt_count"]),
+        max_attempts=int(row["max_attempts"]),
+        next_attempt_at=_text_to_datetime(row["next_attempt_at"]),
+        deadline_at=_text_to_datetime(row["deadline_at"]),
+        lease_owner_token=str(row["lease_owner_token"] or ""),
+        lease_version=int(row["lease_version"] or 0),
+        lease_expires_at=_text_to_datetime(row["lease_expires_at"]),
+        sent_at=_text_to_datetime(row["sent_at"]),
+        provider_message_id=str(row["provider_message_id"] or ""),
+        last_error_code=str(row["last_error_code"] or ""),
+        last_error_message=str(row["last_error_message"] or ""),
+        created_at=_text_to_datetime(row["created_at"]),
+        updated_at=_text_to_datetime(row["updated_at"]),
+    )
+
+
+def _row_to_notification_delivery_attempt(row: sqlite3.Row) -> NotificationDeliveryAttempt:
+    return NotificationDeliveryAttempt(
+        delivery_attempt_id=str(row["delivery_attempt_id"]),
+        notification_id=str(row["notification_id"]),
+        attempt_no=int(row["attempt_no"]),
+        status=str(row["status"]),
+        lease_owner_token=str(row["lease_owner_token"]),
+        lease_version=int(row["lease_version"]),
+        request_fingerprint=str(row["request_fingerprint"]),
+        started_at=_text_to_datetime(row["started_at"]) or datetime.now(),
+        completed_at=_text_to_datetime(row["completed_at"]),
+        provider_status_code=str(row["provider_status_code"] or ""),
+        provider_message_id=str(row["provider_message_id"] or ""),
+        response_fingerprint=str(row["response_fingerprint"] or ""),
+        error_code=str(row["error_code"] or ""),
+        error_message=str(row["error_message"] or ""),
     )
 
 

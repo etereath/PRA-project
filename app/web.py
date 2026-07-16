@@ -7413,7 +7413,7 @@ def _build_runtime_db_checks(db_path: Path) -> list[dict[str, str]]:
             "运行态数据库",
             "schema 完整性",
             "ok" if health.ok else "error",
-            "v5 结构完整" if health.ok else "v5 结构缺失或约束不完整",
+            f"v{LATEST_RUNTIME_SCHEMA_VERSION} 结构完整" if health.ok else f"v{LATEST_RUNTIME_SCHEMA_VERSION} 结构缺失或约束不完整",
             health.summary,
         ),
         _system_check(

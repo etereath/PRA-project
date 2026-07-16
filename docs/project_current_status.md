@@ -53,7 +53,7 @@ SQLite 当前保存以下运行态表：
 
 SQLite 只承接运行态任务系统，不替代 Excel 主数据。
 
-当前 runtime schema 最新版本为 v5。v3 新增自动规则评估运行记录，v4 新增 ShadowBot Executor 账本，v5 新增 `instruction_hash`、`request_file_sha256`、`queue_request_path` 队列审计字段和 `retry_authorizations` 持久化结构。`app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION` 是唯一版本权威来源。
+当前 runtime schema 最新版本为 v6。v3 新增自动规则评估运行记录，v4 新增 ShadowBot Executor 账本，v5 新增 `instruction_hash`、`request_file_sha256`、`queue_request_path` 队列审计字段和 `retry_authorizations` 持久化结构，v6 新增事务型 `notification_outbox` 与 `notification_delivery_attempts`。`app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION` 是唯一版本权威来源。
 
 ### 2.3 人工复核闭环
 
