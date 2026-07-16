@@ -68,6 +68,62 @@ class SQLiteInitializationError(SQLiteConnectionError):
     """Raised when explicit runtime database initialization cannot establish WAL."""
 
 
+@dataclass(frozen=True, slots=True)
+class SQLiteOperationalHealth:
+    """Non-mutating health facts for a runtime SQLite database."""
+
+    ok: bool
+    database_exists: bool
+    local_storage: bool
+    journal_mode: str | None
+    synchronous: str | None
+    foreign_keys: int | None
+    busy_timeout_ms: int | None
+    configured_busy_timeout_ms: int
+    error: str | None = None
+
+    @property
+    def summary(self) -> str:
+        if self.ok:
+            return (
+                "SQLite operational health is healthy "
+                f"(journal_mode={self.journal_mode}, synchronous={self.synchronous}, "
+                f"foreign_keys={self.foreign_keys}, busy_timeout_ms={self.busy_timeout_ms})"
+            )
+        parts = []
+        if not self.database_exists:
+            parts.append("database file does not exist")
+        if not self.local_storage:
+            parts.append("database is not on an accepted local filesystem")
+        if self.journal_mode != "wal":
+            parts.append(f"journal_mode expected wal, actual {self.journal_mode or 'unknown'}")
+        if self.synchronous != "NORMAL":
+            parts.append(f"synchronous expected NORMAL, actual {self.synchronous or 'unknown'}")
+        if self.foreign_keys != 1:
+            parts.append("foreign_keys expected 1")
+        if self.busy_timeout_ms != self.configured_busy_timeout_ms:
+            parts.append(
+                f"busy_timeout expected {self.configured_busy_timeout_ms}, actual {self.busy_timeout_ms}"
+            )
+        if self.error:
+            parts.append(self.error)
+        return "; ".join(parts) or "SQLite operational health is unhealthy"
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "ok": self.ok,
+            "database_exists": self.database_exists,
+            "local_storage": self.local_storage,
+            "journal_mode": self.journal_mode,
+            "synchronous": self.synchronous,
+            "foreign_keys": self.foreign_keys,
+            "busy_timeout_ms": self.busy_timeout_ms,
+            "configured_busy_timeout_ms": self.configured_busy_timeout_ms,
+            "error": self.error,
+            "summary": self.summary,
+        }
+
+
 class SQLiteConcurrencyError(SQLiteConnectionError):
     """Stable error returned after bounded SQLite lock retries are exhausted."""
 
@@ -118,8 +174,8 @@ class SQLiteConnectionConfig:
                 f"retry_base_delay_ms must be between {MIN_RETRY_BASE_DELAY_MS} and {MAX_RETRY_BASE_DELAY_MS}"
             )
         synchronous = str(self.synchronous).strip().upper()
-        if synchronous not in {"OFF", "NORMAL", "FULL", "EXTRA"}:
-            raise SQLiteConfigurationError("synchronous must be OFF, NORMAL, FULL, or EXTRA")
+        if synchronous != "NORMAL":
+            raise SQLiteConfigurationError("synchronous is fixed to NORMAL for runtime SQLite")
         object.__setattr__(self, "synchronous", synchronous)
         if self.retry_max_elapsed_ms is None:
             purpose = self.purpose.strip().lower()
@@ -205,7 +261,10 @@ class SQLiteConnectionFactory:
         raw_path = os.fspath(db_path)
         self._is_memory = raw_path == ":memory:"
         self._is_uri = raw_path.startswith("file:")
-        self._is_memory_uri = self._is_uri and "mode=memory" in raw_path.lower()
+        lowered_path = raw_path.lower()
+        self._is_memory_uri = self._is_uri and (
+            "mode=memory" in lowered_path or lowered_path.startswith("file::memory:")
+        )
         if self._is_memory or self._is_uri:
             self.db_path: Path | str = raw_path
         else:
@@ -213,7 +272,7 @@ class SQLiteConnectionFactory:
 
     @property
     def is_memory_database(self) -> bool:
-        return self._is_memory
+        return self._is_memory or self._is_memory_uri
 
     def connect(self) -> sqlite3.Connection:
         """Connect according to the configured read-only mode."""
@@ -226,8 +285,7 @@ class SQLiteConnectionFactory:
         if self._is_memory:
             return self._open_connection(":memory:", uri=False)
         if self._is_uri:
-            if not self.config.uri:
-                raise SQLiteConfigurationError("file: SQLite URIs require uri=True")
+            self._validate_uri_target()
             return self._open_connection(str(self.db_path), uri=True)
         assert isinstance(self.db_path, Path)
         self.validate_storage_location()
@@ -241,8 +299,9 @@ class SQLiteConnectionFactory:
         if self._is_memory:
             return self._open_connection(":memory:", uri=False)
         if self._is_uri:
-            if not self.config.uri or self.config.read_only:
-                raise SQLiteConfigurationError("writable SQLite URIs require uri=True and read_only=False")
+            self._validate_uri_target()
+            if self.config.read_only:
+                raise SQLiteConfigurationError("read-only SQLite configuration cannot open a writable connection")
             return self._open_connection(str(self.db_path), uri=True)
         assert isinstance(self.db_path, Path)
         self.validate_storage_location()
@@ -277,10 +336,21 @@ class SQLiteConnectionFactory:
     def validate_storage_location(self) -> None:
         """Fail closed for UNC/device paths and remote Windows drives."""
 
-        if self._is_memory or self._is_uri:
+        if self._is_memory:
+            return
+        if self._is_uri:
+            self._validate_uri_target()
             return
         assert isinstance(self.db_path, Path)
         _validate_local_storage_path(self.db_path)
+
+    def _validate_uri_target(self) -> None:
+        if not self.config.uri:
+            raise SQLiteConfigurationError("SQLite URIs require uri=True")
+        if not self._is_memory_uri or self.config.purpose.strip().lower() not in {"test", "testing"}:
+            raise SQLiteStorageLocationError(
+                "file: SQLite URIs are restricted to controlled mode=memory tests"
+            )
 
     @staticmethod
     def read_only_uri(db_path: str | os.PathLike[str]) -> str:
@@ -346,7 +416,7 @@ def is_sqlite_concurrency_error(error: BaseException) -> bool:
     )
 
 
-def execute_with_sqlite_retry(
+def _execute_with_sqlite_retry(
     operation: Callable[[], T],
     *,
     max_attempts: int = DEFAULT_RETRY_MAX_ATTEMPTS,
@@ -404,8 +474,3 @@ def execute_with_sqlite_retry(
                 )
             if delay_seconds > 0:
                 sleep(delay_seconds)
-
-
-# Short aliases keep call sites readable while retaining one implementation.
-run_with_sqlite_retry = execute_with_sqlite_retry
-retry_sqlite_operation = execute_with_sqlite_retry

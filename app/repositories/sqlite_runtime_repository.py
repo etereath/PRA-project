@@ -30,8 +30,10 @@ from app.models import (
 from app.repositories.sqlite_connection import (
     SQLITE_CONCURRENCY_ERROR_CODES,
     SQLiteConnectionConfig,
+    SQLiteConnectionError,
     SQLiteConnectionFactory,
-    execute_with_sqlite_retry,
+    SQLiteOperationalHealth,
+    _execute_with_sqlite_retry,
     is_sqlite_concurrency_error,
 )
 from app.runtime_schema import (
@@ -390,7 +392,7 @@ class SQLiteRuntimeRepository:
 
         return self.connection_factory.connect_write()
 
-    def run_with_lock_retry(
+    def _run_sqlite_retry(
         self,
         operation: Callable[[], Any],
         *,
@@ -399,7 +401,7 @@ class SQLiteRuntimeRepository:
         """Run a database-only operation under the configured bounded retry policy."""
 
         config = self.connection_factory.config
-        return execute_with_sqlite_retry(
+        return _execute_with_sqlite_retry(
             operation,
             max_attempts=config.retry_max_attempts,
             max_elapsed_ms=config.retry_max_elapsed_ms or 0,
@@ -457,6 +459,74 @@ class SQLiteRuntimeRepository:
                 return inspect_runtime_schema(connection)
         with closing(self.connection_factory.connect_read()) as connection:
             return inspect_runtime_schema(connection)
+
+    def check_operational_health(self) -> SQLiteOperationalHealth:
+        """Return non-mutating WAL, PRAGMA, and local-storage health facts."""
+
+        config = self.connection_factory.config
+        database_exists = self.db_path.exists()
+        local_storage = False
+        journal_mode: str | None = None
+        synchronous: str | None = None
+        foreign_keys: int | None = None
+        busy_timeout_ms: int | None = None
+        try:
+            self.connection_factory.validate_storage_location()
+            local_storage = True
+            if not database_exists:
+                return SQLiteOperationalHealth(
+                    ok=False,
+                    database_exists=False,
+                    local_storage=True,
+                    journal_mode=None,
+                    synchronous=None,
+                    foreign_keys=None,
+                    busy_timeout_ms=None,
+                    configured_busy_timeout_ms=config.busy_timeout_ms,
+                    error="SQLite database file does not exist",
+                )
+            with closing(self.connection_factory.connect_read()) as connection:
+                journal_row = connection.execute("PRAGMA journal_mode").fetchone()
+                synchronous_row = connection.execute("PRAGMA synchronous").fetchone()
+                foreign_keys_row = connection.execute("PRAGMA foreign_keys").fetchone()
+                busy_timeout_row = connection.execute("PRAGMA busy_timeout").fetchone()
+            journal_mode = str(journal_row[0]).lower() if journal_row else None
+            synchronous = {
+                0: "OFF",
+                1: "NORMAL",
+                2: "FULL",
+                3: "EXTRA",
+            }.get(int(synchronous_row[0]), "UNKNOWN") if synchronous_row else None
+            foreign_keys = int(foreign_keys_row[0]) if foreign_keys_row else None
+            busy_timeout_ms = int(busy_timeout_row[0]) if busy_timeout_row else None
+            ok = (
+                journal_mode == "wal"
+                and synchronous == "NORMAL"
+                and foreign_keys == 1
+                and busy_timeout_ms == config.busy_timeout_ms
+            )
+            return SQLiteOperationalHealth(
+                ok=ok,
+                database_exists=True,
+                local_storage=True,
+                journal_mode=journal_mode,
+                synchronous=synchronous,
+                foreign_keys=foreign_keys,
+                busy_timeout_ms=busy_timeout_ms,
+                configured_busy_timeout_ms=config.busy_timeout_ms,
+            )
+        except (sqlite3.Error, SQLiteConnectionError) as exc:
+            return SQLiteOperationalHealth(
+                ok=False,
+                database_exists=database_exists,
+                local_storage=local_storage,
+                journal_mode=journal_mode,
+                synchronous=synchronous,
+                foreign_keys=foreign_keys,
+                busy_timeout_ms=busy_timeout_ms,
+                configured_busy_timeout_ms=config.busy_timeout_ms,
+                error=f"SQLite operational check failed: {type(exc).__name__}",
+            )
 
     def runtime_schema_health(self) -> RuntimeSchemaHealth:
         """Alias used by operational callers that name the report directly."""
@@ -1678,6 +1748,28 @@ class SQLiteRuntimeRepository:
             connection.close()
 
     def renew_shadowbot_lease(
+        self,
+        execution_attempt_id: str,
+        *,
+        owner_token: str,
+        lease_version: int,
+        now: datetime,
+        new_expires_at: datetime,
+    ) -> bool:
+        """Renew a lease with bounded retries for this database-only operation."""
+
+        return self._run_sqlite_retry(
+            lambda: self._renew_shadowbot_lease_once(
+                execution_attempt_id,
+                owner_token=owner_token,
+                lease_version=lease_version,
+                now=now,
+                new_expires_at=new_expires_at,
+            ),
+            operation_name="renew ShadowBot lease",
+        )
+
+    def _renew_shadowbot_lease_once(
         self,
         execution_attempt_id: str,
         *,

@@ -611,9 +611,12 @@ def _application(environ, start_response):
         # target fixed to the trusted process configuration; accepting a
         # request-level path would let callers make the service open arbitrary
         # local SQLite files.
-        health = SQLiteRuntimeRepository(Path(DEFAULT_RUNTIME_DB)).check_schema_health()
-        status = "200 OK" if health.ok else "503 Service Unavailable"
-        body = "ok" if health.ok else f"unhealthy: {health.summary}"
+        repository = SQLiteRuntimeRepository(Path(DEFAULT_RUNTIME_DB))
+        schema_health = repository.check_schema_health()
+        operational_health = repository.check_operational_health()
+        health_ok = schema_health.ok and operational_health.ok
+        status = "200 OK" if health_ok else "503 Service Unavailable"
+        body = "ok" if health_ok else f"unhealthy: {schema_health.summary}; {operational_health.summary}"
         return _respond(start_response, status, "text/plain; charset=utf-8", body)
     if path == "/dashboard":
         return _respond(start_response, "200 OK", "text/html; charset=utf-8", _handle_ops_dashboard(environ))
@@ -7371,7 +7374,9 @@ def _build_runtime_db_checks(db_path: Path) -> list[dict[str, str]]:
     versions = _safe_schema_versions(db_path)
     latest_version = max(versions) if versions else 0
     version_value = ", ".join(str(version) for version in versions) if versions else "-"
-    health = SQLiteRuntimeRepository(db_path).check_schema_health()
+    repository = SQLiteRuntimeRepository(db_path)
+    health = repository.check_schema_health()
+    operational_health = repository.check_operational_health()
     return [
         _system_check(
             "运行态数据库",
@@ -7410,6 +7415,13 @@ def _build_runtime_db_checks(db_path: Path) -> list[dict[str, str]]:
             "ok" if health.ok else "error",
             "v5 结构完整" if health.ok else "v5 结构缺失或约束不完整",
             health.summary,
+        ),
+        _system_check(
+            "运行态数据库",
+            "SQLite operational health",
+            "ok" if operational_health.ok else "error",
+            operational_health.summary,
+            "运行数据库必须位于本地磁盘，并使用 WAL、synchronous=NORMAL、foreign_keys=ON 和有界 busy_timeout。",
         ),
     ]
 

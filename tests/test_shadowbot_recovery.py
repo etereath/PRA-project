@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -13,6 +15,7 @@ import pytest
 from app.enums import ReviewTaskStatus, TaskActionType, TaskStatus
 from app.exceptions import ValidationError
 from app.models import ReviewTask, ShadowBotExecutionAttempt, ShadowBotOperationLedger, Task
+from app.repositories.sqlite_connection import SQLiteConnectionConfig
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.runtime import RuntimeTaskService
 from app.services.shadowbot_executor import (
@@ -119,8 +122,16 @@ def _approval(operation_id: str = "OP-RECOVERY") -> ShadowBotApproval:
     )
 
 
-def _repository(tmp_path: Path, operation_id: str = "OP-RECOVERY") -> SQLiteRuntimeRepository:
-    repository = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
+def _repository(
+    tmp_path: Path,
+    operation_id: str = "OP-RECOVERY",
+    *,
+    connection_config: SQLiteConnectionConfig | None = None,
+) -> SQLiteRuntimeRepository:
+    repository = SQLiteRuntimeRepository(
+        tmp_path / "runtime.sqlite3",
+        connection_config=connection_config,
+    )
     RuntimeTaskService(repository).init_schema()
     RuntimeTaskService(repository).create_tasks([_task()])
     payload = _payload(operation_id)
@@ -187,8 +198,13 @@ def _write_json_with_checksum(path: Path, payload: dict[str, object], *, bad_che
     path.with_suffix(path.suffix + ".sha256").write_text(checksum + "\n", encoding="ascii")
 
 
-def _file_attempt(tmp_path: Path, *, attempt_id: str = "ATTEMPT-FILE"):
-    repository = _repository(tmp_path)
+def _file_attempt(
+    tmp_path: Path,
+    *,
+    attempt_id: str = "ATTEMPT-FILE",
+    connection_config: SQLiteConnectionConfig | None = None,
+):
+    repository = _repository(tmp_path, connection_config=connection_config)
     queue_dir = tmp_path / "queue"
     runner = ShadowBotFileQueueRunner(queue_dir)
     executor = ShadowBotExecutor(repository, runner)
@@ -365,6 +381,52 @@ def test_f05_not_applied_evidence_authorizes_once_and_creates_new_lease(tmp_path
     assert _lease(retry_attempt)["owner_token"] != lease["owner_token"]
     assert repository.get_retry_authorization(authorization.retry_authorization_id).status == "CONSUMED"
     assert (queue_dir / "archive" / source.execution_attempt_id).exists()
+
+
+def test_task8_lease_renewal_retries_a_real_sqlite_lock(tmp_path: Path) -> None:
+    config = SQLiteConnectionConfig(
+        busy_timeout_ms=100,
+        retry_max_attempts=3,
+        retry_max_elapsed_ms=500,
+        retry_base_delay_ms=1,
+    )
+    repository, _, _, _, attempt, _, _ = _file_attempt(
+        tmp_path,
+        connection_config=config,
+    )
+    lease = _lease(attempt)
+    blocker = repository.connect()
+    blocker.execute("BEGIN IMMEDIATE")
+    started = threading.Event()
+    outcome: dict[str, object] = {}
+
+    def renew() -> None:
+        started.set()
+        try:
+            outcome["result"] = repository.renew_shadowbot_lease(
+                attempt.execution_attempt_id,
+                owner_token=str(lease["owner_token"]),
+                lease_version=int(lease["version"]),
+                now=datetime.now(UTC),
+                new_expires_at=datetime.now(UTC) + timedelta(minutes=20),
+            )
+        except BaseException as exc:  # noqa: BLE001 - preserve thread failure for the assertion
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=renew)
+    worker.start()
+    assert started.wait(timeout=2)
+    time.sleep(0.15)
+    blocker.rollback()
+    blocker.close()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert "error" not in outcome, outcome.get("error")
+    assert outcome.get("result") is True
+    renewed = repository.get_shadowbot_execution_attempt(attempt.execution_attempt_id)
+    assert renewed is not None
+    assert _lease(renewed)["expires_at"] != lease["expires_at"]
 
 
 def test_manual_retry_authorization_records_actor_reason_and_evidence(tmp_path: Path) -> None:
