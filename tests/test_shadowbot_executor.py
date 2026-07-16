@@ -248,6 +248,8 @@ class ShadowBotExecutorTests(unittest.TestCase):
         notifications = self.repository.list_notification_logs(related_review_task_id=first)
         self.assertEqual(first, second)
         self.assertEqual(review.review_status, ReviewTaskStatus.PENDING)
+        self.assertGreaterEqual((review.required_by - review.created_at).total_seconds(), 120)
+        self.assertLessEqual((review.required_by - review.created_at).total_seconds(), 600)
         self.assertEqual(len(notifications), 1)
         self.assertNotIn("password", str(review.review_payload).lower())
         self.assertIn("ShadowBot 登录验证码人工接管", notifications[0].message)

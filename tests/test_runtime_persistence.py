@@ -495,6 +495,21 @@ class RuntimePersistenceTests(unittest.TestCase):
         self.assertIn("产能预警", logs[0].message)
         self.assertNotIn("decision_trace", logs[0].message)
 
+    def test_repeated_review_business_event_returns_existing_without_notification_error(self) -> None:
+        source = _runtime_task("TASK-REPEATED-REVIEW")
+        self.task_service.create_tasks([source])
+        review_service = ReviewTaskService(self.repository, runtime_task_service=self.task_service)
+        with patch.dict("os.environ", {"DEFAULT_NOTIFICATION_CHANNEL": "FeIsHu"}, clear=False):
+            first = review_service.create_from_tasks([source])
+            second = review_service.create_from_tasks([source])
+        self.assertEqual(first.inserted_review_tasks_count, 1)
+        self.assertEqual(second.inserted_review_tasks_count, 0)
+        self.assertEqual(second.notification_errors, [])
+        self.assertEqual(len(self.repository.list_review_tasks()), 1)
+        self.assertEqual(len(self.repository.list_notification_outbox()), 1)
+        self.assertEqual(self.repository.list_notification_outbox()[0].channel, "feishu")
+        self.assertEqual(len(self.repository.list_notification_logs()), 1)
+
     def test_feishu_notification_flow_sends_url_but_does_not_persist_raw_token(self) -> None:
         source = _runtime_task("TASK-1")
         self.task_service.create_tasks([source])

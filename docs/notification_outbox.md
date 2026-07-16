@@ -11,7 +11,11 @@
 - 发送结果不确定、发送后崩溃或 lease 在 `SENDING` 阶段过期时进入 `UNKNOWN_DELIVERY`，普通 Worker 不会自动重发。
 - 验证码人工介入通知使用最高优先级、2 至 10 分钟 deadline 和最多 3 次尝试；ShadowBot 登录验证的 `ReviewTask` 与 Outbox 在同一事务创建，业务事务不调用渠道。
 - `NotificationChannelRegistry` 按持久化 `channel` 绑定 `fake / scripted / feishu` 适配器；发送前强制校验适配器 channel。`python -m app.cli notification-worker --runtime-db ... --channel feishu` 是可由调度器调用的一次 Worker/Watchdog 入口。
+- 所有 channel 在构造 key 和落库前统一小写；Feishu 新旧适配器复用同一官方签名函数，并同时判定 `code` 与 `StatusCode`。
+- Service 不允许一个时间戳跨越领取、网络调用和写回；各 Repository 事务在取得写锁后独立读取注入时钟。
 - 已知通知类型采用字段白名单、类型和长度限制；provider 错误只保留安全错误码/摘要，Bearer、Cookie、Webhook URL 等值会被拒绝或脱敏。
+- Review 解决、取消或过期时，同一事务将尚未进入 `SENDING` 的关联 Outbox 推进 `CANCELLED`；`SENDING` 保留不确定投递语义。
+- ReviewTask、Outbox 和初始 `notification_logs` 兼容投影在同一事务创建；重复 Review 按业务 `dedupe_key` 返回已有 Outbox，并可幂等补建历史缺失的投影。
 - 所有领取过期、取消、完成写回和 Watchdog 状态变化会在同一事务同步旧 `notification_logs` 兼容投影。
 
 ## 测试发送器

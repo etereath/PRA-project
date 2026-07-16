@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import base64
 import json
 import secrets
 import time
@@ -30,6 +29,7 @@ from app.models import (
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.execution import ExecutionSimulationService
+from app.services.feishu import build_feishu_signature, is_feishu_success_response
 from app.services.manual_intervention import MANUAL_INTERVENTION_ACTIONS
 from app.services.notification_outbox import (
     FakeSender,
@@ -1065,9 +1065,7 @@ def _feishu_message_type() -> str:
 
 
 def _build_feishu_sign(timestamp: str, secret: str) -> str:
-    string_to_sign = f"{timestamp}\n{secret}"
-    digest = hmac.new(string_to_sign.encode("utf-8"), b"", hashlib.sha256).digest()
-    return base64.b64encode(digest).decode("utf-8")
+    return build_feishu_signature(timestamp, secret)
 
 
 def _feishu_response_summary(*, status_code: int, response_text: str) -> dict[str, object]:
@@ -1082,11 +1080,7 @@ def _feishu_response_summary(*, status_code: int, response_text: str) -> dict[st
 
 
 def _is_feishu_success_response(response_json: dict[str, object]) -> bool:
-    if "code" in response_json:
-        return response_json.get("code") == 0
-    if "StatusCode" in response_json:
-        return response_json.get("StatusCode") == 0
-    return True
+    return is_feishu_success_response(response_json)
 
 
 def _feishu_error_message(response_json: dict[str, object]) -> str:

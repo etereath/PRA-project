@@ -853,7 +853,16 @@ class ShadowBotExecutor:
             raise ValidationError("LOGIN_VERIFICATION_REQUIRED operation does not exist.")
         login = phase_data.get("login") if isinstance(phase_data.get("login"), dict) else {}
         now = utc_now()
-        deadline = _parse_optional_datetime(login.get("verification_deadline_at")) or (now + timedelta(minutes=5))
+        requested_deadline = _parse_optional_datetime(login.get("verification_deadline_at"))
+        if requested_deadline is None:
+            deadline = now + timedelta(minutes=5)
+        else:
+            if requested_deadline.tzinfo is None:
+                requested_deadline = requested_deadline.replace(tzinfo=now.tzinfo)
+            ttl_seconds = (requested_deadline - now).total_seconds()
+            # Leave one second of scheduling headroom so validation performed
+            # immediately afterward still observes the 120..600 second TTL.
+            deadline = now + timedelta(seconds=min(599, max(121, ttl_seconds)))
         review = ReviewTask(
             review_task_id=review_task_id,
             trade_date=now.date(),

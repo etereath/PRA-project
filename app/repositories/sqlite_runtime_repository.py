@@ -899,6 +899,12 @@ class SQLiteRuntimeRepository:
                 """,
                 row,
             )
+            if review_task.review_status != ReviewTaskStatus.PENDING:
+                self._cancel_review_outbox_on_connection(
+                    connection,
+                    review_task.review_task_id,
+                    changed_at=review_task.updated_at or self._clock(),
+                )
 
     def update_review_task_with_optional_task_status(
         self,
@@ -924,6 +930,12 @@ class SQLiteRuntimeRepository:
                 """,
                 review_row,
             )
+            if review_task.review_status != ReviewTaskStatus.PENDING:
+                self._cancel_review_outbox_on_connection(
+                    connection,
+                    review_task.review_task_id,
+                    changed_at=review_task.updated_at or self._clock(),
+                )
             if task_id is None or task_status is None or history is None:
                 return
             updated_at = _datetime_to_text(datetime.now())
@@ -953,6 +965,47 @@ class SQLiteRuntimeRepository:
                     _json_dump(history.metadata),
                 ),
             )
+
+    @classmethod
+    def _cancel_review_outbox_on_connection(
+        cls,
+        connection: sqlite3.Connection,
+        review_task_id: str,
+        *,
+        changed_at: datetime,
+    ) -> int:
+        rows = connection.execute(
+            """
+            SELECT notification_id FROM notification_outbox
+            WHERE related_review_task_id = ?
+              AND status IN ('PENDING', 'RETRY_WAIT', 'LEASED')
+            """,
+            (review_task_id,),
+        ).fetchall()
+        changed = 0
+        for row in rows:
+            notification_id = str(row["notification_id"])
+            updated = connection.execute(
+                """
+                UPDATE notification_outbox
+                SET status = 'CANCELLED', lease_owner_token = '', lease_expires_at = NULL,
+                    last_error_code = 'BUSINESS_EVENT_RESOLVED',
+                    last_error_message = 'notification cancelled because review was resolved',
+                    updated_at = ?
+                WHERE notification_id = ?
+                  AND status IN ('PENDING', 'RETRY_WAIT', 'LEASED')
+                """,
+                (_datetime_to_text(changed_at), notification_id),
+            ).rowcount
+            if updated == 1:
+                changed += 1
+                cls._update_notification_log_delivery_on_connection(
+                    connection,
+                    notification_id,
+                    send_status="failed",
+                    error_message="notification cancelled because review was resolved",
+                )
+        return changed
 
     def resolve_mobile_review_atomic(
         self,
@@ -1141,6 +1194,11 @@ class SQLiteRuntimeRepository:
                         MobileReviewErrorCode.REVIEW_ALREADY_RESOLVED,
                         "复核任务已被其他请求处理",
                     )
+                self._cancel_review_outbox_on_connection(
+                    connection,
+                    review_task_id,
+                    changed_at=timestamp,
+                )
                 inject("after_review_update")
 
                 if source_row is not None and source_task_status is not None:
@@ -2682,6 +2740,7 @@ class SQLiteRuntimeRepository:
         review_task: ReviewTask,
         notification: NotificationOutbox,
         *,
+        compatibility_log: NotificationLog | None = None,
         failure_injector: Callable[[str], None] | None = None,
     ) -> tuple[int, int]:
         """Atomically insert a review task and its notification intent."""
@@ -2719,6 +2778,26 @@ class SQLiteRuntimeRepository:
                 raise ValueError("notification_key already exists for a new review task")
             if failure_injector is not None:
                 failure_injector("after_outbox_insert")
+            if compatibility_log is not None:
+                log_row = _notification_log_to_row(compatibility_log)
+                inserted_log = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO notification_logs(
+                        notification_id, related_task_id, related_review_task_id, recipient_type,
+                        recipient, channel, sent_at, send_status, dedupe_key, message,
+                        error_message, created_at
+                    ) VALUES(
+                        :notification_id, :related_task_id, :related_review_task_id, :recipient_type,
+                        :recipient, :channel, :sent_at, :send_status, :dedupe_key, :message,
+                        :error_message, :created_at
+                    )
+                    """,
+                    log_row,
+                ).rowcount
+                if inserted_log != 1:
+                    raise ValueError("compatibility notification log already exists for a new outbox")
+                if failure_injector is not None:
+                    failure_injector("after_compatibility_log_insert")
             connection.commit()
             return review_inserted, outbox_inserted
         except Exception:

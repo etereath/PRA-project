@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import sqlite3
@@ -10,7 +11,12 @@ from pathlib import Path
 import pytest
 
 from app.enums import DeliveryAttemptStatus, NotificationOutboxStatus, ReviewTaskStatus
-from app.exceptions import NotificationChannelMismatchError, NotificationIdempotencyConflictError, NotificationLeaseError
+from app.exceptions import (
+    NotificationChannelMismatchError,
+    NotificationDeliveryError,
+    NotificationIdempotencyConflictError,
+    NotificationLeaseError,
+)
 from app.models import NotificationDeliveryAttempt, NotificationDeliveryResult, NotificationOutbox, ReviewTask
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.notification_outbox import (
@@ -18,9 +24,13 @@ from app.services.notification_outbox import (
     FeishuOutboxSender,
     NotificationChannelRegistry,
     NotificationOutboxService,
+    NotificationOutboxWorker,
+    OutboxReviewNotificationService,
     ScriptedSender,
 )
 from app.services import notification_outbox as notification_outbox_module
+from app.services.feishu import build_feishu_signature
+from app.services.runtime import ReviewTaskService
 
 
 def _review(review_id: str = "REVIEW-1") -> ReviewTask:
@@ -350,6 +360,65 @@ def test_channel_registry_binds_feishu_and_provider_result_is_bounded(repository
     assert result.provider_message_id == "req-1"
 
 
+def test_feishu_outbox_uses_official_signature_vector_and_response_code_matrix(monkeypatch):
+    assert build_feishu_signature("1234567890", "sign-secret") == (
+        "CgzXNZVOeFF3tZW7JDVpuevxS8czITsTOclPQeDiF9c="
+    )
+    captured: dict[str, object] = {}
+    response_body = [b'{"StatusCode":0,"StatusMessage":"success"}']
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def getcode(self):
+            return 200
+
+        def read(self):
+            return response_body[0]
+
+    def fake_urlopen(request, timeout):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return Response()
+
+    monkeypatch.setattr(notification_outbox_module, "urlopen", fake_urlopen)
+    monkeypatch.setattr(notification_outbox_module.time, "time", lambda: 1234567890)
+    monkeypatch.setenv("FEISHU_WEBHOOK_URL", "https://example.invalid/hook/test")
+    monkeypatch.setenv("FEISHU_WEBHOOK_SECRET", "sign-secret")
+    notification = _notification("FEISHU-SIGNED")
+    notification.channel = "feishu"
+    attempt = NotificationDeliveryAttempt(
+        delivery_attempt_id="ATT-SIGNED",
+        notification_id=notification.notification_id,
+        attempt_no=1,
+        status="STARTED",
+        lease_owner_token="owner",
+        lease_version=1,
+        request_fingerprint="request",
+        started_at=datetime(2026, 7, 17, 10, 0),
+    )
+    success = FeishuOutboxSender().send(notification, attempt)
+    assert success.classification == "SUCCESS"
+    assert captured["body"]["timestamp"] == "1234567890"
+    assert captured["body"]["sign"] == "CgzXNZVOeFF3tZW7JDVpuevxS8czITsTOclPQeDiF9c="
+
+    response_body[0] = b'{"StatusCode":19001,"StatusMessage":"bad sign"}'
+    failed = FeishuOutboxSender().send(notification, attempt)
+    assert failed.classification == "PERM_FAILED"
+    assert failed.error_code == "FEISHU_PROVIDER_REJECTED"
+
+    response_body[0] = b'{"code":19002,"msg":"rejected"}'
+    failed_code = FeishuOutboxSender().send(notification, attempt)
+    assert failed_code.classification == "PERM_FAILED"
+
+    response_body[0] = b'{"code":0,"StatusCode":19003,"StatusMessage":"rejected"}'
+    conflicting = FeishuOutboxSender().send(notification, attempt)
+    assert conflicting.classification == "PERM_FAILED"
+
+
 def test_review_and_outbox_commit_or_rollback_together(repository):
     service = NotificationOutboxService(repository, clock=lambda: datetime(2026, 7, 17, 10, 0))
     review = _review()
@@ -370,6 +439,43 @@ def test_review_and_outbox_commit_or_rollback_together(repository):
     assert inserted[:2] == (1, 1)
     assert repository.get_review_task(review.review_task_id) is not None
     assert repository.get_notification_outbox_by_key(inserted[2].notification_key) is not None
+
+
+def test_duplicate_review_dedupe_returns_existing_outbox_and_repairs_projection(repository):
+    service = NotificationOutboxService(repository, clock=lambda: datetime(2026, 7, 17, 10, 0))
+    first_review = _review("REVIEW-RANDOM-1")
+    second_review = _review("REVIEW-RANDOM-2")
+    second_review.dedupe_key = first_review.dedupe_key
+    first = service.enqueue_review_task_atomically(first_review)
+    with closing(repository.connect_write()) as connection, connection:
+        connection.execute(
+            "DELETE FROM notification_logs WHERE notification_id = ?",
+            (first[2].notification_id,),
+        )
+    duplicate = service.enqueue_review_task_atomically(second_review)
+    assert duplicate[:2] == (0, 0)
+    assert duplicate[2].notification_id == first[2].notification_id
+    assert len(repository.list_notification_outbox()) == 1
+    assert repository.get_notification_log(first[2].notification_id) is not None
+
+
+def test_compatibility_projection_insert_failure_rolls_back_review_and_outbox(repository):
+    service = NotificationOutboxService(repository, clock=lambda: datetime(2026, 7, 17, 10, 0))
+    review = _review("REVIEW-COMPAT-ROLLBACK")
+    candidate = service._candidate_review_notification(review)
+    compatibility_log = service._compatibility_log(candidate)
+    with pytest.raises(RuntimeError, match="compatibility failure"):
+        repository.insert_review_task_with_notification_outbox(
+            review,
+            candidate,
+            compatibility_log=compatibility_log,
+            failure_injector=lambda stage: (_ for _ in ()).throw(RuntimeError("compatibility failure"))
+            if stage == "after_compatibility_log_insert"
+            else None,
+        )
+    assert repository.get_review_task(review.review_task_id) is None
+    assert repository.get_notification_outbox(candidate.notification_id) is None
+    assert repository.get_notification_log(candidate.notification_id) is None
 
 
 def test_only_one_worker_claims_a_notification(repository):
@@ -419,6 +525,8 @@ def test_old_owner_is_fenced_before_delivery(repository):
 
 def test_success_is_sent_once_and_temporary_failure_is_bounded(repository):
     now = datetime(2026, 7, 17, 10, 0)
+    current = [now]
+    repository._clock = lambda: current[0]
     service = NotificationOutboxService(repository, clock=lambda: now)
     service.enqueue(
         notification_type="test",
@@ -434,13 +542,15 @@ def test_success_is_sent_once_and_temporary_failure_is_bounded(repository):
     assert first is not None
     assert first.status == NotificationOutboxStatus.RETRY_WAIT.value
     assert first.next_attempt_at == now + timedelta(seconds=1)
-    second = service.deliver_once(sender, now=now + timedelta(seconds=1))
+    current[0] = now + timedelta(seconds=1)
+    second = service.deliver_once(sender)
     assert second is not None
     assert second.status == NotificationOutboxStatus.SENT.value
     assert second.attempt_count == 2
     assert len(repository.list_notification_delivery_attempts(second.notification_id)) == 2
     assert repository.list_notification_delivery_attempts(second.notification_id)[-1].status == DeliveryAttemptStatus.ACKNOWLEDGED.value
-    assert service.deliver_once(sender, now=now + timedelta(minutes=1)) is None
+    current[0] = now + timedelta(minutes=1)
+    assert service.deliver_once(sender) is None
 
 
 def test_unknown_delivery_is_terminal_for_normal_worker(repository):
@@ -522,6 +632,61 @@ def test_late_writeback_after_lease_or_deadline_is_fenced_for_watchdog(repositor
     assert recovered[0].status == NotificationOutboxStatus.UNKNOWN_DELIVERY.value
 
 
+def test_service_re_reads_time_after_slow_sender_and_watchdog_after_lock_wait(repository):
+    now = datetime(2026, 7, 17, 10, 0)
+    current = [now]
+    repository._clock = lambda: current[0]
+    service = NotificationOutboxService(repository, lease_seconds=5)
+    notification = service.enqueue(
+        notification_type="test",
+        notification_key="service-fresh-time",
+        recipient_type="role",
+        recipient_ref="operator",
+        channel="fake",
+        payload={"message": "safe"},
+        deadline_at=now + timedelta(seconds=30),
+    )
+
+    class SlowSender(FakeSender):
+        def send(self, notification, attempt):
+            current[0] = now + timedelta(seconds=6)
+            return super().send(notification, attempt)
+
+    with pytest.raises(NotificationDeliveryError, match="expired before writeback"):
+        service.deliver_once(SlowSender(), lease_seconds=5)
+    assert repository.get_notification_outbox(notification.notification_id).status == "SENDING"
+    assert service.watchdog()[0].status == "UNKNOWN_DELIVERY"
+
+    leased = service.enqueue(
+        notification_type="test",
+        notification_key="watchdog-lock-time",
+        recipient_type="role",
+        recipient_ref="operator",
+        channel="fake",
+        payload={"message": "safe"},
+    )
+    current[0] = now
+    repository.claim_notification_outbox(lease_seconds=5, channel="fake")
+    blocker = repository.connect_write()
+    blocker.execute("BEGIN IMMEDIATE")
+    started = threading.Event()
+    recovered: list[NotificationOutbox] = []
+
+    def run_watchdog():
+        started.set()
+        recovered.extend(service.watchdog())
+
+    thread = threading.Thread(target=run_watchdog)
+    thread.start()
+    assert started.wait(timeout=2)
+    current[0] = now + timedelta(seconds=6)
+    blocker.commit()
+    blocker.close()
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+    assert any(row.notification_id == leased.notification_id for row in recovered)
+
+
 def test_verification_intervention_has_priority_and_short_deadline(repository):
     now = datetime(2026, 7, 17, 10, 0)
     service = NotificationOutboxService(repository, clock=lambda: now)
@@ -545,3 +710,100 @@ def test_verification_intervention_has_priority_and_short_deadline(repository):
     assert claimed.notification_id == verification.notification_id
     assert claimed.priority == 100
     assert claimed.deadline_at == now + timedelta(seconds=300)
+
+
+@pytest.mark.parametrize("ttl_seconds", [-1, 60, 601, 3600])
+def test_atomic_verification_review_rejects_deadline_outside_short_ttl(repository, ttl_seconds):
+    now = datetime(2026, 7, 17, 10, 0)
+    service = NotificationOutboxService(repository, clock=lambda: now)
+    review = _review(f"VERIFY-{ttl_seconds}")
+    review.required_by = now + timedelta(seconds=ttl_seconds)
+    with pytest.raises(ValueError, match="between 120 and 600 seconds"):
+        service.enqueue_verification_review_task_atomically(
+            review,
+            operation_id="OP-1",
+            attempt_id=f"ATT-{ttl_seconds}",
+            recipient_type="role",
+            recipient_ref="operator",
+            channel="fake",
+        )
+
+
+def test_atomic_verification_review_accepts_five_minute_ttl(repository):
+    now = datetime(2026, 7, 17, 10, 0)
+    service = NotificationOutboxService(repository, clock=lambda: now)
+    review = _review("VERIFY-300")
+    review.required_by = now + timedelta(seconds=300)
+    inserted = service.enqueue_verification_review_task_atomically(
+        review,
+        operation_id="OP-1",
+        attempt_id="ATT-300",
+        recipient_type="role",
+        recipient_ref="operator",
+        channel="FeIsHu",
+    )
+    assert inserted[:2] == (1, 1)
+    assert inserted[2].channel == "feishu"
+
+
+def test_review_channel_is_normalized_before_key_and_worker_claim(repository, monkeypatch):
+    monkeypatch.setenv("DEFAULT_NOTIFICATION_CHANNEL", "FeIsHu")
+    adapter = OutboxReviewNotificationService(repository)
+    review = _review("REVIEW-CASE-CHANNEL")
+    inserted = adapter.create_review_task_atomically(review)
+    outbox = inserted[2]
+    assert outbox.channel == "feishu"
+    expected_key = adapter.outbox_service.notification_key(
+        "mobile_review_required",
+        review.review_task_id,
+        "v1",
+        "feishu",
+        "operations",
+    )
+    assert outbox.notification_key == expected_key
+    registry = NotificationChannelRegistry({"feishu": lambda: FakeSender(channel="feishu")})
+    repository._clock = lambda: datetime(2026, 7, 17, 10, 0)
+    worker = NotificationOutboxWorker.for_channel(repository, "FEISHU", registry=registry)
+    assert worker.run_once().status == "SENT"
+
+
+@pytest.mark.parametrize("lease_before_resolve", [False, True])
+def test_resolving_review_cancels_pre_send_outbox_and_projection(repository, lease_before_resolve):
+    now = datetime(2026, 7, 17, 10, 0)
+    repository._clock = lambda: now
+    outbox_service = NotificationOutboxService(repository, clock=lambda: now)
+    review = _review(f"RESOLVE-{lease_before_resolve}")
+    created = outbox_service.enqueue_review_task_atomically(review)[2]
+    if lease_before_resolve:
+        repository.claim_notification_outbox(channel="fake")
+    ReviewTaskService(repository).resolve_review_task(
+        review_task_id=review.review_task_id,
+        status=ReviewTaskStatus.CANCELLED,
+        actor="test",
+    )
+    assert repository.get_notification_outbox(created.notification_id).status == "CANCELLED"
+    assert repository.get_notification_log(created.notification_id).send_status == "failed"
+
+
+def test_resolving_review_does_not_cancel_sending_outbox(repository):
+    now = datetime(2026, 7, 17, 10, 0)
+    current = [now]
+    repository._clock = lambda: current[0]
+    service = NotificationOutboxService(repository, clock=lambda: now)
+    review = _review("RESOLVE-SENDING")
+    created = service.enqueue_review_task_atomically(review)[2]
+    claimed = repository.claim_notification_outbox(channel="fake", lease_seconds=5)[0]
+    repository.begin_notification_delivery(
+        claimed.notification_id,
+        owner_token=claimed.lease_owner_token,
+        lease_version=claimed.lease_version,
+        request_fingerprint="fingerprint",
+    )
+    ReviewTaskService(repository).resolve_review_task(
+        review_task_id=review.review_task_id,
+        status=ReviewTaskStatus.CANCELLED,
+        actor="test",
+    )
+    assert repository.get_notification_outbox(created.notification_id).status == "SENDING"
+    current[0] = now + timedelta(seconds=6)
+    assert service.watchdog()[0].status == "UNKNOWN_DELIVERY"

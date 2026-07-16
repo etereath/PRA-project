@@ -8,7 +8,6 @@ only after a worker has durably recorded a lease and STARTED attempt.
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
 import os
 import re
@@ -25,6 +24,7 @@ from app.exceptions import (
     NotificationDeliveryError,
     NotificationIdempotencyConflictError,
 )
+from app.services.feishu import build_feishu_signature, is_feishu_success_response
 from app.models import (
     NotificationDeliveryAttempt,
     NotificationDeliveryResult,
@@ -175,7 +175,7 @@ class FeishuOutboxSender:
         if secret:
             timestamp = str(int(time.time()))
             body["timestamp"] = timestamp
-            body["sign"] = _build_feishu_signature(timestamp, secret)
+            body["sign"] = build_feishu_signature(timestamp, secret)
         request = Request(
             webhook_url,
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -236,8 +236,8 @@ class FeishuOutboxSender:
                 error_code="FEISHU_HTTP_REJECTED",
                 error_message=f"Feishu provider HTTP {status_code}",
             )
-        code = summary.get("code")
-        if code not in (None, 0, "0", "success", "SUCCESS"):
+        if not is_feishu_success_response(summary):
+            code = summary.get("code", summary.get("StatusCode", ""))
             return NotificationDeliveryResult(
                 classification=DeliveryClassification.PERM_FAILED.value,
                 provider_status_code=str(code)[:100],
@@ -297,6 +297,7 @@ class NotificationOutboxService:
         channel: str,
         recipient_ref: str,
     ) -> str:
+        channel = _normalize_channel(channel)
         parts = [notification_type, entity_id, event_version, channel, recipient_ref]
         if any(not str(part).strip() for part in parts):
             raise ValueError("notification key components must not be empty")
@@ -330,7 +331,7 @@ class NotificationOutboxService:
         notification_key = str(notification_key or "").strip()
         recipient_type = str(recipient_type or "").strip()
         recipient_ref = str(recipient_ref or "").strip()
-        channel = str(channel or "").strip().lower()
+        channel = _normalize_channel(channel)
         if not notification_type or not notification_key:
             raise ValueError("notification_type and notification_key are required")
         if not recipient_type or not recipient_ref or not channel:
@@ -484,14 +485,15 @@ class NotificationOutboxService:
         inserted_review, inserted_outbox = self.repository.insert_review_task_with_notification_outbox(
             review_task,
             candidate,
+            compatibility_log=self._compatibility_log(candidate),
         )
         if inserted_review == 0:
             existing = self.repository.get_notification_outbox_by_key(candidate.notification_key)
             if existing is None:
                 raise RuntimeError("duplicate verification review has no matching notification outbox")
             _assert_idempotent_notification_match(candidate, existing)
+            self._ensure_compatibility_log(existing)
             return 0, 0, existing
-        self._ensure_compatibility_log(candidate)
         return inserted_review, inserted_outbox, candidate
 
     def enqueue_review_task_atomically(
@@ -505,38 +507,47 @@ class NotificationOutboxService:
         inserted_review, inserted_outbox = self.repository.insert_review_task_with_notification_outbox(
             review_task,
             candidate,
+            compatibility_log=self._compatibility_log(candidate),
         )
         if inserted_review == 0:
-            existing = self.repository.get_notification_outbox_by_key(candidate.notification_key)
+            existing_review = self.repository.get_pending_review_task_by_dedupe_key(review_task.dedupe_key)
+            if existing_review is None:
+                raise RuntimeError("duplicate review task could not be resolved by dedupe_key")
+            _assert_duplicate_review_match(review_task, existing_review)
+            existing_rows = self.repository.list_notification_outbox(
+                related_review_task_id=existing_review.review_task_id
+            )
+            existing = next(
+                (row for row in existing_rows if row.notification_type == "mobile_review_required"),
+                None,
+            )
             if existing is None:
                 raise RuntimeError("duplicate review task has no matching notification outbox")
-            _assert_idempotent_notification_match(candidate, existing)
+            self._ensure_compatibility_log(existing)
             return 0, 0, existing
-        self._ensure_compatibility_log(candidate)
         return inserted_review, inserted_outbox, candidate
 
-    def _ensure_compatibility_log(self, notification: NotificationOutbox) -> None:
+    def _compatibility_log(self, notification: NotificationOutbox) -> NotificationLog:
         message_value = None
         if isinstance(notification.payload, dict):
             message_value = notification.payload.get("message") or notification.payload.get("reason")
         message = str(message_value or f"{notification.notification_type} queued")[:1000]
-        self.repository.insert_notification_logs(
-            [
-                NotificationLog(
-                    notification_id=notification.notification_id,
-                    related_task_id=notification.related_task_id,
-                    related_review_task_id=notification.related_review_task_id,
-                    recipient_type=notification.recipient_type,
-                    recipient=notification.recipient_ref,
-                    channel=notification.channel,
-                    sent_at=notification.sent_at,
-                    send_status="pending",
-                    dedupe_key=notification.notification_key,
-                    message=message,
-                    created_at=notification.created_at,
-                )
-            ]
+        return NotificationLog(
+            notification_id=notification.notification_id,
+            related_task_id=notification.related_task_id,
+            related_review_task_id=notification.related_review_task_id,
+            recipient_type=notification.recipient_type,
+            recipient=notification.recipient_ref,
+            channel=notification.channel,
+            sent_at=notification.sent_at,
+            send_status="pending",
+            dedupe_key=notification.notification_key,
+            message=message,
+            created_at=notification.created_at,
         )
+
+    def _ensure_compatibility_log(self, notification: NotificationOutbox) -> None:
+        self.repository.insert_notification_logs([self._compatibility_log(notification)])
 
     def _sync_compatibility_log(self, notification: NotificationOutbox) -> None:
         if notification.status == NotificationOutboxStatus.SENT.value:
@@ -565,7 +576,7 @@ class NotificationOutboxService:
         # repository's single-transaction insert method.
         recipient_type = kwargs.get("recipient_type", "role")
         recipient_ref = kwargs.get("recipient_ref", "operations")
-        channel = kwargs.get("channel", "fake")
+        channel = _normalize_channel(kwargs.get("channel", "fake"))
         event_version = kwargs.get("event_version", "v1")
         priority = kwargs.get("priority", 50)
         max_attempts = kwargs.get("max_attempts", DEFAULT_NOTIFICATION_MAX_ATTEMPTS)
@@ -617,6 +628,11 @@ class NotificationOutboxService:
     ) -> NotificationOutbox:
         if review_task.required_by is None:
             raise ValueError("verification review task must have a deadline")
+        now = self._clock()
+        comparable_deadline = _coerce_datetime_for_comparison(review_task.required_by, now)
+        ttl_seconds = (comparable_deadline - now).total_seconds()
+        if not 120 <= ttl_seconds <= 600:
+            raise ValueError("verification review deadline must be between 120 and 600 seconds")
         safe_payload = {
             "operation_id": operation_id,
             "execution_attempt_id": attempt_id,
@@ -632,7 +648,6 @@ class NotificationOutboxService:
                 )
             safe_payload.update(payload)
         normalized_payload = _sanitize_payload(VERIFICATION_NOTIFICATION_TYPE, safe_payload)
-        now = self._clock()
         return NotificationOutbox(
             notification_id=uuid4().hex,
             notification_key=self.notification_key(
@@ -647,7 +662,7 @@ class NotificationOutboxService:
             related_review_task_id=review_task.review_task_id,
             recipient_type=recipient_type,
             recipient_ref=recipient_ref,
-            channel=str(channel).strip().lower(),
+            channel=_normalize_channel(channel),
             priority=100,
             payload=normalized_payload,
             status=NotificationOutboxStatus.PENDING.value,
@@ -669,8 +684,9 @@ class NotificationOutboxService:
         sender_channel = str(channel or actual_sender_channel).strip().lower()
         if not sender_channel or actual_sender_channel != sender_channel:
             raise NotificationChannelMismatchError("notification sender has no channel")
+        # Each repository operation obtains its own time after acquiring the
+        # write lock.  Never carry one timestamp across the provider call.
         claimed = self.repository.claim_notification_outbox(
-            now=now,
             lease_seconds=lease_seconds or self.lease_seconds,
             limit=1,
             channel=sender_channel,
@@ -687,7 +703,6 @@ class NotificationOutboxService:
             owner_token=notification.lease_owner_token,
             lease_version=notification.lease_version,
             request_fingerprint=_fingerprint(notification.payload),
-            now=now,
         )
         try:
             result = sender.send(notification, attempt)
@@ -717,12 +732,11 @@ class NotificationOutboxService:
             owner_token=notification.lease_owner_token,
             lease_version=notification.lease_version,
             result=result,
-            now=now,
         )
         return final
 
     def watchdog(self, *, now: datetime | None = None) -> list[NotificationOutbox]:
-        return self.repository.recover_expired_notification_leases(now=now or self._clock())
+        return self.repository.recover_expired_notification_leases()
 
 
 class NotificationOutboxWorker:
@@ -767,7 +781,7 @@ class OutboxReviewNotificationService:
         self.channel_registry = NotificationChannelRegistry()
 
     def create_review_task_atomically(self, review_task: ReviewTask) -> tuple[int, int, NotificationOutbox]:
-        channel = os.getenv("DEFAULT_NOTIFICATION_CHANNEL", "mock").strip() or "mock"
+        channel = _normalize_channel(os.getenv("DEFAULT_NOTIFICATION_CHANNEL", "mock"))
         result = self.outbox_service.enqueue_review_task_atomically(
             review_task,
             recipient_type=os.getenv("DEFAULT_NOTIFICATION_RECIPIENT_TYPE", "role").strip() or "role",
@@ -793,7 +807,7 @@ class OutboxReviewNotificationService:
         attempt_id: str,
         payload: dict[str, object] | None = None,
     ) -> tuple[int, int, NotificationOutbox]:
-        channel = os.getenv("DEFAULT_NOTIFICATION_CHANNEL", "mock").strip().lower() or "mock"
+        channel = _normalize_channel(os.getenv("DEFAULT_NOTIFICATION_CHANNEL", "mock"))
         result = self.outbox_service.enqueue_verification_review_task_atomically(
             review_task,
             operation_id=operation_id,
@@ -818,12 +832,12 @@ class OutboxReviewNotificationService:
             review_task,
             recipient_type=os.getenv("DEFAULT_NOTIFICATION_RECIPIENT_TYPE", "role").strip() or "role",
             recipient_ref=os.getenv("DEFAULT_NOTIFICATION_RECIPIENT", "operations").strip() or "operations",
-            channel=os.getenv("DEFAULT_NOTIFICATION_CHANNEL", "mock").strip() or "mock",
+            channel=_normalize_channel(os.getenv("DEFAULT_NOTIFICATION_CHANNEL", "mock")),
         )
         return self.repository.get_notification_log(outbox.notification_id)
 
     def create_expired_notification(self, review_task: ReviewTask, *, timeout_at: datetime) -> NotificationLog | None:
-        channel = os.getenv("DEFAULT_NOTIFICATION_CHANNEL", "mock").strip() or "mock"
+        channel = _normalize_channel(os.getenv("DEFAULT_NOTIFICATION_CHANNEL", "mock"))
         recipient_type = os.getenv("DEFAULT_NOTIFICATION_RECIPIENT_TYPE", "role").strip() or "role"
         recipient_ref = os.getenv("DEFAULT_NOTIFICATION_RECIPIENT", "operations").strip() or "operations"
         key = self.outbox_service.notification_key(
@@ -856,6 +870,19 @@ class OutboxReviewNotificationService:
 def _fingerprint(value: object) -> str:
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _normalize_channel(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized or "mock"
+
+
+def _coerce_datetime_for_comparison(value: datetime, reference: datetime) -> datetime:
+    if value.tzinfo is None and reference.tzinfo is not None:
+        return value.replace(tzinfo=reference.tzinfo)
+    if value.tzinfo is not None and reference.tzinfo is None:
+        return value.replace(tzinfo=None)
+    return value
 
 
 def _review_notification_message(review_task: ReviewTask) -> str:
@@ -1022,6 +1049,27 @@ def _assert_idempotent_notification_match(
         )
 
 
+def _assert_duplicate_review_match(candidate: ReviewTask, existing: ReviewTask) -> None:
+    candidate_identity = (
+        candidate.dedupe_key,
+        candidate.source_task_id,
+        candidate.review_type,
+        candidate.scope_type,
+        candidate.scope_key,
+    )
+    existing_identity = (
+        existing.dedupe_key,
+        existing.source_task_id,
+        existing.review_type,
+        existing.scope_type,
+        existing.scope_key,
+    )
+    if candidate_identity != existing_identity:
+        raise NotificationIdempotencyConflictError(
+            "review dedupe_key is already bound to a different pending review event"
+        )
+
+
 def _build_feishu_outbox_body(notification: NotificationOutbox, message_type: str) -> dict[str, object]:
     payload = notification.payload if isinstance(notification.payload, dict) else {}
     message = str(payload.get("message") or payload.get("reason") or notification.notification_type)[:2000]
@@ -1038,17 +1086,6 @@ def _build_feishu_outbox_body(notification: NotificationOutbox, message_type: st
             },
         }
     return {"msg_type": "text", "content": {"text": message}}
-
-
-def _build_feishu_signature(timestamp: str, secret: str) -> str:
-    digest = hmac.new(
-        secret.encode("utf-8"),
-        f"{timestamp}\n{secret}".encode("utf-8"),
-        hashlib.sha256,
-    ).digest()
-    import base64
-
-    return base64.b64encode(digest).decode("ascii")
 
 
 def _feishu_response_summary(status_code: int, response_text: str) -> dict[str, object]:
