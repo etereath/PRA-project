@@ -16,6 +16,8 @@ Windows 是当前 PRA 的主要运行门禁，执行：
 
 托管 Runner 不启动真实影刀，不读取部署机 Credential Manager，不连接真实销售平台。真实 UI、人工验证码、cpolar 和真实通知继续属于受控手工验收。
 
+Windows Job 将 `TEMP` 与 `TMP` 指向 GitHub 提供的规范化 `runner.temp`。这是为了避免托管 Runner 默认用户临时路径中的 8.3 别名（例如 `RUNNER~1`）与 strict resolve 后的长路径产生 lexical/canonical 差异；不设置 Job 级 `PRA_ALLOWED_DATA_DIRS`，也不放宽路径 allowlist 或防逃逸规则。
+
 ## 最低限度 Linux Core
 
 Linux Job 只证明核心 Python 包没有被 Windows 隐式依赖锁死，执行：
