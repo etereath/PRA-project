@@ -32,6 +32,8 @@ Linux Job 不导入或运行 ShadowBot/xbot，不同步或部署 ShadowBot，不
 
 当前任务 7 分支的本地选择基线为：21 个测试文件进入收集、16 个 `test_shadowbot_*.py` 文件在收集前排除，结果 `199 passed, 6 deselected, 60 subtests passed`。
 
+为避免通过大范围排除 Web 测试获得绿灯，任务 7 只对两处测试夹具做了可移植性修正：路径结果按 `Path.parts` 比较，不硬编码 Windows 分隔符；未登录 POST 使用 query 显式选择测试临时库，不依赖开发机残留的默认 runtime DB。未修改 `app/web.py` 或 Web 前端。
+
 ## 本地复现
 
 Windows 开发机可执行：
