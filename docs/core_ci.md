@@ -22,13 +22,15 @@ Linux Job 只证明核心 Python 包没有被 Windows 隐式依赖锁死，执�
 
 - wheel/sdist 构建、严格制品审计，以及 `app`/`shadowbot` 源码静态敏感信息扫描；
 - 仓库外 venv 安装最终 wheel，验证关键 import、`pra-mvp --help`、Runtime Schema `1..5` 初始化和 health；
-- `python -m pytest -q tests -k "not shadowbot"`，运行核心、SQLite、Schema v5、Web/安全和平台无关测试；
+- `python scripts/run_linux_core_tests.py`，在 pytest 收集前排除 `test_shadowbot_*.py`，打印完整排除文件清单，再运行核心、SQLite、Schema v5、Web/安全和平台无关测试；
 - 使用仓库外临时 SQLite 的 core smoke；
 - `app` 与共享 `scripts` 的语法检查。
 
 Linux Job 不导入或运行 ShadowBot/xbot，不同步或部署 ShadowBot，不访问 Credential Manager，不实现 Linux 凭据后端，也不新增 systemd、Docker、日志轮转、备份恢复或生产安装能力。Linux Core 通过不代表 PRA 已支持 Linux 生产部署。
 
-当前任务 7 分支的选择基线为 `199 passed, 145 deselected, 60 subtests passed`。`145 deselected` 是节点 ID 含 `shadowbot` 的明确排除清单，不是运行后 skip；若后续测试数量变化，应从 Workflow 日志复核新增或减少的节点是否仍符合最低限度 Linux Core 边界。
+`test_shadowbot_*.py` 文件在收集前排除，避免 Windows 专属模块仅因 pytest 收集而在 Linux 被导入；`tests/test_packaging.py` 中名称含 `shadowbot` 的 fixture 测试再由 `-k "not shadowbot"` 明确 deselect。两者都不是运行后 skip。若后续测试数量变化，应从 Workflow 日志复核打印的 selected/excluded 文件清单是否仍符合最低限度 Linux Core 边界。
+
+当前任务 7 分支的本地选择基线为：21 个测试文件进入收集、16 个 `test_shadowbot_*.py` 文件在收集前排除，结果 `199 passed, 6 deselected, 60 subtests passed`。
 
 ## 本地复现
 

@@ -148,7 +148,7 @@ jobs:
         run: python scripts/verify_core_wheel_install.py --dist-dir dist
 
       - name: Run platform-independent pytest scope
-        run: python -m pytest -q tests -k "not shadowbot"
+        run: python scripts/run_linux_core_tests.py
 
       - name: Run core system smoke with a temporary database
         run: python scripts/run_system_smoke_tests.py --temporary-db
