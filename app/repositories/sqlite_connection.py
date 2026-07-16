@@ -378,8 +378,19 @@ class SQLiteConnectionFactory:
 def _validate_local_storage_path(db_path: Path) -> None:
     raw = os.fspath(db_path)
     normalized = raw.replace("/", "\\")
-    if normalized.startswith("\\\\") or normalized.startswith("\\?\\") or normalized.startswith("\\.\\"):
+    if _is_non_local_path_syntax(normalized):
         raise SQLiteStorageLocationError("SQLite runtime database must use a local filesystem path")
+
+    if os.name == "nt":
+        for candidate in _existing_path_chain(Path(raw)):
+            try:
+                if not candidate.is_symlink():
+                    continue
+                link_target = os.readlink(candidate)
+            except OSError:
+                raise SQLiteStorageLocationError("Unable to verify SQLite reparse-point target") from None
+            if _is_non_local_path_syntax(os.fspath(link_target).replace("/", "\\")):
+                raise SQLiteStorageLocationError("SQLite runtime database must resolve to a local disk")
 
     resolved = Path(os.path.realpath(raw))
     if os.name == "nt":
@@ -390,6 +401,22 @@ def _validate_local_storage_path(db_path: Path) -> None:
             drive_type = _get_windows_drive_type(f"{drive}\\")
             if drive_type in {DRIVE_REMOTE, DRIVE_UNKNOWN, DRIVE_NO_ROOT_DIR, DRIVE_CDROM}:
                 raise SQLiteStorageLocationError("SQLite runtime database must be on a local disk")
+
+
+def _existing_path_chain(path: Path):
+    current = Path(os.path.abspath(path))
+    chain = []
+    while True:
+        if current.exists() or current.is_symlink():
+            chain.append(current)
+        if current.parent == current:
+            break
+        current = current.parent
+    return reversed(chain)
+
+
+def _is_non_local_path_syntax(path: str) -> bool:
+    return path.startswith("\\\\") or path.startswith("\\?\\") or path.startswith("\\.\\")
 
 
 def _get_windows_drive_type(root: str) -> int | None:
