@@ -329,14 +329,23 @@ def _database_snapshot(path: Path) -> dict[str, Any]:
     operational_health = repository.check_operational_health()
     integrity_check = ""
     foreign_key_violations: list[list[Any]] = []
-    table_counts: dict[str, int] = {}
+    table_counts: dict[str, int | None] = {}
     try:
         with closing(sqlite3.connect(str(path), timeout=5)) as connection, connection:
             connection.execute("PRAGMA foreign_keys = ON")
             row = connection.execute("PRAGMA integrity_check").fetchone()
             integrity_check = str(row[0]) if row else ""
             foreign_key_violations = [list(item) for item in connection.execute("PRAGMA foreign_key_check")]
+            existing_tables = {
+                str(item[0])
+                for item in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                ).fetchall()
+            }
             for table in sorted(REQUIRED_RUNTIME_TABLES):
+                if table not in existing_tables:
+                    table_counts[table] = None
+                    continue
                 row = connection.execute(
                     "SELECT COUNT(*) FROM " + table
                 ).fetchone()
@@ -370,12 +379,84 @@ def _backup_sqlite(source: Path, destination: Path) -> None:
         destination_connection.execute("PRAGMA journal_mode = WAL")
         destination_connection.execute("PRAGMA synchronous = NORMAL")
         destination_connection.commit()
+        destination_connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     except sqlite3.Error as exc:
         destination_connection.rollback()
         raise ReleaseBackupError(f"SQLite backup failed: {type(exc).__name__}") from exc
     finally:
         destination_connection.close()
         source_connection.close()
+
+
+def _checkpoint_sqlite(path: Path) -> None:
+    try:
+        with closing(sqlite3.connect(str(path), timeout=5)) as connection, connection:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.Error as exc:
+        raise ReleaseBackupError(f"SQLite checkpoint failed: {type(exc).__name__}") from exc
+
+
+def migrate_runtime_database(
+    *,
+    source_db: Path,
+    output_db: Path,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Upgrade a runtime database in a verified copy without mutating the source."""
+
+    source = _require_file(source_db, "source runtime database")
+    output = output_db.expanduser().resolve()
+    if source == output:
+        raise ReleaseBackupError("migration output must be different from the source database")
+    if output.exists() and not force:
+        raise ReleaseBackupError(f"migration output exists; pass --force to replace it: {output}")
+
+    source_snapshot = _database_snapshot(source)
+    if str(source_snapshot.get("integrity_check", "")).lower() != "ok":
+        raise ReleaseBackupError("source runtime database failed SQLite integrity check")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.migrate-", dir=output.parent))
+    staged_database = staging / output.name
+    try:
+        _backup_sqlite(source, staged_database)
+        SQLiteRuntimeRepository(staged_database).init_schema()
+        _checkpoint_sqlite(staged_database)
+        target_snapshot = _database_snapshot(staged_database)
+        if not target_snapshot["ok"]:
+            raise ReleaseBackupError("migrated runtime database failed v6 health validation")
+
+        source_counts = source_snapshot["logical_table_counts"]
+        target_counts = target_snapshot["logical_table_counts"]
+        preserved_tables = [
+            table
+            for table, count in source_counts.items()
+            if count is not None and target_counts.get(table) == count
+        ]
+        if len(preserved_tables) != sum(count is not None for count in source_counts.values()):
+            raise ReleaseBackupError("migration changed a pre-existing logical table row count")
+
+        if force:
+            for sidecar in (Path(str(output) + "-wal"), Path(str(output) + "-shm")):
+                if sidecar.exists():
+                    sidecar.unlink()
+        os.replace(staged_database, output)
+        _fsync_directory(output.parent)
+        return {
+            "source_db": str(source),
+            "output_db": str(output),
+            "source_schema_version": source_snapshot["schema_health"].get("actual_version"),
+            "target_schema_version": target_snapshot["schema_health"].get("actual_version"),
+            "preserved_logical_tables": preserved_tables,
+            "source_snapshot": source_snapshot,
+            "target_snapshot": target_snapshot,
+        }
+    except PermissionError as exc:
+        raise ReleaseBackupError(
+            "migration target is locked; stop PRA services and close database consumers before retrying"
+        ) from exc
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
 
 
 def _file_records_from_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
@@ -496,7 +577,8 @@ def create_backup(
     runtime_source = _require_file(runtime_db, "runtime database")
     source_snapshot = _database_snapshot(runtime_source)
     if not source_snapshot["ok"]:
-        raise ReleaseBackupError("source runtime database is not healthy; backup aborted")
+        summary = source_snapshot["schema_health"].get("summary", "unknown health failure")
+        raise ReleaseBackupError(f"source runtime database is not healthy; backup aborted: {summary}")
     for _, source in config_specs:
         validate_nonsecret_config(source)
 
@@ -721,6 +803,14 @@ def _build_parser() -> argparse.ArgumentParser:
     backup_parser.add_argument("--config-name", action="append", default=[])
     backup_parser.add_argument("--backup-id")
 
+    migrate_parser = subparsers.add_parser(
+        "migrate",
+        help="upgrade a runtime database in a verified copy without changing the source",
+    )
+    migrate_parser.add_argument("--source-db", required=True, type=Path)
+    migrate_parser.add_argument("--output-db", required=True, type=Path)
+    migrate_parser.add_argument("--force", action="store_true")
+
     verify_parser = subparsers.add_parser("verify", help="verify a published backup")
     verify_parser.add_argument("--backup", required=True, type=Path)
 
@@ -763,6 +853,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 backup_id=args.backup_id,
             )
             print(f"backup=PASS path={path}")
+            return 0
+        if args.command == "migrate":
+            result = migrate_runtime_database(
+                source_db=args.source_db,
+                output_db=args.output_db,
+                force=args.force,
+            )
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
             return 0
         if args.command == "verify":
             manifest = verify_backup(args.backup)

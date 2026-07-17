@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,7 @@ from scripts.release_backup import (
     _database_snapshot,
     build_release_manifest,
     create_backup,
+    migrate_runtime_database,
     restore_backup,
     validate_nonsecret_config,
     verify_backup,
@@ -24,6 +26,24 @@ class ReleaseBackupTests(unittest.TestCase):
         path = root / "runtime" / "pra_runtime.sqlite3"
         repository = SQLiteRuntimeRepository(path)
         repository.init_schema()
+        return path
+
+    def _create_legacy_v5_db(self, root: Path) -> Path:
+        path = self._create_runtime_db(root)
+        connection = sqlite3.connect(str(path))
+        try:
+            connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("DROP TABLE notification_delivery_attempts")
+            connection.execute("DROP TABLE notification_outbox")
+            connection.execute(
+                "DELETE FROM runtime_schema_migrations WHERE schema_version = 6"
+            )
+            connection.commit()
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            connection.execute("PRAGMA journal_mode = DELETE")
+            connection.commit()
+        finally:
+            connection.close()
         return path
 
     def test_release_manifest_records_hashes_and_names_without_values(self) -> None:
@@ -94,6 +114,32 @@ class ReleaseBackupTests(unittest.TestCase):
             with self.assertRaises(ReleaseBackupError):
                 restore_backup(backup_path=backup, runtime_db=restored_db)
             restore_backup(backup_path=backup, runtime_db=restored_db, force=True)
+
+    def test_v5_migration_is_copy_only_and_unlocks_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            legacy_db = self._create_legacy_v5_db(root)
+            wheel = root / "pra_mvp.whl"
+            wheel.write_bytes(b"wheel")
+            before = _database_snapshot(legacy_db)
+            self.assertEqual(before["schema_health"]["actual_version"], 5)
+            self.assertIsNone(before["logical_table_counts"]["notification_outbox"])
+
+            migrated_db = root / "migrated" / "pra_runtime.sqlite3"
+            result = migrate_runtime_database(source_db=legacy_db, output_db=migrated_db)
+            self.assertEqual(result["source_schema_version"], 5)
+            self.assertEqual(result["target_schema_version"], 6)
+            self.assertTrue(_database_snapshot(migrated_db)["ok"])
+            self.assertEqual(_database_snapshot(legacy_db)["schema_health"]["actual_version"], 5)
+
+            backup = create_backup(
+                runtime_db=migrated_db,
+                backup_dir=root / "backups",
+                wheel_path=wheel,
+                git_root=ROOT,
+                backup_id="migrated-v5-backup",
+            )
+            self.assertEqual(verify_backup(backup)["backup_id"], "migrated-v5-backup")
 
     def test_secret_config_is_rejected_and_previous_latest_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

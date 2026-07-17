@@ -8,6 +8,7 @@
 - `scripts/release_backup.py backup` 使用 SQLite backup API 复制运行态数据库；Excel 输入和运维配置按角色复制到备份目录。
 - 备份先写入唯一临时目录，完成 SHA-256、SQLite integrity check、Schema health、外键和关键表行数校验后，再一次性改名发布；`latest.json` 只在验证成功后更新。
 - `scripts/release_backup.py verify` 可独立回读 `manifest.json`、`release-manifest.json`、`SHA256SUMS.txt` 和数据库健康结果。
+- `scripts/release_backup.py migrate` 将旧 v5 运行库复制到新路径，在副本上升级到 v6 并校验；原库保持不变。
 - `restore` 默认拒绝覆盖已有目标；`rollback` 是显式覆盖操作，二者都会先验证完整备份，再把数据库暂存、校验后替换。
 
 关键逻辑表至少包含 Outbox、Review、ShadowBot operation/attempt 和 execution log；备份清单同时记录这些表的行数，恢复后必须一致。清单只保存配置项名称，不保存任何环境变量值、token、密码或 webhook 内容。
@@ -32,6 +33,23 @@ python scripts/release_backup.py verify --backup backups/<backup-id>
 ```
 
 `--input` 和 `--config` 可重复使用，也支持 `备份文件名=源文件路径`。不要把 `.env`、密码文件、真实凭据配置或含秘密值的文件作为 `--config` 输入。
+
+## 旧 v5 运行库迁移
+
+如果 health 显示 `schema_versions=[1, 2, 3, 4, 5]` 或 `journal_mode=delete`，先生成一个 v6 副本：
+
+```powershell
+python scripts/release_backup.py migrate `
+  --source-db data/runtime/pra_runtime.sqlite3 `
+  --output-db data/runtime/migrated/pra_runtime.sqlite3
+python -m app.cli health --runtime-db data/runtime/migrated/pra_runtime.sqlite3
+python scripts/release_backup.py backup `
+  --runtime-db data/runtime/migrated/pra_runtime.sqlite3 `
+  --backup-dir backups `
+  --wheel dist/pra_mvp-0.1.0-py3-none-any.whl
+```
+
+迁移命令不会原地修改源库；确认副本 health、备份和回滚演练均通过后，停止所有写入者，再按部署手册切换运行库路径。
 
 ## 恢复与上一版本回滚
 
@@ -68,12 +86,13 @@ python scripts/run_system_smoke_tests.py --temporary-db
 - 复制数据库通过 Schema health、SQLite integrity、外键检查和关键逻辑表行数比对。
 - 至少完成一次“备份 → 恢复 → health/smoke → 回滚”演练。
 
-## 本次验证记录（2026-07-17）
+## 本次验证记录（2026-07-18）
 
-- `python -m pytest -q tests/test_release_backup.py`：3 passed。
-- 完整 `python -m pytest -q tests`：428 passed、3 skipped、63 subtests passed。
+- 更新后 `python -m pytest -q tests/test_release_backup.py`：4 passed，包含 v5 副本迁移与后续备份验证。
+- 完整 `python -m pytest -q tests`：429 passed、3 skipped、63 subtests passed。
 - 相关回归集：37 passed、3 skipped、4 subtests passed。
 - wheel boundary、sdist boundary、secret scan：全部 PASS；隔离 wheel 安装、Runtime Schema v6 init/health：PASS。
 - 使用隔离的 v6 临时数据库完成 CLI `backup → verify → restore → rollback`：全部 PASS，SQLite integrity 为 `ok`、外键违规为 0、关键逻辑表行数一致。
+- 使用工作区现有旧 v5 数据库完成“复制迁移 → v6 health → backup → verify”演练：PASS；原 v5 库未被修改。
 - `run_system_smoke_tests.py --temporary-db`：16 项通过；Linux Core：280 passed、3 skipped、6 deselected；Windows Core fixture：PASS。
 - 工作区现有 `data/runtime/pra_runtime.sqlite3` 是旧 v5 且 `journal_mode=delete`，工具按安全策略拒绝将它作为生产备份源；完成 v6 迁移并停止占用服务后再执行生产备份。
