@@ -10,7 +10,7 @@
 - 网络调用前先写入 `STARTED` attempt 和请求指纹。明确未发送的临时失败进入有限 `RETRY_WAIT`；永久失败进入 `FAILED`。
 - 发送结果不确定、发送后崩溃或 lease 在 `SENDING` 阶段过期时进入 `UNKNOWN_DELIVERY`，普通 Worker 不会自动重发。
 - 验证码人工介入通知使用最高优先级、2 至 10 分钟 deadline 和最多 3 次尝试；ShadowBot 登录验证的 `ReviewTask` 与 Outbox 在同一事务创建，业务事务不调用渠道。
-- `NotificationChannelRegistry` 按持久化 `channel` 绑定 `fake / scripted / feishu` 适配器；发送前强制校验适配器 channel。业务创建路径只入队，绝不自动执行 `FakeSender`；未配置渠道会以 `unconfigured` 保持 `PENDING`。默认 Worker 拒绝 `mock / fake`，CLI 只有在 `DEV_MODE=true` 时才显式开启测试渠道，生产误配置会非零退出且不领取通知。
+- `NotificationChannelRegistry` 按持久化 `channel` 绑定 `mock / fake / scripted / feishu` 适配器；发送前强制校验适配器 channel。业务创建路径只入队，绝不自动执行测试 Sender；未配置渠道会以 `unconfigured` 保持 `PENDING`。默认 Worker 统一拒绝 `mock / fake / scripted`，CLI 只有在 `DEV_MODE=true` 时才显式开启测试渠道，生产误配置会非零退出且不领取通知。
 - 所有 channel 在构造 key 和落库前统一小写；Feishu 新旧适配器复用同一官方签名函数。只有显式 `code=0` 或 `StatusCode=0` 才确认成功；无确认码和已越过发送边界的 HTTP 5xx 均进入 `UNKNOWN_DELIVERY`，429 才按明确限流拒绝进入有限重试。
 - Service 不允许一个时间戳跨越领取、网络调用和写回；各 Repository 事务在取得写锁后独立读取注入时钟。
 - 已知通知类型采用字段白名单、类型和长度限制；provider 错误只保留安全错误码/摘要，Bearer、Cookie、Webhook URL 等值会被拒绝或脱敏。

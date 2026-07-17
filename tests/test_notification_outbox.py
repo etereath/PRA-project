@@ -393,6 +393,12 @@ def test_channel_registry_binds_feishu_and_provider_result_is_bounded(repository
     assert result.provider_message_id == "req-1"
 
 
+@pytest.mark.parametrize("channel", ["mock", "fake", "scripted"])
+def test_default_worker_rejects_all_test_channels(repository, channel):
+    with pytest.raises(NotificationDeliveryError, match="explicitly enabled test worker"):
+        NotificationOutboxWorker.for_channel(repository, channel)
+
+
 def test_feishu_outbox_uses_official_signature_vector_and_response_code_matrix(monkeypatch):
     assert build_feishu_signature("1234567890", "sign-secret") == (
         "CgzXNZVOeFF3tZW7JDVpuevxS8czITsTOclPQeDiF9c="

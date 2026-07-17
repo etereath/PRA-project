@@ -37,7 +37,7 @@ def _runtime_task(task_id: str, *, status: TaskStatus = TaskStatus.MANUAL_REVIEW
 
 class CliTests(unittest.TestCase):
     def test_notification_worker_rejects_test_channels_outside_dev_mode(self) -> None:
-        for channel in ("mock", "fake"):
+        for channel in ("mock", "fake", "scripted"):
             with self.subTest(channel=channel), tempfile.TemporaryDirectory() as temp_dir:
                 db_path = Path(temp_dir) / "runtime.sqlite3"
                 repository = SQLiteRuntimeRepository(db_path)

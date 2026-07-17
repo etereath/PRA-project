@@ -10,7 +10,7 @@ from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import create_template_workbooks
 from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION
 from app.services.ai import MockAISuggestionProvider
-from app.services.notification_outbox import NotificationOutboxWorker
+from app.services.notification_outbox import NotificationOutboxWorker, is_test_notification_channel
 from app.services.pricing import PricingService
 from app.services.runtime import DEFAULT_RUNTIME_DB
 from app.services.workflow import (
@@ -366,8 +366,8 @@ def main() -> int:
                 print("notification worker aborted: channel is required")
                 return 2
             allow_test_channels = os.getenv("DEV_MODE", "false").strip().lower() == "true"
-            if channel in {"mock", "fake"} and not allow_test_channels:
-                print("notification worker aborted: mock/fake channels require DEV_MODE=true")
+            if is_test_notification_channel(channel) and not allow_test_channels:
+                print("notification worker aborted: test channels require DEV_MODE=true")
                 return 2
             repository = SQLiteRuntimeRepository(args.runtime_db)
             repository.init_schema()

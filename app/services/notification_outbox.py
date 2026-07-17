@@ -46,6 +46,7 @@ DEFAULT_NOTIFICATION_RETRY_SECONDS = 2
 VERIFICATION_NOTIFICATION_TYPE = "verification_code_intervention"
 NOTIFICATION_KEY_VERSION = "v1"
 MAX_NOTIFICATION_PAYLOAD_BYTES = 16_384
+TEST_NOTIFICATION_CHANNELS = frozenset({"mock", "fake", "scripted"})
 REVIEW_TYPE_LABELS = {
     "capacity_warning": "产能预警",
     "labor_required": "人工用工确认",
@@ -69,6 +70,10 @@ class NotificationSender(Protocol):
         attempt: NotificationDeliveryAttempt,
     ) -> NotificationDeliveryResult:
         ...
+
+
+def is_test_notification_channel(channel: object) -> bool:
+    return _normalize_channel(channel) in TEST_NOTIFICATION_CHANNELS
 
 
 class FakeSender:
@@ -843,9 +848,9 @@ class NotificationOutboxWorker:
         allow_test_channels: bool = False,
     ) -> "NotificationOutboxWorker":
         normalized_channel = _normalize_channel(channel)
-        if normalized_channel in {"mock", "fake"} and not allow_test_channels:
+        if is_test_notification_channel(normalized_channel) and not allow_test_channels:
             raise NotificationDeliveryError(
-                "mock/fake notification channels require an explicitly enabled test worker"
+                "test notification channels require an explicitly enabled test worker"
             )
         selected_registry = registry or NotificationChannelRegistry()
         return cls(
