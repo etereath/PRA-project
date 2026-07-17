@@ -361,13 +361,21 @@ def main() -> int:
             return 0
 
         if args.command == "notification-worker":
-            repository = SQLiteRuntimeRepository(args.runtime_db)
-            repository.init_schema()
             channel = str(args.channel or os.getenv("DEFAULT_NOTIFICATION_CHANNEL", "")).strip().lower()
             if not channel:
                 print("notification worker aborted: channel is required")
                 return 2
-            worker = NotificationOutboxWorker.for_channel(repository, channel)
+            allow_test_channels = os.getenv("DEV_MODE", "false").strip().lower() == "true"
+            if channel in {"mock", "fake"} and not allow_test_channels:
+                print("notification worker aborted: mock/fake channels require DEV_MODE=true")
+                return 2
+            repository = SQLiteRuntimeRepository(args.runtime_db)
+            repository.init_schema()
+            worker = NotificationOutboxWorker.for_channel(
+                repository,
+                channel,
+                allow_test_channels=allow_test_channels,
+            )
             recovered = worker.run_watchdog()
             delivered = None if args.watchdog_only else worker.run_once()
             print(

@@ -552,6 +552,8 @@ class NotificationOutboxService:
             if existing is None:
                 raise RuntimeError("duplicate review task has no matching notification outbox")
             _assert_duplicate_review_match(review_task, existing_review, candidate, existing)
+            existing_candidate = self._candidate_review_notification(existing_review, **kwargs)
+            _assert_idempotent_notification_match(existing_candidate, existing)
             self._ensure_compatibility_log(existing)
             return 0, 0, existing
         return inserted_review, inserted_outbox, candidate
@@ -838,11 +840,17 @@ class NotificationOutboxWorker:
         *,
         registry: NotificationChannelRegistry | None = None,
         lease_seconds: int = DEFAULT_NOTIFICATION_LEASE_SECONDS,
+        allow_test_channels: bool = False,
     ) -> "NotificationOutboxWorker":
+        normalized_channel = _normalize_channel(channel)
+        if normalized_channel in {"mock", "fake"} and not allow_test_channels:
+            raise NotificationDeliveryError(
+                "mock/fake notification channels require an explicitly enabled test worker"
+            )
         selected_registry = registry or NotificationChannelRegistry()
         return cls(
             NotificationOutboxService(repository, lease_seconds=lease_seconds),
-            selected_registry.build(channel),
+            selected_registry.build(normalized_channel),
         )
 
     def run_once(self, *, now: datetime | None = None) -> NotificationOutbox | None:
@@ -1086,6 +1094,7 @@ def _assert_idempotent_notification_match(
     existing: NotificationOutbox,
 ) -> None:
     candidate_identity = {
+        "notification_key": candidate.notification_key,
         "notification_type": candidate.notification_type,
         "related_task_id": candidate.related_task_id,
         "related_review_task_id": candidate.related_review_task_id,
@@ -1098,6 +1107,7 @@ def _assert_idempotent_notification_match(
         "payload_fingerprint": _fingerprint(candidate.payload),
     }
     existing_identity = {
+        "notification_key": existing.notification_key,
         "notification_type": existing.notification_type,
         "related_task_id": existing.related_task_id,
         "related_review_task_id": existing.related_review_task_id,

@@ -12,14 +12,27 @@ from urllib.error import HTTPError
 
 import pytest
 
-from app.enums import DeliveryAttemptStatus, NotificationOutboxStatus, ReviewTaskStatus
+from app.enums import (
+    DeliveryAttemptStatus,
+    NotificationOutboxStatus,
+    ReviewTaskStatus,
+    TaskActionType,
+    TaskStatus,
+)
 from app.exceptions import (
     NotificationChannelMismatchError,
     NotificationDeliveryError,
     NotificationIdempotencyConflictError,
     NotificationLeaseError,
 )
-from app.models import NotificationDeliveryAttempt, NotificationDeliveryResult, NotificationOutbox, ReviewTask
+from app.models import (
+    NotificationDeliveryAttempt,
+    NotificationDeliveryResult,
+    NotificationOutbox,
+    ReviewTask,
+    Task,
+    TaskStatusHistory,
+)
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.notification_outbox import (
     FakeSender,
@@ -64,6 +77,24 @@ def _notification(notification_id: str = "N-1", *, priority: int = 1) -> Notific
         payload={"message": "safe test payload"},
         created_at=now,
         updated_at=now,
+    )
+
+
+def _source_task(task_id: str) -> Task:
+    return Task(
+        task_id=task_id,
+        internal_sku=None,
+        platform_name=None,
+        action_type=TaskActionType.LABOR_REQUIRED,
+        priority=2,
+        task_status=TaskStatus.MANUAL_REVIEW,
+        created_at=datetime(2026, 7, 17, 9, 0),
+        trade_date=datetime(2026, 7, 17).date(),
+        scope_type="global",
+        scope_key="2026-07-17",
+        dedupe_key=f"source:{task_id}",
+        result_message="needs review",
+        required_by=datetime(2026, 7, 17, 10, 30),
     )
 
 
@@ -564,13 +595,42 @@ def test_duplicate_review_notification_intent_fingerprint_rejects_changes(reposi
 
 
 @pytest.mark.parametrize(
+    "notification_kwargs",
+    [
+        {"event_version": "v2"},
+        {"priority": 99},
+        {"max_attempts": 7},
+        {"deadline_at": datetime(2026, 7, 17, 13, 0)},
+    ],
+)
+def test_duplicate_review_rejects_event_version_or_delivery_policy_changes(repository, notification_kwargs):
+    service = NotificationOutboxService(repository, clock=lambda: datetime(2026, 7, 17, 10, 0))
+    first_review = _review("REVIEW-POLICY-FP-1")
+    second_review = replace(first_review, review_task_id="REVIEW-POLICY-FP-2")
+    service.enqueue_review_task_atomically(first_review, channel="feishu", recipient_ref="operations")
+    with pytest.raises(NotificationIdempotencyConflictError):
+        service.enqueue_review_task_atomically(
+            second_review,
+            channel="feishu",
+            recipient_ref="operations",
+            **notification_kwargs,
+        )
+
+
+@pytest.mark.parametrize(
     "failure_stage",
     ["after_business_update", "after_outbox_insert", "after_compatibility_log_insert"],
 )
 def test_expired_review_notification_transaction_rolls_back_every_stage(repository, monkeypatch, failure_stage):
     monkeypatch.setenv("DEFAULT_NOTIFICATION_CHANNEL", "mock")
     service = NotificationOutboxService(repository, clock=lambda: datetime(2026, 7, 17, 10, 0))
-    review = _review("REVIEW-EXPIRE-ROLLBACK")
+    source = _source_task("TASK-EXPIRE-ROLLBACK")
+    repository.insert_tasks([source])
+    review = replace(
+        _review("REVIEW-EXPIRE-ROLLBACK"),
+        source_task_id=source.task_id,
+        required_by=source.required_by,
+    )
     initial = service.enqueue_review_task_atomically(review, channel="mock")[2]
     updated = replace(
         review,
@@ -584,16 +644,33 @@ def test_expired_review_notification_transaction_rolls_back_every_stage(reposito
         updated,
         timeout_at=datetime(2026, 7, 17, 11, 0),
     )
+    history = TaskStatusHistory(
+        history_id=f"HISTORY-{failure_stage}",
+        task_id=source.task_id,
+        from_status=TaskStatus.MANUAL_REVIEW,
+        to_status=TaskStatus.EXPIRED,
+        changed_by="system",
+        changed_at=datetime(2026, 7, 17, 11, 0),
+        reason="review expired",
+        metadata={"failure_stage": failure_stage},
+    )
+    history_before = repository.list_task_status_history(source.task_id)
     with pytest.raises(RuntimeError, match="injected"):
         repository.expire_review_task_with_notification_outbox(
             updated,
             expired,
             log,
+            task_id=source.task_id,
+            task_status=TaskStatus.EXPIRED,
+            history=history,
+            result_message="expired",
             failure_injector=lambda stage: (_ for _ in ()).throw(RuntimeError("injected"))
             if stage == failure_stage
             else None,
         )
     assert repository.get_review_task(review.review_task_id).review_status == ReviewTaskStatus.PENDING
+    assert repository.get_task(source.task_id).task_status == TaskStatus.MANUAL_REVIEW
+    assert repository.list_task_status_history(source.task_id) == history_before
     assert repository.get_notification_outbox(initial.notification_id).status == NotificationOutboxStatus.PENDING.value
     assert repository.get_notification_outbox(expired.notification_id) is None
     assert repository.get_notification_log(expired.notification_id) is None
