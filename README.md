@@ -131,10 +131,16 @@ $env:MOBILE_REVIEW_BASE_URL = "https://你的固定地址.cpolar.cn"
 python -m app.cli init-runtime-db
 ```
 
-检查 Runtime Schema v5 健康状态：
+检查 Runtime Schema v6 健康状态：
 
 ```powershell
 pra-mvp health --runtime-db data/runtime/pra_runtime.sqlite3
+```
+
+按持久化渠道执行一次通知 Outbox Worker（同时运行 Watchdog）：
+
+```powershell
+python -m app.cli notification-worker --runtime-db data/runtime/pra_runtime.sqlite3 --channel feishu
 ```
 
 生成运行态任务：

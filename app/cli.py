@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from app.enums import ReviewTaskStatus, TaskActionType, TaskStatus
-from app.exceptions import ValidationError
+from app.exceptions import NotificationDeliveryError, ValidationError
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import create_template_workbooks
 from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION
 from app.services.ai import MockAISuggestionProvider
+from app.services.notification_outbox import NotificationOutboxWorker, is_test_notification_channel
 from app.services.pricing import PricingService
 from app.services.runtime import DEFAULT_RUNTIME_DB
 from app.services.workflow import (
@@ -85,7 +87,7 @@ def build_parser() -> argparse.ArgumentParser:
     health_parser = subparsers.add_parser(
         "health",
         aliases=["check-runtime-health"],
-        help="检查 Runtime Schema v5 与 SQLite operational health",
+        help="检查 Runtime Schema v6 与 SQLite operational health",
     )
     health_parser.add_argument("--runtime-db", type=Path, default=DEFAULT_RUNTIME_DB)
 
@@ -123,6 +125,21 @@ def build_parser() -> argparse.ArgumentParser:
     expire_reviews_parser.add_argument("--apply", action="store_true")
     expire_reviews_parser.add_argument("--now")
     expire_reviews_parser.add_argument("--enable-notification", action="store_true")
+
+    notification_worker_parser = subparsers.add_parser(
+        "notification-worker",
+        help="按持久化 channel 执行一次 Outbox Watchdog 与投递 Worker",
+    )
+    notification_worker_parser.add_argument("--runtime-db", type=Path, default=DEFAULT_RUNTIME_DB)
+    notification_worker_parser.add_argument(
+        "--channel",
+        help="渠道适配器名称；默认读取 DEFAULT_NOTIFICATION_CHANNEL",
+    )
+    notification_worker_parser.add_argument(
+        "--watchdog-only",
+        action="store_true",
+        help="只执行过期 lease/deadline Watchdog，不调用渠道",
+    )
 
     web_parser = subparsers.add_parser("serve-web", help="启动简单 Web 管理页")
     web_parser.add_argument("--host", default="127.0.0.1")
@@ -343,9 +360,34 @@ def main() -> int:
                     print(f"- {error}")
             return 0
 
+        if args.command == "notification-worker":
+            channel = str(args.channel or os.getenv("DEFAULT_NOTIFICATION_CHANNEL", "")).strip().lower()
+            if not channel:
+                print("notification worker aborted: channel is required")
+                return 2
+            allow_test_channels = os.getenv("DEV_MODE", "false").strip().lower() == "true"
+            if is_test_notification_channel(channel) and not allow_test_channels:
+                print("notification worker aborted: test channels require DEV_MODE=true")
+                return 2
+            repository = SQLiteRuntimeRepository(args.runtime_db)
+            repository.init_schema()
+            worker = NotificationOutboxWorker.for_channel(
+                repository,
+                channel,
+                allow_test_channels=allow_test_channels,
+            )
+            recovered = worker.run_watchdog()
+            delivered = None if args.watchdog_only else worker.run_once()
+            print(
+                f"notification worker completed: channel={channel} "
+                f"watchdog_recovered={len(recovered)} "
+                f"delivered_status={delivered.status if delivered else '-'}"
+            )
+            return 0
+
         parser.error("未知命令")
         return 2
-    except ValidationError as exc:
+    except (ValidationError, NotificationDeliveryError) as exc:
         print(f"错误：{exc}")
         return 1
 

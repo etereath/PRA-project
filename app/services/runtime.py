@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-import base64
 import json
 import secrets
 import time
@@ -30,7 +29,15 @@ from app.models import (
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.execution import ExecutionSimulationService
+from app.services.feishu import build_feishu_signature, is_feishu_success_response
 from app.services.manual_intervention import MANUAL_INTERVENTION_ACTIONS
+from app.services.notification_outbox import (
+    FakeSender,
+    NotificationOutboxService,
+    NotificationOutboxWorker,
+    OutboxReviewNotificationService,
+    ScriptedSender,
+)
 from app.utils import serialize_decimal, utc_now
 
 
@@ -219,11 +226,11 @@ class ReviewTaskService:
         repository: SQLiteRuntimeRepository,
         *,
         runtime_task_service: RuntimeTaskService | None = None,
-        notification_service: "ReviewNotificationService | None" = None,
+        notification_service: "ReviewNotificationService | OutboxReviewNotificationService | None" = None,
     ) -> None:
         self.repository = repository
         self.runtime_task_service = runtime_task_service or RuntimeTaskService(repository)
-        self.notification_service = notification_service or ReviewNotificationService(repository)
+        self.notification_service = notification_service or OutboxReviewNotificationService(repository)
 
     def create_from_tasks(self, tasks: list[Task], *, trade_date: date | None = None) -> "ReviewTaskCreationSummary":
         review_tasks = [
@@ -236,6 +243,20 @@ class ReviewTaskService:
         inserted_notification_logs_count = 0
         notification_errors: list[str] = []
         for review_task in review_tasks:
+            if isinstance(self.notification_service, OutboxReviewNotificationService):
+                try:
+                    inserted_count, outbox_count, _ = self.notification_service.create_review_task_atomically(
+                        review_task
+                    )
+                except Exception as exc:
+                    notification_errors.append(f"{review_task.review_task_id}: {exc}")
+                    continue
+                if inserted_count != 1:
+                    continue
+                inserted_review_tasks_count += 1
+                inserted_review_tasks.append(review_task)
+                inserted_notification_logs_count += outbox_count
+                continue
             inserted_count = self.repository.insert_review_tasks([review_task])
             if inserted_count != 1:
                 continue
@@ -390,20 +411,71 @@ class ReviewTaskService:
                     summary.expired_source_tasks += 1
                 continue
 
-            resolved = self.resolve_review_task(
-                review_task_id=review.review_task_id,
-                status=ReviewTaskStatus.EXPIRED,
-                actor=actor,
-                actor_source="system_timeout",
-                note="expired by required_by timeout",
-                resolution_payload=resolution_payload,
-                source_task_status=source_task_status,
-                source_task_metadata_extra=metadata_extra,
-            )
+            if enable_notification and isinstance(self.notification_service, OutboxReviewNotificationService):
+                resolved = replace(
+                    review,
+                    review_status=ReviewTaskStatus.EXPIRED,
+                    resolution_payload=resolution_payload,
+                    updated_at=cutoff,
+                    resolved_by=actor,
+                    resolved_at=cutoff,
+                    resolution_note="expired by required_by timeout",
+                )
+                history = None
+                source_task_id = None
+                if source_task_status is not None and source_task is not None:
+                    source_task_id = source_task.task_id
+                    history = TaskStatusHistory(
+                        history_id=uuid4().hex[:12],
+                        task_id=source_task.task_id,
+                        from_status=source_task.task_status,
+                        to_status=source_task_status,
+                        changed_by=actor,
+                        changed_at=cutoff,
+                        reason=f"review_task:{review.review_task_id}:{ReviewTaskStatus.EXPIRED.value}",
+                        metadata={
+                            "review_task_id": review.review_task_id,
+                            "review_status": ReviewTaskStatus.EXPIRED.value,
+                            "actor": actor,
+                            "actor_source": "system_timeout",
+                            "resolution_note": "expired by required_by timeout",
+                            "resolution_payload_summary": _resolution_payload_summary(resolution_payload),
+                            **metadata_extra,
+                        },
+                    )
+                notification, compatibility_log = (
+                    self.notification_service.outbox_service.build_expired_notification_candidate(
+                        resolved,
+                        timeout_at=cutoff,
+                    )
+                )
+                updated_count, outbox_count = self.repository.expire_review_task_with_notification_outbox(
+                    resolved,
+                    notification,
+                    compatibility_log,
+                    task_id=source_task_id,
+                    task_status=source_task_status if source_task_id else None,
+                    history=history,
+                    result_message="expired by required_by timeout",
+                )
+                if updated_count != 1:
+                    continue
+                summary.notification_logs_created += outbox_count
+            else:
+                resolved = self.resolve_review_task(
+                    review_task_id=review.review_task_id,
+                    status=ReviewTaskStatus.EXPIRED,
+                    actor=actor,
+                    actor_source="system_timeout",
+                    note="expired by required_by timeout",
+                    resolution_payload=resolution_payload,
+                    source_task_status=source_task_status,
+                    source_task_metadata_extra=metadata_extra,
+                )
             summary.expired_review_tasks += 1
             if source_task_status is not None:
                 summary.expired_source_tasks += 1
-            if enable_notification:
+            if enable_notification and not isinstance(self.notification_service, OutboxReviewNotificationService):
                 try:
                     created = self.notification_service.create_expired_notification(resolved, timeout_at=cutoff)
                 except Exception as exc:
@@ -1044,9 +1116,7 @@ def _feishu_message_type() -> str:
 
 
 def _build_feishu_sign(timestamp: str, secret: str) -> str:
-    string_to_sign = f"{timestamp}\n{secret}"
-    digest = hmac.new(string_to_sign.encode("utf-8"), b"", hashlib.sha256).digest()
-    return base64.b64encode(digest).decode("utf-8")
+    return build_feishu_signature(timestamp, secret)
 
 
 def _feishu_response_summary(*, status_code: int, response_text: str) -> dict[str, object]:
@@ -1061,11 +1131,7 @@ def _feishu_response_summary(*, status_code: int, response_text: str) -> dict[st
 
 
 def _is_feishu_success_response(response_json: dict[str, object]) -> bool:
-    if "code" in response_json:
-        return response_json.get("code") == 0
-    if "StatusCode" in response_json:
-        return response_json.get("StatusCode") == 0
-    return True
+    return is_feishu_success_response(response_json)
 
 
 def _feishu_error_message(response_json: dict[str, object]) -> str:

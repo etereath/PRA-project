@@ -23,8 +23,8 @@ Windows Job 在 Runner 启动后通过 `RUNNER_TEMP` 将后续步骤的 `TEMP` �
 Linux Job 只证明核心 Python 包没有被 Windows 隐式依赖锁死，执行：
 
 - wheel/sdist 构建、严格制品审计，以及 `app`/`shadowbot` 源码静态敏感信息扫描；
-- 仓库外 venv 安装最终 wheel，验证关键 import、`pra-mvp --help`、Runtime Schema `1..5` 初始化和 health；
-- `python scripts/run_linux_core_tests.py`，在 pytest 收集前排除 `test_shadowbot_*.py`，打印完整排除文件清单，再运行核心、SQLite、Schema v5、Web/安全和平台无关测试；
+- 仓库外 venv 安装最终 wheel，验证关键 import、`pra-mvp --help`、Runtime Schema `1..6` 初始化和 health；
+- `python scripts/run_linux_core_tests.py`，在 pytest 收集前排除 `test_shadowbot_*.py`，打印完整排除文件清单，再运行核心、SQLite、Schema v6、Web/安全和平台无关测试；
 - 使用仓库外临时 SQLite 的 core smoke；
 - `app` 与共享 `scripts` 的语法检查。
 
@@ -60,7 +60,7 @@ Linux 的正式证据来自 GitHub 托管的 `ubuntu-latest`，本机无需安�
 
 - pytest 或 core smoke 失败；
 - wheel/sdist 出现未知成员，或敏感信息扫描命中违规值；
-- 隔离 venv 无法导入核心模块、运行 CLI、初始化 Schema v5 或通过 health；
+- 隔离 venv 无法导入核心模块、运行 CLI、初始化 Schema v6 或通过 health；
 - ShadowBot fixture 缺少 `package.py`/`selectorsV2.xml`，或 `sync --check` 发现哈希漂移；
 - CI 命令修改 checkout。
 

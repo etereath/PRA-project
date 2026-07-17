@@ -74,6 +74,37 @@ class NotificationSendStatus(str, Enum):
     FAILED = "failed"
 
 
+class NotificationOutboxStatus(str, Enum):
+    """Durable logical-notification state, independent from provider results."""
+
+    PENDING = "PENDING"
+    LEASED = "LEASED"
+    SENDING = "SENDING"
+    RETRY_WAIT = "RETRY_WAIT"
+    SENT = "SENT"
+    UNKNOWN_DELIVERY = "UNKNOWN_DELIVERY"
+    FAILED = "FAILED"
+    EXPIRED = "EXPIRED"
+    CANCELLED = "CANCELLED"
+
+
+class DeliveryAttemptStatus(str, Enum):
+    STARTED = "STARTED"
+    ACKNOWLEDGED = "ACKNOWLEDGED"
+    TEMP_FAILED = "TEMP_FAILED"
+    PERM_FAILED = "PERM_FAILED"
+    UNKNOWN = "UNKNOWN"
+
+
+class DeliveryClassification(str, Enum):
+    """Safe result classes returned by a notification sender."""
+
+    SUCCESS = "SUCCESS"
+    TEMP_FAILED = "TEMP_FAILED"
+    PERM_FAILED = "PERM_FAILED"
+    UNKNOWN = "UNKNOWN"
+
+
 class PricingSource(str, Enum):
     RULE_ONLY = "rule_only"
     AI_SUGGESTED = "ai_suggested"

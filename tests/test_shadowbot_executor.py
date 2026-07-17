@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
-from app.enums import ReviewTaskStatus, TaskActionType, TaskStatus
+from app.enums import NotificationOutboxStatus, ReviewTaskStatus, TaskActionType, TaskStatus
 from app.exceptions import ValidationError
 from app.models import ReviewTask, Task
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
@@ -248,10 +248,41 @@ class ShadowBotExecutorTests(unittest.TestCase):
         notifications = self.repository.list_notification_logs(related_review_task_id=first)
         self.assertEqual(first, second)
         self.assertEqual(review.review_status, ReviewTaskStatus.PENDING)
+        self.assertGreaterEqual((review.required_by - review.created_at).total_seconds(), 120)
+        self.assertLessEqual((review.required_by - review.created_at).total_seconds(), 600)
         self.assertEqual(len(notifications), 1)
         self.assertNotIn("password", str(review.review_payload).lower())
         self.assertIn("ShadowBot 登录验证码人工接管", notifications[0].message)
         self.assertNotIn("Please complete", notifications[0].message)
+
+    def test_login_verification_handoff_queues_outbox_for_real_channel_without_sending(self) -> None:
+        self.executor.start_execution(
+            ShadowBotExecutionRequest(
+                operation_id="OP-1",
+                execution_attempt_id="ATTEMPT-LOGIN-REAL-1",
+                execution_mode=EXECUTION_MODE_COMMIT,
+                approval=_approval(),
+            )
+        )
+        phase = {
+            "execution_attempt_id": "ATTEMPT-LOGIN-REAL-1",
+            "phase": "LOGIN_VERIFICATION_REQUIRED",
+            "login": {
+                "verification_detected_at": "2026-07-17T10:00:00+08:00",
+                "verification_deadline_at": "2026-07-17T10:05:00+08:00",
+                "verification_markers": ["验证码"],
+            },
+        }
+        with patch.dict(os.environ, {"DEFAULT_NOTIFICATION_CHANNEL": "feishu"}, clear=False):
+            review_id = self.executor.open_login_verification_handoff(phase)
+
+        outbox = self.repository.list_notification_outbox(related_review_task_id=review_id)
+        self.assertEqual(len(outbox), 1)
+        self.assertEqual(outbox[0].notification_type, "verification_code_intervention")
+        self.assertEqual(outbox[0].channel, "feishu")
+        self.assertEqual(outbox[0].status, NotificationOutboxStatus.PENDING.value)
+        self.assertEqual(self.repository.list_notification_delivery_attempts(outbox[0].notification_id), [])
+        self.assertEqual(self.repository.get_notification_log(outbox[0].notification_id).send_status, "pending")
 
     def test_start_execution_requires_persisted_approved_review_task(self) -> None:
         approval = _approval()

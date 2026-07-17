@@ -53,7 +53,7 @@ SQLite 当前保存以下运行态表：
 
 SQLite 只承接运行态任务系统，不替代 Excel 主数据。
 
-当前 runtime schema 最新版本为 v5。v3 新增自动规则评估运行记录，v4 新增 ShadowBot Executor 账本，v5 新增 `instruction_hash`、`request_file_sha256`、`queue_request_path` 队列审计字段和 `retry_authorizations` 持久化结构。`app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION` 是唯一版本权威来源。
+当前 runtime schema 最新版本为 v6。v3 新增自动规则评估运行记录，v4 新增 ShadowBot Executor 账本，v5 新增 `instruction_hash`、`request_file_sha256`、`queue_request_path` 队列审计字段和 `retry_authorizations` 持久化结构，v6 新增事务型 `notification_outbox` 与 `notification_delivery_attempts`。`app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION` 是唯一版本权威来源。
 
 ### 2.3 人工复核闭环
 
@@ -79,10 +79,18 @@ SQLite 只承接运行态任务系统，不替代 Excel 主数据。
 
 ### 2.5 飞书通知
 
-已完成飞书 Webhook 真实通知：
+已完成飞书 Webhook Outbox 通知链路：
 
-- `NotificationSenderFactory` 支持 `mock / feishu`。
-- `FeishuWebhookNotificationSender` 使用飞书自定义机器人 Webhook。
+- `NotificationChannelRegistry` 按持久化 `channel` 绑定 `fake / scripted / feishu`；默认运行态 review 不再直接调用 provider。
+- ShadowBot 登录验证码人工介入使用 `ReviewTask + verification_code_intervention Outbox` 单事务创建。
+- 验证码 deadline 强制限制为 120 至 600 秒；Review 完成后会在业务事务中取消尚未发送的旧人工介入通知。
+- `FeishuOutboxSender` 使用飞书自定义机器人 Webhook；`notification-worker` CLI 提供一次 Watchdog/Worker 调度入口。
+- 新旧 Feishu 适配器复用官方签名实现；仅显式成功码可确认投递，HTTP 5xx 与缺少确认码的有效 JSON 均按不确定投递处理。
+- ReviewTask、Outbox 与初始 `notification_logs` 兼容投影原子创建；超时回退状态与 `review_expired` 通知也在同一事务提交。
+- 重复业务 Review 仅在完整业务字段、截止时间、payload、平台、渠道、收件人、事件版本和投递策略全部一致时复用已有 Outbox。
+- 业务创建路径不自动执行测试 Sender；渠道缺失会保持 `PENDING`。默认 Worker 拒绝测试渠道，CLI 仅在 `DEV_MODE=true` 时允许 `mock / fake / scripted`，生产误配置会非零退出。
+- 超时原子事务的三阶段故障矩阵覆盖源 Task 与 TaskStatusHistory，证明业务状态、历史、初始 Outbox、过期 Outbox 和兼容日志整体回滚。
+- `FeishuWebhookNotificationSender` 保留为旧通知接口的兼容测试适配器。
 - 支持可选签名 `FEISHU_WEBHOOK_SECRET`。
 - 默认 `FEISHU_MESSAGE_TYPE=post`，使用飞书富文本消息。
 - `FEISHU_MESSAGE_TYPE=text` 可作为纯文本回退。

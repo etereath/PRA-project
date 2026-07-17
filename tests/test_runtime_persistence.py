@@ -8,7 +8,13 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from app.enums import NotificationSendStatus, ReviewTaskStatus, TaskActionType, TaskStatus
+from app.enums import (
+    NotificationOutboxStatus,
+    NotificationSendStatus,
+    ReviewTaskStatus,
+    TaskActionType,
+    TaskStatus,
+)
 from app.models import NotificationLog, Task
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.runtime import (
@@ -62,7 +68,7 @@ class RuntimePersistenceTests(unittest.TestCase):
 
     def test_schema_initializes_version_and_partial_unique_index(self) -> None:
         self.task_service.init_schema()
-        self.assertEqual(self.repository.schema_versions(), [1, 2, 3, 4, 5])
+        self.assertEqual(self.repository.schema_versions(), [1, 2, 3, 4, 5, 6])
         connection = sqlite3.connect(self.db_path)
         try:
             indexes = connection.execute("PRAGMA index_list(tasks)").fetchall()
@@ -101,7 +107,7 @@ class RuntimePersistenceTests(unittest.TestCase):
 
         repository = SQLiteRuntimeRepository(legacy_path)
         repository.init_schema()
-        self.assertEqual(repository.schema_versions(), [1, 2, 3, 4, 5])
+        self.assertEqual(repository.schema_versions(), [1, 2, 3, 4, 5, 6])
         connection = sqlite3.connect(legacy_path)
         try:
             token_table = connection.execute(
@@ -490,31 +496,27 @@ class RuntimePersistenceTests(unittest.TestCase):
         self.assertEqual(len(logs), 1)
         self.assertEqual(logs[0].related_review_task_id, review.review_task_id)
         self.assertEqual(logs[0].related_task_id, source.task_id)
-        self.assertEqual(logs[0].send_status, NotificationSendStatus.SUCCESS.value)
-        self.assertIsNotNone(logs[0].sent_at)
+        self.assertEqual(logs[0].send_status, NotificationSendStatus.PENDING.value)
+        self.assertIsNone(logs[0].sent_at)
         self.assertIn("产能预警", logs[0].message)
         self.assertNotIn("decision_trace", logs[0].message)
 
+    def test_repeated_review_business_event_returns_existing_without_notification_error(self) -> None:
+        source = _runtime_task("TASK-REPEATED-REVIEW")
+        self.task_service.create_tasks([source])
+        review_service = ReviewTaskService(self.repository, runtime_task_service=self.task_service)
+        with patch.dict("os.environ", {"DEFAULT_NOTIFICATION_CHANNEL": "FeIsHu"}, clear=False):
+            first = review_service.create_from_tasks([source])
+            second = review_service.create_from_tasks([source])
+        self.assertEqual(first.inserted_review_tasks_count, 1)
+        self.assertEqual(second.inserted_review_tasks_count, 0)
+        self.assertEqual(second.notification_errors, [])
+        self.assertEqual(len(self.repository.list_review_tasks()), 1)
+        self.assertEqual(len(self.repository.list_notification_outbox()), 1)
+        self.assertEqual(self.repository.list_notification_outbox()[0].channel, "feishu")
+        self.assertEqual(len(self.repository.list_notification_logs()), 1)
+
     def test_feishu_notification_flow_sends_url_but_does_not_persist_raw_token(self) -> None:
-        captured: dict[str, object] = {}
-
-        class FakeResponse:
-            def getcode(self):
-                return 200
-
-            def read(self):
-                return b'{"code":0,"msg":"success"}'
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-        def fake_urlopen(request, timeout):
-            captured["body"] = json.loads(request.data.decode("utf-8"))
-            return FakeResponse()
-
         source = _runtime_task("TASK-1")
         self.task_service.create_tasks([source])
         review_service = ReviewTaskService(self.repository, runtime_task_service=self.task_service)
@@ -528,45 +530,21 @@ class RuntimePersistenceTests(unittest.TestCase):
                 "MOBILE_REVIEW_BASE_URL": "https://pra.example",
             },
             clear=False,
-        ), patch("app.services.runtime.urlopen", side_effect=fake_urlopen):
+        ), patch("app.services.runtime.urlopen") as mocked_urlopen:
             summary = review_service.create_from_tasks([source])
 
         self.assertEqual(summary.inserted_review_tasks_count, 1)
         self.assertEqual(summary.inserted_notification_logs_count, 1)
+        mocked_urlopen.assert_not_called()
         logs = NotificationLogService(self.repository).list_logs()
         self.assertEqual(logs[0].channel, "feishu")
-        self.assertEqual(logs[0].send_status, NotificationSendStatus.SUCCESS.value)
-        self.assertIn("mobile_review_url_created=true", logs[0].message)
+        self.assertEqual(logs[0].send_status, NotificationSendStatus.PENDING.value)
         self.assertNotIn("token=", logs[0].message)
-        self.assertEqual(captured["body"]["msg_type"], "post")
-        post = captured["body"]["content"]["post"]["zh_cn"]
-        flattened = [part for row in post["content"] for part in row]
-        link_parts = [part for part in flattened if part.get("tag") == "a"]
-        self.assertEqual(link_parts[0]["text"], "👉 点击处理复核")
-        self.assertIn("https://pra.example/mobile/review/", link_parts[0]["href"])
-        self.assertIn("token=", link_parts[0]["href"])
-        self.assertNotIn("token=", logs[0].message)
+        outbox = self.repository.list_notification_outbox(related_review_task_id=logs[0].related_review_task_id)[0]
+        self.assertEqual(outbox.status, "PENDING")
+        self.assertNotIn("token", json.dumps(outbox.payload).lower())
 
     def test_feishu_notification_flow_can_send_text_message(self) -> None:
-        captured: dict[str, object] = {}
-
-        class FakeResponse:
-            def getcode(self):
-                return 200
-
-            def read(self):
-                return b'{"code":0,"msg":"success"}'
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-        def fake_urlopen(request, timeout):
-            captured["body"] = json.loads(request.data.decode("utf-8"))
-            return FakeResponse()
-
         source = _runtime_task("TASK-1")
         self.task_service.create_tasks([source])
         review_service = ReviewTaskService(self.repository, runtime_task_service=self.task_service)
@@ -580,15 +558,15 @@ class RuntimePersistenceTests(unittest.TestCase):
                 "MOBILE_REVIEW_BASE_URL": "https://pra.example",
             },
             clear=False,
-        ), patch("app.services.runtime.urlopen", side_effect=fake_urlopen):
+        ), patch("app.services.runtime.urlopen") as mocked_urlopen:
             summary = review_service.create_from_tasks([source])
 
         self.assertEqual(summary.inserted_review_tasks_count, 1)
         self.assertEqual(summary.inserted_notification_logs_count, 1)
-        self.assertEqual(captured["body"]["msg_type"], "text")
-        sent_text = captured["body"]["content"]["text"]
-        self.assertIn("👉 点击处理复核：https://pra.example/mobile/review/", sent_text)
-        self.assertIn("token=", sent_text)
+        mocked_urlopen.assert_not_called()
+        outbox = self.repository.list_notification_outbox()[0]
+        self.assertEqual(outbox.channel, "feishu")
+        self.assertEqual(outbox.status, "PENDING")
 
     def test_feishu_notification_fails_when_review_url_cannot_be_created(self) -> None:
         source = _runtime_task("TASK-1")
@@ -608,9 +586,8 @@ class RuntimePersistenceTests(unittest.TestCase):
         self.assertEqual(summary.inserted_notification_logs_count, 1)
         mocked_urlopen.assert_not_called()
         logs = NotificationLogService(self.repository).list_logs()
-        self.assertEqual(logs[0].send_status, NotificationSendStatus.FAILED.value)
-        self.assertIn("mobile_review_url creation failed", logs[0].error_message)
-        self.assertIn("REVIEW_TOKEN_SECRET", logs[0].error_message)
+        self.assertEqual(logs[0].send_status, NotificationSendStatus.PENDING.value)
+        self.assertEqual(logs[0].error_message, "")
 
     def test_notification_failure_does_not_block_review_creation(self) -> None:
         class FailingReviewNotificationService(ReviewNotificationService):
@@ -757,6 +734,7 @@ class RuntimePersistenceTests(unittest.TestCase):
         applied = review_service.expire_pending_review_tasks(
             now=datetime(2026, 5, 4, 9, 30),
             apply=True,
+            enable_notification=True,
         )
         self.assertEqual(applied.expired_review_tasks, 1)
         self.assertEqual(applied.expired_source_tasks, 1)
@@ -769,6 +747,16 @@ class RuntimePersistenceTests(unittest.TestCase):
         self.assertTrue(history[-1].metadata["fallback_to_safe_default"])
         self.assertEqual(history[-1].metadata["confirmed_temp_worker_count"], 0)
         self.assertEqual(history[-1].metadata["confirmed_packing_capacity_qty"], 250)
+        self.assertEqual(applied.notification_logs_created, 1)
+        outboxes = self.repository.list_notification_outbox(related_review_task_id=review.review_task_id)
+        self.assertEqual(
+            sorted(row.status for row in outboxes),
+            [NotificationOutboxStatus.CANCELLED.value, NotificationOutboxStatus.PENDING.value],
+        )
+        self.assertEqual(
+            [row.notification_type for row in outboxes if row.status == NotificationOutboxStatus.PENDING.value],
+            ["review_expired"],
+        )
 
     def test_expire_pending_review_tasks_skips_non_manual_review_source(self) -> None:
         source = _runtime_task(

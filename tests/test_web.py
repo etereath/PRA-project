@@ -555,7 +555,8 @@ class WebTests(unittest.TestCase):
                 )
                 self.assertEqual(notifications_status, "200 OK")
                 self.assertIn("发送时间", notifications_body)
-                self.assertIn("模拟通知", notifications_body)
+                self.assertIn("unconfigured", notifications_body)
+                self.assertIn("待发送", notifications_body)
                 self.assertNotIn("token=", notifications_body)
 
                 execution_status, _, execution_body = self._call_app(

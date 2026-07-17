@@ -67,13 +67,13 @@ class SmokeRunner:
     def run(self) -> int:
         checks: list[tuple[str, str, Callable[[], None]]] = [
             ("runtime DB 初始化成功", "SQLiteRuntimeRepository / RuntimeTaskService.init_schema", self.check_init_db),
-            ("schema version exact v5", "runtime_schema_migrations", self.check_schema_version),
+            ("schema version exact v6", "runtime_schema_migrations", self.check_schema_version),
             ("关键运行态表存在", "SQLite schema", self.check_required_tables),
-            ("v5 RetryAuthorization 结构完整", "runtime schema health check", self.check_schema_integrity),
+            ("v6 Outbox/RetryAuthorization 结构完整", "runtime schema health check", self.check_schema_integrity),
             ("创建 runtime task", "RuntimeTaskService.create_tasks", self.check_create_task),
             ("dedupe_key 去重有效", "tasks partial unique index", self.check_task_dedupe),
             ("创建 pending review_task", "ReviewTaskService.create_from_tasks", self.check_create_review_task),
-            ("pending review_task 触发 mock notification_log", "ReviewNotificationService / MockNotificationSender", self.check_mock_notification),
+            ("pending review_task 仅写入待发送 Outbox", "OutboxReviewNotificationService", self.check_mock_notification),
             ("notification_logs.message 不泄露 token 或 mobile review URL", "NotificationLogService / ReviewNotificationService", self.check_notification_message_safe),
             ("Web/session approved 复核可推动 source task", "ReviewTaskService / RuntimeTaskService", self.check_web_session_approve),
             ("task_status_history 写入", "RuntimeTaskService.change_status", self.check_status_history),
@@ -173,8 +173,11 @@ class SmokeRunner:
         log = logs[0]
         if log.channel != "mock":
             raise AssertionError(f"通知 channel 应为 mock，实际 {log.channel}")
-        if log.send_status != "success":
-            raise AssertionError(f"mock 通知应为 success，实际 {log.send_status}")
+        if log.send_status != "pending":
+            raise AssertionError(f"业务创建路径的 mock 通知应保持 pending，实际 {log.send_status}")
+        outbox = self.context.repository.get_notification_outbox(log.notification_id)
+        if outbox is None or outbox.status != "PENDING":
+            raise AssertionError("业务创建路径不得自动执行 FakeSender 或将 Outbox 标记为 SENT")
         self.context.notification_id = log.notification_id
 
     def check_notification_message_safe(self) -> None:

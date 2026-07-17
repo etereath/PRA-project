@@ -53,3 +53,23 @@ class TableValidationError(ValidationError):
 
 class AIProviderError(Exception):
     """Raised when an AI suggestion provider fails."""
+
+
+class NotificationOutboxError(Exception):
+    """Base error for durable notification workflow failures."""
+
+
+class NotificationLeaseError(NotificationOutboxError):
+    """The notification lease is missing, expired, or fenced by another worker."""
+
+
+class NotificationDeliveryError(NotificationOutboxError):
+    """The delivery attempt cannot be completed under its current lease."""
+
+
+class NotificationIdempotencyConflictError(NotificationDeliveryError):
+    """A stable notification key was reused for a different immutable event."""
+
+
+class NotificationChannelMismatchError(NotificationDeliveryError):
+    """A provider adapter does not match the persisted notification channel."""

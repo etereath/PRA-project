@@ -322,7 +322,7 @@ class RuntimeSchemaV5Tests(unittest.TestCase):
         repository = SQLiteRuntimeRepository(self.db_path)
         repository.init_schema()
 
-        self.assertEqual(repository.schema_versions(), [1, 2, 3, 4, 5])
+        self.assertEqual(repository.schema_versions(), [1, 2, 3, 4, 5, 6])
         health = repository.check_schema_health()
         self.assertTrue(health.ok, health.summary)
         self.assertEqual(health.actual_version, LATEST_RUNTIME_SCHEMA_VERSION)
@@ -453,6 +453,7 @@ class RuntimeSchemaV5Tests(unittest.TestCase):
             "script": "legacy-script-v5",
             "operation": "legacy-operation-v5",
             "attempt": "legacy-attempt-v5",
+            "notification": "legacy-notification-v5",
         }
         now = datetime(2026, 7, 14, 12, 0).isoformat()
         with sqlite3.connect(path) as connection:
@@ -511,6 +512,17 @@ class RuntimeSchemaV5Tests(unittest.TestCase):
                 """,
                 (ids["attempt"], ids["operation"], now),
             )
+            connection.execute(
+                """
+                INSERT INTO notification_logs(
+                    notification_id, related_task_id, related_review_task_id,
+                    recipient_type, recipient, channel, send_status, dedupe_key,
+                    message, created_at
+                ) VALUES (?, ?, ?, 'role', 'operations', 'mock', 'pending',
+                          'legacy-notification-dedupe', 'legacy notification', ?)
+                """,
+                (ids["notification"], ids["task"], ids["review"], now),
+            )
         return ids
 
     def test_v3_and_v4_databases_upgrade_to_v5(self) -> None:
@@ -533,7 +545,7 @@ class RuntimeSchemaV5Tests(unittest.TestCase):
                         self.assertIn("shadowbot_operations", shadowbot_tables)
                         self.assertIn("shadowbot_execution_attempts", shadowbot_tables)
                 repository.init_schema()
-                self.assertEqual(repository.schema_versions(), [1, 2, 3, 4, 5])
+                self.assertEqual(repository.schema_versions(), [1, 2, 3, 4, 5, 6])
                 health = repository.check_schema_health()
                 self.assertTrue(health.ok, health.summary)
                 with sqlite3.connect(path) as connection:
@@ -573,7 +585,7 @@ class RuntimeSchemaV5Tests(unittest.TestCase):
                             )
                         )
                 repository.init_schema()
-                self.assertEqual(repository.schema_versions(), [1, 2, 3, 4, 5])
+                self.assertEqual(repository.schema_versions(), [1, 2, 3, 4, 5, 6])
                 self.assertTrue(repository.check_schema_health().ok)
                 with sqlite3.connect(path) as connection:
                     self.assertEqual(
@@ -611,7 +623,7 @@ class RuntimeSchemaV5Tests(unittest.TestCase):
             )
 
         repository.init_schema()
-        self.assertEqual(repository.schema_versions(), [1, 2, 3, 4, 5])
+        self.assertEqual(repository.schema_versions(), [1, 2, 3, 4, 5, 6])
         health = repository.check_schema_health()
         self.assertTrue(health.ok, health.summary)
         with sqlite3.connect(path) as connection:
@@ -629,6 +641,13 @@ class RuntimeSchemaV5Tests(unittest.TestCase):
             self.assertEqual(
                 connection.execute("SELECT task_id FROM tasks WHERE task_id = ?", (ids["task"],)).fetchone()[0],
                 ids["task"],
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT message, send_status FROM notification_logs WHERE notification_id = ?",
+                    (ids["notification"],),
+                ).fetchone(),
+                ("legacy notification", "pending"),
             )
             self.assertEqual(
                 connection.execute(

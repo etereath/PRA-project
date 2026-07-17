@@ -7166,7 +7166,7 @@ def _review_runtime_action_link(runtime_db: str, review) -> str:
 
 
 def _render_system_feishu_test_panel(runtime_db: str) -> str:
-    channel = _env_value("DEFAULT_NOTIFICATION_CHANNEL", "mock").lower()
+    channel = _env_value("DEFAULT_NOTIFICATION_CHANNEL", "").lower()
     webhook_configured = bool(_env_value("FEISHU_WEBHOOK_URL"))
     disabled = channel != "feishu" or not webhook_configured
     if channel != "feishu":
@@ -7336,8 +7336,8 @@ def _build_system_config_checks() -> list[dict[str, str]]:
             channel_status = "info"
             channel_recommendation = "DEV_MODE=true 时 mock 适合本地调试，不会发送真实通知。"
         else:
-            channel_status = "warning"
-            channel_recommendation = "DEV_MODE=false 且 channel=mock 不会发送真实通知；运营验收建议切换 feishu。"
+            channel_status = "error"
+            channel_recommendation = "非开发模式禁止使用 mock；请配置真实通知渠道。"
     elif channel == "feishu":
         missing = [
             name
@@ -7352,8 +7352,8 @@ def _build_system_config_checks() -> list[dict[str, str]]:
         )
     else:
         channel_status = "error"
-        channel_recommendation = "DEFAULT_NOTIFICATION_CHANNEL 仅支持 mock 或 feishu。"
-    checks.append(_system_check("通知渠道", "DEFAULT_NOTIFICATION_CHANNEL", channel_status, channel or "mock", channel_recommendation))
+        channel_recommendation = "DEFAULT_NOTIFICATION_CHANNEL 未配置或不受支持；通知将保持 PENDING。"
+    checks.append(_system_check("通知渠道", "DEFAULT_NOTIFICATION_CHANNEL", channel_status, channel or "未配置", channel_recommendation))
 
     if message_type in {"post", "text"}:
         message_status = "ok"
@@ -7413,7 +7413,7 @@ def _build_runtime_db_checks(db_path: Path) -> list[dict[str, str]]:
             "运行态数据库",
             "schema 完整性",
             "ok" if health.ok else "error",
-            "v5 结构完整" if health.ok else "v5 结构缺失或约束不完整",
+            f"v{LATEST_RUNTIME_SCHEMA_VERSION} 结构完整" if health.ok else f"v{LATEST_RUNTIME_SCHEMA_VERSION} 结构缺失或约束不完整",
             health.summary,
         ),
         _system_check(
@@ -7472,7 +7472,8 @@ def _build_system_runtime_summary(db_path: Path) -> list[dict[str, str]]:
         "send_status",
         NotificationSendStatus.FAILED.value,
     )
-    notification_mode = _env_value("DEFAULT_NOTIFICATION_CHANNEL", "mock").lower()
+    notification_mode = _env_value("DEFAULT_NOTIFICATION_CHANNEL", "").lower()
+    dev_mode = _env_value("DEV_MODE", "false").lower()
     message_type = _env_value("FEISHU_MESSAGE_TYPE", "post").lower()
     return [
         _runtime_summary_check("运行状态", UI_TEXT["ops_dashboard_pending_reviews"], pending_reviews, pending_reviews_error),
@@ -7485,7 +7486,13 @@ def _build_system_runtime_summary(db_path: Path) -> list[dict[str, str]]:
             note=f"tasks={expired_tasks if expired_tasks_error is None else '-'}, reviews={expired_reviews if expired_reviews_error is None else '-'}",
         ),
         _runtime_summary_check("运行状态", UI_TEXT["ops_dashboard_pending_tasks"], pending_tasks, pending_tasks_error),
-        _system_check("通知模式", "DEFAULT_NOTIFICATION_CHANNEL", "ok" if notification_mode in {"mock", "feishu"} else "error", notification_mode, "当前通知 sender 选择。"),
+        _system_check(
+            "通知模式",
+            "DEFAULT_NOTIFICATION_CHANNEL",
+            "ok" if notification_mode == "feishu" or (notification_mode == "mock" and dev_mode == "true") else "error",
+            notification_mode or "未配置",
+            "当前通知 sender 选择；未配置或生产 mock 会失败关闭。",
+        ),
         _system_check("通知模式", "FEISHU_MESSAGE_TYPE", "ok" if message_type in {"post", "text"} else "error", message_type, "飞书消息展示模式；不代表历史通知持久化字段。"),
     ]
 

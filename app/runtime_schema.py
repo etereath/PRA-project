@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 
-LATEST_RUNTIME_SCHEMA_VERSION = 5
+LATEST_RUNTIME_SCHEMA_VERSION = 6
 RUNTIME_SCHEMA_VERSIONS = tuple(range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1))
 
 REQUIRED_RUNTIME_TABLES = frozenset(
@@ -32,6 +32,8 @@ REQUIRED_RUNTIME_TABLES = frozenset(
         "shadowbot_execution_attempts",
         "shadowbot_side_effect_checkpoints",
         "retry_authorizations",
+        "notification_outbox",
+        "notification_delivery_attempts",
     }
 )
 
@@ -60,6 +62,68 @@ V5_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
     ),
 }
 
+V6_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
+    "notification_outbox": (
+        "notification_id",
+        "notification_key",
+        "notification_type",
+        "related_task_id",
+        "related_review_task_id",
+        "recipient_type",
+        "recipient_ref",
+        "channel",
+        "priority",
+        "payload_json",
+        "status",
+        "attempt_count",
+        "max_attempts",
+        "next_attempt_at",
+        "deadline_at",
+        "lease_owner_token",
+        "lease_version",
+        "lease_expires_at",
+        "sent_at",
+        "provider_message_id",
+        "last_error_code",
+        "last_error_message",
+        "created_at",
+        "updated_at",
+    ),
+    "notification_delivery_attempts": (
+        "delivery_attempt_id",
+        "notification_id",
+        "attempt_no",
+        "status",
+        "lease_owner_token",
+        "lease_version",
+        "request_fingerprint",
+        "started_at",
+        "completed_at",
+        "provider_status_code",
+        "provider_message_id",
+        "response_fingerprint",
+        "error_code",
+        "error_message",
+    ),
+}
+
+NOTIFICATION_OUTBOX_STATUS_VALUES = frozenset(
+    {
+        "PENDING",
+        "LEASED",
+        "SENDING",
+        "RETRY_WAIT",
+        "SENT",
+        "UNKNOWN_DELIVERY",
+        "FAILED",
+        "EXPIRED",
+        "CANCELLED",
+    }
+)
+DELIVERY_ATTEMPT_STATUS_VALUES = frozenset(
+    {"STARTED", "ACKNOWLEDGED", "TEMP_FAILED", "PERM_FAILED", "UNKNOWN"}
+)
+
 RETRY_AUTHORIZATION_STATUS_VALUES = frozenset({"ACTIVE", "CONSUMED", "EXPIRED", "REVOKED"})
 RETRY_AUTHORIZATION_INDEX_SPECS: Mapping[str, tuple[tuple[str, ...], bool]] = {
     "ix_retry_authorizations_operation_id": (("operation_id",), False),
@@ -72,6 +136,17 @@ RETRY_AUTHORIZATION_INDEX_SPECS: Mapping[str, tuple[tuple[str, ...], bool]] = {
     ),
 }
 RETRY_AUTHORIZATION_INDEXES = frozenset(RETRY_AUTHORIZATION_INDEX_SPECS)
+
+NOTIFICATION_OUTBOX_INDEX_SPECS: Mapping[str, tuple[tuple[str, ...], bool]] = {
+    "ux_notification_outbox_key": (("notification_key",), True),
+    "ix_notification_outbox_claim": (
+        ("status", "priority", "next_attempt_at", "deadline_at", "created_at"),
+        False,
+    ),
+    "ix_notification_outbox_lease_expires_at": (("lease_expires_at",), False),
+    "ix_notification_delivery_attempts_notification_id": (("notification_id",), False),
+}
+NOTIFICATION_OUTBOX_INDEXES = frozenset(NOTIFICATION_OUTBOX_INDEX_SPECS)
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,7 +211,7 @@ class RuntimeSchemaHealth:
 def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealth:
     """Inspect a SQLite connection without mutating it.
 
-    The check is deliberately exact: a database with a migration row for v5
+    The check is deliberately exact: a database with a migration row for v6
     but a missing table, column, index, or constraint is unhealthy.
     """
 
@@ -157,7 +232,7 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
         version_matches = applied_versions == RUNTIME_SCHEMA_VERSIONS and actual_version == LATEST_RUNTIME_SCHEMA_VERSION
 
         missing_columns: dict[str, tuple[str, ...]] = {}
-        for table, required in V5_REQUIRED_COLUMNS.items():
+        for table, required in {**V5_REQUIRED_COLUMNS, **V6_REQUIRED_COLUMNS}.items():
             if table not in tables:
                 continue
             columns = {
@@ -170,10 +245,21 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
 
         constraint_errors: list[str] = []
         missing_indexes: tuple[str, ...]
+        missing_index_names: set[str] = set()
         if "retry_authorizations" in tables and "retry_authorizations" not in missing_tables:
-            missing_indexes = _check_retry_authorization_constraints(connection, constraint_errors)
+            missing_index_names.update(_check_retry_authorization_constraints(connection, constraint_errors))
         else:
-            missing_indexes = tuple(sorted(RETRY_AUTHORIZATION_INDEXES))
+            missing_index_names.update(RETRY_AUTHORIZATION_INDEXES)
+        if (
+            "notification_outbox" in tables
+            and "notification_delivery_attempts" in tables
+            and "notification_outbox" not in missing_tables
+            and "notification_delivery_attempts" not in missing_tables
+        ):
+            missing_index_names.update(_check_notification_outbox_constraints(connection, constraint_errors))
+        else:
+            missing_index_names.update(NOTIFICATION_OUTBOX_INDEXES)
+        missing_indexes = tuple(sorted(missing_index_names))
 
         ok = not (
             missing_tables
@@ -200,7 +286,7 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
             version_matches=False,
             missing_tables=tuple(sorted(REQUIRED_RUNTIME_TABLES)),
             missing_columns={},
-            missing_indexes=tuple(sorted(RETRY_AUTHORIZATION_INDEXES)),
+            missing_indexes=tuple(sorted(RETRY_AUTHORIZATION_INDEXES | NOTIFICATION_OUTBOX_INDEXES)),
             constraint_errors=(),
             error=f"sqlite error: {type(exc).__name__}",
         )
@@ -219,7 +305,7 @@ def runtime_schema_health(connection: sqlite3.Connection) -> RuntimeSchemaHealth
 
 
 def assert_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealth:
-    """Raise a diagnostic error unless the connection has the exact v5 shape."""
+    """Raise a diagnostic error unless the connection has the exact v6 shape."""
 
     result = inspect_runtime_schema(connection)
     if not result.ok:
@@ -309,4 +395,122 @@ def _check_retry_authorization_constraints(
             errors.append(
                 f"{index_name} columns={actual_columns}, expected {expected_columns}"
             )
+    return tuple(sorted(missing_indexes))
+
+
+def _check_notification_outbox_constraints(
+    connection: sqlite3.Connection,
+    errors: list[str],
+) -> tuple[str, ...]:
+    """Validate v6 keys, foreign keys, status/numeric checks, and indexes."""
+
+    outbox_info = connection.execute("PRAGMA table_info(notification_outbox)").fetchall()
+    outbox_columns = {str(row[1]): row for row in outbox_info}
+    if not outbox_columns.get("notification_id") or int(outbox_columns["notification_id"][5]) != 1:
+        errors.append("notification_outbox.notification_id is not the primary key")
+
+    attempt_info = connection.execute("PRAGMA table_info(notification_delivery_attempts)").fetchall()
+    attempt_columns = {str(row[1]): row for row in attempt_info}
+    if not attempt_columns.get("delivery_attempt_id") or int(attempt_columns["delivery_attempt_id"][5]) != 1:
+        errors.append("notification_delivery_attempts.delivery_attempt_id is not the primary key")
+
+    foreign_key_specs = {
+        (str(row[3]), str(row[2]), str(row[4]))
+        for row in connection.execute("PRAGMA foreign_key_list(notification_outbox)").fetchall()
+    }
+    for column, target in (
+        ("related_task_id", ("tasks", "task_id")),
+        ("related_review_task_id", ("review_tasks", "review_task_id")),
+    ):
+        if (column, *target) not in foreign_key_specs:
+            errors.append(f"missing foreign key {column} -> {target[0]}({target[1]})")
+    attempt_foreign_keys = {
+        (str(row[3]), str(row[2]), str(row[4]))
+        for row in connection.execute("PRAGMA foreign_key_list(notification_delivery_attempts)").fetchall()
+    }
+    if ("notification_id", "notification_outbox", "notification_id") not in attempt_foreign_keys:
+        errors.append(
+            "missing foreign key notification_id -> notification_outbox(notification_id)"
+        )
+
+    table_sql_rows = connection.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
+        "AND name IN ('notification_outbox', 'notification_delivery_attempts')"
+    ).fetchall()
+    table_sql = {str(row[0]): str(row[1] or "") for row in table_sql_rows}
+    for table, column, expected in (
+        (
+            "notification_outbox",
+            "status",
+            NOTIFICATION_OUTBOX_STATUS_VALUES,
+        ),
+        (
+            "notification_delivery_attempts",
+            "status",
+            DELIVERY_ATTEMPT_STATUS_VALUES,
+        ),
+    ):
+        match = re.search(
+            rf"\b{column}\b\s+[^,]*?\bCHECK\s*\(\s*{column}\s+IN\s*\((?P<values>[^)]*)\)\)",
+            table_sql.get(table, ""),
+            re.IGNORECASE | re.DOTALL,
+        )
+        actual = {
+            value.replace("''", "'").upper()
+            for value in re.findall(r"'((?:''|[^'])*)'", match.group("values"))
+        } if match else set()
+        if actual != expected:
+            errors.append(
+                f"{table}.status CHECK must allow exactly "
+                + ", ".join(sorted(expected))
+            )
+
+    numeric_checks = (
+        ("notification_outbox", "attempt_count", r"attempt_count\s*>=\s*0"),
+        ("notification_outbox", "max_attempts", r"max_attempts\s*>\s*0"),
+        ("notification_outbox", "lease_version", r"lease_version\s*>=\s*0"),
+        ("notification_delivery_attempts", "attempt_no", r"attempt_no\s*>\s*0"),
+        ("notification_delivery_attempts", "lease_version", r"lease_version\s*>=\s*0"),
+    )
+    for table, column, pattern in numeric_checks:
+        if not re.search(rf"\bCHECK\s*\(\s*{pattern}\s*\)", table_sql.get(table, ""), re.IGNORECASE):
+            errors.append(f"{table}.{column} lacks required numeric CHECK")
+
+    index_rows = {
+        str(row[1]): row
+        for table in ("notification_outbox", "notification_delivery_attempts")
+        for row in connection.execute(f"PRAGMA index_list('{table}')").fetchall()
+    }
+    missing_indexes: list[str] = []
+    for index_name, (expected_columns, expected_unique) in NOTIFICATION_OUTBOX_INDEX_SPECS.items():
+        row = index_rows.get(index_name)
+        if row is None:
+            missing_indexes.append(index_name)
+            continue
+        actual_unique = int(row[2]) == 1
+        if actual_unique != expected_unique:
+            errors.append(f"{index_name} unique={actual_unique}, expected {expected_unique}")
+        actual_columns = tuple(
+            str(index_row[2])
+            for index_row in connection.execute(f"PRAGMA index_info('{index_name}')").fetchall()
+        )
+        if actual_columns != expected_columns:
+            errors.append(f"{index_name} columns={actual_columns}, expected {expected_columns}")
+
+    unique_attempt_key = False
+    for row in connection.execute("PRAGMA index_list('notification_delivery_attempts')").fetchall():
+        if int(row[2]) != 1:
+            continue
+        index_name = str(row[1])
+        actual_columns = tuple(
+            str(index_row[2])
+            for index_row in connection.execute(f"PRAGMA index_info('{index_name}')").fetchall()
+        )
+        if actual_columns == ("notification_id", "attempt_no"):
+            unique_attempt_key = True
+            break
+    if not unique_attempt_key:
+        errors.append(
+            "notification_delivery_attempts lacks UNIQUE(notification_id, attempt_no)"
+        )
     return tuple(sorted(missing_indexes))

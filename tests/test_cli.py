@@ -10,8 +10,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.cli import main
-from app.enums import TaskActionType, TaskStatus
-from app.models import Task
+from app.enums import NotificationOutboxStatus, ReviewTaskStatus, TaskActionType, TaskStatus
+from app.models import ReviewTask, Task
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.runtime import ReviewTaskService, RuntimeTaskService
 
@@ -36,6 +36,79 @@ def _runtime_task(task_id: str, *, status: TaskStatus = TaskStatus.MANUAL_REVIEW
 
 
 class CliTests(unittest.TestCase):
+    def test_notification_worker_rejects_test_channels_outside_dev_mode(self) -> None:
+        for channel in ("mock", "fake", "scripted"):
+            with self.subTest(channel=channel), tempfile.TemporaryDirectory() as temp_dir:
+                db_path = Path(temp_dir) / "runtime.sqlite3"
+                repository = SQLiteRuntimeRepository(db_path)
+                repository.init_schema()
+                review = ReviewTaskService(repository).notification_service
+                with patch.dict(
+                    "os.environ",
+                    {"DEFAULT_NOTIFICATION_CHANNEL": channel, "DEV_MODE": "false"},
+                    clear=False,
+                ):
+                    created = review.create_review_task_atomically(
+                        ReviewTask(
+                            review_task_id=f"CLI-{channel}",
+                            trade_date=None,
+                            scope_type="global",
+                            scope_key="cli",
+                            dedupe_key=f"cli:{channel}",
+                            source_task_id=None,
+                            review_type="manual_review",
+                            review_status=ReviewTaskStatus.PENDING,
+                            created_at=datetime(2026, 7, 17, 10, 0),
+                            updated_at=datetime(2026, 7, 17, 10, 0),
+                        )
+                    )[2]
+                    output = io.StringIO()
+                    args = ["cli", "notification-worker", "--runtime-db", str(db_path)]
+                    with patch.object(sys, "argv", args), redirect_stdout(output):
+                        exit_code = main()
+                self.assertEqual(exit_code, 2)
+                self.assertIn("DEV_MODE=true", output.getvalue())
+                self.assertEqual(
+                    repository.get_notification_outbox(created.notification_id).status,
+                    NotificationOutboxStatus.PENDING.value,
+                )
+                self.assertEqual(repository.list_notification_delivery_attempts(created.notification_id), [])
+
+    def test_notification_worker_allows_explicit_dev_test_channel(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "runtime.sqlite3"
+            repository = SQLiteRuntimeRepository(db_path)
+            repository.init_schema()
+            review = ReviewTaskService(repository).notification_service
+            with patch.dict(
+                "os.environ",
+                {"DEFAULT_NOTIFICATION_CHANNEL": "mock", "DEV_MODE": "true"},
+                clear=False,
+            ):
+                created = review.create_review_task_atomically(
+                    ReviewTask(
+                        review_task_id="CLI-DEV-MOCK",
+                        trade_date=None,
+                        scope_type="global",
+                        scope_key="cli",
+                        dedupe_key="cli:dev:mock",
+                        source_task_id=None,
+                        review_type="manual_review",
+                        review_status=ReviewTaskStatus.PENDING,
+                        created_at=datetime(2026, 7, 17, 10, 0),
+                        updated_at=datetime(2026, 7, 17, 10, 0),
+                    )
+                )[2]
+                output = io.StringIO()
+                args = ["cli", "notification-worker", "--runtime-db", str(db_path)]
+                with patch.object(sys, "argv", args), redirect_stdout(output):
+                    exit_code = main()
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(
+                repository.get_notification_outbox(created.notification_id).status,
+                NotificationOutboxStatus.SENT.value,
+            )
+
     def test_resolve_manual_task_returns_non_zero_and_deprecated_message(self) -> None:
         args = [
             "cli",
