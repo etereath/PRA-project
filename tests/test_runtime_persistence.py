@@ -8,7 +8,13 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
-from app.enums import NotificationSendStatus, ReviewTaskStatus, TaskActionType, TaskStatus
+from app.enums import (
+    NotificationOutboxStatus,
+    NotificationSendStatus,
+    ReviewTaskStatus,
+    TaskActionType,
+    TaskStatus,
+)
 from app.models import NotificationLog, Task
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.runtime import (
@@ -490,8 +496,8 @@ class RuntimePersistenceTests(unittest.TestCase):
         self.assertEqual(len(logs), 1)
         self.assertEqual(logs[0].related_review_task_id, review.review_task_id)
         self.assertEqual(logs[0].related_task_id, source.task_id)
-        self.assertEqual(logs[0].send_status, NotificationSendStatus.SUCCESS.value)
-        self.assertIsNotNone(logs[0].sent_at)
+        self.assertEqual(logs[0].send_status, NotificationSendStatus.PENDING.value)
+        self.assertIsNone(logs[0].sent_at)
         self.assertIn("产能预警", logs[0].message)
         self.assertNotIn("decision_trace", logs[0].message)
 
@@ -728,6 +734,7 @@ class RuntimePersistenceTests(unittest.TestCase):
         applied = review_service.expire_pending_review_tasks(
             now=datetime(2026, 5, 4, 9, 30),
             apply=True,
+            enable_notification=True,
         )
         self.assertEqual(applied.expired_review_tasks, 1)
         self.assertEqual(applied.expired_source_tasks, 1)
@@ -740,6 +747,16 @@ class RuntimePersistenceTests(unittest.TestCase):
         self.assertTrue(history[-1].metadata["fallback_to_safe_default"])
         self.assertEqual(history[-1].metadata["confirmed_temp_worker_count"], 0)
         self.assertEqual(history[-1].metadata["confirmed_packing_capacity_qty"], 250)
+        self.assertEqual(applied.notification_logs_created, 1)
+        outboxes = self.repository.list_notification_outbox(related_review_task_id=review.review_task_id)
+        self.assertEqual(
+            sorted(row.status for row in outboxes),
+            [NotificationOutboxStatus.CANCELLED.value, NotificationOutboxStatus.PENDING.value],
+        )
+        self.assertEqual(
+            [row.notification_type for row in outboxes if row.status == NotificationOutboxStatus.PENDING.value],
+            ["review_expired"],
+        )
 
     def test_expire_pending_review_tasks_skips_non_manual_review_source(self) -> None:
         source = _runtime_task(

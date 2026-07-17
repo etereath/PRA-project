@@ -966,6 +966,114 @@ class SQLiteRuntimeRepository:
                 ),
             )
 
+    def expire_review_task_with_notification_outbox(
+        self,
+        review_task: ReviewTask,
+        notification: NotificationOutbox,
+        compatibility_log: NotificationLog,
+        *,
+        task_id: str | None = None,
+        task_status: TaskStatus | None = None,
+        history: TaskStatusHistory | None = None,
+        result_message: str = "",
+        failure_injector: Callable[[str], None] | None = None,
+    ) -> tuple[int, int]:
+        """Atomically expire review/business state and persist the notification intent."""
+
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            review_row = _review_task_to_row(review_task)
+            updated_review = connection.execute(
+                """
+                UPDATE review_tasks
+                SET review_status = :review_status,
+                    resolution_payload_json = :resolution_payload_json,
+                    updated_at = :updated_at,
+                    resolved_by = :resolved_by,
+                    resolved_at = :resolved_at,
+                    resolution_note = :resolution_note
+                WHERE review_task_id = :review_task_id AND review_status = 'pending'
+                """,
+                review_row,
+            ).rowcount
+            if updated_review != 1:
+                connection.rollback()
+                return 0, 0
+            self._cancel_review_outbox_on_connection(
+                connection,
+                review_task.review_task_id,
+                changed_at=review_task.updated_at or self._clock(),
+            )
+            if task_id is not None and task_status is not None and history is not None:
+                changed_task = connection.execute(
+                    """
+                    UPDATE tasks
+                    SET task_status = ?, result_message = COALESCE(NULLIF(?, ''), result_message), updated_at = ?
+                    WHERE task_id = ? AND task_status = ?
+                    """,
+                    (
+                        task_status.value,
+                        result_message,
+                        _datetime_to_text(review_task.updated_at or self._clock()),
+                        task_id,
+                        history.from_status.value if history.from_status is not None else "",
+                    ),
+                ).rowcount
+                if changed_task != 1:
+                    raise ValueError("source task was not updated while expiring review")
+                connection.execute(
+                    """
+                    INSERT INTO task_status_history(
+                        history_id, task_id, from_status, to_status, changed_by,
+                        changed_at, reason, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        history.history_id,
+                        history.task_id,
+                        history.from_status.value if history.from_status is not None else None,
+                        history.to_status.value,
+                        history.changed_by,
+                        _datetime_to_text(history.changed_at),
+                        history.reason,
+                        _json_dump(history.metadata),
+                    ),
+                )
+            if failure_injector is not None:
+                failure_injector("after_business_update")
+            outbox_inserted = self._insert_notification_outbox_on_connection(connection, notification)
+            if outbox_inserted != 1:
+                raise ValueError("expired review notification_key already exists")
+            if failure_injector is not None:
+                failure_injector("after_outbox_insert")
+            log_row = _notification_log_to_row(compatibility_log)
+            inserted_log = connection.execute(
+                """
+                INSERT INTO notification_logs(
+                    notification_id, related_task_id, related_review_task_id, recipient_type,
+                    recipient, channel, sent_at, send_status, dedupe_key, message,
+                    error_message, created_at
+                ) VALUES(
+                    :notification_id, :related_task_id, :related_review_task_id, :recipient_type,
+                    :recipient, :channel, :sent_at, :send_status, :dedupe_key, :message,
+                    :error_message, :created_at
+                )
+                """,
+                log_row,
+            ).rowcount
+            if inserted_log != 1:
+                raise ValueError("expired review compatibility log was not inserted")
+            if failure_injector is not None:
+                failure_injector("after_compatibility_log_insert")
+            connection.commit()
+            return updated_review, outbox_inserted
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     @classmethod
     def _cancel_review_outbox_on_connection(
         cls,
@@ -3105,6 +3213,7 @@ class SQLiteRuntimeRepository:
                     reference_text,
                 ),
             )
+
             connection.commit()
             return attempt
         except Exception:

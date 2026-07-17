@@ -411,20 +411,71 @@ class ReviewTaskService:
                     summary.expired_source_tasks += 1
                 continue
 
-            resolved = self.resolve_review_task(
-                review_task_id=review.review_task_id,
-                status=ReviewTaskStatus.EXPIRED,
-                actor=actor,
-                actor_source="system_timeout",
-                note="expired by required_by timeout",
-                resolution_payload=resolution_payload,
-                source_task_status=source_task_status,
-                source_task_metadata_extra=metadata_extra,
-            )
+            if enable_notification and isinstance(self.notification_service, OutboxReviewNotificationService):
+                resolved = replace(
+                    review,
+                    review_status=ReviewTaskStatus.EXPIRED,
+                    resolution_payload=resolution_payload,
+                    updated_at=cutoff,
+                    resolved_by=actor,
+                    resolved_at=cutoff,
+                    resolution_note="expired by required_by timeout",
+                )
+                history = None
+                source_task_id = None
+                if source_task_status is not None and source_task is not None:
+                    source_task_id = source_task.task_id
+                    history = TaskStatusHistory(
+                        history_id=uuid4().hex[:12],
+                        task_id=source_task.task_id,
+                        from_status=source_task.task_status,
+                        to_status=source_task_status,
+                        changed_by=actor,
+                        changed_at=cutoff,
+                        reason=f"review_task:{review.review_task_id}:{ReviewTaskStatus.EXPIRED.value}",
+                        metadata={
+                            "review_task_id": review.review_task_id,
+                            "review_status": ReviewTaskStatus.EXPIRED.value,
+                            "actor": actor,
+                            "actor_source": "system_timeout",
+                            "resolution_note": "expired by required_by timeout",
+                            "resolution_payload_summary": _resolution_payload_summary(resolution_payload),
+                            **metadata_extra,
+                        },
+                    )
+                notification, compatibility_log = (
+                    self.notification_service.outbox_service.build_expired_notification_candidate(
+                        resolved,
+                        timeout_at=cutoff,
+                    )
+                )
+                updated_count, outbox_count = self.repository.expire_review_task_with_notification_outbox(
+                    resolved,
+                    notification,
+                    compatibility_log,
+                    task_id=source_task_id,
+                    task_status=source_task_status if source_task_id else None,
+                    history=history,
+                    result_message="expired by required_by timeout",
+                )
+                if updated_count != 1:
+                    continue
+                summary.notification_logs_created += outbox_count
+            else:
+                resolved = self.resolve_review_task(
+                    review_task_id=review.review_task_id,
+                    status=ReviewTaskStatus.EXPIRED,
+                    actor=actor,
+                    actor_source="system_timeout",
+                    note="expired by required_by timeout",
+                    resolution_payload=resolution_payload,
+                    source_task_status=source_task_status,
+                    source_task_metadata_extra=metadata_extra,
+                )
             summary.expired_review_tasks += 1
             if source_task_status is not None:
                 summary.expired_source_tasks += 1
-            if enable_notification:
+            if enable_notification and not isinstance(self.notification_service, OutboxReviewNotificationService):
                 try:
                     created = self.notification_service.create_expired_notification(resolved, timeout_at=cutoff)
                 except Exception as exc:

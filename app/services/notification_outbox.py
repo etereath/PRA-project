@@ -24,7 +24,11 @@ from app.exceptions import (
     NotificationDeliveryError,
     NotificationIdempotencyConflictError,
 )
-from app.services.feishu import build_feishu_signature, is_feishu_success_response
+from app.services.feishu import (
+    build_feishu_signature,
+    has_feishu_confirmation_code,
+    is_feishu_success_response,
+)
 from app.models import (
     NotificationDeliveryAttempt,
     NotificationDeliveryResult,
@@ -188,15 +192,22 @@ class FeishuOutboxSender:
                 response_text = response.read().decode("utf-8", errors="replace")
         except HTTPError as exc:
             # HTTPError may contain credentials or an echoed webhook URL.
-            classification = (
-                DeliveryClassification.TEMP_FAILED.value
-                if exc.code == 429 or exc.code >= 500
-                else DeliveryClassification.PERM_FAILED.value
-            )
+            if exc.code == 429:
+                classification = DeliveryClassification.TEMP_FAILED.value
+            elif exc.code >= 500:
+                classification = DeliveryClassification.UNKNOWN.value
+            else:
+                classification = DeliveryClassification.PERM_FAILED.value
             return NotificationDeliveryResult(
                 classification=classification,
                 provider_status_code=str(exc.code),
-                error_code="FEISHU_HTTP_TEMP_FAILED" if classification == "TEMP_FAILED" else "FEISHU_HTTP_REJECTED",
+                error_code=(
+                    "FEISHU_HTTP_TEMP_FAILED"
+                    if classification == DeliveryClassification.TEMP_FAILED.value
+                    else "FEISHU_UNKNOWN_DELIVERY"
+                    if classification == DeliveryClassification.UNKNOWN.value
+                    else "FEISHU_HTTP_REJECTED"
+                ),
                 error_message=f"Feishu provider HTTP {exc.code}",
             )
         except (TimeoutError, URLError, OSError) as exc:
@@ -218,13 +229,22 @@ class FeishuOutboxSender:
                 error_code="FEISHU_UNKNOWN_DELIVERY",
                 error_message="Feishu provider response was not provable",
             )
-        if status_code == 429 or status_code >= 500:
+        if status_code == 429:
             return NotificationDeliveryResult(
                 classification=DeliveryClassification.TEMP_FAILED.value,
                 provider_status_code=str(status_code),
                 provider_message_id=provider_message_id,
                 response_fingerprint=response_fingerprint,
                 error_code="FEISHU_HTTP_TEMP_FAILED",
+                error_message=f"Feishu provider HTTP {status_code}",
+            )
+        if status_code >= 500:
+            return NotificationDeliveryResult(
+                classification=DeliveryClassification.UNKNOWN.value,
+                provider_status_code=str(status_code),
+                provider_message_id=provider_message_id,
+                response_fingerprint=response_fingerprint,
+                error_code="FEISHU_UNKNOWN_DELIVERY",
                 error_message=f"Feishu provider HTTP {status_code}",
             )
         if status_code < 200 or status_code >= 300:
@@ -235,6 +255,15 @@ class FeishuOutboxSender:
                 response_fingerprint=response_fingerprint,
                 error_code="FEISHU_HTTP_REJECTED",
                 error_message=f"Feishu provider HTTP {status_code}",
+            )
+        if not has_feishu_confirmation_code(summary):
+            return NotificationDeliveryResult(
+                classification=DeliveryClassification.UNKNOWN.value,
+                provider_status_code=str(status_code),
+                provider_message_id=provider_message_id,
+                response_fingerprint=response_fingerprint,
+                error_code="FEISHU_CONFIRMATION_MISSING",
+                error_message="Feishu provider response did not contain an explicit confirmation code",
             )
         if not is_feishu_success_response(summary):
             code = summary.get("code", summary.get("StatusCode", ""))
@@ -513,7 +542,6 @@ class NotificationOutboxService:
             existing_review = self.repository.get_pending_review_task_by_dedupe_key(review_task.dedupe_key)
             if existing_review is None:
                 raise RuntimeError("duplicate review task could not be resolved by dedupe_key")
-            _assert_duplicate_review_match(review_task, existing_review)
             existing_rows = self.repository.list_notification_outbox(
                 related_review_task_id=existing_review.review_task_id
             )
@@ -523,6 +551,7 @@ class NotificationOutboxService:
             )
             if existing is None:
                 raise RuntimeError("duplicate review task has no matching notification outbox")
+            _assert_duplicate_review_match(review_task, existing_review, candidate, existing)
             self._ensure_compatibility_log(existing)
             return 0, 0, existing
         return inserted_review, inserted_outbox, candidate
@@ -545,6 +574,24 @@ class NotificationOutboxService:
             message=message,
             created_at=notification.created_at,
         )
+
+    def build_expired_notification_candidate(
+        self,
+        review_task: ReviewTask,
+        *,
+        timeout_at: datetime,
+    ) -> tuple[NotificationOutbox, NotificationLog]:
+        channel = _configured_notification_channel()
+        recipient_type = os.getenv("DEFAULT_NOTIFICATION_RECIPIENT_TYPE", "role").strip() or "role"
+        recipient_ref = os.getenv("DEFAULT_NOTIFICATION_RECIPIENT", "operations").strip() or "operations"
+        candidate = self._candidate_expired_notification(
+            review_task,
+            timeout_at=timeout_at,
+            recipient_type=recipient_type,
+            recipient_ref=recipient_ref,
+            channel=channel,
+        )
+        return candidate, self._compatibility_log(candidate)
 
     def _ensure_compatibility_log(self, notification: NotificationOutbox) -> None:
         self.repository.insert_notification_logs([self._compatibility_log(notification)])
@@ -610,6 +657,43 @@ class NotificationOutboxService:
             status=NotificationOutboxStatus.PENDING.value,
             max_attempts=int(max_attempts),
             deadline_at=deadline_at,
+            created_at=now,
+            updated_at=now,
+        )
+
+    def _candidate_expired_notification(
+        self,
+        review_task: ReviewTask,
+        *,
+        timeout_at: datetime,
+        recipient_type: str,
+        recipient_ref: str,
+        channel: str,
+    ) -> NotificationOutbox:
+        channel = _normalize_channel(channel)
+        now = self._clock()
+        return NotificationOutbox(
+            notification_id=uuid4().hex,
+            notification_key=self.notification_key(
+                "review_expired", review_task.review_task_id, "v1", channel, recipient_ref
+            ),
+            notification_type="review_expired",
+            related_task_id=review_task.source_task_id,
+            related_review_task_id=review_task.review_task_id,
+            recipient_type=recipient_type,
+            recipient_ref=recipient_ref,
+            channel=channel,
+            priority=70,
+            payload=_sanitize_payload(
+                "review_expired",
+                {
+                    "review_task_id": review_task.review_task_id,
+                    "message": f"人工复核已过期：{timeout_at.isoformat()}",
+                },
+            ),
+            status=NotificationOutboxStatus.PENDING.value,
+            max_attempts=2,
+            deadline_at=timeout_at + timedelta(minutes=5),
             created_at=now,
             updated_at=now,
         )
@@ -781,23 +865,14 @@ class OutboxReviewNotificationService:
         self.channel_registry = NotificationChannelRegistry()
 
     def create_review_task_atomically(self, review_task: ReviewTask) -> tuple[int, int, NotificationOutbox]:
-        channel = _normalize_channel(os.getenv("DEFAULT_NOTIFICATION_CHANNEL", "mock"))
+        channel = _configured_notification_channel()
         result = self.outbox_service.enqueue_review_task_atomically(
             review_task,
             recipient_type=os.getenv("DEFAULT_NOTIFICATION_RECIPIENT_TYPE", "role").strip() or "role",
             recipient_ref=os.getenv("DEFAULT_NOTIFICATION_RECIPIENT", "operations").strip() or "operations",
             channel=channel,
         )
-        # The mock channel is intentionally local and deterministic.  Treat it
-        # as a worker tick so existing local smoke flows still observe the
-        # compatibility log reaching success; real channels remain queued.
-        if result[1] == 1 and channel in {"mock", "fake"}:
-            self.outbox_service.deliver_once(
-                self.channel_registry.build(channel),
-                now=self.outbox_service._clock(),
-            )
-        final = self.repository.get_notification_outbox(result[2].notification_id) or result[2]
-        return result[0], result[1], final
+        return result
 
     def create_verification_review_task_atomically(
         self,
@@ -807,7 +882,7 @@ class OutboxReviewNotificationService:
         attempt_id: str,
         payload: dict[str, object] | None = None,
     ) -> tuple[int, int, NotificationOutbox]:
-        channel = _normalize_channel(os.getenv("DEFAULT_NOTIFICATION_CHANNEL", "mock"))
+        channel = _configured_notification_channel()
         result = self.outbox_service.enqueue_verification_review_task_atomically(
             review_task,
             operation_id=operation_id,
@@ -817,27 +892,19 @@ class OutboxReviewNotificationService:
             channel=channel,
             payload=payload,
         )
-        # Fake/mock delivery is opt-in to local CI/smoke only; real channels
-        # remain durable PENDING rows for their channel worker.
-        if result[1] == 1 and channel in {"mock", "fake"}:
-            self.outbox_service.deliver_once(
-                self.channel_registry.build(channel),
-                now=self.outbox_service._clock(),
-            )
-        final = self.repository.get_notification_outbox(result[2].notification_id) or result[2]
-        return result[0], result[1], final
+        return result
 
     def create_initial_notification(self, review_task: ReviewTask) -> NotificationLog | None:
         outbox = self.outbox_service.enqueue_review_notification(
             review_task,
             recipient_type=os.getenv("DEFAULT_NOTIFICATION_RECIPIENT_TYPE", "role").strip() or "role",
             recipient_ref=os.getenv("DEFAULT_NOTIFICATION_RECIPIENT", "operations").strip() or "operations",
-            channel=_normalize_channel(os.getenv("DEFAULT_NOTIFICATION_CHANNEL", "mock")),
+            channel=_configured_notification_channel(),
         )
         return self.repository.get_notification_log(outbox.notification_id)
 
     def create_expired_notification(self, review_task: ReviewTask, *, timeout_at: datetime) -> NotificationLog | None:
-        channel = _normalize_channel(os.getenv("DEFAULT_NOTIFICATION_CHANNEL", "mock"))
+        channel = _configured_notification_channel()
         recipient_type = os.getenv("DEFAULT_NOTIFICATION_RECIPIENT_TYPE", "role").strip() or "role"
         recipient_ref = os.getenv("DEFAULT_NOTIFICATION_RECIPIENT", "operations").strip() or "operations"
         key = self.outbox_service.notification_key(
@@ -859,11 +926,6 @@ class OutboxReviewNotificationService:
             max_attempts=2,
             deadline_at=timeout_at + timedelta(minutes=5),
         )
-        if channel == "mock":
-            self.outbox_service.deliver_once(
-                self.channel_registry.build(channel),
-                now=self.outbox_service._clock(),
-            )
         return self.repository.get_notification_log(outbox.notification_id)
 
 
@@ -874,7 +936,11 @@ def _fingerprint(value: object) -> str:
 
 def _normalize_channel(value: object) -> str:
     normalized = str(value or "").strip().lower()
-    return normalized or "mock"
+    return normalized or "unconfigured"
+
+
+def _configured_notification_channel() -> str:
+    return _normalize_channel(os.getenv("DEFAULT_NOTIFICATION_CHANNEL", ""))
 
 
 def _coerce_datetime_for_comparison(value: datetime, reference: datetime) -> datetime:
@@ -1049,25 +1115,38 @@ def _assert_idempotent_notification_match(
         )
 
 
-def _assert_duplicate_review_match(candidate: ReviewTask, existing: ReviewTask) -> None:
-    candidate_identity = (
-        candidate.dedupe_key,
-        candidate.source_task_id,
-        candidate.review_type,
-        candidate.scope_type,
-        candidate.scope_key,
-    )
-    existing_identity = (
-        existing.dedupe_key,
-        existing.source_task_id,
-        existing.review_type,
-        existing.scope_type,
-        existing.scope_key,
-    )
+def _assert_duplicate_review_match(
+    candidate: ReviewTask,
+    existing: ReviewTask,
+    candidate_notification: NotificationOutbox,
+    existing_notification: NotificationOutbox,
+) -> None:
+    candidate_identity = _review_event_identity(candidate, candidate_notification)
+    existing_identity = _review_event_identity(existing, existing_notification)
     if candidate_identity != existing_identity:
         raise NotificationIdempotencyConflictError(
             "review dedupe_key is already bound to a different pending review event"
         )
+
+
+def _review_event_identity(review: ReviewTask, notification: NotificationOutbox) -> str:
+    identity = {
+        "dedupe_key": review.dedupe_key,
+        "trade_date": review.trade_date.isoformat() if review.trade_date else None,
+        "scope_type": review.scope_type,
+        "scope_key": review.scope_key,
+        "source_task_id": review.source_task_id,
+        "review_type": review.review_type,
+        "internal_sku": review.internal_sku,
+        "platform_name": review.platform_name,
+        "reason": review.reason,
+        "required_by": review.required_by.isoformat() if review.required_by else None,
+        "review_payload_fingerprint": _fingerprint(review.review_payload),
+        "channel": notification.channel,
+        "recipient_type": notification.recipient_type,
+        "recipient_ref": notification.recipient_ref,
+    }
+    return _fingerprint(identity)
 
 
 def _build_feishu_outbox_body(notification: NotificationOutbox, message_type: str) -> dict[str, object]:

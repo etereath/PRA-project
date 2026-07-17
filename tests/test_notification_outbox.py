@@ -5,8 +5,10 @@ import tempfile
 import threading
 import sqlite3
 from contextlib import closing
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
+from urllib.error import HTTPError
 
 import pytest
 
@@ -418,6 +420,70 @@ def test_feishu_outbox_uses_official_signature_vector_and_response_code_matrix(m
     conflicting = FeishuOutboxSender().send(notification, attempt)
     assert conflicting.classification == "PERM_FAILED"
 
+    for body in (b"{}", b'{"msg":"success"}'):
+        response_body[0] = body
+        missing_confirmation = FeishuOutboxSender().send(notification, attempt)
+        assert missing_confirmation.classification == "UNKNOWN"
+        assert missing_confirmation.error_code == "FEISHU_CONFIRMATION_MISSING"
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [(500, "UNKNOWN"), (502, "UNKNOWN"), (429, "TEMP_FAILED")],
+)
+def test_feishu_http_status_classification_is_safe(monkeypatch, status_code, expected):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def getcode(self):
+            return status_code
+
+        def read(self):
+            return b'{"code":0}'
+
+    monkeypatch.setattr(notification_outbox_module, "urlopen", lambda *args, **kwargs: Response())
+    monkeypatch.setenv("FEISHU_WEBHOOK_URL", "https://example.invalid/hook/test")
+    notification = _notification(f"FEISHU-{status_code}")
+    notification.channel = "feishu"
+    attempt = NotificationDeliveryAttempt(
+        delivery_attempt_id=f"ATT-{status_code}",
+        notification_id=notification.notification_id,
+        attempt_no=1,
+        status="STARTED",
+        lease_owner_token="owner",
+        lease_version=1,
+        request_fingerprint="request",
+        started_at=datetime(2026, 7, 17, 10, 0),
+    )
+    assert FeishuOutboxSender().send(notification, attempt).classification == expected
+
+
+def test_feishu_http_error_5xx_is_unknown(monkeypatch):
+    def raise_http_error(request, timeout):
+        raise HTTPError(request.full_url, 500, "server error", None, None)
+
+    monkeypatch.setattr(notification_outbox_module, "urlopen", raise_http_error)
+    monkeypatch.setenv("FEISHU_WEBHOOK_URL", "https://example.invalid/hook/test")
+    notification = _notification("FEISHU-HTTPERROR")
+    notification.channel = "feishu"
+    attempt = NotificationDeliveryAttempt(
+        delivery_attempt_id="ATT-HTTPERROR",
+        notification_id=notification.notification_id,
+        attempt_no=1,
+        status="STARTED",
+        lease_owner_token="owner",
+        lease_version=1,
+        request_fingerprint="request",
+        started_at=datetime(2026, 7, 17, 10, 0),
+    )
+    result = FeishuOutboxSender().send(notification, attempt)
+    assert result.classification == "UNKNOWN"
+    assert result.error_code == "FEISHU_UNKNOWN_DELIVERY"
+
 
 def test_review_and_outbox_commit_or_rollback_together(repository):
     service = NotificationOutboxService(repository, clock=lambda: datetime(2026, 7, 17, 10, 0))
@@ -457,6 +523,94 @@ def test_duplicate_review_dedupe_returns_existing_outbox_and_repairs_projection(
     assert duplicate[2].notification_id == first[2].notification_id
     assert len(repository.list_notification_outbox()) == 1
     assert repository.get_notification_log(first[2].notification_id) is not None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("reason", "不同原因"),
+        ("required_by", datetime(2026, 7, 17, 12, 0)),
+        ("review_payload", {"decision": "different"}),
+        ("platform_name", "different-platform"),
+        ("internal_sku", "SKU-DIFFERENT"),
+    ],
+)
+def test_duplicate_review_full_business_fingerprint_rejects_changes(repository, field, value):
+    service = NotificationOutboxService(repository, clock=lambda: datetime(2026, 7, 17, 10, 0))
+    first_review = _review("REVIEW-FP-1")
+    first_review.review_payload = {"decision": "same"}
+    second_review = replace(first_review, review_task_id="REVIEW-FP-2")
+    setattr(second_review, field, value)
+    service.enqueue_review_task_atomically(first_review, channel="feishu", recipient_ref="operations")
+    with pytest.raises(NotificationIdempotencyConflictError):
+        service.enqueue_review_task_atomically(second_review, channel="feishu", recipient_ref="operations")
+
+
+@pytest.mark.parametrize(
+    "notification_kwargs",
+    [
+        {"channel": "mock", "recipient_ref": "operations"},
+        {"channel": "feishu", "recipient_ref": "different-recipient"},
+        {"channel": "feishu", "recipient_ref": "operations", "recipient_type": "user"},
+    ],
+)
+def test_duplicate_review_notification_intent_fingerprint_rejects_changes(repository, notification_kwargs):
+    service = NotificationOutboxService(repository, clock=lambda: datetime(2026, 7, 17, 10, 0))
+    first_review = _review("REVIEW-NOTIFY-FP-1")
+    second_review = replace(first_review, review_task_id="REVIEW-NOTIFY-FP-2")
+    service.enqueue_review_task_atomically(first_review, channel="feishu", recipient_ref="operations")
+    with pytest.raises(NotificationIdempotencyConflictError):
+        service.enqueue_review_task_atomically(second_review, **notification_kwargs)
+
+
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["after_business_update", "after_outbox_insert", "after_compatibility_log_insert"],
+)
+def test_expired_review_notification_transaction_rolls_back_every_stage(repository, monkeypatch, failure_stage):
+    monkeypatch.setenv("DEFAULT_NOTIFICATION_CHANNEL", "mock")
+    service = NotificationOutboxService(repository, clock=lambda: datetime(2026, 7, 17, 10, 0))
+    review = _review("REVIEW-EXPIRE-ROLLBACK")
+    initial = service.enqueue_review_task_atomically(review, channel="mock")[2]
+    updated = replace(
+        review,
+        review_status=ReviewTaskStatus.EXPIRED,
+        resolution_payload={"timeout": True},
+        resolved_by="system",
+        resolved_at=datetime(2026, 7, 17, 11, 0),
+        updated_at=datetime(2026, 7, 17, 11, 0),
+    )
+    expired, log = service.build_expired_notification_candidate(
+        updated,
+        timeout_at=datetime(2026, 7, 17, 11, 0),
+    )
+    with pytest.raises(RuntimeError, match="injected"):
+        repository.expire_review_task_with_notification_outbox(
+            updated,
+            expired,
+            log,
+            failure_injector=lambda stage: (_ for _ in ()).throw(RuntimeError("injected"))
+            if stage == failure_stage
+            else None,
+        )
+    assert repository.get_review_task(review.review_task_id).review_status == ReviewTaskStatus.PENDING
+    assert repository.get_notification_outbox(initial.notification_id).status == NotificationOutboxStatus.PENDING.value
+    assert repository.get_notification_outbox(expired.notification_id) is None
+    assert repository.get_notification_log(expired.notification_id) is None
+
+
+@pytest.mark.parametrize("configured_channel", [None, "mock", "fake"])
+def test_business_creation_never_auto_runs_fake_sender(repository, monkeypatch, configured_channel):
+    if configured_channel is None:
+        monkeypatch.delenv("DEFAULT_NOTIFICATION_CHANNEL", raising=False)
+    else:
+        monkeypatch.setenv("DEFAULT_NOTIFICATION_CHANNEL", configured_channel)
+    monkeypatch.setattr(FakeSender, "send", lambda *args, **kwargs: pytest.fail("FakeSender must not run"))
+    result = OutboxReviewNotificationService(repository).create_review_task_atomically(
+        _review(f"REVIEW-NO-FAKE-{configured_channel}")
+    )
+    assert result[2].status == NotificationOutboxStatus.PENDING.value
+    assert result[2].channel == (configured_channel or "unconfigured")
 
 
 def test_compatibility_projection_insert_failure_rolls_back_review_and_outbox(repository):

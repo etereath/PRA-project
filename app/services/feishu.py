@@ -15,7 +15,13 @@ def build_feishu_signature(timestamp: str, secret: str) -> str:
 
 
 def is_feishu_success_response(response: Mapping[str, object]) -> bool:
-    """Accept only explicit Feishu success codes when a code field exists."""
+    """Accept only an explicit Feishu success acknowledgement."""
 
     codes = [response[key] for key in ("code", "StatusCode") if key in response]
-    return all(code in (0, "0") for code in codes) if codes else True
+    return bool(codes) and all(code in (0, "0") for code in codes)
+
+
+def has_feishu_confirmation_code(response: Mapping[str, object]) -> bool:
+    """Return whether the provider supplied any authoritative result code."""
+
+    return any(key in response for key in ("code", "StatusCode"))

@@ -85,8 +85,10 @@ SQLite 只承接运行态任务系统，不替代 Excel 主数据。
 - ShadowBot 登录验证码人工介入使用 `ReviewTask + verification_code_intervention Outbox` 单事务创建。
 - 验证码 deadline 强制限制为 120 至 600 秒；Review 完成后会在业务事务中取消尚未发送的旧人工介入通知。
 - `FeishuOutboxSender` 使用飞书自定义机器人 Webhook；`notification-worker` CLI 提供一次 Watchdog/Worker 调度入口。
-- 新旧 Feishu 适配器复用官方签名实现，并覆盖 `code / StatusCode` 成败矩阵。
-- ReviewTask、Outbox 与初始 `notification_logs` 兼容投影原子创建；重复业务 Review 会解析并返回已有 Outbox。
+- 新旧 Feishu 适配器复用官方签名实现；仅显式成功码可确认投递，HTTP 5xx 与缺少确认码的有效 JSON 均按不确定投递处理。
+- ReviewTask、Outbox 与初始 `notification_logs` 兼容投影原子创建；超时回退状态与 `review_expired` 通知也在同一事务提交。
+- 重复业务 Review 仅在完整业务字段、截止时间、payload、平台、渠道和收件人指纹一致时复用已有 Outbox。
+- 业务创建路径不自动执行 FakeSender；渠道缺失会保持 `PENDING`，生产缺失或 `mock` 误配置会在健康检查中报错。
 - `FeishuWebhookNotificationSender` 保留为旧通知接口的兼容测试适配器。
 - 支持可选签名 `FEISHU_WEBHOOK_SECRET`。
 - 默认 `FEISHU_MESSAGE_TYPE=post`，使用飞书富文本消息。
