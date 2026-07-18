@@ -99,6 +99,7 @@ PLACEHOLDER_VALUES = frozenset(
         "YOUR-VALUE",
     }
 )
+PLACEHOLDER_MARKER_RE = re.compile(r"<[A-Za-z0-9][A-Za-z0-9_.:-]*>")
 TRANSACTION_FILE_GLOB = ".pra-*.transaction.json"
 
 
@@ -249,14 +250,7 @@ def _is_placeholder(value: str) -> bool:
     return (
         not normalized
         or upper in PLACEHOLDER_VALUES
-        or ("<" in normalized and ">" in normalized)
-        or upper.startswith("EXAMPLE_")
-        or upper.startswith("REPLACE-")
-        or upper.startswith("REPLACE_")
-        or "REPLACE-ME" in upper
-        or "REPLACE_ME" in upper
-        or upper.startswith("YOUR-")
-        or upper.startswith("YOUR_")
+        or bool(PLACEHOLDER_MARKER_RE.fullmatch(normalized))
     )
 
 

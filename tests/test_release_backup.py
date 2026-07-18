@@ -206,6 +206,11 @@ class ReleaseBackupTests(unittest.TestCase):
                 "runtime.env": "YINGDAO_ACCESS_KEY_SECRET=real-secret\n",
                 "camel.env": "credentialBlob=real-blob\n",
                 "uppercase.env": "FEISHUWEBHOOKURL=https://example.test/hook/real\n",
+                "angle-bracket.yaml": "Authorization: Bearer <real-token>\n",
+                "angle-suffix.yaml": "Authorization: <real-token>-suffix\n",
+                "example-prefix.yaml": "Authorization: EXAMPLE_real-token\n",
+                "replace-suffix.yaml": "Authorization: REPLACE_ME_real-token\n",
+                "your-suffix.yaml": "Authorization: YOUR_VALUE_real-token\n",
                 "runtime.ps1": '$env:FEISHU_WEBHOOK_URL = "https://example.test/hook/real"\n',
                 "camel.ps1": '$webhookUrl = "https://example.test/hook/real"\n',
                 "powershell-map.ps1": '$config = @{\n  authorizationHeader = "Bearer real-token"\n}\n',
@@ -225,10 +230,23 @@ class ReleaseBackupTests(unittest.TestCase):
             safe.write_text(
                 '{"queue_dir": "D:\\\\PRA_Runtime\\\\queue", '
                 '"login_password_selector": "登录页_密码输入框", '
-                '"YINGDAO_ACCESS_KEY_SECRET": ""}\n',
+                '"YINGDAO_ACCESS_KEY_SECRET": "", '
+                '"Authorization": "<runtime-only>"}\n',
                 encoding="utf-8",
             )
             validate_nonsecret_config(safe)
+
+            self.assertTrue(release_backup._is_placeholder(" CHANGE_ME "))
+            self.assertTrue(release_backup._is_placeholder("<runtime-only>"))
+            for value in (
+                "Bearer <runtime-only>",
+                "EXAMPLE_real-token",
+                "REPLACE_ME_real-token",
+                "YOUR_VALUE_real-token",
+                "<one><two>",
+            ):
+                with self.subTest(placeholder_value=value):
+                    self.assertFalse(release_backup._is_placeholder(value))
 
             unknown = root / "config.txt"
             unknown.write_text("Authorization=real-secret\n", encoding="utf-8")
