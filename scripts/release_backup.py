@@ -9,6 +9,7 @@ just duplicating its main file.
 from __future__ import annotations
 
 import argparse
+import configparser
 from contextlib import closing
 import hashlib
 import json
@@ -21,7 +22,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, NoReturn, Sequence
 from uuid import uuid4
 
 
@@ -76,10 +77,14 @@ LOGICAL_TABLES = (
 )
 
 SECRET_CONFIG_NAME_RE = re.compile(r"(?:^|[._-])(env|secret|password|passwd)(?:$|[._-])", re.I)
-SECRET_ASSIGNMENT_RE = re.compile(
-    r"(?im)(?:['\"]?)(?P<key>[A-Za-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|"
-    r"access[_-]?key|credential[_-]?blob|credentialblob)[A-Za-z0-9_.-]*)['\"]?"
-    r"(?:\s*[:=])\s*['\"](?P<value>[^'\"]+)['\"]"
+SENSITIVE_CONFIG_KEY_RE = re.compile(
+    r"(?:^|[_\-.])(webhook|authorization|token|secret|password|passwd|credential|"
+    r"api[_-]?key|access[_-]?key)(?:$|[_\-.])",
+    re.I,
+)
+CONFIG_ASSIGNMENT_RE = re.compile(
+    r"^\s*(?:export\s+)?(?:\$env:)?['\"]?(?P<key>[A-Za-z0-9_.-]+)['\"]?"
+    r"\s*(?:=|:)\s*(?P<value>.*?)\s*(?:#.*)?$"
 )
 PLACEHOLDER_VALUES = frozenset(
     {
@@ -89,8 +94,12 @@ PLACEHOLDER_VALUES = frozenset(
         "PLACEHOLDER",
         "REDACTED",
         "REPLACE_ME",
+        "REPLACE-ME",
+        "YOUR_VALUE",
+        "YOUR-VALUE",
     }
 )
+TRANSACTION_FILE_GLOB = ".pra-*.transaction.json"
 
 
 def _utc_now() -> str:
@@ -242,23 +251,112 @@ def _is_placeholder(value: str) -> bool:
         or upper in PLACEHOLDER_VALUES
         or ("<" in normalized and ">" in normalized)
         or upper.startswith("EXAMPLE_")
+        or upper.startswith("REPLACE-")
+        or upper.startswith("REPLACE_")
+        or upper.startswith("YOUR-")
+        or upper.startswith("YOUR_")
     )
 
 
 def _is_sensitive_config_key(key: str) -> bool:
     normalized = key.strip().lower().replace("-", "_")
-    if normalized.endswith(("_selector", "_field", "_name", "_url", "_path", "_dir", "_param", "_type")):
+    if normalized.endswith(("_selector", "_field", "_name", "_param", "_type")):
         return False
-    return bool(
-        re.search(
-            r"(?:^|_)(?:password|passwd|secret|token|api_key|access_key|credential_blob|credentialblob)(?:_|$)",
-            normalized,
-        )
+    return bool(SENSITIVE_CONFIG_KEY_RE.search(normalized))
+
+
+def _config_value_is_placeholder(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return _is_placeholder(value)
+    if isinstance(value, (list, tuple)):
+        return not value or all(_config_value_is_placeholder(item) for item in value)
+    return False
+
+
+def _raise_sensitive_config(key: str) -> NoReturn:
+    raise ReleaseBackupError(
+        f"configuration contains a non-placeholder secret value for {key}"
+    )
+
+
+def _scan_structured_config(value: Any, *, path: str = "config") -> None:
+    if isinstance(value, dict):
+        for raw_key, child in value.items():
+            key = str(raw_key)
+            child_path = f"{path}.{key}"
+            if _is_sensitive_config_key(key):
+                if not _config_value_is_placeholder(child):
+                    _raise_sensitive_config(child_path)
+                continue
+            _scan_structured_config(child, path=child_path)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _scan_structured_config(child, path=f"{path}[{index}]")
+
+
+def _strip_assignment_value(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value
+
+
+def _scan_line_config(text: str) -> None:
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", ";", "//")):
+            continue
+        match = CONFIG_ASSIGNMENT_RE.match(line)
+        if not match:
+            continue
+        key = match.group("key")
+        if _is_sensitive_config_key(key):
+            value = _strip_assignment_value(match.group("value"))
+            if not _is_placeholder(value):
+                _raise_sensitive_config(key)
+
+
+def _scan_ini_config(text: str, path: Path) -> None:
+    parser = configparser.ConfigParser()
+    try:
+        parser.read_string(text)
+    except configparser.Error as exc:
+        raise ReleaseBackupError(f"configuration INI is invalid: {path.name}") from exc
+    for section in parser.sections():
+        for key, value in parser.items(section):
+            if _is_sensitive_config_key(key) and not _is_placeholder(value):
+                _raise_sensitive_config(f"{section}.{key}")
+
+
+def _scan_config_text(path: Path, text: str) -> None:
+    suffix = path.suffix.lower()
+    if suffix == ".json":
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise ReleaseBackupError(f"configuration JSON is invalid: {path.name}") from exc
+        _scan_structured_config(payload)
+        return
+    if suffix in {".ini", ".cfg"}:
+        _scan_ini_config(text, path)
+        return
+    if suffix in {".yaml", ".yml", ".env", ".conf", ".ps1"}:
+        _scan_line_config(text)
+        return
+    raise ReleaseBackupError(
+        f"configuration format is not allowlisted; use JSON, YAML, INI, ENV, CONF, or PS1: {path.name}"
     )
 
 
 def validate_nonsecret_config(path: Path) -> None:
-    """Reject obvious secret-bearing configuration before it enters a backup."""
+    """Reject secret-bearing configuration before it enters a backup.
+
+    JSON is scanned structurally; line-oriented formats support quoted and
+    unquoted assignments. Unknown formats are rejected by default so a new
+    configuration syntax cannot silently bypass the allowlist.
+    """
 
     if SECRET_CONFIG_NAME_RE.search(path.name):
         raise ReleaseBackupError(f"secret-like configuration filename is not allowed: {path.name}")
@@ -266,14 +364,7 @@ def validate_nonsecret_config(path: Path) -> None:
         text = path.read_text(encoding="utf-8-sig")
     except UnicodeDecodeError as exc:
         raise ReleaseBackupError(f"configuration must be UTF-8 text: {path.name}") from exc
-    for match in SECRET_ASSIGNMENT_RE.finditer(text):
-        if not _is_sensitive_config_key(match.group("key")):
-            continue
-        value = match.group("value")
-        if not _is_placeholder(value):
-            raise ReleaseBackupError(
-                f"configuration contains a non-placeholder secret value for {match.group('key')}"
-            )
+    _scan_config_text(path, text)
 
 
 def _destination_name(raw: str, source: Path) -> str:
@@ -417,6 +508,7 @@ def migrate_runtime_database(
     output.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.migrate-", dir=output.parent))
     staged_database = staging / output.name
+    transaction_stage: Path | None = None
     try:
         _backup_sqlite(source, staged_database)
         SQLiteRuntimeRepository(staged_database).init_schema()
@@ -435,12 +527,24 @@ def migrate_runtime_database(
         if len(preserved_tables) != sum(count is not None for count in source_counts.values()):
             raise ReleaseBackupError("migration changed a pre-existing logical table row count")
 
-        if force:
-            for sidecar in (Path(str(output) + "-wal"), Path(str(output) + "-shm")):
-                if sidecar.exists():
-                    sidecar.unlink()
-        os.replace(staged_database, output)
-        _fsync_directory(output.parent)
+        transaction_stage = output.parent / f".{output.name}.pra-{uuid4().hex}.stage"
+        shutil.copy2(staged_database, transaction_stage)
+        _fsync_file(transaction_stage)
+        _apply_file_transaction(
+            target_runtime=output,
+            staged_files=[
+                {
+                    "staging": transaction_stage,
+                    "target": output,
+                    "role": "runtime_database",
+                    "sha256": sha256_file(transaction_stage),
+                }
+            ],
+            expected_runtime_snapshot=target_snapshot,
+            force=force,
+            operation="migrate",
+            transaction_id=uuid4().hex,
+        )
         return {
             "source_db": str(source),
             "output_db": str(output),
@@ -455,6 +559,8 @@ def migrate_runtime_database(
             "migration target is locked; stop PRA services and close database consumers before retrying"
         ) from exc
     finally:
+        if transaction_stage is not None and _path_exists(transaction_stage):
+            _remove_path(transaction_stage)
         if staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
 
@@ -464,6 +570,30 @@ def _file_records_from_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]
     if not isinstance(records, list) or not records:
         raise ReleaseBackupError("backup manifest has no file records")
     return records
+
+
+def _release_artifact_record(
+    manifest: dict[str, Any], records: Sequence[dict[str, Any]]
+) -> dict[str, Any]:
+    artifact_records = [record for record in records if record.get("role") == "release_artifact"]
+    if len(artifact_records) != 1:
+        raise ReleaseBackupError("backup manifest must contain exactly one release wheel artifact")
+    release_manifest = manifest.get("release_manifest")
+    wheel = release_manifest.get("wheel") if isinstance(release_manifest, dict) else None
+    if not isinstance(wheel, dict):
+        raise ReleaseBackupError("release manifest has no wheel metadata")
+    record = artifact_records[0]
+    expected_path = f"artifacts/{wheel.get('file_name')}"
+    if record.get("path") != expected_path:
+        raise ReleaseBackupError("release wheel artifact path does not match release manifest")
+    try:
+        record_size = int(record.get("size_bytes", -1))
+        wheel_size = int(wheel.get("size_bytes", -1))
+    except (TypeError, ValueError) as exc:
+        raise ReleaseBackupError("release wheel artifact metadata is invalid") from exc
+    if record.get("sha256") != wheel.get("sha256") or record_size != wheel_size:
+        raise ReleaseBackupError("release wheel artifact does not match release manifest")
+    return record
 
 
 def _safe_backup_path(root: Path, relative_path: str) -> Path:
@@ -527,6 +657,7 @@ def verify_backup(backup_path: Path) -> dict[str, Any]:
         checksum_entries[relative_path] = digest
 
     records = _file_records_from_manifest(manifest)
+    artifact_record = _release_artifact_record(manifest, records)
     record_paths = {str(record.get("path")) for record in records}
     expected_paths = record_paths | {"manifest.json"}
     if set(checksum_entries) != expected_paths:
@@ -544,6 +675,9 @@ def verify_backup(backup_path: Path) -> dict[str, Any]:
             raise ReleaseBackupError(f"size mismatch: {relative_path}")
         if str(record.get("sha256")) != sha256_file(path):
             raise ReleaseBackupError(f"manifest hash mismatch: {relative_path}")
+    artifact_path = _safe_backup_path(root, str(artifact_record["path"]))
+    if not artifact_path.is_file() or artifact_path.suffix.lower() != ".whl":
+        raise ReleaseBackupError("backup release artifact is not a wheel file")
 
     database_path = _safe_backup_path(root, "runtime/pra_runtime.sqlite3")
     database_snapshot = _database_snapshot(database_path)
@@ -575,6 +709,7 @@ def create_backup(
     """Create and atomically publish a fully verified backup directory."""
 
     runtime_source = _require_file(runtime_db, "runtime database")
+    wheel_source = _require_file(wheel_path, "wheel")
     source_snapshot = _database_snapshot(runtime_source)
     if not source_snapshot["ok"]:
         summary = source_snapshot["schema_health"].get("summary", "unknown health failure")
@@ -630,8 +765,17 @@ def create_backup(
 
         release_manifest = build_release_manifest(
             git_root=git_root,
-            wheel_path=wheel_path,
+            wheel_path=wheel_source,
             config_names=config_names,
+        )
+        wheel_name = str(release_manifest["wheel"]["file_name"])
+        files.append(
+            _copy_file_record(
+                wheel_source,
+                temporary_dir / "artifacts" / wheel_name,
+                role="release_artifact",
+                relative_path=f"artifacts/{wheel_name}",
+            )
         )
         release_manifest_path = temporary_dir / "release-manifest.json"
         _atomic_write_json(release_manifest_path, release_manifest)
@@ -686,15 +830,346 @@ def _assert_not_inside(path: Path, root: Path, label: str) -> None:
     raise ReleaseBackupError(f"{label} must not be inside the backup being restored")
 
 
+def _fsync_file(path: Path) -> None:
+    try:
+        with path.open("rb") as handle:
+            os.fsync(handle.fileno())
+    except OSError:
+        pass
+
+
+def _path_exists(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def _remove_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif _path_exists(path):
+        path.unlink()
+
+
+def _assert_sqlite_exclusive(path: Path) -> None:
+    """Prove that the runtime DB can acquire an exclusive write lock."""
+
+    try:
+        connection = sqlite3.connect(str(path), timeout=1)
+        try:
+            connection.execute("PRAGMA busy_timeout = 1000")
+            connection.execute("BEGIN EXCLUSIVE")
+            connection.execute("ROLLBACK")
+        finally:
+            connection.close()
+    except sqlite3.OperationalError as exc:
+        raise ReleaseBackupError(
+            "runtime database is locked; stop PRA services and close database consumers before restore"
+        ) from exc
+    except sqlite3.Error as exc:
+        raise ReleaseBackupError("runtime database cannot be opened exclusively") from exc
+
+
+def _assert_target_file_ready(path: Path, label: str) -> None:
+    if path.is_dir():
+        raise ReleaseBackupError(f"{label} is a directory, expected a file: {path}")
+    if not _path_exists(path):
+        return
+    try:
+        with path.open("r+b"):
+            pass
+    except PermissionError as exc:
+        raise ReleaseBackupError(
+            f"{label} is locked or read-only; close Excel and other consumers before restore: {path}"
+        ) from exc
+    except OSError as exc:
+        raise ReleaseBackupError(f"{label} cannot be opened for replacement: {path}") from exc
+
+
+def _transaction_log_path(parent: Path, transaction_id: str) -> Path:
+    return parent / f".pra-{transaction_id}.transaction.json"
+
+
+def _write_transaction(path: Path, transaction: dict[str, Any]) -> None:
+    _atomic_write_json(path, transaction)
+
+
+def _cleanup_transaction(transaction_path: Path, transaction: dict[str, Any]) -> None:
+    paths: list[Path] = []
+    for entry in transaction.get("entries", []):
+        if not isinstance(entry, dict):
+            continue
+        for field in ("staging", "reserved"):
+            value = entry.get(field)
+            if value:
+                paths.append(Path(str(value)))
+    snapshot = transaction.get("pre_rollback_snapshot")
+    if snapshot:
+        paths.append(Path(str(snapshot)))
+    for path in paths:
+        try:
+            _remove_path(path)
+        except OSError:
+            pass
+    for value in transaction.get("reserve_dirs", []):
+        reserve_dir = Path(str(value))
+        try:
+            if reserve_dir.is_dir() and not any(reserve_dir.iterdir()):
+                reserve_dir.rmdir()
+        except OSError:
+            pass
+    try:
+        if transaction_path.exists():
+            transaction_path.unlink()
+    except OSError:
+        pass
+
+
+def _rollback_transaction(transaction_path: Path, transaction: dict[str, Any]) -> None:
+    transaction["status"] = "rolling_back"
+    _write_transaction(transaction_path, transaction)
+    transaction_id = str(transaction.get("transaction_id", uuid4().hex))
+    for entry in reversed(transaction.get("entries", [])):
+        if not isinstance(entry, dict):
+            continue
+        target = Path(str(entry["target"]))
+        reserved_value = entry.get("reserved")
+        reserved = Path(str(reserved_value)) if reserved_value else None
+        original_exists = bool(entry.get("original_exists"))
+        try:
+            if reserved is not None and _path_exists(reserved):
+                displaced = target.parent / f".{target.name}.pra-{transaction_id}.recovery"
+                if _path_exists(displaced):
+                    _remove_path(displaced)
+                if _path_exists(target):
+                    os.replace(target, displaced)
+                os.replace(reserved, target)
+                if _path_exists(displaced):
+                    _remove_path(displaced)
+            elif not original_exists and _path_exists(target):
+                _remove_path(target)
+            elif original_exists and not _path_exists(target):
+                raise ReleaseBackupError(f"rollback could not find original target: {target}")
+            entry["state"] = "restored"
+            _write_transaction(transaction_path, transaction)
+        except (OSError, ReleaseBackupError) as exc:
+            transaction["status"] = "rollback_failed"
+            transaction["error"] = str(exc)
+            _write_transaction(transaction_path, transaction)
+            raise ReleaseBackupError(
+                f"automatic restore rollback failed; transaction log retained: {transaction_path}"
+            ) from exc
+    transaction["status"] = "rolled_back"
+    _write_transaction(transaction_path, transaction)
+    _cleanup_transaction(transaction_path, transaction)
+
+
+def _recover_pending_transactions(parent: Path) -> None:
+    for transaction_path in sorted(parent.glob(TRANSACTION_FILE_GLOB)):
+        transaction = _read_json(transaction_path)
+        status = str(transaction.get("status", ""))
+        if status == "committed":
+            _cleanup_transaction(transaction_path, transaction)
+            continue
+        _rollback_transaction(transaction_path, transaction)
+
+
+def _prepare_rollback_snapshot(
+    *, target_runtime: Path, reserve_dir: Path | None
+) -> tuple[dict[str, Any] | None, Path | None]:
+    if not _path_exists(target_runtime):
+        return None, None
+    _assert_sqlite_exclusive(target_runtime)
+    current_snapshot = _database_snapshot(target_runtime)
+    if not current_snapshot["ok"]:
+        raise ReleaseBackupError(
+            "current runtime database failed health validation; rollback aborted before replacement"
+        )
+    if reserve_dir is None:
+        raise ReleaseBackupError("rollback reserve directory is unavailable")
+    snapshot_path = reserve_dir / "pre-rollback.sqlite3"
+    _backup_sqlite(target_runtime, snapshot_path)
+    snapshot = _database_snapshot(snapshot_path)
+    if (
+        not snapshot["ok"]
+        or snapshot["logical_table_counts"] != current_snapshot["logical_table_counts"]
+    ):
+        raise ReleaseBackupError("pre-rollback snapshot failed validation")
+    return current_snapshot, snapshot_path
+
+
+def _preflight_targets(
+    *,
+    targets: Sequence[tuple[Path, Path, str]],
+    force: bool,
+) -> None:
+    seen_targets: set[Path] = set()
+    for source, target, role in targets:
+        if not source.is_file():
+            raise ReleaseBackupError(f"staged restore source does not exist: {source}")
+        target = target.resolve()
+        if target in seen_targets:
+            raise ReleaseBackupError(f"restore target is listed more than once: {target}")
+        seen_targets.add(target)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists() and not force:
+            raise ReleaseBackupError(f"{role} target exists; pass --force to replace it: {target}")
+        if target.exists():
+            _assert_target_file_ready(target, f"{role} target")
+        try:
+            usage = shutil.disk_usage(target.parent)
+        except OSError as exc:
+            raise ReleaseBackupError(f"cannot inspect free space for restore target: {target.parent}") from exc
+        required = max(1024 * 1024, source.stat().st_size)
+        if usage.free < required:
+            raise ReleaseBackupError(f"insufficient free space for restore target: {target}")
+
+
+def _stage_source_file(source: Path, target: Path, transaction_id: str) -> Path:
+    staged = target.parent / f".{target.name}.pra-{transaction_id}.stage"
+    if _path_exists(staged):
+        raise ReleaseBackupError(f"restore staging path already exists: {staged}")
+    try:
+        shutil.copy2(source, staged)
+        _fsync_file(staged)
+    except PermissionError as exc:
+        raise ReleaseBackupError(
+            f"cannot stage restore file; target directory may be locked: {target.parent}"
+        ) from exc
+    return staged
+
+
+def _apply_file_transaction(
+    *,
+    target_runtime: Path,
+    staged_files: Sequence[dict[str, Any]],
+    expected_runtime_snapshot: dict[str, Any],
+    force: bool,
+    operation: str,
+    transaction_id: str,
+) -> dict[str, Any]:
+    target_runtime = target_runtime.resolve()
+    target_runtime.parent.mkdir(parents=True, exist_ok=True)
+    _recover_pending_transactions(target_runtime.parent)
+
+    targets = [
+        (Path(str(item["staging"])), Path(str(item["target"])).resolve(), str(item["role"]))
+        for item in staged_files
+    ]
+    sidecar_targets: list[tuple[Path, Path, str]] = []
+    for sidecar in (Path(str(target_runtime) + "-wal"), Path(str(target_runtime) + "-shm")):
+        if sidecar.exists() and not target_runtime.exists():
+            raise ReleaseBackupError(f"runtime sidecar exists without a database: {sidecar}")
+        if sidecar.exists():
+            sidecar_targets.append((sidecar, sidecar, "runtime_sidecar"))
+    all_targets = targets + sidecar_targets
+    _preflight_targets(targets=all_targets, force=force)
+
+    reserve_dirs: dict[Path, Path] = {}
+    pre_snapshot: Path | None = None
+    try:
+        for _, target, _ in all_targets:
+            reserve_dir = reserve_dirs.setdefault(
+                target.parent,
+                target.parent / f".pra-{transaction_id}-reserve",
+            )
+            reserve_dir.mkdir(parents=True, exist_ok=True)
+        runtime_reserve_dir = reserve_dirs[target_runtime.parent]
+        current_snapshot, pre_snapshot = _prepare_rollback_snapshot(
+            target_runtime=target_runtime,
+            reserve_dir=runtime_reserve_dir,
+        )
+    except Exception:
+        for reserve_dir in reserve_dirs.values():
+            shutil.rmtree(reserve_dir, ignore_errors=True)
+        raise
+
+    entries: list[dict[str, Any]] = []
+    staged_by_target = {
+        Path(str(item["target"])).resolve(): item
+        for item in staged_files
+    }
+    for _, target, role in all_targets:
+        item = staged_by_target.get(target)
+        entries.append(
+            {
+                "target": str(target),
+                "staging": str(item["staging"]) if item is not None else None,
+                "reserved": str(reserve_dirs[target.parent] / target.name),
+                "original_exists": _path_exists(target),
+                "role": role,
+                "state": "prepared",
+            }
+        )
+    transaction = {
+        "transaction_version": 1,
+        "transaction_id": transaction_id,
+        "operation": operation,
+        "status": "prepared",
+        "target_runtime": str(target_runtime),
+        "pre_rollback_snapshot": str(pre_snapshot) if pre_snapshot is not None else None,
+        "reserve_dirs": [str(path) for path in reserve_dirs.values()],
+        "entries": entries,
+        "created_at_utc": _utc_now(),
+    }
+    transaction_path = _transaction_log_path(target_runtime.parent, transaction_id)
+    _write_transaction(transaction_path, transaction)
+    try:
+        transaction["status"] = "committing"
+        _write_transaction(transaction_path, transaction)
+        for entry in entries:
+            target = Path(entry["target"])
+            reserved = Path(entry["reserved"])
+            if _path_exists(target):
+                os.replace(target, reserved)
+                entry["state"] = "reserved"
+                _write_transaction(transaction_path, transaction)
+        for entry in entries:
+            staging = entry.get("staging")
+            if not staging:
+                continue
+            os.replace(Path(str(staging)), Path(entry["target"]))
+            entry["state"] = "replaced"
+            _write_transaction(transaction_path, transaction)
+
+        restored_snapshot = _database_snapshot(target_runtime)
+        if (
+            not restored_snapshot["ok"]
+            or restored_snapshot["logical_table_counts"]
+            != expected_runtime_snapshot["logical_table_counts"]
+        ):
+            raise ReleaseBackupError("restored runtime database failed final health validation")
+        for item in staged_files:
+            target = Path(str(item["target"])).resolve()
+            if sha256_file(target) != str(item["sha256"]):
+                raise ReleaseBackupError(f"restored file hash mismatch: {target}")
+
+        transaction["status"] = "committed"
+        _write_transaction(transaction_path, transaction)
+        restored_files = [str(Path(str(item["target"])).resolve()) for item in staged_files]
+        _cleanup_transaction(transaction_path, transaction)
+        _fsync_directory(target_runtime.parent)
+        return {
+            "runtime_snapshot": restored_snapshot,
+            "current_snapshot": current_snapshot,
+            "restored_files": restored_files,
+        }
+    except Exception as exc:
+        try:
+            _rollback_transaction(transaction_path, transaction)
+        except ReleaseBackupError as rollback_exc:
+            raise rollback_exc from exc
+        raise
+
+
 def restore_backup(
     *,
     backup_path: Path,
     runtime_db: Path,
     input_dir: Path | None = None,
     config_dir: Path | None = None,
+    artifact_dir: Path | None = None,
     force: bool = False,
 ) -> dict[str, Any]:
-    """Restore a verified backup; existing targets require explicit force."""
+    """Restore a verified backup through a recoverable multi-file transaction."""
 
     backup_root = _require_directory(backup_path, "backup")
     manifest = verify_backup(backup_root)
@@ -702,42 +1177,62 @@ def restore_backup(
     _assert_not_inside(target_runtime, backup_root, "runtime database target")
     target_inputs = input_dir.expanduser().resolve() if input_dir is not None else None
     target_config = config_dir.expanduser().resolve() if config_dir is not None else None
-    for target, label in ((target_inputs, "input target"), (target_config, "config target")):
+    target_artifacts = artifact_dir.expanduser().resolve() if artifact_dir is not None else None
+    for target, label in (
+        (target_inputs, "input target"),
+        (target_config, "config target"),
+        (target_artifacts, "artifact target"),
+    ):
         if target is not None:
             _assert_not_inside(target, backup_root, label)
 
     records = _file_records_from_manifest(manifest)
+    runtime_records = [record for record in records if record.get("role") == "runtime_database"]
+    if len(runtime_records) != 1:
+        raise ReleaseBackupError("backup manifest must contain exactly one runtime database")
     input_records = [record for record in records if record.get("role") == "business_input"]
     config_records = [record for record in records if record.get("role") == "operations_config"]
-    targets: list[tuple[Path, Path, str]] = []
-    if target_runtime.exists() and not force:
-        raise ReleaseBackupError(f"runtime target exists; pass --force to replace it: {target_runtime}")
-    for sidecar in (
-        Path(str(target_runtime) + "-wal"),
-        Path(str(target_runtime) + "-shm"),
-    ):
-        if sidecar.exists() and not force:
-            raise ReleaseBackupError(f"runtime sidecar exists; stop the service or pass --force: {sidecar}")
+    artifact_records = [record for record in records if record.get("role") == "release_artifact"]
+    if target_artifacts is not None and not artifact_records:
+        raise ReleaseBackupError("backup has no release artifact to restore")
+    targets: list[tuple[Path, Path, str]] = [
+        (
+            _safe_backup_path(backup_root, str(runtime_records[0]["path"])),
+            target_runtime,
+            "runtime database",
+        )
+    ]
     if target_inputs is not None:
         for record in input_records:
             source = _safe_backup_path(backup_root, str(record["path"]))
             target = target_inputs / Path(str(record["path"])).name
-            if target.exists() and not force:
-                raise ReleaseBackupError(f"input target exists; pass --force to replace it: {target}")
             targets.append((source, target, "input"))
     if target_config is not None:
         for record in config_records:
             source = _safe_backup_path(backup_root, str(record["path"]))
             target = target_config / Path(str(record["path"])).name
-            if target.exists() and not force:
-                raise ReleaseBackupError(f"config target exists; pass --force to replace it: {target}")
             targets.append((source, target, "config"))
+    if target_artifacts is not None:
+        for record in artifact_records:
+            source = _safe_backup_path(backup_root, str(record["path"]))
+            target = target_artifacts / Path(str(record["path"])).name
+            targets.append((source, target, "release artifact"))
 
-    target_runtime.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(prefix=".pra-restore-", dir=target_runtime.parent))
+    transaction_id = uuid4().hex
+    staged_files: list[dict[str, Any]] = []
     try:
-        staged_runtime = staging / target_runtime.name
-        shutil.copy2(_safe_backup_path(backup_root, "runtime/pra_runtime.sqlite3"), staged_runtime)
+        _preflight_targets(targets=targets, force=force)
+        for source, target, role in targets:
+            staged = _stage_source_file(source, target, transaction_id)
+            staged_files.append(
+                {
+                    "staging": staged,
+                    "target": target,
+                    "role": role,
+                    "sha256": sha256_file(source),
+                }
+            )
+        staged_runtime = Path(str(staged_files[0]["staging"]))
         staged_snapshot = _database_snapshot(staged_runtime)
         expected_snapshot = manifest["database_validation"]["backup_snapshot"]
         if (
@@ -745,42 +1240,33 @@ def restore_backup(
             or staged_snapshot["logical_table_counts"] != expected_snapshot["logical_table_counts"]
         ):
             raise ReleaseBackupError("staged restore database failed validation")
-
-        staged_targets: list[tuple[Path, Path, str]] = []
-        for index, (source, target, role) in enumerate(targets):
-            staged_file = staging / f"file-{index}-{target.name}"
-            staged_file.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, staged_file)
-            staged_targets.append((staged_file, target, role))
-
-        if force:
-            for sidecar in (
-                Path(str(target_runtime) + "-wal"),
-                Path(str(target_runtime) + "-shm"),
-            ):
-                if sidecar.exists():
-                    sidecar.unlink()
-        os.replace(staged_runtime, target_runtime)
-        restored_files = [str(target_runtime)]
-        for staged_file, target, role in staged_targets:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(staged_file, target)
-            restored_files.append(str(target))
-        _fsync_directory(target_runtime.parent)
+        result = _apply_file_transaction(
+            target_runtime=target_runtime,
+            staged_files=staged_files,
+            expected_runtime_snapshot=expected_snapshot,
+            force=force,
+            operation="restore" if not force else "rollback",
+            transaction_id=transaction_id,
+        )
         return {
             "backup_id": manifest["backup_id"],
             "runtime_db": str(target_runtime),
-            "restored_files": restored_files,
+            "restored_files": result["restored_files"],
             "force": force,
-            "database_validation": staged_snapshot,
+            "database_validation": result["runtime_snapshot"],
         }
     except PermissionError as exc:
         raise ReleaseBackupError(
             "restore target is locked; stop PRA services and close Excel before retrying"
         ) from exc
-    finally:
-        if staging.exists():
-            shutil.rmtree(staging, ignore_errors=True)
+    except Exception:
+        transaction_path = _transaction_log_path(target_runtime.parent, transaction_id)
+        if not transaction_path.exists():
+            for item in staged_files:
+                staged = Path(str(item["staging"]))
+                if _path_exists(staged):
+                    _remove_path(staged)
+        raise
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -823,6 +1309,7 @@ def _build_parser() -> argparse.ArgumentParser:
         restore_parser.add_argument("--runtime-db", required=True, type=Path)
         restore_parser.add_argument("--input-dir", type=Path)
         restore_parser.add_argument("--config-dir", type=Path)
+        restore_parser.add_argument("--artifact-dir", type=Path)
         if command == "restore":
             restore_parser.add_argument("--force", action="store_true")
 
@@ -872,6 +1359,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 runtime_db=args.runtime_db,
                 input_dir=args.input_dir,
                 config_dir=args.config_dir,
+                artifact_dir=args.artifact_dir,
                 force=args.force,
             )
             print(json.dumps(result, ensure_ascii=False, sort_keys=True))
@@ -882,6 +1370,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 runtime_db=args.runtime_db,
                 input_dir=args.input_dir,
                 config_dir=args.config_dir,
+                artifact_dir=args.artifact_dir,
                 force=True,
             )
             print(json.dumps({**result, "operation": "rollback"}, ensure_ascii=False, sort_keys=True))

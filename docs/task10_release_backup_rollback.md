@@ -5,11 +5,11 @@
 ## 交付内容
 
 - `scripts/release_backup.py manifest` 生成不含秘密值的发布清单，记录 Git commit、wheel SHA-256、Runtime Schema 版本和配置项名称。
-- `scripts/release_backup.py backup` 使用 SQLite backup API 复制运行态数据库；Excel 输入和运维配置按角色复制到备份目录。
+- `scripts/release_backup.py backup` 使用 SQLite backup API 复制运行态数据库；Excel 输入、运维配置和实际 wheel 发行物按角色复制到备份目录。
 - 备份先写入唯一临时目录，完成 SHA-256、SQLite integrity check、Schema health、外键和关键表行数校验后，再一次性改名发布；`latest.json` 只在验证成功后更新。
-- `scripts/release_backup.py verify` 可独立回读 `manifest.json`、`release-manifest.json`、`SHA256SUMS.txt` 和数据库健康结果。
+- `scripts/release_backup.py verify` 可独立回读 `manifest.json`、`release-manifest.json`、`SHA256SUMS.txt`、实际 wheel 和数据库健康结果。
 - `scripts/release_backup.py migrate` 将旧 v5 运行库复制到新路径，在副本上升级到 v6 并校验；原库保持不变。
-- `restore` 默认拒绝覆盖已有目标；`rollback` 是显式覆盖操作，二者都会先验证完整备份，再把数据库暂存、校验后替换。
+- `restore` 默认拒绝覆盖已有目标；`rollback` 是显式覆盖操作。二者都会先验证完整备份、检查目标锁定状态和磁盘空间，再以跨目录事务暂存、保留旧文件、校验后替换；失败时按逆序补偿，未完成事务会在下一次操作前自动恢复。
 
 关键逻辑表至少包含 Outbox、Review、ShadowBot operation/attempt 和 execution log；备份清单同时记录这些表的行数，恢复后必须一致。清单只保存配置项名称，不保存任何环境变量值、token、密码或 webhook 内容。
 
@@ -60,7 +60,8 @@ python scripts/release_backup.py restore `
   --backup backups/<backup-id> `
   --runtime-db data/runtime/restore/pra_runtime.sqlite3 `
   --input-dir data/runtime/restore/inputs `
-  --config-dir data/runtime/restore/config
+  --config-dir data/runtime/restore/config `
+  --artifact-dir data/runtime/restore/artifacts
 ```
 
 回滚前先停止服务、确认目标备份的 Git commit 和 wheel SHA-256，再执行显式回滚：
@@ -70,26 +71,30 @@ python scripts/release_backup.py rollback `
   --backup backups/<previous-backup-id> `
   --runtime-db data/runtime/pra_runtime.sqlite3 `
   --input-dir data/production/inputs `
-  --config-dir data/production/config
+  --config-dir data/production/config `
+  --artifact-dir data/production/artifacts
 python scripts/release_backup.py verify --backup backups/<previous-backup-id>
 pra-mvp health --runtime-db data/runtime/pra_runtime.sqlite3
 python scripts/run_system_smoke_tests.py --temporary-db
 ```
 
-`rollback` 只恢复已验证的文件和数据库，不自动切换 Git 分支、不自动安装 wheel，也不自动启动服务；完成 health/smoke 后再按当前部署手册启动。若 Windows 报文件被占用，先关闭 PRA、ShadowBot 和 Excel，再重试。
+`rollback` 会在同一文件系统的事务保留区中保存主数据库、WAL/SHM、Excel、配置和 wheel 的旧版本，并写入事务日志；只有全部替换和最终 health 校验成功后才清理保留区。它只恢复已验证的文件和数据库，不自动切换 Git 分支、不自动安装 wheel，也不自动启动服务；完成隔离环境 wheel 安装、health/smoke 后再按当前部署手册启动。若 Windows 报文件被占用，先关闭 PRA、ShadowBot 和 Excel，再重试；下次 restore/rollback 会先处理遗留事务日志。
 
 ## 验收标准
 
 - 发布清单可回读，包含 Git commit、wheel SHA-256、Schema v6 和配置项名称，且不含秘密值。
-- 备份目录含 `manifest.json`、`release-manifest.json`、`SHA256SUMS.txt`、运行态数据库及选定输入/配置文件。
+- 备份目录含 `manifest.json`、`release-manifest.json`、`SHA256SUMS.txt`、实际 wheel、运行态数据库及选定输入/配置文件。
 - 备份中断或校验失败时，不删除、不覆盖最后一个有效备份，`latest.json` 保持原值。
-- 复制数据库通过 Schema health、SQLite integrity、外键检查和关键逻辑表行数比对。
+- 备份 wheel 与发布清单 hash/大小一致；wheel 被修改后 `verify` 必须失败。
+- 秘密扫描使用 JSON 结构化解析，并覆盖 YAML、INI、ENV、PS1 的无引号/带引号 assignment；未知格式默认拒绝，webhook、Authorization、token、secret、password、credential、api_key、access_key 非空值必须拒绝。
+- 复制数据库通过 Schema health、SQLite integrity、外键检查和关键逻辑表行数比对；回滚前另有 SQLite Backup API pre-rollback 快照。
+- 多文件恢复在各自目标父目录暂存，不跨文件系统 rename；Excel/配置/数据库任一步失败都必须逆序恢复。
 - 至少完成一次“备份 → 恢复 → health/smoke → 回滚”演练。
 
-## 本次验证记录（2026-07-18）
+## 本次验证记录（2026-07-19）
 
-- 更新后 `python -m pytest -q tests/test_release_backup.py`：4 passed，包含 v5 副本迁移与后续备份验证。
-- 完整 `python -m pytest -q tests`：429 passed、3 skipped、63 subtests passed。
+- 更新后 `python -m pytest -q tests/test_release_backup.py`：10 passed、5 subtests，包含 v5 副本迁移、事务补偿、进程中断恢复、wheel artifact 和多格式 secret scan。
+- 完整 `python -m pytest -q tests`：435 passed、3 skipped、68 subtests passed。
 - 相关回归集：37 passed、3 skipped、4 subtests passed。
 - wheel boundary、sdist boundary、secret scan：全部 PASS；隔离 wheel 安装、Runtime Schema v6 init/health：PASS。
 - 使用隔离的 v6 临时数据库完成 CLI `backup → verify → restore → rollback`：全部 PASS，SQLite integrity 为 `ok`、外键违规为 0、关键逻辑表行数一致。
