@@ -12,7 +12,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.sync_shadowbot_test2 import sync
-from scripts.verify_packaging import _scan_path, _verify_sdist, _verify_wheel, main as verify_packaging_main
+from scripts.verify_packaging import (
+    _is_placeholder,
+    _scan_path,
+    _verify_sdist,
+    _verify_wheel,
+    main as verify_packaging_main,
+)
 from scripts.verify_shadowbot_deployment import verify_shadowbot_deployment
 
 
@@ -142,6 +148,14 @@ class PackagingTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(_scan_path(root), [])
+            self.assertTrue(_is_placeholder("<runtime-only>"))
+            for value in (
+                "Bearer <runtime-only>",
+                "EXAMPLE_real-token",
+                "REPLACE_ME_real-token",
+            ):
+                with self.subTest(placeholder_value=value):
+                    self.assertFalse(_is_placeholder(value))
             unsafe = root / "result.json"
             unsafe.write_text('{"account": "alice", "password": "hunter2"}\n', encoding="utf-8")
             issues = _scan_path(root)

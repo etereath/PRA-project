@@ -48,8 +48,12 @@ PLACEHOLDER_VALUES = frozenset(
         "PLACEHOLDER",
         "REDACTED",
         "REPLACE_ME",
+        "REPLACE-ME",
+        "YOUR_VALUE",
+        "YOUR-VALUE",
     }
 )
+PLACEHOLDER_MARKER_RE = re.compile(r"<[A-Za-z0-9][A-Za-z0-9_.:-]*>")
 
 
 def _sha256(path: Path) -> str:
@@ -66,8 +70,7 @@ def _is_placeholder(value: str) -> bool:
     return (
         not normalized
         or upper in PLACEHOLDER_VALUES
-        or ("<" in normalized and ">" in normalized)
-        or upper.startswith("EXAMPLE_")
+        or bool(PLACEHOLDER_MARKER_RE.fullmatch(normalized))
     )
 
 
