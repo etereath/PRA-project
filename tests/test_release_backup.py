@@ -205,10 +205,13 @@ class ReleaseBackupTests(unittest.TestCase):
                 "runtime.ini": "[service]\napi_key = real-key\n",
                 "runtime.env": "YINGDAO_ACCESS_KEY_SECRET=real-secret\n",
                 "camel.env": "credentialBlob=real-blob\n",
+                "uppercase.env": "FEISHUWEBHOOKURL=https://example.test/hook/real\n",
                 "runtime.ps1": '$env:FEISHU_WEBHOOK_URL = "https://example.test/hook/real"\n',
                 "camel.ps1": '$webhookUrl = "https://example.test/hook/real"\n',
                 "powershell-map.ps1": '$config = @{\n  authorizationHeader = "Bearer real-token"\n}\n',
                 "malformed.env": "this is not an assignment\n",
+                "duplicate.json": '{"safe": "one", "safe": "two"}\n',
+                "duplicate.yaml": "safe: one\nsafe: two\n",
             }
             for filename, content in cases.items():
                 path = root / filename
@@ -236,6 +239,10 @@ class ReleaseBackupTests(unittest.TestCase):
                 for filename, content in {
                     "fallback-inline.yml": "headers: {Authorization: Bearer real-token}\n",
                     "fallback-nested.yaml": "service:\n  webhookUrl: https://example.test/hook/real\n",
+                    "fallback-sensitive-parent.yaml": "Authorization:\n  value: Bearer real-token\n",
+                    "fallback-webhook-parent.yaml": "webhookUrl:\n  endpoint: https://example.test/hook/real\n",
+                    "fallback-uppercase.yaml": "FEISHUWEBHOOKURL: https://example.test/hook/real\n",
+                    "fallback-duplicate.yaml": "safe: one\nsafe: two\n",
                 }.items():
                     path = root / filename
                     path.write_text(content, encoding="utf-8")

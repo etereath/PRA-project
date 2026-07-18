@@ -265,7 +265,23 @@ def _is_sensitive_config_key(key: str) -> bool:
     normalized = normalized.lower().replace("-", "_").replace(".", "_")
     if normalized.endswith(("_selector", "_field", "_name", "_param", "_type")):
         return False
-    return bool(SENSITIVE_CONFIG_KEY_RE.search(normalized))
+    if SENSITIVE_CONFIG_KEY_RE.search(normalized):
+        return True
+    compact = re.sub(r"[^a-z0-9]", "", normalized)
+    return any(
+        token in compact
+        for token in (
+            "webhook",
+            "authorization",
+            "token",
+            "secret",
+            "password",
+            "passwd",
+            "credential",
+            "apikey",
+            "accesskey",
+        )
+    )
 
 
 def _config_value_is_placeholder(value: Any) -> bool:
@@ -350,6 +366,7 @@ def _scan_yaml_fallback(text: str) -> None:
     """Conservative YAML fallback for environments without PyYAML."""
 
     parsed_any = False
+    seen_keys: set[str] = set()
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith(("#", "---", "...")):
@@ -361,16 +378,36 @@ def _scan_yaml_fallback(text: str) -> None:
             )
         )
         if not matches:
-            if re.fullmatch(r"(?:[- ]*)[A-Za-z0-9_.-]+\s*:\s*", line):
+            empty_mapping = re.fullmatch(
+                r"(?:[- ]*)(?P<key>[A-Za-z0-9_.-]+)\s*:\s*",
+                line,
+            )
+            if empty_mapping:
                 parsed_any = True
+                key = empty_mapping.group("key")
+                normalized_key = key.casefold()
+                if normalized_key in seen_keys:
+                    raise ReleaseBackupError(
+                        f"configuration YAML contains duplicate key: {key}"
+                    )
+                seen_keys.add(normalized_key)
+                if _is_sensitive_config_key(key):
+                    _raise_sensitive_config(key)
                 continue
             raise ReleaseBackupError("configuration YAML could not be parsed")
         parsed_any = True
         for match in matches:
-            if _is_sensitive_config_key(match.group("key")):
+            key = match.group("key")
+            normalized_key = key.casefold()
+            if normalized_key in seen_keys:
+                raise ReleaseBackupError(
+                    f"configuration YAML contains duplicate key: {key}"
+                )
+            seen_keys.add(normalized_key)
+            if _is_sensitive_config_key(key):
                 value = _strip_assignment_value(match.group("value"))
                 if not _is_placeholder(value):
-                    _raise_sensitive_config(match.group("key"))
+                    _raise_sensitive_config(key)
     if text.strip() and not parsed_any:
         raise ReleaseBackupError("configuration YAML could not be parsed")
 
