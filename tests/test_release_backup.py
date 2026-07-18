@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+import scripts.release_backup as release_backup
 from scripts.release_backup import (
     ROOT,
     ReleaseBackupError,
@@ -197,9 +199,15 @@ class ReleaseBackupTests(unittest.TestCase):
             cases = {
                 "webhook.json": '{"FEISHU_WEBHOOK_URL": "https://example.test/hook/real"}\n',
                 "authorization.yaml": "Authorization: Bearer real-token\n",
+                "nested.yaml": "service:\n  webhookUrl: https://example.test/hook/real\n",
+                "inline.yml": "headers: {Authorization: Bearer real-token}\n",
                 "runtime.ini": "[service]\napi_key = real-key\n",
                 "runtime.env": "YINGDAO_ACCESS_KEY_SECRET=real-secret\n",
+                "camel.env": "credentialBlob=real-blob\n",
                 "runtime.ps1": '$env:FEISHU_WEBHOOK_URL = "https://example.test/hook/real"\n',
+                "camel.ps1": '$webhookUrl = "https://example.test/hook/real"\n',
+                "powershell-map.ps1": '$config = @{\n  authorizationHeader = "Bearer real-token"\n}\n',
+                "malformed.env": "this is not an assignment\n",
             }
             for filename, content in cases.items():
                 path = root / filename
@@ -301,6 +309,117 @@ class ReleaseBackupTests(unittest.TestCase):
             self.assertEqual((old_input_dir / "products.xlsx").read_bytes(), b"old-input")
             self.assertEqual((old_config_dir / "runtime.json").read_bytes(), b'{"queue_dir": "old"}\n')
             self.assertFalse(list(target_db.parent.glob(".pra-*.transaction.json")))
+
+    def test_rollback_restores_commit_that_exists_only_in_wal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_db = self._create_runtime_db(root / "source")
+            wheel = root / "release.whl"
+            wheel.write_bytes(b"release-wheel")
+            backup = create_backup(
+                runtime_db=source_db,
+                backup_dir=root / "backups",
+                wheel_path=wheel,
+                git_root=ROOT,
+                backup_id="wal-only-fixture",
+            )
+
+            target_db = root / "target" / "pra_runtime.sqlite3"
+            SQLiteRuntimeRepository(target_db).init_schema()
+            connection = sqlite3.connect(str(target_db))
+            reader = None
+            try:
+                connection.execute("PRAGMA journal_mode = WAL")
+                connection.execute("PRAGMA wal_autocheckpoint = 0")
+                connection.execute(
+                    """
+                    INSERT INTO tasks(
+                        task_id, scope_type, scope_key, action_type, priority, task_status,
+                        created_at, updated_at
+                    ) VALUES ('wal-only-task', 'sku', 'wal-only-task', 'update_price', 1, 'pending',
+                              '2026-07-19T00:00:00Z', '2026-07-19T00:00:00Z')
+                    """
+                )
+                connection.commit()
+                reader = sqlite3.connect(str(target_db))
+                reader.execute("BEGIN")
+                reader.execute("SELECT COUNT(*) FROM tasks").fetchone()
+            finally:
+                connection.close()
+
+            wal_path = Path(str(target_db) + "-wal")
+            self.assertTrue(wal_path.is_file())
+            self.assertGreater(wal_path.stat().st_size, 0)
+            main_only = root / "main-only.sqlite3"
+            shutil.copy2(target_db, main_only)
+            main_connection = sqlite3.connect(str(main_only))
+            try:
+                self.assertEqual(
+                    main_connection.execute(
+                        "SELECT COUNT(*) FROM tasks WHERE task_id = 'wal-only-task'"
+                    ).fetchone()[0],
+                    0,
+                )
+            finally:
+                main_connection.close()
+
+            saved_wal = root / "saved-wal"
+            saved_shm = root / "saved-shm"
+            shutil.copy2(wal_path, saved_wal)
+            shutil.copy2(Path(str(target_db) + "-shm"), saved_shm)
+            reader_closed = {"value": False}
+
+            def restore_sidecars() -> None:
+                shutil.copy2(saved_wal, wal_path)
+                shutil.copy2(saved_shm, Path(str(target_db) + "-shm"))
+
+            original_snapshot = release_backup._database_snapshot
+            original_backup = release_backup._backup_sqlite
+
+            def snapshot_with_wal(path: Path) -> dict[str, object]:
+                result = original_snapshot(path)
+                if Path(path).resolve() == target_db.resolve() and not reader_closed["value"]:
+                    reader.close()
+                    reader_closed["value"] = True
+                    restore_sidecars()
+                return result
+
+            def backup_with_wal(source: Path, destination: Path) -> None:
+                original_backup(source, destination)
+                if Path(source).resolve() == target_db.resolve():
+                    restore_sidecars()
+
+            real_replace = os.replace
+
+            def fail_database_replace(source: str | os.PathLike[str], target: str | os.PathLike[str]) -> None:
+                if Path(source).suffix == ".stage" and Path(target) == target_db:
+                    raise PermissionError("injected WAL-only replacement failure")
+                real_replace(source, target)
+
+            with patch(
+                "scripts.release_backup._database_snapshot",
+                side_effect=snapshot_with_wal,
+            ), patch(
+                "scripts.release_backup._backup_sqlite",
+                side_effect=backup_with_wal,
+            ), patch("scripts.release_backup.os.replace", side_effect=fail_database_replace):
+                with self.assertRaises(ReleaseBackupError):
+                    restore_backup(backup_path=backup, runtime_db=target_db, force=True)
+
+            self.assertTrue(wal_path.is_file())
+            self.assertGreater(wal_path.stat().st_size, 0)
+            restored_connection = sqlite3.connect(str(target_db))
+            try:
+                self.assertEqual(
+                    restored_connection.execute(
+                        "SELECT COUNT(*) FROM tasks WHERE task_id = 'wal-only-task'"
+                    ).fetchone()[0],
+                    1,
+                )
+                self.assertTrue(wal_path.is_file())
+                self.assertGreater(wal_path.stat().st_size, 0)
+            finally:
+                restored_connection.close()
 
     def test_rollback_after_database_replace_failure_restores_excel_and_config(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

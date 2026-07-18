@@ -86,18 +86,19 @@ python scripts/run_system_smoke_tests.py --temporary-db
 - 备份目录含 `manifest.json`、`release-manifest.json`、`SHA256SUMS.txt`、实际 wheel、运行态数据库及选定输入/配置文件。
 - 备份中断或校验失败时，不删除、不覆盖最后一个有效备份，`latest.json` 保持原值。
 - 备份 wheel 与发布清单 hash/大小一致；wheel 被修改后 `verify` 必须失败。
-- 秘密扫描使用 JSON 结构化解析，并覆盖 YAML、INI、ENV、PS1 的无引号/带引号 assignment；未知格式默认拒绝，webhook、Authorization、token、secret、password、credential、api_key、access_key 非空值必须拒绝。
+- 秘密扫描使用 JSON/YAML 结构化解析，并覆盖嵌套/行内 YAML、INI、ENV、PS1 的无引号/带引号 assignment；驼峰键和无法解析的非空配置行均不能绕过检查。未知格式默认拒绝，webhook、Authorization、token、secret、password、credential、api_key、access_key 非空值必须拒绝。
 - 复制数据库通过 Schema health、SQLite integrity、外键检查和关键逻辑表行数比对；回滚前另有 SQLite Backup API pre-rollback 快照。
 - 多文件恢复在各自目标父目录暂存，不跨文件系统 rename；Excel/配置/数据库任一步失败都必须逆序恢复。
 - 至少完成一次“备份 → 恢复 → health/smoke → 回滚”演练。
 
 ## 本次验证记录（2026-07-19）
 
-- 更新后 `python -m pytest -q tests/test_release_backup.py`：10 passed、5 subtests，包含 v5 副本迁移、事务补偿、进程中断恢复、wheel artifact 和多格式 secret scan。
-- 完整 `python -m pytest -q tests`：435 passed、3 skipped、68 subtests passed。
+- 更新后 `python -m pytest -q tests/test_release_backup.py`：11 passed、11 subtests，包含 v5 副本迁移、事务补偿、进程中断恢复、wheel artifact、多格式 secret scan 和 WAL-only 回滚。
+- 完整 `python -m pytest -q tests`：436 passed、3 skipped、74 subtests passed。
 - 相关回归集：37 passed、3 skipped、4 subtests passed。
 - wheel boundary、sdist boundary、secret scan：全部 PASS；隔离 wheel 安装、Runtime Schema v6 init/health：PASS。
 - 使用隔离的 v6 临时数据库完成 CLI `backup → verify → restore → rollback`：全部 PASS，SQLite integrity 为 `ok`、外键违规为 0、关键逻辑表行数一致。
+- WAL 故障注入：`wal_autocheckpoint=0` 下提交行只存在于非空 `-wal`，单独复制主库看不到该行；注入替换失败后 rollback 恢复该行及原 sidecar。
 - 使用工作区现有旧 v5 数据库完成“复制迁移 → v6 health → backup → verify”演练：PASS；原 v5 库未被修改。
 - `run_system_smoke_tests.py --temporary-db`：16 项通过；Linux Core：280 passed、3 skipped、6 deselected；Windows Core fixture：PASS。
 - 工作区现有 `data/runtime/pra_runtime.sqlite3` 是旧 v5 且 `journal_mode=delete`，工具按安全策略拒绝将它作为生产备份源；完成 v6 迁移并停止占用服务后再执行生产备份。

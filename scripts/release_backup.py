@@ -83,7 +83,7 @@ SENSITIVE_CONFIG_KEY_RE = re.compile(
     re.I,
 )
 CONFIG_ASSIGNMENT_RE = re.compile(
-    r"^\s*(?:export\s+)?(?:\$env:)?['\"]?(?P<key>[A-Za-z0-9_.-]+)['\"]?"
+    r"^\s*(?:export\s+)?(?:\$env:|\$)?['\"]?(?P<key>[A-Za-z0-9_.-]+)['\"]?"
     r"\s*(?:=|:)\s*(?P<value>.*?)\s*(?:#.*)?$"
 )
 PLACEHOLDER_VALUES = frozenset(
@@ -253,13 +253,16 @@ def _is_placeholder(value: str) -> bool:
         or upper.startswith("EXAMPLE_")
         or upper.startswith("REPLACE-")
         or upper.startswith("REPLACE_")
+        or "REPLACE-ME" in upper
+        or "REPLACE_ME" in upper
         or upper.startswith("YOUR-")
         or upper.startswith("YOUR_")
     )
 
 
 def _is_sensitive_config_key(key: str) -> bool:
-    normalized = key.strip().lower().replace("-", "_")
+    normalized = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", "_", key.strip())
+    normalized = normalized.lower().replace("-", "_").replace(".", "_")
     if normalized.endswith(("_selector", "_field", "_name", "_param", "_type")):
         return False
     return bool(SENSITIVE_CONFIG_KEY_RE.search(normalized))
@@ -296,6 +299,15 @@ def _scan_structured_config(value: Any, *, path: str = "config") -> None:
             _scan_structured_config(child, path=f"{path}[{index}]")
 
 
+def _json_object_no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ReleaseBackupError(f"configuration JSON contains duplicate key: {key}")
+        result[key] = value
+    return result
+
+
 def _strip_assignment_value(value: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
@@ -303,14 +315,18 @@ def _strip_assignment_value(value: str) -> str:
     return value
 
 
-def _scan_line_config(text: str) -> None:
+def _scan_line_config(text: str, *, suffix: str) -> None:
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith(("#", ";", "//")):
             continue
+        if suffix == ".conf" and line.startswith("[") and line.endswith("]"):
+            continue
         match = CONFIG_ASSIGNMENT_RE.match(line)
         if not match:
-            continue
+            if suffix == ".ps1" and line in {"@{", "}", "};", ")", "(", "@("}:
+                continue
+            raise ReleaseBackupError(f"configuration line cannot be parsed: {suffix}")
         key = match.group("key")
         if _is_sensitive_config_key(key):
             value = _strip_assignment_value(match.group("value"))
@@ -330,11 +346,72 @@ def _scan_ini_config(text: str, path: Path) -> None:
                 _raise_sensitive_config(f"{section}.{key}")
 
 
+def _scan_yaml_fallback(text: str) -> None:
+    """Conservative YAML fallback for environments without PyYAML."""
+
+    parsed_any = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith(("#", "---", "...")):
+            continue
+        matches = list(
+            re.finditer(
+                r"(?:^|[,{]\s*)(?:['\"]?)(?P<key>[A-Za-z0-9_.-]+)['\"]?\s*:\s*(?P<value>[^,}]+)",
+                line,
+            )
+        )
+        if not matches:
+            if re.fullmatch(r"(?:[- ]*)[A-Za-z0-9_.-]+\s*:\s*", line):
+                parsed_any = True
+                continue
+            raise ReleaseBackupError("configuration YAML could not be parsed")
+        parsed_any = True
+        for match in matches:
+            if _is_sensitive_config_key(match.group("key")):
+                value = _strip_assignment_value(match.group("value"))
+                if not _is_placeholder(value):
+                    _raise_sensitive_config(match.group("key"))
+    if text.strip() and not parsed_any:
+        raise ReleaseBackupError("configuration YAML could not be parsed")
+
+
+def _scan_yaml_config(text: str, path: Path) -> None:
+    try:
+        import yaml  # type: ignore[import-not-found]
+    except ImportError:
+        _scan_yaml_fallback(text)
+        return
+
+    class _UniqueKeyLoader(yaml.SafeLoader):
+        pass
+
+    def _construct_mapping(loader: Any, node: Any, deep: bool = False) -> dict[Any, Any]:
+        mapping: dict[Any, Any] = {}
+        for key_node, value_node in node.value:
+            key = loader.construct_object(key_node, deep=deep)
+            if key in mapping:
+                raise ReleaseBackupError(f"configuration YAML contains duplicate key: {key}")
+            mapping[key] = loader.construct_object(value_node, deep=deep)
+        return mapping
+
+    _UniqueKeyLoader.add_constructor(
+        yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+        _construct_mapping,
+    )
+    try:
+        payload = yaml.load(text, Loader=_UniqueKeyLoader)
+    except ReleaseBackupError:
+        raise
+    except yaml.YAMLError as exc:
+        raise ReleaseBackupError(f"configuration YAML is invalid: {path.name}") from exc
+    _scan_structured_config(payload)
+
+
 def _scan_config_text(path: Path, text: str) -> None:
     suffix = path.suffix.lower()
     if suffix == ".json":
         try:
-            payload = json.loads(text)
+            payload = json.loads(text, object_pairs_hook=_json_object_no_duplicates)
         except json.JSONDecodeError as exc:
             raise ReleaseBackupError(f"configuration JSON is invalid: {path.name}") from exc
         _scan_structured_config(payload)
@@ -342,8 +419,11 @@ def _scan_config_text(path: Path, text: str) -> None:
     if suffix in {".ini", ".cfg"}:
         _scan_ini_config(text, path)
         return
-    if suffix in {".yaml", ".yml", ".env", ".conf", ".ps1"}:
-        _scan_line_config(text)
+    if suffix in {".yaml", ".yml"}:
+        _scan_yaml_config(text, path)
+        return
+    if suffix in {".env", ".conf", ".ps1"}:
+        _scan_line_config(text, suffix=suffix)
         return
     raise ReleaseBackupError(
         f"configuration format is not allowlisted; use JSON, YAML, INI, ENV, CONF, or PS1: {path.name}"
