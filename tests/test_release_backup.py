@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -230,6 +231,17 @@ class ReleaseBackupTests(unittest.TestCase):
             unknown.write_text("Authorization=real-secret\n", encoding="utf-8")
             with self.assertRaises(ReleaseBackupError):
                 validate_nonsecret_config(unknown)
+
+            with patch.dict(sys.modules, {"yaml": None}):
+                for filename, content in {
+                    "fallback-inline.yml": "headers: {Authorization: Bearer real-token}\n",
+                    "fallback-nested.yaml": "service:\n  webhookUrl: https://example.test/hook/real\n",
+                }.items():
+                    path = root / filename
+                    path.write_text(content, encoding="utf-8")
+                    with self.subTest(filename=filename, parser="fallback"):
+                        with self.assertRaises(ReleaseBackupError):
+                            validate_nonsecret_config(path)
 
     def _insert_task(self, path: Path, task_id: str) -> None:
         connection = sqlite3.connect(str(path))

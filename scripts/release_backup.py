@@ -356,7 +356,7 @@ def _scan_yaml_fallback(text: str) -> None:
             continue
         matches = list(
             re.finditer(
-                r"(?:^|[,{]\s*)(?:['\"]?)(?P<key>[A-Za-z0-9_.-]+)['\"]?\s*:\s*(?P<value>[^,}]+)",
+                r"(?:^|[,{]\s*)(?:['\"]?)(?P<key>[A-Za-z0-9_.-]+)['\"]?\s*:\s*(?P<value>[^,{}]+)",
                 line,
             )
         )

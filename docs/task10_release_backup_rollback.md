@@ -93,8 +93,8 @@ python scripts/run_system_smoke_tests.py --temporary-db
 
 ## 本次验证记录（2026-07-19）
 
-- 更新后 `python -m pytest -q tests/test_release_backup.py`：11 passed、11 subtests，包含 v5 副本迁移、事务补偿、进程中断恢复、wheel artifact、多格式 secret scan 和 WAL-only 回滚。
-- 完整 `python -m pytest -q tests`：436 passed、3 skipped、74 subtests passed。
+- 更新后 `python -m pytest -q tests/test_release_backup.py`：11 passed、13 subtests，包含 v5 副本迁移、事务补偿、进程中断恢复、wheel artifact、多格式 secret scan、无 PyYAML fallback 和 WAL-only 回滚。
+- 完整 `python -m pytest -q tests`：436 passed、3 skipped、76 subtests passed。
 - 相关回归集：37 passed、3 skipped、4 subtests passed。
 - wheel boundary、sdist boundary、secret scan：全部 PASS；隔离 wheel 安装、Runtime Schema v6 init/health：PASS。
 - 使用隔离的 v6 临时数据库完成 CLI `backup → verify → restore → rollback`：全部 PASS，SQLite integrity 为 `ok`、外键违规为 0、关键逻辑表行数一致。
