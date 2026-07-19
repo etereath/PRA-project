@@ -224,6 +224,15 @@ def build_payload(
         for item in evidence_results
         if str(item.get("evidence_status") or "").upper() == "FAILED"
     )
+    evidence_diagnostic_validation_applied = capture_requested and evidence_present_count > 0
+    evidence_diagnostic_validation_passed = evidence_failed_count == 0 and (
+        not evidence_diagnostic_validation_applied
+        or all(
+            ev.get("upload_status") == "SUCCESS" and ev.get("hash_verified") is True
+            for item in evidence_results
+            for ev in item["evidence"]
+        )
+    )
     validation_passed = bool(
         result.get("status") == "READ_COMPLETED"
         and result.get("run_success_flag") is True
@@ -255,6 +264,8 @@ def build_payload(
             "required_for_success": False,
             "present_item_count": evidence_present_count,
             "diagnostic_failure_item_count": evidence_failed_count,
+            "diagnostic_validation_applied": evidence_diagnostic_validation_applied,
+            "diagnostic_validation_passed": evidence_diagnostic_validation_passed,
             "note": "第17节：截图/逐商品证据为可选调试产物，不是 READ_ONLY 成功门槛。",
         },
         "source_files": {

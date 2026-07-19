@@ -91,3 +91,5 @@ def test_task11_human_report_does_not_require_screenshot_evidence(tmp_path: Path
     assert payload["overall_status"] == "PASSED"
     assert payload["evidence_policy"]["required_for_success"] is False
     assert payload["evidence_policy"]["present_item_count"] == 0
+    assert payload["evidence_policy"]["diagnostic_validation_applied"] is False
+    assert payload["evidence_policy"]["diagnostic_validation_passed"] is True

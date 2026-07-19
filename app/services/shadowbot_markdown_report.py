@@ -67,6 +67,8 @@ def render_formal_boundary_markdown(payload: Mapping[str, Any]) -> str:
                 bool(item.get("evidence")) for item in results
             ),
             "diagnostic_failure_item_count": 0,
+            "diagnostic_validation_applied": False,
+            "diagnostic_validation_passed": True,
         }
 
     status = _status(report.get("overall_status"))
@@ -114,7 +116,8 @@ def render_formal_boundary_markdown(payload: Mapping[str, Any]) -> str:
             "- 截图/逐商品证据："
             f"{'已显式请求' if bool(evidence_policy.get('capture_requested')) else '未启用'}；"
             f"已提供 {_string(evidence_policy.get('present_item_count'), '0')} 个商品的证据；"
-            "证据为可选调试产物，不影响 READ_ONLY 成功判定。"
+            "证据为可选调试产物，不影响 READ_ONLY 成功判定；"
+            f"诊断校验{'通过' if evidence_policy.get('diagnostic_validation_passed', True) else '未通过（不降级结构化结果）'}。"
         ),
         "",
         "## 排序前后",

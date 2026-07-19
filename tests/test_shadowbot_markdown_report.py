@@ -125,6 +125,7 @@ class ShadowBotMarkdownReportTests(unittest.TestCase):
 
         self.assertIn("截图/逐商品证据：未启用", markdown)
         self.assertIn("证据为可选调试产物，不影响 READ_ONLY 成功判定", markdown)
+        self.assertIn("诊断校验通过", markdown)
         self.assertIn("未启用或未提供（按第17节不影响 READ_ONLY 成功判定）", markdown)
 
     def test_write_round_trips_explicit_utf8(self):
