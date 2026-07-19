@@ -1576,15 +1576,16 @@ def _run_multi_product_read_flow(args, request, result):
                         ),
                     }
                 )
-                if evidence.get("upload_status") == "FAILED":
-                    snapshot["item_status"] = "MANUAL_CHECK_REQUIRED"
-                    snapshot["error_code"] = "EVIDENCE_UNAVAILABLE"
-                    snapshot["error_message"] = evidence.get("upload_error", "")
-                elif not evidence.get("sha256"):
-                    snapshot["item_status"] = "MANUAL_CHECK_REQUIRED"
-                    snapshot["error_code"] = "EVIDENCE_BINDING_FAILED"
-                    snapshot["error_message"] = "evidence hash is missing"
-                snapshot["evidence"] = [evidence]
+                # Section 17: diagnostic capture is never allowed to rewrite
+                # a structured read outcome.  Keep a valid hashed record when
+                # possible; otherwise expose a diagnostic-only failure and
+                # leave evidence empty so Importer can still accept the read.
+                if not evidence.get("sha256"):
+                    snapshot["evidence_status"] = "FAILED"
+                    snapshot["evidence_error"] = evidence.get("upload_error", "evidence hash is missing")
+                    snapshot["evidence"] = []
+                else:
+                    snapshot["evidence"] = [evidence]
             else:
                 snapshot["evidence_status"] = "SKIPPED"
             result["product_snapshots"].append(snapshot)
