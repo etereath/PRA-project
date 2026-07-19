@@ -240,6 +240,42 @@ class ShadowBotExecutorTests(unittest.TestCase):
         self.assertIsNotNone(operation)
         self.assertIsNotNone(attempt)
         self.assertEqual(operation.product_identity["read_batch_id"], "READ-BATCH-EXECUTOR-001")
+        self.assertFalse(queued["capture_evidence"])
+
+    def test_start_multi_product_read_rejects_read_batch_identity_conflict(self) -> None:
+        request = {
+            "contract_version": 2,
+            "execution_mode": "READ_ONLY",
+            "read_batch_id": "READ-BATCH-EXECUTOR-002",
+            "products": [{
+                "item_id": "ITEM-001",
+                "platform": "ant_flower_wechat",
+                "platform_sku": None,
+                "expected_product_name": "艾莎",
+                "expected_grade": "C级",
+            }],
+        }
+        self.executor.start_multi_product_read(
+            task_id="TASK-SB-1",
+            execution_attempt_id="ATTEMPT-READ-EXECUTOR-2A",
+            request_payload=request,
+        )
+        with self.assertRaisesRegex(ValidationError, "READ_BATCH_ID_CONFLICT"):
+            self.executor.start_multi_product_read(
+                task_id="TASK-SB-1",
+                execution_attempt_id="ATTEMPT-READ-EXECUTOR-2B",
+                request_payload={
+                    **request,
+                    "products": [{
+                        "item_id": "ITEM-001",
+                        "platform": "ant_flower_wechat",
+                        "platform_sku": None,
+                        "expected_product_name": "卡布奇诺",
+                        "expected_grade": "C级",
+                    }],
+                },
+            )
+        self.assertEqual(len(self.runner.calls), 1)
 
     def test_start_execution_validates_approval_hash_and_does_not_start_runner_on_mismatch(self) -> None:
         approval = _approval()

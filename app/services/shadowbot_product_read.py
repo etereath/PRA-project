@@ -205,6 +205,10 @@ def normalize_multi_product_request(
         "contract_version": CONTRACT_VERSION,
         "execution_mode": EXECUTION_MODE_READ_ONLY,
         "read_batch_id": read_batch_id,
+        # Evidence capture is an explicit diagnostics/manual-review opt-in.
+        # Section 17 makes structured accessibility-tree reads authoritative;
+        # screenshots must not be an implicit completion gate.
+        "capture_evidence": _normalize_optional_bool(payload.get("capture_evidence", False), "capture_evidence"),
         "products": [
             {
                 "item_id": target.item_id,
@@ -217,6 +221,20 @@ def normalize_multi_product_request(
         ],
         "limits": limits,
     }
+
+
+def _normalize_optional_bool(value: Any, field_name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized in {"", "0", "false", "no", "off"}:
+            return False
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+    raise ProductReadContractError(f"INPUT_INVALID: {field_name} must be a boolean.")
 
 
 def _normalize_limits(raw: Any) -> dict[str, int]:

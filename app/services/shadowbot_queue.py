@@ -205,10 +205,13 @@ class ShadowBotResultImporter:
             execution_attempt_id = str(result.get("execution_attempt_id") or "")
             for snapshot in snapshots:
                 evidence = snapshot.get("evidence")
-                if not isinstance(evidence, list) or not evidence:
-                    if str(snapshot.get("error_code") or "").upper() in {"EVIDENCE_UNAVAILABLE", "EVIDENCE_BINDING_FAILED"}:
-                        continue
-                    raise ValidationError("RESULT_CONTRACT_INVALID: each v2 snapshot requires evidence.")
+                # Section 17: screenshots/evidence are diagnostic opt-ins, not
+                # a production success prerequisite.  Preserve strict binding
+                # validation whenever evidence is actually supplied.
+                if evidence is None or evidence == []:
+                    continue
+                if not isinstance(evidence, list):
+                    raise ValidationError("RESULT_CONTRACT_INVALID: evidence must be an array when present.")
                 if str(snapshot.get("error_code") or "").upper() in {"EVIDENCE_UNAVAILABLE", "EVIDENCE_BINDING_FAILED"}:
                     continue
                 validate_evidence_binding(

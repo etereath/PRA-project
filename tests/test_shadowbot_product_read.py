@@ -51,6 +51,8 @@ class ProductReadContractTests(unittest.TestCase):
         )
         self.assertIsNone(result["products"][0]["platform_sku"])
         self.assertEqual(result["limits"], {"max_pages": 2, "max_scrolls": 3, "max_seconds": 4})
+        self.assertFalse(result["capture_evidence"])
+        self.assertTrue(normalize_multi_product_request(_request([_product()], capture_evidence=True))["capture_evidence"])
 
     def test_request_rejects_non_read_only_and_duplicate_identity(self):
         with self.assertRaisesRegex(ProductReadContractError, "READ_ONLY_REQUIRED"):

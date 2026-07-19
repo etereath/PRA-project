@@ -509,7 +509,15 @@ class ShadowBotQueueTests(unittest.TestCase):
             json.dumps(result, ensure_ascii=False).encode("utf-8"),
         )
         result["product_snapshots"][0]["evidence"] = []
-        with self.assertRaises(ValidationError):
+        # Section 17 makes screenshot/evidence capture an explicit opt-in;
+        # structured READ_ONLY results remain valid without it.
+        ShadowBotResultImporter._validate_v2_result(
+            request,
+            result,
+            json.dumps(result, ensure_ascii=False).encode("utf-8"),
+        )
+        result["product_snapshots"][0]["evidence"] = {"not": "an array"}
+        with self.assertRaisesRegex(ValidationError, "evidence must be an array"):
             ShadowBotResultImporter._validate_v2_result(
                 request,
                 result,

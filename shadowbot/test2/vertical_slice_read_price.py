@@ -1389,6 +1389,10 @@ def _run_multi_product_read_flow(args, request, result):
     ).strip()
     evidence_share_dir = str(_get_arg(request, "evidence_share_dir", "")).strip()
     evidence_storage_uri_prefix = str(_get_arg(request, "evidence_storage_uri_prefix", "")).strip()
+    # Section 17: screenshots are diagnostics/manual-review opt-ins.  The
+    # structured accessibility-tree read remains authoritative when this is
+    # false (the default), and capture failures must not change item status.
+    capture_evidence = request.get("capture_evidence") is True
     login_config = _get_arg(args, "_login_config", {})
     credential_provider = _get_arg(args, "_credential_provider", None)
     read_batch_id = str(request.get("read_batch_id") or "").strip()
@@ -1399,6 +1403,7 @@ def _run_multi_product_read_flow(args, request, result):
             "read_batch_id": read_batch_id,
             "execution_mode": "READ_ONLY",
             "platform_name": products[0].get("platform", ""),
+            "evidence_capture_enabled": capture_evidence,
             # Keep the v2 result bound to the leased attempt just like the
             # legacy single-product path.  The importer uses these fields to
             # reject results that cannot be tied to the executor lease.
@@ -1476,7 +1481,7 @@ def _run_multi_product_read_flow(args, request, result):
         for target in products:
             stop_path = str(request.get("_stop_signal_path") or "").strip()
             if stop_path and os.path.exists(stop_path):
-                raise SliceError("BATCH_STOPPED", "worker stop requested before the next product evidence capture", True)
+                raise SliceError("BATCH_STOPPED", "worker stop requested before the next product read", True)
             matches = [row for row in observed_rows if _multi_product_target_matches(target, row)]
             item_id = str(target["item_id"])
             snapshot = {
@@ -1530,55 +1535,58 @@ def _run_multi_product_read_flow(args, request, result):
                 else:
                     snapshot["item_status"] = "SUCCESS"
                     snapshot["error_code"] = None
-            try:
-                evidence = _capture_window(
-                    window,
-                    evidence_dir,
-                    execution_attempt_id + "_" + _safe_path_part(item_id),
-                    "PRODUCT_READ",
-                    "product_read",
-                    evidence_share_dir,
-                    evidence_storage_uri_prefix,
+            if capture_evidence:
+                try:
+                    evidence = _capture_window(
+                        window,
+                        evidence_dir,
+                        execution_attempt_id + "_" + _safe_path_part(item_id),
+                        "PRODUCT_READ",
+                        "product_read",
+                        evidence_share_dir,
+                        evidence_storage_uri_prefix,
+                    )
+                except SliceError as exc:
+                    evidence = {
+                        "evidence_id": "EVD-%s-%s" % (read_batch_id, _safe_path_part(item_id)),
+                        "type": "PRODUCT_READ",
+                        "storage_uri": "",
+                        "storage_path": "",
+                        "local_path": "",
+                        "sha256": "",
+                        "storage_sha256": "",
+                        "hash_verified": False,
+                        "size_bytes": 0,
+                        "captured_at": _multi_product_utc_now(),
+                        "upload_status": "FAILED",
+                        "upload_error": str(exc.message),
+                    }
+                evidence.update(
+                    {
+                        "evidence_id": "EVD-%s-%s" % (read_batch_id, _safe_path_part(item_id)),
+                        "evidence_type": "PRODUCT_READ",
+                        "read_batch_id": read_batch_id,
+                        "item_id": item_id,
+                        "execution_attempt_id": execution_attempt_id,
+                        "captured_at": _multi_product_utc_now(),
+                        "relative_path": "%s/%s/%s" % (
+                            read_batch_id,
+                            _safe_path_part(item_id),
+                            os.path.basename(str(evidence.get("storage_path") or evidence.get("local_path") or "")),
+                        ),
+                    }
                 )
-            except SliceError as exc:
-                evidence = {
-                    "evidence_id": "EVD-%s-%s" % (read_batch_id, _safe_path_part(item_id)),
-                    "type": "PRODUCT_READ",
-                    "storage_uri": "",
-                    "storage_path": "",
-                    "local_path": "",
-                    "sha256": "",
-                    "storage_sha256": "",
-                    "hash_verified": False,
-                    "size_bytes": 0,
-                    "captured_at": _multi_product_utc_now(),
-                    "upload_status": "FAILED",
-                    "upload_error": str(exc.message),
-                }
-            evidence.update(
-                {
-                    "evidence_id": "EVD-%s-%s" % (read_batch_id, _safe_path_part(item_id)),
-                    "evidence_type": "PRODUCT_READ",
-                    "read_batch_id": read_batch_id,
-                    "item_id": item_id,
-                    "execution_attempt_id": execution_attempt_id,
-                    "captured_at": _multi_product_utc_now(),
-                    "relative_path": "%s/%s/%s" % (
-                        read_batch_id,
-                        _safe_path_part(item_id),
-                        os.path.basename(str(evidence.get("storage_path") or evidence.get("local_path") or "")),
-                    ),
-                }
-            )
-            if evidence.get("upload_status") == "FAILED":
-                snapshot["item_status"] = "MANUAL_CHECK_REQUIRED"
-                snapshot["error_code"] = "EVIDENCE_UNAVAILABLE"
-                snapshot["error_message"] = evidence.get("upload_error", "")
-            elif not evidence.get("sha256"):
-                snapshot["item_status"] = "MANUAL_CHECK_REQUIRED"
-                snapshot["error_code"] = "EVIDENCE_BINDING_FAILED"
-                snapshot["error_message"] = "evidence hash is missing"
-            snapshot["evidence"] = [evidence]
+                if evidence.get("upload_status") == "FAILED":
+                    snapshot["item_status"] = "MANUAL_CHECK_REQUIRED"
+                    snapshot["error_code"] = "EVIDENCE_UNAVAILABLE"
+                    snapshot["error_message"] = evidence.get("upload_error", "")
+                elif not evidence.get("sha256"):
+                    snapshot["item_status"] = "MANUAL_CHECK_REQUIRED"
+                    snapshot["error_code"] = "EVIDENCE_BINDING_FAILED"
+                    snapshot["error_message"] = "evidence hash is missing"
+                snapshot["evidence"] = [evidence]
+            else:
+                snapshot["evidence_status"] = "SKIPPED"
             result["product_snapshots"].append(snapshot)
             result["current_item_id"] = item_id
             result["processed_count"] = len(result["product_snapshots"])

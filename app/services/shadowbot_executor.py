@@ -763,8 +763,16 @@ class ShadowBotExecutor:
             )
             if inserted != 1:
                 raise ValidationError("read_batch_id already exists.")
-        elif existing.approved_payload_hash != approved_payload_hash:
-            raise ValidationError("read_batch_id already exists with a different request digest.")
+        elif (
+            existing.task_id != task_id
+            or existing.platform != platform
+            or existing.product_identity != product_identity
+            or existing.approved_payload_hash != approved_payload_hash
+        ):
+            # A read_batch_id is the idempotency boundary.  Replaying it is
+            # safe only when the task, platform, product identity, and
+            # normalized request digest are all identical.
+            raise ValidationError("READ_BATCH_ID_CONFLICT")
         payload: dict[str, Any] = {
             "schema_version": "shadowbot-request-2.0",
             "contract_version": 2,
@@ -776,12 +784,13 @@ class ShadowBotExecutor:
             "read_batch_id": read_batch_id,
             "products": normalized["products"],
             "limits": normalized["limits"],
+            "capture_evidence": normalized["capture_evidence"],
             "applet_uri": str(os.environ.get("SHADOWBOT_APPLET_URI", "")).strip(),
             "created_at": utc_now().isoformat(),
             "expires_at": (utc_now() + timedelta(seconds=max(int(lease_seconds), 1))).isoformat(),
         }
         for key, value in (runner_payload or {}).items():
-            if key in {"contract_version", "execution_mode", "task_id", "operation_id", "execution_attempt_id", "read_batch_id", "products", "limits"}:
+            if key in {"contract_version", "execution_mode", "task_id", "operation_id", "execution_attempt_id", "read_batch_id", "products", "limits", "capture_evidence"}:
                 if value != payload.get(key):
                     raise ValidationError(f"runner payload cannot override approved field: {key}")
                 continue

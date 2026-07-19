@@ -127,6 +127,7 @@ def _v2_normalize_request(request):
         "contract_version": V2_CONTRACT_VERSION,
         "execution_mode": "READ_ONLY",
         "read_batch_id": read_batch_id,
+        "capture_evidence": _as_bool(request.get("capture_evidence", False)),
         "products": normalized_products,
         "limits": limits,
     }
