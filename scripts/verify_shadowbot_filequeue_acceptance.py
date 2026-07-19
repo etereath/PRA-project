@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import sys
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -119,6 +120,13 @@ def verify_acceptance(
         )
     check("result_request_hash_matches", result.get("request_file_sha256") == request_hash, request_hash)
     check("result_mode_matches", result.get("execution_mode") == execution_mode, result.get("execution_mode"))
+    # Task 11 contract v2 stores per-product price/inventory in
+    # product_snapshots rather than the legacy top-level price fields.
+    is_v2_multi_product_read = (
+        execution_mode == "READ_ONLY"
+        and result.get("contract_version") == 2
+        and isinstance(result.get("product_snapshots"), list)
+    )
     expected_statuses = {"FAILED"} if profile == "PRE_SUBMIT_STOP" else SUCCESS_STATUSES[execution_mode]
     check("result_status_accepted", result.get("status") in expected_statuses, result.get("status"))
     if profile == "PRE_SUBMIT_STOP":
@@ -131,7 +139,44 @@ def verify_acceptance(
         check("technical_run_succeeded", result.get("run_success_flag") is True, result.get("run_success_flag"))
 
     if profile == "NORMAL" and execution_mode == "READ_ONLY":
-        check("actual_price_recorded", bool(result.get("actual_price") or result.get("old_price")), result.get("actual_price") or result.get("old_price"))
+        if is_v2_multi_product_read:
+            snapshots = result.get("product_snapshots") or []
+            success_snapshots = [
+                item for item in snapshots
+                if isinstance(item, dict) and item.get("item_status") == "SUCCESS"
+            ]
+            invalid_prices = [
+                item.get("item_id") for item in success_snapshots
+                if not _valid_v2_price(item.get("price"))
+            ]
+            invalid_inventory = [
+                item.get("item_id") for item in success_snapshots
+                if not _valid_v2_inventory(item.get("inventory"))
+            ]
+            total_count = result.get("total_count")
+            processed_count = result.get("processed_count")
+            status_counts = {
+                "success_count": result.get("success_count"),
+                "failed_count": result.get("failed_count"),
+                "skipped_count": result.get("skipped_count"),
+                "manual_check_count": result.get("manual_check_count"),
+            }
+            count_sum = sum(
+                value for value in status_counts.values()
+                if isinstance(value, int) and not isinstance(value, bool)
+            )
+            count_fields_valid = all(
+                isinstance(value, int) and not isinstance(value, bool)
+                for value in (total_count, processed_count, *status_counts.values())
+            )
+            check("v2_product_snapshots_present", bool(snapshots), len(snapshots))
+            check("v2_total_count_matches_snapshots", total_count == len(snapshots), {"total_count": total_count, "snapshots": len(snapshots)})
+            check("v2_total_equals_processed", total_count == processed_count, {"total_count": total_count, "processed_count": processed_count})
+            check("v2_count_identity", count_fields_valid and processed_count == count_sum, {"processed_count": processed_count, "sum": count_sum, **status_counts})
+            check("v2_success_prices_recorded", not invalid_prices, invalid_prices)
+            check("v2_success_inventory_recorded", not invalid_inventory, invalid_inventory)
+        else:
+            check("actual_price_recorded", bool(result.get("actual_price") or result.get("old_price")), result.get("actual_price") or result.get("old_price"))
     if profile == "NORMAL" and execution_mode == "FILL_PREVIEW":
         check(
             "preview_old_price_matches_request",
@@ -162,11 +207,6 @@ def verify_acceptance(
 
     # Task 11 contract v2 follows Section 17: screenshots are optional
     # diagnostics, so the verifier must not make them a READ_ONLY gate.
-    is_v2_multi_product_read = (
-        execution_mode == "READ_ONLY"
-        and result.get("contract_version") == 2
-        and isinstance(result.get("product_snapshots"), list)
-    )
     evidence = result.get("evidence")
     capture_requested = bool(
         request.get("capture_evidence") is True
@@ -215,6 +255,20 @@ def verify_acceptance(
     report = _report(execution_attempt_id, execution_mode, checks, attempt=attempt, result=result)
     report["profile"] = profile
     return report
+
+
+def _valid_v2_price(value: Any) -> bool:
+    if isinstance(value, bool) or value is None or not str(value).strip():
+        return False
+    try:
+        price = Decimal(str(value).strip())
+    except (InvalidOperation, ValueError):
+        return False
+    return price.is_finite() and price >= 0
+
+
+def _valid_v2_inventory(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _checksum_valid(path: Path, content: bytes) -> bool:
