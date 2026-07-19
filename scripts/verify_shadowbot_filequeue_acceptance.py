@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import sys
+from collections import Counter
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -124,9 +125,21 @@ def verify_acceptance(
     # product_snapshots rather than the legacy top-level price fields.
     is_v2_multi_product_read = (
         execution_mode == "READ_ONLY"
+        and request.get("contract_version") == 2
         and result.get("contract_version") == 2
         and isinstance(result.get("product_snapshots"), list)
     )
+    if request.get("contract_version") == 2 or result.get("contract_version") == 2:
+        check(
+            "v2_contract_version_matches",
+            request.get("contract_version") == result.get("contract_version") == 2,
+            {"request": request.get("contract_version"), "result": result.get("contract_version")},
+        )
+        check(
+            "v2_read_batch_id_matches",
+            bool(request.get("read_batch_id")) and request.get("read_batch_id") == result.get("read_batch_id"),
+            {"request": request.get("read_batch_id"), "result": result.get("read_batch_id")},
+        )
     expected_statuses = {"FAILED"} if profile == "PRE_SUBMIT_STOP" else SUCCESS_STATUSES[execution_mode]
     check("result_status_accepted", result.get("status") in expected_statuses, result.get("status"))
     if profile == "PRE_SUBMIT_STOP":
@@ -141,9 +154,19 @@ def verify_acceptance(
     if profile == "NORMAL" and execution_mode == "READ_ONLY":
         if is_v2_multi_product_read:
             snapshots = result.get("product_snapshots") or []
+            snapshot_objects = [item for item in snapshots if isinstance(item, dict)]
+            request_products = request.get("products") if isinstance(request.get("products"), list) else []
+            request_item_ids = [
+                str(item.get("item_id") or "") for item in request_products if isinstance(item, dict)
+            ]
+            result_item_ids = [str(item.get("item_id") or "") for item in snapshot_objects]
+            allowed_item_statuses = {"SUCCESS", "FAILED", "SKIPPED", "MANUAL_CHECK_REQUIRED"}
+            invalid_statuses = [
+                item.get("item_status") for item in snapshot_objects
+                if item.get("item_status") not in allowed_item_statuses
+            ]
             success_snapshots = [
-                item for item in snapshots
-                if isinstance(item, dict) and item.get("item_status") == "SUCCESS"
+                item for item in snapshot_objects if item.get("item_status") == "SUCCESS"
             ]
             invalid_prices = [
                 item.get("item_id") for item in success_snapshots
@@ -169,10 +192,26 @@ def verify_acceptance(
                 isinstance(value, int) and not isinstance(value, bool)
                 for value in (total_count, processed_count, *status_counts.values())
             )
+            computed_counts = Counter(item.get("item_status") for item in snapshot_objects)
+            status_to_count_key = {
+                "SUCCESS": "success_count",
+                "FAILED": "failed_count",
+                "SKIPPED": "skipped_count",
+                "MANUAL_CHECK_REQUIRED": "manual_check_count",
+            }
+            snapshot_counts_match = all(
+                status_counts[status_to_count_key[status]] == computed_counts.get(status, 0)
+                for status in allowed_item_statuses
+            ) if count_fields_valid else False
             check("v2_product_snapshots_present", bool(snapshots), len(snapshots))
+            check("v2_snapshot_objects", len(snapshot_objects) == len(snapshots), len(snapshot_objects))
+            check("v2_snapshot_statuses_allowed", not invalid_statuses, invalid_statuses)
+            check("v2_item_ids_unique", len(request_item_ids) == len(set(request_item_ids)) and len(result_item_ids) == len(set(result_item_ids)), {"request": request_item_ids, "result": result_item_ids})
+            check("v2_item_ids_match", request_item_ids and set(request_item_ids) == set(result_item_ids), {"request": request_item_ids, "result": result_item_ids})
             check("v2_total_count_matches_snapshots", total_count == len(snapshots), {"total_count": total_count, "snapshots": len(snapshots)})
             check("v2_total_equals_processed", total_count == processed_count, {"total_count": total_count, "processed_count": processed_count})
             check("v2_count_identity", count_fields_valid and processed_count == count_sum, {"processed_count": processed_count, "sum": count_sum, **status_counts})
+            check("v2_snapshot_status_counts_match", snapshot_counts_match, {"expected": status_counts, "computed": dict(computed_counts)})
             check("v2_success_prices_recorded", not invalid_prices, invalid_prices)
             check("v2_success_inventory_recorded", not invalid_inventory, invalid_inventory)
         else:
@@ -258,7 +297,7 @@ def verify_acceptance(
 
 
 def _valid_v2_price(value: Any) -> bool:
-    if isinstance(value, bool) or value is None or not str(value).strip():
+    if not isinstance(value, str) or not value.strip():
         return False
     try:
         price = Decimal(str(value).strip())
