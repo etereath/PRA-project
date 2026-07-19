@@ -6,6 +6,7 @@ import re
 import shutil
 import time
 import uuid
+import unicodedata
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation
 
@@ -28,6 +29,8 @@ APPLET_URI_PREFIXES = ("weixin://launchapplet/",)
 ROW_INDEX_START = 1
 ROW_INDEX_STEP = 16
 PRICE_INDEX_OFFSET = 9
+INVENTORY_INDEX_OFFSET = 6
+INVENTORY_TEXT_INDEX = 0
 DEFAULT_MAX_PRODUCT_ROWS = 3
 
 ELEMENTS = {
@@ -45,6 +48,7 @@ ELEMENTS = {
 SELECTOR_TEMPLATES = {
     "name": "商品_2_名称",
     "grade": "商品_2_等级",
+    "inventory": "商品_1_库存",
 }
 
 DEFAULT_REQUEST = {
@@ -353,6 +357,11 @@ def _remove_dynamic_page_id_constraints(value):
                 attribute.get("name") == "id"
                 and re.fullmatch(r"page-\d+", str(attribute.get("value") or ""))
             )
+            and not (
+                node.get("name") == "Document"
+                and attribute.get("name") == "value"
+                and "servicewechat.com" in str(attribute.get("value") or "")
+            )
         ]
     return value
 
@@ -396,6 +405,59 @@ def _clone_row_selector(base_name, inferred_name, parent_index, static_text_inde
         raise SliceError("SELECTOR_BUILD_FAILED", "基础选择器缺少 StaticText")
     _set_path_attribute(static_nodes[-1], "role", "StaticText")
     _set_path_attribute(static_nodes[-1], "index", static_text_index)
+    return Selector(value)
+
+
+def _clone_row_value_selector(base_name, inferred_name, target_index):
+    """Clone a captured row value whose terminal wx-view exposes the text directly."""
+    base = package.selector(base_name)
+    value = copy.deepcopy(base.__dict__["value"])
+    _remove_dynamic_page_id_constraints(value)
+    value["id"] = str(uuid.uuid4())
+    value["name"] = inferred_name
+    value["screenshot"] = ""
+
+    selected_nodes = [node for node in value["path"] if node.get("selected") is True]
+    indexed_wx_views = [
+        node
+        for node in selected_nodes
+        if node.get("name") == "wx-view"
+        and any(attr.get("name") == "index" for attr in node.get("attributes", []))
+    ]
+    if not indexed_wx_views:
+        raise SliceError("SELECTOR_BUILD_FAILED", "库存选择器缺少可替换 wx-view index")
+    target_node = indexed_wx_views[-1]
+    _set_path_attribute(target_node, "index", target_index)
+
+    target_position = value["path"].index(target_node)
+    for parent_node in reversed(value["path"][:target_position]):
+        if parent_node.get("name") == "wx-view":
+            parent_node["selected"] = True
+            _set_path_attribute(
+                parent_node,
+                "class",
+                "van-checkbox-group",
+                operator="Contains",
+            )
+            break
+
+    # The captured inventory target is a visual wx-view wrapper. Its value is
+    # exposed by the child StaticText node in the live WeChat accessibility
+    # tree, while get_text() on the grouping wrapper is empty.
+    grade_value = package.selector(SELECTOR_TEMPLATES["grade"]).__dict__["value"]
+    static_nodes = [node for node in grade_value["path"] if node.get("name") == "StaticText"]
+    if not static_nodes:
+        raise SliceError("SELECTOR_BUILD_FAILED", "库存选择器缺少 StaticText 值节点模板")
+    static_node = copy.deepcopy(static_nodes[-1])
+    static_node["selected"] = True
+    static_node["attributes"] = [
+        attribute
+        for attribute in static_node.get("attributes", [])
+        if attribute.get("name") not in {"acc-name", "name-from"}
+    ]
+    _set_path_attribute(static_node, "role", "StaticText")
+    _set_path_attribute(static_node, "index", INVENTORY_TEXT_INDEX)
+    value["path"].append(static_node)
     return Selector(value)
 
 
@@ -486,6 +548,12 @@ def _row_field_selector(row_parent_index, field):
             "动态_index_%d_商品价格" % row_parent_index,
             row_parent_index + PRICE_INDEX_OFFSET,
             0,
+        )
+    if field == "inventory":
+        return _clone_row_value_selector(
+            SELECTOR_TEMPLATES["inventory"],
+            "动态_index_%d_商品库存" % row_parent_index,
+            row_parent_index + INVENTORY_INDEX_OFFSET,
         )
     raise SliceError("SELECTOR_BUILD_FAILED", "不支持的行字段: " + field)
 
@@ -1090,12 +1158,20 @@ def _enumerate_product_rows(window, timeout_seconds):
                 ),
                 ("商品等级", "等级"),
             )
+            labels = _element_label(element)
+            try:
+                labels.extend(_element_label(element.parent()))
+            except Exception:
+                pass
             rows.append(
                 {
                     "source": "DYNAMIC",
                     "parent_index": parent_index,
+                    "row_identity": "parent-index:%s" % parent_index,
                     "name": name,
                     "grade": grade,
+                    "platform_sku": None,
+                    "listing_status": _infer_listing_status(labels),
                 }
             )
         except Exception as exc:
@@ -1108,6 +1184,455 @@ def _enumerate_product_rows(window, timeout_seconds):
                 }
             )
     return rows
+
+
+def _multi_product_text(value):
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    return re.sub(r"\s+", " ", normalized).strip().casefold()
+
+
+def _multi_product_utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _multi_product_grade(value):
+    return _multi_product_text(value).upper()
+
+
+def _multi_product_sku(value):
+    normalized = _multi_product_text(value)
+    return normalized.upper() if normalized else None
+
+
+def _infer_listing_status(labels):
+    normalized_labels = [_multi_product_text(label) for label in labels if str(label).strip()]
+    # The card exposes the action button rather than a separate status label:
+    # “下架” means the listing is currently online, while “上架” means it is
+    # currently offline.  Prefer these exact action labels before the broader
+    # textual markers below.
+    if any(label in {"下架", "下架按钮"} for label in normalized_labels):
+        return "ONLINE"
+    if any(label in {"上架", "上架按钮"} for label in normalized_labels):
+        return "OFFLINE"
+    normalized = " ".join(normalized_labels)
+    if any(token in normalized for token in ("online", "on sale", "listed", "active", "已上架", "在线", "在售")):
+        return "ONLINE"
+    if any(token in normalized for token in ("offline", "off sale", "delisted", "inactive", "out of stock", "已下架", "未上架", "停售")):
+        return "OFFLINE"
+    return "UNKNOWN"
+
+
+def _multi_product_identity(platform, sku, name, grade):
+    normalized_sku = _multi_product_sku(sku)
+    if normalized_sku:
+        return "%s|sku:%s" % (_multi_product_text(platform), normalized_sku)
+    return "%s|name:%s|grade:%s" % (
+        _multi_product_text(platform),
+        _multi_product_text(name),
+        _multi_product_grade(grade),
+    )
+
+
+def _multi_product_target_matches(target, row):
+    platform = str(target.get("platform") or "")
+    if _multi_product_text(row.get("platform") or platform) != _multi_product_text(platform):
+        return False
+    target_sku = _multi_product_sku(target.get("platform_sku"))
+    if target_sku:
+        row_sku = _multi_product_sku(row.get("platform_sku"))
+        # The supplier mini-program cards do not expose SKU in their
+        # accessibility tree.  Keep exact SKU matching whenever the UI
+        # exposes one; otherwise use the visible name+grade identity and let
+        # the caller reject multiple candidates as AMBIGUOUS_MATCH.
+        if row_sku:
+            return row_sku == target_sku
+    return (
+        _multi_product_text(row.get("name")) == _multi_product_text(target.get("expected_product_name"))
+        and _multi_product_grade(row.get("grade")) == _multi_product_grade(target.get("expected_grade"))
+    )
+
+
+def _multi_product_fingerprint(rows):
+    counts = {}
+    for row in rows:
+        identity = _multi_product_identity(
+            row.get("platform", ""),
+            row.get("platform_sku"),
+            row.get("name", ""),
+            row.get("grade", ""),
+        )
+        counts[identity] = counts.get(identity, 0) + 1
+    encoded = json.dumps(sorted(counts.items()), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _multi_product_enumerate_rows(window, timeout_seconds):
+    rows = _enumerate_product_rows(window, timeout_seconds)
+    enriched = []
+    for row in rows:
+        if row.get("error"):
+            enriched.append(row)
+            continue
+        parent_index = row.get("parent_index")
+        try:
+            row["price"] = _read_row_price(window, parent_index, timeout_seconds)
+        except SliceError as exc:
+            row["price_error_code"] = "PRICE_PARSE_FAILED"
+            row["price_error_message"] = str(exc.message)
+        try:
+            row["inventory"] = _read_row_inventory(window, parent_index, timeout_seconds)
+        except SliceError as exc:
+            row["inventory_error_code"] = "INVENTORY_PARSE_FAILED"
+            row["inventory_error_message"] = str(exc.message)
+        row["platform"] = str(row.get("platform") or "")
+        listing_status = str(row.get("listing_status") or "UNKNOWN").upper()
+        # Product management opens on the “上架中” list and the mini-program
+        # does not expose the card's “下架” action as a descendant of the
+        # product-name node.  When no explicit per-row status is available,
+        # the active list itself is the authoritative ONLINE context.
+        row["listing_status"] = "ONLINE" if listing_status == "UNKNOWN" else listing_status
+        enriched.append(row)
+    return enriched
+
+
+def _advance_product_list(window, timeout_seconds):
+    """Best-effort bounded scroll hook; never claims progress without a call."""
+    try:
+        container = _find_product_list_container(window, min(timeout_seconds, 3))
+    except Exception:
+        return False
+    for target in (container, window):
+        for method_name in ("scroll", "scroll_to", "wheel"):
+            method = getattr(target, method_name, None)
+            if not callable(method):
+                continue
+            for args, kwargs in (((), {"direction": "down"}), (("down",), {}), ((0, 800), {})):
+                try:
+                    method(*args, **kwargs)
+                    sleep(0.5)
+                    return True
+                except Exception:
+                    continue
+    return False
+
+
+def _validate_multi_product_request_for_flow(request):
+    if request.get("contract_version") != 2:
+        raise SliceError("UNKNOWN_CONTRACT_VERSION", "task 11 requires contract_version=2", False)
+    if str(request.get("execution_mode") or "").strip().upper() != "READ_ONLY":
+        raise SliceError("READ_ONLY_REQUIRED", "task 11 only permits READ_ONLY", False)
+    read_batch_id = str(request.get("read_batch_id") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}", read_batch_id):
+        raise SliceError("INPUT_INVALID", "read_batch_id is missing or malformed", False)
+    products = request.get("products")
+    if not isinstance(products, list) or not products or len(products) > 50:
+        raise SliceError("PRODUCT_COUNT_LIMIT_EXCEEDED", "products must contain 1-50 items", False)
+    item_ids = set()
+    identities = set()
+    platforms = set()
+    for product in products:
+        if not isinstance(product, dict):
+            raise SliceError("INPUT_INVALID", "each product target must be an object", False)
+        item_id = str(product.get("item_id") or "").strip()
+        platform = str(product.get("platform") or "").strip()
+        name = str(product.get("expected_product_name") or "").strip()
+        grade = str(product.get("expected_grade") or "").strip()
+        if not item_id or not platform or not name or not grade or item_id in item_ids:
+            raise SliceError("INPUT_INVALID", "item_id, platform, name, and grade are required and unique", False)
+        identity = _multi_product_identity(platform, product.get("platform_sku"), name, grade)
+        if identity in identities:
+            raise SliceError("DUPLICATE_TARGET_IDENTITY", "duplicate normalized product identity", False)
+        item_ids.add(item_id)
+        identities.add(identity)
+        platforms.add(_multi_product_text(platform))
+    if len(platforms) != 1:
+        raise SliceError("SINGLE_PLATFORM_REQUIRED", "task 11 accepts one platform per batch", False)
+    limits = request.get("limits") or {}
+    if not isinstance(limits, dict):
+        raise SliceError("INPUT_INVALID", "limits must be an object", False)
+    for key, hard_limit in (("max_pages", 100), ("max_scrolls", 500), ("max_seconds", 900)):
+        raw_value = limits.get(key, {"max_pages": 20, "max_scrolls": 100, "max_seconds": 300}[key])
+        if isinstance(raw_value, bool) or (isinstance(raw_value, float) and not raw_value.is_integer()):
+            raise SliceError("INPUT_INVALID", "%s must be an integer" % key, False)
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            raise SliceError("INPUT_INVALID", "%s must be an integer" % key, False)
+        if not 1 <= value <= hard_limit:
+            raise SliceError("%s_LIMIT_EXCEEDED" % key.upper(), "%s exceeds hard limit" % key, False)
+    return products
+
+
+def _refresh_for_multi_product_read(window, timeout_seconds, result):
+    refresh = globals()["_refresh_product_list"]
+    return refresh(window, timeout_seconds, result, "BEFORE_PRODUCT_READ")
+
+
+def _run_multi_product_read_flow(args, request, result):
+    """Execute task 11's dynamic, bounded, READ_ONLY adapter path."""
+    started_at = result.get("started_at") or _multi_product_utc_now()
+    execution_attempt_id = str(result.get("execution_attempt_id") or "")
+    products = _validate_multi_product_request_for_flow(request)
+    timeout_seconds = _as_int(request, "element_timeout_seconds", ELEMENT_TIMEOUT_DEFAULT, minimum=1)
+    launch_timeout = _as_int(request, "applet_launch_timeout_seconds", APPLET_LAUNCH_TIMEOUT_DEFAULT, minimum=1)
+    max_pages = int((request.get("limits") or {}).get("max_pages", 20))
+    max_scrolls = int((request.get("limits") or {}).get("max_scrolls", 100))
+    max_seconds = int((request.get("limits") or {}).get("max_seconds", 300))
+    window_title = str(_get_arg(request, "window_title", WINDOW_TITLE_DEFAULT)).strip()
+    applet_uri = str(_get_arg(request, "applet_uri", "")).strip()
+    evidence_dir = str(
+        _get_arg(
+            request,
+            "evidence_dir",
+            os.path.join(os.environ.get("LOCALAPPDATA", os.getcwd()), "ShadowBot", "evidence", "vertical_slice"),
+        )
+    ).strip()
+    evidence_share_dir = str(_get_arg(request, "evidence_share_dir", "")).strip()
+    evidence_storage_uri_prefix = str(_get_arg(request, "evidence_storage_uri_prefix", "")).strip()
+    # Section 17: screenshots are diagnostics/manual-review opt-ins.  The
+    # structured accessibility-tree read remains authoritative when this is
+    # false (the default), and capture failures must not change item status.
+    capture_evidence = request.get("capture_evidence") is True
+    login_config = _get_arg(args, "_login_config", {})
+    credential_provider = _get_arg(args, "_credential_provider", None)
+    read_batch_id = str(request.get("read_batch_id") or "").strip()
+    result.update(
+        {
+            "schema_version": "shadowbot-result-2.0",
+            "contract_version": 2,
+            "read_batch_id": read_batch_id,
+            "execution_mode": "READ_ONLY",
+            "platform_name": products[0].get("platform", ""),
+            "evidence_capture_enabled": capture_evidence,
+            # Keep the v2 result bound to the leased attempt just like the
+            # legacy single-product path.  The importer uses these fields to
+            # reject results that cannot be tied to the executor lease.
+            "operation_id": str(request.get("operation_id") or ""),
+            "instruction_hash": str(request.get("instruction_hash") or ""),
+            "request_file_sha256": str(request.get("request_file_sha256") or ""),
+            "lease_owner_token": str(request.get("lease_owner_token") or ""),
+            "lease_version": int(request.get("lease_version") or 0),
+            "worker_id": str(request.get("worker_id") or ""),
+            "product_snapshots": [],
+            "started_at": started_at,
+        }
+    )
+    try:
+        _write_phase(request, result, "UI_STARTED")
+        window, launch = _get_or_open_and_prepare_window(
+            window_title,
+            _as_int(request, "window_x", WINDOW_X_DEFAULT),
+            _as_int(request, "window_y", WINDOW_Y_DEFAULT),
+            _as_int(request, "window_width", WINDOW_WIDTH_DEFAULT, minimum=100),
+            _as_int(request, "window_height", WINDOW_HEIGHT_DEFAULT, minimum=100),
+            applet_uri,
+            launch_timeout,
+        )
+        result["applet_launch"] = launch
+        sleep(1)
+        _recover_login_if_needed(window, request, result, timeout_seconds, login_config, credential_provider)
+        result["current_step"] = "REFRESH_PRODUCT_LIST"
+        try:
+            _refresh_for_multi_product_read(window, timeout_seconds, result)
+        except SliceError as refresh_error:
+            # The mini-program can expire an otherwise valid session between
+            # the initial login check and the product-list refresh.  Recover
+            # the login state once, then retry the read-only refresh; without
+            # this retry the worker reports a misleading container-not-found
+            # failure while the UI has already returned to the login page.
+            labels = _collect_ui_state_labels(window)
+            login_state, _ = _login_page_state(labels)
+            if login_state not in {"ACCOUNT_PASSWORD", "VERIFICATION_REQUIRED"}:
+                raise refresh_error
+            _recover_login_if_needed(window, request, result, timeout_seconds, login_config, credential_provider)
+            _refresh_for_multi_product_read(window, timeout_seconds, result)
+        list_loaded = True
+        observed_rows = []
+        fingerprints = []
+        scroll_count = 0
+        started_clock = time.time()
+        for page in range(max_pages):
+            stop_path = str(request.get("_stop_signal_path") or "").strip()
+            if stop_path and os.path.exists(stop_path):
+                raise SliceError("BATCH_STOPPED", "worker stop requested before the next read page", True)
+            current_rows = _multi_product_enumerate_rows(window, timeout_seconds)
+            if page == 0 and not current_rows:
+                list_loaded = False
+                break
+            fingerprints.append(_multi_product_fingerprint(current_rows))
+            known = {(row.get("row_identity"), row.get("name"), row.get("grade")): row for row in observed_rows}
+            for row in current_rows:
+                known[(row.get("row_identity"), row.get("name"), row.get("grade"))] = row
+            observed_rows = list(known.values())
+            unresolved = []
+            for target in products:
+                matches = [row for row in observed_rows if _multi_product_target_matches(target, row)]
+                if len(matches) != 1:
+                    unresolved.append(target)
+            if not unresolved:
+                break
+            if len(fingerprints) >= 3 and fingerprints[-1] == fingerprints[-2] == fingerprints[-3]:
+                break
+            if page + 1 >= max_pages or scroll_count >= max_scrolls or time.time() - started_clock >= max_seconds:
+                break
+            if not _advance_product_list(window, timeout_seconds):
+                break
+            scroll_count += 1
+        for target in products:
+            stop_path = str(request.get("_stop_signal_path") or "").strip()
+            if stop_path and os.path.exists(stop_path):
+                raise SliceError("BATCH_STOPPED", "worker stop requested before the next product read", True)
+            matches = [row for row in observed_rows if _multi_product_target_matches(target, row)]
+            item_id = str(target["item_id"])
+            snapshot = {
+                "item_id": item_id,
+                "platform": target.get("platform", ""),
+                "platform_sku": target.get("platform_sku"),
+                "product_name": "",
+                "grade": "",
+                "price": None,
+                "inventory": None,
+                "currency": "CNY",
+                "listing_status": "UNKNOWN",
+                "observed_at": _multi_product_utc_now(),
+                "item_status": "FAILED",
+                "error_code": "PRODUCT_NOT_FOUND",
+                "error_message": "",
+                "source_execution_attempt_id": execution_attempt_id,
+                "row_identity": "",
+                "locator_summary": "",
+                "evidence": [],
+            }
+            if not list_loaded:
+                snapshot["error_code"] = "LIST_NOT_LOADED"
+                snapshot["error_message"] = "商品列表未能确认加载或滚动未能确认前进"
+            elif len(matches) > 1:
+                snapshot["item_status"] = "MANUAL_CHECK_REQUIRED"
+                snapshot["error_code"] = "AMBIGUOUS_MATCH"
+                snapshot["error_message"] = "多个候选商品匹配目标，拒绝自动选择"
+            elif len(matches) == 1:
+                row = matches[0]
+                snapshot.update(
+                    {
+                        "product_name": row.get("name", ""),
+                        "grade": row.get("grade", ""),
+                        "price": row.get("price"),
+                        "inventory": row.get("inventory"),
+                        "listing_status": str(row.get("listing_status") or "UNKNOWN").upper(),
+                        "row_identity": row.get("row_identity", ""),
+                        "locator_summary": "parent_index=%s" % row.get("parent_index", ""),
+                    }
+                )
+                if row.get("price_error_code"):
+                    snapshot["error_code"] = "PRICE_PARSE_FAILED"
+                    snapshot["error_message"] = row.get("price_error_message", "")
+                elif row.get("inventory_error_code"):
+                    snapshot["error_code"] = "INVENTORY_PARSE_FAILED"
+                    snapshot["error_message"] = row.get("inventory_error_message", "")
+                elif snapshot["listing_status"] == "UNKNOWN":
+                    snapshot["item_status"] = "MANUAL_CHECK_REQUIRED"
+                    snapshot["error_code"] = "LISTING_STATUS_UNKNOWN"
+                else:
+                    snapshot["item_status"] = "SUCCESS"
+                    snapshot["error_code"] = None
+            if capture_evidence:
+                try:
+                    evidence = _capture_window(
+                        window,
+                        evidence_dir,
+                        execution_attempt_id + "_" + _safe_path_part(item_id),
+                        "PRODUCT_READ",
+                        "product_read",
+                        evidence_share_dir,
+                        evidence_storage_uri_prefix,
+                    )
+                except SliceError as exc:
+                    evidence = {
+                        "evidence_id": "EVD-%s-%s" % (read_batch_id, _safe_path_part(item_id)),
+                        "type": "PRODUCT_READ",
+                        "storage_uri": "",
+                        "storage_path": "",
+                        "local_path": "",
+                        "sha256": "",
+                        "storage_sha256": "",
+                        "hash_verified": False,
+                        "size_bytes": 0,
+                        "captured_at": _multi_product_utc_now(),
+                        "upload_status": "FAILED",
+                        "upload_error": str(exc.message),
+                    }
+                evidence.update(
+                    {
+                        "evidence_id": "EVD-%s-%s" % (read_batch_id, _safe_path_part(item_id)),
+                        "evidence_type": "PRODUCT_READ",
+                        "read_batch_id": read_batch_id,
+                        "item_id": item_id,
+                        "execution_attempt_id": execution_attempt_id,
+                        "captured_at": _multi_product_utc_now(),
+                        "relative_path": "%s/%s/%s" % (
+                            read_batch_id,
+                            _safe_path_part(item_id),
+                            os.path.basename(str(evidence.get("storage_path") or evidence.get("local_path") or "")),
+                        ),
+                    }
+                )
+                # Section 17: diagnostic capture is never allowed to rewrite
+                # a structured read outcome.  Keep a valid hashed record when
+                # possible; otherwise expose a diagnostic-only failure and
+                # leave evidence empty so Importer can still accept the read.
+                if not evidence.get("sha256"):
+                    snapshot["evidence_status"] = "FAILED"
+                    snapshot["evidence_error"] = evidence.get("upload_error", "evidence hash is missing")
+                    snapshot["evidence"] = []
+                else:
+                    snapshot["evidence"] = [evidence]
+            else:
+                snapshot["evidence_status"] = "SKIPPED"
+            result["product_snapshots"].append(snapshot)
+            result["current_item_id"] = item_id
+            result["processed_count"] = len(result["product_snapshots"])
+            _write_phase(request, result, "PRODUCT_READ")
+        counts = {status: sum(item["item_status"] == status for item in result["product_snapshots"]) for status in ("SUCCESS", "FAILED", "SKIPPED", "MANUAL_CHECK_REQUIRED")}
+        total = len(result["product_snapshots"])
+        if counts["SUCCESS"] == total:
+            overall_status = "COMPLETED"
+        elif counts["SUCCESS"] == 0 and counts["MANUAL_CHECK_REQUIRED"] == 0 and counts["SKIPPED"] == 0:
+            overall_status = "FAILED"
+        else:
+            overall_status = "PARTIAL"
+        result.update(
+            {
+                "total_count": total,
+                "success_count": counts["SUCCESS"],
+                "failed_count": counts["FAILED"],
+                "skipped_count": counts["SKIPPED"],
+                "manual_check_count": counts["MANUAL_CHECK_REQUIRED"],
+                "overall_status": overall_status,
+                "status": "READ_COMPLETED",
+                "run_success_flag": True,
+                "business_operation_completed": False,
+                "side_effect_state": "NOT_STARTED",
+                "error_code": "",
+                "error_message": "",
+                "current_step": "COMPLETE",
+                "ended_at": _multi_product_utc_now(),
+            }
+        )
+        _write_phase(request, result, "VERIFIED", include_result_snapshot=True)
+    except SliceError as exc:
+        result.update(
+            {
+                "status": "FAILED",
+                "run_success_flag": False,
+                "business_operation_completed": False,
+                "side_effect_state": "NOT_STARTED",
+                "error_code": exc.code,
+                "error_message": exc.message,
+                "retryable": exc.retryable,
+                "ended_at": _multi_product_utc_now(),
+            }
+        )
+    return _set_result(args, result)
 
 
 def _locate_product_row(
@@ -1683,6 +2208,25 @@ def _read_row_price(window, row_index, timeout_seconds):
     return _parse_price(raw_price)
 
 
+def _parse_inventory(raw_text):
+    normalized = str(raw_text or "").replace(",", "").strip()
+    matches = re.findall(r"-?\d+(?:\.\d+)?", normalized)
+    if len(matches) != 1 or "." in matches[0]:
+        raise SliceError("INVENTORY_PARSE_FAILED", "库存无法唯一解析: " + str(raw_text))
+    try:
+        value = int(matches[0])
+    except (TypeError, ValueError):
+        raise SliceError("INVENTORY_PARSE_FAILED", "库存格式错误: " + str(raw_text))
+    if value < 0:
+        raise SliceError("INVENTORY_PARSE_FAILED", "库存不能为负数: " + str(raw_text))
+    return value
+
+
+def _read_row_inventory(window, row_index, timeout_seconds):
+    raw_inventory = _read_text(window, _row_field_selector(row_index, "inventory"), timeout_seconds)
+    return _parse_inventory(raw_inventory)
+
+
 def _wait_after_submit_price(window, row_index, timeout_seconds, target_price):
     deadline = time.time() + max(float(timeout_seconds), 5.0)
     last_price = ""
@@ -1773,6 +2317,8 @@ def main(args):
             "row_index_start": ROW_INDEX_START,
             "row_index_step": ROW_INDEX_STEP,
             "price_index_offset": PRICE_INDEX_OFFSET,
+            "inventory_index_offset": INVENTORY_INDEX_OFFSET,
+            "inventory_text_index": INVENTORY_TEXT_INDEX,
             "parent_class": "van-checkbox-group",
         },
         "error_code": "",
@@ -1793,8 +2339,11 @@ def main(args):
                 "DUPLICATE_EXECUTION_ATTEMPT_ID",
                 "execution_attempt_id 已存在，拒绝覆盖旧结果: " + execution_attempt_id,
                 False,
-            )
+        )
         result.update({"task_id": task_id, "execution_attempt_id": execution_attempt_id})
+
+        if request.get("contract_version") == 2:
+            return _run_multi_product_read_flow(args, request, result)
 
         product_keyword = _required_text(request, "product_keyword")
         expected_name = _required_text(request, "expected_product_name")

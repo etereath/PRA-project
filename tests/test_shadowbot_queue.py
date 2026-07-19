@@ -22,6 +22,7 @@ from app.services.shadowbot_executor import (
     ShadowBotFileQueueRunner,
     compute_instruction_hash,
 )
+from app.services.shadowbot_product_read import compute_multi_product_instruction_hash
 from app.services.shadowbot_queue import (
     ShadowBotLoginVerificationMonitor,
     ShadowBotQueueWatchdog,
@@ -61,6 +62,43 @@ class ShadowBotQueueTests(unittest.TestCase):
         self.assertEqual(request["instruction_hash"], compute_instruction_hash(request))
         self.assertEqual(checksum_path.read_text(encoding="ascii").strip(), hashlib.sha256(request_path.read_bytes()).hexdigest())
         self.assertEqual(list((self.queue_dir / "inbox").glob("*.tmp-*")), [])
+
+    def test_file_queue_publishes_v2_multi_product_request_with_v2_hash(self) -> None:
+        runner = ShadowBotFileQueueRunner(self.queue_dir)
+        payload = {
+            "schema_version": "shadowbot-request-2.0",
+            "contract_version": 2,
+            "task_id": "TASK-READ-11",
+            "operation_id": "READ-READ-BATCH-TEST-001",
+            "execution_attempt_id": "ATTEMPT-READ-11",
+            "execution_mode": "READ_ONLY",
+            "platform_name": "ant_flower_wechat",
+            "read_batch_id": "READ-BATCH-TEST-001",
+            "products": [
+                {
+                    "item_id": "ITEM-001",
+                    "platform": "ant_flower_wechat",
+                    "platform_sku": "SKU-001",
+                    "expected_product_name": "A",
+                    "expected_grade": "B",
+                }
+            ],
+            "limits": {"max_pages": 2, "max_scrolls": 3, "max_seconds": 4},
+            "applet_uri": "",
+            "window_title": "",
+            "created_at": datetime.now(UTC).isoformat(),
+            "expires_at": (datetime.now(UTC) + timedelta(minutes=30)).isoformat(),
+        }
+        payload["instruction_hash"] = compute_multi_product_instruction_hash(payload)
+
+        result = runner.start(payload)
+
+        request_path = self.queue_dir / "inbox" / "ATTEMPT-READ-11.ready.json"
+        request = json.loads(request_path.read_text(encoding="utf-8"))
+        self.assertEqual(result.shadowbot_run_id, "filequeue:ATTEMPT-READ-11")
+        self.assertEqual(request["contract_version"], 2)
+        self.assertEqual(request["instruction_hash"], compute_multi_product_instruction_hash(request))
+        self.assertEqual(request["products"][0]["item_id"], "ITEM-001")
 
     def test_file_queue_rejects_fault_injection_and_unsupported_spec_verification(self) -> None:
         runner = ShadowBotFileQueueRunner(self.queue_dir)
@@ -362,6 +400,129 @@ class ShadowBotQueueTests(unittest.TestCase):
         self.assertEqual(result["processed"], 1)
         self.assertEqual(result_data["queue_phase"], "RESULT_WRITTEN")
         self.assertEqual(heartbeat["status"], "STOPPED")
+
+    def test_bounded_worker_accepts_v2_multi_product_request(self) -> None:
+        runner = ShadowBotFileQueueRunner(self.queue_dir)
+        payload = {
+            "schema_version": "shadowbot-request-2.0",
+            "contract_version": 2,
+            "task_id": "TASK-READ-11",
+            "operation_id": "READ-READ-BATCH-WORKER-001",
+            "execution_attempt_id": "ATTEMPT-READ-WORKER-1",
+            "execution_mode": "READ_ONLY",
+            "platform_name": "ant_flower_wechat",
+            "read_batch_id": "READ-BATCH-WORKER-001",
+            "products": [{
+                "item_id": "ITEM-001",
+                "platform": "ant_flower_wechat",
+                "platform_sku": "SKU-001",
+                "expected_product_name": "A",
+                "expected_grade": "B",
+            }],
+            "limits": {"max_pages": 2, "max_scrolls": 3, "max_seconds": 4},
+            "applet_uri": "",
+            "window_title": "",
+            "created_at": datetime.now(UTC).isoformat(),
+            "expires_at": (datetime.now(UTC) + timedelta(minutes=30)).isoformat(),
+        }
+        payload["instruction_hash"] = compute_multi_product_instruction_hash(payload)
+        runner.start(payload)
+        shadowbot_source = Path.cwd() / "shadowbot" / "test2"
+        sys.path.insert(0, str(shadowbot_source))
+        try:
+            import shadowbot_queue_worker
+
+            fake_vertical = types.SimpleNamespace(
+                main=lambda args: json.dumps({
+                    "status": "READ_COMPLETED",
+                    "contract_version": 2,
+                    "read_batch_id": "READ-BATCH-WORKER-001",
+                    "overall_status": "COMPLETED",
+                    "total_count": 1,
+                    "success_count": 1,
+                    "failed_count": 0,
+                    "skipped_count": 0,
+                    "manual_check_count": 0,
+                    "product_snapshots": [],
+                    "run_success_flag": True,
+                    "business_operation_completed": False,
+                    "side_effect_state": "NOT_STARTED",
+                    "retryable": False,
+                })
+            )
+            with patch.dict(sys.modules, {"vertical_slice_read_price": fake_vertical}):
+                run_result = shadowbot_queue_worker.QueueWorker({
+                    "queue_dir": str(self.queue_dir),
+                    "poll_seconds": 0.01,
+                    "max_hours": 1,
+                    "max_tasks": 1,
+                    "heartbeat_seconds": 0.01,
+                }).run()
+        finally:
+            sys.path.remove(str(shadowbot_source))
+
+        result_data = json.loads((self.queue_dir / "results" / "ATTEMPT-READ-WORKER-1.result.json").read_text(encoding="utf-8"))
+        self.assertEqual(run_result["processed"], 1)
+        self.assertEqual(result_data["contract_version"], 2)
+        self.assertEqual(result_data["read_batch_id"], "READ-BATCH-WORKER-001")
+        self.assertEqual(result_data["instruction_hash"], payload["instruction_hash"])
+
+    def test_v2_result_validation_checks_snapshot_identity_and_evidence_binding(self) -> None:
+        request = {
+            "contract_version": 2,
+            "execution_mode": "READ_ONLY",
+            "read_batch_id": "READ-BATCH-VALIDATE-001",
+            "products": [{
+                "item_id": "ITEM-001",
+                "platform": "ant_flower_wechat",
+                "platform_sku": "SKU-001",
+                "expected_product_name": "A",
+                "expected_grade": "B",
+            }],
+        }
+        result = {
+            "contract_version": 2,
+            "read_batch_id": request["read_batch_id"],
+            "execution_attempt_id": "ATTEMPT-VALIDATE-1",
+            "status": "READ_COMPLETED",
+            "started_at": datetime.now(UTC).isoformat(),
+            "ended_at": datetime.now(UTC).isoformat(),
+            "product_snapshots": [{
+                "item_id": "ITEM-001",
+                "item_status": "SUCCESS",
+                "listing_status": "ONLINE",
+                "error_code": None,
+                "evidence": [{
+                    "evidence_id": "EVD-001",
+                    "evidence_type": "PRODUCT_READ",
+                    "relative_path": "READ-BATCH-VALIDATE-001/ITEM-001.png",
+                    "sha256": "a" * 64,
+                    "read_batch_id": request["read_batch_id"],
+                    "item_id": "ITEM-001",
+                    "execution_attempt_id": "ATTEMPT-VALIDATE-1",
+                }],
+            }],
+        }
+        ShadowBotResultImporter._validate_v2_result(
+            request,
+            result,
+            json.dumps(result, ensure_ascii=False).encode("utf-8"),
+        )
+        result["product_snapshots"][0]["evidence"] = []
+        # Section 17 makes screenshot/evidence capture an explicit opt-in;
+        # structured READ_ONLY results remain valid without it.
+        ShadowBotResultImporter._validate_v2_result(
+            request,
+            result,
+            json.dumps(result, ensure_ascii=False).encode("utf-8"),
+        )
+        result["product_snapshots"][0]["evidence"] = {"not": "an array"}
+        with self.assertRaisesRegex(ValidationError, "evidence must be an array"):
+            ShadowBotResultImporter._validate_v2_result(
+                request,
+                result,
+                json.dumps(result, ensure_ascii=False).encode("utf-8"),
+            )
 
     def test_atomic_write_retries_windows_file_sharing_collision(self) -> None:
         shadowbot_source = Path.cwd() / "shadowbot" / "test2"

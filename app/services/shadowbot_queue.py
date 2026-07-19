@@ -24,6 +24,12 @@ from app.services.shadowbot_executor import (
     ShadowBotTaskRunner,
     shadowbot_result_contract_from_data,
 )
+from app.services.shadowbot_product_read import (
+    MAX_RESULT_BYTES,
+    aggregate_product_snapshots,
+    normalize_multi_product_request,
+    validate_evidence_binding,
+)
 
 
 SUBMIT_PHASES = {"SUBMIT_INTENT_RECORDED", "SUBMIT_CLICKED"}
@@ -138,6 +144,7 @@ class ShadowBotResultImporter:
         if request_sha256 != attempt.request_file_sha256:
             raise ValidationError("RESULT_CONTRACT_INVALID: archived request hash does not match attempt.")
         request_data = json.loads(request_bytes.decode("utf-8-sig"))
+        self._validate_v2_result(request_data, data, result_bytes)
         result_file_sha256 = hashlib.sha256(result_bytes).hexdigest()
         data.setdefault("result_id", f"RESULT-{result_file_sha256[:24]}")
         lease_required = isinstance(attempt.raw_output.get("lease"), dict)
@@ -173,6 +180,46 @@ class ShadowBotResultImporter:
             "execution_attempt_id": contract.execution_attempt_id,
             "archive_dir": str(archive_dir),
         }
+
+    @staticmethod
+    def _validate_v2_result(request: dict[str, Any], result: dict[str, Any], result_bytes: bytes) -> None:
+        if request.get("contract_version") != 2:
+            return
+        if len(result_bytes) > MAX_RESULT_BYTES:
+            raise ValidationError("RESULT_CONTRACT_INVALID: v2 result exceeds 4 MiB.")
+        normalized_request = normalize_multi_product_request(request)
+        if result.get("contract_version") != 2 or str(result.get("read_batch_id") or "") != normalized_request["read_batch_id"]:
+            raise ValidationError("RESULT_CONTRACT_INVALID: v2 batch identity mismatch.")
+        snapshots = result.get("product_snapshots")
+        if result.get("status") == "READ_COMPLETED":
+            if not isinstance(snapshots, list) or not snapshots:
+                raise ValidationError("RESULT_CONTRACT_INVALID: READ_COMPLETED requires product_snapshots.")
+            aggregate_product_snapshots(
+                read_batch_id=normalized_request["read_batch_id"],
+                contract_version=2,
+                started_at=str(result.get("started_at") or ""),
+                completed_at=str(result.get("ended_at") or result.get("completed_at") or ""),
+                snapshots=snapshots,
+                expected_item_ids=[product["item_id"] for product in normalized_request["products"]],
+            )
+            execution_attempt_id = str(result.get("execution_attempt_id") or "")
+            for snapshot in snapshots:
+                evidence = snapshot.get("evidence")
+                # Section 17: screenshots/evidence are diagnostic opt-ins, not
+                # a production success prerequisite.  Preserve strict binding
+                # validation whenever evidence is actually supplied.
+                if evidence is None or evidence == []:
+                    continue
+                if not isinstance(evidence, list):
+                    raise ValidationError("RESULT_CONTRACT_INVALID: evidence must be an array when present.")
+                if str(snapshot.get("error_code") or "").upper() in {"EVIDENCE_UNAVAILABLE", "EVIDENCE_BINDING_FAILED"}:
+                    continue
+                validate_evidence_binding(
+                    evidence,
+                    read_batch_id=normalized_request["read_batch_id"],
+                    item_id=str(snapshot.get("item_id") or ""),
+                    execution_attempt_id=execution_attempt_id,
+                )
 
     def _find_request(self, execution_attempt_id: str, recorded_path: str) -> Path:
         candidates = [

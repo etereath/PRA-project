@@ -6700,6 +6700,31 @@ def _render_shadowbot_log_summary(log) -> str:
         ("quarantine_reason", payload.get("quarantine_reason")),
         ("automatic_reconcile_attempt_id", payload.get("automatic_reconcile_attempt_id")),
     ]
+    v2_evidence = payload.get("evidence")
+    if payload.get("contract_version") == 2:
+        snapshots = payload.get("product_snapshots") if isinstance(payload.get("product_snapshots"), list) else []
+        counts = {
+            "total": payload.get("total_count", len(snapshots)),
+            "success": payload.get("success_count", 0),
+            "failed": payload.get("failed_count", 0),
+            "skipped": payload.get("skipped_count", 0),
+            "manual": payload.get("manual_check_count", 0),
+        }
+        fields = [
+            ("contract_version", payload.get("contract_version")),
+            ("read_batch_id", payload.get("read_batch_id")),
+            ("overall_status", payload.get("overall_status")),
+            ("product_counts", json.dumps(counts, ensure_ascii=False, sort_keys=True)),
+        ] + fields
+        v2_evidence = []
+        for snapshot in snapshots:
+            if not isinstance(snapshot, dict):
+                continue
+            for evidence in snapshot.get("evidence") or []:
+                if isinstance(evidence, dict):
+                    item = dict(evidence)
+                    item.setdefault("item_id", snapshot.get("item_id", ""))
+                    v2_evidence.append(item)
     rows = "".join(
         "<tr>"
         f"<th>{escape(label)}</th>"
@@ -6712,7 +6737,7 @@ def _render_shadowbot_log_summary(log) -> str:
         "<details class='json-details' open>"
         "<summary>ShadowBot</summary>"
         f"<table><tbody>{rows}</tbody></table>"
-        f"{_render_shadowbot_evidence(payload.get('evidence'))}"
+        f"{_render_shadowbot_evidence(v2_evidence)}"
         f"{_render_shadowbot_manual_actions(payload)}"
         "</details>"
     )

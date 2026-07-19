@@ -8,6 +8,8 @@ import socket
 import threading
 import time
 import uuid
+import unicodedata
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -40,6 +42,108 @@ INSTRUCTION_HASH_FIELDS = (
     "target_price",
     "applet_uri",
 )
+
+V2_CONTRACT_VERSION = 2
+V2_DEFAULT_LIMITS = {"max_pages": 20, "max_scrolls": 100, "max_seconds": 300}
+V2_HARD_LIMITS = {"max_pages": 100, "max_scrolls": 500, "max_seconds": 900}
+V2_HARD_MAX_PRODUCTS = 50
+V2_MAX_REQUEST_BYTES = 256 * 1024
+V2_MAX_RESULT_BYTES = 4 * 1024 * 1024
+_V2_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _v2_normalize_text(value):
+    value = unicodedata.normalize("NFKC", str(value or ""))
+    return _V2_WHITESPACE_RE.sub(" ", value).strip().casefold()
+
+
+def _v2_normalize_sku(value):
+    value = _v2_normalize_text(value)
+    return value.upper() if value else None
+
+
+def _v2_normalize_request(request):
+    if request.get("contract_version") != V2_CONTRACT_VERSION:
+        raise ValueError("UNKNOWN_CONTRACT_VERSION")
+    if str(request.get("execution_mode") or "").strip().upper() != "READ_ONLY":
+        raise ValueError("READ_ONLY_REQUIRED")
+    read_batch_id = str(request.get("read_batch_id") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}", read_batch_id):
+        raise ValueError("invalid read_batch_id")
+    products = request.get("products")
+    if not isinstance(products, list) or not products or len(products) > V2_HARD_MAX_PRODUCTS:
+        raise ValueError("PRODUCT_COUNT_LIMIT_EXCEEDED")
+    identities = set()
+    item_ids = set()
+    platforms = set()
+    normalized_products = []
+    for product in products:
+        if not isinstance(product, dict):
+            raise ValueError("invalid product target")
+        item_id = str(product.get("item_id") or "").strip()
+        platform = str(product.get("platform") or "").strip()
+        name = str(product.get("expected_product_name") or "").strip()
+        grade = str(product.get("expected_grade") or "").strip()
+        if not item_id or not platform or not name or not grade or item_id in item_ids:
+            raise ValueError("invalid or duplicate product target")
+        sku = _v2_normalize_sku(product.get("platform_sku"))
+        identity = (
+            f"{_v2_normalize_text(platform)}|sku:{sku}"
+            if sku
+            else f"{_v2_normalize_text(platform)}|name:{_v2_normalize_text(name)}|grade:{_v2_normalize_text(grade).upper()}"
+        )
+        if identity in identities:
+            raise ValueError("DUPLICATE_TARGET_IDENTITY")
+        item_ids.add(item_id)
+        identities.add(identity)
+        platforms.add(_v2_normalize_text(platform))
+        normalized_products.append(
+            {
+                "item_id": item_id,
+                "platform": platform,
+                "platform_sku": sku,
+                "expected_product_name": name,
+                "expected_grade": grade,
+            }
+        )
+    if len(platforms) != 1:
+        raise ValueError("SINGLE_PLATFORM_REQUIRED")
+    platform_name = str(request.get("platform_name") or "").strip()
+    if platform_name and _v2_normalize_text(platform_name) not in platforms:
+        raise ValueError("SINGLE_PLATFORM_REQUIRED")
+    raw_limits = request.get("limits") or {}
+    if not isinstance(raw_limits, dict):
+        raise ValueError("invalid limits")
+    limits = {}
+    for name, default in V2_DEFAULT_LIMITS.items():
+        raw_value = raw_limits.get(name, default)
+        if isinstance(raw_value, bool) or (isinstance(raw_value, float) and not raw_value.is_integer()):
+            raise ValueError(f"{name} must be an integer")
+        value = int(raw_value)
+        if not 1 <= value <= V2_HARD_LIMITS[name]:
+            raise ValueError(f"{name.upper()}_LIMIT_EXCEEDED")
+        limits[name] = value
+    return {
+        "contract_version": V2_CONTRACT_VERSION,
+        "execution_mode": "READ_ONLY",
+        "read_batch_id": read_batch_id,
+        "capture_evidence": _as_bool(request.get("capture_evidence", False)),
+        "products": normalized_products,
+        "limits": limits,
+    }
+
+
+def _v2_instruction_hash(request):
+    canonical = {
+        "task_id": str(request.get("task_id") or ""),
+        "operation_id": str(request.get("operation_id") or ""),
+        "execution_attempt_id": str(request.get("execution_attempt_id") or ""),
+        "request": _v2_normalize_request(request),
+        "applet_uri": str(request.get("applet_uri") or ""),
+        "window_title": str(request.get("window_title") or ""),
+    }
+    encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def _now_iso():
@@ -290,6 +394,9 @@ class QueueWorker:
         return None
 
     def _validate_request(self, request):
+        if request.get("contract_version") == V2_CONTRACT_VERSION:
+            self._validate_multi_product_request(request)
+            return
         required = (
             "task_id",
             "operation_id",
@@ -314,6 +421,20 @@ class QueueWorker:
             raise ValueError("current platform adapter cannot verify expected_spec")
         if request["instruction_hash"] != _instruction_hash(request):
             raise ValueError("instruction_hash mismatch")
+        expires_at = datetime.fromisoformat(str(request["expires_at"]))
+        if expires_at.tzinfo is None or expires_at.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+            raise ValueError("request expired")
+
+    def _validate_multi_product_request(self, request):
+        if len(_json_bytes(request)) > V2_MAX_REQUEST_BYTES:
+            raise ValueError("REQUEST_SIZE_LIMIT_EXCEEDED")
+        _v2_normalize_request(request)
+        required = ("task_id", "operation_id", "execution_attempt_id", "created_at", "expires_at", "instruction_hash")
+        missing = [name for name in required if not str(request.get(name) or "").strip()]
+        if missing:
+            raise ValueError("missing v2 request fields: " + ", ".join(missing))
+        if request["instruction_hash"] != _v2_instruction_hash(request):
+            raise ValueError("multi-product instruction_hash mismatch")
         expires_at = datetime.fromisoformat(str(request["expires_at"]))
         if expires_at.tzinfo is None or expires_at.astimezone(timezone.utc) <= datetime.now(timezone.utc):
             raise ValueError("request expired")
@@ -361,7 +482,7 @@ class QueueWorker:
                 "run_success_flag": False,
                 "business_operation_completed": False,
                 "side_effect_state": "NOT_STARTED",
-                "error_code": "WORKER_EXECUTION_FAILED",
+                "error_code": "BATCH_STOPPED" if request.get("contract_version") == V2_CONTRACT_VERSION else "WORKER_EXECUTION_FAILED",
                 # A lower-level UI exception can echo the text that was passed
                 # to a credential field. Keep queue results free of secrets.
                 "error_message": "worker execution failed: " + type(exc).__name__,
@@ -374,7 +495,7 @@ class QueueWorker:
             result.pop("provider_error_code", None)
         result.update(
             {
-                "schema_version": "shadowbot-result-1.0",
+                "schema_version": "shadowbot-result-2.0" if request.get("contract_version") == V2_CONTRACT_VERSION else "shadowbot-result-1.0",
                 "task_id": request["task_id"],
                 "operation_id": request["operation_id"],
                 "execution_attempt_id": attempt_id,
@@ -386,11 +507,40 @@ class QueueWorker:
                 "worker_heartbeat_at": _now_iso(),
             }
         )
+        if request.get("contract_version") == V2_CONTRACT_VERSION:
+            result.setdefault("contract_version", V2_CONTRACT_VERSION)
+            result.setdefault("read_batch_id", request.get("read_batch_id", ""))
+            result.setdefault("total_count", len(request.get("products") or []))
         if not result.get("result_id"):
             result_identity = json.dumps(result, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
             result["result_id"] = "RESULT-" + hashlib.sha256(result_identity).hexdigest()[:24]
         result_path = self.results / (attempt_id + ".result.json")
         content = _json_bytes(result)
+        if request.get("contract_version") == V2_CONTRACT_VERSION and len(content) > V2_MAX_RESULT_BYTES:
+            result = {
+                "schema_version": "shadowbot-result-2.0",
+                "contract_version": V2_CONTRACT_VERSION,
+                "task_id": request["task_id"],
+                "operation_id": request["operation_id"],
+                "execution_attempt_id": attempt_id,
+                "execution_mode": request["execution_mode"],
+                "read_batch_id": request.get("read_batch_id", ""),
+                "instruction_hash": request.get("instruction_hash", ""),
+                "request_file_sha256": request_sha256,
+                "worker_id": self.worker_id,
+                "queue_phase": "RESULT_WRITTEN",
+                "worker_heartbeat_at": _now_iso(),
+                "status": "FAILED",
+                "run_success_flag": False,
+                "business_operation_completed": False,
+                "side_effect_state": "NOT_STARTED",
+                "error_code": "BATCH_STOPPED",
+                "error_message": "result exceeds 4 MiB contract limit",
+                "retryable": False,
+                "product_snapshots": [],
+            }
+            result["result_id"] = "RESULT-" + hashlib.sha256(_json_bytes(result)).hexdigest()[:24]
+            content = _json_bytes(result)
         _atomic_write(result_path.with_suffix(result_path.suffix + ".sha256"), (hashlib.sha256(content).hexdigest() + "\n").encode("ascii"))
         _atomic_write(result_path, content)
         self._write_phase(request, phase_path, "RESULT_WRITTEN", str(result.get("side_effect_state") or "NOT_STARTED"), request_sha256)
@@ -423,6 +573,14 @@ class QueueWorker:
             "lease_version": request.get("lease_version", 0),
             "updated_at": _now_iso(),
         }
+        if request.get("contract_version") == V2_CONTRACT_VERSION:
+            payload.update(
+                {
+                    "contract_version": V2_CONTRACT_VERSION,
+                    "read_batch_id": request.get("read_batch_id", ""),
+                    "total_count": len(request.get("products") or []),
+                }
+            )
         _atomic_write(phase_path, _json_bytes(payload))
 
     def _write_rejected_request_result(

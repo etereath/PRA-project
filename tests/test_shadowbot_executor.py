@@ -42,6 +42,7 @@ from app.services.shadowbot_executor import (
     compute_approved_payload_hash,
     compute_instruction_hash,
 )
+from app.services.shadowbot_product_read import compute_multi_product_instruction_hash
 from scripts.run_shadowbot_executor import (
     check_yingdao_app_params,
     record_result_from_file,
@@ -204,6 +205,77 @@ class ShadowBotExecutorTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         shutil.rmtree(self.temp_path, ignore_errors=True)
+
+    def test_start_multi_product_read_creates_v2_operation_attempt_and_queue_payload(self) -> None:
+        request = {
+            "contract_version": 2,
+            "execution_mode": "READ_ONLY",
+            "read_batch_id": "READ-BATCH-EXECUTOR-001",
+            "products": [{
+                "item_id": "ITEM-001",
+                "platform": "ant_flower_wechat",
+                "platform_sku": "SKU-001",
+                "expected_product_name": "A",
+                "expected_grade": "B",
+            }],
+            "limits": {"max_pages": 2, "max_scrolls": 3, "max_seconds": 4},
+        }
+
+        started = self.executor.start_multi_product_read(
+            task_id="TASK-SB-1",
+            execution_attempt_id="ATTEMPT-READ-EXECUTOR-1",
+            request_payload=request,
+        )
+
+        self.assertEqual(started.status, STATUS_RUNNING)
+        self.assertEqual(started.side_effect_state, SIDE_EFFECT_NOT_STARTED)
+        self.assertEqual(len(self.runner.calls), 1)
+        queued = self.runner.calls[0]
+        self.assertEqual(queued["contract_version"], 2)
+        self.assertEqual(queued["read_batch_id"], "READ-BATCH-EXECUTOR-001")
+        self.assertEqual(queued["instruction_hash"], compute_multi_product_instruction_hash(queued))
+        self.assertEqual(queued["execution_mode"], "READ_ONLY")
+        operation = self.repository.get_shadowbot_operation(started.operation_id)
+        attempt = self.repository.get_shadowbot_execution_attempt(started.execution_attempt_id)
+        self.assertIsNotNone(operation)
+        self.assertIsNotNone(attempt)
+        self.assertEqual(operation.product_identity["read_batch_id"], "READ-BATCH-EXECUTOR-001")
+        self.assertFalse(queued["capture_evidence"])
+
+    def test_start_multi_product_read_rejects_read_batch_identity_conflict(self) -> None:
+        request = {
+            "contract_version": 2,
+            "execution_mode": "READ_ONLY",
+            "read_batch_id": "READ-BATCH-EXECUTOR-002",
+            "products": [{
+                "item_id": "ITEM-001",
+                "platform": "ant_flower_wechat",
+                "platform_sku": None,
+                "expected_product_name": "艾莎",
+                "expected_grade": "C级",
+            }],
+        }
+        self.executor.start_multi_product_read(
+            task_id="TASK-SB-1",
+            execution_attempt_id="ATTEMPT-READ-EXECUTOR-2A",
+            request_payload=request,
+        )
+        with self.assertRaisesRegex(ValidationError, "READ_BATCH_ID_CONFLICT"):
+            self.executor.start_multi_product_read(
+                task_id="TASK-SB-1",
+                execution_attempt_id="ATTEMPT-READ-EXECUTOR-2B",
+                request_payload={
+                    **request,
+                    "products": [{
+                        "item_id": "ITEM-001",
+                        "platform": "ant_flower_wechat",
+                        "platform_sku": None,
+                        "expected_product_name": "卡布奇诺",
+                        "expected_grade": "C级",
+                    }],
+                },
+            )
+        self.assertEqual(len(self.runner.calls), 1)
 
     def test_start_execution_validates_approval_hash_and_does_not_start_runner_on_mismatch(self) -> None:
         approval = _approval()

@@ -52,7 +52,7 @@ class CredentialProviderError(RuntimeError):
         super().__init__(safe_message)
 
 
-@dataclass(frozen=True, slots=True, repr=False)
+@dataclass(frozen=True, repr=False)
 class LoginCredentials:
     """Runtime-only credentials; repr intentionally redacts both fields."""
 
