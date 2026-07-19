@@ -168,9 +168,20 @@ def verify_acceptance(
         and isinstance(result.get("product_snapshots"), list)
     )
     evidence = result.get("evidence")
+    capture_requested = bool(
+        request.get("capture_evidence") is True
+        or result.get("evidence_capture_enabled") is True
+    )
     if profile == "NORMAL" and not is_v2_multi_product_read:
         check("evidence_present", isinstance(evidence, list) and bool(evidence), len(evidence) if isinstance(evidence, list) else 0)
-    if profile == "NORMAL" and not is_v2_multi_product_read and isinstance(evidence, list):
+    if profile == "NORMAL" and is_v2_multi_product_read:
+        check("v2_evidence_optional", True, "Section 17: structured READ_ONLY success does not require screenshots")
+    should_validate_evidence = (
+        profile == "NORMAL"
+        and isinstance(evidence, list)
+        and (not is_v2_multi_product_read or capture_requested)
+    )
+    if should_validate_evidence:
         for index, item in enumerate(evidence, start=1):
             if not isinstance(item, dict):
                 check(f"evidence_{index}_object", False, type(item).__name__)
@@ -190,8 +201,6 @@ def verify_acceptance(
                         storage_hash == item.get("storage_sha256") == item.get("sha256"),
                         storage_hash,
                     )
-    elif profile == "NORMAL" and is_v2_multi_product_read:
-        check("v2_evidence_optional", True, "Section 17: structured READ_ONLY success does not require screenshots")
 
     active_files = []
     for directory in ("inbox", "working", "results"):
