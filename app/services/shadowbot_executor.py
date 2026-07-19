@@ -32,6 +32,12 @@ from app.services.shadowbot_state import (
     operation_status_from_result,
     validate_result_state,
 )
+from app.services.shadowbot_product_read import (
+    build_read_batch_id,
+    canonical_request_digest,
+    compute_multi_product_instruction_hash,
+    normalize_multi_product_request,
+)
 from app.utils import serialize_decimal, utc_now
 
 
@@ -209,9 +215,17 @@ class ShadowBotFileQueueRunner:
         return cls(queue_dir, command=os.environ.get("SHADOWBOT_RUNNER_COMMAND", ""))
 
     def start(self, payload: dict[str, Any]) -> ShadowBotStartResult:
-        _validate_queue_request(payload)
+        is_multi_product = payload.get("contract_version") == 2
+        if is_multi_product:
+            _validate_multi_product_queue_request(payload)
+        else:
+            _validate_queue_request(payload)
         execution_attempt_id = str(payload["execution_attempt_id"])
-        instruction_hash = compute_instruction_hash(payload)
+        instruction_hash = (
+            compute_multi_product_instruction_hash(payload)
+            if is_multi_product
+            else compute_instruction_hash(payload)
+        )
         supplied_instruction_hash = str(payload.get("instruction_hash") or "")
         if supplied_instruction_hash and supplied_instruction_hash != instruction_hash:
             raise ValidationError("instruction_hash does not match the execution instruction.")
@@ -688,6 +702,182 @@ class ShadowBotExecutor:
         return ShadowBotExecutorStartResult(
             operation_id=payload.operation_id,
             execution_attempt_id=request.execution_attempt_id,
+            shadowbot_run_id=start_result.shadowbot_run_id,
+            status=STATUS_RUNNING,
+            side_effect_state=SIDE_EFFECT_NOT_STARTED,
+        )
+
+    def start_multi_product_read(
+        self,
+        *,
+        task_id: str,
+        execution_attempt_id: str,
+        request_payload: dict[str, Any],
+        lock_owner: str = SHADOWBOT_EXECUTOR_NAME,
+        lease_seconds: int = 900,
+        runner_payload: dict[str, Any] | None = None,
+    ) -> ShadowBotExecutorStartResult:
+        """Start one v2 single-platform multi-product READ_ONLY attempt.
+
+        READ_ONLY has no business write approval envelope.  It still gets a
+        normal operation/attempt/lease record so the existing queue, phase,
+        importer, and execution-log boundaries remain authoritative.
+        """
+
+        self.repository.init_schema()
+        request_payload = dict(request_payload or {})
+        if not str(request_payload.get("read_batch_id") or "").strip():
+            request_payload["read_batch_id"] = build_read_batch_id()
+        normalized = normalize_multi_product_request(request_payload)
+        if str(task_id or "").strip() == "":
+            raise ValidationError("task_id is required.")
+        if self.repository.get_task(task_id) is None:
+            raise ValidationError("task_id does not exist.")
+        execution_attempt_id = str(execution_attempt_id or "").strip()
+        if not execution_attempt_id:
+            raise ValidationError("execution_attempt_id is required.")
+        read_batch_id = normalized["read_batch_id"]
+        operation_id = f"READ-{read_batch_id}"
+        approved_payload_hash = canonical_request_digest(normalized)
+        platform = normalized["products"][0]["platform"]
+        product_identity = {
+            "multi_product_read": True,
+            "read_batch_id": read_batch_id,
+            "products": normalized["products"],
+        }
+        existing = self.repository.get_shadowbot_operation(operation_id)
+        if existing is None:
+            inserted = self.repository.insert_shadowbot_operation(
+                ShadowBotOperationLedger(
+                    operation_id=operation_id,
+                    task_id=task_id,
+                    platform=platform,
+                    product_identity=product_identity,
+                    expected_old_price=Decimal("0"),
+                    target_price=Decimal("0"),
+                    status=STATUS_PENDING,
+                    approved_payload_hash=approved_payload_hash,
+                    created_at=utc_now(),
+                    updated_at=utc_now(),
+                )
+            )
+            if inserted != 1:
+                raise ValidationError("read_batch_id already exists.")
+        elif existing.approved_payload_hash != approved_payload_hash:
+            raise ValidationError("read_batch_id already exists with a different request digest.")
+        payload: dict[str, Any] = {
+            "schema_version": "shadowbot-request-2.0",
+            "contract_version": 2,
+            "task_id": task_id,
+            "operation_id": operation_id,
+            "execution_attempt_id": execution_attempt_id,
+            "execution_mode": "READ_ONLY",
+            "platform_name": platform,
+            "read_batch_id": read_batch_id,
+            "products": normalized["products"],
+            "limits": normalized["limits"],
+            "applet_uri": str(os.environ.get("SHADOWBOT_APPLET_URI", "")).strip(),
+            "created_at": utc_now().isoformat(),
+            "expires_at": (utc_now() + timedelta(seconds=max(int(lease_seconds), 1))).isoformat(),
+        }
+        for key, value in (runner_payload or {}).items():
+            if key in {"contract_version", "execution_mode", "task_id", "operation_id", "execution_attempt_id", "read_batch_id", "products", "limits"}:
+                if value != payload.get(key):
+                    raise ValidationError(f"runner payload cannot override approved field: {key}")
+                continue
+            payload[key] = value
+        payload["instruction_hash"] = compute_multi_product_instruction_hash(payload)
+        now = utc_now()
+        owner_token = f"{lock_owner}:{uuid4().hex}"
+        lease_expires_at = now + timedelta(seconds=max(int(lease_seconds), 1))
+        attempt = ShadowBotExecutionAttempt(
+            execution_attempt_id=execution_attempt_id,
+            operation_id=operation_id,
+            execution_mode=EXECUTION_MODE_READ_ONLY,
+            shadowbot_run_id="",
+            status=STATUS_STARTING,
+            side_effect_state=SIDE_EFFECT_NOT_STARTED,
+            started_at=now,
+            instruction_hash=payload["instruction_hash"],
+            raw_output={
+                "contract_version": 2,
+                "read_batch_id": read_batch_id,
+                "operation_status_before_attempt": STATUS_PENDING,
+            },
+        )
+        claimed = self.repository.create_shadowbot_attempt_with_lease(
+            attempt,
+            owner_token=owner_token,
+            lease_expires_at=lease_expires_at,
+            expected_operation_statuses=(STATUS_PENDING,),
+        )
+        if claimed is None:
+            raise ValidationError("read operation is already locked or execution_attempt_id exists.")
+        lease = claimed.raw_output.get("lease", {})
+        lease_version = int(lease.get("version") or 0)
+        payload.update(
+            {
+                "lease_owner_token": owner_token,
+                "lease_version": lease_version,
+                "lease_expires_at": str(lease.get("expires_at") or ""),
+            }
+        )
+        try:
+            start_result = self.runner.start(payload)
+        except Exception as exc:
+            boundary_known = isinstance(exc, ShadowBotStartBoundaryError)
+            published = exc.published if boundary_known else None
+            attempt_status = STATUS_START_FAILED if boundary_known and not published else STATUS_START_UNKNOWN
+            operation_status = STATUS_NEEDS_RECONCILIATION if attempt_status == STATUS_START_UNKNOWN else STATUS_FAILED
+            raw_output = {
+                "error_code": "RUNNER_START_UNKNOWN" if attempt_status == STATUS_START_UNKNOWN else "RUNNER_START_FAILED",
+                "error_type": type(exc).__name__,
+                "published": published,
+                "read_batch_id": read_batch_id,
+            }
+            if boundary_known:
+                raw_output.update(exc.raw_output)
+            if not self.repository.mark_shadowbot_start_outcome(
+                execution_attempt_id,
+                owner_token=owner_token,
+                lease_version=lease_version,
+                attempt_status=attempt_status,
+                operation_status=operation_status,
+                instruction_hash=payload["instruction_hash"],
+                raw_output=raw_output,
+                ended_at=utc_now(),
+            ):
+                raise ValidationError("SHADOWBOT_LEASE_LOST_DURING_START") from exc
+            raise
+        if not start_result.shadowbot_run_id:
+            self.repository.mark_shadowbot_start_outcome(
+                execution_attempt_id,
+                owner_token=owner_token,
+                lease_version=lease_version,
+                attempt_status=STATUS_START_UNKNOWN,
+                operation_status=STATUS_NEEDS_RECONCILIATION,
+                instruction_hash=payload["instruction_hash"],
+                raw_output={"error_code": "RUNNER_START_ID_UNKNOWN", "read_batch_id": read_batch_id},
+                ended_at=utc_now(),
+            )
+            raise ValidationError("ShadowBot runner did not return shadowbot_run_id.")
+        if not self.repository.mark_shadowbot_start_outcome(
+            execution_attempt_id,
+            owner_token=owner_token,
+            lease_version=lease_version,
+            attempt_status=STATUS_RUNNING,
+            operation_status=OperationStatus.RUNNING.value,
+            shadowbot_run_id=start_result.shadowbot_run_id,
+            instruction_hash=str(start_result.raw_output.get("instruction_hash") or payload["instruction_hash"]),
+            request_file_sha256=str(start_result.raw_output.get("request_file_sha256") or ""),
+            queue_request_path=str(start_result.raw_output.get("queue_request_path") or ""),
+            raw_output=start_result.raw_output,
+        ):
+            raise ValidationError("SHADOWBOT_LEASE_LOST_DURING_START")
+        self._move_task_to_running(task_id, execution_attempt_id)
+        return ShadowBotExecutorStartResult(
+            operation_id=operation_id,
+            execution_attempt_id=execution_attempt_id,
             shadowbot_run_id=start_result.shadowbot_run_id,
             status=STATUS_RUNNING,
             side_effect_state=SIDE_EFFECT_NOT_STARTED,
@@ -1479,6 +1669,26 @@ def _validate_queue_request(payload: dict[str, Any]) -> None:
         raise ValidationError("ShadowBot queue expires_at must include a timezone.")
     if expires_at <= utc_now():
         raise ValidationError("ShadowBot queue request has expired.")
+
+
+def _validate_multi_product_queue_request(payload: dict[str, Any]) -> None:
+    """Validate task 11's v2 request without requiring single-product fields."""
+
+    normalized = normalize_multi_product_request(payload)
+    required = ("task_id", "operation_id", "execution_attempt_id", "created_at", "expires_at", "instruction_hash")
+    missing = [field_name for field_name in required if not str(payload.get(field_name) or "").strip()]
+    if missing:
+        raise ValidationError("ShadowBot v2 queue request is missing required fields: " + ", ".join(missing))
+    try:
+        expires_at = datetime.fromisoformat(str(payload["expires_at"]))
+    except ValueError as exc:
+        raise ValidationError("ShadowBot v2 queue expires_at must be ISO-8601.") from exc
+    if expires_at.tzinfo is None or expires_at <= utc_now():
+        raise ValidationError("ShadowBot v2 queue request has expired.")
+    if str(payload.get("instruction_hash")) != compute_multi_product_instruction_hash(payload):
+        raise ValidationError("multi-product instruction_hash mismatch")
+    if normalized["read_batch_id"] != payload.get("read_batch_id"):
+        raise ValidationError("multi-product read_batch_id normalization mismatch")
 
 
 def _canonical_file_json(payload: dict[str, Any]) -> bytes:
