@@ -28,11 +28,13 @@ python scripts/build_task11_three_round_handoff.py
 - 先用自然语言给出本次实机测试是否通过；
 - 按商品逐项列出商品名称、等级、读取结果、库存、价格和上架状态；
 - 展示排序前后、任务/运行/操作/读取批次 ID；
-- 为每个商品列出页面位置和逐商品证据 ID、上传状态、哈希校验；
+- 为每个商品列出页面位置；逐商品截图/证据仅在显式调试或异常诊断时列出，未提供时明确标注“未启用或未提供”，不作为 READ_ONLY 成功门槛；
 - 展示数据库回读的 attempt、execution log、结果 ID 和请求哈希一致性；
 - 展示 `total=processed` 以及 `processed=success+failed+skipped+manual_check` 计数恒等式；
 - 用一句话说明队列是否正常收尾、是否产生业务副作用；
 - 以 UTF-8 写入并支持 UTF-8-SIG 输入 JSON；
 - 在测试中回读报告，检查替换字符和意外问号。
+
+第17节口径：结构化可访问性树读取、名称/等级匹配、价格、库存、ONLINE、phase、计数、Importer、数据库回读和无副作用检查是成功判定依据。截图是可选诊断产物，默认关闭；截图失败不得把结构化读取成功降级为失败。
 
 对应测试位于 `tests/test_shadowbot_markdown_report.py`。

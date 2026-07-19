@@ -147,7 +147,7 @@ def _render_item(item: dict[str, Any]) -> str:
     evidence_text = "；".join(
         f"{entry.get('evidence_id')}（上传 {entry.get('upload_status')}，哈希校验 {entry.get('hash_verified')}）"
         for entry in evidence
-    ) or "无"
+    ) or "未启用或未提供（按第17节不影响 READ_ONLY 成功判定）"
     return (
         f"| {item['position']} | {item['product_name']} | {item['grade']} | {item['platform_sku']} | "
         f"{item['inventory']} | ¥{item['price']} | {item['listing_status']} | {item['item_status']} | "
@@ -180,6 +180,7 @@ def render_round(round_data: dict[str, Any]) -> str:
 - 执行模式：`{round_data['execution_mode']}`
 - 结果：`{round_data['result_status']}` / `overall_status={round_data['overall_status']}`
 - 页面排序：等级优先；实际顺序：{' → '.join(round_data['observed_order'])}
+- 截图/逐商品证据：仅在显式调试请求时生成；本轮证据为空不影响结构化 READ_ONLY 成功。
 
 ## JSON 与哈希证据
 
@@ -191,7 +192,7 @@ def render_round(round_data: dict[str, Any]) -> str:
 
 ## 逐商品结果
 
-| 位置 | 商品 | 等级 | 目标 SKU/身份键 | 库存 | 价格 | 状态 | 结果 | 行定位 | 证据 |
+| 位置 | 商品 | 等级 | 目标 SKU/身份键 | 库存 | 价格 | 状态 | 结果 | 行定位 | 证据（可选） |
 |---:|---|---|---|---:|---:|---|---|---|---|
 {rows}
 
@@ -201,6 +202,7 @@ def render_round(round_data: dict[str, Any]) -> str:
 - 本轮检查项：`{len(round_data['checks'])}` 项，全部通过。
 - 最终 phase：`{round_data['phase'].get('phase')}`；`side_effect_state={round_data['phase'].get('side_effect_state')}`。
 - `business_operation_completed=false`，本轮没有改价、改库存、上下架或提交等业务写操作。
+- 逐商品截图/证据是可选调试产物；若未提供，不影响本轮结构化读取判定。
 
 > 注：目标 SKU/身份键来自请求；当前小程序商品卡不暴露 SKU，因此本轮成功证明的是名称、等级、库存、价格和上架状态读取，不证明 SKU 页面回读。
 """
@@ -252,7 +254,7 @@ def render_handoff(summary: dict[str, Any]) -> str:
 |---:|---|---|---|---:|---:|---|
 {chr(10).join(product_rows)}
 
-三轮每轮均为 `READ_COMPLETED/COMPLETED`，计数恒等式均为 `5 = 5 + 0 + 0 + 0`，每个商品均有 `PRODUCT_READ` 证据，上传成功且哈希校验通过。
+三轮每轮均为 `READ_COMPLETED/COMPLETED`，计数恒等式均为 `5 = 5 + 0 + 0 + 0`。截图/逐商品证据默认关闭；若显式开启并提供证据，才校验 `PRODUCT_READ`、上传状态和哈希绑定；证据为空不影响结构化读取通过。
 
 ## 分轮 Markdown 报告
 
