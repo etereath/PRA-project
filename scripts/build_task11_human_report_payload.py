@@ -140,6 +140,7 @@ def build_payload(
     archive_dir: Path,
     runtime_db: Path,
     sort_acceptance: Path,
+    queue_root: Path | None = None,
 ) -> dict[str, Any]:
     request_path = next(archive_dir.glob("*.request.json"))
     result_path = next(archive_dir.glob("*.result.json"))
@@ -172,6 +173,7 @@ def build_payload(
                 "listing_status": snapshot.get("listing_status"),
                 "item_status": snapshot.get("item_status"),
                 "error_code": snapshot.get("error_code"),
+                "evidence_status": snapshot.get("evidence_status"),
                 "item_id": snapshot.get("item_id"),
                 "row_identity": snapshot.get("row_identity"),
                 "evidence": [
@@ -203,7 +205,7 @@ def build_payload(
         result=result,
         request_hash=request_hash,
     )
-    queue_root = Path(r"D:\PRA_Runtime\shadowbot_queue")
+    queue_root = queue_root or Path(r"D:\PRA_Runtime\shadowbot_queue")
     heartbeat = _load(queue_root / "heartbeat.json")
     queue_state = {
         "heartbeat_status": heartbeat.get("status"),
@@ -212,14 +214,15 @@ def build_payload(
         "results_empty": not any((queue_root / "results").iterdir()),
         "stop_signal_present": (queue_root / "control" / "stop.signal").exists(),
     }
-    evidence_passed = all(
-        item["item_status"] == "SUCCESS"
-        and item["evidence"]
-        and all(
-            ev.get("upload_status") == "SUCCESS" and ev.get("hash_verified") is True
-            for ev in item["evidence"]
-        )
+    capture_requested = bool(
+        request.get("capture_evidence") is True
+        or result.get("evidence_capture_enabled") is True
+    )
+    evidence_present_count = sum(bool(item["evidence"]) for item in evidence_results)
+    evidence_failed_count = sum(
+        1
         for item in evidence_results
+        if str(item.get("evidence_status") or "").upper() == "FAILED"
     )
     validation_passed = bool(
         result.get("status") == "READ_COMPLETED"
@@ -227,7 +230,6 @@ def build_payload(
         and result.get("execution_mode") == "READ_ONLY"
         and result.get("business_operation_completed") is False
         and result.get("side_effect_state") == "NOT_STARTED"
-        and evidence_passed
         and counts["passed"]
         and database["readback_passed"]
         and queue_state["heartbeat_status"] == "STOPPED"
@@ -248,6 +250,13 @@ def build_payload(
         "side_effect_started": result.get("business_operation_completed") is True
         or result.get("side_effect_state") != "NOT_STARTED",
         "validation_passed": validation_passed,
+        "evidence_policy": {
+            "capture_requested": capture_requested,
+            "required_for_success": False,
+            "present_item_count": evidence_present_count,
+            "diagnostic_failure_item_count": evidence_failed_count,
+            "note": "第17节：截图/逐商品证据为可选调试产物，不是 READ_ONLY 成功门槛。",
+        },
         "source_files": {
             "archive_dir": str(archive_dir),
             "runtime_db": str(runtime_db),

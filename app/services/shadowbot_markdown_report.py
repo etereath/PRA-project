@@ -58,6 +58,16 @@ def render_formal_boundary_markdown(payload: Mapping[str, Any]) -> str:
     database = _require_mapping(report.get("database_readback"), "database_readback")
     queue = _require_mapping(report.get("final_queue_state"), "final_queue_state")
     encoding = _require_mapping(report.get("encoding_check"), "encoding_check")
+    evidence_policy = report.get("evidence_policy")
+    if not isinstance(evidence_policy, Mapping):
+        evidence_policy = {
+            "capture_requested": False,
+            "required_for_success": False,
+            "present_item_count": sum(
+                bool(item.get("evidence")) for item in results
+            ),
+            "diagnostic_failure_item_count": 0,
+        }
 
     status = _status(report.get("overall_status"))
     conclusion = "本次实机测试通过。" if status == "PASSED" else "本次实机测试未通过。"
@@ -100,6 +110,12 @@ def render_formal_boundary_markdown(payload: Mapping[str, Any]) -> str:
         f"- 操作 ID：`{_string(run.get('operation_id'))}`",
         f"- 读取批次 ID：`{_string(run.get('read_batch_id'))}`",
         f"- 影刀运行 ID：`{_string(run.get('shadowbot_run_id'))}`",
+        (
+            "- 截图/逐商品证据："
+            f"{'已显式请求' if bool(evidence_policy.get('capture_requested')) else '未启用'}；"
+            f"已提供 {_string(evidence_policy.get('present_item_count'), '0')} 个商品的证据；"
+            "证据为可选调试产物，不影响 READ_ONLY 成功判定。"
+        ),
         "",
         "## 排序前后",
         "",
@@ -122,7 +138,7 @@ def render_formal_boundary_markdown(payload: Mapping[str, Any]) -> str:
             f"哈希校验{ '通过' if first_evidence.get('hash_verified') is True else '未通过' }；"
             f"证据 ID `{_string(first_evidence.get('evidence_id'))}`"
             if evidence
-            else "无证据"
+            else "未启用或未提供（按第17节不影响 READ_ONLY 成功判定）"
         )
         if item_status == "SUCCESS":
             result_line = (

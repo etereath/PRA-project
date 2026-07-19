@@ -112,6 +112,21 @@ class ShadowBotMarkdownReportTests(unittest.TestCase):
         self.assertNotIn("DUPLICATE_TARGET_IDENTITY", markdown)
         self.assertNotIn("\ufffd", markdown)
 
+    def test_render_accepts_success_without_screenshot_evidence(self):
+        payload = _payload()
+        payload["test_results"][0]["evidence"] = []
+        payload["evidence_policy"] = {
+            "capture_requested": False,
+            "required_for_success": False,
+            "present_item_count": 0,
+        }
+
+        markdown = render_formal_boundary_markdown(payload)
+
+        self.assertIn("截图/逐商品证据：未启用", markdown)
+        self.assertIn("证据为可选调试产物，不影响 READ_ONLY 成功判定", markdown)
+        self.assertIn("未启用或未提供（按第17节不影响 READ_ONLY 成功判定）", markdown)
+
     def test_write_round_trips_explicit_utf8(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

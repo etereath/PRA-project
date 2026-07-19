@@ -160,10 +160,17 @@ def verify_acceptance(
         check("phase_result_written", phase.get("phase") == "RESULT_WRITTEN", phase.get("phase"))
         check("phase_worker_recorded", bool(phase.get("worker_id")), phase.get("worker_id"))
 
+    # Task 11 contract v2 follows Section 17: screenshots are optional
+    # diagnostics, so the verifier must not make them a READ_ONLY gate.
+    is_v2_multi_product_read = (
+        execution_mode == "READ_ONLY"
+        and result.get("contract_version") == 2
+        and isinstance(result.get("product_snapshots"), list)
+    )
     evidence = result.get("evidence")
-    if profile == "NORMAL":
+    if profile == "NORMAL" and not is_v2_multi_product_read:
         check("evidence_present", isinstance(evidence, list) and bool(evidence), len(evidence) if isinstance(evidence, list) else 0)
-    if profile == "NORMAL" and isinstance(evidence, list):
+    if profile == "NORMAL" and not is_v2_multi_product_read and isinstance(evidence, list):
         for index, item in enumerate(evidence, start=1):
             if not isinstance(item, dict):
                 check(f"evidence_{index}_object", False, type(item).__name__)
@@ -183,6 +190,8 @@ def verify_acceptance(
                         storage_hash == item.get("storage_sha256") == item.get("sha256"),
                         storage_hash,
                     )
+    elif profile == "NORMAL" and is_v2_multi_product_read:
+        check("v2_evidence_optional", True, "Section 17: structured READ_ONLY success does not require screenshots")
 
     active_files = []
     for directory in ("inbox", "working", "results"):
