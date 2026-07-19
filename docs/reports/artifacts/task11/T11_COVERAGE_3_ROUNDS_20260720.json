@@ -1,0 +1,571 @@
+{
+  "schema_version": "shadowbot-t11-three-round-handoff-1.0",
+  "generated_at": "2026-07-19T18:47:17.967723+00:00",
+  "task": "任务11",
+  "platform": "蚂蚁花团供应商",
+  "execution_mode": "READ_ONLY",
+  "conclusion": "三轮连续 READ_ONLY 均通过；每轮 5/5 成功；未产生业务副作用。",
+  "sort_rule": "等级优先",
+  "sort_order": [
+    "卡布奇诺 B级",
+    "艾莎 B级",
+    "艾莎 C级",
+    "卡布奇诺 C级",
+    "艾莎 D级"
+  ],
+  "sku_note": "platform_sku 是请求中的目标身份键；当前商品卡可访问性树不暴露 SKU，因此不把它称为页面回读值。",
+  "rounds": [
+    {
+      "round": "R1",
+      "attempt_id": "ATTEMPT-T11-COVERAGE-R1-20260719-225159",
+      "task_id": "TASK-T11-COVERAGE-R1-20260719-225159",
+      "operation_id": "READ-READ-BATCH-T11-COVERAGE-R1-20260719-225159",
+      "read_batch_id": "READ-BATCH-T11-COVERAGE-R1-20260719-225159",
+      "execution_mode": "READ_ONLY",
+      "result_status": "READ_COMPLETED",
+      "overall_status": "COMPLETED",
+      "counts": {
+        "total_count": 5,
+        "processed_count": 5,
+        "success_count": 5,
+        "failed_count": 0,
+        "skipped_count": 0,
+        "manual_check_count": 0
+      },
+      "observed_order": [
+        "卡布奇诺 B级",
+        "艾莎 B级",
+        "艾莎 C级",
+        "卡布奇诺 C级",
+        "艾莎 D级"
+      ],
+      "items": [
+        {
+          "position": 1,
+          "item_id": "ITEM-CAPPUCCINO-B-COVERAGE-R1-20260719-225159",
+          "product_name": "卡布奇诺",
+          "grade": "B级",
+          "platform_sku": "SKU-CAPPUCCINO-B",
+          "inventory": 1,
+          "price": "24.00",
+          "listing_status": "ONLINE",
+          "item_status": "SUCCESS",
+          "row_identity": "parent-index:1",
+          "locator_summary": "parent_index=1",
+          "evidence": [
+            {
+              "evidence_id": "EVD-READ-BATCH-T11-COVERAGE-R1-20260719-225159-ITEM-CAPPUCCINO-B-COVERAGE-R1-20260719-225159",
+              "upload_status": "SUCCESS",
+              "hash_verified": true,
+              "sha256": "588173d371872a11f3933e3c51d3cb66cbcddaf52ff7d122d8166ee0a9d6d9f6"
+            }
+          ]
+        },
+        {
+          "position": 2,
+          "item_id": "ITEM-AISHA-B-COVERAGE-R1-20260719-225159",
+          "product_name": "艾莎",
+          "grade": "B级",
+          "platform_sku": "SKU-AISHA-B",
+          "inventory": 19,
+          "price": "8.60",
+          "listing_status": "ONLINE",
+          "item_status": "SUCCESS",
+          "row_identity": "parent-index:17",
+          "locator_summary": "parent_index=17",
+          "evidence": [
+            {
+              "evidence_id": "EVD-READ-BATCH-T11-COVERAGE-R1-20260719-225159-ITEM-AISHA-B-COVERAGE-R1-20260719-225159",
+              "upload_status": "SUCCESS",
+              "hash_verified": true,
+              "sha256": "588173d371872a11f3933e3c51d3cb66cbcddaf52ff7d122d8166ee0a9d6d9f6"
+            }
+          ]
+        },
+        {
+          "position": 3,
+          "item_id": "ITEM-AISHA-C-COVERAGE-R1-20260719-225159",
+          "product_name": "艾莎",
+          "grade": "C级",
+          "platform_sku": "SKU-AISHA-C",
+          "inventory": 20,
+          "price": "6.00",
+          "listing_status": "ONLINE",
+          "item_status": "SUCCESS",
+          "row_identity": "parent-index:33",
+          "locator_summary": "parent_index=33",
+          "evidence": [
+            {
+              "evidence_id": "EVD-READ-BATCH-T11-COVERAGE-R1-20260719-225159-ITEM-AISHA-C-COVERAGE-R1-20260719-225159",
+              "upload_status": "SUCCESS",
+              "hash_verified": true,
+              "sha256": "588173d371872a11f3933e3c51d3cb66cbcddaf52ff7d122d8166ee0a9d6d9f6"
+            }
+          ]
+        },
+        {
+          "position": 4,
+          "item_id": "ITEM-CAPPUCCINO-C-COVERAGE-R1-20260719-225159",
+          "product_name": "卡布奇诺",
+          "grade": "C级",
+          "platform_sku": "SKU-CAPPUCCINO-C",
+          "inventory": 1,
+          "price": "16.80",
+          "listing_status": "ONLINE",
+          "item_status": "SUCCESS",
+          "row_identity": "parent-index:49",
+          "locator_summary": "parent_index=49",
+          "evidence": [
+            {
+              "evidence_id": "EVD-READ-BATCH-T11-COVERAGE-R1-20260719-225159-ITEM-CAPPUCCINO-C-COVERAGE-R1-20260719-225159",
+              "upload_status": "SUCCESS",
+              "hash_verified": true,
+              "sha256": "588173d371872a11f3933e3c51d3cb66cbcddaf52ff7d122d8166ee0a9d6d9f6"
+            }
+          ]
+        },
+        {
+          "position": 5,
+          "item_id": "ITEM-AISHA-D-COVERAGE-R1-20260719-225159",
+          "product_name": "艾莎",
+          "grade": "D级",
+          "platform_sku": "SKU-AISHA-D",
+          "inventory": 6,
+          "price": "5.00",
+          "listing_status": "ONLINE",
+          "item_status": "SUCCESS",
+          "row_identity": "parent-index:65",
+          "locator_summary": "parent_index=65",
+          "evidence": [
+            {
+              "evidence_id": "EVD-READ-BATCH-T11-COVERAGE-R1-20260719-225159-ITEM-AISHA-D-COVERAGE-R1-20260719-225159",
+              "upload_status": "SUCCESS",
+              "hash_verified": true,
+              "sha256": "588173d371872a11f3933e3c51d3cb66cbcddaf52ff7d122d8166ee0a9d6d9f6"
+            }
+          ]
+        }
+      ],
+      "all_pass": true,
+      "checks": {
+        "request_utf8_names": true,
+        "request_sidecar": true,
+        "result_sidecar": true,
+        "overall_status": true,
+        "execution_mode": true,
+        "total_count": true,
+        "processed_count": true,
+        "success_count": true,
+        "failed_count": true,
+        "skipped_count": true,
+        "manual_check_count": true,
+        "business_operation_completed": true,
+        "side_effect_state": true,
+        "phase": true,
+        "item_1": true,
+        "item_2": true,
+        "item_3": true,
+        "item_4": true,
+        "item_5": true
+      },
+      "phase": {
+        "contract_version": 2,
+        "execution_attempt_id": "ATTEMPT-T11-COVERAGE-R1-20260719-225159",
+        "execution_mode": "READ_ONLY",
+        "instruction_hash": "sha256:06e9c8b2923667e33ffcab8313d7f3bbe0ab6b2361b112d93505cf37616c2cf3",
+        "lease_owner_token": "",
+        "lease_version": 0,
+        "operation_id": "READ-READ-BATCH-T11-COVERAGE-R1-20260719-225159",
+        "phase": "RESULT_WRITTEN",
+        "read_batch_id": "READ-BATCH-T11-COVERAGE-R1-20260719-225159",
+        "request_file_sha256": "668eb6a5a5292b7ba3fd8c14669dfdaf40fea6fcf9e43d4f59326abce5823121",
+        "side_effect_state": "NOT_STARTED",
+        "task_id": "TASK-T11-COVERAGE-R1-20260719-225159",
+        "total_count": 5,
+        "updated_at": "2026-07-19T14:53:06.236040+00:00",
+        "worker_id": "LAPTOP-O9O76RQV"
+      },
+      "request_sha256": "668eb6a5a5292b7ba3fd8c14669dfdaf40fea6fcf9e43d4f59326abce5823121",
+      "result_sha256": "9b9e3c40e96f987ae13db4d1934b0f54616469ff464c52570bd8b10e60fd2866",
+      "artifacts": {
+        "request_json": "artifacts/task11/coverage-r1/ATTEMPT-T11-COVERAGE-R1-20260719-225159.request.json",
+        "result_json": "artifacts/task11/coverage-r1/ATTEMPT-T11-COVERAGE-R1-20260719-225159.result.json",
+        "validation_json": "artifacts/task11/coverage-r1/validation.json",
+        "request_sha256": "artifacts/task11/coverage-r1/ATTEMPT-T11-COVERAGE-R1-20260719-225159.request.json.sha256",
+        "result_sha256": "artifacts/task11/coverage-r1/ATTEMPT-T11-COVERAGE-R1-20260719-225159.result.json.sha256"
+      }
+    },
+    {
+      "round": "R2",
+      "attempt_id": "ATTEMPT-T11-COVERAGE-R2-20260719-225443",
+      "task_id": "TASK-T11-COVERAGE-R2-20260719-225443",
+      "operation_id": "READ-READ-BATCH-T11-COVERAGE-R2-20260719-225443",
+      "read_batch_id": "READ-BATCH-T11-COVERAGE-R2-20260719-225443",
+      "execution_mode": "READ_ONLY",
+      "result_status": "READ_COMPLETED",
+      "overall_status": "COMPLETED",
+      "counts": {
+        "total_count": 5,
+        "processed_count": 5,
+        "success_count": 5,
+        "failed_count": 0,
+        "skipped_count": 0,
+        "manual_check_count": 0
+      },
+      "observed_order": [
+        "卡布奇诺 B级",
+        "艾莎 B级",
+        "艾莎 C级",
+        "卡布奇诺 C级",
+        "艾莎 D级"
+      ],
+      "items": [
+        {
+          "position": 1,
+          "item_id": "ITEM-CAPPUCCINO-B-COVERAGE-R2-20260719-225443",
+          "product_name": "卡布奇诺",
+          "grade": "B级",
+          "platform_sku": "SKU-CAPPUCCINO-B",
+          "inventory": 1,
+          "price": "24.00",
+          "listing_status": "ONLINE",
+          "item_status": "SUCCESS",
+          "row_identity": "parent-index:1",
+          "locator_summary": "parent_index=1",
+          "evidence": [
+            {
+              "evidence_id": "EVD-READ-BATCH-T11-COVERAGE-R2-20260719-225443-ITEM-CAPPUCCINO-B-COVERAGE-R2-20260719-225443",
+              "upload_status": "SUCCESS",
+              "hash_verified": true,
+              "sha256": "678937c6c3d22cd660454a8aa924c1f614d46bce12402cb8897465c748e38fa8"
+            }
+          ]
+        },
+        {
+          "position": 2,
+          "item_id": "ITEM-AISHA-B-COVERAGE-R2-20260719-225443",
+          "product_name": "艾莎",
+          "grade": "B级",
+          "platform_sku": "SKU-AISHA-B",
+          "inventory": 19,
+          "price": "8.60",
+          "listing_status": "ONLINE",
+          "item_status": "SUCCESS",
+          "row_identity": "parent-index:17",
+          "locator_summary": "parent_index=17",
+          "evidence": [
+            {
+              "evidence_id": "EVD-READ-BATCH-T11-COVERAGE-R2-20260719-225443-ITEM-AISHA-B-COVERAGE-R2-20260719-225443",
+              "upload_status": "SUCCESS",
+              "hash_verified": true,
+              "sha256": "678937c6c3d22cd660454a8aa924c1f614d46bce12402cb8897465c748e38fa8"
+            }
+          ]
+        },
+        {
+          "position": 3,
+          "item_id": "ITEM-AISHA-C-COVERAGE-R2-20260719-225443",
+          "product_name": "艾莎",
+          "grade": "C级",
+          "platform_sku": "SKU-AISHA-C",
+          "inventory": 20,
+          "price": "6.00",
+          "listing_status": "ONLINE",
+          "item_status": "SUCCESS",
+          "row_identity": "parent-index:33",
+          "locator_summary": "parent_index=33",
+          "evidence": [
+            {
+              "evidence_id": "EVD-READ-BATCH-T11-COVERAGE-R2-20260719-225443-ITEM-AISHA-C-COVERAGE-R2-20260719-225443",
+              "upload_status": "SUCCESS",
+              "hash_verified": true,
+              "sha256": "678937c6c3d22cd660454a8aa924c1f614d46bce12402cb8897465c748e38fa8"
+            }
+          ]
+        },
+        {
+          "position": 4,
+          "item_id": "ITEM-CAPPUCCINO-C-COVERAGE-R2-20260719-225443",
+          "product_name": "卡布奇诺",
+          "grade": "C级",
+          "platform_sku": "SKU-CAPPUCCINO-C",
+          "inventory": 1,
+          "price": "16.80",
+          "listing_status": "ONLINE",
+          "item_status": "SUCCESS",
+          "row_identity": "parent-index:49",
+          "locator_summary": "parent_index=49",
+          "evidence": [
+            {
+              "evidence_id": "EVD-READ-BATCH-T11-COVERAGE-R2-20260719-225443-ITEM-CAPPUCCINO-C-COVERAGE-R2-20260719-225443",
+              "upload_status": "SUCCESS",
+              "hash_verified": true,
+              "sha256": "678937c6c3d22cd660454a8aa924c1f614d46bce12402cb8897465c748e38fa8"
+            }
+          ]
+        },
+        {
+          "position": 5,
+          "item_id": "ITEM-AISHA-D-COVERAGE-R2-20260719-225443",
+          "product_name": "艾莎",
+          "grade": "D级",
+          "platform_sku": "SKU-AISHA-D",
+          "inventory": 6,
+          "price": "5.00",
+          "listing_status": "ONLINE",
+          "item_status": "SUCCESS",
+          "row_identity": "parent-index:65",
+          "locator_summary": "parent_index=65",
+          "evidence": [
+            {
+              "evidence_id": "EVD-READ-BATCH-T11-COVERAGE-R2-20260719-225443-ITEM-AISHA-D-COVERAGE-R2-20260719-225443",
+              "upload_status": "SUCCESS",
+              "hash_verified": true,
+              "sha256": "678937c6c3d22cd660454a8aa924c1f614d46bce12402cb8897465c748e38fa8"
+            }
+          ]
+        }
+      ],
+      "all_pass": true,
+      "checks": {
+        "request_sidecar": true,
+        "result_sidecar": true,
+        "overall_status": true,
+        "execution_mode": true,
+        "total_count": true,
+        "processed_count": true,
+        "success_count": true,
+        "failed_count": true,
+        "skipped_count": true,
+        "manual_check_count": true,
+        "business_operation_completed": true,
+        "side_effect_state": true,
+        "phase": true,
+        "item_1": true,
+        "item_2": true,
+        "item_3": true,
+        "item_4": true,
+        "item_5": true
+      },
+      "phase": {
+        "contract_version": 2,
+        "execution_attempt_id": "ATTEMPT-T11-COVERAGE-R2-20260719-225443",
+        "execution_mode": "READ_ONLY",
+        "instruction_hash": "sha256:3b8ec37081dee27929ace7e732db6fcd77ae379a5851137619a1c40f41565c7f",
+        "lease_owner_token": "",
+        "lease_version": 0,
+        "operation_id": "READ-READ-BATCH-T11-COVERAGE-R2-20260719-225443",
+        "phase": "RESULT_WRITTEN",
+        "read_batch_id": "READ-BATCH-T11-COVERAGE-R2-20260719-225443",
+        "request_file_sha256": "635da6d9c6da990c0af0b3bedb7bd4b5dc9e7f3d5256bc91bfe8b7671d6d9979",
+        "side_effect_state": "NOT_STARTED",
+        "task_id": "TASK-T11-COVERAGE-R2-20260719-225443",
+        "total_count": 5,
+        "updated_at": "2026-07-19T14:55:40.712743+00:00",
+        "worker_id": "LAPTOP-O9O76RQV"
+      },
+      "request_sha256": "635da6d9c6da990c0af0b3bedb7bd4b5dc9e7f3d5256bc91bfe8b7671d6d9979",
+      "result_sha256": "d02d312dee3185f1d11ad1f09461c3df14dcc7d858f2b352974667ca3d36a380",
+      "artifacts": {
+        "request_json": "artifacts/task11/coverage-r2/ATTEMPT-T11-COVERAGE-R2-20260719-225443.request.json",
+        "result_json": "artifacts/task11/coverage-r2/ATTEMPT-T11-COVERAGE-R2-20260719-225443.result.json",
+        "validation_json": "artifacts/task11/coverage-r2/validation.json",
+        "request_sha256": "artifacts/task11/coverage-r2/ATTEMPT-T11-COVERAGE-R2-20260719-225443.request.json.sha256",
+        "result_sha256": "artifacts/task11/coverage-r2/ATTEMPT-T11-COVERAGE-R2-20260719-225443.result.json.sha256"
+      }
+    },
+    {
+      "round": "R3",
+      "attempt_id": "ATTEMPT-T11-COVERAGE-R3-20260719-225645",
+      "task_id": "TASK-T11-COVERAGE-R3-20260719-225645",
+      "operation_id": "READ-READ-BATCH-T11-COVERAGE-R3-20260719-225645",
+      "read_batch_id": "READ-BATCH-T11-COVERAGE-R3-20260719-225645",
+      "execution_mode": "READ_ONLY",
+      "result_status": "READ_COMPLETED",
+      "overall_status": "COMPLETED",
+      "counts": {
+        "total_count": 5,
+        "processed_count": 5,
+        "success_count": 5,
+        "failed_count": 0,
+        "skipped_count": 0,
+        "manual_check_count": 0
+      },
+      "observed_order": [
+        "卡布奇诺 B级",
+        "艾莎 B级",
+        "艾莎 C级",
+        "卡布奇诺 C级",
+        "艾莎 D级"
+      ],
+      "items": [
+        {
+          "position": 1,
+          "item_id": "ITEM-CAPPUCCINO-B-COVERAGE-R3-20260719-225645",
+          "product_name": "卡布奇诺",
+          "grade": "B级",
+          "platform_sku": "SKU-CAPPUCCINO-B",
+          "inventory": 1,
+          "price": "24.00",
+          "listing_status": "ONLINE",
+          "item_status": "SUCCESS",
+          "row_identity": "parent-index:1",
+          "locator_summary": "parent_index=1",
+          "evidence": [
+            {
+              "evidence_id": "EVD-READ-BATCH-T11-COVERAGE-R3-20260719-225645-ITEM-CAPPUCCINO-B-COVERAGE-R3-20260719-225645",
+              "upload_status": "SUCCESS",
+              "hash_verified": true,
+              "sha256": "2c1903d4ce23bbf80d01c016754769a21f9f838c4412af7d9ea475dc63d0bd3b"
+            }
+          ]
+        },
+        {
+          "position": 2,
+          "item_id": "ITEM-AISHA-B-COVERAGE-R3-20260719-225645",
+          "product_name": "艾莎",
+          "grade": "B级",
+          "platform_sku": "SKU-AISHA-B",
+          "inventory": 19,
+          "price": "8.60",
+          "listing_status": "ONLINE",
+          "item_status": "SUCCESS",
+          "row_identity": "parent-index:17",
+          "locator_summary": "parent_index=17",
+          "evidence": [
+            {
+              "evidence_id": "EVD-READ-BATCH-T11-COVERAGE-R3-20260719-225645-ITEM-AISHA-B-COVERAGE-R3-20260719-225645",
+              "upload_status": "SUCCESS",
+              "hash_verified": true,
+              "sha256": "2c1903d4ce23bbf80d01c016754769a21f9f838c4412af7d9ea475dc63d0bd3b"
+            }
+          ]
+        },
+        {
+          "position": 3,
+          "item_id": "ITEM-AISHA-C-COVERAGE-R3-20260719-225645",
+          "product_name": "艾莎",
+          "grade": "C级",
+          "platform_sku": "SKU-AISHA-C",
+          "inventory": 20,
+          "price": "6.00",
+          "listing_status": "ONLINE",
+          "item_status": "SUCCESS",
+          "row_identity": "parent-index:33",
+          "locator_summary": "parent_index=33",
+          "evidence": [
+            {
+              "evidence_id": "EVD-READ-BATCH-T11-COVERAGE-R3-20260719-225645-ITEM-AISHA-C-COVERAGE-R3-20260719-225645",
+              "upload_status": "SUCCESS",
+              "hash_verified": true,
+              "sha256": "2c1903d4ce23bbf80d01c016754769a21f9f838c4412af7d9ea475dc63d0bd3b"
+            }
+          ]
+        },
+        {
+          "position": 4,
+          "item_id": "ITEM-CAPPUCCINO-C-COVERAGE-R3-20260719-225645",
+          "product_name": "卡布奇诺",
+          "grade": "C级",
+          "platform_sku": "SKU-CAPPUCCINO-C",
+          "inventory": 1,
+          "price": "16.80",
+          "listing_status": "ONLINE",
+          "item_status": "SUCCESS",
+          "row_identity": "parent-index:49",
+          "locator_summary": "parent_index=49",
+          "evidence": [
+            {
+              "evidence_id": "EVD-READ-BATCH-T11-COVERAGE-R3-20260719-225645-ITEM-CAPPUCCINO-C-COVERAGE-R3-20260719-225645",
+              "upload_status": "SUCCESS",
+              "hash_verified": true,
+              "sha256": "2c1903d4ce23bbf80d01c016754769a21f9f838c4412af7d9ea475dc63d0bd3b"
+            }
+          ]
+        },
+        {
+          "position": 5,
+          "item_id": "ITEM-AISHA-D-COVERAGE-R3-20260719-225645",
+          "product_name": "艾莎",
+          "grade": "D级",
+          "platform_sku": "SKU-AISHA-D",
+          "inventory": 6,
+          "price": "5.00",
+          "listing_status": "ONLINE",
+          "item_status": "SUCCESS",
+          "row_identity": "parent-index:65",
+          "locator_summary": "parent_index=65",
+          "evidence": [
+            {
+              "evidence_id": "EVD-READ-BATCH-T11-COVERAGE-R3-20260719-225645-ITEM-AISHA-D-COVERAGE-R3-20260719-225645",
+              "upload_status": "SUCCESS",
+              "hash_verified": true,
+              "sha256": "2c1903d4ce23bbf80d01c016754769a21f9f838c4412af7d9ea475dc63d0bd3b"
+            }
+          ]
+        }
+      ],
+      "all_pass": true,
+      "checks": {
+        "request_sidecar": true,
+        "result_sidecar": true,
+        "overall_status": true,
+        "execution_mode": true,
+        "total_count": true,
+        "processed_count": true,
+        "success_count": true,
+        "failed_count": true,
+        "skipped_count": true,
+        "manual_check_count": true,
+        "business_operation_completed": true,
+        "side_effect_state": true,
+        "phase": true,
+        "item_1": true,
+        "item_2": true,
+        "item_3": true,
+        "item_4": true,
+        "item_5": true
+      },
+      "phase": {
+        "contract_version": 2,
+        "execution_attempt_id": "ATTEMPT-T11-COVERAGE-R3-20260719-225645",
+        "execution_mode": "READ_ONLY",
+        "instruction_hash": "sha256:db83ddb5ffd4728dc9bc0aa2bd14c6eb38cba4e2fd9b5abeecf1477b19dbe936",
+        "lease_owner_token": "",
+        "lease_version": 0,
+        "operation_id": "READ-READ-BATCH-T11-COVERAGE-R3-20260719-225645",
+        "phase": "RESULT_WRITTEN",
+        "read_batch_id": "READ-BATCH-T11-COVERAGE-R3-20260719-225645",
+        "request_file_sha256": "668798ee25e88a67b1725589f62802d1fb680fdd4a3dc929fe2b5af39b0a862c",
+        "side_effect_state": "NOT_STARTED",
+        "task_id": "TASK-T11-COVERAGE-R3-20260719-225645",
+        "total_count": 5,
+        "updated_at": "2026-07-19T14:57:37.787853+00:00",
+        "worker_id": "LAPTOP-O9O76RQV"
+      },
+      "request_sha256": "668798ee25e88a67b1725589f62802d1fb680fdd4a3dc929fe2b5af39b0a862c",
+      "result_sha256": "58a36e64f9354241adbfa782c35b90aa9ff2b70a767f8305aaad5bbc2549b91b",
+      "artifacts": {
+        "request_json": "artifacts/task11/coverage-r3/ATTEMPT-T11-COVERAGE-R3-20260719-225645.request.json",
+        "result_json": "artifacts/task11/coverage-r3/ATTEMPT-T11-COVERAGE-R3-20260719-225645.result.json",
+        "validation_json": "artifacts/task11/coverage-r3/validation.json",
+        "request_sha256": "artifacts/task11/coverage-r3/ATTEMPT-T11-COVERAGE-R3-20260719-225645.request.json.sha256",
+        "result_sha256": "artifacts/task11/coverage-r3/ATTEMPT-T11-COVERAGE-R3-20260719-225645.result.json.sha256"
+      }
+    }
+  ],
+  "count_identity": "5 = 5 + 0 + 0 + 0",
+  "final_queue_state": {
+    "heartbeat_status": "STOPPED",
+    "inbox_empty": true,
+    "working_empty": true,
+    "results_empty": true,
+    "stop_signal_present": false,
+    "business_side_effect": false
+  },
+  "other_reports": [
+    "docs/reports/shadowbot_t11_db_real_machine_20260720.md",
+    "docs/reports/shadowbot_t11_formal_boundary_acceptance_20260719.md",
+    "docs/reports/shadowbot_t11_report_real_machine_20260719.md"
+  ]
+}

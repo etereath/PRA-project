@@ -2,6 +2,10 @@
 
 **结论：本次实机测试通过。**
 
+## 三轮连续 READ_ONLY 交接索引
+
+三轮连续验收的每轮 JSON、Markdown、运行 ID、`read_batch_id`、逐商品证据、计数恒等式和队列收尾见：[三轮连续 READ_ONLY 交接报告](shadowbot_t11_three_round_readonly_handoff_20260720.md)。
+
 影刀在只读模式下读取 5 个目标，处理 5 个：成功 5 个，失败 0 个，跳过 0 个，人工复核 0 个。
 
 ## 运行信息

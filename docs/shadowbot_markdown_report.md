@@ -15,6 +15,14 @@ python scripts/build_task11_human_report_payload.py `
   --output-markdown docs\reports\shadowbot_t11_db_real_machine_20260720.md
 ```
 
+三轮连续 READ_ONLY 交接包使用：
+
+```powershell
+python scripts/build_task11_three_round_handoff.py
+```
+
+该命令会保留三轮请求/结果/校验 JSON 及 SHA-256 sidecar，并生成总交接报告和每轮 Markdown 报告。
+
 生成器会：
 
 - 先用自然语言给出本次实机测试是否通过；
