@@ -338,7 +338,7 @@ def test_fresh_read_older_than_sixty_seconds_is_rejected(prepared):
     assert repository.get_shadowbot_batch_item(batch.batch_id, item.item_id).error_code == "FRESH_READ_EXPIRED"
 
 
-def test_write_attempt_cannot_start_without_persisted_fresh_read(prepared):
+def test_diagnostic_preview_still_requires_persisted_fresh_read(prepared):
     repository, orchestrator, _, _, batch = prepared
     item = orchestrator.claim_next(batch.batch_id, now=NOW)
     with pytest.raises(PriceBatchContractError) as caught:
@@ -351,6 +351,22 @@ def test_write_attempt_cannot_start_without_persisted_fresh_read(prepared):
     assert caught.value.code == "FRESH_READ_EXPIRED"
     stored = repository.get_shadowbot_batch_item(batch.batch_id, item.item_id)
     assert stored.status == BatchItemStatus.FAILED.value
+
+
+def test_commit_attempt_starts_without_persisted_fresh_read(prepared_commit):
+    repository, orchestrator, _, _, batch = prepared_commit
+    item = orchestrator.claim_next(batch.batch_id, now=NOW)
+    orchestrator.bind_execution_attempt(
+        batch.batch_id,
+        item.item_id,
+        execution_attempt_id="ATTEMPT-DIRECT-COMMIT-001",
+        now=NOW,
+    )
+    stored = repository.get_shadowbot_batch_item(batch.batch_id, item.item_id)
+    assert stored.status == BatchItemStatus.RUNNING.value
+    assert stored.fresh_read_attempt_id == ""
+    assert stored.fresh_old_price is None
+    assert stored.current_execution_attempt_id == "ATTEMPT-DIRECT-COMMIT-001"
 
 
 def test_preview_post_read_must_still_equal_fresh_old_price(prepared):
@@ -397,7 +413,6 @@ def test_stop_before_claim_and_after_submit_boundary(prepared_commit):
     assert repository.get_shadowbot_batch(batch.batch_id).status == BatchStatus.PAUSED.value
     assert orchestrator.resume(batch.batch_id, actor="owner", now=NOW)
     first = orchestrator.claim_next(batch.batch_id, now=NOW)
-    _record_valid_fresh_read(orchestrator, batch.batch_id, first)
     orchestrator.bind_execution_attempt(
         batch.batch_id,
         first.item_id,
@@ -430,7 +445,6 @@ def test_stop_before_claim_and_after_submit_boundary(prepared_commit):
 def test_commit_verified_price_mismatch_routes_to_reconcile(prepared_commit):
     repository, orchestrator, _, _, batch = prepared_commit
     item = orchestrator.claim_next(batch.batch_id, now=NOW)
-    _record_valid_fresh_read(orchestrator, batch.batch_id, item)
     orchestrator.bind_execution_attempt(
         batch.batch_id,
         item.item_id,
@@ -473,7 +487,6 @@ def test_stop_before_submit_is_terminal_without_touching_next_item(prepared):
 def test_unknown_pauses_and_allows_only_one_reconcile(prepared_commit):
     repository, orchestrator, _, _, batch = prepared_commit
     item = orchestrator.claim_next(batch.batch_id, now=NOW)
-    _record_valid_fresh_read(orchestrator, batch.batch_id, item)
     orchestrator.bind_execution_attempt(
         batch.batch_id,
         item.item_id,
@@ -530,7 +543,6 @@ def test_unknown_pauses_and_allows_only_one_reconcile(prepared_commit):
 def test_unresolved_reconcile_blocks_resume(prepared_commit):
     _, orchestrator, _, _, batch = prepared_commit
     item = orchestrator.claim_next(batch.batch_id, now=NOW)
-    _record_valid_fresh_read(orchestrator, batch.batch_id, item)
     orchestrator.record_item_result(
         batch.batch_id,
         item.item_id,
@@ -557,7 +569,6 @@ def test_cancel_pending_never_cancels_running_item(prepared):
 def test_recovery_never_replays_commit_and_routes_unknown_to_reconcile(prepared_commit):
     repository, orchestrator, _, _, batch = prepared_commit
     item = orchestrator.claim_next(batch.batch_id, now=NOW)
-    _record_valid_fresh_read(orchestrator, batch.batch_id, item)
     orchestrator.bind_execution_attempt(
         batch.batch_id,
         item.item_id,
@@ -575,7 +586,6 @@ def test_recovery_never_replays_commit_and_routes_unknown_to_reconcile(prepared_
 def test_recovery_projects_already_verified_operation_without_new_attempt(prepared_commit):
     repository, orchestrator, _, _, batch = prepared_commit
     item = orchestrator.claim_next(batch.batch_id, now=NOW)
-    _record_valid_fresh_read(orchestrator, batch.batch_id, item)
     orchestrator.bind_execution_attempt(
         batch.batch_id,
         item.item_id,

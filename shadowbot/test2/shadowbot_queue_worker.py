@@ -476,8 +476,11 @@ class QueueWorker:
             "source_page_context_sha256",
             "page_identity_key",
             "write_identity_key",
-            "fresh_read_attempt_id",
         )
+        stage = str(request.get("price_batch_stage") or "").strip().upper()
+        batch_mode = str(request.get("batch_execution_mode") or "").strip().upper()
+        if stage == "FRESH_READ" or batch_mode == "FILL_PREVIEW":
+            required += ("fresh_read_attempt_id",)
         missing = [name for name in required if not str(request.get(name) or "").strip()]
         if request.get("batch_contract_version") == 3:
             missing = [name for name in missing if name != "platform_sku"]
@@ -498,9 +501,7 @@ class QueueWorker:
                 raise ValueError("invalid task 12 hash: " + name)
         if not isinstance(request.get("capture_evidence"), bool):
             raise ValueError("capture_evidence must be boolean")
-        stage = str(request.get("price_batch_stage") or "").strip().upper()
         mode = str(request.get("execution_mode") or "").strip().upper()
-        batch_mode = str(request.get("batch_execution_mode") or "").strip().upper()
         if stage != "RECONCILE" and not str(request.get("approval_id") or "").strip():
             raise ValueError("task 12 approval_id is required")
         if batch_mode not in ("FILL_PREVIEW", "COMMIT"):
@@ -513,10 +514,16 @@ class QueueWorker:
         elif stage == "WRITE":
             if mode != batch_mode:
                 raise ValueError("BATCH_ITEM_BINDING_MISMATCH")
-            if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(request.get("fresh_read_result_sha256") or "")):
-                raise ValueError("BATCH_ITEM_BINDING_MISMATCH")
-            if str(request.get("fresh_old_price") or "") != str(request.get("expected_old_price") or ""):
-                raise ValueError("OLD_PRICE_CHANGED")
+            fresh_values = (
+                str(request.get("fresh_read_attempt_id") or ""),
+                str(request.get("fresh_read_result_sha256") or ""),
+                str(request.get("fresh_old_price") or ""),
+            )
+            if batch_mode == "FILL_PREVIEW" or any(fresh_values):
+                if not all(fresh_values) or not re.fullmatch(r"sha256:[0-9a-f]{64}", fresh_values[1]):
+                    raise ValueError("BATCH_ITEM_BINDING_MISMATCH")
+                if fresh_values[2] != str(request.get("expected_old_price") or ""):
+                    raise ValueError("OLD_PRICE_CHANGED")
         elif stage == "RECONCILE":
             if mode != "RECONCILE":
                 raise ValueError("BATCH_ITEM_BINDING_MISMATCH")

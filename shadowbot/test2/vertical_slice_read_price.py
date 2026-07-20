@@ -24,6 +24,7 @@ WINDOW_WIDTH_DEFAULT = 562
 WINDOW_HEIGHT_DEFAULT = 1056
 ELEMENT_TIMEOUT_DEFAULT = 15
 APPLET_LAUNCH_TIMEOUT_DEFAULT = 20
+INLINE_OLD_PRICE_MAX_AGE_SECONDS = 60
 APPLET_URI_PREFIXES = ("weixin://launchapplet/",)
 
 ROW_INDEX_START = 1
@@ -213,6 +214,18 @@ def _check_stop_before_submit(request, result):
     stop_path = str(_get_arg(request, "_stop_signal_path", "")).strip()
     if stop_path and os.path.exists(stop_path) and not _has_submit_side_effect(result):
         raise SliceError("WORKER_STOP_REQUESTED", "worker stop requested at safe checkpoint", True)
+
+
+def _check_inline_old_price_fresh(observed_monotonic, now_monotonic=None):
+    current = time.monotonic() if now_monotonic is None else float(now_monotonic)
+    age_seconds = current - float(observed_monotonic)
+    if age_seconds < 0 or age_seconds > INLINE_OLD_PRICE_MAX_AGE_SECONDS:
+        raise SliceError(
+            "FRESH_READ_EXPIRED",
+            "inline old-price observation is older than 60 seconds",
+            retryable=False,
+        )
+    return age_seconds
 
 
 def _get_arg(args, name, default=None):
@@ -2553,6 +2566,7 @@ def main(args):
         current_step = "READ_OLD_PRICE"
         result["current_step"] = current_step
         actual_price = _read_row_price(window, row_index, timeout_seconds)
+        old_price_observed_monotonic = time.monotonic()
         result.update(
             {
                 "old_price": actual_price,
@@ -2707,6 +2721,7 @@ def main(args):
                         }
                     )
             else:
+                _check_inline_old_price_fresh(old_price_observed_monotonic)
                 _check_stop_before_submit(request, result)
                 current_step = "RECORD_SUBMIT_INTENT"
                 result["current_step"] = current_step

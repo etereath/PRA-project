@@ -1,6 +1,8 @@
 import ast
 from pathlib import Path
 
+import pytest
+
 
 FLOW_PATH = Path(__file__).resolve().parents[1] / "shadowbot" / "test2" / "vertical_slice_read_price.py"
 WORKER_PATH = Path(__file__).resolve().parents[1] / "shadowbot" / "test2" / "shadowbot_queue_worker.py"
@@ -200,6 +202,37 @@ def test_submit_intent_phase_is_written_before_inner_confirm():
     confirm_index = source.index("_confirm_price_dialog(window, timeout_seconds)", intent_index)
 
     assert intent_index < confirm_index
+
+
+def test_commit_inline_old_price_check_expires_after_sixty_seconds():
+    check = _load_named_helpers("_check_inline_old_price_fresh")["_check_inline_old_price_fresh"]
+
+    class InlineSliceError(Exception):
+        def __init__(self, code, message, retryable):
+            super().__init__(message)
+            self.code = code
+            self.retryable = retryable
+
+    check.__globals__.update(
+        {
+            "INLINE_OLD_PRICE_MAX_AGE_SECONDS": 60,
+            "SliceError": InlineSliceError,
+        }
+    )
+
+    assert check(100.0, 160.0) == 60.0
+    with pytest.raises(InlineSliceError) as caught:
+        check(100.0, 160.001)
+    assert caught.value.code == "FRESH_READ_EXPIRED"
+    assert caught.value.retryable is False
+
+    source = FLOW_PATH.read_text(encoding="utf-8")
+    read_index = source.index("actual_price = _read_row_price(window, row_index, timeout_seconds)")
+    compare_index = source.index("actual_price != expected_old_price", read_index)
+    dialog_index = source.index("_open_price_dialog(window, row_index, timeout_seconds)", compare_index)
+    freshness_index = source.index("_check_inline_old_price_fresh(old_price_observed_monotonic)", dialog_index)
+    intent_index = source.index('result["side_effect_state"] = "SUBMIT_INTENT_RECORDED"', freshness_index)
+    assert read_index < compare_index < dialog_index < freshness_index < intent_index
 
 
 def test_stop_signal_is_not_honored_after_submit_intent():

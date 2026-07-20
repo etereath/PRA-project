@@ -207,7 +207,7 @@ class ShadowBotPriceBatchExecutionService:
                 "source_page_context_sha256": batch.source_page_context_sha256,
                 "page_identity_key": item.page_identity_key,
                 "write_identity_key": item.write_identity_key,
-                "fresh_read_attempt_id": fresh_read_attempt_id or item.fresh_read_attempt_id,
+                "fresh_read_attempt_id": fresh_read_attempt_id or item.fresh_read_attempt_id or "",
                 "fresh_read_result_sha256": item.fresh_read_result_sha256,
                 "fresh_old_price": (
                     format(item.fresh_old_price, ".2f") if item.fresh_old_price is not None else ""

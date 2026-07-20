@@ -1792,14 +1792,22 @@ def _validate_task12_item_queue_request(payload: dict[str, Any]) -> None:
         for name in TASK12_INSTRUCTION_HASH_FIELDS
         if name not in {"approval_id", "capture_evidence"}
     )
-    missing = [name for name in required if not str(payload.get(name) or "").strip()]
     stage = str(payload.get("price_batch_stage") or "").strip().upper()
+    batch_mode = str(payload.get("batch_execution_mode") or "").strip().upper()
+    optional_fresh_fields: set[str] = set()
     if stage == "FRESH_READ":
-        missing = [
-            name
-            for name in missing
-            if name not in {"fresh_read_result_sha256", "fresh_old_price"}
-        ]
+        optional_fresh_fields = {"fresh_read_result_sha256", "fresh_old_price"}
+    elif batch_mode == EXECUTION_MODE_COMMIT and stage in {"WRITE", "RECONCILE"}:
+        optional_fresh_fields = {
+            "fresh_read_attempt_id",
+            "fresh_read_result_sha256",
+            "fresh_old_price",
+        }
+    missing = [
+        name
+        for name in required
+        if name not in optional_fresh_fields and not str(payload.get(name) or "").strip()
+    ]
     if missing:
         raise ValidationError("task 12 queue request is missing fields: " + ", ".join(missing))
     ordinal = payload.get("price_batch_ordinal")
@@ -1818,7 +1826,6 @@ def _validate_task12_item_queue_request(payload: dict[str, Any]) -> None:
     if not isinstance(payload.get("capture_evidence"), bool):
         raise ValidationError("capture_evidence must be boolean")
     mode = str(payload.get("execution_mode") or "").strip().upper()
-    batch_mode = str(payload.get("batch_execution_mode") or "").strip().upper()
     if stage != "RECONCILE" and not str(payload.get("approval_id") or "").strip():
         raise ValidationError("task 12 queue approval_id is required")
     if batch_mode not in {EXECUTION_MODE_FILL_PREVIEW, EXECUTION_MODE_COMMIT}:
@@ -1833,10 +1840,16 @@ def _validate_task12_item_queue_request(payload: dict[str, Any]) -> None:
     elif stage == "WRITE":
         if mode != batch_mode:
             raise ValidationError("BATCH_ITEM_BINDING_MISMATCH")
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(payload.get("fresh_read_result_sha256") or "")):
-            raise ValidationError("BATCH_ITEM_BINDING_MISMATCH")
-        if str(payload.get("fresh_old_price") or "") != str(payload.get("expected_old_price") or ""):
-            raise ValidationError("OLD_PRICE_CHANGED")
+        fresh_values = (
+            str(payload.get("fresh_read_attempt_id") or ""),
+            str(payload.get("fresh_read_result_sha256") or ""),
+            str(payload.get("fresh_old_price") or ""),
+        )
+        if batch_mode == EXECUTION_MODE_FILL_PREVIEW or any(fresh_values):
+            if not all(fresh_values) or not re.fullmatch(r"sha256:[0-9a-f]{64}", fresh_values[1]):
+                raise ValidationError("BATCH_ITEM_BINDING_MISMATCH")
+            if fresh_values[2] != str(payload.get("expected_old_price") or ""):
+                raise ValidationError("OLD_PRICE_CHANGED")
     elif stage == "RECONCILE":
         if mode != EXECUTION_MODE_RECONCILE:
             raise ValidationError("BATCH_ITEM_BINDING_MISMATCH")

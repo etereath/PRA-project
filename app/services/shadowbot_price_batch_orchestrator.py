@@ -290,10 +290,11 @@ class ShadowBotPriceBatchOrchestrator:
         now: datetime | None = None,
     ) -> None:
         timestamp = _aware_utc(now or utc_now())
+        batch = self.repository.get_shadowbot_batch(batch_id)
         item = self.repository.get_shadowbot_batch_item(batch_id, item_id)
-        if item is None or item.status != BatchItemStatus.RUNNING.value:
+        if batch is None or item is None or item.status != BatchItemStatus.RUNNING.value:
             raise PriceBatchContractError(PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH)
-        if (
+        if batch.execution_mode == "FILL_PREVIEW" and (
             not item.fresh_read_attempt_id
             or item.fresh_old_price != item.approved_expected_old_price
             or item.updated_at is None
@@ -311,6 +312,8 @@ class ShadowBotPriceBatchOrchestrator:
                 now=timestamp,
             )
             raise PriceBatchContractError(PriceBatchErrorCode.FRESH_READ_EXPIRED)
+        if batch.execution_mode not in {"FILL_PREVIEW", "COMMIT"}:
+            raise PriceBatchContractError(PriceBatchErrorCode.UNSUPPORTED_EXECUTION_MODE)
         try:
             self.revalidate_item_approval(batch_id, item_id, now=timestamp)
         except PriceBatchContractError as exc:
