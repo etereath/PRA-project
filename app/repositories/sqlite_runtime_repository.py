@@ -60,6 +60,7 @@ from app.services.shadowbot_price_batch import (
     PriceBatchErrorCode,
     WRITE_LOCK_STATES,
 )
+from app.services.shadowbot_product_read import normalize_grade, normalize_text
 from app.utils import serialize_decimal
 from app.utils import utc_now
 
@@ -570,6 +571,11 @@ SCHEMA_V7_SQL = [
     """
     CREATE UNIQUE INDEX IF NOT EXISTS ux_shadowbot_batch_items_operation_id
     ON shadowbot_batch_items(operation_id)
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_shadowbot_batch_items_reconcile_attempt_id
+    ON shadowbot_batch_items(reconcile_attempt_id)
+    WHERE reconcile_attempt_id <> ''
     """,
     """
     CREATE INDEX IF NOT EXISTS ix_shadowbot_batch_items_status
@@ -1767,6 +1773,8 @@ class SQLiteRuntimeRepository:
         self,
         batch: ShadowBotBatch,
         items: Iterable[ShadowBotBatchItem],
+        *,
+        operations: Iterable[ShadowBotOperationLedger] | None = None,
     ) -> int:
         """Persist a new task 12 batch and its operation bindings atomically.
 
@@ -1776,6 +1784,15 @@ class SQLiteRuntimeRepository:
         """
 
         materialized = sorted(list(items), key=lambda item: item.ordinal)
+        operation_rows = list(operations or ())
+        operation_by_id = {operation.operation_id: operation for operation in operation_rows}
+        if len(operation_by_id) != len(operation_rows):
+            raise PriceBatchContractError(PriceBatchErrorCode.DUPLICATE_OPERATION_ID)
+        if operation_by_id and set(operation_by_id) != {item.operation_id for item in materialized}:
+            raise PriceBatchContractError(
+                PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH,
+                "supplied operations must match batch items exactly",
+            )
         if batch.status != BatchStatus.PENDING.value or any(
             item.status != BatchItemStatus.PENDING.value for item in materialized
         ):
@@ -1826,24 +1843,86 @@ class SQLiteRuntimeRepository:
             for item in materialized:
                 operation = connection.execute(
                     """
-                    SELECT task_id, platform, approved_payload_hash,
-                           write_identity_key, page_identity_key
+                    SELECT task_id, platform, product_identity_json, expected_old_price,
+                           target_price, approved_payload_hash, write_identity_key,
+                           page_identity_key
                     FROM shadowbot_operations
                     WHERE operation_id = ?
                     """,
                     (item.operation_id,),
                 ).fetchone()
                 if operation is None:
-                    raise PriceBatchContractError(
-                        PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH,
-                        f"missing operation {item.operation_id}",
+                    supplied = operation_by_id.get(item.operation_id)
+                    if supplied is None:
+                        raise PriceBatchContractError(
+                            PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH,
+                            f"missing operation {item.operation_id}",
+                        )
+                    if (
+                        supplied.task_id != item.task_id
+                        or supplied.platform != batch.platform
+                        or supplied.approved_payload_hash != item.approved_payload_hash
+                        or supplied.write_identity_key != item.write_identity_key
+                        or supplied.page_identity_key != item.page_identity_key
+                        or supplied.expected_old_price != item.approved_expected_old_price
+                        or supplied.target_price != item.target_price
+                        or supplied.status != "PENDING"
+                    ):
+                        raise PriceBatchContractError(PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH)
+                    conflict = connection.execute(
+                        f"""
+                        SELECT operation_id
+                        FROM shadowbot_operations
+                        WHERE status IN ({_WRITE_LOCK_STATUS_SQL})
+                          AND (write_identity_key = ? OR page_identity_key = ?)
+                        LIMIT 1
+                        """,
+                        (item.write_identity_key, item.page_identity_key),
+                    ).fetchone()
+                    if conflict is not None:
+                        raise PriceBatchContractError(PriceBatchErrorCode.WRITE_LOCK_CONFLICT)
+                    connection.execute(
+                        """
+                        INSERT INTO shadowbot_operations(
+                            operation_id, task_id, platform, product_identity_json,
+                            expected_old_price, target_price, status, lock_owner,
+                            approved_payload_hash, write_identity_key, page_identity_key,
+                            created_at, updated_at
+                        ) VALUES(
+                            :operation_id, :task_id, :platform, :product_identity_json,
+                            :expected_old_price, :target_price, :status, :lock_owner,
+                            :approved_payload_hash, :write_identity_key, :page_identity_key,
+                            :created_at, :updated_at
+                        )
+                        """,
+                        _shadowbot_operation_to_row(supplied),
                     )
+                    operation = connection.execute(
+                        """
+                        SELECT task_id, platform, product_identity_json, expected_old_price,
+                               target_price, approved_payload_hash, write_identity_key,
+                               page_identity_key
+                        FROM shadowbot_operations
+                        WHERE operation_id = ?
+                        """,
+                        (item.operation_id,),
+                    ).fetchone()
                 if (
                     str(operation["task_id"]) != item.task_id
                     or str(operation["platform"]) != batch.platform
                     or str(operation["approved_payload_hash"] or "") != item.approved_payload_hash
                     or str(operation["write_identity_key"] or "") != item.write_identity_key
                     or str(operation["page_identity_key"] or "") != item.page_identity_key
+                    or Decimal(str(operation["expected_old_price"])) != item.approved_expected_old_price
+                    or Decimal(str(operation["target_price"])) != item.target_price
+                ):
+                    raise PriceBatchContractError(PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH)
+                operation_identity = json.loads(str(operation["product_identity_json"] or "{}"))
+                if (
+                    normalize_text(operation_identity.get("expected_product_name") or operation_identity.get("name"))
+                    != normalize_text(item.expected_product_name)
+                    or normalize_grade(operation_identity.get("expected_grade") or operation_identity.get("grade"))
+                    != normalize_grade(item.expected_grade)
                 ):
                     raise PriceBatchContractError(PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH)
                 conflict = connection.execute(
@@ -1944,6 +2023,532 @@ class SQLiteRuntimeRepository:
                 (batch_id,),
             ).fetchall()
         return [_row_to_shadowbot_batch_item(row) for row in rows]
+
+    def get_shadowbot_batch_item(self, batch_id: str, item_id: str) -> ShadowBotBatchItem | None:
+        with closing(self.connect_read()) as connection:
+            row = connection.execute(
+                "SELECT * FROM shadowbot_batch_items WHERE batch_id = ? AND item_id = ?",
+                (batch_id, item_id),
+            ).fetchone()
+        return _row_to_shadowbot_batch_item(row) if row is not None else None
+
+    def claim_next_shadowbot_batch_item(
+        self,
+        batch_id: str,
+        *,
+        now: datetime,
+        stop_requested: bool = False,
+    ) -> ShadowBotBatchItem | None:
+        """Claim the next item without ever overlapping two batch writes."""
+
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            batch = connection.execute(
+                "SELECT status, started_at FROM shadowbot_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if batch is None:
+                raise PriceBatchContractError(PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH)
+            if str(batch["status"]) in {
+                BatchStatus.COMPLETED.value,
+                BatchStatus.PARTIAL.value,
+                BatchStatus.FAILED.value,
+                BatchStatus.CANCELLED.value,
+            }:
+                connection.rollback()
+                return None
+            if stop_requested:
+                _refresh_shadowbot_batch_on_connection(
+                    connection,
+                    batch_id,
+                    now=now,
+                    forced_status=BatchStatus.PAUSED.value,
+                    paused_reason=PriceBatchErrorCode.WORKER_STOP_REQUESTED.value,
+                    error_code=PriceBatchErrorCode.WORKER_STOP_REQUESTED.value,
+                )
+                connection.commit()
+                return None
+            if str(batch["status"]) not in {BatchStatus.PENDING.value, BatchStatus.RUNNING.value}:
+                connection.rollback()
+                return None
+            blockers = connection.execute(
+                """
+                SELECT
+                    SUM(CASE WHEN status = 'RUNNING' THEN 1 ELSE 0 END) AS running_count,
+                    SUM(CASE WHEN status = 'NEEDS_RECONCILIATION' THEN 1 ELSE 0 END) AS reconcile_count
+                FROM shadowbot_batch_items WHERE batch_id = ?
+                """,
+                (batch_id,),
+            ).fetchone()
+            if int(blockers["running_count"] or 0) or int(blockers["reconcile_count"] or 0):
+                connection.rollback()
+                return None
+            row = connection.execute(
+                """
+                SELECT * FROM shadowbot_batch_items
+                WHERE batch_id = ? AND status IN ('PENDING', 'READY')
+                ORDER BY ordinal LIMIT 1
+                """,
+                (batch_id,),
+            ).fetchone()
+            if row is None:
+                _refresh_shadowbot_batch_on_connection(connection, batch_id, now=now)
+                connection.commit()
+                return None
+            connection.execute(
+                """
+                UPDATE shadowbot_batch_items
+                SET status = 'RUNNING', started_at = COALESCE(started_at, ?), updated_at = ?
+                WHERE batch_id = ? AND item_id = ? AND status IN ('PENDING', 'READY')
+                """,
+                (_datetime_to_text(now), _datetime_to_text(now), batch_id, str(row["item_id"])),
+            )
+            _refresh_shadowbot_batch_on_connection(
+                connection,
+                batch_id,
+                now=now,
+                forced_status=BatchStatus.RUNNING.value,
+            )
+            claimed = connection.execute(
+                "SELECT * FROM shadowbot_batch_items WHERE batch_id = ? AND item_id = ?",
+                (batch_id, str(row["item_id"])),
+            ).fetchone()
+            connection.commit()
+            return _row_to_shadowbot_batch_item(claimed)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def bind_shadowbot_batch_item_attempt(
+        self,
+        batch_id: str,
+        item_id: str,
+        *,
+        execution_attempt_id: str,
+        run_id: str = "",
+        fresh_read_attempt_id: str = "",
+        fresh_read_result_sha256: str = "",
+        fresh_old_price: Decimal | None = None,
+        now: datetime,
+    ) -> bool:
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM shadowbot_batch_items WHERE batch_id = ? AND item_id = ?",
+                (batch_id, item_id),
+            ).fetchone()
+            if row is None or str(row["status"]) != BatchItemStatus.RUNNING.value:
+                raise PriceBatchContractError(PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH)
+            existing_attempt = str(row["current_execution_attempt_id"] or "")
+            if existing_attempt and existing_attempt != execution_attempt_id:
+                raise PriceBatchContractError(PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH)
+            connection.execute(
+                """
+                UPDATE shadowbot_batch_items
+                SET current_execution_attempt_id = ?, current_run_id = ?,
+                    fresh_read_attempt_id = CASE WHEN ? <> '' THEN ? ELSE fresh_read_attempt_id END,
+                    fresh_read_result_sha256 = CASE WHEN ? <> '' THEN ? ELSE fresh_read_result_sha256 END,
+                    fresh_old_price = COALESCE(?, fresh_old_price), updated_at = ?
+                WHERE batch_id = ? AND item_id = ?
+                """,
+                (
+                    execution_attempt_id,
+                    run_id,
+                    fresh_read_attempt_id,
+                    fresh_read_attempt_id,
+                    fresh_read_result_sha256,
+                    fresh_read_result_sha256,
+                    serialize_decimal(fresh_old_price) if fresh_old_price is not None else None,
+                    _datetime_to_text(now),
+                    batch_id,
+                    item_id,
+                ),
+            )
+            connection.commit()
+            return not bool(existing_attempt)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def record_shadowbot_batch_fresh_read(
+        self,
+        batch_id: str,
+        item_id: str,
+        *,
+        fresh_read_attempt_id: str,
+        fresh_read_result_sha256: str,
+        fresh_old_price: Decimal,
+        now: datetime,
+    ) -> None:
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status, fresh_read_attempt_id FROM shadowbot_batch_items "
+                "WHERE batch_id = ? AND item_id = ?",
+                (batch_id, item_id),
+            ).fetchone()
+            if row is None or str(row["status"]) != BatchItemStatus.RUNNING.value:
+                raise PriceBatchContractError(PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH)
+            existing = str(row["fresh_read_attempt_id"] or "")
+            if existing and existing != fresh_read_attempt_id:
+                raise PriceBatchContractError(PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH)
+            connection.execute(
+                """
+                UPDATE shadowbot_batch_items
+                SET fresh_read_attempt_id = ?, fresh_read_result_sha256 = ?,
+                    fresh_old_price = ?, updated_at = ?
+                WHERE batch_id = ? AND item_id = ?
+                """,
+                (
+                    fresh_read_attempt_id,
+                    fresh_read_result_sha256,
+                    serialize_decimal(fresh_old_price),
+                    _datetime_to_text(now),
+                    batch_id,
+                    item_id,
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def complete_shadowbot_batch_item(
+        self,
+        batch_id: str,
+        item_id: str,
+        *,
+        status: str,
+        execution_attempt_id: str,
+        run_id: str = "",
+        post_commit_price: Decimal | None = None,
+        error_code: str = "",
+        error_message: str = "",
+        result_id: str = "",
+        result_hash: str = "",
+        stop_requested: bool = False,
+        now: datetime,
+    ) -> bool:
+        terminal_statuses = {
+            BatchItemStatus.PREVIEWED.value,
+            BatchItemStatus.VERIFIED.value,
+            BatchItemStatus.FAILED.value,
+            BatchItemStatus.SKIPPED.value,
+            BatchItemStatus.CANCELLED.value,
+            BatchItemStatus.NEEDS_RECONCILIATION.value,
+        }
+        if status not in terminal_statuses:
+            raise PriceBatchContractError(PriceBatchErrorCode.RESULT_CONTRACT_INVALID)
+        if error_code and error_code not in {code.value for code in PriceBatchErrorCode}:
+            raise PriceBatchContractError(PriceBatchErrorCode.RESULT_CONTRACT_INVALID)
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM shadowbot_batch_items WHERE batch_id = ? AND item_id = ?",
+                (batch_id, item_id),
+            ).fetchone()
+            if row is None:
+                raise PriceBatchContractError(PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH)
+            current_status = str(row["status"])
+            if current_status != BatchItemStatus.RUNNING.value:
+                same_result = (
+                    current_status == status
+                    and str(row["current_execution_attempt_id"] or "") == execution_attempt_id
+                    and str(row["result_id"] or "") == result_id
+                    and str(row["result_hash"] or "") == result_hash
+                )
+                if same_result:
+                    connection.rollback()
+                    return False
+                raise PriceBatchContractError(PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH)
+            bound_attempt = str(row["current_execution_attempt_id"] or "")
+            if bound_attempt and bound_attempt != execution_attempt_id:
+                raise PriceBatchContractError(PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH)
+            connection.execute(
+                """
+                UPDATE shadowbot_batch_items
+                SET status = ?, current_execution_attempt_id = ?, current_run_id = ?,
+                    post_commit_price = ?, error_code = ?, error_message = ?,
+                    result_id = ?, result_hash = ?, completed_at = ?, updated_at = ?
+                WHERE batch_id = ? AND item_id = ?
+                """,
+                (
+                    status,
+                    execution_attempt_id,
+                    run_id,
+                    serialize_decimal(post_commit_price) if post_commit_price is not None else None,
+                    error_code,
+                    error_message,
+                    result_id,
+                    result_hash,
+                    _datetime_to_text(now),
+                    _datetime_to_text(now),
+                    batch_id,
+                    item_id,
+                ),
+            )
+            forced_status = None
+            paused_reason = None
+            batch_error = None
+            if status == BatchItemStatus.NEEDS_RECONCILIATION.value:
+                forced_status = BatchStatus.PAUSED.value
+                paused_reason = PriceBatchErrorCode.RECONCILIATION_REQUIRED.value
+                batch_error = error_code or PriceBatchErrorCode.RECONCILIATION_REQUIRED.value
+            _refresh_shadowbot_batch_on_connection(
+                connection,
+                batch_id,
+                now=now,
+                forced_status=forced_status,
+                paused_reason=paused_reason,
+                error_code=batch_error,
+            )
+            if stop_requested and forced_status is None:
+                remaining = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM shadowbot_batch_items
+                    WHERE batch_id = ? AND status IN ('PENDING', 'READY')
+                    """,
+                    (batch_id,),
+                ).fetchone()[0]
+                if int(remaining):
+                    _refresh_shadowbot_batch_on_connection(
+                        connection,
+                        batch_id,
+                        now=now,
+                        forced_status=BatchStatus.PAUSED.value,
+                        paused_reason=PriceBatchErrorCode.WORKER_STOP_REQUESTED.value,
+                        error_code=PriceBatchErrorCode.WORKER_STOP_REQUESTED.value,
+                    )
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def control_shadowbot_batch(
+        self,
+        batch_id: str,
+        *,
+        action: str,
+        actor: str,
+        reason: str = "",
+        now: datetime,
+    ) -> bool:
+        """Apply PAUSE, RESUME, or CANCEL_PENDING without touching a running item."""
+
+        normalized_action = str(action or "").strip().upper()
+        if normalized_action not in {"PAUSE", "RESUME", "CANCEL_PENDING"} or not actor.strip():
+            raise PriceBatchContractError(PriceBatchErrorCode.RESULT_CONTRACT_INVALID)
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status, started_at FROM shadowbot_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if row is None:
+                raise PriceBatchContractError(PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH)
+            current = str(row["status"])
+            if current in {
+                BatchStatus.COMPLETED.value,
+                BatchStatus.PARTIAL.value,
+                BatchStatus.FAILED.value,
+                BatchStatus.CANCELLED.value,
+            }:
+                connection.rollback()
+                return False
+            audit_reason = f"{actor}: {reason}".strip().rstrip(":")
+            if normalized_action == "PAUSE":
+                _refresh_shadowbot_batch_on_connection(
+                    connection,
+                    batch_id,
+                    now=now,
+                    forced_status=BatchStatus.PAUSED.value,
+                    paused_reason=audit_reason or "operator pause",
+                )
+            elif normalized_action == "RESUME":
+                if current != BatchStatus.PAUSED.value:
+                    connection.rollback()
+                    return False
+                unresolved = connection.execute(
+                    "SELECT COUNT(*) FROM shadowbot_batch_items "
+                    "WHERE batch_id = ? AND status = 'NEEDS_RECONCILIATION'",
+                    (batch_id,),
+                ).fetchone()[0]
+                if int(unresolved):
+                    raise PriceBatchContractError(PriceBatchErrorCode.RECONCILIATION_REQUIRED)
+                next_status = (
+                    BatchStatus.RUNNING.value if row["started_at"] else BatchStatus.PENDING.value
+                )
+                _refresh_shadowbot_batch_on_connection(
+                    connection,
+                    batch_id,
+                    now=now,
+                    forced_status=next_status,
+                    paused_reason="",
+                    error_code="",
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE shadowbot_batch_items
+                    SET status = 'CANCELLED', error_code = 'BATCH_CANCELLED',
+                        error_message = ?, completed_at = ?, updated_at = ?
+                    WHERE batch_id = ? AND status IN ('PENDING', 'READY')
+                    """,
+                    (
+                        audit_reason or "pending item cancelled",
+                        _datetime_to_text(now),
+                        _datetime_to_text(now),
+                        batch_id,
+                    ),
+                )
+                _refresh_shadowbot_batch_on_connection(connection, batch_id, now=now)
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def claim_shadowbot_batch_reconcile(
+        self,
+        batch_id: str,
+        item_id: str,
+        *,
+        reconcile_attempt_id: str,
+        now: datetime,
+    ) -> ShadowBotBatchItem:
+        if not str(reconcile_attempt_id or "").strip():
+            raise PriceBatchContractError(PriceBatchErrorCode.RECONCILIATION_CONFLICT)
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM shadowbot_batch_items WHERE batch_id = ? AND item_id = ?",
+                (batch_id, item_id),
+            ).fetchone()
+            if row is None or str(row["status"]) != BatchItemStatus.NEEDS_RECONCILIATION.value:
+                raise PriceBatchContractError(PriceBatchErrorCode.RECONCILIATION_CONFLICT)
+            existing = str(row["reconcile_attempt_id"] or "")
+            if existing and existing != reconcile_attempt_id:
+                raise PriceBatchContractError(PriceBatchErrorCode.RECONCILIATION_CONFLICT)
+            if not existing:
+                connection.execute(
+                    """
+                    UPDATE shadowbot_batch_items
+                    SET reconcile_attempt_id = ?, reconciliation_outcome = 'PENDING', updated_at = ?
+                    WHERE batch_id = ? AND item_id = ?
+                    """,
+                    (reconcile_attempt_id, _datetime_to_text(now), batch_id, item_id),
+                )
+            claimed = connection.execute(
+                "SELECT * FROM shadowbot_batch_items WHERE batch_id = ? AND item_id = ?",
+                (batch_id, item_id),
+            ).fetchone()
+            connection.commit()
+            return _row_to_shadowbot_batch_item(claimed)
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            raise PriceBatchContractError(PriceBatchErrorCode.RECONCILIATION_CONFLICT) from exc
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def complete_shadowbot_batch_reconcile(
+        self,
+        batch_id: str,
+        item_id: str,
+        *,
+        reconcile_attempt_id: str,
+        outcome: str,
+        post_commit_price: Decimal | None = None,
+        error_code: str = "",
+        error_message: str = "",
+        now: datetime,
+    ) -> bool:
+        normalized_outcome = str(outcome or "").strip().upper()
+        outcome_status = {
+            "VERIFIED": BatchItemStatus.VERIFIED.value,
+            "NOT_APPLIED": BatchItemStatus.FAILED.value,
+            "FAILED": BatchItemStatus.FAILED.value,
+            "UNCERTAIN": BatchItemStatus.NEEDS_RECONCILIATION.value,
+        }
+        if normalized_outcome not in outcome_status:
+            raise PriceBatchContractError(PriceBatchErrorCode.RESULT_CONTRACT_INVALID)
+        if error_code and error_code not in {code.value for code in PriceBatchErrorCode}:
+            raise PriceBatchContractError(PriceBatchErrorCode.RESULT_CONTRACT_INVALID)
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM shadowbot_batch_items WHERE batch_id = ? AND item_id = ?",
+                (batch_id, item_id),
+            ).fetchone()
+            if row is None or str(row["reconcile_attempt_id"] or "") != reconcile_attempt_id:
+                raise PriceBatchContractError(PriceBatchErrorCode.RECONCILIATION_CONFLICT)
+            previous = str(row["reconciliation_outcome"] or "")
+            if previous not in {"", "PENDING"}:
+                if previous == normalized_outcome:
+                    connection.rollback()
+                    return False
+                raise PriceBatchContractError(PriceBatchErrorCode.RECONCILIATION_CONFLICT)
+            connection.execute(
+                """
+                UPDATE shadowbot_batch_items
+                SET status = ?, reconciliation_outcome = ?, reconciled_at = ?,
+                    post_commit_price = ?, error_code = ?, error_message = ?,
+                    completed_at = ?, updated_at = ?
+                WHERE batch_id = ? AND item_id = ?
+                """,
+                (
+                    outcome_status[normalized_outcome],
+                    normalized_outcome,
+                    _datetime_to_text(now),
+                    serialize_decimal(post_commit_price) if post_commit_price is not None else row["post_commit_price"],
+                    error_code,
+                    error_message,
+                    _datetime_to_text(now),
+                    _datetime_to_text(now),
+                    batch_id,
+                    item_id,
+                ),
+            )
+            forced = (
+                BatchStatus.PAUSED.value
+                if normalized_outcome == "UNCERTAIN"
+                else None
+            )
+            _refresh_shadowbot_batch_on_connection(
+                connection,
+                batch_id,
+                now=now,
+                forced_status=forced,
+                paused_reason=(PriceBatchErrorCode.RECONCILIATION_REQUIRED.value if forced else None),
+                error_code=(error_code or PriceBatchErrorCode.RECONCILIATION_REQUIRED.value if forced else None),
+            )
+            connection.commit()
+            return True
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def acquire_shadowbot_operation_lock(self, operation_id: str, lock_owner: str) -> bool:
         with closing(self.connect()) as connection, connection:
@@ -4046,6 +4651,146 @@ class SQLiteRuntimeRepository:
                 (script_run_id,),
             ).fetchall()
         return [_row_to_script_run_item(row) for row in rows]
+
+
+def _refresh_shadowbot_batch_on_connection(
+    connection: sqlite3.Connection,
+    batch_id: str,
+    *,
+    now: datetime,
+    forced_status: str | None = None,
+    paused_reason: str | None = None,
+    error_code: str | None = None,
+) -> None:
+    batch = connection.execute(
+        "SELECT * FROM shadowbot_batches WHERE batch_id = ?",
+        (batch_id,),
+    ).fetchone()
+    if batch is None:
+        raise PriceBatchContractError(PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH)
+    rows = connection.execute(
+        """
+        SELECT status, COUNT(*) AS item_count
+        FROM shadowbot_batch_items WHERE batch_id = ? GROUP BY status
+        """,
+        (batch_id,),
+    ).fetchall()
+    by_status = {str(row["status"]): int(row["item_count"]) for row in rows}
+    counts = {
+        "pending_count": by_status.get(BatchItemStatus.PENDING.value, 0),
+        "ready_count": by_status.get(BatchItemStatus.READY.value, 0),
+        "running_count": by_status.get(BatchItemStatus.RUNNING.value, 0),
+        "previewed_count": by_status.get(BatchItemStatus.PREVIEWED.value, 0),
+        "verified_count": by_status.get(BatchItemStatus.VERIFIED.value, 0),
+        "failed_count": by_status.get(BatchItemStatus.FAILED.value, 0),
+        "skipped_count": by_status.get(BatchItemStatus.SKIPPED.value, 0),
+        "cancelled_count": by_status.get(BatchItemStatus.CANCELLED.value, 0),
+        "needs_reconciliation_count": by_status.get(BatchItemStatus.NEEDS_RECONCILIATION.value, 0),
+    }
+    counts["processed_count"] = sum(
+        counts[key]
+        for key in (
+            "previewed_count",
+            "verified_count",
+            "failed_count",
+            "skipped_count",
+            "cancelled_count",
+            "needs_reconciliation_count",
+        )
+    )
+    total_count = (
+        counts["pending_count"]
+        + counts["ready_count"]
+        + counts["running_count"]
+        + counts["processed_count"]
+    )
+    active_count = counts["pending_count"] + counts["ready_count"] + counts["running_count"]
+    current_status = str(batch["status"])
+    terminal_statuses = {
+        BatchStatus.COMPLETED.value,
+        BatchStatus.PARTIAL.value,
+        BatchStatus.FAILED.value,
+        BatchStatus.CANCELLED.value,
+    }
+    if active_count == 0 and counts["needs_reconciliation_count"] == 0:
+        successful = counts["previewed_count"] + counts["verified_count"]
+        unsuccessful = counts["failed_count"] + counts["skipped_count"] + counts["cancelled_count"]
+        if total_count and counts["cancelled_count"] == total_count:
+            status = BatchStatus.CANCELLED.value
+        elif total_count and successful == total_count:
+            status = BatchStatus.COMPLETED.value
+        elif total_count and unsuccessful == total_count:
+            status = BatchStatus.FAILED.value
+        else:
+            status = BatchStatus.PARTIAL.value
+    elif forced_status is not None:
+        status = forced_status
+    elif counts["needs_reconciliation_count"]:
+        status = BatchStatus.PAUSED.value
+    elif current_status == BatchStatus.PAUSED.value:
+        status = BatchStatus.PAUSED.value
+    elif current_status == BatchStatus.PENDING.value and counts["running_count"] == 0:
+        status = BatchStatus.PENDING.value
+    else:
+        status = BatchStatus.RUNNING.value
+    current_item = connection.execute(
+        """
+        SELECT item_id FROM shadowbot_batch_items
+        WHERE batch_id = ? AND status = 'RUNNING' ORDER BY ordinal LIMIT 1
+        """,
+        (batch_id,),
+    ).fetchone()
+    reconciled_count = int(
+        connection.execute(
+            """
+            SELECT COUNT(*) FROM shadowbot_batch_items
+            WHERE batch_id = ? AND reconciliation_outcome NOT IN ('', 'PENDING')
+            """,
+            (batch_id,),
+        ).fetchone()[0]
+    )
+    started_at = batch["started_at"]
+    if started_at is None and status != BatchStatus.PENDING.value:
+        started_at = _datetime_to_text(now)
+    completed_at = batch["completed_at"]
+    if status in terminal_statuses:
+        completed_at = completed_at or _datetime_to_text(now)
+    elif completed_at is not None:
+        completed_at = None
+    effective_paused_reason = str(batch["paused_reason"] or "") if paused_reason is None else paused_reason
+    effective_error_code = str(batch["error_code"] or "") if error_code is None else error_code
+    connection.execute(
+        """
+        UPDATE shadowbot_batches
+        SET status = ?, current_item_id = ?, pending_count = ?, ready_count = ?,
+            running_count = ?, processed_count = ?, previewed_count = ?, verified_count = ?,
+            failed_count = ?, skipped_count = ?, cancelled_count = ?,
+            needs_reconciliation_count = ?, reconciled_item_count = ?,
+            paused_reason = ?, error_code = ?, started_at = ?, completed_at = ?, updated_at = ?
+        WHERE batch_id = ?
+        """,
+        (
+            status,
+            str(current_item["item_id"]) if current_item is not None else "",
+            counts["pending_count"],
+            counts["ready_count"],
+            counts["running_count"],
+            counts["processed_count"],
+            counts["previewed_count"],
+            counts["verified_count"],
+            counts["failed_count"],
+            counts["skipped_count"],
+            counts["cancelled_count"],
+            counts["needs_reconciliation_count"],
+            reconciled_count,
+            effective_paused_reason,
+            effective_error_code,
+            started_at,
+            completed_at,
+            _datetime_to_text(now),
+            batch_id,
+        ),
+    )
 
 
 def _task_to_row(task: Task) -> dict[str, Any]:

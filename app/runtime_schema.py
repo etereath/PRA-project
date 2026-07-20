@@ -195,6 +195,7 @@ PRICE_BATCH_INDEX_SPECS: Mapping[str, tuple[tuple[str, ...], bool]] = {
     "ix_shadowbot_batches_digest": (("normalized_request_digest",), False),
     "ux_shadowbot_batch_items_ordinal": (("batch_id", "ordinal"), True),
     "ux_shadowbot_batch_items_operation_id": (("operation_id",), True),
+    "ux_shadowbot_batch_items_reconcile_attempt_id": (("reconcile_attempt_id",), True),
     "ix_shadowbot_batch_items_status": (("batch_id", "status", "ordinal"), False),
     "ix_shadowbot_operations_write_identity_status": (("write_identity_key", "status"), False),
     "ix_shadowbot_operations_page_identity_status": (("page_identity_key", "status"), False),
@@ -307,7 +308,7 @@ class RuntimeSchemaHealth:
 def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealth:
     """Inspect a SQLite connection without mutating it.
 
-    The check is deliberately exact: a database with a migration row for v6
+    The check is deliberately exact: a database with a migration row for v7
     but a missing table, column, index, or constraint is unhealthy.
     """
 
@@ -748,4 +749,17 @@ def _check_price_batch_constraints(
         } if match else set()
         if actual_states != WRITE_LOCK_STATES:
             errors.append(f"{index_name} must use the complete WRITE_LOCK_STATES set")
+    reconcile_index = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' "
+        "AND name = 'ux_shadowbot_batch_items_reconcile_attempt_id'"
+    ).fetchone()
+    reconcile_sql = str(reconcile_index[0] or "") if reconcile_index else ""
+    if not re.search(
+        r"\breconcile_attempt_id\s*<>\s*''",
+        reconcile_sql,
+        re.IGNORECASE,
+    ):
+        errors.append(
+            "ux_shadowbot_batch_items_reconcile_attempt_id must exclude empty identifiers"
+        )
     return tuple(sorted(missing_indexes))

@@ -566,6 +566,41 @@ def compute_normalized_request_digest(normalized_request: Mapping[str, Any]) -> 
     return sha256_jcs(digest_view)
 
 
+def build_batch_item_approval_view(
+    normalized_request: Mapping[str, Any],
+    item: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return the exact per-item data a task 12 approval authorizes."""
+
+    return {
+        "v": CONTRACT_VERSION,
+        "execution_mode": str(normalized_request["execution_mode"]),
+        "platform": str(normalized_request["platform"]),
+        "source_read_batch_id": str(normalized_request["source_read_batch_id"]),
+        "source_snapshot_sha256": str(normalized_request["source_snapshot_sha256"]),
+        "source_page_context_sha256": str(normalized_request["source_page_context_sha256"]),
+        "source_item_id": str(item["source_item_id"]),
+        "task_id": str(item["task_id"]),
+        "operation_id": str(item["operation_id"]),
+        "product_identity": {
+            "platform_sku": item.get("platform_sku"),
+            "normalized_product_name": str(item["normalized_product_name"]),
+            "normalized_grade": str(item["normalized_grade"]),
+            "page_identity_key": str(item["page_identity_key"]),
+            "write_identity_key": str(item["write_identity_key"]),
+        },
+        "approved_expected_old_price": str(item["approved_expected_old_price"]),
+        "target_price": str(item["target_price"]),
+    }
+
+
+def compute_batch_item_approved_payload_hash(
+    normalized_request: Mapping[str, Any],
+    item: Mapping[str, Any],
+) -> str:
+    return sha256_jcs(build_batch_item_approval_view(normalized_request, item))
+
+
 def validate_source_binding(
     normalized_request: Mapping[str, Any],
     source_binding: Mapping[str, Any],
