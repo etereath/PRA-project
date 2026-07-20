@@ -369,3 +369,114 @@ Web 提供只读批次摘要、逐项明细和受审计的 pause/resume/cancel p
 - Worker 为 `STOPPED`，`stop.signal` 不存在，主流程已执行末端 `关闭.flow`。
 
 以上分别证明代码和文件检查通过、自动逻辑测试通过、第三轮 READ_ONLY 实机页面上下文修复有效；不代表 FILL_PREVIEW 或 COMMIT 已验收。任务状态保持不变，等待后续实机覆盖和审查方审查。
+
+## 17. 任务12流程修订计划：批次单次确认与既有单商品执行器复用（最高优先级）
+
+本节记录项目负责人对任务12执行流程的最新决策。自本节起，与本节冲突的第9节、第12节、第13节及既有阶段记录均以本节为准；未冲突的逐商品审批、写锁、提交意图、独立回读、UNKNOWN、唯一 RECONCILE、报告和影刀收尾要求继续有效。本节只修改后续实施计划，不修改任务状态。
+
+### 17.1 修订目标
+
+任务12不再重新开发或重复验证一套 `READ_ONLY → fresh READ → FILL_PREVIEW` 垂直切片。任务11已经提供批量 READ_ONLY，既有单商品流程已经验证改价的可行性和稳定性；任务12的新增价值应限于严格串行队列、逐商品审批、结果汇总和恢复控制。
+
+正常批次改价流程调整为：
+
+```text
+一轮批次 READ_ONLY
+→ 冻结来源快照和逐商品审批数据
+→ 队列严格串行领取一个商品
+→ 直接复用既有单商品 COMMIT 执行器
+→ 导入、归档并更新该商品终态
+→ 无不确定状态时领取下一个商品
+→ 批次报告和 Worker 收尾
+```
+
+以5个商品为例，页面执行从“一轮批次 READ_ONLY + 5轮独立 fresh READ + 5轮写流程”的约11次页面遍历，缩减为“一轮批次 READ_ONLY + 5轮单商品 COMMIT”的约6次页面遍历。效率优化不得削弱提交前旧价阻断、逐商品授权和提交后独立回读。
+
+### 17.2 唯一批次 READ_ONLY
+
+每一批次改价前只执行一轮任务11 contract v2 多商品 READ_ONLY，用于：
+
+1. 确认全部目标商品唯一存在且处于 ONLINE。
+2. 读取并冻结商品名、等级、平台 SKU（若平台可提供）、当前价格和库存。
+3. 生成 `read_batch_id`、请求/结果哈希、业务快照哈希和页面上下文哈希。
+4. 为逐商品审批和 COMMIT 提供 `approved_expected_old_price` 来源。
+
+任一目标商品读取失败、身份歧义、状态不是 ONLINE、请求/结果绑定不一致或计数不成立时，不得创建可执行改价批次。该轮 READ_ONLY 结果由 Importer 一次性导入归档；不得为每个商品再生成独立的队列级 fresh READ 请求。
+
+来源快照的300秒时限只约束“READ_ONLY 完成到批次创建/审批数据冻结”的入口。批次执行期间不因后续商品排队时间较长而重复整批 READ_ONLY；实时价格安全由每个 COMMIT 内部的旧价检查承担。
+
+### 17.3 直接复用既有单商品 COMMIT
+
+队列领取商品后，直接调用既有单商品 COMMIT 状态机，不创建独立 `FRESH_READ` stage 或 attempt。单商品执行器内部原有的以下步骤必须保留：
+
+1. 刷新商品管理 ONLINE 列表并唯一定位审批商品。
+2. 在打开价格弹窗和进入提交副作用区之前读取列表当前价格。
+3. 将页面当前价格与批次快照绑定的 `approved_expected_old_price` 比较。
+4. 不一致时返回 `OLD_PRICE_CHANGED`，保持 `side_effect_state=NOT_STARTED`，默认暂停批次等待人工决定；不得自动刷新审批旧价或继续提交。
+5. 一致时复核逐商品 ReviewTask、批准模式、批准哈希、审批有效期和写锁，然后进入既有填写与提交步骤。
+6. 从该次内联旧价读取的 `observed_at` 到 `SUBMIT_INTENT_RECORDED` 不得超过60秒；超时按提交前安全失败处理，不新增一次 fresh READ 队列任务。
+7. COMMIT 必须先持久化 `SUBMIT_INTENT_RECORDED`，再执行真实点击；提交后继续使用既有独立页面回读判断 VERIFIED、NOT_APPLIED 或 NEEDS_RECONCILIATION。
+
+这里移除的是“独立队列级 fresh READ 编排”，不是提交前旧价校验。旧价校验仍在每个单商品 COMMIT 内完成，因此后续排队商品不会仅凭过期批次价格直接提交。
+
+### 17.4 FILL_PREVIEW 的新定位
+
+FILL_PREVIEW 已完成开发前期可行性验证，不再属于任务12正常批次流程，也不再是任务12实机验收的必做项目。
+
+- 正常批次不得在 COMMIT 前自动运行 FILL_PREVIEW。
+- FILL_PREVIEW 底层能力可以暂时保留，供平台页面改版、元素重新捕获或专项故障诊断使用。
+- 诊断性 FILL_PREVIEW 必须由人员明确发起，使用独立批次/数据库/证据范围，不得混入正常改价报告。
+- 正常批次的 `previewed_count` 应为0；`PREVIEWED` 状态只保留为兼容和诊断状态。
+
+### 17.5 严格串行队列和停止语义
+
+批次编排层只负责领取、锁定、调用既有单商品执行器、导入结果和决定是否领取下一项，不复制平台页面逻辑。
+
+1. 同一批次同时最多一个商品处于写锁状态或活动 attempt。
+2. 当前商品结果完成导入和归档前，不得领取下一商品。
+3. 提交意图前失败且副作用明确为 NOT_STARTED 时，记录该商品失败；是否继续必须服从批次 stop policy，`OLD_PRICE_CHANGED` 默认暂停。
+4. 任何 UNKNOWN、SUBMIT_CLICKED 后失联或 NEEDS_RECONCILIATION 都必须立即暂停批次；不得自动重复 COMMIT。
+5. 恢复批次时只能从数据库权威状态继续，已终态商品不得重放。
+6. `stop.signal` 继续只在安全检查点阻止领取下一商品；提交意图后的当前商品必须完成读回或进入唯一 RECONCILE。
+
+### 17.6 数据和兼容策略
+
+为控制改动范围，现有 fresh-read 字段和 PREVIEWED 计数在第一轮实现中不强制删除，但降级为兼容字段，不参与正常执行路径。后续只有在迁移、备份恢复和历史报告兼容得到单独评估后，才允许通过独立 Schema 变更清理。
+
+正常路径不再要求：
+
+- `fresh_read_attempt_id`
+- `fresh_read_result_sha256`
+- `fresh_old_price`
+- 独立 `FRESH_READ` 请求、结果、phase 和归档目录
+- 正常批次 FILL_PREVIEW 请求及其验收报告
+
+批次来源仍以任务11 READ_ONLY 归档和哈希为准；副作用事实仍以 operation、COMMIT attempt、side-effect checkpoint、独立回读和 RECONCILE 为准。
+
+### 17.7 修订后的验收门槛
+
+后续实现 PR 的自动测试应聚焦：单轮来源绑定、严格串行领取、逐商品审批、内联旧价漂移阻断、写锁、提交意图边界、独立回读、UNKNOWN 唯一 RECONCILE、暂停恢复不重放、Importer 计数重算、报告和旧单商品回归。删除“每项 fresh READ 及60秒 fresh-read 绑定”和“至少3项 FILL_PREVIEW”作为正常流程验收条件。
+
+修订后的实机验收要求：
+
+1. 一轮约5–10个 ONLINE 商品的批次 READ_ONLY，完整保存请求、结果、`read_batch_id`、run ID、哈希、归档和数据库回读。
+2. 证明改价队列同时最多执行一个商品，且前一商品完成导入归档后才领取下一商品。
+3. 仅在项目负责人逐商品明确授权后，对至少2个不同页面身份商品执行受控 COMMIT。
+4. 提供至少一个 COMMIT 内联旧价漂移阻断样本，证明不新增 fresh READ attempt 仍能在提交前 fail closed。
+5. 保留提交意图前安全停止、UNKNOWN/唯一 RECONCILE、暂停恢复不重放和计数恒等式证据。
+6. 人工可读 Markdown 和机器可读 JSON 继续逐商品列出前价、目标价、后价、最终状态、错误、审批和 operation/attempt/run ID，并汇报来源 READ_ONLY、Importer、归档、数据库回读及无跨商品副作用。
+
+FILL_PREVIEW 不再计入正常验收；如因平台变化单独执行，只作为诊断附件，不改变批次验收结论。
+
+### 17.8 后续实施顺序
+
+后续代码工作必须另开实现 PR，并按以下顺序控制范围：
+
+1. 先审计并移除或隔离重复的批次验收驱动和独立 fresh READ 正常路径；不得重新实现任务11读取或单商品垂直切片。
+2. 将批次 orchestrator 改为领取商品后直接调用既有单商品 COMMIT executor。
+3. 将批次快照旧价映射到 COMMIT 的 `expected_old_price`，保留执行器内部读取和 `OLD_PRICE_CHANGED` 阻断。
+4. 更新 Importer、批次计数、Web 和报告，使正常路径不依赖 fresh-read 字段或 PREVIEWED。
+5. 更新自动测试后再进行受控实机验收；没有逐商品明确授权时不得执行 COMMIT。
+6. 通过 GitHub PR 交接实现和证据，任务状态仍由审查方在审查合格后单独修改。
+
+本计划修改 PR 不包含代码、Schema、影刀同步或实机操作，也不把此前未通过或部分通过的实验批次计入正式验收。
