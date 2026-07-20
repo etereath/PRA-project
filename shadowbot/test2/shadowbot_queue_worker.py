@@ -43,6 +43,28 @@ INSTRUCTION_HASH_FIELDS = (
     "applet_uri",
 )
 
+TASK12_INSTRUCTION_HASH_FIELDS = (
+    "batch_contract_version",
+    "price_batch_id",
+    "price_batch_item_id",
+    "price_batch_ordinal",
+    "price_batch_stage",
+    "batch_execution_mode",
+    "normalized_request_digest",
+    "source_read_batch_id",
+    "source_snapshot_sha256",
+    "source_page_context_sha256",
+    "page_identity_key",
+    "write_identity_key",
+    "fresh_read_attempt_id",
+    "fresh_read_result_sha256",
+    "fresh_old_price",
+    "approved_payload_hash",
+    "approval_id",
+    "expires_at",
+    "capture_evidence",
+)
+
 V2_CONTRACT_VERSION = 2
 V2_DEFAULT_LIMITS = {"max_pages": 20, "max_scrolls": 100, "max_seconds": 300}
 V2_HARD_LIMITS = {"max_pages": 100, "max_scrolls": 500, "max_seconds": 900}
@@ -181,9 +203,21 @@ def _json_bytes(data):
 
 
 def _instruction_hash(payload):
-    canonical = {name: payload.get(name, "") for name in INSTRUCTION_HASH_FIELDS}
+    fields = INSTRUCTION_HASH_FIELDS
+    if payload.get("batch_contract_version") == 3:
+        fields = INSTRUCTION_HASH_FIELDS + TASK12_INSTRUCTION_HASH_FIELDS
+    canonical = {name: payload.get(name, "") for name in fields}
     encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _task12_binding(payload):
+    if payload.get("batch_contract_version") != 3:
+        return {}
+    return {
+        name: payload.get(name, "")
+        for name in TASK12_INSTRUCTION_HASH_FIELDS
+    }
 
 
 def _as_bool(value):
@@ -421,9 +455,73 @@ class QueueWorker:
             raise ValueError("current platform adapter cannot verify expected_spec")
         if request["instruction_hash"] != _instruction_hash(request):
             raise ValueError("instruction_hash mismatch")
+        if request.get("batch_contract_version") == 3:
+            self._validate_task12_item_request(request)
         expires_at = datetime.fromisoformat(str(request["expires_at"]))
         if expires_at.tzinfo is None or expires_at.astimezone(timezone.utc) <= datetime.now(timezone.utc):
             raise ValueError("request expired")
+
+    def _validate_task12_item_request(self, request):
+        if len(_json_bytes(request)) > V2_MAX_REQUEST_BYTES:
+            raise ValueError("REQUEST_SIZE_LIMIT_EXCEEDED")
+        required = (
+            "price_batch_id",
+            "price_batch_item_id",
+            "price_batch_ordinal",
+            "price_batch_stage",
+            "batch_execution_mode",
+            "normalized_request_digest",
+            "source_read_batch_id",
+            "source_snapshot_sha256",
+            "source_page_context_sha256",
+            "page_identity_key",
+            "write_identity_key",
+            "fresh_read_attempt_id",
+        )
+        missing = [name for name in required if not str(request.get(name) or "").strip()]
+        if request.get("batch_contract_version") == 3:
+            missing = [name for name in missing if name != "platform_sku"]
+        if missing:
+            raise ValueError("missing task 12 item fields: " + ", ".join(missing))
+        ordinal = request.get("price_batch_ordinal")
+        if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 1:
+            raise ValueError("INVALID_ORDINAL")
+        for name in (
+            "normalized_request_digest",
+            "source_snapshot_sha256",
+            "source_page_context_sha256",
+            "page_identity_key",
+            "write_identity_key",
+            "approved_payload_hash",
+        ):
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(request.get(name) or "")):
+                raise ValueError("invalid task 12 hash: " + name)
+        if not isinstance(request.get("capture_evidence"), bool):
+            raise ValueError("capture_evidence must be boolean")
+        stage = str(request.get("price_batch_stage") or "").strip().upper()
+        mode = str(request.get("execution_mode") or "").strip().upper()
+        batch_mode = str(request.get("batch_execution_mode") or "").strip().upper()
+        if stage != "RECONCILE" and not str(request.get("approval_id") or "").strip():
+            raise ValueError("task 12 approval_id is required")
+        if batch_mode not in ("FILL_PREVIEW", "COMMIT"):
+            raise ValueError("UNSUPPORTED_EXECUTION_MODE")
+        if stage == "FRESH_READ":
+            if mode != "READ_ONLY" or request.get("fresh_read_attempt_id") != request.get("execution_attempt_id"):
+                raise ValueError("BATCH_ITEM_BINDING_MISMATCH")
+            if str(request.get("fresh_read_result_sha256") or "") or str(request.get("fresh_old_price") or ""):
+                raise ValueError("BATCH_ITEM_BINDING_MISMATCH")
+        elif stage == "WRITE":
+            if mode != batch_mode:
+                raise ValueError("BATCH_ITEM_BINDING_MISMATCH")
+            if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(request.get("fresh_read_result_sha256") or "")):
+                raise ValueError("BATCH_ITEM_BINDING_MISMATCH")
+            if str(request.get("fresh_old_price") or "") != str(request.get("expected_old_price") or ""):
+                raise ValueError("OLD_PRICE_CHANGED")
+        elif stage == "RECONCILE":
+            if mode != "RECONCILE":
+                raise ValueError("BATCH_ITEM_BINDING_MISMATCH")
+        else:
+            raise ValueError("BATCH_ITEM_BINDING_MISMATCH")
 
     def _validate_multi_product_request(self, request):
         if len(_json_bytes(request)) > V2_MAX_REQUEST_BYTES:
@@ -505,6 +603,7 @@ class QueueWorker:
                 "worker_id": self.worker_id,
                 "queue_phase": "RESULT_WRITTEN",
                 "worker_heartbeat_at": _now_iso(),
+                **_task12_binding(request),
             }
         )
         if request.get("contract_version") == V2_CONTRACT_VERSION:
@@ -541,6 +640,29 @@ class QueueWorker:
             }
             result["result_id"] = "RESULT-" + hashlib.sha256(_json_bytes(result)).hexdigest()[:24]
             content = _json_bytes(result)
+        if request.get("batch_contract_version") == 3 and len(content) > V2_MAX_RESULT_BYTES:
+            result = {
+                "schema_version": "shadowbot-result-1.0",
+                "task_id": request["task_id"],
+                "operation_id": request["operation_id"],
+                "execution_attempt_id": attempt_id,
+                "execution_mode": request["execution_mode"],
+                "instruction_hash": request.get("instruction_hash", ""),
+                "request_file_sha256": request_sha256,
+                "worker_id": self.worker_id,
+                "queue_phase": "RESULT_WRITTEN",
+                "worker_heartbeat_at": _now_iso(),
+                "status": "FAILED",
+                "run_success_flag": False,
+                "business_operation_completed": False,
+                "side_effect_state": "NOT_STARTED",
+                "error_code": "RESULT_TOO_LARGE",
+                "error_message": "result exceeds 4 MiB contract limit",
+                "retryable": False,
+                **_task12_binding(request),
+            }
+            result["result_id"] = "RESULT-" + hashlib.sha256(_json_bytes(result)).hexdigest()[:24]
+            content = _json_bytes(result)
         _atomic_write(result_path.with_suffix(result_path.suffix + ".sha256"), (hashlib.sha256(content).hexdigest() + "\n").encode("ascii"))
         _atomic_write(result_path, content)
         self._write_phase(request, phase_path, "RESULT_WRITTEN", str(result.get("side_effect_state") or "NOT_STARTED"), request_sha256)
@@ -572,6 +694,7 @@ class QueueWorker:
             "lease_owner_token": request.get("lease_owner_token", ""),
             "lease_version": request.get("lease_version", 0),
             "updated_at": _now_iso(),
+            **_task12_binding(request),
         }
         if request.get("contract_version") == V2_CONTRACT_VERSION:
             payload.update(
@@ -618,6 +741,7 @@ class QueueWorker:
             "retryable": False,
             "queue_phase": "RESULT_WRITTEN",
             "worker_heartbeat_at": _now_iso(),
+            **_task12_binding(request),
         }
         result_identity = json.dumps(result, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
         result["result_id"] = "RESULT-" + hashlib.sha256(result_identity).hexdigest()[:24]

@@ -506,6 +506,7 @@ SCHEMA_V7_SQL = [
         paused_reason TEXT NOT NULL DEFAULT '',
         error_code TEXT NOT NULL DEFAULT '',
         created_by TEXT NOT NULL,
+        capture_evidence INTEGER NOT NULL DEFAULT 0 CHECK (capture_evidence IN (0, 1)),
         created_at TEXT NOT NULL,
         started_at TEXT,
         completed_at TEXT,
@@ -674,6 +675,12 @@ class SQLiteRuntimeRepository:
                 connection.execute(statement)
             for statement in SCHEMA_V7_SQL:
                 connection.execute(statement)
+            _ensure_column(
+                connection,
+                "shadowbot_batches",
+                "capture_evidence",
+                "INTEGER NOT NULL DEFAULT 0 CHECK (capture_evidence IN (0, 1))",
+            )
             for version in range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1):
                 connection.execute(
                     """
@@ -1949,7 +1956,7 @@ class SQLiteRuntimeRepository:
                     pending_count, ready_count, running_count, processed_count, previewed_count,
                     verified_count, failed_count, skipped_count, cancelled_count,
                     needs_reconciliation_count, reconciled_item_count, paused_reason, error_code,
-                    created_by, created_at, started_at, completed_at, updated_at
+                    created_by, capture_evidence, created_at, started_at, completed_at, updated_at
                 ) VALUES(
                     :batch_id, :contract_version, :platform, :batch_type, :execution_mode,
                     :identity_normalization_version, :normalized_request_digest, :stop_policy,
@@ -1958,7 +1965,7 @@ class SQLiteRuntimeRepository:
                     :pending_count, :ready_count, :running_count, :processed_count, :previewed_count,
                     :verified_count, :failed_count, :skipped_count, :cancelled_count,
                     :needs_reconciliation_count, :reconciled_item_count, :paused_reason, :error_code,
-                    :created_by, :created_at, :started_at, :completed_at, :updated_at
+                    :created_by, :capture_evidence, :created_at, :started_at, :completed_at, :updated_at
                 )
                 """,
                 _shadowbot_batch_to_row(batch),
@@ -2031,6 +2038,44 @@ class SQLiteRuntimeRepository:
                 (batch_id, item_id),
             ).fetchone()
         return _row_to_shadowbot_batch_item(row) if row is not None else None
+
+    def reserve_shadowbot_batch_fresh_read_attempt(
+        self,
+        batch_id: str,
+        item_id: str,
+        *,
+        fresh_read_attempt_id: str,
+        now: datetime,
+    ) -> bool:
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT status, fresh_read_attempt_id FROM shadowbot_batch_items "
+                "WHERE batch_id = ? AND item_id = ?",
+                (batch_id, item_id),
+            ).fetchone()
+            if row is None or str(row["status"]) != BatchItemStatus.RUNNING.value:
+                raise PriceBatchContractError(PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH)
+            existing = str(row["fresh_read_attempt_id"] or "")
+            if existing and existing != fresh_read_attempt_id:
+                raise PriceBatchContractError(PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH)
+            if not existing:
+                connection.execute(
+                    """
+                    UPDATE shadowbot_batch_items
+                    SET fresh_read_attempt_id = ?, updated_at = ?
+                    WHERE batch_id = ? AND item_id = ?
+                    """,
+                    (fresh_read_attempt_id, _datetime_to_text(now), batch_id, item_id),
+                )
+            connection.commit()
+            return not bool(existing)
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def claim_next_shadowbot_batch_item(
         self,
@@ -5042,6 +5087,7 @@ def _shadowbot_batch_to_row(batch: ShadowBotBatch) -> dict[str, Any]:
         "paused_reason": batch.paused_reason,
         "error_code": batch.error_code,
         "created_by": batch.created_by,
+        "capture_evidence": int(batch.capture_evidence),
         "created_at": _datetime_to_text(created_at),
         "started_at": _datetime_to_text(batch.started_at),
         "completed_at": _datetime_to_text(batch.completed_at),
@@ -5066,6 +5112,7 @@ def _row_to_shadowbot_batch(row: sqlite3.Row) -> ShadowBotBatch:
         source_snapshot_max_age_seconds=int(row["source_snapshot_max_age_seconds"]),
         status=str(row["status"]),
         created_by=str(row["created_by"]),
+        capture_evidence=bool(row["capture_evidence"]),
         current_item_id=str(row["current_item_id"] or ""),
         pending_count=int(row["pending_count"]),
         ready_count=int(row["ready_count"]),

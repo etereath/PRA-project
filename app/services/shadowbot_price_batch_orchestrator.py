@@ -139,6 +139,7 @@ class ShadowBotPriceBatchOrchestrator:
             source_snapshot_max_age_seconds=normalized["source_snapshot_max_age_seconds"],
             status=BatchStatus.PENDING.value,
             created_by=actor,
+            capture_evidence=normalized["capture_evidence"],
             pending_count=len(items),
             created_at=timestamp,
             updated_at=timestamp,
@@ -198,7 +199,7 @@ class ShadowBotPriceBatchOrchestrator:
             if normalize_text(value)
         }
         accepted_platforms.add(normalize_text(batch.platform))
-        normalized = _approval_request_view(batch, item)
+        normalized = build_persisted_batch_item_request_view(batch, item)
         self._validate_approval(
             normalized,
             normalized["items"][0],
@@ -654,7 +655,10 @@ class ShadowBotPriceBatchOrchestrator:
             raise PriceBatchContractError(PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH)
 
 
-def _approval_request_view(batch: ShadowBotBatch, item: ShadowBotBatchItem) -> dict[str, Any]:
+def build_persisted_batch_item_request_view(
+    batch: ShadowBotBatch,
+    item: ShadowBotBatchItem,
+) -> dict[str, Any]:
     raw_item = {
         "item_id": item.item_id,
         "ordinal": item.ordinal,

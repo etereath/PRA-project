@@ -97,19 +97,24 @@ def test_refresh_failure_is_normalized_and_audited():
     assert "management entry missing" in event["error_message"]
 
 
-def test_main_flow_refreshes_before_initial_read_and_once_before_submit_verification():
+def test_main_flow_refreshes_before_initial_read_preview_cancel_and_submit_verification():
     source = FLOW_PATH.read_text(encoding="utf-8")
 
-    # One helper definition, one normal pre-read refresh, and one post-submit
-    # verification refresh. Login recovery must happen before the first refresh.
-    assert source.count('_refresh_product_list(') == 3
+    # One helper definition plus refreshes before the initial read, after a
+    # cancelled preview, and after a real submit. Login recovery must happen
+    # before the first refresh.
+    assert source.count('_refresh_product_list(') == 4
     login_check = source.index('current_step = "CHECK_LOGIN"')
     initial_refresh = source.index('"BEFORE_PRICE_READ"')
     initial_locate = source.index('current_step = "LOCATE_PRODUCT"', initial_refresh)
+    preview_cancel = source.index('current_step = "CANCEL_PREVIEW"')
+    preview_refresh = source.index('"AFTER_PREVIEW_CANCEL"', preview_cancel)
+    preview_post_read = source.index('"PREVIEW_INPUT_MISMATCH"', preview_refresh)
     post_refresh = source.index('"AFTER_SUBMIT_VERIFY"')
     post_verify = source.index('current_step = "VERIFY_AFTER_SUBMIT"', post_refresh)
 
     assert login_check < initial_refresh < initial_locate
+    assert preview_cancel < preview_refresh < preview_post_read
     assert post_refresh < post_verify
     assert "row_index, list_name, list_grade = _locate_product_row(" in source[post_refresh:post_verify]
     assert "_wait_after_submit_price" in source[post_verify:]

@@ -395,6 +395,7 @@ class ShadowBotBatch:
     source_snapshot_max_age_seconds: int
     status: str
     created_by: str
+    capture_evidence: bool = False
     current_item_id: str = ""
     pending_count: int = 0
     ready_count: int = 0

@@ -146,6 +146,7 @@ V7_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
         "paused_reason",
         "error_code",
         "created_by",
+        "capture_evidence",
         "created_at",
         "started_at",
         "completed_at",
@@ -711,6 +712,12 @@ def _check_price_batch_constraints(
         re.IGNORECASE,
     ):
         errors.append("shadowbot_batch_items.ordinal lacks CHECK (ordinal > 0)")
+    if not re.search(
+        r"\bCHECK\s*\(\s*capture_evidence\s+IN\s*\(\s*0\s*,\s*1\s*\)\s*\)",
+        table_sql.get("shadowbot_batches", ""),
+        re.IGNORECASE,
+    ):
+        errors.append("shadowbot_batches.capture_evidence lacks boolean CHECK")
 
     index_rows = {
         str(row[1]): row
