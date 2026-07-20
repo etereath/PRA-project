@@ -32,6 +32,8 @@ from app.models import (
     ScriptRun,
     ScriptRunItem,
     ShadowBotExecutionAttempt,
+    ShadowBotBatch,
+    ShadowBotBatchItem,
     ShadowBotOperationLedger,
     ShadowBotSideEffectCheckpoint,
     Task,
@@ -50,6 +52,13 @@ from app.runtime_schema import (
     LATEST_RUNTIME_SCHEMA_VERSION,
     RuntimeSchemaHealth,
     inspect_runtime_schema,
+)
+from app.services.shadowbot_price_batch import (
+    BatchItemStatus,
+    BatchStatus,
+    PriceBatchContractError,
+    PriceBatchErrorCode,
+    WRITE_LOCK_STATES,
 )
 from app.utils import serialize_decimal
 from app.utils import utc_now
@@ -293,6 +302,8 @@ SCHEMA_SQL = [
         status TEXT NOT NULL,
         lock_owner TEXT NOT NULL DEFAULT '',
         approved_payload_hash TEXT NOT NULL DEFAULT '',
+        write_identity_key TEXT NOT NULL DEFAULT '',
+        page_identity_key TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         FOREIGN KEY(task_id) REFERENCES tasks(task_id)
@@ -452,6 +463,139 @@ SCHEMA_V6_SQL = [
 ]
 
 
+def _sql_string_values(values: Iterable[str]) -> str:
+    return ", ".join("'" + str(value).replace("'", "''") + "'" for value in sorted(values))
+
+
+_BATCH_STATUS_SQL = _sql_string_values(status.value for status in BatchStatus)
+_BATCH_ITEM_STATUS_SQL = _sql_string_values(status.value for status in BatchItemStatus)
+_WRITE_LOCK_STATUS_SQL = _sql_string_values(WRITE_LOCK_STATES)
+
+SCHEMA_V7_SQL = [
+    f"""
+    CREATE TABLE IF NOT EXISTS shadowbot_batches (
+        batch_id TEXT PRIMARY KEY,
+        contract_version INTEGER NOT NULL CHECK (contract_version = 3),
+        platform TEXT NOT NULL,
+        batch_type TEXT NOT NULL,
+        execution_mode TEXT NOT NULL,
+        identity_normalization_version TEXT NOT NULL,
+        normalized_request_digest TEXT NOT NULL,
+        stop_policy TEXT NOT NULL,
+        source_read_batch_id TEXT NOT NULL,
+        source_snapshot_sha256 TEXT NOT NULL,
+        source_page_context_sha256 TEXT NOT NULL,
+        source_observed_at TEXT NOT NULL,
+        source_snapshot_max_age_seconds INTEGER NOT NULL
+            CHECK (source_snapshot_max_age_seconds = 300),
+        status TEXT NOT NULL CHECK (status IN ({_BATCH_STATUS_SQL})),
+        current_item_id TEXT NOT NULL DEFAULT '',
+        pending_count INTEGER NOT NULL DEFAULT 0 CHECK (pending_count >= 0),
+        ready_count INTEGER NOT NULL DEFAULT 0 CHECK (ready_count >= 0),
+        running_count INTEGER NOT NULL DEFAULT 0 CHECK (running_count >= 0),
+        processed_count INTEGER NOT NULL DEFAULT 0 CHECK (processed_count >= 0),
+        previewed_count INTEGER NOT NULL DEFAULT 0 CHECK (previewed_count >= 0),
+        verified_count INTEGER NOT NULL DEFAULT 0 CHECK (verified_count >= 0),
+        failed_count INTEGER NOT NULL DEFAULT 0 CHECK (failed_count >= 0),
+        skipped_count INTEGER NOT NULL DEFAULT 0 CHECK (skipped_count >= 0),
+        cancelled_count INTEGER NOT NULL DEFAULT 0 CHECK (cancelled_count >= 0),
+        needs_reconciliation_count INTEGER NOT NULL DEFAULT 0
+            CHECK (needs_reconciliation_count >= 0),
+        reconciled_item_count INTEGER NOT NULL DEFAULT 0 CHECK (reconciled_item_count >= 0),
+        paused_reason TEXT NOT NULL DEFAULT '',
+        error_code TEXT NOT NULL DEFAULT '',
+        created_by TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        completed_at TEXT,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    f"""
+    CREATE TABLE IF NOT EXISTS shadowbot_batch_items (
+        batch_id TEXT NOT NULL,
+        item_id TEXT NOT NULL,
+        ordinal INTEGER NOT NULL CHECK (ordinal > 0),
+        source_item_id TEXT NOT NULL,
+        source_read_batch_id TEXT NOT NULL,
+        source_snapshot_sha256 TEXT NOT NULL,
+        source_page_context_sha256 TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        review_task_id TEXT NOT NULL,
+        operation_id TEXT NOT NULL,
+        approved_payload_hash TEXT NOT NULL,
+        page_identity_key TEXT NOT NULL,
+        write_identity_key TEXT NOT NULL,
+        external_platform_sku TEXT,
+        expected_product_name TEXT NOT NULL,
+        expected_grade TEXT NOT NULL,
+        approved_expected_old_price TEXT NOT NULL,
+        target_price TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ({_BATCH_ITEM_STATUS_SQL})),
+        current_execution_attempt_id TEXT NOT NULL DEFAULT '',
+        current_run_id TEXT NOT NULL DEFAULT '',
+        fresh_read_attempt_id TEXT NOT NULL DEFAULT '',
+        fresh_read_result_sha256 TEXT NOT NULL DEFAULT '',
+        fresh_old_price TEXT,
+        post_commit_price TEXT,
+        reconcile_attempt_id TEXT NOT NULL DEFAULT '',
+        reconciliation_outcome TEXT NOT NULL DEFAULT '',
+        reconciled_at TEXT,
+        error_code TEXT NOT NULL DEFAULT '',
+        error_message TEXT NOT NULL DEFAULT '',
+        result_id TEXT NOT NULL DEFAULT '',
+        result_hash TEXT NOT NULL DEFAULT '',
+        started_at TEXT,
+        completed_at TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(batch_id, item_id),
+        FOREIGN KEY(batch_id) REFERENCES shadowbot_batches(batch_id),
+        FOREIGN KEY(task_id) REFERENCES tasks(task_id),
+        FOREIGN KEY(review_task_id) REFERENCES review_tasks(review_task_id),
+        FOREIGN KEY(operation_id) REFERENCES shadowbot_operations(operation_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_shadowbot_batches_status
+    ON shadowbot_batches(status, created_at)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_shadowbot_batches_digest
+    ON shadowbot_batches(normalized_request_digest)
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_shadowbot_batch_items_ordinal
+    ON shadowbot_batch_items(batch_id, ordinal)
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_shadowbot_batch_items_operation_id
+    ON shadowbot_batch_items(operation_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_shadowbot_batch_items_status
+    ON shadowbot_batch_items(batch_id, status, ordinal)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_shadowbot_operations_write_identity_status
+    ON shadowbot_operations(write_identity_key, status)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_shadowbot_operations_page_identity_status
+    ON shadowbot_operations(page_identity_key, status)
+    """,
+    f"""
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_shadowbot_operations_active_write_identity
+    ON shadowbot_operations(write_identity_key)
+    WHERE write_identity_key <> '' AND status IN ({_WRITE_LOCK_STATUS_SQL})
+    """,
+    f"""
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_shadowbot_operations_active_page_identity
+    ON shadowbot_operations(page_identity_key)
+    WHERE page_identity_key <> '' AND status IN ({_WRITE_LOCK_STATUS_SQL})
+    """,
+]
+
+
 class SQLiteRuntimeRepository:
     def __init__(
         self,
@@ -509,6 +653,8 @@ class SQLiteRuntimeRepository:
             _ensure_column(connection, "shadowbot_execution_attempts", "instruction_hash", "TEXT NOT NULL DEFAULT ''")
             _ensure_column(connection, "shadowbot_execution_attempts", "request_file_sha256", "TEXT NOT NULL DEFAULT ''")
             _ensure_column(connection, "shadowbot_execution_attempts", "queue_request_path", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(connection, "shadowbot_operations", "write_identity_key", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(connection, "shadowbot_operations", "page_identity_key", "TEXT NOT NULL DEFAULT ''")
             migration_notes = {
                 1: "initial runtime schema",
                 2: "review token runtime schema",
@@ -516,8 +662,11 @@ class SQLiteRuntimeRepository:
                 4: "shadowbot executor runtime schema",
                 5: "retry authorization persistence and shadowbot file queue audit fields",
                 6: "durable notification outbox and delivery attempt persistence",
+                7: "serial price batch ledger and active product write identities",
             }
             for statement in SCHEMA_V6_SQL:
+                connection.execute(statement)
+            for statement in SCHEMA_V7_SQL:
                 connection.execute(statement)
             for version in range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1):
                 connection.execute(
@@ -547,7 +696,7 @@ class SQLiteRuntimeRepository:
         return [int(row["schema_version"]) for row in rows]
 
     def check_schema_health(self) -> RuntimeSchemaHealth:
-        """Return a non-mutating exact-v5 schema health report."""
+        """Return a non-mutating exact-latest schema health report."""
 
         if not self.db_path.exists():
             memory_factory = SQLiteConnectionFactory(":memory:")
@@ -1551,22 +1700,60 @@ class SQLiteRuntimeRepository:
 
     def insert_shadowbot_operation(self, operation: ShadowBotOperationLedger) -> int:
         row = _shadowbot_operation_to_row(operation)
-        with closing(self.connect()) as connection, connection:
-            before = connection.total_changes
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT operation_id FROM shadowbot_operations WHERE operation_id = ?",
+                (operation.operation_id,),
+            ).fetchone()
+            if existing is not None:
+                connection.rollback()
+                return 0
+            if operation.write_identity_key or operation.page_identity_key:
+                conflict = connection.execute(
+                    f"""
+                    SELECT operation_id
+                    FROM shadowbot_operations
+                    WHERE status IN ({_WRITE_LOCK_STATUS_SQL})
+                      AND (
+                          (write_identity_key <> '' AND write_identity_key = ?)
+                          OR (page_identity_key <> '' AND page_identity_key = ?)
+                      )
+                    LIMIT 1
+                    """,
+                    (operation.write_identity_key, operation.page_identity_key),
+                ).fetchone()
+                if conflict is not None:
+                    raise PriceBatchContractError(PriceBatchErrorCode.WRITE_LOCK_CONFLICT)
             connection.execute(
                 """
-                INSERT OR IGNORE INTO shadowbot_operations(
+                INSERT INTO shadowbot_operations(
                     operation_id, task_id, platform, product_identity_json, expected_old_price,
-                    target_price, status, lock_owner, approved_payload_hash, created_at, updated_at
+                    target_price, status, lock_owner, approved_payload_hash,
+                    write_identity_key, page_identity_key, created_at, updated_at
                 )
                 VALUES(
                     :operation_id, :task_id, :platform, :product_identity_json, :expected_old_price,
-                    :target_price, :status, :lock_owner, :approved_payload_hash, :created_at, :updated_at
+                    :target_price, :status, :lock_owner, :approved_payload_hash,
+                    :write_identity_key, :page_identity_key, :created_at, :updated_at
                 )
                 """,
                 row,
             )
-            return connection.total_changes - before
+            connection.commit()
+            return 1
+        except PriceBatchContractError:
+            connection.rollback()
+            raise
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            message = str(exc).casefold()
+            if "active_write_identity" in message or "active_page_identity" in message:
+                raise PriceBatchContractError(PriceBatchErrorCode.WRITE_LOCK_CONFLICT) from exc
+            raise
+        finally:
+            connection.close()
 
     def get_shadowbot_operation(self, operation_id: str) -> ShadowBotOperationLedger | None:
         with closing(self.connect()) as connection:
@@ -1575,6 +1762,188 @@ class SQLiteRuntimeRepository:
                 (operation_id,),
             ).fetchone()
         return _row_to_shadowbot_operation(row) if row is not None else None
+
+    def insert_shadowbot_batch(
+        self,
+        batch: ShadowBotBatch,
+        items: Iterable[ShadowBotBatchItem],
+    ) -> int:
+        """Persist a new task 12 batch and its operation bindings atomically.
+
+        Replaying the same batch id and normalized digest is idempotent.  Any
+        other identity, operation, or approval mismatch fails before a batch
+        item can become runnable.
+        """
+
+        materialized = sorted(list(items), key=lambda item: item.ordinal)
+        if batch.status != BatchStatus.PENDING.value or any(
+            item.status != BatchItemStatus.PENDING.value for item in materialized
+        ):
+            raise PriceBatchContractError(
+                PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH,
+                "new batches and items must start in PENDING",
+            )
+        if not materialized or [item.ordinal for item in materialized] != list(range(1, len(materialized) + 1)):
+            raise PriceBatchContractError(PriceBatchErrorCode.INVALID_ORDINAL)
+        if any(item.batch_id != batch.batch_id for item in materialized):
+            raise PriceBatchContractError(PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH)
+        if (
+            batch.pending_count != len(materialized)
+            or any(
+                value != 0
+                for value in (
+                    batch.ready_count,
+                    batch.running_count,
+                    batch.processed_count,
+                    batch.previewed_count,
+                    batch.verified_count,
+                    batch.failed_count,
+                    batch.skipped_count,
+                    batch.cancelled_count,
+                    batch.needs_reconciliation_count,
+                    batch.reconciled_item_count,
+                )
+            )
+        ):
+            raise PriceBatchContractError(
+                PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH,
+                "initial batch counts do not match PENDING items",
+            )
+
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT normalized_request_digest FROM shadowbot_batches WHERE batch_id = ?",
+                (batch.batch_id,),
+            ).fetchone()
+            if existing is not None:
+                if str(existing["normalized_request_digest"]) != batch.normalized_request_digest:
+                    raise PriceBatchContractError(PriceBatchErrorCode.PRICE_BATCH_ID_CONFLICT)
+                connection.rollback()
+                return 0
+
+            for item in materialized:
+                operation = connection.execute(
+                    """
+                    SELECT task_id, platform, approved_payload_hash,
+                           write_identity_key, page_identity_key
+                    FROM shadowbot_operations
+                    WHERE operation_id = ?
+                    """,
+                    (item.operation_id,),
+                ).fetchone()
+                if operation is None:
+                    raise PriceBatchContractError(
+                        PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH,
+                        f"missing operation {item.operation_id}",
+                    )
+                if (
+                    str(operation["task_id"]) != item.task_id
+                    or str(operation["platform"]) != batch.platform
+                    or str(operation["approved_payload_hash"] or "") != item.approved_payload_hash
+                    or str(operation["write_identity_key"] or "") != item.write_identity_key
+                    or str(operation["page_identity_key"] or "") != item.page_identity_key
+                ):
+                    raise PriceBatchContractError(PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH)
+                conflict = connection.execute(
+                    f"""
+                    SELECT operation_id
+                    FROM shadowbot_operations
+                    WHERE operation_id <> ?
+                      AND status IN ({_WRITE_LOCK_STATUS_SQL})
+                      AND (write_identity_key = ? OR page_identity_key = ?)
+                    LIMIT 1
+                    """,
+                    (item.operation_id, item.write_identity_key, item.page_identity_key),
+                ).fetchone()
+                if conflict is not None:
+                    raise PriceBatchContractError(PriceBatchErrorCode.WRITE_LOCK_CONFLICT)
+
+            connection.execute(
+                """
+                INSERT INTO shadowbot_batches(
+                    batch_id, contract_version, platform, batch_type, execution_mode,
+                    identity_normalization_version, normalized_request_digest, stop_policy,
+                    source_read_batch_id, source_snapshot_sha256, source_page_context_sha256,
+                    source_observed_at, source_snapshot_max_age_seconds, status, current_item_id,
+                    pending_count, ready_count, running_count, processed_count, previewed_count,
+                    verified_count, failed_count, skipped_count, cancelled_count,
+                    needs_reconciliation_count, reconciled_item_count, paused_reason, error_code,
+                    created_by, created_at, started_at, completed_at, updated_at
+                ) VALUES(
+                    :batch_id, :contract_version, :platform, :batch_type, :execution_mode,
+                    :identity_normalization_version, :normalized_request_digest, :stop_policy,
+                    :source_read_batch_id, :source_snapshot_sha256, :source_page_context_sha256,
+                    :source_observed_at, :source_snapshot_max_age_seconds, :status, :current_item_id,
+                    :pending_count, :ready_count, :running_count, :processed_count, :previewed_count,
+                    :verified_count, :failed_count, :skipped_count, :cancelled_count,
+                    :needs_reconciliation_count, :reconciled_item_count, :paused_reason, :error_code,
+                    :created_by, :created_at, :started_at, :completed_at, :updated_at
+                )
+                """,
+                _shadowbot_batch_to_row(batch),
+            )
+            connection.executemany(
+                """
+                INSERT INTO shadowbot_batch_items(
+                    batch_id, item_id, ordinal, source_item_id, source_read_batch_id,
+                    source_snapshot_sha256, source_page_context_sha256, task_id, review_task_id,
+                    operation_id, approved_payload_hash, page_identity_key, write_identity_key,
+                    external_platform_sku, expected_product_name, expected_grade,
+                    approved_expected_old_price, target_price, status,
+                    current_execution_attempt_id, current_run_id, fresh_read_attempt_id,
+                    fresh_read_result_sha256, fresh_old_price, post_commit_price,
+                    reconcile_attempt_id, reconciliation_outcome, reconciled_at,
+                    error_code, error_message, result_id, result_hash,
+                    started_at, completed_at, updated_at
+                ) VALUES(
+                    :batch_id, :item_id, :ordinal, :source_item_id, :source_read_batch_id,
+                    :source_snapshot_sha256, :source_page_context_sha256, :task_id, :review_task_id,
+                    :operation_id, :approved_payload_hash, :page_identity_key, :write_identity_key,
+                    :external_platform_sku, :expected_product_name, :expected_grade,
+                    :approved_expected_old_price, :target_price, :status,
+                    :current_execution_attempt_id, :current_run_id, :fresh_read_attempt_id,
+                    :fresh_read_result_sha256, :fresh_old_price, :post_commit_price,
+                    :reconcile_attempt_id, :reconciliation_outcome, :reconciled_at,
+                    :error_code, :error_message, :result_id, :result_hash,
+                    :started_at, :completed_at, :updated_at
+                )
+                """,
+                [_shadowbot_batch_item_to_row(item) for item in materialized],
+            )
+            connection.commit()
+            return 1
+        except PriceBatchContractError:
+            connection.rollback()
+            raise
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            message = str(exc).casefold()
+            code = (
+                PriceBatchErrorCode.WRITE_LOCK_CONFLICT
+                if "active_write_identity" in message or "active_page_identity" in message
+                else PriceBatchErrorCode.BATCH_ITEM_BINDING_MISMATCH
+            )
+            raise PriceBatchContractError(code) from exc
+        finally:
+            connection.close()
+
+    def get_shadowbot_batch(self, batch_id: str) -> ShadowBotBatch | None:
+        with closing(self.connect_read()) as connection:
+            row = connection.execute(
+                "SELECT * FROM shadowbot_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+        return _row_to_shadowbot_batch(row) if row is not None else None
+
+    def list_shadowbot_batch_items(self, batch_id: str) -> list[ShadowBotBatchItem]:
+        with closing(self.connect_read()) as connection:
+            rows = connection.execute(
+                "SELECT * FROM shadowbot_batch_items WHERE batch_id = ? ORDER BY ordinal",
+                (batch_id,),
+            ).fetchall()
+        return [_row_to_shadowbot_batch_item(row) for row in rows]
 
     def acquire_shadowbot_operation_lock(self, operation_id: str, lock_owner: str) -> bool:
         with closing(self.connect()) as connection, connection:
@@ -3864,6 +4233,8 @@ def _shadowbot_operation_to_row(operation: ShadowBotOperationLedger) -> dict[str
         "status": operation.status,
         "lock_owner": operation.lock_owner,
         "approved_payload_hash": operation.approved_payload_hash,
+        "write_identity_key": operation.write_identity_key,
+        "page_identity_key": operation.page_identity_key,
         "created_at": _datetime_to_text(created_at),
         "updated_at": _datetime_to_text(updated_at),
     }
@@ -3886,7 +4257,173 @@ def _row_to_shadowbot_operation(row: sqlite3.Row) -> ShadowBotOperationLedger:
         status=str(row["status"]),
         lock_owner=str(row["lock_owner"] or ""),
         approved_payload_hash=str(row["approved_payload_hash"] or ""),
+        write_identity_key=str(row["write_identity_key"] or ""),
+        page_identity_key=str(row["page_identity_key"] or ""),
         created_at=_text_to_datetime(row["created_at"]),
+        updated_at=_text_to_datetime(row["updated_at"]),
+    )
+
+
+def _shadowbot_batch_to_row(batch: ShadowBotBatch) -> dict[str, Any]:
+    created_at = batch.created_at or datetime.now()
+    updated_at = batch.updated_at or created_at
+    return {
+        "batch_id": batch.batch_id,
+        "contract_version": batch.contract_version,
+        "platform": batch.platform,
+        "batch_type": batch.batch_type,
+        "execution_mode": batch.execution_mode,
+        "identity_normalization_version": batch.identity_normalization_version,
+        "normalized_request_digest": batch.normalized_request_digest,
+        "stop_policy": batch.stop_policy,
+        "source_read_batch_id": batch.source_read_batch_id,
+        "source_snapshot_sha256": batch.source_snapshot_sha256,
+        "source_page_context_sha256": batch.source_page_context_sha256,
+        "source_observed_at": _datetime_to_text(batch.source_observed_at),
+        "source_snapshot_max_age_seconds": batch.source_snapshot_max_age_seconds,
+        "status": batch.status,
+        "current_item_id": batch.current_item_id,
+        "pending_count": batch.pending_count,
+        "ready_count": batch.ready_count,
+        "running_count": batch.running_count,
+        "processed_count": batch.processed_count,
+        "previewed_count": batch.previewed_count,
+        "verified_count": batch.verified_count,
+        "failed_count": batch.failed_count,
+        "skipped_count": batch.skipped_count,
+        "cancelled_count": batch.cancelled_count,
+        "needs_reconciliation_count": batch.needs_reconciliation_count,
+        "reconciled_item_count": batch.reconciled_item_count,
+        "paused_reason": batch.paused_reason,
+        "error_code": batch.error_code,
+        "created_by": batch.created_by,
+        "created_at": _datetime_to_text(created_at),
+        "started_at": _datetime_to_text(batch.started_at),
+        "completed_at": _datetime_to_text(batch.completed_at),
+        "updated_at": _datetime_to_text(updated_at),
+    }
+
+
+def _row_to_shadowbot_batch(row: sqlite3.Row) -> ShadowBotBatch:
+    return ShadowBotBatch(
+        batch_id=str(row["batch_id"]),
+        contract_version=int(row["contract_version"]),
+        platform=str(row["platform"]),
+        batch_type=str(row["batch_type"]),
+        execution_mode=str(row["execution_mode"]),
+        identity_normalization_version=str(row["identity_normalization_version"]),
+        normalized_request_digest=str(row["normalized_request_digest"]),
+        stop_policy=str(row["stop_policy"]),
+        source_read_batch_id=str(row["source_read_batch_id"]),
+        source_snapshot_sha256=str(row["source_snapshot_sha256"]),
+        source_page_context_sha256=str(row["source_page_context_sha256"]),
+        source_observed_at=_text_to_datetime(row["source_observed_at"]) or datetime.now(),
+        source_snapshot_max_age_seconds=int(row["source_snapshot_max_age_seconds"]),
+        status=str(row["status"]),
+        created_by=str(row["created_by"]),
+        current_item_id=str(row["current_item_id"] or ""),
+        pending_count=int(row["pending_count"]),
+        ready_count=int(row["ready_count"]),
+        running_count=int(row["running_count"]),
+        processed_count=int(row["processed_count"]),
+        previewed_count=int(row["previewed_count"]),
+        verified_count=int(row["verified_count"]),
+        failed_count=int(row["failed_count"]),
+        skipped_count=int(row["skipped_count"]),
+        cancelled_count=int(row["cancelled_count"]),
+        needs_reconciliation_count=int(row["needs_reconciliation_count"]),
+        reconciled_item_count=int(row["reconciled_item_count"]),
+        paused_reason=str(row["paused_reason"] or ""),
+        error_code=str(row["error_code"] or ""),
+        created_at=_text_to_datetime(row["created_at"]),
+        started_at=_text_to_datetime(row["started_at"]),
+        completed_at=_text_to_datetime(row["completed_at"]),
+        updated_at=_text_to_datetime(row["updated_at"]),
+    )
+
+
+def _shadowbot_batch_item_to_row(item: ShadowBotBatchItem) -> dict[str, Any]:
+    return {
+        "batch_id": item.batch_id,
+        "item_id": item.item_id,
+        "ordinal": item.ordinal,
+        "source_item_id": item.source_item_id,
+        "source_read_batch_id": item.source_read_batch_id,
+        "source_snapshot_sha256": item.source_snapshot_sha256,
+        "source_page_context_sha256": item.source_page_context_sha256,
+        "task_id": item.task_id,
+        "review_task_id": item.review_task_id,
+        "operation_id": item.operation_id,
+        "approved_payload_hash": item.approved_payload_hash,
+        "page_identity_key": item.page_identity_key,
+        "write_identity_key": item.write_identity_key,
+        "external_platform_sku": item.external_platform_sku,
+        "expected_product_name": item.expected_product_name,
+        "expected_grade": item.expected_grade,
+        "approved_expected_old_price": serialize_decimal(item.approved_expected_old_price),
+        "target_price": serialize_decimal(item.target_price),
+        "status": item.status,
+        "current_execution_attempt_id": item.current_execution_attempt_id,
+        "current_run_id": item.current_run_id,
+        "fresh_read_attempt_id": item.fresh_read_attempt_id,
+        "fresh_read_result_sha256": item.fresh_read_result_sha256,
+        "fresh_old_price": (
+            serialize_decimal(item.fresh_old_price) if item.fresh_old_price is not None else None
+        ),
+        "post_commit_price": (
+            serialize_decimal(item.post_commit_price) if item.post_commit_price is not None else None
+        ),
+        "reconcile_attempt_id": item.reconcile_attempt_id,
+        "reconciliation_outcome": item.reconciliation_outcome,
+        "reconciled_at": _datetime_to_text(item.reconciled_at),
+        "error_code": item.error_code,
+        "error_message": item.error_message,
+        "result_id": item.result_id,
+        "result_hash": item.result_hash,
+        "started_at": _datetime_to_text(item.started_at),
+        "completed_at": _datetime_to_text(item.completed_at),
+        "updated_at": _datetime_to_text(item.updated_at or datetime.now()),
+    }
+
+
+def _row_to_shadowbot_batch_item(row: sqlite3.Row) -> ShadowBotBatchItem:
+    return ShadowBotBatchItem(
+        batch_id=str(row["batch_id"]),
+        item_id=str(row["item_id"]),
+        ordinal=int(row["ordinal"]),
+        source_item_id=str(row["source_item_id"]),
+        source_read_batch_id=str(row["source_read_batch_id"]),
+        source_snapshot_sha256=str(row["source_snapshot_sha256"]),
+        source_page_context_sha256=str(row["source_page_context_sha256"]),
+        task_id=str(row["task_id"]),
+        review_task_id=str(row["review_task_id"]),
+        operation_id=str(row["operation_id"]),
+        approved_payload_hash=str(row["approved_payload_hash"]),
+        page_identity_key=str(row["page_identity_key"]),
+        write_identity_key=str(row["write_identity_key"]),
+        external_platform_sku=(str(row["external_platform_sku"]) if row["external_platform_sku"] is not None else None),
+        expected_product_name=str(row["expected_product_name"]),
+        expected_grade=str(row["expected_grade"]),
+        approved_expected_old_price=Decimal(str(row["approved_expected_old_price"])),
+        target_price=Decimal(str(row["target_price"])),
+        status=str(row["status"]),
+        current_execution_attempt_id=str(row["current_execution_attempt_id"] or ""),
+        current_run_id=str(row["current_run_id"] or ""),
+        fresh_read_attempt_id=str(row["fresh_read_attempt_id"] or ""),
+        fresh_read_result_sha256=str(row["fresh_read_result_sha256"] or ""),
+        fresh_old_price=(Decimal(str(row["fresh_old_price"])) if row["fresh_old_price"] is not None else None),
+        post_commit_price=(
+            Decimal(str(row["post_commit_price"])) if row["post_commit_price"] is not None else None
+        ),
+        reconcile_attempt_id=str(row["reconcile_attempt_id"] or ""),
+        reconciliation_outcome=str(row["reconciliation_outcome"] or ""),
+        reconciled_at=_text_to_datetime(row["reconciled_at"]),
+        error_code=str(row["error_code"] or ""),
+        error_message=str(row["error_message"] or ""),
+        result_id=str(row["result_id"] or ""),
+        result_hash=str(row["result_hash"] or ""),
+        started_at=_text_to_datetime(row["started_at"]),
+        completed_at=_text_to_datetime(row["completed_at"]),
         updated_at=_text_to_datetime(row["updated_at"]),
     )
 

@@ -68,7 +68,7 @@ class RuntimePersistenceTests(unittest.TestCase):
 
     def test_schema_initializes_version_and_partial_unique_index(self) -> None:
         self.task_service.init_schema()
-        self.assertEqual(self.repository.schema_versions(), [1, 2, 3, 4, 5, 6])
+        self.assertEqual(self.repository.schema_versions(), [1, 2, 3, 4, 5, 6, 7])
         connection = sqlite3.connect(self.db_path)
         try:
             indexes = connection.execute("PRAGMA index_list(tasks)").fetchall()
@@ -107,7 +107,7 @@ class RuntimePersistenceTests(unittest.TestCase):
 
         repository = SQLiteRuntimeRepository(legacy_path)
         repository.init_schema()
-        self.assertEqual(repository.schema_versions(), [1, 2, 3, 4, 5, 6])
+        self.assertEqual(repository.schema_versions(), [1, 2, 3, 4, 5, 6, 7])
         connection = sqlite3.connect(legacy_path)
         try:
             token_table = connection.execute(

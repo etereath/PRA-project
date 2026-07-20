@@ -67,7 +67,7 @@ class SmokeRunner:
     def run(self) -> int:
         checks: list[tuple[str, str, Callable[[], None]]] = [
             ("runtime DB 初始化成功", "SQLiteRuntimeRepository / RuntimeTaskService.init_schema", self.check_init_db),
-            ("schema version exact v6", "runtime_schema_migrations", self.check_schema_version),
+            ("schema version exact v7", "runtime_schema_migrations", self.check_schema_version),
             ("关键运行态表存在", "SQLite schema", self.check_required_tables),
             ("v6 Outbox/RetryAuthorization 结构完整", "runtime schema health check", self.check_schema_integrity),
             ("创建 runtime task", "RuntimeTaskService.create_tasks", self.check_create_task),

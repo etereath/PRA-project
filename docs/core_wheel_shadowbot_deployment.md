@@ -67,7 +67,7 @@ Push-Location $verifyRoot
 Pop-Location
 ```
 
-预期结果：import、CLI 帮助、数据库初始化和 health 均为退出码 `0`；初始化输出包含 `schema_versions=[1, 2, 3, 4, 5, 6]`，health 输出包含 `ok=True`。数据库应位于临时目录，不写入 wheel 或仓库。
+预期结果：import、CLI 帮助、数据库初始化和 health 均为退出码 `0`；初始化输出包含 `schema_versions=[1, 2, 3, 4, 5, 6, 7]`，health 输出包含 `ok=True`。数据库应位于临时目录，不写入 wheel 或仓库。
 
 如果机器上没有 `pra-mvp.exe`，可使用等价入口：
 

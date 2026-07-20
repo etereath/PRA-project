@@ -33,7 +33,7 @@ python scripts/run_system_smoke_tests.py --temporary-db
 
 ```text
 [OK] runtime DB 初始化成功
-[OK] schema version exact v6
+[OK] schema version exact v7
 [OK] v6 Outbox/RetryAuthorization 结构完整
 [FAILED] review token 创建、校验、使用后失效
   原因：REVIEW_TOKEN_SECRET is required

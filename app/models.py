@@ -356,6 +356,8 @@ class ShadowBotOperationLedger:
     status: str
     lock_owner: str = ""
     approved_payload_hash: str = ""
+    write_identity_key: str = ""
+    page_identity_key: str = ""
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -374,6 +376,82 @@ class ShadowBotExecutionAttempt:
     queue_request_path: str = ""
     ended_at: datetime | None = None
     raw_output: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class ShadowBotBatch:
+    batch_id: str
+    contract_version: int
+    platform: str
+    batch_type: str
+    execution_mode: str
+    identity_normalization_version: str
+    normalized_request_digest: str
+    stop_policy: str
+    source_read_batch_id: str
+    source_snapshot_sha256: str
+    source_page_context_sha256: str
+    source_observed_at: datetime
+    source_snapshot_max_age_seconds: int
+    status: str
+    created_by: str
+    current_item_id: str = ""
+    pending_count: int = 0
+    ready_count: int = 0
+    running_count: int = 0
+    processed_count: int = 0
+    previewed_count: int = 0
+    verified_count: int = 0
+    failed_count: int = 0
+    skipped_count: int = 0
+    cancelled_count: int = 0
+    needs_reconciliation_count: int = 0
+    reconciled_item_count: int = 0
+    paused_reason: str = ""
+    error_code: str = ""
+    created_at: datetime | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
+@dataclass(slots=True)
+class ShadowBotBatchItem:
+    batch_id: str
+    item_id: str
+    ordinal: int
+    source_item_id: str
+    source_read_batch_id: str
+    source_snapshot_sha256: str
+    source_page_context_sha256: str
+    task_id: str
+    review_task_id: str
+    operation_id: str
+    approved_payload_hash: str
+    page_identity_key: str
+    write_identity_key: str
+    expected_product_name: str
+    expected_grade: str
+    approved_expected_old_price: Decimal
+    target_price: Decimal
+    status: str
+    external_platform_sku: str | None = None
+    current_execution_attempt_id: str = ""
+    current_run_id: str = ""
+    fresh_read_attempt_id: str = ""
+    fresh_read_result_sha256: str = ""
+    fresh_old_price: Decimal | None = None
+    post_commit_price: Decimal | None = None
+    reconcile_attempt_id: str = ""
+    reconciliation_outcome: str = ""
+    reconciled_at: datetime | None = None
+    error_code: str = ""
+    error_message: str = ""
+    result_id: str = ""
+    result_hash: str = ""
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 @dataclass(slots=True)
