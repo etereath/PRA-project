@@ -13,8 +13,10 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from app.services.shadowbot_price_batch import BatchItemStatus, BatchStatus, WRITE_LOCK_STATES
 
-LATEST_RUNTIME_SCHEMA_VERSION = 6
+
+LATEST_RUNTIME_SCHEMA_VERSION = 7
 RUNTIME_SCHEMA_VERSIONS = tuple(range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1))
 
 REQUIRED_RUNTIME_TABLES = frozenset(
@@ -34,6 +36,9 @@ REQUIRED_RUNTIME_TABLES = frozenset(
         "retry_authorizations",
         "notification_outbox",
         "notification_delivery_attempts",
+        "shadowbot_batches",
+        "shadowbot_batch_items",
+        "shadowbot_batch_control_events",
     }
 )
 
@@ -106,6 +111,112 @@ V6_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
         "error_message",
     ),
 }
+
+V7_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
+    "shadowbot_operations": (
+        "write_identity_key",
+        "page_identity_key",
+    ),
+    "shadowbot_batches": (
+        "batch_id",
+        "contract_version",
+        "platform",
+        "batch_type",
+        "execution_mode",
+        "identity_normalization_version",
+        "normalized_request_digest",
+        "stop_policy",
+        "source_read_batch_id",
+        "source_snapshot_sha256",
+        "source_page_context_sha256",
+        "source_observed_at",
+        "source_snapshot_max_age_seconds",
+        "status",
+        "current_item_id",
+        "pending_count",
+        "ready_count",
+        "running_count",
+        "processed_count",
+        "previewed_count",
+        "verified_count",
+        "failed_count",
+        "skipped_count",
+        "cancelled_count",
+        "needs_reconciliation_count",
+        "reconciled_item_count",
+        "paused_reason",
+        "error_code",
+        "created_by",
+        "capture_evidence",
+        "created_at",
+        "started_at",
+        "completed_at",
+        "updated_at",
+    ),
+    "shadowbot_batch_items": (
+        "batch_id",
+        "item_id",
+        "ordinal",
+        "source_item_id",
+        "source_read_batch_id",
+        "source_snapshot_sha256",
+        "source_page_context_sha256",
+        "task_id",
+        "review_task_id",
+        "operation_id",
+        "approved_payload_hash",
+        "page_identity_key",
+        "write_identity_key",
+        "external_platform_sku",
+        "expected_product_name",
+        "expected_grade",
+        "approved_expected_old_price",
+        "target_price",
+        "status",
+        "current_execution_attempt_id",
+        "current_run_id",
+        "fresh_read_attempt_id",
+        "fresh_read_result_sha256",
+        "fresh_old_price",
+        "post_commit_price",
+        "reconcile_attempt_id",
+        "reconciliation_outcome",
+        "reconciled_at",
+        "error_code",
+        "error_message",
+        "result_id",
+        "result_hash",
+        "started_at",
+        "completed_at",
+        "updated_at",
+    ),
+    "shadowbot_batch_control_events": (
+        "event_id",
+        "batch_id",
+        "action",
+        "actor",
+        "reason",
+        "previous_status",
+        "resulting_status",
+        "applied",
+        "created_at",
+    ),
+}
+
+PRICE_BATCH_INDEX_SPECS: Mapping[str, tuple[tuple[str, ...], bool]] = {
+    "ix_shadowbot_batches_status": (("status", "created_at"), False),
+    "ix_shadowbot_batches_digest": (("normalized_request_digest",), False),
+    "ux_shadowbot_batch_items_ordinal": (("batch_id", "ordinal"), True),
+    "ux_shadowbot_batch_items_operation_id": (("operation_id",), True),
+    "ux_shadowbot_batch_items_reconcile_attempt_id": (("reconcile_attempt_id",), True),
+    "ix_shadowbot_batch_items_status": (("batch_id", "status", "ordinal"), False),
+    "ix_shadowbot_batch_control_events_batch": (("batch_id", "created_at"), False),
+    "ix_shadowbot_operations_write_identity_status": (("write_identity_key", "status"), False),
+    "ix_shadowbot_operations_page_identity_status": (("page_identity_key", "status"), False),
+    "ux_shadowbot_operations_active_write_identity": (("write_identity_key",), True),
+    "ux_shadowbot_operations_active_page_identity": (("page_identity_key",), True),
+}
+PRICE_BATCH_INDEXES = frozenset(PRICE_BATCH_INDEX_SPECS)
 
 NOTIFICATION_OUTBOX_STATUS_VALUES = frozenset(
     {
@@ -211,7 +322,7 @@ class RuntimeSchemaHealth:
 def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealth:
     """Inspect a SQLite connection without mutating it.
 
-    The check is deliberately exact: a database with a migration row for v6
+    The check is deliberately exact: a database with a migration row for v7
     but a missing table, column, index, or constraint is unhealthy.
     """
 
@@ -232,7 +343,7 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
         version_matches = applied_versions == RUNTIME_SCHEMA_VERSIONS and actual_version == LATEST_RUNTIME_SCHEMA_VERSION
 
         missing_columns: dict[str, tuple[str, ...]] = {}
-        for table, required in {**V5_REQUIRED_COLUMNS, **V6_REQUIRED_COLUMNS}.items():
+        for table, required in {**V5_REQUIRED_COLUMNS, **V6_REQUIRED_COLUMNS, **V7_REQUIRED_COLUMNS}.items():
             if table not in tables:
                 continue
             columns = {
@@ -259,6 +370,14 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
             missing_index_names.update(_check_notification_outbox_constraints(connection, constraint_errors))
         else:
             missing_index_names.update(NOTIFICATION_OUTBOX_INDEXES)
+        if {
+            "shadowbot_operations",
+            "shadowbot_batches",
+            "shadowbot_batch_items",
+        }.issubset(tables):
+            missing_index_names.update(_check_price_batch_constraints(connection, constraint_errors))
+        else:
+            missing_index_names.update(PRICE_BATCH_INDEXES)
         missing_indexes = tuple(sorted(missing_index_names))
 
         ok = not (
@@ -286,7 +405,9 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
             version_matches=False,
             missing_tables=tuple(sorted(REQUIRED_RUNTIME_TABLES)),
             missing_columns={},
-            missing_indexes=tuple(sorted(RETRY_AUTHORIZATION_INDEXES | NOTIFICATION_OUTBOX_INDEXES)),
+            missing_indexes=tuple(
+                sorted(RETRY_AUTHORIZATION_INDEXES | NOTIFICATION_OUTBOX_INDEXES | PRICE_BATCH_INDEXES)
+            ),
             constraint_errors=(),
             error=f"sqlite error: {type(exc).__name__}",
         )
@@ -305,7 +426,7 @@ def runtime_schema_health(connection: sqlite3.Connection) -> RuntimeSchemaHealth
 
 
 def assert_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealth:
-    """Raise a diagnostic error unless the connection has the exact v6 shape."""
+    """Raise a diagnostic error unless the connection has the exact v7 shape."""
 
     result = inspect_runtime_schema(connection)
     if not result.ok:
@@ -512,5 +633,172 @@ def _check_notification_outbox_constraints(
     if not unique_attempt_key:
         errors.append(
             "notification_delivery_attempts lacks UNIQUE(notification_id, attempt_no)"
+        )
+    return tuple(sorted(missing_indexes))
+
+
+def _check_price_batch_constraints(
+    connection: sqlite3.Connection,
+    errors: list[str],
+) -> tuple[str, ...]:
+    """Validate the v7 batch ledger, bindings, and active identity locks."""
+
+    batch_info = connection.execute("PRAGMA table_info(shadowbot_batches)").fetchall()
+    batch_columns = {str(row[1]): row for row in batch_info}
+    if not batch_columns.get("batch_id") or int(batch_columns["batch_id"][5]) != 1:
+        errors.append("shadowbot_batches.batch_id is not the primary key")
+
+    item_info = connection.execute("PRAGMA table_info(shadowbot_batch_items)").fetchall()
+    item_pk = tuple(
+        name
+        for _, name in sorted(
+            (int(row[5]), str(row[1])) for row in item_info if int(row[5]) > 0
+        )
+    )
+    if item_pk != ("batch_id", "item_id"):
+        errors.append("shadowbot_batch_items primary key must be (batch_id, item_id)")
+
+    item_foreign_keys = {
+        (str(row[3]), str(row[2]), str(row[4]))
+        for row in connection.execute("PRAGMA foreign_key_list(shadowbot_batch_items)").fetchall()
+    }
+    for column, target_table, target_column in (
+        ("batch_id", "shadowbot_batches", "batch_id"),
+        ("task_id", "tasks", "task_id"),
+        ("review_task_id", "review_tasks", "review_task_id"),
+        ("operation_id", "shadowbot_operations", "operation_id"),
+    ):
+        if (column, target_table, target_column) not in item_foreign_keys:
+            errors.append(f"missing foreign key {column} -> {target_table}({target_column})")
+
+    sql_rows = connection.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
+        "AND name IN ('shadowbot_batches', 'shadowbot_batch_items', "
+        "'shadowbot_batch_control_events')"
+    ).fetchall()
+    table_sql = {str(row[0]): str(row[1] or "") for row in sql_rows}
+    for table, expected in (
+        ("shadowbot_batches", {status.value for status in BatchStatus}),
+        ("shadowbot_batch_items", {status.value for status in BatchItemStatus}),
+    ):
+        match = re.search(
+            r"\bstatus\b\s+[^,]*?\bCHECK\s*\(\s*status\s+IN\s*\((?P<values>[^)]*)\)\)",
+            table_sql.get(table, ""),
+            re.IGNORECASE | re.DOTALL,
+        )
+        actual = {
+            value.replace("''", "'").upper()
+            for value in re.findall(r"'((?:''|[^'])*)'", match.group("values"))
+        } if match else set()
+        if actual != expected:
+            errors.append(f"{table}.status CHECK must allow exactly " + ", ".join(sorted(expected)))
+
+    for column in (
+        "source_snapshot_max_age_seconds",
+        "pending_count",
+        "ready_count",
+        "running_count",
+        "processed_count",
+        "previewed_count",
+        "verified_count",
+        "failed_count",
+        "skipped_count",
+        "cancelled_count",
+        "needs_reconciliation_count",
+        "reconciled_item_count",
+    ):
+        pattern = (
+            rf"\bCHECK\s*\(\s*{column}\s*=\s*300\s*\)"
+            if column == "source_snapshot_max_age_seconds"
+            else rf"\bCHECK\s*\(\s*{column}\s*>=\s*0\s*\)"
+        )
+        if not re.search(pattern, table_sql.get("shadowbot_batches", ""), re.IGNORECASE):
+            errors.append(f"shadowbot_batches.{column} lacks required CHECK")
+    if not re.search(
+        r"\bCHECK\s*\(\s*contract_version\s*=\s*3\s*\)",
+        table_sql.get("shadowbot_batches", ""),
+        re.IGNORECASE,
+    ):
+        errors.append("shadowbot_batches.contract_version lacks CHECK (contract_version = 3)")
+    if not re.search(
+        r"\bCHECK\s*\(\s*ordinal\s*>\s*0\s*\)",
+        table_sql.get("shadowbot_batch_items", ""),
+        re.IGNORECASE,
+    ):
+        errors.append("shadowbot_batch_items.ordinal lacks CHECK (ordinal > 0)")
+    if not re.search(
+        r"\bCHECK\s*\(\s*capture_evidence\s+IN\s*\(\s*0\s*,\s*1\s*\)\s*\)",
+        table_sql.get("shadowbot_batches", ""),
+        re.IGNORECASE,
+    ):
+        errors.append("shadowbot_batches.capture_evidence lacks boolean CHECK")
+    control_sql = table_sql.get("shadowbot_batch_control_events", "")
+    if not re.search(
+        r"\bCHECK\s*\(\s*action\s+IN\s*\(\s*'PAUSE'\s*,\s*'RESUME'\s*,\s*'CANCEL_PENDING'\s*\)\s*\)",
+        control_sql,
+        re.IGNORECASE,
+    ):
+        errors.append("shadowbot_batch_control_events.action lacks required CHECK")
+    if not re.search(
+        r"\bCHECK\s*\(\s*applied\s+IN\s*\(\s*0\s*,\s*1\s*\)\s*\)",
+        control_sql,
+        re.IGNORECASE,
+    ):
+        errors.append("shadowbot_batch_control_events.applied lacks boolean CHECK")
+
+    index_rows = {
+        str(row[1]): row
+        for table in (
+            "shadowbot_batches",
+            "shadowbot_batch_items",
+            "shadowbot_batch_control_events",
+            "shadowbot_operations",
+        )
+        for row in connection.execute(f"PRAGMA index_list('{table}')").fetchall()
+    }
+    missing_indexes: list[str] = []
+    for index_name, (expected_columns, expected_unique) in PRICE_BATCH_INDEX_SPECS.items():
+        row = index_rows.get(index_name)
+        if row is None:
+            missing_indexes.append(index_name)
+            continue
+        actual_unique = int(row[2]) == 1
+        if actual_unique != expected_unique:
+            errors.append(f"{index_name} unique={actual_unique}, expected {expected_unique}")
+        actual_columns = tuple(
+            str(index_row[2])
+            for index_row in connection.execute(f"PRAGMA index_info('{index_name}')").fetchall()
+        )
+        if actual_columns != expected_columns:
+            errors.append(f"{index_name} columns={actual_columns}, expected {expected_columns}")
+
+    for index_name in (
+        "ux_shadowbot_operations_active_write_identity",
+        "ux_shadowbot_operations_active_page_identity",
+    ):
+        sql_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index_name,),
+        ).fetchone()
+        index_sql = str(sql_row[0] or "") if sql_row else ""
+        match = re.search(r"\bstatus\s+IN\s*\((?P<values>[^)]*)\)", index_sql, re.IGNORECASE)
+        actual_states = {
+            value.replace("''", "'").upper()
+            for value in re.findall(r"'((?:''|[^'])*)'", match.group("values"))
+        } if match else set()
+        if actual_states != WRITE_LOCK_STATES:
+            errors.append(f"{index_name} must use the complete WRITE_LOCK_STATES set")
+    reconcile_index = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' "
+        "AND name = 'ux_shadowbot_batch_items_reconcile_attempt_id'"
+    ).fetchone()
+    reconcile_sql = str(reconcile_index[0] or "") if reconcile_index else ""
+    if not re.search(
+        r"\breconcile_attempt_id\s*<>\s*''",
+        reconcile_sql,
+        re.IGNORECASE,
+    ):
+        errors.append(
+            "ux_shadowbot_batch_items_reconcile_attempt_id must exclude empty identifiers"
         )
     return tuple(sorted(missing_indexes))

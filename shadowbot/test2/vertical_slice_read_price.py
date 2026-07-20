@@ -166,6 +166,29 @@ def _write_phase(request, result, phase, include_result_snapshot=False):
         "cleanup_confirmed": result.get("cleanup_action") == "PRICE_DIALOG_CANCELLED",
         "updated_at": _now_iso(),
     }
+    if request.get("batch_contract_version") == 3:
+        for name in (
+            "batch_contract_version",
+            "price_batch_id",
+            "price_batch_item_id",
+            "price_batch_ordinal",
+            "price_batch_stage",
+            "batch_execution_mode",
+            "normalized_request_digest",
+            "source_read_batch_id",
+            "source_snapshot_sha256",
+            "source_page_context_sha256",
+            "page_identity_key",
+            "write_identity_key",
+            "fresh_read_attempt_id",
+            "fresh_read_result_sha256",
+            "fresh_old_price",
+            "approved_payload_hash",
+            "approval_id",
+            "expires_at",
+            "capture_evidence",
+        ):
+            payload[name] = request.get(name, "")
     if include_result_snapshot:
         payload["result_snapshot"] = _safe_output_payload(dict(result))
     if isinstance(result.get("login"), dict):
@@ -577,6 +600,15 @@ def _generic_acc_node_selector(node_name, selector_name):
     return Selector(value)
 
 
+def _exact_acc_label_selector(label, selector_name):
+    selector = _generic_acc_node_selector("StaticText", selector_name)
+    value = copy.deepcopy(selector.__dict__["value"])
+    target_node = value["path"][-1]
+    _set_path_attribute(target_node, "role", "StaticText")
+    _set_path_attribute(target_node, "acc-name", label)
+    return Selector(value)
+
+
 def _element_attributes(element):
     try:
         raw = element.get_all_attributes()
@@ -608,6 +640,7 @@ def _element_label(element):
 
 
 FINAL_SAVE_BUTTON_NODE_NAMES = ("Button", "wx-button", "wx-van-button")
+ONLINE_LIST_LABEL = "上架中"
 UI_STATE_NODE_NAMES = (
     "StaticText",
     "Edit",
@@ -767,6 +800,14 @@ def _login_config_value(login_config, name, default=""):
     if isinstance(login_config, dict):
         return login_config.get(name, default)
     return default
+
+
+def _as_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in ("", "0", "false", "no", "off")
 
 
 def _safe_login_markers(markers):
@@ -2090,6 +2131,10 @@ def _refresh_product_list(window, timeout_seconds, result, stage):
 
         _find_element(window, ELEMENTS["product_management"], timeout_seconds).click()
         sleep(1)
+        # The mini-program preserves the last selected listing tab.  Entering
+        # 商品管理 therefore does not prove that the active list is 上架中.
+        # Task 11/12 source reads require an explicit ONLINE page context.
+        _select_online_product_list(window, timeout_seconds, result)
         # Require two independent observations so the first stale WebView frame is not accepted.
         _find_product_list_container(window, timeout_seconds)
         sleep(0.5)
@@ -2110,6 +2155,32 @@ def _refresh_product_list(window, timeout_seconds, result, stage):
         )
     event.update({"status": "SUCCESS", "ended_at": _now_iso()})
     return event
+
+
+def _select_online_product_list(window, timeout_seconds, result):
+    selector = _exact_acc_label_selector(
+        ONLINE_LIST_LABEL,
+        "dynamic_online_listing_tab",
+    )
+    try:
+        target = _find_element(window, selector, timeout_seconds)
+        try:
+            target.click()
+        except Exception:
+            target.parent().click()
+    except Exception as exc:
+        if isinstance(exc, SliceError):
+            detail = exc.message
+        else:
+            detail = str(exc)
+        raise SliceError(
+            "ONLINE_LIST_NOT_FOUND",
+            "上架中 listing tab could not be selected: " + detail,
+            retryable=True,
+        )
+    sleep(1)
+    result["active_listing_filter"] = "ONLINE"
+    result["active_listing_filter_selected_at"] = _now_iso()
 
 
 def _find_product_list_container(window, timeout_seconds):
@@ -2363,6 +2434,7 @@ def main(args):
             )
 
         fault_injection = str(_get_arg(request, "fault_injection", "")).strip().upper()
+        capture_evidence = _as_bool(_get_arg(request, "capture_evidence", True), default=True)
         login_config = _get_arg(args, "_login_config", {})
         credential_provider = _get_arg(args, "_credential_provider", None)
         window_title = str(_get_arg(request, "window_title", WINDOW_TITLE_DEFAULT)).strip()
@@ -2481,7 +2553,13 @@ def main(args):
         current_step = "READ_OLD_PRICE"
         result["current_step"] = current_step
         actual_price = _read_row_price(window, row_index, timeout_seconds)
-        result.update({"old_price": actual_price, "actual_price": actual_price})
+        result.update(
+            {
+                "old_price": actual_price,
+                "actual_price": actual_price,
+                "observed_at": _now_iso(),
+            }
+        )
 
         if execution_mode in ("FILL_PREVIEW", "COMMIT") and expected_old_price and actual_price != expected_old_price:
             raise SliceError(
@@ -2495,45 +2573,53 @@ def main(args):
         if execution_mode == "READ_ONLY":
             current_step = "CAPTURE_EVIDENCE"
             result["current_step"] = current_step
-            evidence = _capture_window(
-                window,
-                evidence_dir,
-                execution_attempt_id,
-                "READ_OLD_PRICE",
-                "supply_price",
-                evidence_share_dir,
-                evidence_storage_uri_prefix,
-                fault_injection,
-            )
+            evidence_items = []
+            if capture_evidence:
+                evidence_items.append(
+                    _capture_window(
+                        window,
+                        evidence_dir,
+                        execution_attempt_id,
+                        "READ_OLD_PRICE",
+                        "supply_price",
+                        evidence_share_dir,
+                        evidence_storage_uri_prefix,
+                        fault_injection,
+                    )
+                )
             result.update(
                 {
                     "status": "READ_COMPLETED",
                     "run_success_flag": True,
                     "business_operation_completed": False,
                     "current_step": "COMPLETE",
-                    "evidence": [evidence],
-                    "evidence_status": _summarize_evidence_status([evidence]),
+                    "evidence": evidence_items,
+                    "evidence_status": _summarize_evidence_status(evidence_items),
                 }
             )
         elif execution_mode == "RECONCILE":
             current_step = "CAPTURE_RECONCILE_EVIDENCE"
             result["current_step"] = current_step
-            evidence = _capture_window(
-                window,
-                evidence_dir,
-                execution_attempt_id,
-                "RECONCILE",
-                "reconcile",
-                evidence_share_dir,
-                evidence_storage_uri_prefix,
-                fault_injection,
-            )
+            evidence_items = []
+            if capture_evidence:
+                evidence_items.append(
+                    _capture_window(
+                        window,
+                        evidence_dir,
+                        execution_attempt_id,
+                        "RECONCILE",
+                        "reconcile",
+                        evidence_share_dir,
+                        evidence_storage_uri_prefix,
+                        fault_injection,
+                    )
+                )
             result.update(_build_reconcile_update(actual_price, expected_old_price, target_price))
             result.update(
                 {
                     "current_step": "COMPLETE",
-                    "evidence": [evidence],
-                    "evidence_status": _summarize_evidence_status([evidence]),
+                    "evidence": evidence_items,
+                    "evidence_status": _summarize_evidence_status(evidence_items),
                 }
             )
         else:
@@ -2561,31 +2647,65 @@ def main(args):
 
             current_step = "CAPTURE_BEFORE_SUBMIT"
             result["current_step"] = current_step
-            before_evidence = _capture_window(
-                window,
-                evidence_dir,
-                execution_attempt_id,
-                "BEFORE_SUBMIT" if execution_mode == "COMMIT" else "FILL_PREVIEW",
-                "before_submit" if execution_mode == "COMMIT" else "fill_preview",
-                evidence_share_dir,
-                evidence_storage_uri_prefix,
-                fault_injection,
-            )
+            before_evidence = None
+            if capture_evidence:
+                before_evidence = _capture_window(
+                    window,
+                    evidence_dir,
+                    execution_attempt_id,
+                    "BEFORE_SUBMIT" if execution_mode == "COMMIT" else "FILL_PREVIEW",
+                    "before_submit" if execution_mode == "COMMIT" else "fill_preview",
+                    evidence_share_dir,
+                    evidence_storage_uri_prefix,
+                    fault_injection,
+                )
 
             if execution_mode == "FILL_PREVIEW":
                 current_step = "CANCEL_PREVIEW"
                 result["current_step"] = current_step
                 _cancel_price_dialog(window, timeout_seconds)
-                result.update(
-                    {
-                        "status": "PREVIEW_COMPLETED",
-                        "run_success_flag": True,
-                        "business_operation_completed": False,
-                        "current_step": "COMPLETE",
-                        "evidence": [before_evidence],
-                        "evidence_status": _summarize_evidence_status([before_evidence]),
-                    }
+                current_step = "VERIFY_AFTER_PREVIEW_CANCEL"
+                result["current_step"] = current_step
+                refresh_event = _refresh_product_list(
+                    window, timeout_seconds, result, "AFTER_PREVIEW_CANCEL"
                 )
+                row_index, list_name, list_grade = _locate_product_row(
+                    window, expected_name, expected_grade, max_product_rows, timeout_seconds
+                )
+                _assert_list_name(list_name, expected_name, expected_grade)
+                _assert_identity("商品等级", list_grade, expected_grade)
+                refresh_event["matched_row_index"] = row_index
+                refresh_event["matched_product_name"] = list_name
+                refresh_event["matched_grade"] = list_grade
+                after_preview_price = _read_row_price(window, row_index, timeout_seconds)
+                result["actual_price"] = after_preview_price
+                result["post_read_at"] = _now_iso()
+                evidence_items = [item for item in (before_evidence,) if item is not None]
+                if after_preview_price == expected_old_price:
+                    result.update(
+                        {
+                            "status": "PREVIEW_COMPLETED",
+                            "run_success_flag": True,
+                            "business_operation_completed": False,
+                            "current_step": "COMPLETE",
+                            "evidence": evidence_items,
+                            "evidence_status": _summarize_evidence_status(evidence_items),
+                        }
+                    )
+                else:
+                    result.update(
+                        {
+                            "status": "SIDE_EFFECT_UNKNOWN",
+                            "run_success_flag": None,
+                            "business_operation_completed": None,
+                            "side_effect_state": "UNKNOWN",
+                            "error_code": "PREVIEW_INPUT_MISMATCH",
+                            "error_message": "price changed after preview cancellation",
+                            "retryable": False,
+                            "evidence": evidence_items,
+                            "evidence_status": _summarize_evidence_status(evidence_items),
+                        }
+                    )
             else:
                 _check_stop_before_submit(request, result)
                 current_step = "RECORD_SUBMIT_INTENT"
@@ -2659,17 +2779,22 @@ def main(args):
                 if after_price_read_error:
                     result["after_submit_read_warning"] = after_price_read_error
 
-                after_evidence = _capture_window(
-                    window,
-                    evidence_dir,
-                    execution_attempt_id,
-                    "AFTER_SUBMIT",
-                    "after_submit",
-                    evidence_share_dir,
-                    evidence_storage_uri_prefix,
-                    fault_injection,
-                )
-                evidence_items = [before_evidence, after_evidence]
+                result["post_read_at"] = _now_iso()
+                after_evidence = None
+                if capture_evidence:
+                    after_evidence = _capture_window(
+                        window,
+                        evidence_dir,
+                        execution_attempt_id,
+                        "AFTER_SUBMIT",
+                        "after_submit",
+                        evidence_share_dir,
+                        evidence_storage_uri_prefix,
+                        fault_injection,
+                    )
+                evidence_items = [
+                    item for item in (before_evidence, after_evidence) if item is not None
+                ]
                 if not after_price:
                     result.update(
                         {

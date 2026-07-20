@@ -149,7 +149,7 @@ def verify_core_wheel(wheel: Path) -> None:
             env=env,
             isolated_root=isolated_root,
         )
-        if "schema_versions=[1, 2, 3, 4, 5, 6]" not in init_output:
+        if "schema_versions=[1, 2, 3, 4, 5, 6, 7]" not in init_output:
             raise RuntimeError("schema initialization did not report the exact v1-v6 migration sequence")
         health_output = _run_checked(
             "schema_health",
@@ -158,7 +158,7 @@ def verify_core_wheel(wheel: Path) -> None:
             env=env,
             isolated_root=isolated_root,
         )
-        if "ok=True" not in health_output or "schema_versions=[1, 2, 3, 4, 5, 6]" not in health_output:
+        if "ok=True" not in health_output or "schema_versions=[1, 2, 3, 4, 5, 6, 7]" not in health_output:
             raise RuntimeError("health output did not confirm exact Runtime Schema v6 health")
 
 
