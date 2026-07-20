@@ -814,6 +814,24 @@ class ShadowBotQueueWatchdog:
             "recovered_phase": phase,
             "ended_at": datetime.now(UTC).isoformat(),
         }
+        if request.get("contract_version") == 2:
+            products = request.get("products")
+            product_count = len(products) if isinstance(products, list) else 0
+            result.update(
+                {
+                    "schema_version": "shadowbot-result-2.0",
+                    "contract_version": 2,
+                    "read_batch_id": request.get("read_batch_id", ""),
+                    "platform_name": request.get("platform_name", ""),
+                    "product_snapshots": [],
+                    "total_count": product_count,
+                    "success_count": 0,
+                    "failed_count": product_count,
+                    "skipped_count": 0,
+                    "manual_check_count": 0,
+                    "overall_status": "FAILED",
+                }
+            )
         return self._write_result(result, str(request.get("execution_attempt_id") or ""))
 
     def _write_result(self, result: dict[str, Any], execution_attempt_id: str) -> dict[str, Any]:

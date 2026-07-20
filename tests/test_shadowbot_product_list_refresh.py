@@ -10,7 +10,7 @@ FLOW_PATH = (
 )
 
 
-def _load_refresh_helper(find_element):
+def _load_refresh_helper(find_element, select_online=None):
     tree = ast.parse(FLOW_PATH.read_text(encoding="utf-8"))
     nodes = []
     for node in tree.body:
@@ -27,6 +27,11 @@ def _load_refresh_helper(find_element):
     ast.fix_missing_locations(module)
     namespace = {
         "_find_element": find_element,
+        "_select_online_product_list": select_online or (
+            lambda _window, _timeout_seconds, result: result.update(
+                {"active_listing_filter": "ONLINE"}
+            )
+        ),
         "_find_product_list_container": lambda window, timeout_seconds: find_element(
             window, "蚂蚁_商品管理_目标商品_容器", timeout_seconds
         ),
@@ -57,7 +62,11 @@ def test_refresh_clicks_management_even_when_list_container_is_already_available
         assert selector == "蚂蚁_商品管理_目标商品_容器"
         return object()
 
-    refresh, slice_error, _elements = _load_refresh_helper(find_element)
+    def select_online(_window, _timeout_seconds, result):
+        calls.append("select_online")
+        result["active_listing_filter"] = "ONLINE"
+
+    refresh, slice_error, _elements = _load_refresh_helper(find_element, select_online)
     result = {"product_list_refreshes": []}
 
     event = refresh(object(), 5, result, "BEFORE_PRICE_READ")
@@ -66,12 +75,14 @@ def test_refresh_clicks_management_even_when_list_container_is_already_available
         "价格弹窗_容器",
         "蚂蚁_首页_商品管理_入口",
         "clicked",
+        "select_online",
         "蚂蚁_商品管理_目标商品_容器",
         "蚂蚁_商品管理_目标商品_容器",
     ]
     assert event["status"] == "SUCCESS"
     assert event["stage"] == "BEFORE_PRICE_READ"
     assert result["product_list_refreshes"] == [event]
+    assert result["active_listing_filter"] == "ONLINE"
 
 
 def test_refresh_failure_is_normalized_and_audited():
@@ -118,3 +129,16 @@ def test_main_flow_refreshes_before_initial_read_preview_cancel_and_submit_verif
     assert post_refresh < post_verify
     assert "row_index, list_name, list_grade = _locate_product_row(" in source[post_refresh:post_verify]
     assert "_wait_after_submit_price" in source[post_verify:]
+
+
+def test_refresh_explicitly_selects_online_listing_context():
+    source = FLOW_PATH.read_text(encoding="utf-8")
+    refresh_start = source.index("def _refresh_product_list(")
+    refresh_end = source.index("def _select_online_product_list(", refresh_start)
+    refresh_source = source[refresh_start:refresh_end]
+
+    assert 'ONLINE_LIST_LABEL = "上架中"' in source
+    assert "_select_online_product_list(window, timeout_seconds, result)" in refresh_source
+    assert '_set_path_attribute(target_node, "acc-name", label)' in source
+    assert '"dynamic_online_listing_tab"' in source
+    assert 'result["active_listing_filter"] = "ONLINE"' in source

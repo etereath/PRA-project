@@ -313,3 +313,59 @@ Web 提供只读批次摘要、逐项明细和受审计的 pause/resume/cancel p
 本阶段新增两个冻结错误码扩展：`SUBMIT_NOT_APPLIED` 表示独立读回确认目标价未生效；`PLATFORM_EXECUTION_FAILED` 表示提交意图前的平台执行失败。平台原始错误码继续保存在错误说明中；提交意图后的未知平台错误统一进入 `SUBMIT_RESULT_UNKNOWN`，不得自动重试 COMMIT。
 
 本阶段自动测试结果为 `509 passed, 3 skipped, 96 subtests passed`。源码、JSON 和 Markdown 编码门禁通过；本阶段未启动影刀、未执行真实 FILL_PREVIEW 或 COMMIT，因此这些结果只证明文件内容正确和离线业务逻辑通过，不构成影刀实机验收证据。任务状态保持不变，等待审查方审查。
+
+## 16. 2026-07-21 阶段6接续实施记录：来源读取实机预检与修复
+
+本节继续追加阶段6记录，不覆盖前述要求，也不修改任务状态。时间是北京时间墙钟近似值；token 是根据本轮上下文、推理和工具输出规模估算的模型消耗，误差可能达到约 30%，不等同于 API 计费账单。
+
+| 步骤 | 工作内容 | 大概耗时 | 估算 token |
+|---|---|---:|---:|
+| 1 | 读取规则、计划和阶段6验收矩阵，检查队列、Worker、影刀应用目录及部署哈希 | 约 6 分钟 | 约 6k |
+| 2 | 新增任务12来源 READ_ONLY 准备入口及数据库/队列绑定测试 | 约 4 分钟 | 约 8k |
+| 3 | 同步影刀并执行第一轮 5 商品来源读取，定位“待上架被误认为上架中”的实机问题 | 约 7 分钟 | 约 5k |
+| 4 | 增加显式 ONLINE 标签选择，执行第二轮并定位全树枚举超时和 v2 Watchdog 恢复契约缺口 | 约 10 分钟 | 约 12k |
+| 5 | 改为精确 `acc-name=上架中` 选择器，修复 v2 恢复结果，完成第三轮实机复验与归档 | 约 8 分钟 | 约 8k |
+| 6 | 定向、完整、Windows Core、Linux Core 和编码门禁 | 约 6 分钟 | 约 4k |
+| 7 | 文档接续、差异复核及 GitHub PR 交接 | 约 4 分钟 | 约 3k |
+| **合计** | **本次阶段6接续开发与实机预检** | **约 45 分钟** | **约 46k** |
+
+### 16.1 新增受控来源读取入口
+
+新增 `scripts/prepare_task12_source_read.py`。它从已验收的任务11 v2 请求读取商品身份模板，为每一轮生成新的 `read_batch_id/task_id/operation_id/execution_attempt_id/item_id`，创建独立 Runtime Task 和 attempt，并通过 `ShadowBotFileQueueRunner` 生成带校验和的 READ_ONLY 队列请求。入口固定 `capture_evidence=false`，不包含 FILL_PREVIEW 或 COMMIT 能力。
+
+### 16.2 实机问题与修复
+
+第一轮 `ATTEMPT-T12-SOURCE-20260720-203008` 证明小程序会保留上一次的商品状态标签。旧代码只点击“商品管理”，却假定进入后必然位于“上架中”；实际页面仍为“待上架”，导致两个卡布奇诺的价格定位读到“报名秒杀”，其余三个目标不存在。结果为 `0/5`，`side_effect_state=NOT_STARTED`，已由 Importer 归档。
+
+第一版修复在刷新后枚举整个可访问性树查找“上架中”。第二轮 `ATTEMPT-T12-SOURCE-20260720-203917` 表明该方案会在大型小程序树中超过 300 秒。异常停止后又发现 Watchdog 生成的 v2 恢复结果没有继承 `contract_version/read_batch_id`，Importer 正确隔离为 `RESULT_CONTRACT_INVALID`。该 attempt 在数据库中保持 `START_UNKNOWN/NOT_STARTED`；原始 working 文件和恢复结果保存在 `D:\PRA_Runtime\task12_failed_attempts\ATTEMPT-T12-SOURCE-20260720-203917`，隔离文件保留在队列 quarantine。
+
+最终修复使用精确 `StaticText` 选择器和 `acc-name=上架中`，不再枚举整棵树；结果新增 `active_listing_filter=ONLINE` 和选择时间。Watchdog 的 v2 恢复结果现在继承批次身份、平台、空快照和失败计数，可被 Importer 一次性接受并归档，不再形成“隔离后重复恢复”的循环。
+
+### 16.3 第三轮实机结果与当前阻塞
+
+第三轮正式来源读取：
+
+- `read_batch_id`：`READ-BATCH-T12-SOURCE-20260720-205106`
+- `execution_attempt_id`：`ATTEMPT-T12-SOURCE-20260720-205106`
+- `shadowbot_run_id`：`filequeue:ATTEMPT-T12-SOURCE-20260720-205106`
+- 请求 SHA-256：`ce61c0a811df3d9ace40cd373aab85a29cae91b6f9e6a8c6a334b9deb61cab77`
+- 页面上下文：`active_listing_filter=ONLINE`
+- 结果：`PARTIAL`，成功 `2/5`，失败 `3/5`，`side_effect_state=NOT_STARTED`
+- 成功商品：艾莎 B级，价格 `9.00`、库存 `10`；艾莎 C级，价格 `8.00`、库存 `5`
+- 当前 ONLINE 列表未找到：卡布奇诺 B级、卡布奇诺 C级、艾莎 D级
+- 归档：`D:\PRA_Runtime\shadowbot_queue\archive\ATTEMPT-T12-SOURCE-20260720-205106`
+- 数据库：`D:\PRA_Runtime\task12_acceptance_20260721.sqlite3`
+
+当前平台目标范围只能确认两个 ONLINE 页面身份，因此尚不满足第13节“约 5–10 个 ONLINE 商品 READ_ONLY 回归”和“至少 3 个不同品种或等级的 FILL_PREVIEW”。本阶段未生成 FILL_PREVIEW 请求，更未生成或执行 COMMIT。需要项目负责人先确认是否把至少第三个目标商品恢复为 ONLINE，或提供新的 ONLINE 商品身份，才能继续正式 FILL_PREVIEW 验收。
+
+### 16.4 自动验证和安全终态
+
+- 定向测试：`37 passed`；精确 ONLINE 选择器相关组合测试：`16 passed`。
+- 完整测试：`512 passed, 3 skipped, 96 subtests passed`。
+- Windows Core 部署夹具：通过。
+- Linux Core：`297 passed, 3 skipped, 6 deselected, 96 subtests passed`。
+- 影刀规范文件与真实 `test2` 部署哈希一致，部署结构检查通过。
+- 第三轮结果已由 Result Importer 导入归档；`inbox/working/results` 均为空。
+- Worker 为 `STOPPED`，`stop.signal` 不存在，主流程已执行末端 `关闭.flow`。
+
+以上分别证明代码和文件检查通过、自动逻辑测试通过、第三轮 READ_ONLY 实机页面上下文修复有效；不代表 FILL_PREVIEW 或 COMMIT 已验收。任务状态保持不变，等待后续实机覆盖和审查方审查。

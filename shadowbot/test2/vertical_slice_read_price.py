@@ -600,6 +600,15 @@ def _generic_acc_node_selector(node_name, selector_name):
     return Selector(value)
 
 
+def _exact_acc_label_selector(label, selector_name):
+    selector = _generic_acc_node_selector("StaticText", selector_name)
+    value = copy.deepcopy(selector.__dict__["value"])
+    target_node = value["path"][-1]
+    _set_path_attribute(target_node, "role", "StaticText")
+    _set_path_attribute(target_node, "acc-name", label)
+    return Selector(value)
+
+
 def _element_attributes(element):
     try:
         raw = element.get_all_attributes()
@@ -631,6 +640,7 @@ def _element_label(element):
 
 
 FINAL_SAVE_BUTTON_NODE_NAMES = ("Button", "wx-button", "wx-van-button")
+ONLINE_LIST_LABEL = "上架中"
 UI_STATE_NODE_NAMES = (
     "StaticText",
     "Edit",
@@ -2121,6 +2131,10 @@ def _refresh_product_list(window, timeout_seconds, result, stage):
 
         _find_element(window, ELEMENTS["product_management"], timeout_seconds).click()
         sleep(1)
+        # The mini-program preserves the last selected listing tab.  Entering
+        # 商品管理 therefore does not prove that the active list is 上架中.
+        # Task 11/12 source reads require an explicit ONLINE page context.
+        _select_online_product_list(window, timeout_seconds, result)
         # Require two independent observations so the first stale WebView frame is not accepted.
         _find_product_list_container(window, timeout_seconds)
         sleep(0.5)
@@ -2141,6 +2155,32 @@ def _refresh_product_list(window, timeout_seconds, result, stage):
         )
     event.update({"status": "SUCCESS", "ended_at": _now_iso()})
     return event
+
+
+def _select_online_product_list(window, timeout_seconds, result):
+    selector = _exact_acc_label_selector(
+        ONLINE_LIST_LABEL,
+        "dynamic_online_listing_tab",
+    )
+    try:
+        target = _find_element(window, selector, timeout_seconds)
+        try:
+            target.click()
+        except Exception:
+            target.parent().click()
+    except Exception as exc:
+        if isinstance(exc, SliceError):
+            detail = exc.message
+        else:
+            detail = str(exc)
+        raise SliceError(
+            "ONLINE_LIST_NOT_FOUND",
+            "上架中 listing tab could not be selected: " + detail,
+            retryable=True,
+        )
+    sleep(1)
+    result["active_listing_filter"] = "ONLINE"
+    result["active_listing_filter_selected_at"] = _now_iso()
 
 
 def _find_product_list_container(window, timeout_seconds):
