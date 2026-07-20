@@ -38,6 +38,7 @@ REQUIRED_RUNTIME_TABLES = frozenset(
         "notification_delivery_attempts",
         "shadowbot_batches",
         "shadowbot_batch_items",
+        "shadowbot_batch_control_events",
     }
 )
 
@@ -189,6 +190,17 @@ V7_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
         "completed_at",
         "updated_at",
     ),
+    "shadowbot_batch_control_events": (
+        "event_id",
+        "batch_id",
+        "action",
+        "actor",
+        "reason",
+        "previous_status",
+        "resulting_status",
+        "applied",
+        "created_at",
+    ),
 }
 
 PRICE_BATCH_INDEX_SPECS: Mapping[str, tuple[tuple[str, ...], bool]] = {
@@ -198,6 +210,7 @@ PRICE_BATCH_INDEX_SPECS: Mapping[str, tuple[tuple[str, ...], bool]] = {
     "ux_shadowbot_batch_items_operation_id": (("operation_id",), True),
     "ux_shadowbot_batch_items_reconcile_attempt_id": (("reconcile_attempt_id",), True),
     "ix_shadowbot_batch_items_status": (("batch_id", "status", "ordinal"), False),
+    "ix_shadowbot_batch_control_events_batch": (("batch_id", "created_at"), False),
     "ix_shadowbot_operations_write_identity_status": (("write_identity_key", "status"), False),
     "ix_shadowbot_operations_page_identity_status": (("page_identity_key", "status"), False),
     "ux_shadowbot_operations_active_write_identity": (("write_identity_key",), True),
@@ -660,7 +673,8 @@ def _check_price_batch_constraints(
 
     sql_rows = connection.execute(
         "SELECT name, sql FROM sqlite_master WHERE type = 'table' "
-        "AND name IN ('shadowbot_batches', 'shadowbot_batch_items')"
+        "AND name IN ('shadowbot_batches', 'shadowbot_batch_items', "
+        "'shadowbot_batch_control_events')"
     ).fetchall()
     table_sql = {str(row[0]): str(row[1] or "") for row in sql_rows}
     for table, expected in (
@@ -718,10 +732,28 @@ def _check_price_batch_constraints(
         re.IGNORECASE,
     ):
         errors.append("shadowbot_batches.capture_evidence lacks boolean CHECK")
+    control_sql = table_sql.get("shadowbot_batch_control_events", "")
+    if not re.search(
+        r"\bCHECK\s*\(\s*action\s+IN\s*\(\s*'PAUSE'\s*,\s*'RESUME'\s*,\s*'CANCEL_PENDING'\s*\)\s*\)",
+        control_sql,
+        re.IGNORECASE,
+    ):
+        errors.append("shadowbot_batch_control_events.action lacks required CHECK")
+    if not re.search(
+        r"\bCHECK\s*\(\s*applied\s+IN\s*\(\s*0\s*,\s*1\s*\)\s*\)",
+        control_sql,
+        re.IGNORECASE,
+    ):
+        errors.append("shadowbot_batch_control_events.applied lacks boolean CHECK")
 
     index_rows = {
         str(row[1]): row
-        for table in ("shadowbot_batches", "shadowbot_batch_items", "shadowbot_operations")
+        for table in (
+            "shadowbot_batches",
+            "shadowbot_batch_items",
+            "shadowbot_batch_control_events",
+            "shadowbot_operations",
+        )
         for row in connection.execute(f"PRAGMA index_list('{table}')").fetchall()
     }
     missing_indexes: list[str] = []

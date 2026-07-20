@@ -7,6 +7,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -18,16 +19,34 @@ from app.services.shadowbot_executor import (
     SIDE_EFFECT_NOT_STARTED,
     SIDE_EFFECT_UNKNOWN,
     STATUS_FAILED,
+    STATUS_NOT_APPLIED,
+    STATUS_PREVIEW_COMPLETED,
+    STATUS_READ_COMPLETED,
     STATUS_SIDE_EFFECT_UNKNOWN,
+    STATUS_START_FAILED,
     STATUS_START_UNKNOWN,
+    STATUS_VERIFIED,
+    TASK12_INSTRUCTION_HASH_FIELDS,
     ShadowBotExecutor,
     ShadowBotTaskRunner,
     shadowbot_result_contract_from_data,
 )
+from app.services.shadowbot_price_batch import (
+    MAX_RESULT_BYTES as PRICE_BATCH_MAX_RESULT_BYTES,
+    PRICE_BATCH_ERROR_CODES,
+    BatchItemStatus,
+    PriceBatchContractError,
+    PriceBatchErrorCode,
+    normalize_price_string,
+    aggregate_batch_counts,
+)
+from app.services.shadowbot_price_batch_orchestrator import ShadowBotPriceBatchOrchestrator
 from app.services.shadowbot_product_read import (
     MAX_RESULT_BYTES,
     aggregate_product_snapshots,
+    normalize_grade,
     normalize_multi_product_request,
+    normalize_text,
     validate_evidence_binding,
 )
 
@@ -145,6 +164,12 @@ class ShadowBotResultImporter:
             raise ValidationError("RESULT_CONTRACT_INVALID: archived request hash does not match attempt.")
         request_data = json.loads(request_bytes.decode("utf-8-sig"))
         self._validate_v2_result(request_data, data, result_bytes)
+        task12_context = self._validate_task12_result(
+            request_data,
+            data,
+            result_bytes,
+            execution_attempt_id=execution_attempt_id,
+        )
         result_file_sha256 = hashlib.sha256(result_bytes).hexdigest()
         data.setdefault("result_id", f"RESULT-{result_file_sha256[:24]}")
         lease_required = isinstance(attempt.raw_output.get("lease"), dict)
@@ -174,11 +199,220 @@ class ShadowBotResultImporter:
                 )
             if imported_result_id != contract.result_id or imported_result_sha256 != result_file_sha256:
                 raise ValidationError("RESULT_CONTRACT_INVALID: conflicting result evidence for completed attempt.")
+        task12_projection = None
+        if task12_context is not None:
+            task12_projection = self._project_task12_result(
+                task12_context,
+                contract,
+                result_file_sha256=result_file_sha256,
+            )
         archive_dir = self._archive_attempt(contract.execution_attempt_id, request_path, result_path)
-        return {
+        event = {
             "status": "IMPORTED" if attempt.ended_at is None else "ALREADY_IMPORTED",
             "execution_attempt_id": contract.execution_attempt_id,
             "archive_dir": str(archive_dir),
+        }
+        if task12_projection is not None:
+            event["price_batch"] = task12_projection
+        return event
+
+    def _validate_task12_result(
+        self,
+        request: dict[str, Any],
+        result: dict[str, Any],
+        result_bytes: bytes,
+        *,
+        execution_attempt_id: str,
+    ) -> dict[str, Any] | None:
+        if request.get("batch_contract_version") != 3:
+            return None
+        if len(result_bytes) > PRICE_BATCH_MAX_RESULT_BYTES:
+            raise ValidationError("RESULT_TOO_LARGE: task 12 result exceeds 4 MiB.")
+        if result.get("batch_contract_version") != 3:
+            raise ValidationError("RESULT_CONTRACT_INVALID: task 12 contract version mismatch.")
+        for name in TASK12_INSTRUCTION_HASH_FIELDS:
+            if result.get(name) != request.get(name):
+                raise ValidationError(f"RESULT_CONTRACT_INVALID: task 12 {name} mismatch.")
+        for name in ("run_success_flag", "business_operation_completed"):
+            value = result.get(name)
+            if value is not None and not isinstance(value, bool):
+                raise ValidationError(f"RESULT_CONTRACT_INVALID: {name} must be boolean or null.")
+        if not isinstance(result.get("retryable"), bool):
+            raise ValidationError("RESULT_CONTRACT_INVALID: retryable must be boolean.")
+
+        batch_id = str(request.get("price_batch_id") or "").strip()
+        item_id = str(request.get("price_batch_item_id") or "").strip()
+        stage = str(request.get("price_batch_stage") or "").strip().upper()
+        batch = self.repository.get_shadowbot_batch(batch_id)
+        item = self.repository.get_shadowbot_batch_item(batch_id, item_id)
+        if batch is None or item is None:
+            raise ValidationError("BATCH_ITEM_BINDING_MISMATCH: batch item does not exist.")
+        expected_attempt_id = {
+            "FRESH_READ": item.fresh_read_attempt_id,
+            "WRITE": item.current_execution_attempt_id,
+            "RECONCILE": item.reconcile_attempt_id,
+        }.get(stage)
+        if not expected_attempt_id or expected_attempt_id != execution_attempt_id:
+            raise ValidationError("BATCH_ITEM_BINDING_MISMATCH: attempt is not bound to this item stage.")
+        expected_batch = {
+            "batch_execution_mode": batch.execution_mode,
+            "normalized_request_digest": batch.normalized_request_digest,
+            "source_read_batch_id": batch.source_read_batch_id,
+            "source_snapshot_sha256": batch.source_snapshot_sha256,
+            "source_page_context_sha256": batch.source_page_context_sha256,
+            "capture_evidence": batch.capture_evidence,
+        }
+        expected_item = {
+            "price_batch_ordinal": item.ordinal,
+            "page_identity_key": item.page_identity_key,
+            "write_identity_key": item.write_identity_key,
+            "approved_payload_hash": item.approved_payload_hash,
+        }
+        for name, expected in {**expected_batch, **expected_item}.items():
+            if request.get(name) != expected:
+                raise ValidationError(f"BATCH_ITEM_BINDING_MISMATCH: persisted {name} differs.")
+        if str(request.get("operation_id") or "") != item.operation_id:
+            raise ValidationError("BATCH_ITEM_BINDING_MISMATCH: operation_id differs.")
+        if str(request.get("task_id") or "") != item.task_id:
+            raise ValidationError("BATCH_ITEM_BINDING_MISMATCH: task_id differs.")
+        if stage != "RECONCILE" and str(request.get("approval_id") or "") != item.review_task_id:
+            raise ValidationError("BATCH_ITEM_BINDING_MISMATCH: approval_id differs.")
+        return {
+            "batch": batch,
+            "item": item,
+            "request": request,
+            "result": result,
+            "stage": stage,
+        }
+
+    def _project_task12_result(
+        self,
+        context: dict[str, Any],
+        contract,
+        *,
+        result_file_sha256: str,
+    ) -> dict[str, Any]:
+        batch = context["batch"]
+        item = context["item"]
+        result = context["result"]
+        stage = context["stage"]
+        orchestrator = ShadowBotPriceBatchOrchestrator(self.repository)
+        result_hash = "sha256:" + result_file_sha256
+        actual_price = _task12_optional_price(result.get("actual_price"))
+        if contract.status in {STATUS_READ_COMPLETED, STATUS_PREVIEW_COMPLETED, STATUS_VERIFIED, STATUS_NOT_APPLIED}:
+            if actual_price is None:
+                raise ValidationError("RESULT_CONTRACT_INVALID: successful task 12 readback requires actual_price.")
+            if contract.status != STATUS_NOT_APPLIED and str(result.get("error_code") or "").strip():
+                raise ValidationError("RESULT_CONTRACT_INVALID: successful task 12 result cannot carry error_code.")
+            if (
+                normalize_text(result.get("product_name")) != normalize_text(item.expected_product_name)
+                or normalize_grade(result.get("grade")) != normalize_grade(item.expected_grade)
+            ):
+                raise ValidationError("PRODUCT_IDENTITY_MISMATCH: result identity differs from batch item.")
+        normalized_error, adapter_error = _task12_batch_error(
+            str(result.get("error_code") or ""),
+            side_effect_state=contract.side_effect_state,
+        )
+        error_message = str(result.get("error_message") or "").strip()
+        if adapter_error and adapter_error != normalized_error:
+            error_message = (f"adapter_error_code={adapter_error}; {error_message}").strip("; ")
+        try:
+            if stage == "FRESH_READ":
+                if contract.status == STATUS_READ_COMPLETED:
+                    orchestrator.record_fresh_read(
+                        batch.batch_id,
+                        item.item_id,
+                        fresh_read_attempt_id=contract.execution_attempt_id,
+                        result_sha256=result_hash,
+                        observed_product_name=result.get("product_name"),
+                        observed_grade=result.get("grade"),
+                        observed_platform_sku=result.get("platform_sku"),
+                        observed_price=result.get("actual_price"),
+                        observed_at=result.get("observed_at"),
+                    )
+                else:
+                    orchestrator.record_item_result(
+                        batch.batch_id,
+                        item.item_id,
+                        status=BatchItemStatus.FAILED.value,
+                        execution_attempt_id=contract.execution_attempt_id,
+                        run_id=_attempt_run_id(self.repository, contract.execution_attempt_id),
+                        error_code=normalized_error or PriceBatchErrorCode.PLATFORM_EXECUTION_FAILED.value,
+                        error_message=error_message,
+                        result_id=contract.result_id,
+                        result_hash=result_hash,
+                        stop_requested=normalized_error == PriceBatchErrorCode.WORKER_STOP_REQUESTED.value,
+                    )
+            elif stage == "WRITE":
+                if contract.status == STATUS_PREVIEW_COMPLETED:
+                    item_status = BatchItemStatus.PREVIEWED.value
+                elif contract.status == STATUS_VERIFIED:
+                    item_status = BatchItemStatus.VERIFIED.value
+                elif contract.status in {STATUS_SIDE_EFFECT_UNKNOWN, STATUS_START_UNKNOWN} or contract.side_effect_state in {
+                    "SUBMIT_INTENT_RECORDED",
+                    "SUBMIT_CLICKED",
+                    "UNKNOWN",
+                }:
+                    item_status = BatchItemStatus.NEEDS_RECONCILIATION.value
+                    normalized_error = PriceBatchErrorCode.SUBMIT_RESULT_UNKNOWN.value
+                elif contract.status in {STATUS_FAILED, STATUS_NOT_APPLIED, STATUS_START_FAILED}:
+                    item_status = BatchItemStatus.FAILED.value
+                else:
+                    raise ValidationError("RESULT_CONTRACT_INVALID: unsupported task 12 write result status.")
+                orchestrator.record_item_result(
+                    batch.batch_id,
+                    item.item_id,
+                    status=item_status,
+                    execution_attempt_id=contract.execution_attempt_id,
+                    run_id=_attempt_run_id(self.repository, contract.execution_attempt_id),
+                    post_commit_price=actual_price,
+                    error_code=normalized_error,
+                    error_message=error_message,
+                    result_id=contract.result_id,
+                    result_hash=result_hash,
+                    stop_requested=normalized_error == PriceBatchErrorCode.WORKER_STOP_REQUESTED.value,
+                )
+            elif stage == "RECONCILE":
+                if contract.status == STATUS_VERIFIED and actual_price == item.target_price:
+                    outcome = "VERIFIED"
+                elif (
+                    contract.status in {STATUS_NOT_APPLIED, STATUS_FAILED}
+                    and contract.side_effect_state == "NOT_APPLIED"
+                    and actual_price in {item.fresh_old_price, item.approved_expected_old_price}
+                ):
+                    outcome = "NOT_APPLIED"
+                else:
+                    outcome = "UNCERTAIN"
+                    normalized_error = PriceBatchErrorCode.SUBMIT_RESULT_UNKNOWN.value
+                orchestrator.complete_reconcile(
+                    batch.batch_id,
+                    item.item_id,
+                    reconcile_attempt_id=contract.execution_attempt_id,
+                    outcome=outcome,
+                    post_commit_price=actual_price,
+                    error_code=normalized_error,
+                    error_message=error_message,
+                )
+            else:
+                raise ValidationError("RESULT_CONTRACT_INVALID: unsupported task 12 stage.")
+        except PriceBatchContractError as exc:
+            stored_after_error = self.repository.get_shadowbot_batch_item(batch.batch_id, item.item_id)
+            if stored_after_error is None or stored_after_error.status == BatchItemStatus.RUNNING.value:
+                raise
+            normalized_error = stored_after_error.error_code or exc.code
+
+        stored_batch = self.repository.get_shadowbot_batch(batch.batch_id)
+        stored_item = self.repository.get_shadowbot_batch_item(batch.batch_id, item.item_id)
+        assert stored_batch is not None and stored_item is not None
+        counts = _validate_persisted_batch_counts(self.repository, batch.batch_id)
+        return {
+            "batch_id": batch.batch_id,
+            "item_id": item.item_id,
+            "stage": stage,
+            "item_status": stored_item.status,
+            "batch_status": stored_batch.status,
+            "error_code": stored_item.error_code or normalized_error,
+            "counts": counts,
         }
 
     @staticmethod
@@ -289,6 +523,79 @@ class ShadowBotResultImporter:
             ),
         )
         return destination
+
+
+_TASK12_ERROR_ALIASES = {
+    "DUPLICATE_TARGET_IDENTITY": PriceBatchErrorCode.AMBIGUOUS_MATCH.value,
+    "PRODUCT_MATCH_AMBIGUOUS": PriceBatchErrorCode.AMBIGUOUS_MATCH.value,
+    "OLD_PRICE_PARSE_FAILED": PriceBatchErrorCode.CURRENT_PRICE_PARSE_FAILED.value,
+    "FINAL_SAVE_NOT_FOUND": PriceBatchErrorCode.SUBMIT_RESULT_UNKNOWN.value,
+    "POST_SUBMIT_PRICE_MISMATCH": PriceBatchErrorCode.SUBMIT_RESULT_UNKNOWN.value,
+}
+
+_TASK12_LIST_LOAD_ERRORS = frozenset(
+    {
+        "APPLET_URI_INVALID",
+        "APPLET_URI_MISSING",
+        "APPLET_URI_OPEN_FAILED",
+        "ELEMENT_NOT_FOUND",
+        "PRODUCT_LIST_REFRESH_FAILED",
+        "SELECTOR_BUILD_FAILED",
+        "WINDOW_NOT_AVAILABLE",
+    }
+)
+
+
+def _task12_optional_price(value: Any) -> Decimal | None:
+    if value is None or str(value).strip() == "":
+        return None
+    return Decimal(
+        normalize_price_string(
+            value,
+            error_code=PriceBatchErrorCode.CURRENT_PRICE_PARSE_FAILED,
+        )
+    )
+
+
+def _task12_batch_error(raw_error: str, *, side_effect_state: str) -> tuple[str, str]:
+    adapter_error = str(raw_error or "").strip().upper()
+    if not adapter_error:
+        return "", ""
+    if adapter_error in PRICE_BATCH_ERROR_CODES:
+        return adapter_error, adapter_error
+    if adapter_error in _TASK12_ERROR_ALIASES:
+        return _TASK12_ERROR_ALIASES[adapter_error], adapter_error
+    if adapter_error in _TASK12_LIST_LOAD_ERRORS:
+        return PriceBatchErrorCode.LIST_NOT_LOADED.value, adapter_error
+    if side_effect_state in {"SUBMIT_INTENT_RECORDED", "SUBMIT_CLICKED", "UNKNOWN"}:
+        return PriceBatchErrorCode.SUBMIT_RESULT_UNKNOWN.value, adapter_error
+    return PriceBatchErrorCode.PLATFORM_EXECUTION_FAILED.value, adapter_error
+
+
+def _attempt_run_id(repository: SQLiteRuntimeRepository, execution_attempt_id: str) -> str:
+    attempt = repository.get_shadowbot_execution_attempt(execution_attempt_id)
+    return attempt.shadowbot_run_id if attempt is not None else ""
+
+
+def _validate_persisted_batch_counts(
+    repository: SQLiteRuntimeRepository,
+    batch_id: str,
+) -> dict[str, int]:
+    batch = repository.get_shadowbot_batch(batch_id)
+    items = repository.list_shadowbot_batch_items(batch_id)
+    if batch is None:
+        raise ValidationError("BATCH_ITEM_BINDING_MISMATCH: batch disappeared during import.")
+    counts = aggregate_batch_counts([item.status for item in items])
+    for name, expected in counts.items():
+        if name == "total_count":
+            actual = len(items)
+        else:
+            actual = getattr(batch, name)
+        if actual != expected:
+            raise ValidationError(
+                f"RESULT_CONTRACT_INVALID: persisted batch count mismatch for {name}."
+            )
+    return counts
 
 
 class ShadowBotLoginVerificationMonitor:

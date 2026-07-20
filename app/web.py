@@ -61,6 +61,8 @@ from app.services.workflow import (
 )
 from app.services.runtime import DEFAULT_RUNTIME_DB, NotificationLogService, NotificationSenderFactory
 from app.services.shadowbot_executor import ShadowBotExecutor, build_shadowbot_task_runner_from_environment
+from app.services.shadowbot_price_batch import PriceBatchContractError
+from app.services.shadowbot_price_batch_orchestrator import ShadowBotPriceBatchOrchestrator
 from app.services.business_rule_evaluation import BusinessRuleRunner
 from app.services.product_inventory_input import (
     FOLLOW_GRADE_VALUE,
@@ -208,6 +210,7 @@ CSRF_PROTECTED_WRITE_PATHS = frozenset({
     "/runtime/logout",
     "/reviews",
     "/execution-logs",
+    "/price-batches",
     "/business-inputs",
     "/system/test-feishu-notification",
 })
@@ -331,6 +334,7 @@ UI_TEXT = {
     "reviews_tab": "\u590d\u6838\u4e2d\u5fc3",
     "notifications_tab": "\u901a\u77e5\u4e2d\u5fc3",
     "execution_logs_tab": "执行记录",
+    "price_batches_tab": "改价批次",
     "business_inputs_tab": "业务数据",
     "system_tab": "系统维护",
     "tables_tab": "Excel \u8868\u683c\u7ba1\u7406",
@@ -632,6 +636,12 @@ def _application(environ, start_response):
         return _respond(start_response, "200 OK", "text/html; charset=utf-8", _handle_notifications_page(environ))
     if path == "/execution-logs":
         result = _handle_execution_logs_page(method, environ)
+        if isinstance(result, tuple):
+            status, body, headers = result
+            return _respond(start_response, status, "text/html; charset=utf-8", body, headers=headers)
+        return _respond(start_response, "200 OK", "text/html; charset=utf-8", result)
+    if path == "/price-batches":
+        result = _handle_price_batches(method, environ)
         if isinstance(result, tuple):
             status, body, headers = result
             return _respond(start_response, status, "text/html; charset=utf-8", body, headers=headers)
@@ -1331,6 +1341,96 @@ def _parse_mobile_review_path(path: str) -> tuple[str, bool] | None:
     if len(parts) == 2 and parts[1] == "resolve":
         return (unquote(parts[0]), True)
     return None
+
+
+def _handle_price_batches(method: str, environ) -> str | tuple[str, str, list[tuple[str, str]]]:
+    runtime_db = _runtime_db_for_request(environ)
+    session_user = _get_runtime_session_user(environ)
+    if session_user is None:
+        return _redirect_response(
+            _append_query_to_path(
+                "/runtime/login",
+                {"runtime_db": runtime_db, "next": "/price-batches"},
+            )
+        )
+    query = _parse_query(environ)
+    batch_id = _first(query, "batch_id", "").strip()
+    message = _first(query, "message", "")
+    level = _first(query, "level", "info")
+    repository = SQLiteRuntimeRepository(Path(runtime_db))
+
+    if method == "POST":
+        parsed = _parse_body(environ)
+        batch_id = _first(parsed, "batch_id", "").strip()
+        action = _first(parsed, "action", "").strip().upper()
+        reason = _first(parsed, "reason", "").strip()[:500]
+        allowed = {"PAUSE", "RESUME", "CANCEL_PENDING"}
+        if action not in allowed:
+            record_security_event(
+                "PRICE_BATCH_CONTROL_REJECTED",
+                route="/price-batches",
+                outcome="rejected",
+                reason_code="ACTION_NOT_ALLOWED",
+                subject=session_user,
+            )
+            return "422 Unprocessable Entity", "不允许的批次操作。", []
+        try:
+            orchestrator = ShadowBotPriceBatchOrchestrator(repository)
+            if action == "PAUSE":
+                applied = orchestrator.pause(batch_id, actor=session_user, reason=reason)
+            elif action == "RESUME":
+                applied = orchestrator.resume(batch_id, actor=session_user, reason=reason)
+            else:
+                applied = orchestrator.cancel_pending(batch_id, actor=session_user, reason=reason)
+            record_security_event(
+                "PRICE_BATCH_CONTROL",
+                route="/price-batches",
+                outcome="applied" if applied else "no_change",
+                reason_code=action,
+                subject=session_user,
+            )
+            message = "批次控制操作已记录。" if applied else "批次状态未发生变化，操作记录已保留。"
+            level = "success" if applied else "info"
+        except (PriceBatchContractError, ValidationError) as exc:
+            record_security_event(
+                "PRICE_BATCH_CONTROL_REJECTED",
+                route="/price-batches",
+                outcome="rejected",
+                reason_code=action,
+                subject=session_user,
+            )
+            message = str(exc)
+            level = "error"
+        return _redirect_response(
+            _append_query_to_path(
+                "/price-batches",
+                {
+                    "runtime_db": runtime_db,
+                    "batch_id": batch_id,
+                    "message": message,
+                    "level": level,
+                },
+            )
+        )
+
+    batches = repository.list_shadowbot_batches(limit=100)
+    selected_batch = repository.get_shadowbot_batch(batch_id) if batch_id else None
+    selected_items = repository.list_shadowbot_batch_items(batch_id) if selected_batch else []
+    control_events = (
+        repository.list_shadowbot_batch_control_events(batch_id, limit=100)
+        if selected_batch
+        else []
+    )
+    return render_price_batches_page(
+        runtime_db=runtime_db,
+        session_user=session_user,
+        batches=batches,
+        selected_batch=selected_batch,
+        selected_items=selected_items,
+        control_events=control_events,
+        message=message,
+        message_level=level,
+    )
 
 
 def _handle_runtime(method: str, environ) -> str | tuple[str, str, list[tuple[str, str]]]:
@@ -5778,6 +5878,116 @@ def _render_login_required_page(
     )
 
 
+def render_price_batches_page(
+    *,
+    runtime_db: str,
+    session_user: str,
+    batches,
+    selected_batch,
+    selected_items,
+    control_events,
+    message: str = "",
+    message_level: str = "info",
+) -> str:
+    batch_rows = "".join(
+        "<tr>"
+        f"<td><a href='{escape(_append_query_to_path('/price-batches', {'batch_id': batch.batch_id}))}'><code>{escape(batch.batch_id)}</code></a></td>"
+        f"<td>{escape(batch.execution_mode)}</td>"
+        f"<td>{_status_badge(batch.status)}</td>"
+        f"<td>{batch.processed_count}/{batch.pending_count + batch.ready_count + batch.running_count + batch.processed_count}</td>"
+        f"<td>{batch.verified_count}</td><td>{batch.failed_count}</td>"
+        f"<td>{batch.needs_reconciliation_count}</td>"
+        f"<td>{escape(format_display_datetime(batch.updated_at))}</td>"
+        "</tr>"
+        for batch in batches
+    )
+    body = _render_table_panel(
+        "任务12批次摘要",
+        ["batch_id", "execution_mode", "status", "processed", "verified", "failed", "needs_reconciliation", "updated_at"],
+        batch_rows,
+        empty_message="当前没有改价批次。",
+    )
+    if selected_batch is not None:
+        total = (
+            selected_batch.pending_count
+            + selected_batch.ready_count
+            + selected_batch.running_count
+            + selected_batch.processed_count
+        )
+        controls = f"""
+        <section class="panel">
+          <h2>受控批次操作</h2>
+          <p class="subtle">只允许暂停、恢复和取消尚未开始的商品。这里不提供重试 COMMIT、跳过 UNKNOWN、修改审批哈希或批准全部。</p>
+          <form method="post" action="/price-batches">
+            <input type="hidden" name="batch_id" value="{escape(selected_batch.batch_id)}">
+            <div class="field"><label for="batch_reason">操作原因</label><input id="batch_reason" name="reason" maxlength="500"></div>
+            <div class="actions">
+              <button class="secondary" type="submit" name="action" value="pause">暂停</button>
+              <button class="secondary" type="submit" name="action" value="resume">恢复</button>
+              <button class="secondary" type="submit" name="action" value="cancel_pending">取消未开始商品</button>
+            </div>
+          </form>
+        </section>
+        """
+        summary = f"""
+        <section class="panel">
+          <h2>批次详情：<code>{escape(selected_batch.batch_id)}</code></h2>
+          <div class="metrics">
+            <div class="metric"><span class="label">批次状态</span><strong>{escape(selected_batch.status)}</strong></div>
+            <div class="metric"><span class="label">执行模式</span><strong>{escape(selected_batch.execution_mode)}</strong></div>
+            <div class="metric"><span class="label">商品总数</span><strong>{total}</strong></div>
+            <div class="metric"><span class="label">已处理</span><strong>{selected_batch.processed_count}</strong></div>
+          </div>
+          <p class="subtle">计数恒等式：{total} = {selected_batch.pending_count} pending + {selected_batch.ready_count} ready + {selected_batch.running_count} running + {selected_batch.processed_count} processed。</p>
+          <p class="subtle">来源读取批次：<code>{escape(selected_batch.source_read_batch_id)}</code>；请求摘要：<code>{escape(selected_batch.normalized_request_digest)}</code></p>
+        </section>
+        """
+        item_rows = "".join(
+            "<tr>"
+            f"<td>{item.ordinal}</td><td>{escape(item.expected_product_name)}</td><td>{escape(item.expected_grade)}</td>"
+            f"<td>{escape(str(item.approved_expected_old_price))}</td><td>{escape(str(item.target_price))}</td>"
+            f"<td>{escape(str(item.post_commit_price) if item.post_commit_price is not None else '-')}</td>"
+            f"<td>{_status_badge(item.status)}</td><td>{escape(item.error_code or '-')}</td>"
+            f"<td><code>{escape(item.task_id)}</code></td><td><code>{escape(item.review_task_id)}</code></td>"
+            f"<td><code>{escape(item.operation_id)}</code></td>"
+            f"<td><code>{escape(item.current_execution_attempt_id or item.fresh_read_attempt_id or '-')}</code></td>"
+            "</tr>"
+            for item in selected_items
+        )
+        items_panel = _render_table_panel(
+            "逐商品明细",
+            ["ordinal", "product", "grade", "old_price", "target_price", "post_price", "status", "error", "task_id", "review_task_id", "operation_id", "attempt_id"],
+            item_rows,
+            empty_message="该批次没有商品明细。",
+        )
+        event_rows = "".join(
+            "<tr>"
+            f"<td>{escape(format_display_datetime(event['created_at']))}</td>"
+            f"<td>{escape(event['action'])}</td><td>{escape(event['actor'])}</td>"
+            f"<td>{escape(event['previous_status'])} → {escape(event['resulting_status'])}</td>"
+            f"<td>{'是' if event['applied'] else '否'}</td><td>{escape(event['reason'] or '-')}</td>"
+            "</tr>"
+            for event in control_events
+        )
+        events_panel = _render_table_panel(
+            "批次控制审计",
+            ["created_at", "action", "actor", "status_change", "applied", "reason"],
+            event_rows,
+            empty_message="当前没有批次控制记录。",
+        )
+        body += summary + controls + items_panel + events_panel
+    return _render_ops_page(
+        title="任务12改价批次",
+        description="查看同一平台多商品串行改价状态，并执行受审计的暂停、恢复或取消未开始商品。",
+        active_path="/price-batches",
+        runtime_db=runtime_db,
+        session_user=session_user,
+        body_html=body,
+        message=message,
+        message_level=message_level,
+    )
+
+
 def _render_ops_page(
     *,
     title: str,
@@ -7704,6 +7914,7 @@ def navigation(active_path: str, runtime_db: str | None = None) -> str:
         ("/reviews", UI_TEXT["reviews_tab"]),
         ("/notifications", UI_TEXT["notifications_tab"]),
         ("/execution-logs", UI_TEXT["execution_logs_tab"]),
+        ("/price-batches", UI_TEXT["price_batches_tab"]),
         ("/business-inputs", UI_TEXT["business_inputs_tab"]),
     ]
     links = "".join(

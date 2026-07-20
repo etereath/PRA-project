@@ -558,6 +558,20 @@ SCHEMA_V7_SQL = [
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS shadowbot_batch_control_events (
+        event_id TEXT PRIMARY KEY,
+        batch_id TEXT NOT NULL,
+        action TEXT NOT NULL CHECK (action IN ('PAUSE', 'RESUME', 'CANCEL_PENDING')),
+        actor TEXT NOT NULL,
+        reason TEXT NOT NULL DEFAULT '',
+        previous_status TEXT NOT NULL,
+        resulting_status TEXT NOT NULL,
+        applied INTEGER NOT NULL CHECK (applied IN (0, 1)),
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(batch_id) REFERENCES shadowbot_batches(batch_id)
+    )
+    """,
+    """
     CREATE INDEX IF NOT EXISTS ix_shadowbot_batches_status
     ON shadowbot_batches(status, created_at)
     """,
@@ -581,6 +595,10 @@ SCHEMA_V7_SQL = [
     """
     CREATE INDEX IF NOT EXISTS ix_shadowbot_batch_items_status
     ON shadowbot_batch_items(batch_id, status, ordinal)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_shadowbot_batch_control_events_batch
+    ON shadowbot_batch_control_events(batch_id, created_at)
     """,
     """
     CREATE INDEX IF NOT EXISTS ix_shadowbot_operations_write_identity_status
@@ -2023,6 +2041,58 @@ class SQLiteRuntimeRepository:
             ).fetchone()
         return _row_to_shadowbot_batch(row) if row is not None else None
 
+    def list_shadowbot_batches(
+        self,
+        *,
+        status: str = "",
+        limit: int = 100,
+    ) -> list[ShadowBotBatch]:
+        normalized_status = str(status or "").strip().upper()
+        if normalized_status and normalized_status not in {value.value for value in BatchStatus}:
+            raise PriceBatchContractError(PriceBatchErrorCode.RESULT_CONTRACT_INVALID)
+        bounded_limit = min(max(int(limit), 1), 500)
+        with closing(self.connect()) as connection:
+            if normalized_status:
+                rows = connection.execute(
+                    "SELECT * FROM shadowbot_batches WHERE status = ? "
+                    "ORDER BY created_at DESC LIMIT ?",
+                    (normalized_status, bounded_limit),
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    "SELECT * FROM shadowbot_batches ORDER BY created_at DESC LIMIT ?",
+                    (bounded_limit,),
+                ).fetchall()
+        return [_row_to_shadowbot_batch(row) for row in rows]
+
+    def list_shadowbot_batch_control_events(
+        self,
+        batch_id: str,
+        *,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        bounded_limit = min(max(int(limit), 1), 500)
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                "SELECT * FROM shadowbot_batch_control_events WHERE batch_id = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (batch_id, bounded_limit),
+            ).fetchall()
+        return [
+            {
+                "event_id": str(row["event_id"]),
+                "batch_id": str(row["batch_id"]),
+                "action": str(row["action"]),
+                "actor": str(row["actor"]),
+                "reason": str(row["reason"] or ""),
+                "previous_status": str(row["previous_status"]),
+                "resulting_status": str(row["resulting_status"]),
+                "applied": bool(row["applied"]),
+                "created_at": _text_to_datetime(row["created_at"]),
+            }
+            for row in rows
+        ]
+
     def list_shadowbot_batch_items(self, batch_id: str) -> list[ShadowBotBatchItem]:
         with closing(self.connect_read()) as connection:
             rows = connection.execute(
@@ -2412,7 +2482,18 @@ class SQLiteRuntimeRepository:
                 BatchStatus.FAILED.value,
                 BatchStatus.CANCELLED.value,
             }:
-                connection.rollback()
+                _insert_shadowbot_batch_control_event(
+                    connection,
+                    batch_id=batch_id,
+                    action=normalized_action,
+                    actor=actor,
+                    reason=reason,
+                    previous_status=current,
+                    resulting_status=current,
+                    applied=False,
+                    now=now,
+                )
+                connection.commit()
                 return False
             audit_reason = f"{actor}: {reason}".strip().rstrip(":")
             if normalized_action == "PAUSE":
@@ -2425,7 +2506,18 @@ class SQLiteRuntimeRepository:
                 )
             elif normalized_action == "RESUME":
                 if current != BatchStatus.PAUSED.value:
-                    connection.rollback()
+                    _insert_shadowbot_batch_control_event(
+                        connection,
+                        batch_id=batch_id,
+                        action=normalized_action,
+                        actor=actor,
+                        reason=reason,
+                        previous_status=current,
+                        resulting_status=current,
+                        applied=False,
+                        now=now,
+                    )
+                    connection.commit()
                     return False
                 unresolved = connection.execute(
                     "SELECT COUNT(*) FROM shadowbot_batch_items "
@@ -2461,6 +2553,21 @@ class SQLiteRuntimeRepository:
                     ),
                 )
                 _refresh_shadowbot_batch_on_connection(connection, batch_id, now=now)
+            resulting = connection.execute(
+                "SELECT status FROM shadowbot_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            _insert_shadowbot_batch_control_event(
+                connection,
+                batch_id=batch_id,
+                action=normalized_action,
+                actor=actor,
+                reason=reason,
+                previous_status=current,
+                resulting_status=str(resulting["status"]),
+                applied=True,
+                now=now,
+            )
             connection.commit()
             return True
         except Exception:
@@ -4696,6 +4803,39 @@ class SQLiteRuntimeRepository:
                 (script_run_id,),
             ).fetchall()
         return [_row_to_script_run_item(row) for row in rows]
+
+
+def _insert_shadowbot_batch_control_event(
+    connection: sqlite3.Connection,
+    *,
+    batch_id: str,
+    action: str,
+    actor: str,
+    reason: str,
+    previous_status: str,
+    resulting_status: str,
+    applied: bool,
+    now: datetime,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO shadowbot_batch_control_events(
+            event_id, batch_id, action, actor, reason, previous_status,
+            resulting_status, applied, created_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "BATCH-CONTROL-" + uuid4().hex,
+            batch_id,
+            action,
+            actor.strip(),
+            str(reason or "").strip(),
+            previous_status,
+            resulting_status,
+            int(applied),
+            _datetime_to_text(now),
+        ),
+    )
 
 
 def _refresh_shadowbot_batch_on_connection(
