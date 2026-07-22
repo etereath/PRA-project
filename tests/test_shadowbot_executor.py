@@ -16,6 +16,7 @@ from app.enums import NotificationOutboxStatus, ReviewTaskStatus, TaskActionType
 from app.exceptions import ValidationError
 from app.models import ReviewTask, Task
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.repositories.workbook_repository import save_table_records
 from app.services.runtime import RuntimeTaskService
 from app.services.shadowbot_executor import (
     EXECUTION_MODE_COMMIT,
@@ -35,6 +36,7 @@ from app.services.shadowbot_executor import (
     ShadowBotApprovedPayload,
     ShadowBotExecutionRequest,
     ShadowBotExecutor,
+    ShadowBotFileQueueRunner,
     ShadowBotResultContract,
     ShadowBotStartResult,
     YingdaoOpenApiJobRunner,
@@ -43,6 +45,7 @@ from app.services.shadowbot_executor import (
     compute_instruction_hash,
 )
 from app.services.shadowbot_product_read import compute_multi_product_instruction_hash
+from app.services.shadowbot_queue import ShadowBotResultImporter
 from scripts.run_shadowbot_executor import (
     check_yingdao_app_params,
     record_result_from_file,
@@ -241,6 +244,56 @@ class ShadowBotExecutorTests(unittest.TestCase):
         self.assertIsNotNone(attempt)
         self.assertEqual(operation.product_identity["read_batch_id"], "READ-BATCH-EXECUTOR-001")
         self.assertFalse(queued["capture_evidence"])
+        self.assertEqual(self.repository.get_task("TASK-SB-1").task_status, TaskStatus.PENDING)
+
+    def test_read_only_replaces_caller_hints_with_inventory_sku_mapping(self) -> None:
+        products_path = self.temp_path / "products.xlsx"
+        save_table_records(
+            "products",
+            products_path,
+            [
+                {
+                    "internal_sku": "CAPPUCCINO-E-45-Z",
+                    "product_name": "卡布奇诺",
+                    "grade": "E",
+                    "stem_length": "45",
+                    "unit": "扎",
+                    "base_cost": "10.00",
+                    "current_stock": 1,
+                    "sale_enabled": True,
+                }
+            ],
+        )
+        executor = ShadowBotExecutor(
+            self.repository,
+            self.runner,
+            inventory_products_path=products_path,
+        )
+
+        executor.start_multi_product_read(
+            task_id="TASK-SB-1",
+            execution_attempt_id="ATTEMPT-READ-INVENTORY-MAPPING-1",
+            request_payload={
+                "contract_version": 2,
+                "execution_mode": "READ_ONLY",
+                "platform_name": "蚂蚁花团供应商",
+                "read_batch_id": "READ-BATCH-INVENTORY-MAPPING-001",
+                "products": [],
+            },
+        )
+
+        self.assertEqual(
+            self.runner.calls[-1]["products"],
+            [
+                {
+                    "item_id": "ITEM-CAPPUCCINO-E-45-Z",
+                    "platform": "蚂蚁花团供应商",
+                    "platform_sku": None,
+                    "expected_product_name": "卡布奇诺",
+                    "expected_grade": "E",
+                }
+            ],
+        )
 
     def test_start_multi_product_read_rejects_read_batch_identity_conflict(self) -> None:
         request = {
@@ -266,13 +319,10 @@ class ShadowBotExecutorTests(unittest.TestCase):
                 execution_attempt_id="ATTEMPT-READ-EXECUTOR-2B",
                 request_payload={
                     **request,
-                    "products": [{
-                        "item_id": "ITEM-001",
-                        "platform": "ant_flower_wechat",
-                        "platform_sku": None,
-                        "expected_product_name": "卡布奇诺",
-                        "expected_grade": "C级",
-                    }],
+                    # READ_ONLY product hints are owned by the inventory table;
+                    # change another immutable contract field to exercise the
+                    # read_batch_id conflict boundary.
+                    "limits": {"max_pages": 2, "max_scrolls": 3, "max_seconds": 4},
                 },
             )
         self.assertEqual(len(self.runner.calls), 1)
@@ -926,36 +976,53 @@ class ShadowBotExecutorTests(unittest.TestCase):
                 runner_type="filedrop",
             )
         )
-        result_path = self.temp_path / "shadowbot_result.json"
-        result_path.write_text(
-            json.dumps(
-                {
-                    "execution_attempt_id": "ATTEMPT-CLI-2",
-                    **_result_binding(self.repository, "ATTEMPT-CLI-2"),
-                    "status": STATUS_VERIFIED,
-                    "run_success_flag": True,
-                    "business_operation_completed": True,
-                    "side_effect_state": "VERIFIED",
-                    "retryable": False,
-                    "old_price": "19.00",
-                    "target_price": "19.50",
-                    "actual_price": "19.50",
-                    "evidence_status": "COMPLETE",
-                    "evidence": [{"type": "AFTER_SUBMIT", "storage_uri": r"\\share\after.png"}],
-                },
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
+        result_path = request_dir / "results" / "ATTEMPT-CLI-2.result.json"
+        result_bytes = b"\xef\xbb\xbf" + json.dumps(
+            {
+                "execution_attempt_id": "ATTEMPT-CLI-2",
+                **_result_binding(self.repository, "ATTEMPT-CLI-2"),
+                "status": STATUS_VERIFIED,
+                "run_success_flag": True,
+                "business_operation_completed": True,
+                "side_effect_state": "VERIFIED",
+                "retryable": False,
+                "old_price": "19.00",
+                "target_price": "19.50",
+                "actual_price": "19.50",
+                "evidence_status": "COMPLETE",
+                "evidence": [{"type": "AFTER_SUBMIT", "storage_uri": r"\\share\after.png"}],
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        result_path.write_bytes(result_bytes)
+        result_file_sha256 = hashlib.sha256(result_bytes).hexdigest()
+        result_path.with_suffix(result_path.suffix + ".sha256").write_text(
+            result_file_sha256 + "\n",
+            encoding="ascii",
         )
 
         record_result_from_file(self.db_path, result_path)
 
         operation = self.repository.get_shadowbot_operation("OP-CLI-2")
+        attempt = self.repository.get_shadowbot_execution_attempt("ATTEMPT-CLI-2")
         task = self.repository.get_task("TASK-SB-1")
         logs = self.repository.list_execution_logs(task_id="TASK-SB-1")
         self.assertEqual(operation.status, STATUS_VERIFIED)
+        self.assertEqual(attempt.raw_output["result_id"], f"RESULT-{result_file_sha256[:24]}")
+        self.assertEqual(attempt.raw_output["result_file_sha256"], result_file_sha256)
         self.assertEqual(task.task_status, TaskStatus.SUCCESS)
         self.assertTrue(any('"actual_price": "19.50"' in log.raw_output for log in logs))
+
+        imported = ShadowBotResultImporter(
+            self.repository,
+            ShadowBotFileQueueRunner(request_dir),
+            request_dir,
+        ).import_one(result_path)
+
+        self.assertEqual(imported["status"], "ALREADY_IMPORTED")
+        self.assertTrue((request_dir / "archive" / "ATTEMPT-CLI-2").is_dir())
+        self.assertFalse(result_path.exists())
+        self.assertFalse(list((request_dir / "quarantine").iterdir()))
 
     def test_shadowbot_executor_imports_result_from_yingdao_job_output_param(self) -> None:
         request_dir = self.temp_path / "requests"

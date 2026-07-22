@@ -10,6 +10,7 @@
 | `/runtime`、`/reviews`、`/execution-logs`、系统通知 | GET 仅读 | Session 写操作要求 Session CSRF（表单、JSON、Header 均支持） | 旧 Session Cookie、旧 CSRF token 在轮换/登出后失效 |
 | `/runtime/logout` | 不接受 GET、PUT、PATCH、DELETE；统一返回 405，不改变 Session、审计或 Cookie | 仅 POST，要求有效 Session CSRF；成功后清理 Session、预认证 Cookie 与 CSRF 上下文 | 非 POST 请求在 CSRF guard 前拒绝，避免方法差异造成状态变化 |
 | `/business-inputs` | GET 只读已有文件；缺失文件返回空态/提示，不调用 ensure/create | 创建或初始化业务映射仅在受 Session + CSRF 保护的 POST 中执行 | GET 前后文件、目录和工作簿内容不变 |
+| `/task-generator` | GET 只读取规则与平台摘要并渲染任务生成表单 | 批量及单规则校验、预览与确认生成均要求后台 Session；确认后导出工作簿并通过 RuntimeTaskService 去重写入任务中心；POST 要求 Session CSRF，所有路径均受白名单约束 | 通配平台规则必须选择实际平台；单规则商品任务共享规则组 ID/截止时间并派生组状态，商品任务 ID 仍唯一；重复任务不会再次入库；原 `/` 继续保持安全关闭 |
 | `/tasks?task_tab=automation` | GET 只读已有数据库 | 不调用 schema 初始化，不创建缺失数据库 | 自动化页读取失败时返回空态，不改变应用状态 |
 | `/mobile/review/{id}` | 使用独立移动复核 token | 不依赖后端 Session CSRF；token 单次使用、过期失效 | 与 Web Session/CSRF 边界隔离，审计不记录 token 或完整 URL |
 | Web 文件路径 | 请求路径与服务器默认路径均经同一策略解析 | 默认路径也必须落在 `PRA_ALLOWED_DATA_DIRS`；`allow_create=False` 的缺失目标拒绝 | 拒绝原始及多层 URL 编码 `.`/`..`、UNC/设备/驱动器切换、尾随点空格，以及解析后越界的 symlink/junction |

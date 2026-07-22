@@ -1,0 +1,30 @@
+{
+  "batch_id": "BATCH-T12-FORMAL-COMMIT-20260722-02",
+  "development_confirmation_text": "确认授权批次 BATCH-T12-FORMAL-COMMIT-20260722-02 以上2项真实COMMIT",
+  "execution_mode": "COMMIT",
+  "items": [
+    {
+      "expected_grade": "B级",
+      "expected_old_price": "46.30",
+      "expected_product_name": "卡布奇诺",
+      "internal_sku": "CAPPUCCINO-B-60-Z",
+      "item_id": "ITEM-ccd693dde358",
+      "item_payload_sha256": "sha256:5b9c27125dc95b0f6aa47d4534796e591a704bcbc8fcef2a07aa2e18b04d3c8f",
+      "source_task_id": "ccd693dde358",
+      "target_price": "46.40"
+    },
+    {
+      "expected_grade": "B级",
+      "expected_old_price": "26.30",
+      "expected_product_name": "艾莎",
+      "internal_sku": "AISHA-B-60-Z",
+      "item_id": "ITEM-10fbaded17fa",
+      "item_payload_sha256": "sha256:eee9171fb58ad9dbdf3e69c365f5a48b3646f61bd5c9d8296b5edf757d0bd260",
+      "source_task_id": "10fbaded17fa",
+      "target_price": "26.40"
+    }
+  ],
+  "manifest_sha256": "sha256:a48afd35c7b32dc59dc59d258ea7ee80b74c342b343ae74a8d9eb1c5edb829e4",
+  "platform_name": "蚂蚁花团供应商",
+  "schema_version": "shadowbot-commit-manifest-1.1"
+}

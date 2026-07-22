@@ -10,6 +10,19 @@ from app.exceptions import MobileReviewErrorCode, MobileReviewTransactionError
 ADJUSTMENT_FIELDS = frozenset({"target_price", "target_status", "result_message"})
 
 
+def resolution_payload_summary(payload: dict[str, object]) -> dict[str, object]:
+    """Return audit-safe metadata without exposing reviewer credentials."""
+
+    if not payload:
+        return {}
+    summary: dict[str, object] = {"keys": sorted(payload.keys())}
+    if "reviewer_code" in payload and payload.get("reviewer_code"):
+        summary["reviewer_code_present"] = True
+    if "adjustment" in payload:
+        summary["adjustment"] = payload.get("adjustment")
+    return summary
+
+
 def normalize_mobile_review_resolution_payload(
     status: ReviewTaskStatus,
     payload: dict[str, object] | None,

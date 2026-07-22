@@ -3,12 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlencode
@@ -34,20 +33,24 @@ from app.services.shadowbot_state import (
     validate_result_state,
 )
 from app.services.shadowbot_product_read import (
+    DEFAULT_INVENTORY_PRODUCTS_PATH,
+    build_inventory_read_targets,
     build_read_batch_id,
     canonical_request_digest,
     compute_multi_product_instruction_hash,
     normalize_multi_product_request,
 )
-from app.services.shadowbot_price_batch import sha256_jcs
-from app.services.shadowbot_product_read import normalize_grade, normalize_sku, normalize_text
+from app.services.shadowbot_commit_batch import (
+    CONTRACT_VERSION as COMMIT_BATCH_CONTRACT_VERSION,
+    compute_instruction_hash as compute_commit_batch_instruction_hash,
+    validate_request as validate_commit_batch_request,
+)
 from app.utils import serialize_decimal, utc_now
 
 
 SHADOWBOT_EXECUTOR_NAME = "shadowbot_executor"
 
 EXECUTION_MODE_READ_ONLY = "READ_ONLY"
-EXECUTION_MODE_FILL_PREVIEW = "FILL_PREVIEW"
 EXECUTION_MODE_COMMIT = "COMMIT"
 EXECUTION_MODE_RECONCILE = "RECONCILE"
 
@@ -84,7 +87,6 @@ SIDE_EFFECT_RECONCILE_REQUIRED = {
 
 ALLOWED_EXECUTION_MODES = {
     EXECUTION_MODE_READ_ONLY,
-    EXECUTION_MODE_FILL_PREVIEW,
     EXECUTION_MODE_COMMIT,
     EXECUTION_MODE_RECONCILE,
 }
@@ -126,8 +128,6 @@ class ShadowBotApproval:
     approved_payload_hash: str
     approved_at: datetime
     expires_at: datetime | None = None
-    approval_contract_version: int = 1
-    approved_payload_view: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -188,7 +188,7 @@ class ShadowBotTimeoutClassification:
     next_execution_mode: str
 
 
-class ShadowBotStartBoundaryError(Exception):
+class ShadowBotStartBoundaryError(ValidationError):
     """Runner failure with an explicit, auditable publication boundary."""
 
     def __init__(self, message: str, *, published: bool, raw_output: dict[str, Any] | None = None) -> None:
@@ -220,30 +220,42 @@ class ShadowBotFileQueueRunner:
         return cls(queue_dir, command=os.environ.get("SHADOWBOT_RUNNER_COMMAND", ""))
 
     def start(self, payload: dict[str, Any]) -> ShadowBotStartResult:
-        is_multi_product = payload.get("contract_version") == 2
-        if is_multi_product:
-            _validate_multi_product_queue_request(payload)
-        else:
-            _validate_queue_request(payload)
-        execution_attempt_id = str(payload["execution_attempt_id"])
-        instruction_hash = (
-            compute_multi_product_instruction_hash(payload)
-            if is_multi_product
-            else compute_instruction_hash(payload)
-        )
-        supplied_instruction_hash = str(payload.get("instruction_hash") or "")
-        if supplied_instruction_hash and supplied_instruction_hash != instruction_hash:
-            raise ValidationError("instruction_hash does not match the execution instruction.")
-        request_payload = dict(payload)
-        request_payload["instruction_hash"] = instruction_hash
+        try:
+            contract_version = payload.get("contract_version")
+            is_multi_product = contract_version == 2
+            is_commit_batch = contract_version == COMMIT_BATCH_CONTRACT_VERSION
+            if is_multi_product:
+                _validate_multi_product_queue_request(payload)
+            elif is_commit_batch:
+                validate_commit_batch_request(payload)
+            else:
+                _validate_queue_request(payload)
+            execution_attempt_id = str(payload["execution_attempt_id"])
+            instruction_hash = (
+                compute_multi_product_instruction_hash(payload)
+                if is_multi_product
+                else compute_commit_batch_instruction_hash(payload)
+                if is_commit_batch
+                else compute_instruction_hash(payload)
+            )
+            supplied_instruction_hash = str(payload.get("instruction_hash") or "")
+            if supplied_instruction_hash and supplied_instruction_hash != instruction_hash:
+                raise ValidationError("instruction_hash does not match the execution instruction.")
+            request_payload = dict(payload)
+            request_payload["instruction_hash"] = instruction_hash
 
-        inbox_dir = self.queue_dir / "inbox"
-        for name in ("inbox", "working", "results", "archive", "quarantine", "evidence", "control"):
-            (self.queue_dir / name).mkdir(parents=True, exist_ok=True)
-        request_path = inbox_dir / f"{execution_attempt_id}.ready.json"
-        checksum_path = request_path.with_suffix(request_path.suffix + ".sha256")
-        if request_path.exists() or checksum_path.exists():
-            raise ValidationError("execution_attempt_id already exists in the ShadowBot queue.")
+            inbox_dir = self.queue_dir / "inbox"
+            for name in ("inbox", "working", "results", "archive", "quarantine", "evidence", "control"):
+                (self.queue_dir / name).mkdir(parents=True, exist_ok=True)
+            request_path = inbox_dir / f"{execution_attempt_id}.ready.json"
+            checksum_path = request_path.with_suffix(request_path.suffix + ".sha256")
+            if request_path.exists() or checksum_path.exists():
+                raise ValidationError("execution_attempt_id already exists in the ShadowBot queue.")
+        except (OSError, ValidationError) as exc:
+            raise ShadowBotStartBoundaryError(
+                str(exc),
+                published=False,
+            ) from exc
         request_bytes = _canonical_file_json(request_payload)
         request_file_sha256 = hashlib.sha256(request_bytes).hexdigest()
         try:
@@ -513,9 +525,16 @@ class ShadowBotExecutor:
         self,
         repository: SQLiteRuntimeRepository,
         runner: ShadowBotTaskRunner,
+        *,
+        inventory_products_path: Path | None = None,
     ) -> None:
         self.repository = repository
         self.runner = runner
+        self.inventory_products_path = Path(
+            inventory_products_path
+            or os.environ.get("PRA_PRODUCTS_PATH")
+            or DEFAULT_INVENTORY_PRODUCTS_PATH
+        )
         self.runtime_task_service = RuntimeTaskService(repository)
         self.notification_outbox_service = OutboxReviewNotificationService(repository)
 
@@ -722,17 +741,23 @@ class ShadowBotExecutor:
         lease_seconds: int = 900,
         runner_payload: dict[str, Any] | None = None,
     ) -> ShadowBotExecutorStartResult:
-        """Start one v2 single-platform multi-product READ_ONLY attempt.
-
-        READ_ONLY has no business write approval envelope.  It still gets a
-        normal operation/attempt/lease record so the existing queue, phase,
-        importer, and execution-log boundaries remain authoritative.
-        """
+        """Start one v2 single-platform READ_ONLY attempt."""
 
         self.repository.init_schema()
         request_payload = dict(request_payload or {})
         if not str(request_payload.get("read_batch_id") or "").strip():
             request_payload["read_batch_id"] = build_read_batch_id()
+        platform_name = str(request_payload.get("platform_name") or "").strip()
+        raw_products = request_payload.get("products")
+        if not platform_name and isinstance(raw_products, list) and raw_products:
+            first_product = raw_products[0]
+            if isinstance(first_product, dict):
+                platform_name = str(first_product.get("platform") or "").strip()
+        request_payload["platform_name"] = platform_name
+        request_payload["products"] = build_inventory_read_targets(
+            platform_name,
+            products_path=self.inventory_products_path,
+        )
         normalized = normalize_multi_product_request(request_payload)
         if str(task_id or "").strip() == "":
             raise ValidationError("task_id is required.")
@@ -742,9 +767,10 @@ class ShadowBotExecutor:
         if not execution_attempt_id:
             raise ValidationError("execution_attempt_id is required.")
         read_batch_id = normalized["read_batch_id"]
+        execution_mode = normalized["execution_mode"]
         operation_id = f"READ-{read_batch_id}"
         approved_payload_hash = canonical_request_digest(normalized)
-        platform = normalized["products"][0]["platform"]
+        platform = normalized["platform_name"]
         product_identity = {
             "multi_product_read": True,
             "read_batch_id": read_batch_id,
@@ -784,7 +810,7 @@ class ShadowBotExecutor:
             "task_id": task_id,
             "operation_id": operation_id,
             "execution_attempt_id": execution_attempt_id,
-            "execution_mode": "READ_ONLY",
+            "execution_mode": execution_mode,
             "platform_name": platform,
             "read_batch_id": read_batch_id,
             "products": normalized["products"],
@@ -807,7 +833,7 @@ class ShadowBotExecutor:
         attempt = ShadowBotExecutionAttempt(
             execution_attempt_id=execution_attempt_id,
             operation_id=operation_id,
-            execution_mode=EXECUTION_MODE_READ_ONLY,
+            execution_mode=execution_mode,
             shadowbot_run_id="",
             status=STATUS_STARTING,
             side_effect_state=SIDE_EFFECT_NOT_STARTED,
@@ -888,7 +914,8 @@ class ShadowBotExecutor:
             raw_output=start_result.raw_output,
         ):
             raise ValidationError("SHADOWBOT_LEASE_LOST_DURING_START")
-        self._move_task_to_running(task_id, execution_attempt_id)
+        # A v2 observation attempt does not execute the bound business task.
+        # Keep the task pending so a later v4 COMMIT can validate and claim it.
         return ShadowBotExecutorStartResult(
             operation_id=operation_id,
             execution_attempt_id=execution_attempt_id,
@@ -1015,11 +1042,7 @@ class ShadowBotExecutor:
             execution_attempt_id=attempt.execution_attempt_id,
             result=result,
         )
-        if (
-            result.status in {STATUS_START_UNKNOWN, STATUS_SIDE_EFFECT_UNKNOWN}
-            and attempt.execution_mode == EXECUTION_MODE_COMMIT
-            and not str(result.raw_output.get("price_batch_id") or "").strip()
-        ):
+        if result.status in {STATUS_START_UNKNOWN, STATUS_SIDE_EFFECT_UNKNOWN} and attempt.execution_mode == EXECUTION_MODE_COMMIT:
             try:
                 reconcile = self.ensure_reconcile_attempt(
                     operation_id=operation.operation_id,
@@ -1043,6 +1066,48 @@ class ShadowBotExecutor:
             )
         self._insert_execution_log(operation=operation, attempt=attempt, result=result)
         self._update_task_after_result(operation=operation, result=result)
+        self._update_listing_status_after_result(operation=operation, result=result)
+
+    def _update_listing_status_after_result(
+        self,
+        *,
+        operation: ShadowBotOperationLedger,
+        result: ShadowBotResultContract,
+    ) -> None:
+        if result.business_operation_completed is not True:
+            return
+        variety = str(
+            operation.product_identity.get("expected_product_name")
+            or operation.product_identity.get("product_name")
+            or operation.product_identity.get("variety")
+            or operation.product_identity.get("name")
+            or ""
+        ).strip()
+        grade = str(
+            operation.product_identity.get("expected_grade")
+            or operation.product_identity.get("grade")
+            or ""
+        ).strip()
+        if not variety or not grade:
+            return
+        raw_price = result.raw_output.get("actual_price") or result.raw_output.get("verified_price")
+        try:
+            current_price = Decimal(str(raw_price)) if raw_price not in (None, "") else operation.target_price
+            if not current_price.is_finite() or current_price < 0:
+                current_price = operation.target_price
+        except (InvalidOperation, TypeError, ValueError):
+            current_price = operation.target_price
+        existing = self.repository.get_listing_status(operation.platform, variety, grade)
+        if existing is None:
+            return
+        self.repository.update_listing_price(
+            platform_name=operation.platform,
+            variety=variety,
+            grade=grade,
+            current_price=current_price,
+            source="shadowbot",
+            updated_at=utc_now(),
+        )
 
     def open_login_verification_handoff(self, phase_data: dict[str, Any]) -> str:
         """Create one auditable manual-verification record for a waiting Worker attempt."""
@@ -1390,17 +1455,9 @@ class ShadowBotExecutor:
         payload = approval.approved_payload
         if payload.operation_id != request.operation_id:
             raise ValidationError("approval does not belong to this operation.")
-        if approval.approval_contract_version == 3:
-            if not approval.approved_payload_view:
-                raise ValidationError("approved task 12 payload view is required.")
-            actual_hash = sha256_jcs(approval.approved_payload_view)
-            if actual_hash != _normalize_sha256_text(approval.approved_payload_hash):
-                raise ValidationError("approved payload hash mismatch.")
-            _validate_task12_approved_payload_view(approval.approved_payload_view, payload)
-        else:
-            actual_hash = compute_approved_payload_hash(payload)
-            if actual_hash != approval.approved_payload_hash:
-                raise ValidationError("approved payload hash mismatch.")
+        actual_hash = compute_approved_payload_hash(payload)
+        if actual_hash != approval.approved_payload_hash:
+            raise ValidationError("approved payload hash mismatch.")
         review_task = self.repository.get_review_task(approval.approval_id)
         if review_task is None:
             raise ValidationError("approval record does not exist.")
@@ -1408,31 +1465,15 @@ class ShadowBotExecutor:
             raise ValidationError("approval record is not approved.")
         if review_task.source_task_id and review_task.source_task_id != payload.task_id:
             raise ValidationError("approval record does not belong to this task.")
-        operation = self.repository.get_shadowbot_operation(payload.operation_id)
-        approved_platform_names = {
-            normalize_text(value)
-            for value in (
-                operation.product_identity.get("approved_platform_names", [])
-                if operation is not None
-                else []
-            )
-            if normalize_text(value)
-        }
-        approved_platform_names.add(normalize_text(payload.platform))
-        if review_task.platform_name and normalize_text(review_task.platform_name) not in approved_platform_names:
+        if review_task.platform_name and review_task.platform_name != payload.platform:
             raise ValidationError("approval record does not belong to this platform.")
-        approved_sku = str(
-            payload.product_identity.get("sku")
-            or payload.product_identity.get("internal_sku")
-            or payload.product_identity.get("platform_sku")
-            or ""
-        )
+        approved_sku = str(payload.product_identity.get("sku") or payload.product_identity.get("internal_sku") or "")
         if review_task.internal_sku and approved_sku and review_task.internal_sku != approved_sku:
             raise ValidationError("approval record does not belong to this SKU.")
         task = self.repository.get_task(payload.task_id)
         if task is None:
             raise ValidationError("approved task does not exist.")
-        if task.platform_name and normalize_text(task.platform_name) not in approved_platform_names:
+        if task.platform_name and task.platform_name != payload.platform:
             raise ValidationError("approved task platform does not match payload.")
         if task.internal_sku and approved_sku and task.internal_sku != approved_sku:
             raise ValidationError("approved task SKU does not match payload.")
@@ -1441,13 +1482,7 @@ class ShadowBotExecutor:
             or review_task.review_payload.get("approved_payload_hash")
             or ""
         )
-        if approval.approval_contract_version == 3:
-            stored_hash_matches = _normalize_sha256_text(stored_hash) == _normalize_sha256_text(
-                approval.approved_payload_hash
-            )
-        else:
-            stored_hash_matches = stored_hash == approval.approved_payload_hash
-        if not stored_hash_matches:
+        if stored_hash != approval.approved_payload_hash:
             raise ValidationError("approval record hash does not match approved payload.")
         return payload
 
@@ -1582,42 +1617,6 @@ def compute_approved_payload_hash(payload: ShadowBotApprovedPayload) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _normalize_sha256_text(value: Any) -> str:
-    raw = str(value or "").strip().lower()
-    if raw.startswith("sha256:"):
-        digest = raw[7:]
-    else:
-        digest = raw
-    if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
-        raise ValidationError("approved payload hash is not SHA-256.")
-    return "sha256:" + digest
-
-
-def _validate_task12_approved_payload_view(
-    view: dict[str, Any],
-    payload: ShadowBotApprovedPayload,
-) -> None:
-    identity = view.get("product_identity")
-    if not isinstance(identity, dict):
-        raise ValidationError("approved task 12 product identity is invalid.")
-    payload_name = payload.product_identity.get("expected_product_name") or payload.product_identity.get("name")
-    payload_grade = payload.product_identity.get("expected_grade") or payload.product_identity.get("grade")
-    payload_sku = payload.product_identity.get("platform_sku") or payload.product_identity.get("sku")
-    if (
-        view.get("v") != 3
-        or str(view.get("operation_id") or "") != payload.operation_id
-        or str(view.get("task_id") or "") != payload.task_id
-        or normalize_text(view.get("platform")) != normalize_text(payload.platform)
-        or normalize_text(identity.get("normalized_product_name")) != normalize_text(payload_name)
-        or normalize_grade(identity.get("normalized_grade")) != normalize_grade(payload_grade)
-        or normalize_sku(identity.get("platform_sku")) != normalize_sku(payload_sku)
-        or str(view.get("approved_expected_old_price") or "")
-        != serialize_decimal(payload.expected_old_price)
-        or str(view.get("target_price") or "") != serialize_decimal(payload.target_price)
-    ):
-        raise ValidationError("approved task 12 payload view does not match execution payload.")
-
-
 INSTRUCTION_HASH_FIELDS = (
     "task_id",
     "operation_id",
@@ -1635,34 +1634,9 @@ INSTRUCTION_HASH_FIELDS = (
     "applet_uri",
 )
 
-TASK12_INSTRUCTION_HASH_FIELDS = (
-    "batch_contract_version",
-    "price_batch_id",
-    "price_batch_item_id",
-    "price_batch_ordinal",
-    "price_batch_stage",
-    "batch_execution_mode",
-    "normalized_request_digest",
-    "source_read_batch_id",
-    "source_snapshot_sha256",
-    "source_page_context_sha256",
-    "page_identity_key",
-    "write_identity_key",
-    "fresh_read_attempt_id",
-    "fresh_read_result_sha256",
-    "fresh_old_price",
-    "approved_payload_hash",
-    "approval_id",
-    "expires_at",
-    "capture_evidence",
-)
-
 
 def compute_instruction_hash(payload: dict[str, Any]) -> str:
-    fields = INSTRUCTION_HASH_FIELDS
-    if payload.get("batch_contract_version") == 3:
-        fields = INSTRUCTION_HASH_FIELDS + TASK12_INSTRUCTION_HASH_FIELDS
-    canonical = {field_name: payload.get(field_name, "") for field_name in fields}
+    canonical = {field_name: payload.get(field_name, "") for field_name in INSTRUCTION_HASH_FIELDS}
     encoded = json.dumps(canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
@@ -1683,7 +1657,9 @@ def _build_queue_request_payload(
     overrides: dict[str, Any],
 ) -> dict[str, Any]:
     _reject_fault_injection(overrides)
-    platform_sku = str(product_identity.get("platform_sku") or product_identity.get("sku") or "").strip()
+    # The current platform does not expose a SKU.  Never reinterpret PRA's
+    # internal ``sku`` field as a platform identifier.
+    platform_sku = str(product_identity.get("platform_sku") or "").strip()
     expected_name = str(
         product_identity.get("expected_product_name") or product_identity.get("name") or ""
     ).strip()
@@ -1754,7 +1730,6 @@ def _validate_queue_request(payload: dict[str, Any]) -> None:
         "execution_attempt_id",
         "execution_mode",
         "platform_name",
-        "platform_sku",
         "product_keyword",
         "expected_product_name",
         "expected_grade",
@@ -1765,15 +1740,11 @@ def _validate_queue_request(payload: dict[str, Any]) -> None:
         "expires_at",
     )
     missing = [field_name for field_name in required if not str(payload.get(field_name) or "").strip()]
-    if payload.get("batch_contract_version") == 3:
-        missing = [field_name for field_name in missing if field_name != "platform_sku"]
     if missing:
         raise ValidationError("ShadowBot queue request is missing required fields: " + ", ".join(missing))
     _validate_execution_mode(str(payload["execution_mode"]))
     if bool(payload.get("spec_verification_required")):
         raise ValidationError("INPUT_INVALID: current platform adapter cannot verify expected_spec.")
-    if payload.get("batch_contract_version") == 3:
-        _validate_task12_item_queue_request(payload)
     try:
         expires_at = datetime.fromisoformat(str(payload["expires_at"]))
     except ValueError as exc:
@@ -1782,66 +1753,6 @@ def _validate_queue_request(payload: dict[str, Any]) -> None:
         raise ValidationError("ShadowBot queue expires_at must include a timezone.")
     if expires_at <= utc_now():
         raise ValidationError("ShadowBot queue request has expired.")
-
-
-def _validate_task12_item_queue_request(payload: dict[str, Any]) -> None:
-    if len(json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")) > 256 * 1024:
-        raise ValidationError("REQUEST_SIZE_LIMIT_EXCEEDED")
-    required = tuple(
-        name
-        for name in TASK12_INSTRUCTION_HASH_FIELDS
-        if name not in {"approval_id", "capture_evidence"}
-    )
-    missing = [name for name in required if not str(payload.get(name) or "").strip()]
-    stage = str(payload.get("price_batch_stage") or "").strip().upper()
-    if stage == "FRESH_READ":
-        missing = [
-            name
-            for name in missing
-            if name not in {"fresh_read_result_sha256", "fresh_old_price"}
-        ]
-    if missing:
-        raise ValidationError("task 12 queue request is missing fields: " + ", ".join(missing))
-    ordinal = payload.get("price_batch_ordinal")
-    if isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 1:
-        raise ValidationError("INVALID_ORDINAL")
-    for name in (
-        "normalized_request_digest",
-        "source_snapshot_sha256",
-        "source_page_context_sha256",
-        "page_identity_key",
-        "write_identity_key",
-        "approved_payload_hash",
-    ):
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(payload.get(name) or "")):
-            raise ValidationError("task 12 queue hash is invalid: " + name)
-    if not isinstance(payload.get("capture_evidence"), bool):
-        raise ValidationError("capture_evidence must be boolean")
-    mode = str(payload.get("execution_mode") or "").strip().upper()
-    batch_mode = str(payload.get("batch_execution_mode") or "").strip().upper()
-    if stage != "RECONCILE" and not str(payload.get("approval_id") or "").strip():
-        raise ValidationError("task 12 queue approval_id is required")
-    if batch_mode not in {EXECUTION_MODE_FILL_PREVIEW, EXECUTION_MODE_COMMIT}:
-        raise ValidationError("UNSUPPORTED_EXECUTION_MODE")
-    if stage == "FRESH_READ":
-        if mode != EXECUTION_MODE_READ_ONLY or payload.get("fresh_read_attempt_id") != payload.get(
-            "execution_attempt_id"
-        ):
-            raise ValidationError("BATCH_ITEM_BINDING_MISMATCH")
-        if str(payload.get("fresh_read_result_sha256") or "") or str(payload.get("fresh_old_price") or ""):
-            raise ValidationError("BATCH_ITEM_BINDING_MISMATCH")
-    elif stage == "WRITE":
-        if mode != batch_mode:
-            raise ValidationError("BATCH_ITEM_BINDING_MISMATCH")
-        if not re.fullmatch(r"sha256:[0-9a-f]{64}", str(payload.get("fresh_read_result_sha256") or "")):
-            raise ValidationError("BATCH_ITEM_BINDING_MISMATCH")
-        if str(payload.get("fresh_old_price") or "") != str(payload.get("expected_old_price") or ""):
-            raise ValidationError("OLD_PRICE_CHANGED")
-    elif stage == "RECONCILE":
-        if mode != EXECUTION_MODE_RECONCILE:
-            raise ValidationError("BATCH_ITEM_BINDING_MISMATCH")
-    else:
-        raise ValidationError("BATCH_ITEM_BINDING_MISMATCH")
 
 
 def _validate_multi_product_queue_request(payload: dict[str, Any]) -> None:

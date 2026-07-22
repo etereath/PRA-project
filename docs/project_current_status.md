@@ -8,7 +8,7 @@ PRA 当前定位为：
 
 鲜切花预测性销售决策系统 + 运行态任务运营后台。
 
-PRA 主系统仍未形成真实销售平台和生产级 RPA 的无人值守调度闭环；但影刀微信小程序真实平台 UI 自动化实验已完成垂直切片、安全边界验证和核心故障注入。系统核心职责是：
+PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、多商品、受控 RPA 改价闭环；当前仍不承诺生产级无人值守调度，也未扩展到第二平台。系统核心职责是：
 
 - 从 Excel 读取业务输入。
 - 根据规则和预测输入生成运行态任务。
@@ -50,10 +50,15 @@ SQLite 当前保存以下运行态表：
 - `shadowbot_execution_attempts`
 - `shadowbot_side_effect_checkpoints`
 - `retry_authorizations`
+- `notification_outbox`
+- `notification_delivery_attempts`
+- `listing_status`
+- `shadowbot_commit_batches`
+- `shadowbot_commit_batch_items`
 
 SQLite 只承接运行态任务系统，不替代 Excel 主数据。
 
-当前 runtime schema 最新版本为 v6。v3 新增自动规则评估运行记录，v4 新增 ShadowBot Executor 账本，v5 新增 `instruction_hash`、`request_file_sha256`、`queue_request_path` 队列审计字段和 `retry_authorizations` 持久化结构，v6 新增事务型 `notification_outbox` 与 `notification_delivery_attempts`。`app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION` 是唯一版本权威来源。
+当前 runtime schema 最新版本为 v11。v3 新增自动规则评估运行记录，v4 新增 ShadowBot Executor 账本，v5 新增队列审计字段和 `retry_authorizations`，v6 新增事务型通知 Outbox，v7-v9 建立 `listing_status` 并将业务身份统一为“平台 + 品种 + 等级”，v10 将 `tasks.expected_old_price` 结构化，v11 新增单次请求的 `shadowbot_commit_batches` 和 `shadowbot_commit_batch_items`。`app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION` 是唯一版本权威来源。
 
 ### 2.3 人工复核闭环
 
@@ -160,27 +165,31 @@ SQLite 只承接运行态任务系统，不替代 Excel 主数据。
 - 不绕过 `RuntimeTaskService / ReviewTaskService / NotificationSender`。
 - 不把平台库存覆盖为 PRA 公共库存。
 
-### 2.10 影刀微信小程序 RPA 接入实验
+### 2.10 影刀微信小程序 RPA 单平台闭环
 
-已完成真实桌面微信小程序 `蚂蚁花团供应商` 的影刀垂直切片实验，并已建立 PRA `ShadowBotExecutor` 最小执行边界。当前定位是“真实平台 UI 自动化实验室 + 执行器骨架”，尚不是生产无人值守调度闭环。
+已完成真实桌面微信小程序 `蚂蚁花团供应商` 的单平台、多商品、受控改价闭环。当前定位是“可审查的单平台执行实现”，不是生产级无人值守或多平台调度承诺。最终交接见 [reports/task12_final_handoff_20260723.md](reports/task12_final_handoff_20260723.md)。
 
-已验证能力：
+当前已验证能力：
 
-- 影刀应用 `test2` 可控制桌面端微信小程序 `WeChatAppEx`。
-- `vertical_slice_read_price.py` 已支持 `READ_ONLY / FILL_PREVIEW / COMMIT / RECONCILE`。
-- 已在测试商品 `C级 艾莎` 上完成真实 `COMMIT`，并通过列表复核价格。
-- 已配置共享证据目录 `\\LAPTOP-O9O76RQV\pra-evidence`，截图证据可复制到共享目录并记录 SHA-256。
-- 已完成六条核心故障注入：旧价变化、商品找不到、缺参、输入回读不一致、提交后结果未知、结果未知后的只读对账。详见 [reports/shadowbot_fault_injection_20260625.md](reports/shadowbot_fault_injection_20260625.md)。
-- PRA 后端已具备 `ShadowBotExecutor` 最小闭环骨架：校验已批准 review、创建 `operation_id` 和 `execution_attempt_id`、启动 runner、记录副作用检查点、接收结果、写入 `execution_logs`、更新 operation 和 task。
-- 已覆盖三条核心结果分支的单元测试：成功归并 `VERIFIED` 并完成 task、提交前 `FAILED + NOT_STARTED` 写日志并按错误码保留重试决策空间、提交后 `NEEDS_RECONCILIATION + UNKNOWN` 冻结 operation 并阻止再次 `COMMIT`。
-- Web 执行日志最小查看入口已能展示 `operation_id`、`execution_attempt_id`、`shadowbot_run_id`、`execution_mode`、`status`、`side_effect_state`、价格、证据状态和共享截图，并对 `NEEDS_RECONCILIATION` 等高风险状态显示告警。
-- Web 执行日志已展示队列 heartbeat、working phase、Worker、三类 hash、隔离数量和自动对账 attempt；继续保留人工只读对账与确认人工处理入口，不提供强制重新提交按钮。
-- 已新增 `ShadowBotFileQueueRunner`，按 `.ready.json + .sha256` 原子发布请求；`filedrop` 保留为兼容名称。
-- 已实现有界常驻影刀 Worker、独立 `ShadowBotResultImporter` 和独立 `ShadowBotQueueWatchdog`。Importer 只导入结果，Watchdog 只监测 heartbeat、phase、超时和遗留 working。
-- 已在真实影刀 `test2` 中完成空队列启动与安全停止冒烟：Worker 每 5 秒写入 `heartbeat.json`，状态从 `RUNNING` 正常转为 `STOPPED`，期间未领取任务、未操作微信小程序。
+- 影刀应用 `test2` 控制桌面端微信小程序 `WeChatAppEx`，`vertical_slice_read_price.py` 支持 `READ_ONLY / COMMIT / RECONCILE`；FILL_PREVIEW 作为历史开发诊断能力保留，不是正式 COMMIT 前置。
+- 任务中心正式输入使用内部 SKU、`expected_old_price` 和 `target_price`；SKU 通过 `products.xlsx` 映射为页面商品名称和等级。
+- v4 合同一次投递完整多商品 `items` 队列，不包含页面位置、READ_ONLY、FILL_PREVIEW、`listing_status_id` 或快照版本依赖。
+- Worker 写操作前主动刷新并结构化读取当前“上架中”页面，按“商品名称 + 等级”匹配全部目标，确认均唯一存在并校验全部旧价。
+- 任一旧价不一致时，全批次返回 `OLD_PRICE_CHANGED/NOT_STARTED`，不提交任何商品。
+- 全部门禁通过后，按页面实时行号从上到下严格串行执行；页面顺序变化和跳过中间商品均已实机覆盖。
+- 第 4 行及以后商品按实际元素边界滚动，不通过点击失败后再滚动试错；非默认滚动位置失败样本和修复后成功样本均已归档。
+- 每项提交后独立重新定位并回读，只有平台实际价格等于目标价才记为 `VERIFIED`。
+- 结果同时回传完整页面的价格、库存和 `ONLINE` 状态，Importer 校验后更新任务、批次账本、逐商品账本和 `listing_status`。
+- `ShadowBotExecutor` 继续管理 operation/attempt、副作用检查点和 UNKNOWN→唯一 RECONCILE；Worker、Importer 和 Watchdog 不得自行创建重复 COMMIT。
+- `ShadowBotFileQueueRunner` 按 `.ready.json + .sha256` 原子发布请求；常驻 Worker、Result Importer 和 Queue Watchdog 的职责保持分离。
+- `test2` 支持长驻监听；生命周期状态记录避免每条任务重复启动/关闭，正常结束使用 `stop.signal → STOPPED → 关闭.flow`。
+- 最终暖态四商品实机批次 `BATCH-T12-WARM-FAST-PATH-20260723-01` 为 4/4 `VERIFIED`，总用时 `51.094 秒`。
+- READ_ONLY 完整页面结束判定样本 `ATTEMPT-PLATFORM-ENDMARKER-READONLY-20260722-01` 为 1 页、1 次扫描、0 次滚动、`27.445 秒`。
+
+历史垂直切片、故障注入和运维验证仍作为当前安全边界的基础：
 - 已完成文件队列真实 `READ_ONLY -> FILL_PREVIEW -> 后置 READ_ONLY` 验收：实际旧价 `9.80`，预览目标和输入回读均为 `10.30`，取消后列表实际价仍为 `9.80`；请求、结果、phase、数据库、执行日志和共享证据 SHA-256 均通过自动校验。
-- 已新增 `scripts/verify_shadowbot_filequeue_acceptance.py` 和 [shadowbot_filequeue_real_machine_acceptance.md](shadowbot_filequeue_real_machine_acceptance.md)，用于生成可回读的 JSON 验收报告。
-- 已新增 `scripts/prepare_shadowbot_commit_acceptance.py`：COMMIT 必须引用默认 10 分钟内完成且全项通过的 READ_ONLY attempt，自动使用实际旧价，并要求精确确认文本；本轮 `9.80 -> 10.30` 已通过该安全门投递。
+- 已新增 `scripts/verify_shadowbot_filequeue_acceptance.py`；当时的单商品验收流程已移入 [archive/shadowbot_pre_task12/shadowbot_filequeue_real_machine_acceptance.md](archive/shadowbot_pre_task12/shadowbot_filequeue_real_machine_acceptance.md)。
+- 历史开发工具 `scripts/prepare_shadowbot_commit_acceptance.py` 曾要求新鲜 READ_ONLY 和精确确认文本；该要求只用于早期单商品验收，不是当前 v4 正式 COMMIT 前置。
 - 已完成文件队列受控 COMMIT：`ATTEMPT-ACCEPT-COMMIT-94538902e3dd` 将 `C级艾莎` 从 `9.80` 修改为 `10.30`，结果为 `SUCCESS/VERIFIED`，42 项请求、结果、phase、数据库、执行日志和双证据 hash 校验全部通过；独立 post-COMMIT READ_ONLY 再次读取为 `10.30`。
 - 已完成隔离 UNKNOWN→RECONCILE 恢复验收：真实 NTFS 队列上的 stale `SUBMIT_CLICKED` 由 Watchdog 写出 UNKNOWN，Importer 导入后 Executor 只创建一个确定性 RECONCILE，最终归并为 `NOT_APPLIED`，两个 attempt 均归档且无活动队列残留。
 - 已完成执行中副作用前停止验收：在 READ_ONLY `UI_STARTED` phase 后写入 `stop.signal`，流程在安全检查点返回 `FAILED/WORKER_STOP_REQUESTED/NOT_STARTED`，Result Importer 归档后 Worker 转为 `STOPPED`，31 项专项校验通过。
@@ -200,7 +209,7 @@ SQLite 只承接运行态任务系统，不替代 Excel 主数据。
 - 已新增 `check-yingdao-app-params` 只读预检命令，可在真实启动前确认影刀应用已暴露 `request_json` 入参和 `shadowbot_result_json` 出参。
 - 已新增 `scripts/check_shadowbot_readiness.py` 离线就绪检查命令，可在真实启动前检查 runner、runtime DB 和必需环境变量；该命令不启动影刀、不访问影刀 OpenAPI，也不会输出密钥明文。
 - 已新增 `poll-yingdao-result` 桥接命令，可通过影刀 `job/query` 读取 `shadowbot_result_json` 出参并回写 PRA `execution_logs`、operation 和 task。
-- 当前项目体量不再使用环境变量 SKU/平台白名单；真实联调范围由 PRA 已审批任务、批准载荷 hash、单商品串行执行和人工对账共同约束。
+- 当前项目不再使用环境变量 SKU/平台白名单；production profile 以发布前再次校验通过的 `pending update_price` 任务为执行权威，并由 v4 批次/逐项哈希、单 Worker 多商品严格串行、旧价门禁和可对账状态机共同约束。
 - 已新增 `scripts/prepare_shadowbot_e2e_chain.py`，可一键准备首条 `update_price` task、approved review、批准载荷 hash，并在显式 `--start` 时调用 Executor 启动 `COMMIT`。
 - 已新增 `scripts/run_shadowbot_e2e_local_demo.py`，可在本地 runtime DB 中演练成功、提交前失败、提交后未知再对账三条结果分支，并通过 Web 执行日志查看字段、告警和证据链接。
 - 已新增 `scripts/run_shadowbot_executor.py` 桥接脚本，可从已批准 review 启动 ShadowBot 执行尝试，也可导入影刀结果 JSON 回灌 PRA 运行态。
@@ -214,11 +223,11 @@ SQLite 只承接运行态任务系统，不替代 Excel 主数据。
 
 边界：
 
-- 当前已形成不依赖 OpenAPI 的本地文件队列代码闭环，并完成空队列、真实 READ_ONLY、FILL_PREVIEW、受控 COMMIT、post-COMMIT 读价、副作用前停止、提交意图后停止、隔离 UNKNOWN→RECONCILE、真实商品提交后 UNKNOWN→RECONCILE 和 8 小时 READ_ONLY 连续运行验收。尚未完成长期告警和证据运维观察，因此仍不是无人值守生产调度承诺。
+- 当前已形成不依赖 OpenAPI 的本地文件队列代码闭环，并完成 READ_ONLY、历史 FILL_PREVIEW、v4 多商品 COMMIT、逐项独立回读、副作用前停止、提交意图后停止、UNKNOWN→RECONCILE 和 8 小时 READ_ONLY 连续运行验收。尚未完成长期告警和证据运维观察，因此仍不是无人值守生产调度承诺。
 - 影刀 OpenAPI runner 继续保留为可选能力；申请成本较高，不再作为当前阶段的上线前置条件。
 - 当前未形成无人值守生产运行承诺。
-- 当前仅验证单平台、单窗口、单测试商品路径。
-- 本轮针对性回归共通过 115 项测试及 7 个子测试：其中 Executor、文件队列和影刀垂直切片 42 项，运行时持久化与 Web 73 项。
+- 当前仅验证单平台、单窗口、单 Worker 严格串行多商品路径，不支持跨平台混合批次或多 Worker 并发。
+- 任务12交接文档整理后的核心定向回归为 `62 passed in 10.72s`；系统冒烟测试为 16 项通过、0 项失败。完整发布仍需按第 10 节运行更大范围测试。
 
 ## 3. 当前主控流程
 
@@ -233,7 +242,9 @@ SQLite 只承接运行态任务系统，不替代 Excel 主数据。
 7. 复核处理结果写回 `review_tasks`。
 8. 如绑定源任务且满足条件，通过 `RuntimeTaskService` 推动 `tasks` 状态。
 9. 源任务状态变化写入 `task_status_history`。
-10. 后续执行器可读取 `tasks` 并写入 `execution_logs`。
+10. 对发布前校验仍有效的 `pending update_price` 任务，ShadowBot 批次管线读取完整任务列表并生成一个 v4 COMMIT 请求。
+11. Worker 完成全页预扫描、旧价门禁、页面顺序编排、严格串行提交和独立回读。
+12. Result Importer 校验合同后更新任务、批次账本、逐商品账本、`listing_status` 和 `execution_logs`。
 
 Mock 平台测试流程在当前阶段作为本地验证链路：
 
@@ -242,6 +253,15 @@ Mock 平台测试流程在当前阶段作为本地验证链路：
 3. 执行结果写入 `execution_logs`。
 4. `PlatformSyncEvaluator` 对比 PRA 期望状态与 Mock 平台实际状态。
 5. 发现差异时生成 review proposal，再由现有复核和通知链路处理。
+
+真实平台价格更新流程：
+
+1. 任务中心提供同一平台的完整 `update_price` 任务列表。
+2. PRA 以 `products.xlsx` 将 SKU 唯一映射为页面商品名称和等级。
+3. 批次管线创建一个 v4 COMMIT 合同并原子发布一次。
+4. ShadowBot 读取当前页面、匹配全部目标并校验全部旧价。
+5. 全部门禁通过后按页面实时位置严格串行提交，每项独立回读。
+6. Importer 校验并回写运行态；UNKNOWN 只允许进入唯一 RECONCILE。
 
 ## 4. 数据流
 
@@ -264,6 +284,17 @@ runtime tasks
   -> execution_logs
   -> PlatformSyncEvaluator
   -> review_tasks / notification_logs
+```
+
+真实平台价格更新数据流：
+
+```text
+products.xlsx + runtime tasks
+  -> ShadowBot v4 commit manifest/request
+  -> file queue -> test2 Worker -> 微信小程序
+  -> item results + full page snapshot
+  -> Result Importer
+  -> tasks / execution_logs / commit ledgers / listing_status
 ```
 
 关键边界：
@@ -350,7 +381,7 @@ Web 复核主入口：
 
 当前明确不做：
 
-- 不承诺真实销售平台无人值守生产改价；当前保留单商品串行、人工审批、旧价校验和人工可对账边界。
+- 不承诺真实销售平台无人值守生产改价；当前 production profile 以有效 pending 任务为执行权威，并保留单 Worker 多商品严格串行、旧价校验和人工可对账边界。
 - 不承诺生产级无人值守 RPA；本地文件队列、自动对账和审计闭环代码已完成，但常驻实机样本、告警和长期证据运维仍未达到生产级。
 - 不接 AI Agent 自动决策。
 - 不引入 React / Vue。
@@ -390,25 +421,38 @@ Web 复核主入口：
 
 ## 8. 后续推荐优先级
 
-当前下一步不是扩大无人值守真实 RPA，也不是做 AI Agent。
+当前下一步是审查并交接任务12，然后在复用现有闭环的前提下进入任务13；不是扩大无人值守真实 RPA，也不是做 AI Agent。
 
 Code Review 后的高中低风险问题已完成修复，系统冒烟测试、全量单元测试和主控端到端流程测试均已通过。修复详情见 [reports/risk_fix_report_20260610.md](reports/risk_fix_report_20260610.md)。
 
 推荐顺序：
 
-1. 持续运行 `python scripts/run_system_smoke_tests.py` 和完整单元测试，保持主控流程基线稳定。
-2. 进入下一轮功能开发前，先做小范围设计审查，确认不会绕过 `RuntimeTaskService / ReviewTaskService / NotificationSender`。
-3. 基于自动规则评估框架继续规划上下架、冷库、包装产能等 evaluator，但保持 dry-run/apply 和 service 边界。
-4. 继续打磨业务输入、Web 可用性和运行态排障体验。
-5. 在已通过 8 小时 READ_ONLY、提交意图后停止和真实 UNKNOWN 自动对账验收的基础上，补充长期告警、磁盘清理、证据保留和服务账号运维样本；继续保持单商品串行、人工审批、旧价校验和对账边界。
-6. AI Agent 自动决策应放在真实平台 / RPA 执行链路跑通并具备足够审计边界后再推进。
+1. 审查 [reports/task12_final_handoff_20260723.md](reports/task12_final_handoff_20260723.md) 及对应真实运行归档；审查通过后再修改任务12状态并创建统一 GitHub PR。
+2. 进入任务13，复用任务12的合同、队列、身份映射、账本、完整页面快照和副作用状态机，实现上下架及 OFFLINE 跨页面对账。
+3. 补充长期告警、磁盘清理、证据保留和服务账号运维样本，并分别定义冷态/暖态性能指标。
+4. 继续运行系统冒烟、完整单元测试和 ShadowBot 成功基线测试，任何新功能不得重写已验证 COMMIT 动作链路。
+5. 基于自动规则评估框架继续规划上下架、冷库、包装产能等 evaluator，但保持 dry-run/apply 和 service 边界。
+6. AI Agent 自动决策应放在真实平台执行和运维边界通过更长期审查后再推进。
 
-## 9. 推荐验收命令
+## 9. 后续可复用资产
+
+完整清单见 [task12_reusable_assets.md](task12_reusable_assets.md)。优先复用：
+
+- v4 单次请求多商品合同、批次/逐项哈希和 SQLite v11 批次账本。
+- 文件队列原子发布、Worker 租约、phase、Importer、Watchdog 和归档。
+- operation/attempt/side-effect 状态机及 UNKNOWN→唯一 RECONCILE。
+- SKU→商品名称/等级映射、平台/等级规范化和完整页面快照。
+- 全目标唯一匹配、旧价总门禁、页面实时顺序编排和视口边界检查。
+- 每项提交后的独立回读和 `listing_status` 新鲜度保护。
+- 长驻 `test2` 生命周期记录和 `stop.signal → STOPPED → 关闭.flow` 收尾。
+- 成功动作基线、v4 编排、READ_ONLY 快照和状态回写测试。
+
+## 10. 推荐验收命令
 
 ```powershell
 python scripts/run_system_smoke_tests.py
 python -m unittest discover -s tests
-python -m pytest tests/test_shadowbot_evidence_share.py tests/test_shadowbot_vertical_slice_reconcile.py
+python -m pytest -q tests/test_shadowbot_commit_batch.py tests/test_shadowbot_commit_pipeline.py tests/test_shadowbot_commit_success_baseline.py tests/test_shadowbot_commit_v4_orchestration.py tests/test_shadowbot_readonly_snapshot_baseline.py tests/test_shadowbot_product_read.py tests/test_listing_status.py
 ```
 
 系统冒烟测试脚本已落地，建议与完整单元测试一起作为后续功能开发前、发布前和回归排查时的基线检查。

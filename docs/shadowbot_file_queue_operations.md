@@ -2,9 +2,9 @@
 
 ## 1. 运行边界
 
-第一版不调用影刀 OpenAPI。PRA 使用本地文件队列投递已审批指令，操作员每天手工启动一次影刀 `test2` 常驻流程，独立 PRA 队列服务负责结果导入和超时监测。
+当前默认不调用影刀 OpenAPI。PRA 使用本地文件队列投递已授权指令，影刀 `test2` 作为有界长驻 Worker 运行，独立 PRA 队列服务负责结果导入和超时监测。普通连续任务复用现有 Worker，不为每条请求重复启动和关闭影刀。
 
-逐阶段实机验收步骤见 [shadowbot_filequeue_real_machine_acceptance.md](shadowbot_filequeue_real_machine_acceptance.md)。
+任务12当前交接与实机证据见 [reports/task12_final_handoff_20260723.md](reports/task12_final_handoff_20260723.md)。早期单商品分阶段验收流程已归档至 [archive/shadowbot_pre_task12/shadowbot_filequeue_real_machine_acceptance.md](archive/shadowbot_pre_task12/shadowbot_filequeue_real_machine_acceptance.md)。
 
 - Worker 单线程运行，默认最多 8 小时或 50 个任务。
 - `ShadowBotResultImporter` 只处理 `results/*.result.json`。
@@ -105,9 +105,20 @@ python scripts\run_shadowbot_queue_services.py
 
 `--queue-dir` 是队列服务的显式运行边界。服务会同步覆盖 `SHADOWBOT_QUEUE_DIR` 与兼容别名 `SHADOWBOT_REQUEST_DIR`，因此 Executor 自动创建的 `RECONCILE` 会回到同一队列。自动对账从已校验的源请求继承 `evidence_share_dir`、`applet_uri` 和 `window_title`；仍需先加载 `SHADOWBOT_EVIDENCE_DIR`，以便共享证据可用。
 
-主流程只调用 `module1.py`；影刀自动执行其中的 `main(args)`，该薄入口再委托 `shadowbot_queue_worker.main(args)`。Worker 将复用 `vertical_slice_read_price.main` 的现有元素逻辑。
+主流程顺序为“调用 `module1` → 等待 1 秒 → 调用 `关闭.flow`”。`module1` 的 `main(args)` 委托 `shadowbot_queue_worker.main(args)`；Worker 长驻期间不会返回，因此 `关闭.flow` 只会在 Worker 正常结束后运行，且必须是主流程最后一步。
 
-外部同步 Python 后，首选在影刀“应用”主页面选中 `test2`，点击其行内圆形“运行应用”图标直接启动主流程。不要为了运行而进入编辑页面：已打开的设计器可能保留旧代码缓存，甚至把旧内容写回磁盘。只有人工录制或改元素时才进入编辑器；外部同步前必须先退出编辑器，随后恢复使用应用列表直接运行。
+每次使用前先读取 `D:\PRA_Runtime\shadowbot_queue\control\shadowbot_lifecycle_state.json`。记录为 `RUNNING` 且 Worker、队列和窗口事实一致时直接复用；记录为 `STOPPED` 时，才从影刀“应用”主页面选中 `test2` 并点击行内圆形“运行应用”图标。记录与实际不一致时进入异常恢复，不得根据固定坐标或单一窗口枚举结果猜测状态。
+
+外部同步 Python 后必须重启：先停止 Worker、退出影刀编辑器、完成同步，再从应用列表启动。不要为了运行而进入编辑页面；已打开的设计器可能保留旧代码缓存，甚至把旧内容写回磁盘。只有人工录制或修改元素时才进入编辑器。
+
+以下情况需要重启 `test2`：
+
+- 同步或修改了 `test2` Python/流程/元素。
+- Worker 达到默认 8 小时或 50 个任务上限。
+- 生命周期记录与 Worker/窗口事实不一致，且常规恢复无法消除。
+- Worker 停止后影刀主窗口无法正常恢复，需要按异常停止路径重启。
+
+其余情况下处理完一条或一批任务后保持 Worker 运行，并更新生命周期记录中的最后使用时间、执行 ID 和处理计数。
 
 请求安全停止：
 
@@ -119,7 +130,7 @@ New-Item -ItemType File -Force D:\PRA_Runtime\shadowbot_queue\control\stop.signa
 
 若存在已经写出 result 的 `working`，应先让 Result Importer 完成归档，再等待停止；Worker 不会丢弃未归档 working。
 
-确认 `heartbeat.json` 的 `status` 已变为 `STOPPED` 后，删除停止信号，避免下次启动立即退出：
+确认结果已经由 Importer 归档、`inbox/working/results` 无活动文件，Worker 心跳已变为 `STOPPED`，且主流程末端 `关闭.flow` 已执行后，删除停止信号，避免下次启动立即退出：
 
 ```powershell
 Remove-Item D:\PRA_Runtime\shadowbot_queue\control\stop.signal
@@ -171,4 +182,4 @@ python scripts\verify_shadowbot_deployment.py --app-dir $env:SHADOWBOT_APP_DIR
 python scripts\sync_shadowbot_test2.py --app-dir $env:SHADOWBOT_APP_DIR
 ```
 
-同步后确认编辑器处于关闭状态，并从影刀“应用”主页面的 `test2` 行内“运行应用”图标直接启动。该路径是外部 Python 同步后的默认测试方式；运行完成后仍需关闭影刀残留运行窗口。
+同步后确认编辑器处于关闭状态，并从影刀“应用”主页面的 `test2` 行内“运行应用”图标直接启动。该路径是外部 Python 同步后的默认测试方式。普通任务完成后保持 Worker 运行；只有准备结束本轮应用时才按第 4 节创建 `stop.signal`，由主流程末端 `关闭.flow` 清理残留运行窗口。

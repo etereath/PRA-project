@@ -6,8 +6,6 @@ from decimal import Decimal
 from typing import Any
 
 from app.enums import (
-    ConditionType,
-    ListingAction,
     ListingStrategy,
     PricingMethod,
     PricingSource,
@@ -251,12 +249,32 @@ class RulePricingInput:
     product: Product
     platform_name: str
     rules: list[PriceRule]
+    old_price: Decimal | None = None
+
+
+@dataclass(slots=True)
+class ListingStatus:
+    listing_status_id: str
+    platform_name: str
+    internal_sku: str
+    variety: str
+    current_price: Decimal
+    grade: str = ""
+    platform_stock_qty: int = 100
+    sold_qty: int = 0
+    online_status: str = "online"
+    source: str = "manual"
+    updated_at: datetime | None = None
+    inventory_source: str = "default"
+    inventory_observed_at: datetime | None = None
+    inventory_source_attempt_id: str = ""
 
 
 @dataclass(slots=True)
 class RulePricingResult:
     matched_rule_ids: list[str]
     matched_rule_names: list[str]
+    old_price: Decimal | None
     rule_price: Decimal
     applied_steps: list[str]
 
@@ -285,6 +303,7 @@ class AISuggestionResult:
 class FinalPricingDecision:
     internal_sku: str
     platform_name: str
+    expected_old_price: Decimal | None
     rule_price: Decimal
     final_price: Decimal
     pricing_source: PricingSource
@@ -301,6 +320,7 @@ class Task:
     priority: int
     task_status: TaskStatus
     created_at: datetime
+    expected_old_price: Decimal | None = None
     target_price: Decimal | None = None
     target_status: str | None = None
     pricing_source: PricingSource | None = None

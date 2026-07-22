@@ -1,0 +1,40 @@
+{
+  "applet_uri": "weixin://launchapplet/?app_id=wxdc8ef8e770254c0e",
+  "batch_id": "BATCH-T12-PRODUCTION-20260722-03",
+  "capture_evidence": false,
+  "contract_version": 4,
+  "created_at": "2026-07-21T18:38:13.185503+00:00",
+  "execution_attempt_id": "ATTEMPT-62b7cbb9c3194352",
+  "execution_mode": "COMMIT",
+  "execution_profile": "production",
+  "expires_at": "2026-07-21T19:08:13.185503+00:00",
+  "instruction_hash": "sha256:aa63de6ae5749c3c97f6daee23a7f6b861abfd75cac19e4bd225649b35f86e22",
+  "items": [
+    {
+      "expected_grade": "B级",
+      "expected_old_price": "26.30",
+      "expected_product_name": "艾莎",
+      "internal_sku": "AISHA-B-60-Z",
+      "item_id": "ITEM-850d20cb8c22",
+      "item_payload_sha256": "sha256:848a787f71ceb2ece66254ffab27aeebd88715982d00bc0d8df433382b744e40",
+      "source_task_id": "850d20cb8c22",
+      "target_price": "26.40"
+    },
+    {
+      "expected_grade": "B级",
+      "expected_old_price": "46.30",
+      "expected_product_name": "卡布奇诺",
+      "internal_sku": "CAPPUCCINO-B-60-Z",
+      "item_id": "ITEM-5b7a999bd6e4",
+      "item_payload_sha256": "sha256:59c564e61aaaf007027c4e7aa15348be080417ba989e29adff401395b3a25bc4",
+      "source_task_id": "5b7a999bd6e4",
+      "target_price": "46.40"
+    }
+  ],
+  "manifest_sha256": "sha256:4a1c27d724939cffed728d67af3b6ae58d93c6ac195a460b3f6dfde13d4d5f53",
+  "operation_id": "OP-62b7cbb9c3194352",
+  "platform_name": "蚂蚁花团供应商",
+  "schema_version": "shadowbot-commit-batch-request-1.1",
+  "task_id": "BATCHTASK-62b7cbb9c3194352",
+  "window_title": "微信"
+}

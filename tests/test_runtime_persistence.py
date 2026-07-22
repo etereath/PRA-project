@@ -68,7 +68,7 @@ class RuntimePersistenceTests(unittest.TestCase):
 
     def test_schema_initializes_version_and_partial_unique_index(self) -> None:
         self.task_service.init_schema()
-        self.assertEqual(self.repository.schema_versions(), [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(self.repository.schema_versions(), list(range(1, 12)))
         connection = sqlite3.connect(self.db_path)
         try:
             indexes = connection.execute("PRAGMA index_list(tasks)").fetchall()
@@ -81,6 +81,7 @@ class RuntimePersistenceTests(unittest.TestCase):
         self.assertIn(("review_tokens",), tables)
         self.assertIn(("script_runs",), tables)
         self.assertIn(("script_run_items",), tables)
+        self.assertIn(("listing_status",), tables)
 
     def test_schema_migrates_v1_database_to_latest(self) -> None:
         legacy_path = Path(self.temp_dir.name) / "legacy_runtime.sqlite3"
@@ -107,7 +108,7 @@ class RuntimePersistenceTests(unittest.TestCase):
 
         repository = SQLiteRuntimeRepository(legacy_path)
         repository.init_schema()
-        self.assertEqual(repository.schema_versions(), [1, 2, 3, 4, 5, 6, 7])
+        self.assertEqual(repository.schema_versions(), list(range(1, 12)))
         connection = sqlite3.connect(legacy_path)
         try:
             token_table = connection.execute(
@@ -163,6 +164,41 @@ class RuntimePersistenceTests(unittest.TestCase):
                 changed_by="worker",
                 reason="invalid",
             )
+
+    def test_overdue_pending_tasks_are_expired_with_history(self) -> None:
+        now = datetime(2026, 7, 21, 22, 54)
+        self.task_service.create_tasks([
+            _runtime_task(
+                "TASK-OVERDUE",
+                action_type=TaskActionType.UPDATE_PRICE,
+                required_by=now - timedelta(minutes=1),
+            ),
+            _runtime_task(
+                "TASK-FUTURE",
+                action_type=TaskActionType.UPDATE_PRICE,
+                required_by=now + timedelta(minutes=1),
+            ),
+        ])
+
+        expired_count = self.task_service.expire_overdue_pending_tasks(now=now)
+
+        self.assertEqual(expired_count, 1)
+        self.assertEqual(self.task_service.get_task("TASK-OVERDUE").task_status, TaskStatus.EXPIRED)
+        self.assertEqual(self.task_service.get_task("TASK-FUTURE").task_status, TaskStatus.PENDING)
+        history = self.task_service.list_status_history("TASK-OVERDUE")
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0].from_status, TaskStatus.PENDING)
+        self.assertEqual(history[0].to_status, TaskStatus.EXPIRED)
+        self.assertEqual(history[0].reason, "required_by_deadline_passed")
+
+    def test_overdue_manual_intervention_tasks_stay_in_review_expiry_flow(self) -> None:
+        now = datetime(2026, 7, 21, 22, 54)
+        self.task_service.create_tasks([
+            _runtime_task("TASK-REVIEW", required_by=now - timedelta(minutes=1)),
+        ])
+
+        self.assertEqual(self.task_service.expire_overdue_pending_tasks(now=now), 0)
+        self.assertEqual(self.task_service.get_task("TASK-REVIEW").task_status, TaskStatus.PENDING)
 
     def test_mock_notification_sender_returns_structured_result(self) -> None:
         sender = MockNotificationSender()

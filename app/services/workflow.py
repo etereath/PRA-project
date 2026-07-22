@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
+from uuid import uuid4
 
 from app.enums import ReviewTaskStatus, TaskActionType, TaskStatus
 from app.exceptions import MobileReviewErrorCode, MobileReviewTransactionError, ValidationError
+from app.listing_identity import listing_identity_key
+from app.listing_status_policy import is_price_task_listing
 from app.models import (
     ColdStorageStatus,
     ExecutionLog,
@@ -20,14 +24,17 @@ from app.models import (
     Task,
     TaskStatusHistory,
 )
+from app.platform_identity import canonical_platform_name, platform_identity_key, platform_names_match
 from app.repositories.workbook_repository import (
     export_execution_logs,
     export_tasks,
     load_capacity_plan,
     load_cold_storage_status,
     load_harvest_forecasts,
+    load_listing_rule,
     load_listing_rules,
     load_price_forecasts,
+    load_price_rule,
     load_price_rules,
     load_products,
     load_tasks,
@@ -64,6 +71,8 @@ class WorkflowInputs:
     trade_date: date | None = None
     now: datetime | None = None
     inventory_strategy: str = "conservative_v1"
+    runtime_db_path: Path | None = None
+    platform_names: tuple[str, ...] = ()
 
 
 @dataclass(slots=True)
@@ -213,18 +222,28 @@ def generate_runtime_tasks_from_sources(inputs: WorkflowInputs, *, db_path: Path
         trade_date=inputs.trade_date,
         now=inputs.now,
         inventory_strategy=inputs.inventory_strategy,
+        runtime_db_path=inputs.runtime_db_path or db_path,
     )
     summary = generate_tasks_from_sources(preview_inputs)
+    return persist_task_generation_summary(summary, db_path=db_path, trade_date=inputs.trade_date)
+
+
+def persist_task_generation_summary(
+    summary: TaskGenerationSummary,
+    *,
+    db_path: Path = DEFAULT_RUNTIME_DB,
+    trade_date: date | None = None,
+) -> RuntimeTaskGenerationSummary:
     repository = SQLiteRuntimeRepository(db_path)
     runtime_task_service = RuntimeTaskService(repository)
     runtime_task_service.init_schema()
     inserted_task_rows = runtime_task_service.create_tasks_returning_inserted(
         summary.tasks,
-        trade_date=inputs.trade_date,
+        trade_date=trade_date,
     )
     review_summary = ReviewTaskService(repository, runtime_task_service=runtime_task_service).create_from_tasks(
         inserted_task_rows,
-        trade_date=inputs.trade_date,
+        trade_date=trade_date,
     )
     return RuntimeTaskGenerationSummary(
         validation=summary.validation,
@@ -247,8 +266,10 @@ def list_runtime_tasks(
     scope_key: str | None = None,
 ) -> list[Task]:
     repository = SQLiteRuntimeRepository(db_path)
-    RuntimeTaskService(repository).init_schema()
-    return RuntimeTaskService(repository).list_tasks(
+    service = RuntimeTaskService(repository)
+    service.init_schema()
+    service.expire_overdue_pending_tasks()
+    return service.list_tasks(
         trade_date=trade_date,
         status=status,
         action_type=action_type,
@@ -471,11 +492,13 @@ def generate_tasks_from_sources(inputs: WorkflowInputs) -> TaskGenerationSummary
     pricing_service = PricingService(ai_provider=ai_provider)
     listing_service = ListingService()
     generator = TaskGenerationService(pricing_service=pricing_service, listing_service=listing_service)
+    resolved_platform_name = _resolve_runtime_platform_name(inputs.runtime_db_path, inputs.platform_name)
+    old_prices = _load_current_platform_prices(inputs.runtime_db_path, resolved_platform_name)
     tasks = generator.generate(
         products=products,
         price_rules=price_rules,
         listing_rules=listing_rules,
-        platform_name=inputs.platform_name,
+        platform_name=resolved_platform_name,
         harvest_forecasts=harvest_forecasts,
         price_forecasts=price_forecasts,
         capacity_plan=capacity_plan,
@@ -483,6 +506,7 @@ def generate_tasks_from_sources(inputs: WorkflowInputs) -> TaskGenerationSummary
         trade_date=inputs.trade_date,
         now=inputs.now,
         inventory_strategy=inputs.inventory_strategy,
+        old_prices=old_prices,
     )
 
     output_written = inputs.output_path is not None
@@ -505,6 +529,207 @@ def generate_tasks_from_sources(inputs: WorkflowInputs) -> TaskGenerationSummary
     )
 
 
+def generate_tasks_from_selected_rule(
+    inputs: WorkflowInputs,
+    *,
+    rule_type: str,
+    rule_id: str,
+    task_group_id: str | None = None,
+    required_by: datetime | None = None,
+) -> TaskGenerationSummary:
+    normalized_type = str(rule_type or "").strip().lower()
+    selected_id = str(rule_id or "").strip()
+    if normalized_type not in {"price", "listing"}:
+        raise ValidationError("单规则生成的规则类型只能是 price 或 listing")
+    if not selected_id:
+        raise ValidationError("请选择要生成任务的规则")
+
+    products = load_products(inputs.products_path)
+    price_rules = [load_price_rule(inputs.price_rules_path, selected_id)] if normalized_type == "price" else []
+    listing_rules = [load_listing_rule(inputs.listing_rules_path, selected_id)] if normalized_type == "listing" else []
+    selected_rule = price_rules[0] if price_rules else listing_rules[0]
+    platform_names = _resolve_selected_rule_platforms(
+        selected_rule.platform_filter,
+        inputs,
+        require_online_price=normalized_type == "price",
+    )
+    resolved_group_id = str(task_group_id or "").strip() or f"RULE-GROUP-{uuid4().hex[:12]}"
+    resolved_required_by = required_by or datetime.now(timezone.utc) + timedelta(minutes=30)
+    ai_provider = MockAISuggestionProvider() if inputs.use_mock_ai else NullAISuggestionProvider()
+    generator = TaskGenerationService(
+        pricing_service=PricingService(ai_provider=ai_provider),
+        listing_service=ListingService(),
+    )
+    tasks: list[Task] = []
+    for platform_name in platform_names:
+        old_prices = _load_current_platform_prices(inputs.runtime_db_path, platform_name)
+        generated = generator.generate(
+            products=products,
+            price_rules=price_rules,
+            listing_rules=listing_rules,
+            platform_name=platform_name,
+            old_prices=old_prices,
+        )
+        if normalized_type == "price":
+            selected_tasks = [
+                task
+                for task in generated
+                if task.action_type == TaskActionType.UPDATE_PRICE
+                and selected_id in task.decision_trace.get("matched_rule_ids", [])
+            ]
+        else:
+            marker = f"matched:{selected_id}:"
+            selected_tasks = [
+                task
+                for task in generated
+                if any(marker in str(step) for step in task.decision_trace.get("listing_trace", []))
+            ]
+        for task in selected_tasks:
+            task.decision_trace = dict(task.decision_trace) | {
+                "generation_mode": "single_rule",
+                "selected_rule_type": normalized_type,
+                "selected_rule_id": selected_id,
+                "selected_rule_platform_filter": selected_rule.platform_filter,
+                "resolved_platform_name": platform_name,
+                "task_group_id": resolved_group_id,
+            }
+            task.required_by = resolved_required_by
+        tasks.extend(selected_tasks)
+
+    output_written = inputs.output_path is not None
+    if output_written:
+        export_tasks(inputs.output_path, tasks)
+    return TaskGenerationSummary(
+        validation=ValidationSummary(
+            products=products,
+            price_rules_count=len(price_rules),
+            listing_rules_count=len(listing_rules),
+        ),
+        tasks=tasks,
+        output_path=inputs.output_path,
+        output_written=output_written,
+    )
+
+
+def preview_tasks_from_selected_rule(
+    inputs: WorkflowInputs,
+    *,
+    rule_type: str,
+    rule_id: str,
+    task_group_id: str | None = None,
+    required_by: datetime | None = None,
+) -> TaskGenerationSummary:
+    preview_inputs = WorkflowInputs(
+        products_path=inputs.products_path,
+        price_rules_path=inputs.price_rules_path,
+        listing_rules_path=inputs.listing_rules_path,
+        output_path=None,
+        platform_name=inputs.platform_name,
+        use_mock_ai=inputs.use_mock_ai,
+        inventory_strategy=inputs.inventory_strategy,
+        runtime_db_path=inputs.runtime_db_path,
+        platform_names=inputs.platform_names,
+    )
+    return generate_tasks_from_selected_rule(
+        preview_inputs,
+        rule_type=rule_type,
+        rule_id=rule_id,
+        task_group_id=task_group_id,
+        required_by=required_by,
+    )
+
+
+def _resolve_selected_rule_platforms(
+    platform_filter: str,
+    inputs: WorkflowInputs,
+    *,
+    require_online_price: bool,
+) -> list[str]:
+    rule_platform = str(platform_filter or "").strip()
+    if rule_platform and rule_platform != "*":
+        if inputs.runtime_db_path is not None:
+            repository = SQLiteRuntimeRepository(inputs.runtime_db_path)
+            repository.init_schema()
+            matching_online_platforms = list(dict.fromkeys(
+                status.platform_name
+                for status in repository.list_listing_statuses()
+                if is_price_task_listing(status)
+                and platform_names_match(rule_platform, status.platform_name)
+            ))
+            if matching_online_platforms:
+                canonical_name = canonical_platform_name(rule_platform)
+                if canonical_name in matching_online_platforms:
+                    return [canonical_name]
+                return [matching_online_platforms[0]]
+        return [canonical_platform_name(rule_platform)]
+    candidates = list(dict.fromkeys(
+        platform
+        for platform in (*inputs.platform_names, inputs.platform_name)
+        if platform and platform != "default_platform"
+    ))
+    if require_online_price and inputs.runtime_db_path is not None:
+        repository = SQLiteRuntimeRepository(inputs.runtime_db_path)
+        repository.init_schema()
+        listing_statuses = repository.list_listing_statuses()
+        online_platforms = list(dict.fromkeys(
+            status.platform_name
+            for status in listing_statuses
+            if is_price_task_listing(status)
+        ))
+        if not online_platforms and listing_statuses:
+            online_platforms = list(dict.fromkeys(status.platform_name for status in listing_statuses))
+        resolved_candidates: list[str] = []
+        resolved_keys: set[str] = set()
+        for candidate in candidates:
+            matching_platform = next(
+                (platform for platform in online_platforms if platform_names_match(candidate, platform)),
+                None,
+            )
+            if matching_platform is None:
+                continue
+            identity = platform_identity_key(matching_platform)
+            if identity not in resolved_keys:
+                resolved_keys.add(identity)
+                resolved_candidates.append(matching_platform)
+        candidates = resolved_candidates
+    if not candidates:
+        if require_online_price:
+            raise ValidationError("全平台价格规则未找到带在线价格快照的平台，请先运行 ShadowBot READ_ONLY")
+        raise ValidationError("全平台规则未找到有效平台配置")
+    return candidates
+
+
+def _load_current_platform_prices(
+    runtime_db_path: Path | None,
+    platform_name: str,
+) -> dict[tuple[str, str, str], Decimal] | None:
+    if runtime_db_path is None:
+        return None
+    repository = SQLiteRuntimeRepository(runtime_db_path)
+    repository.init_schema()
+    return {
+        listing_identity_key(platform_name, status.variety, status.grade): status.current_price
+        for status in repository.list_listing_statuses()
+        if is_price_task_listing(status) and platform_names_match(platform_name, status.platform_name)
+    }
+
+
+def _resolve_runtime_platform_name(runtime_db_path: Path | None, platform_name: str) -> str:
+    canonical_name = canonical_platform_name(platform_name)
+    if runtime_db_path is None:
+        return canonical_name
+    repository = SQLiteRuntimeRepository(runtime_db_path)
+    repository.init_schema()
+    matching_platforms = list(dict.fromkeys(
+        status.platform_name
+        for status in repository.list_listing_statuses()
+        if platform_names_match(platform_name, status.platform_name)
+    ))
+    if canonical_name in matching_platforms:
+        return canonical_name
+    return matching_platforms[0] if matching_platforms else canonical_name
+
+
 def preview_tasks_from_sources(inputs: WorkflowInputs) -> TaskGenerationSummary:
     preview_inputs = WorkflowInputs(
         products_path=inputs.products_path,
@@ -520,6 +745,7 @@ def preview_tasks_from_sources(inputs: WorkflowInputs) -> TaskGenerationSummary:
         trade_date=inputs.trade_date,
         now=inputs.now,
         inventory_strategy=inputs.inventory_strategy,
+        runtime_db_path=inputs.runtime_db_path,
     )
     return generate_tasks_from_sources(preview_inputs)
 

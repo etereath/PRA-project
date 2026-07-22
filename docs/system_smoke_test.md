@@ -33,8 +33,8 @@ python scripts/run_system_smoke_tests.py --temporary-db
 
 ```text
 [OK] runtime DB 初始化成功
-[OK] schema version exact v7
-[OK] v6 Outbox/RetryAuthorization 结构完整
+[OK] schema version exact v11
+[OK] v11 任务原价/平台身份/库存观测/Outbox/COMMIT 批次结构完整
 [FAILED] review token 创建、校验、使用后失效
   原因：REVIEW_TOKEN_SECRET is required
   建议检查模块：ReviewTokenService
@@ -76,9 +76,9 @@ data/runtime/pra_runtime.sqlite3
 脚本至少覆盖以下主控流程：
 
 - runtime DB 初始化成功。
-- schema version 必须精确为 v6，迁移记录连续包含 `1..6`。
-- 关键表存在：`tasks`、`review_tasks`、`notification_logs`、`execution_logs`、`task_status_history`、`review_tokens`、`script_runs`、`script_run_items`、`shadowbot_operations`、`shadowbot_execution_attempts`、`shadowbot_side_effect_checkpoints`、`retry_authorizations`。
-- v6 Outbox 与 RetryAuthorization 表的列、外键、状态约束、唯一约束、lease/claim 索引完整。
+- schema version 必须精确为 `app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION`，当前为 v11，迁移记录连续包含 `1..11`。
+- 关键表存在：`tasks`、复核/通知/历史表、自动规则表、ShadowBot operation/attempt/side-effect 表、Outbox 表、`listing_status`、`shadowbot_commit_batches` 和 `shadowbot_commit_batch_items`。
+- v11 health check 要求 Outbox、RetryAuthorization、平台身份/库存观测、任务旧价和 COMMIT 批次账本的列、外键、状态约束、唯一约束及关键索引完整。
 - 创建 runtime task。
 - `dedupe_key` 去重有效。
 - 创建 `pending review_task`。
@@ -97,8 +97,8 @@ data/runtime/pra_runtime.sqlite3
 按脚本输出的“建议检查模块”优先定位：
 
 - `SQLiteRuntimeRepository / RuntimeTaskService.init_schema`：检查运行态 schema 初始化、测试 DB 路径和表结构。
-- `runtime_schema_migrations`：检查 schema version 是否精确为 `6` 且迁移记录连续。
-- `runtime schema health check`：检查 v6 必需表、列、约束和索引，避免“伪 v6”数据库通过检查。
+- `runtime_schema_migrations`：检查 schema version 是否精确为 `app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION` 且迁移记录连续。
+- `runtime schema health check`：检查当前 v11 必需表、列、约束和索引，避免“伪升级”数据库通过检查。
 - `RuntimeTaskService.create_tasks`：检查 task 模型、状态枚举、`dedupe_key` 和 partial unique index。
 - `ReviewTaskService.create_from_tasks`：检查人工复核任务生成、`MANUAL_INTERVENTION_ACTIONS` 和复核 dedupe。
 - `OutboxReviewNotificationService / FakeSender`：检查 `DEFAULT_NOTIFICATION_CHANNEL=mock`、Outbox 入队和兼容日志投影。

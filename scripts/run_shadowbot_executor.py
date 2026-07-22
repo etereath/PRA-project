@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from datetime import UTC, datetime
@@ -166,9 +167,13 @@ def start_from_args(args: argparse.Namespace):
 
 
 def record_result_from_file(runtime_db: Path, result_json: Path) -> None:
-    data = json.loads(result_json.read_text(encoding="utf-8"))
+    result_bytes = result_json.read_bytes()
+    data = json.loads(result_bytes.decode("utf-8-sig"))
     if not isinstance(data, dict):
         raise ValidationError("ShadowBot result JSON must be an object.")
+    result_file_sha256 = hashlib.sha256(result_bytes).hexdigest()
+    data.setdefault("result_id", f"RESULT-{result_file_sha256[:24]}")
+    data["result_file_sha256"] = result_file_sha256
     record_result_from_data(runtime_db, data)
 
 

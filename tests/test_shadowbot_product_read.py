@@ -54,9 +54,20 @@ class ProductReadContractTests(unittest.TestCase):
         self.assertFalse(result["capture_evidence"])
         self.assertTrue(normalize_multi_product_request(_request([_product()], capture_evidence=True))["capture_evidence"])
 
+    def test_read_only_allows_no_product_targets_when_platform_is_explicit(self):
+        normalized = normalize_multi_product_request(
+            _request([], platform_name="ant_flower_wechat")
+        )
+
+        self.assertEqual(normalized["execution_mode"], "READ_ONLY")
+        self.assertEqual(normalized["platform_name"], "ant_flower_wechat")
+        self.assertEqual(normalized["products"], [])
+
     def test_request_rejects_non_read_only_and_duplicate_identity(self):
         with self.assertRaisesRegex(ProductReadContractError, "READ_ONLY_REQUIRED"):
             normalize_multi_product_request(_request([_product()], execution_mode="COMMIT"))
+        with self.assertRaisesRegex(ProductReadContractError, "READ_ONLY_REQUIRED"):
+            normalize_multi_product_request(_request([_product()], execution_mode="PRE_COMMIT"))
         with self.assertRaisesRegex(ProductReadContractError, "DUPLICATE_TARGET_IDENTITY"):
             normalize_multi_product_request(_request([_product(), _product("ITEM-002")]))
 

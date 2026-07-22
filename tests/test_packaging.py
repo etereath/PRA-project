@@ -98,6 +98,7 @@ class PackagingTests(unittest.TestCase):
             "shadowbot_worker_config.example.json",
         ):
             self.assertTrue((shadowbot_dir / name).is_file(), name)
+        self.assertTrue((ROOT / "app" / "shadowbot_contract_primitives.py").is_file())
         gitignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
         self.assertIn("shadowbot/test2/shadowbot_worker_config.json", gitignore)
         self.assertIn("*.egg-info/", gitignore)
@@ -182,8 +183,8 @@ class PackagingTests(unittest.TestCase):
             (app_dir / "package.py").write_text("def selector(name): return name\n", encoding="utf-8")
             (app_dir / "selectorsV2.xml").write_text("<selectors />\n", encoding="utf-8")
             records = sync(app_dir, check_only=False)
-            self.assertEqual([record["status"] for record in records[:4]], ["SYNCED"] * 4)
-            self.assertEqual(records[4]["status"], "CREATED")
+            self.assertEqual([record["status"] for record in records[:5]], ["SYNCED"] * 5)
+            self.assertEqual(records[5]["status"], "CREATED")
             self.assertEqual(verify_shadowbot_deployment(app_dir), [])
 
             (app_dir / "package.py").unlink()

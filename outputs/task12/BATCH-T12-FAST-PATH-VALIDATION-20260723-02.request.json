@@ -1,0 +1,60 @@
+{
+  "applet_uri": "weixin://launchapplet/?app_id=wxdc8ef8e770254c0e",
+  "batch_id": "BATCH-T12-FAST-PATH-VALIDATION-20260723-02",
+  "capture_evidence": false,
+  "contract_version": 4,
+  "created_at": "2026-07-22T16:02:04.447107+00:00",
+  "execution_attempt_id": "ATTEMPT-a023675861d24d34",
+  "execution_mode": "COMMIT",
+  "execution_profile": "production",
+  "expires_at": "2026-07-22T16:32:04.447107+00:00",
+  "instruction_hash": "sha256:2439ebe02fe4da7ea3c0355b17d15cc97739c1a6bd28fb06ff613e1998c9ceb0",
+  "items": [
+    {
+      "expected_grade": "D",
+      "expected_old_price": "16.80",
+      "expected_product_name": "艾莎",
+      "internal_sku": "AISHA-D-50-Z",
+      "item_id": "ITEM-9fc5787a63bf",
+      "item_payload_sha256": "sha256:3fb2285393b33e90e7401ee8fc5df0dacb6a1c8dc0d1872af95d753bd1c8e42e",
+      "source_task_id": "9fc5787a63bf",
+      "target_price": "16.90"
+    },
+    {
+      "expected_grade": "E",
+      "expected_old_price": "12.30",
+      "expected_product_name": "卡布奇诺",
+      "internal_sku": "CAPPUCCINO-E-45-Z",
+      "item_id": "ITEM-0abb42a22704",
+      "item_payload_sha256": "sha256:8be6f6a49c9df512c705a07020184cd33febee19162edae3469004d9c2757382",
+      "source_task_id": "0abb42a22704",
+      "target_price": "12.40"
+    },
+    {
+      "expected_grade": "C",
+      "expected_old_price": "13.10",
+      "expected_product_name": "艾莎",
+      "internal_sku": "AISHA-C-55-Z",
+      "item_id": "ITEM-f3133cb403ec",
+      "item_payload_sha256": "sha256:d7b9bdaa8be58f7f5c67124fbdcbc3f8ea47c56a20448141cc55cd5239d4b971",
+      "source_task_id": "f3133cb403ec",
+      "target_price": "13.20"
+    },
+    {
+      "expected_grade": "B",
+      "expected_old_price": "26.70",
+      "expected_product_name": "艾莎",
+      "internal_sku": "AISHA-B-60-Z",
+      "item_id": "ITEM-58ac55ab95eb",
+      "item_payload_sha256": "sha256:04da6a8c108abaaefed8bff234037517a29d60f8dabc7f11b91ca35473bd365e",
+      "source_task_id": "58ac55ab95eb",
+      "target_price": "26.80"
+    }
+  ],
+  "manifest_sha256": "sha256:75832a3451acab2a63d18447c266c8e7a2ad24a47cf0fd228b3aa5964ce2b5c6",
+  "operation_id": "OP-a023675861d24d34",
+  "platform_name": "蚂蚁花团供应商",
+  "schema_version": "shadowbot-commit-batch-request-1.1",
+  "task_id": "BATCHTASK-a023675861d24d34",
+  "window_title": "蚂蚁花团供应商"
+}

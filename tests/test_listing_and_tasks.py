@@ -119,7 +119,11 @@ class ListingAndTaskTests(unittest.TestCase):
             active=True,
             priority=0,
         )
-        action, trace = service.evaluate(self.products[0], [platform_rule, *self.listing_rules], "蚂蚁")
+        action, trace = service.evaluate(
+            self.products[0],
+            [platform_rule, *self.listing_rules],
+            "蚂蚁花团供应商",
+        )
         self.assertEqual(action, ListingAction.SET_ONLINE.value)
         self.assertTrue(any("L3" in item for item in trace))
 

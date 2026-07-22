@@ -5,7 +5,8 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta
 from uuid import uuid4
 
-from app.enums import PricingSource, TaskActionType, TaskStatus, TradePhase
+from app.enums import TaskActionType, TaskStatus, TradePhase
+from app.listing_identity import listing_identity_key
 from app.models import (
     ColdStorageStatus,
     FinalPricingDecision,
@@ -59,6 +60,7 @@ class TaskGenerationService:
         trade_date: date | None = None,
         now: datetime | None = None,
         inventory_strategy: str = "conservative_v1",
+        old_prices: dict[tuple[str, str, str], Decimal] | None = None,
     ) -> list[Task]:
         if harvest_forecasts or price_forecasts or capacity_plan or cold_storage_status or trade_date:
             return self._generate_predictive_tasks(
@@ -77,14 +79,24 @@ class TaskGenerationService:
         dedupe: set[tuple[str, str, str]] = set()
 
         for product in products:
-            pricing_decision = self.pricing_service.calculate(product, platform_name, price_rules)
             listing_action, listing_trace = self.listing_service.evaluate(product, listing_rules, platform_name)
 
             if product.sale_enabled and product.current_stock > 0:
-                update_key = (product.internal_sku, TaskActionType.UPDATE_PRICE.value, platform_name)
-                if update_key not in dedupe:
-                    dedupe.add(update_key)
-                    tasks.append(self._price_task(pricing_decision))
+                identity = listing_identity_key(platform_name, product.product_name, product.grade)
+                participates_in_price_generation = old_prices is None or identity in old_prices
+                if participates_in_price_generation:
+                    old_price = old_prices.get(identity) if old_prices is not None else None
+                    pricing_decision = self.pricing_service.calculate(
+                        product,
+                        platform_name,
+                        price_rules,
+                        old_price=old_price,
+                        require_old_price=old_prices is not None,
+                    )
+                    update_key = (product.internal_sku, TaskActionType.UPDATE_PRICE.value, platform_name)
+                    if update_key not in dedupe:
+                        dedupe.add(update_key)
+                        tasks.append(self._price_task(pricing_decision))
 
             if listing_action:
                 action_type = TaskActionType(listing_action)
@@ -288,6 +300,7 @@ class TaskGenerationService:
             priority=10,
             task_status=TaskStatus.PENDING,
             created_at=utc_now(),
+            expected_old_price=pricing_decision.expected_old_price,
             target_price=pricing_decision.final_price,
             pricing_source=pricing_decision.pricing_source,
             decision_trace=pricing_decision.decision_trace,

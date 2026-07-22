@@ -39,23 +39,12 @@ class ReleaseBackupTests(unittest.TestCase):
         connection = sqlite3.connect(str(path))
         try:
             connection.execute("PRAGMA foreign_keys = OFF")
-            connection.execute("DROP TABLE shadowbot_batch_items")
-            connection.execute("DROP TABLE shadowbot_batches")
-            connection.execute("DROP INDEX ux_shadowbot_operations_active_write_identity")
-            connection.execute("DROP INDEX ux_shadowbot_operations_active_page_identity")
-            connection.execute("DROP INDEX ix_shadowbot_operations_write_identity_status")
-            connection.execute("DROP INDEX ix_shadowbot_operations_page_identity_status")
-            connection.execute(
-                "ALTER TABLE shadowbot_operations DROP COLUMN write_identity_key"
-            )
-            connection.execute(
-                "ALTER TABLE shadowbot_operations DROP COLUMN page_identity_key"
-            )
             connection.execute("DROP TABLE notification_delivery_attempts")
             connection.execute("DROP TABLE notification_outbox")
             connection.execute(
-                "DELETE FROM runtime_schema_migrations WHERE schema_version IN (6, 7)"
+                "DELETE FROM runtime_schema_migrations WHERE schema_version >= 6"
             )
+            connection.execute("DROP TABLE listing_status")
             connection.commit()
             connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
             connection.execute("PRAGMA journal_mode = DELETE")
@@ -76,7 +65,7 @@ class ReleaseBackupTests(unittest.TestCase):
                 git_commit="eecd284c51e50f106a75c5504bab7f43afa9d632",
             )
             self.assertEqual(manifest["git_commit"], "eecd284c51e50f106a75c5504bab7f43afa9d632")
-            self.assertEqual(manifest["runtime_schema_version"], 7)
+            self.assertEqual(manifest["runtime_schema_version"], 11)
             self.assertIn("CUSTOM_SETTING", manifest["configuration_item_names"])
             self.assertIn("YINGDAO_ACCESS_KEY_SECRET", manifest["configuration_item_names"])
             self.assertFalse(manifest["secret_values_included"])
@@ -157,7 +146,7 @@ class ReleaseBackupTests(unittest.TestCase):
             migrated_db = root / "migrated" / "pra_runtime.sqlite3"
             result = migrate_runtime_database(source_db=legacy_db, output_db=migrated_db)
             self.assertEqual(result["source_schema_version"], 5)
-            self.assertEqual(result["target_schema_version"], 7)
+            self.assertEqual(result["target_schema_version"], 11)
             self.assertTrue(_database_snapshot(migrated_db)["ok"])
             self.assertEqual(_database_snapshot(legacy_db)["schema_health"]["actual_version"], 5)
 
