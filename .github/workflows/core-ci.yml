@@ -43,6 +43,7 @@ jobs:
         run: >-
           python -m pip install --disable-pip-version-check
           "setuptools>=68" wheel build pytest "openpyxl>=3.1.5,<4"
+          "tzdata>=2025.2"
 
       - name: Run complete Windows pytest gate
         run: python -m pytest -q tests
