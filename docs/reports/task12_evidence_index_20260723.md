@@ -52,7 +52,35 @@ D:\PRA_Runtime\shadowbot_queue\archive\<execution_attempt_id>
 
 两个样本读取范围不同。16.228 秒可以作为旧目标字段路径的历史性能基线，不能直接覆盖当前完整页面快照的验收口径。
 
-## 5. 审查核对项
+## 5. 审查修复版实机证据
+
+| 批次 | Run ID | 结果 | 用途 | 结果文件 SHA-256 |
+| --- | --- | --- | --- | --- |
+| `BATCH-T12-REMEDIATION-COMMIT-20260723-01` | `ATTEMPT-52c584afca044d79` | 4/4 `VERIFIED` | v12 原子导入、技术回执、ACK、逐项独立回读和写锁释放 | `4a7d2df8bbc9c98553844b538f648d41ff56fe79ce922ea7b47cb2f60969b826` |
+| `BATCH-T12-CONTROLLED-UNKNOWN-20260723-02` | `ATTEMPT-0f30900b398045cc` | 1/1 `UNKNOWN` | 提交点击后受控制造不可判定结果；没有追加恢复 COMMIT | `3c28f255fd0b675337d1e20f130b4602b1f292a5adbae2c933a5ac2ad666b84a` |
+| 同上 | `RECONCILE-046a063ae885fcb4f352` | `VERIFIED`，实际价格 10.30 | 确定性唯一 RECONCILE、任务恢复和 UNKNOWN 写锁释放 | `50316f907638e7fa96b0a0d30852ca2b991991c8fe5b6fc099f4a12a79eb0890` |
+
+正常批次计数恒等式：
+
+```text
+total=4
+= attempted(4) + not_attempted(0)
+= verified(4) + failed(0) + unknown(0) + not_applied(0) + not_attempted(0)
+```
+
+正常批次按页面顺序执行卡布奇诺 E级、艾莎 C级、艾莎 D级和艾莎 B级，
+分别独立回读为 12.60、7.90、9.10 和 10.10。受控 UNKNOWN 的艾莎 B级从
+10.20 提交到 10.30，COMMIT 保持 UNKNOWN，唯一 RECONCILE 回读 10.30 后将
+operation 归并为 `VERIFIED` 并释放写锁。
+
+RECONCILE 截图：
+
+```text
+C:\Users\etere\AppData\Local\ShadowBot\evidence\vertical_slice\RECONCILE-046a063ae885fcb4f352_reconcile.png
+SHA-256: 2329e5c823c4459d613d7dfd4f42ca5df5a39b9555357cdacff9b6f65d9cb141
+```
+
+## 6. 审查核对项
 
 1. 重新计算 `.result.json` SHA-256，与本索引一致。
 2. 校验同目录 request/result/phase 的 batch、attempt、instruction 和 manifest 绑定。
@@ -61,3 +89,5 @@ D:\PRA_Runtime\shadowbot_queue\archive\<execution_attempt_id>
 5. 检查失败样本在提交前为 `NOT_STARTED`，剩余项没有被执行。
 6. 对照 SQLite 任务、批次、逐商品和 `listing_status` 回读。
 7. 确认归档中的敏感配置、本机路径和临时日志不会未经审查进入 GitHub。
+8. 确认受控 UNKNOWN 只有一个 COMMIT Run ID 和一个确定性 RECONCILE ID，
+   历史 UNKNOWN 事实未被覆盖，最终 operation/任务/写锁/平台状态投影一致。

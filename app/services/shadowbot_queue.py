@@ -208,6 +208,7 @@ class ShadowBotResultImporter:
                 )
             if imported_result_id != contract.result_id or imported_result_sha256 != result_file_sha256:
                 raise ValidationError("RESULT_CONTRACT_INVALID: conflicting result evidence for completed attempt.")
+            self.executor.reproject_terminal_result(contract)
         inventory_events = self._import_v2_inventory_observations(request_data, data)
         archive_dir = self._archive_attempt(contract.execution_attempt_id, request_path, result_path)
         return {
@@ -269,13 +270,105 @@ class ShadowBotResultImporter:
             batch_row is not None
             and str(batch_row["result_id"] or "") == str(data["result_id"])
         )
-        listing_status_events = self._import_v4_page_snapshot(request_data, data)
-        counts = import_task_commit_result(self.repository, data)
+        listing_observations = self._normalize_v4_page_snapshot(request_data, data)
+        counts = import_task_commit_result(
+            self.repository,
+            data,
+            listing_observations=listing_observations,
+            result_file_sha256=result_file_sha256,
+            source_result_path=str(result_path),
+        )
+        reconcile_events: list[dict[str, Any]] = []
+        for item in data.get("items") or []:
+            if str(item.get("status") or "").upper() != "UNKNOWN":
+                continue
+            try:
+                reconcile = self.executor.ensure_reconcile_attempt(
+                    operation_id=str(item.get("operation_id") or ""),
+                    source_execution_attempt_id=str(
+                        item.get("item_execution_attempt_id") or ""
+                    ),
+                    runner_payload={
+                        key: request_data[key]
+                        for key in ("applet_uri", "window_title")
+                        if request_data.get(key)
+                    },
+                )
+                reconcile_events.append(
+                    {
+                        "operation_id": str(item.get("operation_id") or ""),
+                        "execution_attempt_id": (
+                            reconcile.execution_attempt_id
+                            if reconcile is not None
+                            else ""
+                        ),
+                        "status": (
+                            reconcile.status if reconcile is not None else "NOT_REQUIRED"
+                        ),
+                    }
+                )
+            except (ValidationError, OSError) as exc:
+                reconcile_events.append(
+                    {
+                        "operation_id": str(item.get("operation_id") or ""),
+                        "execution_attempt_id": "",
+                        "status": "RETRY_PENDING",
+                        "error_message": str(exc),
+                    }
+                )
+        archive_dir = self.paths.archive / execution_attempt_id
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        ack_path = archive_dir / f"{execution_attempt_id}.import.ack.json"
+        try:
+            _atomic_write(
+                ack_path,
+                _json_bytes(
+                    {
+                        "schema_version": "shadowbot-commit-import-ack-1.0",
+                        "result_id": data["result_id"],
+                        "batch_id": data["batch_id"],
+                        "execution_attempt_id": execution_attempt_id,
+                        "result_file_sha256": result_file_sha256,
+                        "accepted_at": datetime.now(UTC).isoformat(),
+                    }
+                ),
+            )
+        except OSError as exc:
+            with self.repository.connect_write() as connection, connection:
+                connection.execute(
+                    """
+                    UPDATE shadowbot_commit_result_receipts
+                    SET ack_state = 'FAILED', ack_updated_at = ?,
+                        last_projection_error = ?
+                    WHERE result_id = ?
+                    """,
+                    (datetime.now(UTC).isoformat(), str(exc), data["result_id"]),
+                )
+            return {
+                "status": "IMPORTED_ACK_PENDING",
+                "contract_version": COMMIT_BATCH_CONTRACT_VERSION,
+                "batch_id": str(data.get("batch_id") or ""),
+                "execution_attempt_id": execution_attempt_id,
+                "archive_dir": str(archive_dir),
+                "counts": counts,
+                "listing_status_events": listing_observations,
+                "reconcile_events": reconcile_events,
+            }
         archive_dir = self._archive_attempt(
             execution_attempt_id,
             request_path,
             result_path,
         )
+        with self.repository.connect_write() as connection, connection:
+            connection.execute(
+                """
+                UPDATE shadowbot_commit_result_receipts
+                SET ack_state = 'WRITTEN', ack_updated_at = ?,
+                    last_projection_error = ''
+                WHERE result_id = ?
+                """,
+                (datetime.now(UTC).isoformat(), data["result_id"]),
+            )
         return {
             "status": "ALREADY_IMPORTED" if already_imported else "IMPORTED",
             "contract_version": COMMIT_BATCH_CONTRACT_VERSION,
@@ -283,7 +376,8 @@ class ShadowBotResultImporter:
             "execution_attempt_id": execution_attempt_id,
             "archive_dir": str(archive_dir),
             "counts": counts,
-            "listing_status_events": listing_status_events,
+            "listing_status_events": listing_observations,
+            "reconcile_events": reconcile_events,
         }
 
     def _find_v4_request(self, execution_attempt_id: str) -> Path:
@@ -298,12 +392,12 @@ class ShadowBotResultImporter:
                 return candidate
         raise ValidationError("RESULT_CONTRACT_INVALID: v4 source request file is missing.")
 
-    def _import_v4_page_snapshot(
+    def _normalize_v4_page_snapshot(
         self,
         request: dict[str, Any],
         result: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        """Persist every product observed on the active listing page."""
+        """Validate and normalize every observed product without mutating the database."""
 
         snapshot = result.get("page_snapshot")
         if snapshot is None:
@@ -326,11 +420,6 @@ class ShadowBotResultImporter:
             raise ValidationError(
                 "RESULT_CONTRACT_INVALID: v4 page_snapshot total_count mismatch."
             )
-        observed_at = _parse_shadowbot_observed_at(
-            snapshot.get("finalized_at")
-            or result.get("ended_at")
-            or snapshot.get("captured_at")
-        )
         execution_attempt_id = str(result.get("execution_attempt_id") or "").strip()
         seen_positions: set[int] = set()
         seen_identities: set[tuple[str, str, str]] = set()
@@ -376,7 +465,7 @@ class ShadowBotResultImporter:
                     raise ValidationError(
                         "RESULT_CONTRACT_INVALID: unknown v4 price has no existing listing status."
                     )
-                observed_price = existing.current_price
+                observed_price = None
             else:
                 try:
                     observed_price = Decimal(str(raw_price))
@@ -405,38 +494,18 @@ class ShadowBotResultImporter:
                     "position": position,
                     "identity": identity,
                     "observed_price": observed_price,
+                    "preserve_existing_price": price_status
+                    == "UNKNOWN_AFTER_SUBMIT",
                     "inventory": inventory,
                     "online_status": online_status,
+                    "preserve_existing_online_status": listing_value == "UNKNOWN",
+                    "observed_at": _parse_shadowbot_observed_at(
+                        product.get("observed_at") or snapshot.get("captured_at")
+                    ),
+                    "execution_attempt_id": execution_attempt_id,
                 }
             )
-
-        events: list[dict[str, Any]] = []
-        for observation in observations:
-            identity = observation["identity"]
-            update_status = self.repository.apply_shadowbot_inventory_observation(
-                platform_name=identity[0],
-                variety=identity[1],
-                grade=identity[2],
-                observed_price=observation["observed_price"],
-                platform_stock_qty=observation["inventory"],
-                online_status=observation["online_status"],
-                observed_at=observed_at,
-                execution_attempt_id=execution_attempt_id,
-                source="shadowbot_commit_v4_page_snapshot",
-            )
-            events.append(
-                {
-                    "position": observation["position"],
-                    "platform_name": identity[0],
-                    "variety": identity[1],
-                    "grade": identity[2],
-                    "current_price": str(observation["observed_price"]),
-                    "platform_stock_qty": observation["inventory"],
-                    "online_status": observation["online_status"],
-                    "status": update_status,
-                }
-            )
-        return events
+        return observations
 
     def _import_v2_inventory_observations(
         self,
@@ -1050,6 +1119,11 @@ class ShadowBotQueueWatchdog:
                     "preflight_price",
                     "execution_ordinal",
                     "submit_attempted",
+                    "side_effect_state",
+                    "preflight_observed_at",
+                    "submit_intent_at",
+                    "submit_clicked_at",
+                    "readback_observed_at",
                     "actual_price",
                     "status",
                     "error_code",
@@ -1069,6 +1143,16 @@ class ShadowBotQueueWatchdog:
             if not current.get("execution_ordinal") and phase_data.get("execution_ordinal"):
                 current["execution_ordinal"] = int(phase_data["execution_ordinal"])
             child_snapshot = phase_data.get("result_snapshot")
+            item_phase = phase_data.get("item_phase")
+            if isinstance(item_phase, dict):
+                for name in (
+                    "side_effect_state",
+                    "submit_intent_at",
+                    "submit_clicked_at",
+                    "readback_observed_at",
+                ):
+                    if item_phase.get(name) not in (None, ""):
+                        current[name] = item_phase[name]
             child_verified = (
                 phase == "VERIFIED"
                 and isinstance(child_snapshot, dict)
@@ -1082,7 +1166,11 @@ class ShadowBotQueueWatchdog:
                 current.update(
                     {
                         "submit_attempted": True,
+                        "side_effect_state": "VERIFIED",
                         "actual_price": child_snapshot.get("actual_price"),
+                        "submit_intent_at": child_snapshot.get("submit_intent_at"),
+                        "submit_clicked_at": child_snapshot.get("submit_clicked_at"),
+                        "readback_observed_at": child_snapshot.get("readback_observed_at"),
                         "status": "VERIFIED",
                         "error_code": "",
                         "error_message": "",
@@ -1092,6 +1180,19 @@ class ShadowBotQueueWatchdog:
                 current.update(
                     {
                         "submit_attempted": True,
+                        "side_effect_state": "UNKNOWN",
+                        "submit_intent_at": current.get("submit_intent_at")
+                        or (
+                            phase_data.get("updated_at")
+                            if phase == "SUBMIT_INTENT_RECORDED"
+                            else None
+                        ),
+                        "submit_clicked_at": current.get("submit_clicked_at")
+                        or (
+                            phase_data.get("updated_at")
+                            if phase in {"SUBMIT_CLICKED", "VERIFIED"}
+                            else None
+                        ),
                         "status": "UNKNOWN",
                         "error_code": "SUBMIT_RESULT_UNKNOWN",
                         "error_message": f"stale ShadowBot v4 batch recovered at phase {phase}",
@@ -1124,7 +1225,7 @@ class ShadowBotQueueWatchdog:
         else:
             batch_status = "FAILED"
         result = {
-            "schema_version": "shadowbot-commit-batch-result-1.0",
+            "schema_version": "shadowbot-commit-batch-result-1.1",
             "contract_version": COMMIT_BATCH_CONTRACT_VERSION,
             "task_id": request.get("task_id", ""),
             "operation_id": request.get("operation_id", ""),
@@ -1155,7 +1256,6 @@ class ShadowBotQueueWatchdog:
             "ended_at": datetime.now(UTC).isoformat(),
         }
         if isinstance(page_snapshot, dict):
-            page_snapshot["finalized_at"] = result["ended_at"]
             result["page_snapshot"] = page_snapshot
         return self._write_result(result, str(request.get("execution_attempt_id") or ""))
 
@@ -1167,6 +1267,11 @@ class ShadowBotQueueWatchdog:
             "preflight_price": None,
             "execution_ordinal": None,
             "submit_attempted": False,
+            "side_effect_state": "NOT_STARTED",
+            "preflight_observed_at": None,
+            "submit_intent_at": None,
+            "submit_clicked_at": None,
+            "readback_observed_at": None,
             "actual_price": None,
             "status": "NOT_ATTEMPTED",
             "error_code": "",
@@ -1185,7 +1290,7 @@ class ShadowBotQueueWatchdog:
             "not_attempted": 0,
         }
         for item in items:
-            if item.get("submit_attempted"):
+            if item.get("submit_attempted") is True:
                 counts["attempted"] += 1
             status = str(item.get("status") or "NOT_ATTEMPTED").lower()
             if status not in counts or status in {"total", "attempted"}:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import sqlite3
 import time
@@ -607,6 +608,65 @@ SCHEMA_V11_SQL = [
     """,
 ]
 
+SCHEMA_V12_SQL = [
+    """
+    CREATE TABLE IF NOT EXISTS shadowbot_write_locks (
+        write_identity_key TEXT PRIMARY KEY,
+        operation_id TEXT NOT NULL UNIQUE,
+        item_execution_attempt_id TEXT NOT NULL,
+        batch_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'UNKNOWN', 'RELEASED')),
+        acquired_at TEXT NOT NULL,
+        released_at TEXT,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(operation_id) REFERENCES shadowbot_operations(operation_id),
+        FOREIGN KEY(item_execution_attempt_id) REFERENCES shadowbot_execution_attempts(execution_attempt_id),
+        FOREIGN KEY(batch_id) REFERENCES shadowbot_commit_batches(batch_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS shadowbot_commit_result_receipts (
+        result_id TEXT PRIMARY KEY,
+        batch_id TEXT NOT NULL,
+        execution_attempt_id TEXT NOT NULL,
+        instruction_hash TEXT NOT NULL,
+        manifest_sha256 TEXT NOT NULL,
+        result_sha256 TEXT NOT NULL,
+        source_result_path TEXT NOT NULL DEFAULT '',
+        accepted_at TEXT NOT NULL,
+        ack_state TEXT NOT NULL CHECK (ack_state IN ('PENDING', 'WRITTEN', 'FAILED')),
+        ack_updated_at TEXT,
+        last_projection_error TEXT NOT NULL DEFAULT '',
+        FOREIGN KEY(batch_id) REFERENCES shadowbot_commit_batches(batch_id)
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_shadowbot_commit_batch_items_item_id
+    ON shadowbot_commit_batch_items(item_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_shadowbot_commit_batch_items_operation_id
+    ON shadowbot_commit_batch_items(operation_id)
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_shadowbot_commit_batch_items_attempt_id
+    ON shadowbot_commit_batch_items(item_execution_attempt_id)
+    WHERE item_execution_attempt_id <> ''
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_shadowbot_write_locks_operation_id
+    ON shadowbot_write_locks(operation_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_shadowbot_commit_result_receipts_batch_id
+    ON shadowbot_commit_result_receipts(batch_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_shadowbot_commit_result_receipts_ack_state
+    ON shadowbot_commit_result_receipts(ack_state, accepted_at)
+    """,
+]
+
 
 class SQLiteRuntimeRepository:
     def __init__(
@@ -679,6 +739,7 @@ class SQLiteRuntimeRepository:
                 9: "platform listing identity uses platform, variety, and grade instead of SKU",
                 10: "task expected old price persisted as a first-class structured field",
                 11: "single-request ShadowBot commit batch ledger",
+                12: "per-item commit identity, write locks, observation times, and durable result receipts",
             }
             for statement in SCHEMA_V6_SQL:
                 connection.execute(statement)
@@ -686,6 +747,42 @@ class SQLiteRuntimeRepository:
                 connection.execute(statement)
             _migrate_listing_status_to_v9(connection)
             for statement in SCHEMA_V11_SQL:
+                connection.execute(statement)
+            _ensure_column(connection, "shadowbot_commit_batch_items", "item_id", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(connection, "shadowbot_commit_batch_items", "operation_id", "TEXT NOT NULL DEFAULT ''")
+            _ensure_column(
+                connection,
+                "shadowbot_commit_batch_items",
+                "item_execution_attempt_id",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "shadowbot_commit_batch_items",
+                "write_identity_key",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "shadowbot_commit_batch_items",
+                "page_identity_key",
+                "TEXT NOT NULL DEFAULT ''",
+            )
+            _ensure_column(
+                connection,
+                "shadowbot_commit_batch_items",
+                "side_effect_state",
+                "TEXT NOT NULL DEFAULT 'NOT_STARTED'",
+            )
+            _ensure_column(connection, "shadowbot_commit_batch_items", "preflight_observed_at", "TEXT")
+            _ensure_column(connection, "shadowbot_commit_batch_items", "submit_intent_at", "TEXT")
+            _ensure_column(connection, "shadowbot_commit_batch_items", "submit_clicked_at", "TEXT")
+            _ensure_column(connection, "shadowbot_commit_batch_items", "readback_observed_at", "TEXT")
+            _backfill_commit_item_identities(connection)
+            connection.execute(
+                "DROP INDEX IF EXISTS ux_shadowbot_commit_batch_items_operation_id"
+            )
+            for statement in SCHEMA_V12_SQL:
                 connection.execute(statement)
             for version in range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1):
                 connection.execute(
@@ -1974,6 +2071,19 @@ class SQLiteRuntimeRepository:
                 f"UPDATE shadowbot_operations SET {', '.join(assignments)} WHERE operation_id = ?",
                 params,
             )
+
+    def release_shadowbot_write_lock(self, operation_id: str, *, released_at: datetime) -> bool:
+        timestamp = _datetime_to_text(released_at)
+        with closing(self.connect_write()) as connection, connection:
+            cursor = connection.execute(
+                """
+                UPDATE shadowbot_write_locks
+                SET status = 'RELEASED', released_at = ?, updated_at = ?
+                WHERE operation_id = ? AND status IN ('ACTIVE', 'UNKNOWN')
+                """,
+                (timestamp, timestamp, operation_id),
+            )
+        return cursor.rowcount == 1
 
     def insert_shadowbot_execution_attempt(self, attempt: ShadowBotExecutionAttempt) -> int:
         row = _shadowbot_attempt_to_row(attempt)
@@ -4304,6 +4414,69 @@ def _backfill_task_expected_old_price(connection: sqlite3.Connection) -> None:
         connection.execute(
             "UPDATE tasks SET expected_old_price = ? WHERE task_id = ?",
             (serialize_decimal(old_price), str(row["task_id"])),
+        )
+
+
+def _backfill_commit_item_identities(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        """
+        SELECT item.rowid AS item_rowid, item.batch_id, item.source_task_id,
+               item.internal_sku, item.expected_product_name, item.expected_grade,
+               item.expected_old_price, item.target_price, batch.platform_name,
+               item.item_id, item.operation_id, item.item_execution_attempt_id,
+               item.write_identity_key, item.page_identity_key
+        FROM shadowbot_commit_batch_items AS item
+        JOIN shadowbot_commit_batches AS batch ON batch.batch_id = item.batch_id
+        """
+    ).fetchall()
+    for row in rows:
+        batch_id = str(row["batch_id"])
+        task_id = str(row["source_task_id"])
+        item_digest = hashlib.sha256(
+            f"{batch_id}\0{task_id}".encode("utf-8")
+        ).hexdigest()
+        payload_digest = hashlib.sha256(
+            "\0".join(
+                (
+                    task_id,
+                    str(row["internal_sku"]).upper(),
+                    str(row["expected_old_price"]),
+                    str(row["target_price"]),
+                )
+            ).encode("utf-8")
+        ).hexdigest()
+        item_id = str(row["item_id"] or "") or f"ITEM-{item_digest[:32]}"
+        operation_id = str(row["operation_id"] or "") or f"OP-{payload_digest[:32]}"
+        item_attempt_id = (
+            str(row["item_execution_attempt_id"] or "")
+            or f"ATTEMPT-{item_digest[:32]}"
+        )
+        write_identity_key = str(row["write_identity_key"] or "") or (
+            f"{normalize_listing_text(row['platform_name'])}|"
+            f"{str(row['internal_sku']).strip().upper()}"
+        )
+        page_identity_key = str(row["page_identity_key"] or "") or "|".join(
+            (
+                normalize_listing_text(row["platform_name"]),
+                normalize_listing_text(row["expected_product_name"]),
+                normalize_listing_text(row["expected_grade"]).upper(),
+            )
+        )
+        connection.execute(
+            """
+            UPDATE shadowbot_commit_batch_items
+            SET item_id = ?, operation_id = ?, item_execution_attempt_id = ?,
+                write_identity_key = ?, page_identity_key = ?
+            WHERE rowid = ?
+            """,
+            (
+                item_id,
+                operation_id,
+                item_attempt_id,
+                write_identity_key,
+                page_identity_key,
+                int(row["item_rowid"]),
+            ),
         )
 
 

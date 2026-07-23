@@ -10,7 +10,7 @@
 | 平台名称规范化 | `app/platform_identity.py` | 规范平台代码和名称 | 在公共层写死页面标题 |
 | 页面业务身份规范化 | `app/listing_identity.py` | 品种、等级归一化和业务键 | 用固定行号作为长期身份 |
 | 平台状态策略 | `app/listing_status_policy.py` | 状态写入、库存和在售事实边界 | 用目标价冒充实际回读价 |
-| SQLite Repository | `app/repositories/sqlite_runtime_repository.py` | v11 schema、事务、回读 | 绕过 Repository 拼接业务 SQL |
+| SQLite Repository | `app/repositories/sqlite_runtime_repository.py` | v12 schema、事务、逐商品写锁和技术回执 | 绕过 Repository 拼接业务 SQL |
 
 ## 2. ShadowBot 合同和调度层
 

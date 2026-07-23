@@ -72,6 +72,10 @@ def _item(task_id, sku, name, grade, old_price, target_price):
         "expected_old_price": old_price,
         "target_price": target_price,
         "item_payload_sha256": "sha256:" + task_id.lower().ljust(64, "0")[:64],
+        "operation_id": "OP-" + task_id,
+        "item_execution_attempt_id": "ATTEMPT-" + task_id,
+        "write_identity_key": "蚂蚁花团供应商|" + sku,
+        "page_identity_key": "蚂蚁花团供应商|%s|%s" % (name, grade),
     }
 
 
@@ -126,6 +130,37 @@ def test_v4_batch_defers_row_four_to_existing_downward_scroll_path():
     assert result["attempts"] == []
 
 
+def test_v4_stable_request_forwards_validated_batch_fault_injection():
+    namespace = _load_functions()
+    item = _item(
+        "TASK-AISHA-B",
+        "AISHA-B-60-Z",
+        "艾莎",
+        "B级",
+        "10.10",
+        "10.20",
+    )
+    request = {
+        "execution_attempt_id": "ATTEMPT-CONTROLLED-UNKNOWN-0001",
+        "operation_id": "OP-CONTROLLED-UNKNOWN-0001",
+        "task_id": "BATCHTASK-CONTROLLED-UNKNOWN-0001",
+        "instruction_hash": "sha256:" + "a" * 64,
+        "batch_id": "BATCH-T12-CONTROLLED-UNKNOWN-0001",
+        "platform_name": "蚂蚁花团供应商",
+        "fault_injection": "AFTER_SUBMIT_CLICK_UNKNOWN",
+    }
+
+    stable_request = namespace["_commit_v4_stable_request"](
+        request,
+        item,
+        {"position": 4},
+        1,
+        1,
+    )
+
+    assert stable_request["fault_injection"] == "AFTER_SUBMIT_CLICK_UNKNOWN"
+
+
 def _execute(items, rows, outcomes):
     namespace = _load_functions()
     calls = []
@@ -153,6 +188,9 @@ def _execute(items, rows, outcomes):
                 "status": outcome["status"],
                 "side_effect_state": outcome["side_effect_state"],
                 "actual_price": outcome.get("actual_price"),
+                "submit_intent_at": "2026-07-22T00:00:00+00:00",
+                "submit_clicked_at": "2026-07-22T00:00:01+00:00",
+                "readback_observed_at": "2026-07-22T00:00:02+00:00",
                 "error_code": outcome.get("error_code", ""),
                 "error_message": outcome.get("error_message", ""),
                 "retryable": False,
@@ -352,5 +390,6 @@ def test_v4_old_price_change_blocks_the_whole_queue_before_submit():
     assert calls == []
     assert result["batch_status"] == "FAILED"
     assert result["error_code"] == "OLD_PRICE_CHANGED"
-    assert result["counts"]["not_attempted"] == 2
+    assert result["counts"]["failed"] == 1
+    assert result["counts"]["not_attempted"] == 1
     assert result["counts"]["attempted"] == 0

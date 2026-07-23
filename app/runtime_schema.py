@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 
-LATEST_RUNTIME_SCHEMA_VERSION = 11
+LATEST_RUNTIME_SCHEMA_VERSION = 12
 RUNTIME_SCHEMA_VERSIONS = tuple(range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1))
 
 REQUIRED_RUNTIME_TABLES = frozenset(
@@ -37,6 +37,8 @@ REQUIRED_RUNTIME_TABLES = frozenset(
         "listing_status",
         "shadowbot_commit_batches",
         "shadowbot_commit_batch_items",
+        "shadowbot_write_locks",
+        "shadowbot_commit_result_receipts",
     }
 )
 
@@ -104,6 +106,53 @@ V11_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
         "error_message",
         "updated_at",
     ),
+}
+
+V12_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
+    "shadowbot_commit_batch_items": (
+        "item_id",
+        "operation_id",
+        "item_execution_attempt_id",
+        "write_identity_key",
+        "page_identity_key",
+        "side_effect_state",
+        "preflight_observed_at",
+        "submit_intent_at",
+        "submit_clicked_at",
+        "readback_observed_at",
+    ),
+    "shadowbot_write_locks": (
+        "write_identity_key",
+        "operation_id",
+        "item_execution_attempt_id",
+        "batch_id",
+        "status",
+        "acquired_at",
+        "released_at",
+        "updated_at",
+    ),
+    "shadowbot_commit_result_receipts": (
+        "result_id",
+        "batch_id",
+        "execution_attempt_id",
+        "instruction_hash",
+        "manifest_sha256",
+        "result_sha256",
+        "source_result_path",
+        "accepted_at",
+        "ack_state",
+        "ack_updated_at",
+        "last_projection_error",
+    ),
+}
+
+V12_INDEX_SPECS: Mapping[str, tuple[str, ...]] = {
+    "ux_shadowbot_commit_batch_items_item_id": ("item_id",),
+    "ix_shadowbot_commit_batch_items_operation_id": ("operation_id",),
+    "ux_shadowbot_commit_batch_items_attempt_id": ("item_execution_attempt_id",),
+    "ux_shadowbot_write_locks_operation_id": ("operation_id",),
+    "ix_shadowbot_commit_result_receipts_batch_id": ("batch_id",),
+    "ix_shadowbot_commit_result_receipts_ack_state": ("ack_state", "accepted_at"),
 }
 
 V5_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
@@ -309,6 +358,7 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
             **V9_REQUIRED_COLUMNS,
             **V10_REQUIRED_COLUMNS,
             **V11_REQUIRED_COLUMNS,
+            **V12_REQUIRED_COLUMNS,
         }.items():
             if table not in tables:
                 continue
@@ -347,6 +397,22 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
             missing_index_names.update(_check_notification_outbox_constraints(connection, constraint_errors))
         else:
             missing_index_names.update(NOTIFICATION_OUTBOX_INDEXES)
+        for index_name, expected_columns in V12_INDEX_SPECS.items():
+            index_row = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
+                (index_name,),
+            ).fetchone()
+            if index_row is None:
+                missing_index_names.add(index_name)
+                continue
+            actual_columns = tuple(
+                str(row[2])
+                for row in connection.execute(f"PRAGMA index_info({index_name})").fetchall()
+            )
+            if actual_columns != expected_columns:
+                constraint_errors.append(
+                    f"{index_name} columns expected {expected_columns}, actual {actual_columns}"
+                )
         missing_indexes = tuple(sorted(missing_index_names))
 
         ok = not (
@@ -393,7 +459,7 @@ def runtime_schema_health(connection: sqlite3.Connection) -> RuntimeSchemaHealth
 
 
 def assert_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealth:
-    """Raise a diagnostic error unless the connection has the exact v6 shape."""
+    """Raise a diagnostic error unless the connection has the exact latest shape."""
 
     result = inspect_runtime_schema(connection)
     if not result.ok:
@@ -490,7 +556,7 @@ def _check_notification_outbox_constraints(
     connection: sqlite3.Connection,
     errors: list[str],
 ) -> tuple[str, ...]:
-    """Validate v6 keys, foreign keys, status/numeric checks, and indexes."""
+    """Validate required keys, foreign keys, status/numeric checks, and indexes."""
 
     outbox_info = connection.execute("PRAGMA table_info(notification_outbox)").fetchall()
     outbox_columns = {str(row[1]): row for row in outbox_info}

@@ -75,8 +75,10 @@ V2_HARD_MAX_PRODUCTS = 50
 V2_MAX_REQUEST_BYTES = 256 * 1024
 V2_MAX_RESULT_BYTES = 4 * 1024 * 1024
 V4_CONTRACT_VERSION = 4
-V4_SCHEMA_VERSION = "shadowbot-commit-batch-request-1.1"
-V4_RESULT_SCHEMA_VERSION = "shadowbot-commit-batch-result-1.0"
+V4_SCHEMA_VERSION = "shadowbot-commit-batch-request-1.2"
+V4_RESULT_SCHEMA_VERSION = "shadowbot-commit-batch-result-1.1"
+V4_PHASE_SCHEMA_VERSION = "shadowbot-commit-batch-phase-1.0"
+V4_DEVELOPMENT_FAULT_INJECTIONS = frozenset({"AFTER_SUBMIT_CLICK_UNKNOWN"})
 def _v2_normalize_text(value):
     return normalize_contract_text(value)
 
@@ -188,6 +190,10 @@ def _v4_item_payload(platform_name, item):
         "platform_name": str(platform_name or "").strip(),
         "source_task_id": str(item.get("source_task_id") or "").strip(),
         "internal_sku": str(item.get("internal_sku") or "").strip().upper(),
+        "expected_product_name": _v2_normalize_text(
+            item.get("expected_product_name")
+        ),
+        "expected_grade": normalize_contract_grade(item.get("expected_grade")),
         "expected_old_price": _v4_price(item.get("expected_old_price"), "expected_old_price"),
         "target_price": _v4_price(item.get("target_price"), "target_price"),
     }
@@ -221,7 +227,92 @@ def _v4_instruction_hash(request):
         "created_at": request.get("created_at"),
         "expires_at": request.get("expires_at"),
     }
+    if "fault_injection" in request:
+        canonical["fault_injection"] = request.get("fault_injection")
     return _v4_sha256(canonical)
+
+
+def _v4_stable_id(prefix, payload):
+    return prefix + "-" + _v4_sha256(payload).replace("sha256:", "", 1)[:32]
+
+
+def _v4_write_identity_key(platform_name, internal_sku):
+    return "|".join(
+        (
+            _v2_normalize_text(platform_name),
+            str(internal_sku or "").strip().upper(),
+        )
+    )
+
+
+def _v4_page_identity_key(platform_name, product_name, grade):
+    return "|".join(
+        (
+            _v2_normalize_text(platform_name),
+            _v2_normalize_text(product_name),
+            normalize_contract_grade(grade),
+        )
+    )
+
+
+def _v4_result_item_skeleton(item, *, status="NOT_ATTEMPTED", error_code="", error_message=""):
+    return {
+        "item_id": item.get("item_id", ""),
+        "source_task_id": item.get("source_task_id", ""),
+        "internal_sku": item.get("internal_sku", ""),
+        "expected_product_name": item.get("expected_product_name", ""),
+        "expected_grade": item.get("expected_grade", ""),
+        "expected_old_price": item.get("expected_old_price", ""),
+        "target_price": item.get("target_price", ""),
+        "item_payload_sha256": item.get("item_payload_sha256", ""),
+        "operation_id": item.get("operation_id", ""),
+        "item_execution_attempt_id": item.get("item_execution_attempt_id", ""),
+        "write_identity_key": item.get("write_identity_key", ""),
+        "page_identity_key": item.get("page_identity_key", ""),
+        "preflight_row": None,
+        "preflight_price": None,
+        "execution_ordinal": None,
+        "submit_attempted": False,
+        "side_effect_state": "NOT_STARTED",
+        "preflight_observed_at": None,
+        "submit_intent_at": None,
+        "submit_clicked_at": None,
+        "readback_observed_at": None,
+        "actual_price": None,
+        "status": status,
+        "error_code": error_code,
+        "error_message": error_message,
+    }
+
+
+def _v4_result_counts(items):
+    counts = {
+        "total": len(items),
+        "attempted": 0,
+        "verified": 0,
+        "not_applied": 0,
+        "failed": 0,
+        "unknown": 0,
+        "not_attempted": 0,
+    }
+    for item in items:
+        if item.get("submit_attempted") is True:
+            counts["attempted"] += 1
+        status = str(item.get("status") or "").lower()
+        if status not in counts or status == "total" or status == "attempted":
+            raise ValueError("invalid COMMIT result item status")
+        counts[status] += 1
+    return counts
+
+
+def _v4_batch_status(counts):
+    if counts["verified"] == counts["total"]:
+        return "VERIFIED"
+    if counts["verified"]:
+        return "PARTIAL"
+    if counts["unknown"]:
+        return "UNKNOWN"
+    return "FAILED"
 
 
 def _v4_validate_request(request):
@@ -232,6 +323,14 @@ def _v4_validate_request(request):
     profile = str(request.get("execution_profile") or "").strip().lower()
     if profile not in {"development", "production"}:
         raise ValueError("INVALID_EXECUTION_PROFILE")
+    if "fault_injection" in request:
+        fault_injection = str(request.get("fault_injection") or "").strip().upper()
+        if (
+            profile != "development"
+            or fault_injection not in V4_DEVELOPMENT_FAULT_INJECTIONS
+            or request.get("fault_injection") != fault_injection
+        ):
+            raise ValueError("UNSAFE_TEST_PARAMETER_REJECTED")
     for name in ("task_id", "operation_id", "execution_attempt_id", "batch_id"):
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}", str(request.get(name) or "")):
             raise ValueError("invalid " + name)
@@ -245,7 +344,17 @@ def _v4_validate_request(request):
     for item in items:
         if not isinstance(item, dict):
             raise ValueError("invalid COMMIT item")
-        required = ("item_id", "source_task_id", "internal_sku", "expected_product_name", "expected_grade")
+        required = (
+            "item_id",
+            "source_task_id",
+            "internal_sku",
+            "expected_product_name",
+            "expected_grade",
+            "operation_id",
+            "item_execution_attempt_id",
+            "write_identity_key",
+            "page_identity_key",
+        )
         if any(not str(item.get(name) or "").strip() for name in required):
             raise ValueError("invalid COMMIT item")
         task_id = str(item["source_task_id"])
@@ -261,6 +370,41 @@ def _v4_validate_request(request):
         identities.add(identity)
         if item.get("item_payload_sha256") != _v4_sha256(_v4_item_payload(platform_name, item)):
             raise ValueError("COMMIT item payload hash mismatch")
+        expected_item_id = _v4_stable_id(
+            "ITEM",
+            {
+                "batch_id": request["batch_id"],
+                "source_task_id": task_id,
+            },
+        )
+        if item["item_id"] != expected_item_id:
+            raise ValueError("COMMIT item_id mismatch")
+        expected_operation_id = _v4_stable_id(
+            "OP",
+            {
+                "source_task_id": task_id,
+                "item_payload_sha256": item["item_payload_sha256"],
+            },
+        )
+        if item["operation_id"] != expected_operation_id:
+            raise ValueError("COMMIT operation_id mismatch")
+        expected_attempt_id = _v4_stable_id(
+            "ATTEMPT",
+            {
+                "execution_attempt_id": request["execution_attempt_id"],
+                "item_id": item["item_id"],
+            },
+        )
+        if item["item_execution_attempt_id"] != expected_attempt_id:
+            raise ValueError("COMMIT item execution attempt mismatch")
+        if item["write_identity_key"] != _v4_write_identity_key(platform_name, sku):
+            raise ValueError("COMMIT write identity mismatch")
+        if item["page_identity_key"] != _v4_page_identity_key(
+            platform_name,
+            item["expected_product_name"],
+            item["expected_grade"],
+        ):
+            raise ValueError("COMMIT page identity mismatch")
     if request.get("manifest_sha256") != _v4_manifest_hash(platform_name, items):
         raise ValueError("COMMIT manifest hash mismatch")
     confirmation = request.get("development_confirmation")
@@ -528,6 +672,14 @@ class QueueWorker:
         return None
 
     def _validate_request(self, request):
+        fault_injection = str(request.get("fault_injection") or "").strip()
+        if fault_injection and (
+            not self.allow_fault_injection
+            or request.get("contract_version") != V4_CONTRACT_VERSION
+            or str(request.get("execution_profile") or "").strip().lower()
+            != "development"
+        ):
+            raise ValueError("UNSAFE_TEST_PARAMETER_REJECTED")
         if request.get("contract_version") == V2_CONTRACT_VERSION:
             self._validate_multi_product_request(request)
             return
@@ -540,7 +692,6 @@ class QueueWorker:
             "execution_attempt_id",
             "execution_mode",
             "platform_name",
-            "platform_sku",
             "product_keyword",
             "expected_product_name",
             "expected_grade",
@@ -552,7 +703,7 @@ class QueueWorker:
         missing = [name for name in required if not str(request.get(name) or "").strip()]
         if missing:
             raise ValueError("missing request fields: " + ", ".join(missing))
-        if str(request.get("fault_injection") or "").strip() and not self.allow_fault_injection:
+        if str(request.get("fault_injection") or "").strip():
             raise ValueError("UNSAFE_TEST_PARAMETER_REJECTED")
         if bool(request.get("spec_verification_required")):
             raise ValueError("current platform adapter cannot verify expected_spec")
@@ -578,6 +729,7 @@ class QueueWorker:
 
     def _execute_claimed(self, request, request_sha256, working_request, phase_path):
         attempt_id = str(request["execution_attempt_id"])
+        is_v4 = request.get("contract_version") == V4_CONTRACT_VERSION
         runtime_request = dict(request)
         runtime_request.update(
             {
@@ -625,12 +777,28 @@ class QueueWorker:
                 "error_message": "worker execution failed: " + type(exc).__name__,
                 "retryable": False,
             }
+            if is_v4:
+                result_items = [
+                    _v4_result_item_skeleton(
+                        item,
+                        status="FAILED",
+                        error_code="WORKER_EXECUTION_FAILED",
+                        error_message="worker execution failed: " + type(exc).__name__,
+                    )
+                    for item in request.get("items") or []
+                ]
+                result.update(
+                    {
+                        "batch_status": "FAILED",
+                        "items": result_items,
+                        "counts": _v4_result_counts(result_items),
+                    }
+                )
         provider_error_code = str(result.get("provider_error_code") or "").strip()
         if provider_error_code in SAFE_PROVIDER_ERROR_CODES:
             result["provider_error_code"] = provider_error_code
         else:
             result.pop("provider_error_code", None)
-        is_v4 = request.get("contract_version") == V4_CONTRACT_VERSION
         result.update(
             {
                 "schema_version": V4_RESULT_SCHEMA_VERSION if is_v4 else "shadowbot-result-2.0" if request.get("contract_version") == V2_CONTRACT_VERSION else "shadowbot-result-1.0",
@@ -688,6 +856,46 @@ class QueueWorker:
             result["result_id"] = "RESULT-" + hashlib.sha256(_json_bytes(result)).hexdigest()[:24]
             content = _json_bytes(result)
         if is_v4 and len(content) > V2_MAX_RESULT_BYTES:
+            compact_items = []
+            supplied_items = result.get("items")
+            if not isinstance(supplied_items, list) or len(supplied_items) != len(
+                request.get("items") or []
+            ):
+                supplied_items = [
+                    _v4_result_item_skeleton(
+                        item,
+                        status="UNKNOWN",
+                        error_code="RESULT_TOO_LARGE",
+                        error_message="result exceeded the contract size limit",
+                    )
+                    for item in request.get("items") or []
+                ]
+            for request_item, supplied_item in zip(
+                request.get("items") or [], supplied_items
+            ):
+                compact = _v4_result_item_skeleton(request_item)
+                for name in (
+                    "preflight_row",
+                    "preflight_price",
+                    "execution_ordinal",
+                    "submit_attempted",
+                    "side_effect_state",
+                    "preflight_observed_at",
+                    "submit_intent_at",
+                    "submit_clicked_at",
+                    "readback_observed_at",
+                    "actual_price",
+                    "status",
+                    "error_code",
+                ):
+                    if name in supplied_item:
+                        compact[name] = supplied_item[name]
+                compact["error_message"] = str(
+                    supplied_item.get("error_message") or ""
+                )[:512]
+                compact_items.append(compact)
+            compact_counts = _v4_result_counts(compact_items)
+            compact_batch_status = _v4_batch_status(compact_counts)
             result = {
                 "schema_version": V4_RESULT_SCHEMA_VERSION,
                 "contract_version": V4_CONTRACT_VERSION,
@@ -702,24 +910,28 @@ class QueueWorker:
                 "worker_id": self.worker_id,
                 "queue_phase": "RESULT_WRITTEN",
                 "worker_heartbeat_at": _now_iso(),
-                "status": "FAILED",
-                "batch_status": "FAILED",
-                "run_success_flag": False,
-                "business_operation_completed": False,
-                "side_effect_state": "NOT_STARTED",
-                "error_code": "RESULT_TOO_LARGE",
-                "error_message": "result exceeds 4 MiB contract limit",
+                "status": compact_batch_status,
+                "batch_status": compact_batch_status,
+                "run_success_flag": compact_batch_status == "VERIFIED",
+                "business_operation_completed": compact_counts["attempted"] > 0,
+                "side_effect_state": (
+                    "VERIFIED"
+                    if compact_batch_status == "VERIFIED"
+                    else "UNKNOWN"
+                    if compact_counts["unknown"]
+                    else "NOT_STARTED"
+                ),
+                "error_code": (
+                    "" if compact_batch_status == "VERIFIED" else "RESULT_COMPACTED"
+                ),
+                "error_message": (
+                    ""
+                    if compact_batch_status == "VERIFIED"
+                    else "oversized result was reduced to its complete item ledger"
+                ),
                 "retryable": False,
-                "items": [],
-                "counts": {
-                    "total": 0,
-                    "attempted": 0,
-                    "verified": 0,
-                    "not_applied": 0,
-                    "failed": 0,
-                    "unknown": 0,
-                    "not_attempted": 0,
-                },
+                "items": compact_items,
+                "counts": compact_counts,
             }
             result["result_id"] = "RESULT-" + hashlib.sha256(_json_bytes(result)).hexdigest()[:24]
             content = _json_bytes(result)
@@ -766,6 +978,7 @@ class QueueWorker:
         if request.get("contract_version") == V4_CONTRACT_VERSION:
             payload.update(
                 {
+                    "schema_version": V4_PHASE_SCHEMA_VERSION,
                     "contract_version": V4_CONTRACT_VERSION,
                     "batch_id": request.get("batch_id", ""),
                     "manifest_sha256": request.get("manifest_sha256", ""),

@@ -55,10 +55,12 @@ SQLite 当前保存以下运行态表：
 - `listing_status`
 - `shadowbot_commit_batches`
 - `shadowbot_commit_batch_items`
+- `shadowbot_write_locks`
+- `shadowbot_commit_result_receipts`
 
 SQLite 只承接运行态任务系统，不替代 Excel 主数据。
 
-当前 runtime schema 最新版本为 v11。v3 新增自动规则评估运行记录，v4 新增 ShadowBot Executor 账本，v5 新增队列审计字段和 `retry_authorizations`，v6 新增事务型通知 Outbox，v7-v9 建立 `listing_status` 并将业务身份统一为“平台 + 品种 + 等级”，v10 将 `tasks.expected_old_price` 结构化，v11 新增单次请求的 `shadowbot_commit_batches` 和 `shadowbot_commit_batch_items`。`app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION` 是唯一版本权威来源。
+当前 runtime schema 最新版本为 v12。v3 新增自动规则评估运行记录，v4 新增 ShadowBot Executor 账本，v5 新增队列审计字段和 `retry_authorizations`，v6 新增事务型通知 Outbox，v7-v9 建立 `listing_status` 并将业务身份统一为“平台 + 品种 + 等级”，v10 将 `tasks.expected_old_price` 结构化，v11 新增单次请求的 `shadowbot_commit_batches` 和 `shadowbot_commit_batch_items`，v12 新增逐商品操作/尝试身份、活动写锁、观察时间和持久化结果回执。`app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION` 是唯一版本权威来源。
 
 ### 2.3 人工复核闭环
 
@@ -181,6 +183,10 @@ SQLite 只承接运行态任务系统，不替代 Excel 主数据。
 - 每项提交后独立重新定位并回读，只有平台实际价格等于目标价才记为 `VERIFIED`。
 - 结果同时回传完整页面的价格、库存和 `ONLINE` 状态，Importer 校验后更新任务、批次账本、逐商品账本和 `listing_status`。
 - `ShadowBotExecutor` 继续管理 operation/attempt、副作用检查点和 UNKNOWN→唯一 RECONCILE；Worker、Importer 和 Watchdog 不得自行创建重复 COMMIT。
+- 2026-07-23 审查接续修复将 manifest/request/result 分别升级为 `1.2/1.2/1.1`：逐商品 `operation_id` 在任务载荷不变时保持稳定，逐商品 attempt 随批次执行尝试变化；页面身份只用于 UI 定位，写锁身份固定为“平台 + internal_sku”。
+- 终态结果支持幂等重投影：同一份已通过身份和哈希绑定的结果若曾在任务或商品状态投影阶段中断，再次导入只修复数据库投影，不重新发布队列请求或重复执行平台动作。
+- Result Importer 先完成严格类型、价格、时间、逐项绑定和计数校验，再在一个 SQLite 事务中写入页面快照、任务、批次/逐项账本、operation/attempt/checkpoint、写锁和技术回执。数据库回执是接受真值，归档 ACK 是可重试投影。
+- Worker 的通用异常和 4 MiB 降级结果均保留完整逐商品骨架；Watchdog 只重建完整恢复结果，只有 `ShadowBotExecutor.ensure_reconcile_attempt(...)` 可以创建唯一 RECONCILE。
 - `ShadowBotFileQueueRunner` 按 `.ready.json + .sha256` 原子发布请求；常驻 Worker、Result Importer 和 Queue Watchdog 的职责保持分离。
 - `test2` 支持长驻监听；生命周期状态记录避免每条任务重复启动/关闭，正常结束使用 `stop.signal → STOPPED → 关闭.flow`。
 - 最终暖态四商品实机批次 `BATCH-T12-WARM-FAST-PATH-20260723-01` 为 4/4 `VERIFIED`，总用时 `51.094 秒`。
@@ -421,24 +427,27 @@ Web 复核主入口：
 
 ## 8. 后续推荐优先级
 
-当前下一步是审查并交接任务12，然后在复用现有闭环的前提下进入任务13；不是扩大无人值守真实 RPA，也不是做 AI Agent。
+任务12审查修复版的正常 COMMIT 与受控 UNKNOWN→唯一 RECONCILE 实机证据
+均已完成。当前下一步是完成文档和 GitHub PR 交接并交由审查方复核；不是修改
+任务状态，也不是扩大无人值守真实 RPA。
 
 Code Review 后的高中低风险问题已完成修复，系统冒烟测试、全量单元测试和主控端到端流程测试均已通过。修复详情见 [reports/risk_fix_report_20260610.md](reports/risk_fix_report_20260610.md)。
 
 推荐顺序：
 
-1. 审查 [reports/task12_final_handoff_20260723.md](reports/task12_final_handoff_20260723.md) 及对应真实运行归档；审查通过后再修改任务12状态并创建统一 GitHub PR。
-2. 进入任务13，复用任务12的合同、队列、身份映射、账本、完整页面快照和副作用状态机，实现上下架及 OFFLINE 跨页面对账。
-3. 补充长期告警、磁盘清理、证据保留和服务账号运维样本，并分别定义冷态/暖态性能指标。
-4. 继续运行系统冒烟、完整单元测试和 ShadowBot 成功基线测试，任何新功能不得重写已验证 COMMIT 动作链路。
-5. 基于自动规则评估框架继续规划上下架、冷库、包装产能等 evaluator，但保持 dry-run/apply 和 service 边界。
-6. AI Agent 自动决策应放在真实平台执行和运维边界通过更长期审查后再推进。
+1. 审查 [reports/task12_review_remediation_20260723.md](reports/task12_review_remediation_20260723.md) 中新增的正常四商品 COMMIT 与受控 UNKNOWN→唯一 RECONCILE 证据。
+2. 连同 [reports/task12_final_handoff_20260723.md](reports/task12_final_handoff_20260723.md)、证据索引和对应本地归档交由审查方复核；审查通过后再修改任务12状态。
+3. 进入任务13，复用任务12的合同、队列、身份映射、账本、完整页面快照和副作用状态机，实现上下架及 OFFLINE 跨页面对账。
+4. 补充长期告警、磁盘清理、证据保留和服务账号运维样本，并分别定义冷态/暖态性能指标。
+5. 继续运行系统冒烟、完整单元测试和 ShadowBot 成功基线测试，任何新功能不得重写已验证 COMMIT 动作链路。
+6. 基于自动规则评估框架继续规划上下架、冷库、包装产能等 evaluator，但保持 dry-run/apply 和 service 边界。
+7. AI Agent 自动决策应放在真实平台执行和运维边界通过更长期审查后再推进。
 
 ## 9. 后续可复用资产
 
 完整清单见 [task12_reusable_assets.md](task12_reusable_assets.md)。优先复用：
 
-- v4 单次请求多商品合同、批次/逐项哈希和 SQLite v11 批次账本。
+- v4 单次请求多商品合同、批次/逐项哈希和 SQLite v12 批次/逐项/技术回执账本。
 - 文件队列原子发布、Worker 租约、phase、Importer、Watchdog 和归档。
 - operation/attempt/side-effect 状态机及 UNKNOWN→唯一 RECONCILE。
 - SKU→商品名称/等级映射、平台/等级规范化和完整页面快照。

@@ -232,6 +232,10 @@ def _write_phase(request, result, phase, include_result_snapshot=False):
         "cleanup_confirmed": result.get("cleanup_action") == "PRICE_DIALOG_CANCELLED",
         "updated_at": _now_iso(),
     }
+    if int(_get_arg(request, "contract_version", 0) or 0) == 4 or _get_arg(
+        request, "commit_batch_id", ""
+    ):
+        payload["schema_version"] = "shadowbot-commit-batch-phase-1.0"
     parent_snapshot = _get_arg(request, "phase_parent_result_snapshot", None)
     if isinstance(parent_snapshot, dict):
         payload["batch_result_snapshot"] = _safe_output_payload(parent_snapshot)
@@ -241,6 +245,30 @@ def _write_phase(request, result, phase, include_result_snapshot=False):
         payload["execution_ordinal"] = int(
             _get_arg(request, "phase_parent_execution_ordinal", 0) or 0
         )
+        payload["item_phase"] = {
+            "item_id": str(_get_arg(request, "commit_item_id", "")),
+            "source_task_id": str(
+                _get_arg(request, "phase_parent_current_source_task_id", "")
+            ),
+            "operation_id": str(_get_arg(request, "operation_id", "")),
+            "item_execution_attempt_id": str(
+                _get_arg(request, "execution_attempt_id", "")
+            ),
+            "write_identity_key": str(
+                _get_arg(request, "write_identity_key", "")
+            ),
+            "page_identity_key": str(
+                _get_arg(request, "page_identity_key", "")
+            ),
+            "phase": phase,
+            "side_effect_state": str(
+                result.get("side_effect_state") or "NOT_STARTED"
+            ),
+            "submit_intent_at": result.get("submit_intent_at"),
+            "submit_clicked_at": result.get("submit_clicked_at"),
+            "readback_observed_at": result.get("readback_observed_at"),
+            "updated_at": payload["updated_at"],
+        }
     if include_result_snapshot:
         payload["result_snapshot"] = _safe_output_payload(dict(result))
     if isinstance(result.get("login"), dict):
@@ -2058,7 +2086,8 @@ def _locate_product_row(
         if row.get("error"):
             continue
         if _list_name_matches(row["name"], expected_name, expected_grade) and (
-            _normalize_text(row["grade"]) == _normalize_text(expected_grade)
+            _multi_product_grade(row["grade"])
+            == _multi_product_grade(expected_grade)
         ):
             matches.append(
                 (
@@ -2379,6 +2408,37 @@ def _mark_submit_result_unknown(result, current_step, original_error_code, origi
             "retryable": False,
         }
     )
+
+
+def _prove_submit_intent_not_clicked(result, window, timeout_seconds):
+    if (
+        result.get("side_effect_state") != "SUBMIT_INTENT_RECORDED"
+        or result.get("submit_clicked_at")
+    ):
+        return False
+    try:
+        _cancel_price_dialog(window, timeout_seconds)
+    except Exception as exc:
+        result["submit_not_clicked_proof_error"] = type(exc).__name__
+        return False
+    result.update(
+        {
+            "status": "NOT_APPLIED",
+            "run_success_flag": True,
+            "business_operation_completed": False,
+            "side_effect_state": "NOT_APPLIED",
+            "submit_attempted": False,
+            "submit_not_clicked_proof": {
+                "proof_type": "PRICE_DIALOG_CANCELLED_AFTER_SUBMIT_INTENT",
+                "proved_at": _now_iso(),
+            },
+            "cleanup_action": "PRICE_DIALOG_CANCELLED",
+            "error_code": "SUBMIT_NOT_CLICKED",
+            "error_message": "submit intent was recorded, but the still-open dialog was cancelled before any submit click",
+            "retryable": False,
+        }
+    )
+    return True
 
 
 def _sha256(path):
@@ -3034,6 +3094,7 @@ def _commit_v4_scan_target_rows(window, timeout_seconds, items):
 
 
 def _commit_v4_page_snapshot(platform_name, rows):
+    captured_at = _multi_product_utc_now()
     products = []
     for row in rows:
         products.append(
@@ -3048,12 +3109,13 @@ def _commit_v4_page_snapshot(platform_name, rows):
                 "listing_status": str(
                     row.get("listing_status") or "UNKNOWN"
                 ).upper(),
+                "observed_at": captured_at,
             }
         )
     return {
         "capture_basis": "BATCH_PREFLIGHT_PLUS_COMMIT_READBACK",
-        "captured_at": _multi_product_utc_now(),
-        "finalized_at": "",
+        "captured_at": captured_at,
+        "finalized_at": captured_at,
         "platform_name": str(platform_name or "").strip(),
         "total_count": len(products),
         "products": products,
@@ -3074,6 +3136,7 @@ def _commit_v4_update_page_snapshot(result, item_result):
             if item_result.get("status") == "VERIFIED":
                 product["price"] = str(item_result.get("actual_price") or "")
                 product["price_status"] = "VERIFIED_AFTER_COMMIT"
+                product["observed_at"] = item_result.get("readback_observed_at")
             elif item_result.get("status") == "UNKNOWN":
                 product["price_status"] = "UNKNOWN_AFTER_SUBMIT"
             return
@@ -3089,10 +3152,19 @@ def _commit_v4_item_result(item):
         "expected_old_price": item["expected_old_price"],
         "target_price": item["target_price"],
         "item_payload_sha256": item["item_payload_sha256"],
+        "operation_id": item["operation_id"],
+        "item_execution_attempt_id": item["item_execution_attempt_id"],
+        "write_identity_key": item["write_identity_key"],
+        "page_identity_key": item["page_identity_key"],
         "preflight_row": None,
         "preflight_price": None,
         "execution_ordinal": None,
         "submit_attempted": False,
+        "side_effect_state": "NOT_STARTED",
+        "preflight_observed_at": None,
+        "submit_intent_at": None,
+        "submit_clicked_at": None,
+        "readback_observed_at": None,
         "actual_price": None,
         "status": "NOT_ATTEMPTED",
         "error_code": "",
@@ -3103,7 +3175,7 @@ def _commit_v4_item_result(item):
 def _commit_v4_stable_request(request, item, row, execution_ordinal, batch_size):
     """Adapt one planned item to the already-verified single-item COMMIT contract."""
     parent_attempt_id = str(request.get("execution_attempt_id") or "").strip()
-    item_attempt_id = "%s-ITEM-%02d" % (parent_attempt_id, execution_ordinal)
+    item_attempt_id = str(item["item_execution_attempt_id"])
     stable_request = {
         "schema_version": "shadowbot-request-1.0",
         "task_id": item["source_task_id"],
@@ -3117,12 +3189,14 @@ def _commit_v4_stable_request(request, item, row, execution_ordinal, batch_size)
         "spec_verification_required": False,
         "expected_old_price": item["expected_old_price"],
         "target_price": item["target_price"],
-        "operation_id": "%s-ITEM-%02d"
-        % (str(request.get("operation_id") or request.get("batch_id") or "BATCH"), execution_ordinal),
+        "operation_id": item["operation_id"],
         "platform_name": request.get("platform_name", ""),
         "platform_sku": item["internal_sku"],
         "instruction_hash": item["item_payload_sha256"],
         "commit_batch_id": request.get("batch_id", ""),
+        "commit_item_id": item["item_id"],
+        "write_identity_key": item["write_identity_key"],
+        "page_identity_key": item["page_identity_key"],
         "commit_batch_ordinal": execution_ordinal,
         "commit_batch_size": batch_size,
         "page_position_hint": int(row["position"]),
@@ -3153,6 +3227,7 @@ def _commit_v4_stable_request(request, item, row, execution_ordinal, batch_size)
         "evidence_storage_uri_prefix",
         "worker_id",
         "request_file_sha256",
+        "fault_injection",
         "_phase_file_path",
         "_stop_signal_path",
     ):
@@ -3265,7 +3340,7 @@ def _run_commit_batch_v4(args, request, result):
     by_task_id = {item["source_task_id"]: item for item in item_results}
     result.update(
         {
-            "schema_version": "shadowbot-commit-batch-result-1.0",
+            "schema_version": "shadowbot-commit-batch-result-1.1",
             "contract_version": 4,
             "batch_id": request.get("batch_id", ""),
             "manifest_sha256": request.get("manifest_sha256", ""),
@@ -3335,11 +3410,19 @@ def _run_commit_batch_v4(args, request, result):
             output = by_task_id[task_id]
             output["preflight_row"] = int(row["position"])
             output["preflight_price"] = row["price"]
+            output["preflight_observed_at"] = result["page_snapshot"]["captured_at"]
             if row["price"] != item["expected_old_price"]:
+                output.update(
+                    {
+                        "status": "FAILED",
+                        "error_code": "OLD_PRICE_CHANGED",
+                        "error_message": "任务 %s 旧价不一致：输入=%s，页面=%s"
+                        % (task_id, item["expected_old_price"], row["price"]),
+                    }
+                )
                 raise SliceError(
                     "OLD_PRICE_CHANGED",
-                    "任务 %s 旧价不一致：输入=%s，页面=%s"
-                    % (task_id, item["expected_old_price"], row["price"]),
+                    output["error_message"],
                     retryable=False,
                 )
         plan = sorted(items, key=lambda item: preflight[item["source_task_id"]]["position"])
@@ -3410,6 +3493,12 @@ def _run_commit_batch_v4(args, request, result):
             output["error_code"] = str(stable_result.get("error_code") or "")
             output["error_message"] = str(stable_result.get("error_message") or "")
             output["submit_attempted"] = stable_side_effect != "NOT_STARTED"
+            output["side_effect_state"] = stable_side_effect
+            output["submit_intent_at"] = stable_result.get("submit_intent_at")
+            output["submit_clicked_at"] = stable_result.get("submit_clicked_at")
+            output["readback_observed_at"] = stable_result.get(
+                "readback_observed_at"
+            )
             if stable_status == "VERIFIED" and stable_side_effect == "VERIFIED":
                 output["status"] = "VERIFIED"
             elif stable_side_effect == "NOT_APPLIED":
@@ -3462,8 +3551,6 @@ def _run_commit_batch_v4(args, request, result):
             "ended_at": _now_iso(),
         }
     )
-    if isinstance(result.get("page_snapshot"), dict):
-        result["page_snapshot"]["finalized_at"] = result["ended_at"]
     result["batch_performance"]["total_seconds"] = round(
         time.monotonic() - batch_started_monotonic,
         3,
@@ -4034,6 +4121,7 @@ def _run_single_product_flow(args, allow_contract_dispatch=False):
             else:
                 result["post_submit_verification_path"] = "CURRENT_LIST_FAST_PATH"
             result["actual_price"] = after_price
+            result["readback_observed_at"] = _now_iso()
             if after_price_read_error:
                 result["after_submit_read_warning"] = after_price_read_error
 
@@ -4136,9 +4224,19 @@ def _run_single_product_flow(args, allow_contract_dispatch=False):
                 result["cleanup_action"] = "PRICE_DIALOG_CANCELLED"
             except Exception as cleanup_exc:
                 result["cleanup_error"] = str(cleanup_exc)
-        if execution_mode == "COMMIT" and _has_submit_side_effect(result):
+        submit_proven_absent = (
+            execution_mode == "COMMIT"
+            and "window" in locals()
+            and "timeout_seconds" in locals()
+            and _prove_submit_intent_not_clicked(result, window, timeout_seconds)
+        )
+        if (
+            execution_mode == "COMMIT"
+            and _has_submit_side_effect(result)
+            and not submit_proven_absent
+        ):
             _mark_submit_result_unknown(result, current_step, exc.code, exc.message)
-        else:
+        elif not submit_proven_absent:
             result.update(
                 {
                     "status": "FAILED",
@@ -4151,9 +4249,19 @@ def _run_single_product_flow(args, allow_contract_dispatch=False):
                 }
             )
     except Exception as exc:
-        if execution_mode == "COMMIT" and _has_submit_side_effect(result):
+        submit_proven_absent = (
+            execution_mode == "COMMIT"
+            and "window" in locals()
+            and "timeout_seconds" in locals()
+            and _prove_submit_intent_not_clicked(result, window, timeout_seconds)
+        )
+        if (
+            execution_mode == "COMMIT"
+            and _has_submit_side_effect(result)
+            and not submit_proven_absent
+        ):
             _mark_submit_result_unknown(result, current_step, "UNKNOWN_ERROR", str(exc))
-        else:
+        elif not submit_proven_absent:
             result.update(
                 {
                     "status": "FAILED",

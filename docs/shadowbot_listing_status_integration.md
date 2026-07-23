@@ -20,7 +20,7 @@ SQLite 中的价格是“最近一次已确认的平台快照”，不是对平�
 
 ## 2. SQLite 平台状态快照
 
-当前运行库结构版本为 v11，物理表名为 `listing_status`。该表的“平台 + 品种 + 等级”唯一身份结构在 v9 引入；v10 增加任务旧价字段，v11 增加多商品 COMMIT 批次账本。
+当前运行库结构版本为 v12，物理状态表名为 `listing_status`。该表的“平台 + 品种 + 等级”唯一身份结构在 v9 引入；v10 增加任务旧价字段，v11 增加多商品 COMMIT 批次账本，v12 增加逐商品操作/尝试身份、活动写锁、观察时间和技术结果回执。
 
 ### 2.1 平台商品业务键
 
@@ -161,15 +161,16 @@ platform + internal_sku
 4. 在创建任何可执行 COMMIT 队列文件前，向项目负责人申请对这份固定清单的明确授权。
 5. 授权文本与清单哈希完全一致后，才创建一个 COMMIT 队列合同。
 
-开发/实机验收的一次授权可以覆盖同一消息中逐项明确列出的完整固定清单。正式运行的 `execution_profile=production` 不依赖 Codex 对话确认，以发布前再次校验通过的 `pending update_price` 任务作为执行权威。逐商品载荷哈希绑定 `platform + internal_sku + expected_old_price + target_price`；批次 `manifest_sha256` 绑定平台及规范化项目清单。解析后的商品名称和等级由 `item_payload_sha256` 和最终 `instruction_hash` 保护，但不引入额外的快照版本门禁。清单固化后不得添加、删除或修改项目；发生变化时必须生成新合同。
+开发/实机验收的一次授权可以覆盖同一消息中逐项明确列出的完整固定清单。正式运行的 `execution_profile=production` 不依赖 Codex 对话确认，以发布前再次校验通过的 `pending update_price` 任务作为执行权威。逐商品载荷哈希绑定 `platform + internal_sku + expected_product_name + expected_grade + expected_old_price + target_price`；批次 `manifest_sha256` 绑定平台及规范化项目清单。解析后的商品名称和等级同时受 `item_payload_sha256` 和最终 `instruction_hash` 保护，但不引入额外的快照版本门禁。清单固化后不得添加、删除或修改项目；发生变化时必须生成新合同。
 
 ### 5.3 一个队列合同
 
 一个批次只允许投递一个 COMMIT 请求。顶层至少包含：
 
+- `schema_version=shadowbot-commit-batch-request-1.2` 和 `contract_version=4`；
 - `task_id` 或稳定的批次任务 ID；
-- `operation_id`；
-- `execution_attempt_id`；
+- 兼容用的批次顶层 `operation_id`；
+- 批次级 `execution_attempt_id`；
 - `execution_mode=COMMIT`；
 - `batch_id`；
 - 规范平台代码和名称；
@@ -180,7 +181,11 @@ platform + internal_sku
 
 每个 `items` 项至少绑定：
 
-- `item_id` 和连续序号；
+- 由“批次 + source_task_id”确定的稳定 `item_id`；
+- 由“source_task_id + 逐项载荷哈希”确定、跨同一业务操作发布重试保持稳定的 `operation_id`；
+- 由“批次 execution_attempt_id + item_id”确定的 `item_execution_attempt_id`；
+- 仅用于 UI 唯一定位的 `page_identity_key=平台 + 规范商品名 + 等级`；
+- 用于并发写入互斥的 `write_identity_key=平台 + internal_sku`；
 - `internal_sku`，以及由其解析得到的 `platform`、`expected_product_name` 和 `expected_grade`；
 - `expected_old_price`；
 - `target_price`；
@@ -231,7 +236,10 @@ side_effect_state = NOT_STARTED
 - 执行模式和指令哈希；
 - 授权清单哈希；
 - 每个 item 的平台、`internal_sku`、页面商品名、等级、旧价、目标价和 `item_payload_sha256`；
+- 每个 item 的操作 ID、尝试 ID、页面身份、写入身份、严格布尔值、规范价格和带时区观察时间；
 - 计数恒等式和未执行项目状态。
+
+新结果合同为 `shadowbot-commit-batch-result-1.1`。Worker 的通用异常和结果体积降级也必须保留与请求等长的完整 `items` 骨架，不允许用空数组丢失逐商品边界。Importer 先生成只读 `ImportPlan`，全部验证通过后，才在同一个 SQLite 事务中写入页面快照、任务状态、批次/逐项账本、operation/attempt/checkpoint、活动写锁和 `shadowbot_commit_result_receipts`。数据库回执是“结果已接受”的唯一真值；归档目录中的 import ACK 是事务后的文件投影，写入失败可以重试，不能回滚或重复业务写入。
 
 成功 COMMIT 项的规范状态为 `VERIFIED`，不再在新合同中生成旧状态 `SUCCESS`：
 
@@ -258,8 +266,8 @@ side_effect_state = NOT_STARTED
 - 总数、已尝试数、成功数、失败数、UNKNOWN 数和未执行数；
 - 每个商品的独立结果与回读证据；
 - 停止原因和停止项目；
-- `total = attempted + not_attempted`；
-- `attempted = verified + failed + unknown`。
+- `total = verified + not_applied + failed + unknown + not_attempted`；
+- `attempted` 只统计 `submit_attempted=true` 的项目，不能通过字符串真值或状态名称推导。
 
 `run_success_flag` 只代表技术运行结果。只有逐商品状态为 `VERIFIED`、`business_operation_completed=true`、`side_effect_state=VERIFIED`，并且 `actual_price=target_price` 时，PRA 才允许完成对应业务任务和回写平台价格。
 
@@ -326,7 +334,7 @@ READ_ONLY 以当前“上架中”页面为完整快照。页面商品在“商�
 
 ## 9. UNKNOWN 与 RECONCILE
 
-COMMIT 在点击提交后结果不确定时，不得直接重试写操作。PRA 为该商品创建唯一的只读 `RECONCILE` 尝试：
+COMMIT 在提交意图之后若无法证明“确认按钮未被点击”，必须进入 UNKNOWN，不得直接重试写操作。只有 `ShadowBotExecutor.ensure_reconcile_attempt(...)` 可以为该商品创建确定性 ID 的唯一只读 `RECONCILE` 尝试；Worker、Importer 和 Watchdog 只能记录或请求该入口，不能自行构造第二份对账：
 
 | 平台实际价 | 对账结果 | 是否回写 |
 | --- | --- | --- |
@@ -340,7 +348,7 @@ COMMIT 在点击提交后结果不确定时，不得直接重试写操作。PRA 
 
 ### 10.1 数据和合同
 
-1. SQLite 已升级到 v9，`listing_status` 表及库存观测字段存在。
+1. SQLite 已升级到 v12，`listing_status`、逐商品操作/尝试、活动写锁和技术回执结构存在。
 2. 测试平台商品已按“平台 + 品种 + 等级”维护当前价格，平台名称符合唯一规范。
 3. 每个执行项都有唯一的页面商品名称和等级。
 4. 固定改价满足 `TARGET_PRICE = OLD_PRICE + markup_value`。
@@ -376,7 +384,7 @@ COMMIT 在点击提交后结果不确定时，不得直接重试写操作。PRA 
 本文件要求的任务12核心闭环已经实现：
 
 1. 任务表以 `internal_sku`、`expected_old_price` 和 `target_price` 无损构建正式合同。
-2. v4 单次请求多商品合同、`manifest_sha256`、逐项哈希和 SQLite v11 批次/逐项账本已经落地。
+2. v4 单次请求多商品合同、`manifest_sha256`、逐项哈希和 SQLite v12 批次/逐项/技术回执账本已经落地。
 3. 批次创建前检查重复内部 SKU 和重复页面身份；Worker 运行时再次确认全部目标均唯一存在。
 4. Worker 写操作前校验所有目标旧价，失败时全批次 `NOT_STARTED`。
 5. 成功项只有存在独立 `actual_price=target_price` 回读时才回写平台价格，不回退到任务目标价。

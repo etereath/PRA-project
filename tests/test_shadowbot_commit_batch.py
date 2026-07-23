@@ -232,6 +232,30 @@ class ShadowBotCommitBatchContractTests(unittest.TestCase):
                 confirmed_by="unexpected",
             )
 
+    def test_development_request_can_bind_controlled_unknown_fault(self) -> None:
+        manifest = self.build_manifest()
+        request = self.build_request(
+            manifest,
+            profile="development",
+            confirmation_text=manifest["development_confirmation_text"],
+            confirmed_by="project-owner",
+            fault_injection="AFTER_SUBMIT_CLICK_UNKNOWN",
+        )
+
+        validate_request(request)
+        self.assertEqual(
+            request["fault_injection"],
+            "AFTER_SUBMIT_CLICK_UNKNOWN",
+        )
+        self.assertEqual(request["instruction_hash"], compute_instruction_hash(request))
+
+    def test_production_request_rejects_fault_injection(self) -> None:
+        with self.assertRaisesRegex(ValidationError, "不得携带故障注入"):
+            self.build_request(
+                self.build_manifest(),
+                fault_injection="AFTER_SUBMIT_CLICK_UNKNOWN",
+            )
+
     def test_snapshot_and_page_fields_are_rejected(self) -> None:
         invalid = [dict(self.items[0], page_position=1)]
         with self.assertRaisesRegex(ValidationError, "非正式输入字段"):

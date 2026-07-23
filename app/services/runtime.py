@@ -53,6 +53,7 @@ ALLOWED_TASK_TRANSITIONS = {
     TaskStatus.FAILED: {TaskStatus.PENDING, TaskStatus.CANCELLED},
     TaskStatus.MANUAL_REVIEW: {
         TaskStatus.PENDING,
+        TaskStatus.SUCCESS,
         TaskStatus.SKIPPED,
         TaskStatus.CANCELLED,
         TaskStatus.EXPIRED,

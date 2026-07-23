@@ -58,6 +58,11 @@ def _parser() -> argparse.ArgumentParser:
     publish.add_argument("--applet-uri", required=True)
     publish.add_argument("--confirmation-text", default="")
     publish.add_argument("--confirmed-by", default="")
+    publish.add_argument(
+        "--fault-injection",
+        choices=("AFTER_SUBMIT_CLICK_UNKNOWN",),
+        default="",
+    )
     publish.add_argument("--request-output", type=Path)
 
     run = subparsers.add_parser("production-run", help="正式模式：从 pending 任务创建并仅投递一次")
@@ -106,6 +111,7 @@ def main(argv: list[str] | None = None) -> int:
             applet_uri=args.applet_uri,
             confirmation_text=args.confirmation_text,
             confirmed_by=args.confirmed_by,
+            fault_injection=args.fault_injection,
         )
         if args.request_output:
             _write_json(args.request_output, request)

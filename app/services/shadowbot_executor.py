@@ -1038,6 +1038,15 @@ class ShadowBotExecutor:
         operation = self.repository.get_shadowbot_operation(attempt.operation_id)
         if operation is None:
             raise ValidationError("operation_id does not exist.")
+        if (
+            attempt.execution_mode == EXECUTION_MODE_RECONCILE
+            and result.side_effect_state
+            in {SIDE_EFFECT_VERIFIED, SIDE_EFFECT_NOT_APPLIED}
+        ):
+            self.repository.release_shadowbot_write_lock(
+                operation.operation_id,
+                released_at=completed_at,
+            )
         self._resolve_login_verification_handoff(
             execution_attempt_id=attempt.execution_attempt_id,
             result=result,
@@ -1065,6 +1074,61 @@ class ShadowBotExecutor:
                 raw_output=merged_raw_output,
             )
         self._insert_execution_log(operation=operation, attempt=attempt, result=result)
+        self._update_task_after_result(operation=operation, result=result)
+        self._update_listing_status_after_result(operation=operation, result=result)
+
+    def reproject_terminal_result(self, result: ShadowBotResultContract) -> None:
+        """Idempotently repair projections for an already accepted terminal result.
+
+        The attempt/result identity is validated by the importer before this
+        method is called. Replaying these projections never republishes a queue
+        request or inserts another execution log.
+        """
+
+        self.repository.init_schema()
+        normalized_side_effect, _ = normalize_side_effect_state(result.side_effect_state)
+        normalized_status, _ = normalize_result_status(result.status, normalized_side_effect)
+        if (
+            normalized_side_effect != result.side_effect_state
+            or normalized_status != result.status
+        ):
+            result = replace(
+                result,
+                status=normalized_status,
+                side_effect_state=normalized_side_effect,
+            )
+        _validate_result_contract(result)
+        attempt = self.repository.get_shadowbot_execution_attempt(
+            result.execution_attempt_id
+        )
+        if attempt is None or attempt.ended_at is None:
+            raise ValidationError(
+                "RESULT_CONTRACT_INVALID: terminal attempt does not exist."
+            )
+        self._validate_result_binding(attempt, result)
+        operation = self.repository.get_shadowbot_operation(attempt.operation_id)
+        if operation is None:
+            raise ValidationError("operation_id does not exist.")
+        operation_status = _operation_status_from_result(result)
+        if result.status in {STATUS_READ_COMPLETED, STATUS_PREVIEW_COMPLETED}:
+            operation_status = str(
+                attempt.raw_output.get("operation_status_before_attempt")
+                or OperationStatus.PENDING.value
+            )
+        self.repository.update_shadowbot_operation_status(
+            operation.operation_id,
+            operation_status,
+            lock_owner="",
+        )
+        if (
+            attempt.execution_mode == EXECUTION_MODE_RECONCILE
+            and result.side_effect_state
+            in {SIDE_EFFECT_VERIFIED, SIDE_EFFECT_NOT_APPLIED}
+        ):
+            self.repository.release_shadowbot_write_lock(
+                operation.operation_id,
+                released_at=utc_now(),
+            )
         self._update_task_after_result(operation=operation, result=result)
         self._update_listing_status_after_result(operation=operation, result=result)
 

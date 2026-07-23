@@ -104,7 +104,7 @@ def main() -> int:
             return 2
         while True:
             for event in run_cycle(importer, watchdog, login_monitor):
-                print(json.dumps(event, ensure_ascii=False, sort_keys=True), flush=True)
+                print(json.dumps(event, ensure_ascii=False, sort_keys=True, default=str), flush=True)
             if args.once:
                 return 0
             time.sleep(max(args.poll_seconds, 0.2))

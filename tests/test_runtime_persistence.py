@@ -68,7 +68,7 @@ class RuntimePersistenceTests(unittest.TestCase):
 
     def test_schema_initializes_version_and_partial_unique_index(self) -> None:
         self.task_service.init_schema()
-        self.assertEqual(self.repository.schema_versions(), list(range(1, 12)))
+        self.assertEqual(self.repository.schema_versions(), list(range(1, 13)))
         connection = sqlite3.connect(self.db_path)
         try:
             indexes = connection.execute("PRAGMA index_list(tasks)").fetchall()
@@ -108,7 +108,7 @@ class RuntimePersistenceTests(unittest.TestCase):
 
         repository = SQLiteRuntimeRepository(legacy_path)
         repository.init_schema()
-        self.assertEqual(repository.schema_versions(), list(range(1, 12)))
+        self.assertEqual(repository.schema_versions(), list(range(1, 13)))
         connection = sqlite3.connect(legacy_path)
         try:
             token_table = connection.execute(
@@ -164,6 +164,22 @@ class RuntimePersistenceTests(unittest.TestCase):
                 changed_by="worker",
                 reason="invalid",
             )
+
+    def test_manual_review_can_resolve_to_success_after_verified_reconcile(self) -> None:
+        self.task_service.create_tasks(
+            [_runtime_task("TASK-RECONCILED", status=TaskStatus.MANUAL_REVIEW)]
+        )
+
+        self.task_service.change_status(
+            task_id="TASK-RECONCILED",
+            to_status=TaskStatus.SUCCESS,
+            changed_by="shadowbot_executor",
+            reason="shadowbot_business_completed",
+        )
+
+        task = self.task_service.get_task("TASK-RECONCILED")
+        self.assertIsNotNone(task)
+        self.assertEqual(task.task_status, TaskStatus.SUCCESS)
 
     def test_overdue_pending_tasks_are_expired_with_history(self) -> None:
         now = datetime(2026, 7, 21, 22, 54)

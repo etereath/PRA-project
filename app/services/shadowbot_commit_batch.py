@@ -17,10 +17,11 @@ from app.shadowbot_contract_primitives import (
 
 
 CONTRACT_VERSION = 4
-SCHEMA_VERSION = "shadowbot-commit-batch-request-1.1"
-PROPOSAL_SCHEMA_VERSION = "shadowbot-commit-manifest-1.1"
+SCHEMA_VERSION = "shadowbot-commit-batch-request-1.2"
+PROPOSAL_SCHEMA_VERSION = "shadowbot-commit-manifest-1.2"
 MAX_ITEMS = 50
 EXECUTION_PROFILES = frozenset({"development", "production"})
+DEVELOPMENT_FAULT_INJECTIONS = frozenset({"AFTER_SUBMIT_CLICK_UNKNOWN"})
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}")
 _SHA256_RE = re.compile(r"sha256:[0-9a-f]{64}")
 _FORBIDDEN_POSITION_FIELDS = frozenset(
@@ -136,7 +137,6 @@ def build_commit_manifest(
         if old_price == target_price:
             raise ValidationError(f"SKU {internal_sku} 的旧价与目标价相同。")
         item = {
-            "item_id": f"ITEM-{source_task_id}",
             "source_task_id": source_task_id,
             "internal_sku": internal_sku,
             "expected_product_name": str(identity["expected_product_name"]).strip(),
@@ -145,6 +145,23 @@ def build_commit_manifest(
             "target_price": target_price,
         }
         item["item_payload_sha256"] = _sha256(_item_manifest_payload(normalized_platform, item))
+        item["item_id"] = _stable_id(
+            "ITEM",
+            {"batch_id": batch_id, "source_task_id": source_task_id},
+        )
+        item["operation_id"] = _stable_id(
+            "OP",
+            {
+                "source_task_id": source_task_id,
+                "item_payload_sha256": item["item_payload_sha256"],
+            },
+        )
+        item["write_identity_key"] = _write_identity_key(normalized_platform, internal_sku)
+        item["page_identity_key"] = _page_identity_key(
+            normalized_platform,
+            item["expected_product_name"],
+            item["expected_grade"],
+        )
         normalized_items.append(item)
 
     manifest = {
@@ -174,6 +191,7 @@ def build_commit_request(
     window_title: str = "微信",
     capture_evidence: bool = False,
     ttl_minutes: int = 30,
+    fault_injection: str = "",
 ) -> dict[str, Any]:
     validate_manifest(manifest)
     profile = str(execution_profile or "").strip().lower()
@@ -211,7 +229,19 @@ def build_commit_request(
         "execution_mode": "COMMIT",
         "batch_id": manifest["batch_id"],
         "platform_name": manifest["platform_name"],
-        "items": [dict(item) for item in manifest["items"]],
+        "items": [
+            {
+                **dict(item),
+                "item_execution_attempt_id": _stable_id(
+                    "ATTEMPT",
+                    {
+                        "execution_attempt_id": execution_attempt_id,
+                        "item_id": item["item_id"],
+                    },
+                ),
+            }
+            for item in manifest["items"]
+        ],
         "manifest_sha256": manifest["manifest_sha256"],
         "applet_uri": str(applet_uri or "").strip(),
         "window_title": str(window_title or "微信").strip(),
@@ -222,6 +252,8 @@ def build_commit_request(
     if development_confirmation is not None:
         development_confirmation["confirmed_at"] = now.isoformat()
         request["development_confirmation"] = development_confirmation
+    if str(fault_injection or "").strip():
+        request["fault_injection"] = str(fault_injection).strip()
     request["instruction_hash"] = compute_instruction_hash(request)
     validate_request(request)
     return request
@@ -247,6 +279,8 @@ def compute_instruction_hash(request: dict[str, Any]) -> str:
         "created_at": request.get("created_at"),
         "expires_at": request.get("expires_at"),
     }
+    if "fault_injection" in request:
+        canonical["fault_injection"] = request.get("fault_injection")
     return _sha256(canonical)
 
 
@@ -266,6 +300,14 @@ def validate_request(
     profile = str(request.get("execution_profile") or "").strip().lower()
     if profile not in EXECUTION_PROFILES:
         raise ValidationError("INVALID_EXECUTION_PROFILE")
+    if "fault_injection" in request:
+        fault_injection = str(request.get("fault_injection") or "").strip().upper()
+        if profile != "development":
+            raise ValidationError("正式运行合同不得携带故障注入字段。")
+        if fault_injection not in DEVELOPMENT_FAULT_INJECTIONS:
+            raise ValidationError("开发阶段故障注入值不受支持。")
+        if request.get("fault_injection") != fault_injection:
+            raise ValidationError("开发阶段故障注入值必须使用规范枚举。")
     allowed_request_fields = {
         "schema_version",
         "contract_version",
@@ -285,6 +327,7 @@ def validate_request(
         "created_at",
         "expires_at",
         "instruction_hash",
+        "fault_injection",
     }
     unexpected = sorted(set(request) - allowed_request_fields)
     if unexpected:
@@ -295,7 +338,13 @@ def validate_request(
     for name in ("task_id", "operation_id", "execution_attempt_id", "batch_id"):
         _validate_id(str(request.get(name) or ""), name)
     platform_name = _required_text(request, "platform_name")
-    items = _validate_items(platform_name, request.get("items"))
+    items = _validate_items(
+        platform_name,
+        request.get("items"),
+        batch_id=str(request["batch_id"]),
+        execution_attempt_id=str(request["execution_attempt_id"]),
+        require_item_execution_attempt_id=True,
+    )
     supplied_manifest_hash = str(request.get("manifest_sha256") or "")
     if not _SHA256_RE.fullmatch(supplied_manifest_hash):
         raise ValidationError("COMMIT 批次 manifest_sha256 无效。")
@@ -350,7 +399,11 @@ def validate_manifest(manifest: dict[str, Any]) -> None:
     if str(manifest.get("execution_mode") or "").upper() != "COMMIT":
         raise ValidationError("COMMIT_REQUIRED")
     platform_name = _required_text(manifest, "platform_name")
-    items = _validate_items(platform_name, manifest.get("items"))
+    items = _validate_items(
+        platform_name,
+        manifest.get("items"),
+        batch_id=str(manifest["batch_id"]),
+    )
     if manifest.get("manifest_sha256") != _manifest_sha256(platform_name, items):
         raise ValidationError("COMMIT 清单哈希不匹配。")
     if manifest.get("development_confirmation_text") != required_development_confirmation(
@@ -363,7 +416,14 @@ def required_development_confirmation(batch_id: str, item_count: int) -> str:
     return f"确认授权批次 {batch_id} 以上{item_count}项真实COMMIT"
 
 
-def _validate_items(platform_name: str, raw_items: Any) -> list[dict[str, Any]]:
+def _validate_items(
+    platform_name: str,
+    raw_items: Any,
+    *,
+    batch_id: str,
+    execution_attempt_id: str = "",
+    require_item_execution_attempt_id: bool = False,
+) -> list[dict[str, Any]]:
     if not isinstance(raw_items, list) or not raw_items or len(raw_items) > MAX_ITEMS:
         raise ValidationError("COMMIT 批次 items 数量无效。")
     allowed_item_fields = {
@@ -375,6 +435,10 @@ def _validate_items(platform_name: str, raw_items: Any) -> list[dict[str, Any]]:
         "expected_old_price",
         "target_price",
         "item_payload_sha256",
+        "operation_id",
+        "item_execution_attempt_id",
+        "write_identity_key",
+        "page_identity_key",
     }
     seen_item_ids: set[str] = set()
     seen_task_ids: set[str] = set()
@@ -395,10 +459,23 @@ def _validate_items(platform_name: str, raw_items: Any) -> list[dict[str, Any]]:
             "internal_sku",
             "expected_product_name",
             "expected_grade",
+            "operation_id",
+            "write_identity_key",
+            "page_identity_key",
         ):
             _required_text(item, name)
+        if require_item_execution_attempt_id:
+            _required_text(item, "item_execution_attempt_id")
+        elif "item_execution_attempt_id" in item:
+            raise ValidationError("COMMIT 清单不得预先分配 item_execution_attempt_id。")
         _validate_id(str(item["item_id"]), "item_id")
         _validate_id(str(item["source_task_id"]), "source_task_id")
+        _validate_id(str(item["operation_id"]), "operation_id")
+        if require_item_execution_attempt_id:
+            _validate_id(
+                str(item["item_execution_attempt_id"]),
+                "item_execution_attempt_id",
+            )
         item_id = str(item["item_id"])
         task_id = str(item["source_task_id"])
         internal_sku = str(item["internal_sku"]).strip().upper()
@@ -421,6 +498,46 @@ def _validate_items(platform_name: str, raw_items: Any) -> list[dict[str, Any]]:
         expected_hash = _sha256(_item_manifest_payload(platform_name, item))
         if not _SHA256_RE.fullmatch(supplied_hash) or supplied_hash != expected_hash:
             raise ValidationError("COMMIT item payload 哈希不匹配。")
+        expected_item_id = _stable_id(
+            "ITEM",
+            {
+                "batch_id": batch_id,
+                "source_task_id": task_id,
+            },
+        )
+        if item_id != expected_item_id:
+            raise ValidationError("COMMIT item item_id 与批次任务不匹配。")
+        expected_operation_id = _stable_id(
+            "OP",
+            {
+                "source_task_id": task_id,
+                "item_payload_sha256": supplied_hash,
+            },
+        )
+        if str(item["operation_id"]) != expected_operation_id:
+            raise ValidationError("COMMIT item operation_id 与任务载荷不匹配。")
+        if require_item_execution_attempt_id:
+            expected_attempt_id = _stable_id(
+                "ATTEMPT",
+                {
+                    "execution_attempt_id": execution_attempt_id,
+                    "item_id": item_id,
+                },
+            )
+            if str(item["item_execution_attempt_id"]) != expected_attempt_id:
+                raise ValidationError(
+                    "COMMIT item item_execution_attempt_id 与批次尝试不匹配。"
+                )
+        if str(item["write_identity_key"]) != _write_identity_key(
+            platform_name, internal_sku
+        ):
+            raise ValidationError("COMMIT item write_identity_key 不匹配。")
+        if str(item["page_identity_key"]) != _page_identity_key(
+            platform_name,
+            item["expected_product_name"],
+            item["expected_grade"],
+        ):
+            raise ValidationError("COMMIT item page_identity_key 不匹配。")
     return raw_items
 
 
@@ -429,6 +546,10 @@ def _item_manifest_payload(platform_name: str, item: dict[str, Any]) -> dict[str
         "platform_name": str(platform_name or "").strip(),
         "source_task_id": str(item.get("source_task_id") or "").strip(),
         "internal_sku": str(item.get("internal_sku") or "").strip().upper(),
+        "expected_product_name": normalize_text(
+            item.get("expected_product_name")
+        ),
+        "expected_grade": normalize_grade(item.get("expected_grade")),
         "expected_old_price": _price(item.get("expected_old_price"), "expected_old_price"),
         "target_price": _price(item.get("target_price"), "target_price"),
     }
@@ -463,3 +584,26 @@ def _validate_id(value: str, name: str) -> None:
 
 def _sha256(payload: Any) -> str:
     return sha256_json(payload)
+
+
+def _stable_id(prefix: str, payload: Any) -> str:
+    return f"{prefix}-{_sha256(payload).removeprefix('sha256:')[:32]}"
+
+
+def _write_identity_key(platform_name: str, internal_sku: str) -> str:
+    return "|".join(
+        (
+            normalize_text(platform_name),
+            str(internal_sku or "").strip().upper(),
+        )
+    )
+
+
+def _page_identity_key(platform_name: str, product_name: str, grade: str) -> str:
+    return "|".join(
+        (
+            normalize_text(platform_name),
+            normalize_text(product_name),
+            normalize_grade(grade),
+        )
+    )

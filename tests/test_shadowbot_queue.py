@@ -458,6 +458,46 @@ class ShadowBotQueueTests(unittest.TestCase):
         self.assertTrue(result_path.exists())
         self.assertFalse(list((self.queue_dir / "quarantine").glob("*.result.json")))
 
+    def test_terminal_result_reimport_repairs_interrupted_task_projection(self) -> None:
+        prepared, repository, runner, request, request_path = self._prepare_attempt(
+            "REPROJECT"
+        )
+        result_path = self._write_result(
+            request,
+            request_path,
+            status="VERIFIED",
+            side_effect_state="VERIFIED",
+        )
+        importer = ShadowBotResultImporter(repository, runner, self.queue_dir)
+
+        with patch.object(
+            importer.executor,
+            "_update_task_after_result",
+            side_effect=ValidationError("simulated projection interruption"),
+        ):
+            with self.assertRaisesRegex(
+                ValidationError,
+                "simulated projection interruption",
+            ):
+                importer.import_one(result_path)
+
+        interrupted_attempt = repository.get_shadowbot_execution_attempt(
+            prepared.execution_attempt_id
+        )
+        interrupted_task = repository.get_task(request["task_id"])
+        assert interrupted_attempt is not None
+        assert interrupted_task is not None
+        self.assertIsNotNone(interrupted_attempt.ended_at)
+        self.assertNotEqual(interrupted_task.task_status.value, "success")
+
+        event = importer.import_one(result_path)
+
+        repaired_task = repository.get_task(request["task_id"])
+        assert repaired_task is not None
+        self.assertEqual(event["status"], "ALREADY_IMPORTED")
+        self.assertEqual(repaired_task.task_status.value, "success")
+        self.assertFalse(result_path.exists())
+
     def test_queue_json_reader_retries_windows_file_collision(self) -> None:
         path = self.root / "heartbeat.json"
         path.write_text('{"status":"RUNNING"}', encoding="utf-8")
@@ -501,7 +541,7 @@ class ShadowBotQueueTests(unittest.TestCase):
             "scripts.run_shadowbot_queue_services.ShadowBotQueueWatchdog"
         ), patch(
             "scripts.run_shadowbot_queue_services.run_cycle",
-            return_value=[],
+            return_value=[{"status": "IMPORTED", "observed_at": datetime(2026, 7, 23, tzinfo=UTC)}],
         ), patch(
             "scripts.run_shadowbot_queue_services.msvcrt.locking"
         ), patch.object(

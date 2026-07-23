@@ -9,6 +9,7 @@ description = "平台无关的价格与上下架自动化 MVP（预留 AI 定价
 requires-python = ">=3.11"
 dependencies = [
   "openpyxl>=3.1.5,<4",
+  "tzdata>=2025.2; platform_system == 'Windows'",
 ]
 
 [project.scripts]
