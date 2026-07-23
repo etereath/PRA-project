@@ -14,28 +14,40 @@ from pathlib import Path
 
 try:
     from app.shadowbot_contract_primitives import (
+        build_v4_recovery_result,
         canonical_positive_price,
+        derive_v4_batch_semantics,
         normalize_contract_grade,
         normalize_contract_sku,
         normalize_contract_text,
         sha256_json,
+        v4_result_counts,
+        v4_result_item_skeleton,
     )
 except ImportError:
     try:
         from .shadowbot_contract_primitives import (
+            build_v4_recovery_result,
             canonical_positive_price,
+            derive_v4_batch_semantics,
             normalize_contract_grade,
             normalize_contract_sku,
             normalize_contract_text,
             sha256_json,
+            v4_result_counts,
+            v4_result_item_skeleton,
         )
     except ImportError:
         from shadowbot_contract_primitives import (
+            build_v4_recovery_result,
             canonical_positive_price,
+            derive_v4_batch_semantics,
             normalize_contract_grade,
             normalize_contract_sku,
             normalize_contract_text,
             sha256_json,
+            v4_result_counts,
+            v4_result_item_skeleton,
         )
 
 
@@ -256,63 +268,20 @@ def _v4_page_identity_key(platform_name, product_name, grade):
 
 
 def _v4_result_item_skeleton(item, *, status="NOT_ATTEMPTED", error_code="", error_message=""):
-    return {
-        "item_id": item.get("item_id", ""),
-        "source_task_id": item.get("source_task_id", ""),
-        "internal_sku": item.get("internal_sku", ""),
-        "expected_product_name": item.get("expected_product_name", ""),
-        "expected_grade": item.get("expected_grade", ""),
-        "expected_old_price": item.get("expected_old_price", ""),
-        "target_price": item.get("target_price", ""),
-        "item_payload_sha256": item.get("item_payload_sha256", ""),
-        "operation_id": item.get("operation_id", ""),
-        "item_execution_attempt_id": item.get("item_execution_attempt_id", ""),
-        "write_identity_key": item.get("write_identity_key", ""),
-        "page_identity_key": item.get("page_identity_key", ""),
-        "preflight_row": None,
-        "preflight_price": None,
-        "execution_ordinal": None,
-        "submit_attempted": False,
-        "side_effect_state": "NOT_STARTED",
-        "preflight_observed_at": None,
-        "submit_intent_at": None,
-        "submit_clicked_at": None,
-        "readback_observed_at": None,
-        "actual_price": None,
-        "status": status,
-        "error_code": error_code,
-        "error_message": error_message,
-    }
+    return v4_result_item_skeleton(
+        item,
+        status=status,
+        error_code=error_code,
+        error_message=error_message,
+    )
 
 
 def _v4_result_counts(items):
-    counts = {
-        "total": len(items),
-        "attempted": 0,
-        "verified": 0,
-        "not_applied": 0,
-        "failed": 0,
-        "unknown": 0,
-        "not_attempted": 0,
-    }
-    for item in items:
-        if item.get("submit_attempted") is True:
-            counts["attempted"] += 1
-        status = str(item.get("status") or "").lower()
-        if status not in counts or status == "total" or status == "attempted":
-            raise ValueError("invalid COMMIT result item status")
-        counts[status] += 1
-    return counts
+    return v4_result_counts(items)
 
 
 def _v4_batch_status(counts):
-    if counts["verified"] == counts["total"]:
-        return "VERIFIED"
-    if counts["verified"]:
-        return "PARTIAL"
-    if counts["unknown"]:
-        return "UNKNOWN"
-    return "FAILED"
+    return derive_v4_batch_semantics(counts)["batch_status"]
 
 
 def _v4_validate_request(request):
@@ -766,34 +735,38 @@ class QueueWorker:
             )
             result = json.loads(raw_result) if isinstance(raw_result, str) else dict(raw_result)
         except Exception as exc:
-            result = {
-                "status": "FAILED",
-                "run_success_flag": False,
-                "business_operation_completed": False,
-                "side_effect_state": "NOT_STARTED",
-                "error_code": "BATCH_STOPPED" if request.get("contract_version") == V2_CONTRACT_VERSION else "WORKER_EXECUTION_FAILED",
-                # A lower-level UI exception can echo the text that was passed
-                # to a credential field. Keep queue results free of secrets.
-                "error_message": "worker execution failed: " + type(exc).__name__,
-                "retryable": False,
-            }
             if is_v4:
-                result_items = [
-                    _v4_result_item_skeleton(
-                        item,
-                        status="FAILED",
-                        error_code="WORKER_EXECUTION_FAILED",
-                        error_message="worker execution failed: " + type(exc).__name__,
+                try:
+                    phase_data = json.loads(
+                        phase_path.read_text(encoding="utf-8-sig")
                     )
-                    for item in request.get("items") or []
-                ]
-                result.update(
-                    {
-                        "batch_status": "FAILED",
-                        "items": result_items,
-                        "counts": _v4_result_counts(result_items),
-                    }
+                except (OSError, ValueError, json.JSONDecodeError):
+                    phase_data = {}
+                result = build_v4_recovery_result(
+                    request,
+                    phase_data,
+                    request_file_sha256=request_sha256,
+                    recovered_at=_now_iso(),
+                    worker_id=self.worker_id,
+                    error_code="WORKER_EXECUTION_FAILED",
+                    error_message="worker execution failed: "
+                    + type(exc).__name__,
                 )
+            else:
+                result = {
+                    "status": "FAILED",
+                    "run_success_flag": False,
+                    "business_operation_completed": False,
+                    "side_effect_state": "NOT_STARTED",
+                    "error_code": "BATCH_STOPPED"
+                    if request.get("contract_version") == V2_CONTRACT_VERSION
+                    else "WORKER_EXECUTION_FAILED",
+                    # A lower-level UI exception can echo the text that was passed
+                    # to a credential field. Keep queue results free of secrets.
+                    "error_message": "worker execution failed: "
+                    + type(exc).__name__,
+                    "retryable": False,
+                }
         provider_error_code = str(result.get("provider_error_code") or "").strip()
         if provider_error_code in SAFE_PROVIDER_ERROR_CODES:
             result["provider_error_code"] = provider_error_code
@@ -895,7 +868,7 @@ class QueueWorker:
                 )[:512]
                 compact_items.append(compact)
             compact_counts = _v4_result_counts(compact_items)
-            compact_batch_status = _v4_batch_status(compact_counts)
+            compact_semantics = derive_v4_batch_semantics(compact_counts)
             result = {
                 "schema_version": V4_RESULT_SCHEMA_VERSION,
                 "contract_version": V4_CONTRACT_VERSION,
@@ -910,23 +883,15 @@ class QueueWorker:
                 "worker_id": self.worker_id,
                 "queue_phase": "RESULT_WRITTEN",
                 "worker_heartbeat_at": _now_iso(),
-                "status": compact_batch_status,
-                "batch_status": compact_batch_status,
-                "run_success_flag": compact_batch_status == "VERIFIED",
-                "business_operation_completed": compact_counts["attempted"] > 0,
-                "side_effect_state": (
-                    "VERIFIED"
-                    if compact_batch_status == "VERIFIED"
-                    else "UNKNOWN"
-                    if compact_counts["unknown"]
-                    else "NOT_STARTED"
-                ),
+                **compact_semantics,
                 "error_code": (
-                    "" if compact_batch_status == "VERIFIED" else "RESULT_COMPACTED"
+                    ""
+                    if compact_semantics["batch_status"] == "VERIFIED"
+                    else "RESULT_COMPACTED"
                 ),
                 "error_message": (
                     ""
-                    if compact_batch_status == "VERIFIED"
+                    if compact_semantics["batch_status"] == "VERIFIED"
                     else "oversized result was reduced to its complete item ledger"
                 ),
                 "retryable": False,
@@ -937,7 +902,14 @@ class QueueWorker:
             content = _json_bytes(result)
         _atomic_write(result_path.with_suffix(result_path.suffix + ".sha256"), (hashlib.sha256(content).hexdigest() + "\n").encode("ascii"))
         _atomic_write(result_path, content)
-        self._write_phase(request, phase_path, "RESULT_WRITTEN", str(result.get("side_effect_state") or "NOT_STARTED"), request_sha256)
+        self._write_phase(
+            request,
+            phase_path,
+            "RESULT_WRITTEN",
+            str(result.get("side_effect_state") or "NOT_STARTED"),
+            request_sha256,
+            result_snapshot=result if is_v4 else None,
+        )
 
     def _build_credential_provider(self):
         try:
@@ -952,7 +924,16 @@ class QueueWorker:
                 self.credential_provider_error_code = provider_error_code
             return None
 
-    def _write_phase(self, request, phase_path, phase, side_effect_state, request_sha256):
+    def _write_phase(
+        self,
+        request,
+        phase_path,
+        phase,
+        side_effect_state,
+        request_sha256,
+        *,
+        result_snapshot=None,
+    ):
         payload = {
             "task_id": request.get("task_id", ""),
             "operation_id": request.get("operation_id", ""),
@@ -985,6 +966,8 @@ class QueueWorker:
                     "total_count": len(request.get("items") or []),
                 }
             )
+            if isinstance(result_snapshot, dict):
+                payload["batch_result_snapshot"] = result_snapshot
         _atomic_write(phase_path, _json_bytes(payload))
 
     def _write_rejected_request_result(

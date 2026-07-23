@@ -188,6 +188,74 @@ class ListingStatusTests(unittest.TestCase):
             self.assertEqual(status.inventory_source_attempt_id, "READ-1")
             self.assertEqual(status.source, "shadowbot")
 
+    def test_reconcile_listing_freshness_uses_readback_time_and_requires_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            repository = SQLiteRuntimeRepository(Path(temp_dir) / "runtime.sqlite3")
+            repository.init_schema()
+            original_time = datetime(2026, 7, 21, 9, 0, tzinfo=UTC)
+            observed_at = datetime(2026, 7, 21, 10, 0, tzinfo=UTC)
+            repository.upsert_listing_status(
+                ListingStatus(
+                    listing_status_id="LISTING-RECONCILE-1",
+                    platform_name="蚂蚁",
+                    internal_sku="SKU-001",
+                    variety="艾莎",
+                    grade="C",
+                    current_price=Decimal("18.50"),
+                    updated_at=original_time,
+                )
+            )
+            executor = ShadowBotExecutor(repository, object())
+            operation = ShadowBotOperationLedger(
+                operation_id="OP-RECONCILE-1",
+                task_id="TASK-RECONCILE-1",
+                platform="蚂蚁",
+                product_identity={"variety": "艾莎", "grade": "C"},
+                expected_old_price=Decimal("18.50"),
+                target_price=Decimal("20.00"),
+                status="NEEDS_RECONCILIATION",
+            )
+            without_time = ShadowBotResultContract(
+                execution_attempt_id="RECONCILE-1",
+                execution_mode="RECONCILE",
+                status="VERIFIED",
+                run_success_flag=True,
+                business_operation_completed=True,
+                side_effect_state="VERIFIED",
+                retryable=False,
+                raw_output={"actual_price": "20.00"},
+            )
+            executor._update_listing_status_after_result(
+                operation=operation,
+                result=without_time,
+            )
+            unchanged = repository.get_listing_status("蚂蚁", "艾莎", "C")
+            assert unchanged is not None
+            self.assertEqual(unchanged.current_price, Decimal("18.50"))
+            self.assertEqual(unchanged.updated_at, original_time)
+
+            with_time = ShadowBotResultContract(
+                execution_attempt_id="RECONCILE-2",
+                execution_mode="RECONCILE",
+                status="VERIFIED",
+                run_success_flag=True,
+                business_operation_completed=True,
+                side_effect_state="VERIFIED",
+                retryable=False,
+                raw_output={
+                    "actual_price": "20.00",
+                    "readback_observed_at": observed_at.isoformat(),
+                },
+            )
+            executor._update_listing_status_after_result(
+                operation=operation,
+                result=with_time,
+            )
+            updated = repository.get_listing_status("蚂蚁", "艾莎", "C")
+            assert updated is not None
+            self.assertEqual(updated.current_price, Decimal("20.00"))
+            self.assertEqual(updated.updated_at, observed_at)
+
     def test_shadowbot_inventory_observation_updates_default_and_rejects_stale_result(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             repository = SQLiteRuntimeRepository(Path(temp_dir) / "runtime.sqlite3")

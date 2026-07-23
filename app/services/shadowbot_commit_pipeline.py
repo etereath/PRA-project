@@ -36,6 +36,7 @@ ITEM_STATUSES = frozenset(
 )
 from app.shadowbot_contract_primitives import (
     canonical_positive_price,
+    derive_v4_batch_semantics,
     sha256_json,
 )
 ITEM_SIDE_EFFECT_STATES = frozenset(
@@ -714,7 +715,7 @@ def import_task_commit_result(
                     (
                         item["internal_sku"],
                         item["actual_price"],
-                        now,
+                        item["readback_observed_at"],
                         identity[0],
                         identity[1],
                         identity[2],
@@ -820,6 +821,23 @@ def _build_commit_import_plan(
             raise ValidationError("COMMIT 批次结果 counts 必须是整数。")
         if supplied_value != value:
             raise ValidationError("COMMIT 批次结果计数恒等式不成立。")
+    expected_semantics = derive_v4_batch_semantics(counts)
+    for name in (
+        "batch_status",
+        "status",
+        "run_success_flag",
+        "business_operation_completed",
+        "side_effect_state",
+    ):
+        if name not in result:
+            raise ValidationError(f"COMMIT 批次结果缺少顶层语义字段：{name}")
+        supplied_value = result[name]
+        expected_value = expected_semantics[name]
+        if isinstance(expected_value, bool):
+            if type(supplied_value) is not bool or supplied_value is not expected_value:
+                raise ValidationError(f"COMMIT 批次顶层语义与逐商品结果不一致：{name}")
+        elif str(supplied_value or "").upper() != str(expected_value).upper():
+            raise ValidationError(f"COMMIT 批次顶层语义与逐商品结果不一致：{name}")
 
     normalized_items: list[dict[str, Any]] = []
     for task_id, raw_item in supplied.items():
@@ -832,7 +850,7 @@ def _build_commit_import_plan(
             item["source_task_id"],
         )
     )
-    expected_batch_status = _derived_batch_status(counts)
+    expected_batch_status = expected_semantics["batch_status"]
     batch_status = str(result.get("batch_status") or "").upper()
     if batch_status != expected_batch_status:
         raise ValidationError(
@@ -938,10 +956,20 @@ def _normalize_result_item(
         ):
             raise ValidationError(f"VERIFIED 项缺少完整提交与回读证据：{task_id}")
     elif status == "UNKNOWN":
+        fail_closed_recovery = str(item.get("error_code") or "") in {
+            "PHASE_UNAVAILABLE_SIDE_EFFECT_UNKNOWN",
+            "PHASE_SNAPSHOT_BINDING_INVALID",
+            "PHASE_ITEM_BINDING_INVALID",
+            "PHASE_INSUFFICIENT_SIDE_EFFECT_UNKNOWN",
+        }
         if (
             not submit_attempted
             or side_effect_state not in {"SUBMIT_CLICKED", "UNKNOWN"}
-            or (submit_clicked_at is None and submit_intent_at is None)
+            or (
+                submit_clicked_at is None
+                and submit_intent_at is None
+                and not fail_closed_recovery
+            )
         ):
             raise ValidationError(f"UNKNOWN 项缺少提交风险证据：{task_id}")
     elif status == "NOT_APPLIED":
@@ -1002,13 +1030,7 @@ def _optional_observation_time(value: Any, name: str) -> str | None:
 
 
 def _derived_batch_status(counts: dict[str, int]) -> str:
-    if counts["verified"] == counts["total"]:
-        return "VERIFIED"
-    if counts["verified"]:
-        return "PARTIAL"
-    if counts["unknown"]:
-        return "UNKNOWN"
-    return "FAILED"
+    return derive_v4_batch_semantics(counts)["batch_status"]
 
 
 def _terminal_item_ledger_states(status: str, side_effect_state: str) -> tuple[str, str, str]:

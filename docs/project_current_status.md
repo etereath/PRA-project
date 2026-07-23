@@ -215,7 +215,7 @@ SQLite 只承接运行态任务系统，不替代 Excel 主数据。
 - 已新增 `check-yingdao-app-params` 只读预检命令，可在真实启动前确认影刀应用已暴露 `request_json` 入参和 `shadowbot_result_json` 出参。
 - 已新增 `scripts/check_shadowbot_readiness.py` 离线就绪检查命令，可在真实启动前检查 runner、runtime DB 和必需环境变量；该命令不启动影刀、不访问影刀 OpenAPI，也不会输出密钥明文。
 - 已新增 `poll-yingdao-result` 桥接命令，可通过影刀 `job/query` 读取 `shadowbot_result_json` 出参并回写 PRA `execution_logs`、operation 和 task。
-- 当前项目不再使用环境变量 SKU/平台白名单；production profile 以发布前再次校验通过的 `pending update_price` 任务为执行权威，并由 v4 批次/逐项哈希、单 Worker 多商品严格串行、旧价门禁和可对账状态机共同约束。
+- 当前项目不再使用环境变量 SKU/平台白名单；任务14完成前，production 入口只接受操作人员明确传入的一个或多个 `--task-id`，再校验这些任务仍为有效 `pending update_price`。`pending` 只是候选状态，不能由调度器自动解释为执行授权。明确选择后的批次由 v4 批次/逐项哈希、单 Worker 多商品严格串行、旧价门禁和可对账状态机共同约束。
 - 已新增 `scripts/prepare_shadowbot_e2e_chain.py`，可一键准备首条 `update_price` task、approved review、批准载荷 hash，并在显式 `--start` 时调用 Executor 启动 `COMMIT`。
 - 已新增 `scripts/run_shadowbot_e2e_local_demo.py`，可在本地 runtime DB 中演练成功、提交前失败、提交后未知再对账三条结果分支，并通过 Web 执行日志查看字段、告警和证据链接。
 - 已新增 `scripts/run_shadowbot_executor.py` 桥接脚本，可从已批准 review 启动 ShadowBot 执行尝试，也可导入影刀结果 JSON 回灌 PRA 运行态。
@@ -248,7 +248,7 @@ SQLite 只承接运行态任务系统，不替代 Excel 主数据。
 7. 复核处理结果写回 `review_tasks`。
 8. 如绑定源任务且满足条件，通过 `RuntimeTaskService` 推动 `tasks` 状态。
 9. 源任务状态变化写入 `task_status_history`。
-10. 对发布前校验仍有效的 `pending update_price` 任务，ShadowBot 批次管线读取完整任务列表并生成一个 v4 COMMIT 请求。
+10. 操作人员显式传入一个或多个 `--task-id`；ShadowBot 批次管线只读取这些明确选择且发布前仍有效的 `pending update_price` 任务，并生成一个 v4 COMMIT 请求。
 11. Worker 完成全页预扫描、旧价门禁、页面顺序编排、严格串行提交和独立回读。
 12. Result Importer 校验合同后更新任务、批次账本、逐商品账本、`listing_status` 和 `execution_logs`。
 
@@ -262,7 +262,7 @@ Mock 平台测试流程在当前阶段作为本地验证链路：
 
 真实平台价格更新流程：
 
-1. 任务中心提供同一平台的完整 `update_price` 任务列表。
+1. 操作人员从任务中心明确选择同一平台的一个或多个 `update_price task_id`；任务14前禁止自动扫描并发布全部 pending。
 2. PRA 以 `products.xlsx` 将 SKU 唯一映射为页面商品名称和等级。
 3. 批次管线创建一个 v4 COMMIT 合同并原子发布一次。
 4. ShadowBot 读取当前页面、匹配全部目标并校验全部旧价。
@@ -428,7 +428,7 @@ Web 复核主入口：
 ## 8. 后续推荐优先级
 
 任务12审查修复版的正常 COMMIT 与受控 UNKNOWN→唯一 RECONCILE 实机证据
-均已完成。当前下一步是完成文档和 GitHub PR 交接并交由审查方复核；不是修改
+均已完成。PR 内已补充可复算的脱敏原始证据；当前下一步是完成 GitHub PR 交接并交由审查方复核；不是修改
 任务状态，也不是扩大无人值守真实 RPA。
 
 Code Review 后的高中低风险问题已完成修复，系统冒烟测试、全量单元测试和主控端到端流程测试均已通过。修复详情见 [reports/risk_fix_report_20260610.md](reports/risk_fix_report_20260610.md)。
@@ -436,12 +436,13 @@ Code Review 后的高中低风险问题已完成修复，系统冒烟测试、�
 推荐顺序：
 
 1. 审查 [reports/task12_review_remediation_20260723.md](reports/task12_review_remediation_20260723.md) 中新增的正常四商品 COMMIT 与受控 UNKNOWN→唯一 RECONCILE 证据。
-2. 连同 [reports/task12_final_handoff_20260723.md](reports/task12_final_handoff_20260723.md)、证据索引和对应本地归档交由审查方复核；审查通过后再修改任务12状态。
-3. 进入任务13，复用任务12的合同、队列、身份映射、账本、完整页面快照和副作用状态机，实现上下架及 OFFLINE 跨页面对账。
-4. 补充长期告警、磁盘清理、证据保留和服务账号运维样本，并分别定义冷态/暖态性能指标。
-5. 继续运行系统冒烟、完整单元测试和 ShadowBot 成功基线测试，任何新功能不得重写已验证 COMMIT 动作链路。
-6. 基于自动规则评估框架继续规划上下架、冷库、包装产能等 evaluator，但保持 dry-run/apply 和 service 边界。
-7. AI Agent 自动决策应放在真实平台执行和运维边界通过更长期审查后再推进。
+2. 连同 [reports/task12_final_handoff_20260723.md](reports/task12_final_handoff_20260723.md)、[PR 内脱敏证据](evidence/task12/index.md)和自动校验报告交由审查方复核；审查通过后再修改任务12状态。
+3. 任务14实现统一任务审查和正式调度授权；在此之前保持显式 `--task-id` 门禁，禁止无人值守扫描全部 pending 并自动发布。
+4. 进入任务13，复用任务12的合同、队列、身份映射、账本、完整页面快照和副作用状态机，实现上下架及 OFFLINE 跨页面对账。
+5. 补充长期告警、磁盘清理、证据保留和服务账号运维样本，并分别定义冷态/暖态性能指标。
+6. 继续运行系统冒烟、完整单元测试和 ShadowBot 成功基线测试，任何新功能不得重写已验证 COMMIT 动作链路。
+7. 基于自动规则评估框架继续规划上下架、冷库、包装产能等 evaluator，但保持 dry-run/apply 和 service 边界。
+8. AI Agent 自动决策应放在真实平台执行和运维边界通过更长期审查后再推进。
 
 ## 9. 后续可复用资产
 

@@ -38,6 +38,9 @@ from app.services.shadowbot_commit_batch import (
     CONTRACT_VERSION as COMMIT_BATCH_CONTRACT_VERSION,
     validate_request as validate_commit_batch_request,
 )
+from app.shadowbot_contract_primitives import (
+    build_v4_recovery_result,
+)
 
 
 SUBMIT_PHASES = {"SUBMIT_INTENT_RECORDED", "SUBMIT_CLICKED"}
@@ -797,7 +800,16 @@ class ShadowBotResultImporter:
         try:
             quarantined_data = json.loads(destination.read_text(encoding="utf-8-sig"))
             execution_attempt_id = str(quarantined_data.get("execution_attempt_id") or "")
-            if execution_attempt_id:
+            if (
+                quarantined_data.get("contract_version") == COMMIT_BATCH_CONTRACT_VERSION
+                and str(quarantined_data.get("batch_id") or "")
+            ):
+                self.repository.quarantine_shadowbot_commit_batch(
+                    str(quarantined_data["batch_id"]),
+                    reason=type(error).__name__ + ":" + str(error),
+                    now=datetime.now(UTC),
+                )
+            elif execution_attempt_id:
                 self.repository.quarantine_shadowbot_attempt(
                     execution_attempt_id,
                     reason=type(error).__name__ + ":" + str(error),
@@ -1024,14 +1036,32 @@ class ShadowBotQueueWatchdog:
         if not execution_attempt_id:
             raise ValidationError(f"phase file has no execution_attempt_id: {phase_path}")
         result_path = self.paths.results / f"{execution_attempt_id}.result.json"
-        if result_path.exists() or str(phase_data.get("phase") or "") == "RESULT_WRITTEN":
+        if result_path.exists():
             return None
         request_path = self.paths.working / f"{execution_attempt_id}.request.json"
         request_data = _read_json_object(request_path)
         phase_data.setdefault("request_file_sha256", hashlib.sha256(request_path.read_bytes()).hexdigest())
         phase = str(phase_data.get("phase") or "CLAIMED")
         if request_data.get("contract_version") == COMMIT_BATCH_CONTRACT_VERSION:
+            if self.repository is not None:
+                with self.repository.connect_read() as connection:
+                    accepted = connection.execute(
+                        """
+                        SELECT 1
+                        FROM shadowbot_commit_result_receipts
+                        WHERE batch_id = ? AND execution_attempt_id = ?
+                        LIMIT 1
+                        """,
+                        (
+                            str(request_data.get("batch_id") or ""),
+                            execution_attempt_id,
+                        ),
+                    ).fetchone()
+                if accepted is not None:
+                    return None
             return self._write_v4_recovery_result(request_data, phase_data, phase=phase)
+        if phase == "RESULT_WRITTEN":
+            return None
         if phase == "VERIFIED" and isinstance(phase_data.get("result_snapshot"), dict):
             return self._write_result(dict(phase_data["result_snapshot"]), execution_attempt_id)
         return self._write_recovery_result(request_data, phase_data, phase=phase)
@@ -1095,209 +1125,17 @@ class ShadowBotQueueWatchdog:
         *,
         phase: str,
     ) -> dict[str, Any]:
-        """Recover a stale v4 batch without losing completed-item boundaries."""
-
         validate_commit_batch_request(request, check_expiry=False)
-        request_items = [dict(item) for item in request.get("items") or []]
-        items = [self._v4_recovery_item(item) for item in request_items]
-        by_task_id = {str(item["source_task_id"]): item for item in items}
-
-        snapshot = phase_data.get("batch_result_snapshot")
-        if not isinstance(snapshot, dict):
-            candidate = phase_data.get("result_snapshot")
-            if isinstance(candidate, dict) and candidate.get("contract_version") == COMMIT_BATCH_CONTRACT_VERSION:
-                snapshot = candidate
-        if isinstance(snapshot, dict):
-            for snapshot_item in snapshot.get("items") or []:
-                if not isinstance(snapshot_item, dict):
-                    continue
-                target = by_task_id.get(str(snapshot_item.get("source_task_id") or ""))
-                if target is None:
-                    continue
-                for name in (
-                    "preflight_row",
-                    "preflight_price",
-                    "execution_ordinal",
-                    "submit_attempted",
-                    "side_effect_state",
-                    "preflight_observed_at",
-                    "submit_intent_at",
-                    "submit_clicked_at",
-                    "readback_observed_at",
-                    "actual_price",
-                    "status",
-                    "error_code",
-                    "error_message",
-                ):
-                    if name in snapshot_item:
-                        target[name] = snapshot_item[name]
-        page_snapshot = None
-        if isinstance(snapshot, dict) and isinstance(snapshot.get("page_snapshot"), dict):
-            page_snapshot = json.loads(
-                json.dumps(snapshot["page_snapshot"], ensure_ascii=False)
-            )
-
-        current_task_id = str(phase_data.get("current_source_task_id") or "").strip()
-        current = by_task_id.get(current_task_id)
-        if current is not None:
-            if not current.get("execution_ordinal") and phase_data.get("execution_ordinal"):
-                current["execution_ordinal"] = int(phase_data["execution_ordinal"])
-            child_snapshot = phase_data.get("result_snapshot")
-            item_phase = phase_data.get("item_phase")
-            if isinstance(item_phase, dict):
-                for name in (
-                    "side_effect_state",
-                    "submit_intent_at",
-                    "submit_clicked_at",
-                    "readback_observed_at",
-                ):
-                    if item_phase.get(name) not in (None, ""):
-                        current[name] = item_phase[name]
-            child_verified = (
-                phase == "VERIFIED"
-                and isinstance(child_snapshot, dict)
-                and str(child_snapshot.get("status") or "").upper() == "VERIFIED"
-                and str(child_snapshot.get("side_effect_state") or "").upper() == "VERIFIED"
-                and str(child_snapshot.get("actual_price") or "") == str(current["target_price"])
-            )
-            side_effect = str(phase_data.get("side_effect_state") or SIDE_EFFECT_NOT_STARTED).upper()
-            has_submit_risk = phase in SUBMIT_PHASES or phase == "VERIFIED" or side_effect != SIDE_EFFECT_NOT_STARTED
-            if child_verified:
-                current.update(
-                    {
-                        "submit_attempted": True,
-                        "side_effect_state": "VERIFIED",
-                        "actual_price": child_snapshot.get("actual_price"),
-                        "submit_intent_at": child_snapshot.get("submit_intent_at"),
-                        "submit_clicked_at": child_snapshot.get("submit_clicked_at"),
-                        "readback_observed_at": child_snapshot.get("readback_observed_at"),
-                        "status": "VERIFIED",
-                        "error_code": "",
-                        "error_message": "",
-                    }
-                )
-            elif has_submit_risk:
-                current.update(
-                    {
-                        "submit_attempted": True,
-                        "side_effect_state": "UNKNOWN",
-                        "submit_intent_at": current.get("submit_intent_at")
-                        or (
-                            phase_data.get("updated_at")
-                            if phase == "SUBMIT_INTENT_RECORDED"
-                            else None
-                        ),
-                        "submit_clicked_at": current.get("submit_clicked_at")
-                        or (
-                            phase_data.get("updated_at")
-                            if phase in {"SUBMIT_CLICKED", "VERIFIED"}
-                            else None
-                        ),
-                        "status": "UNKNOWN",
-                        "error_code": "SUBMIT_RESULT_UNKNOWN",
-                        "error_message": f"stale ShadowBot v4 batch recovered at phase {phase}",
-                    }
-                )
-            if isinstance(page_snapshot, dict):
-                for product in page_snapshot.get("products") or []:
-                    identity_matches = (
-                        str(product.get("product_name") or "").strip()
-                        == str(current.get("expected_product_name") or "").strip()
-                        and str(product.get("grade") or "").strip()
-                        == str(current.get("expected_grade") or "").strip()
-                    )
-                    if not identity_matches:
-                        continue
-                    if child_verified:
-                        product["price"] = str(current.get("actual_price") or "")
-                        product["price_status"] = "VERIFIED_AFTER_COMMIT"
-                    elif has_submit_risk:
-                        product["price_status"] = "UNKNOWN_AFTER_SUBMIT"
-                    break
-
-        counts = self._v4_recovery_counts(items)
-        if counts["verified"] == counts["total"]:
-            batch_status = "VERIFIED"
-        elif counts["verified"]:
-            batch_status = "PARTIAL"
-        elif counts["unknown"]:
-            batch_status = "UNKNOWN"
-        else:
-            batch_status = "FAILED"
-        result = {
-            "schema_version": "shadowbot-commit-batch-result-1.1",
-            "contract_version": COMMIT_BATCH_CONTRACT_VERSION,
-            "task_id": request.get("task_id", ""),
-            "operation_id": request.get("operation_id", ""),
-            "execution_attempt_id": request.get("execution_attempt_id", ""),
-            "execution_mode": "COMMIT",
-            "batch_id": request.get("batch_id", ""),
-            "manifest_sha256": request.get("manifest_sha256", ""),
-            "instruction_hash": request.get("instruction_hash", ""),
-            "request_file_sha256": phase_data.get("request_file_sha256", ""),
-            "worker_id": phase_data.get("worker_id", ""),
-            "batch_status": batch_status,
-            "status": batch_status,
-            "run_success_flag": batch_status == "VERIFIED",
-            "business_operation_completed": counts["attempted"] > 0,
-            "side_effect_state": (
-                SIDE_EFFECT_UNKNOWN
-                if counts["unknown"]
-                else "VERIFIED"
-                if counts["verified"]
-                else SIDE_EFFECT_NOT_STARTED
-            ),
-            "error_code": "SUBMIT_RESULT_UNKNOWN" if counts["unknown"] else "WORKER_INTERRUPTED",
-            "error_message": f"stale ShadowBot v4 batch recovered at phase {phase}",
-            "retryable": False,
-            "recovered_phase": phase,
-            "items": items,
-            "counts": counts,
-            "ended_at": datetime.now(UTC).isoformat(),
-        }
-        if isinstance(page_snapshot, dict):
-            result["page_snapshot"] = page_snapshot
+        result = build_v4_recovery_result(
+            request,
+            phase_data,
+            request_file_sha256=str(phase_data.get("request_file_sha256") or ""),
+            recovered_at=datetime.now(UTC).isoformat(),
+            worker_id=str(phase_data.get("worker_id") or ""),
+            error_code="WORKER_INTERRUPTED",
+            error_message=f"stale ShadowBot v4 batch recovered at phase {phase}",
+        )
         return self._write_result(result, str(request.get("execution_attempt_id") or ""))
-
-    @staticmethod
-    def _v4_recovery_item(item: dict[str, Any]) -> dict[str, Any]:
-        return {
-            **item,
-            "preflight_row": None,
-            "preflight_price": None,
-            "execution_ordinal": None,
-            "submit_attempted": False,
-            "side_effect_state": "NOT_STARTED",
-            "preflight_observed_at": None,
-            "submit_intent_at": None,
-            "submit_clicked_at": None,
-            "readback_observed_at": None,
-            "actual_price": None,
-            "status": "NOT_ATTEMPTED",
-            "error_code": "",
-            "error_message": "",
-        }
-
-    @staticmethod
-    def _v4_recovery_counts(items: list[dict[str, Any]]) -> dict[str, int]:
-        counts = {
-            "total": len(items),
-            "attempted": 0,
-            "verified": 0,
-            "not_applied": 0,
-            "failed": 0,
-            "unknown": 0,
-            "not_attempted": 0,
-        }
-        for item in items:
-            if item.get("submit_attempted") is True:
-                counts["attempted"] += 1
-            status = str(item.get("status") or "NOT_ATTEMPTED").lower()
-            if status not in counts or status in {"total", "attempted"}:
-                status = "not_attempted"
-                item["status"] = "NOT_ATTEMPTED"
-            counts[status] += 1
-        return counts
 
     def _write_result(self, result: dict[str, Any], execution_attempt_id: str) -> dict[str, Any]:
         if not execution_attempt_id:

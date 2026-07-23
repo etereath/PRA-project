@@ -48,6 +48,9 @@ jobs:
       - name: Run complete Windows pytest gate
         run: python -m pytest -q tests
 
+      - name: Recompute Task 12 sanitized evidence bindings
+        run: python scripts/verify_task12_sanitized_evidence.py
+
       - name: Verify Credential Manager provider mocks and redaction
         run: python -m pytest -q tests/test_shadowbot_credentials.py
 
@@ -156,6 +159,9 @@ jobs:
 
       - name: Run platform-independent pytest scope
         run: python scripts/run_linux_core_tests.py
+
+      - name: Recompute Task 12 sanitized evidence bindings
+        run: python scripts/verify_task12_sanitized_evidence.py
 
       - name: Run core system smoke with a temporary database
         run: python scripts/run_system_smoke_tests.py --temporary-db

@@ -9,6 +9,7 @@
 - [project_current_status.md](project_current_status.md)：当前项目定位、已完成能力、主控流程、安全边界和下一步优先级。
 - [reports/task12_final_handoff_20260723.md](reports/task12_final_handoff_20260723.md)：任务12当前实现、正式合同、实机证据、已知限制和审查步骤的最终交接入口。
 - [reports/task12_review_remediation_20260723.md](reports/task12_review_remediation_20260723.md)：针对任务12审查问题的接续修复记录；以该文档说明 v12 合同、原子导入和待补实机证据，不覆盖原交接报告。
+- [evidence/task12/index.md](evidence/task12/index.md)：任务12正常 COMMIT 与 UNKNOWN→RECONCILE 的 PR 内脱敏原始证据及自动复算入口。
 - [reports/task12_development_report_20260723.md](reports/task12_development_report_20260723.md)：任务12开发成果、问题回溯、修复方法和防复发规则。
 - [reports/task12_evidence_index_20260723.md](reports/task12_evidence_index_20260723.md)：任务12代表性实机 Run ID、结果 SHA-256、归档位置和审查核对项。
 - [task12_reusable_assets.md](task12_reusable_assets.md)：后续任务可直接复用的代码、合同、测试、运行流程和安全门禁。

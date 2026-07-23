@@ -7,7 +7,7 @@
 1. PRA 可以在 SQLite 中维护每个平台商品最近一次已确认的平台状态，用于任务生成、展示和报告。
 2. PRA 接收任务中心提供的完整改价列表；每项明确包含 `internal_sku`、`expected_old_price` 和 `target_price`。
 3. PRA 把内部 SKU 解析为页面商品名和等级，并按“平台 + internal_sku + 旧价 + 目标价”形成不可变清单。
-4. 开发/实机验收由操作人员确认固定清单；正式运行以任务中心仍有效的 `pending update_price` 任务作为执行权威，不再要求 Codex 对话确认，PRA 创建一个 COMMIT 队列合同。
+4. 开发/实机验收由操作人员确认固定清单；任务14前的正式入口由操作人员明确传入一个或多个 `--task-id`，PRA 只对这些任务重新校验 `pending update_price` 有效性并创建一个 COMMIT 队列合同。不得把全部 pending 自动视为执行授权。
 5. ShadowBot 在同一次 Worker 请求中逐商品动态定位、核对旧价、提交并独立回读。
 6. Result Importer 校验请求、结果和逐商品绑定后更新任务与操作账本。
 7. 只有平台实际回读证明确认改价完成时，PRA 才回写 SQLite 当前平台价格。
@@ -161,7 +161,7 @@ platform + internal_sku
 4. 在创建任何可执行 COMMIT 队列文件前，向项目负责人申请对这份固定清单的明确授权。
 5. 授权文本与清单哈希完全一致后，才创建一个 COMMIT 队列合同。
 
-开发/实机验收的一次授权可以覆盖同一消息中逐项明确列出的完整固定清单。正式运行的 `execution_profile=production` 不依赖 Codex 对话确认，以发布前再次校验通过的 `pending update_price` 任务作为执行权威。逐商品载荷哈希绑定 `platform + internal_sku + expected_product_name + expected_grade + expected_old_price + target_price`；批次 `manifest_sha256` 绑定平台及规范化项目清单。解析后的商品名称和等级同时受 `item_payload_sha256` 和最终 `instruction_hash` 保护，但不引入额外的快照版本门禁。清单固化后不得添加、删除或修改项目；发生变化时必须生成新合同。
+开发/实机验收的一次授权可以覆盖同一消息中逐项明确列出的完整固定清单。正式运行的 `execution_profile=production` 不依赖 Codex 对话确认，但任务14前必须由操作人员明确传入一个或多个 `--task-id`；系统只把这些明确选择且发布前再次校验通过的 `pending update_price` 任务作为本批次执行权威。统一任务审查和无人值守调度授权延期到任务14，完成并审查前禁止扫描全部 pending 后自动发布。逐商品载荷哈希绑定 `platform + internal_sku + expected_product_name + expected_grade + expected_old_price + target_price`；批次 `manifest_sha256` 绑定平台及规范化项目清单。解析后的商品名称和等级同时受 `item_payload_sha256` 和最终 `instruction_hash` 保护，但不引入额外的快照版本门禁。清单固化后不得添加、删除或修改项目；发生变化时必须生成新合同。
 
 ### 5.3 一个队列合同
 

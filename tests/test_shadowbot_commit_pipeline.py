@@ -7,6 +7,9 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sys
+import types
+from unittest.mock import patch
 
 import pytest
 
@@ -27,6 +30,10 @@ from app.services.shadowbot_executor import (
     ShadowBotStartResult,
 )
 from app.services.shadowbot_queue import ShadowBotQueueWatchdog, ShadowBotResultImporter
+from app.shadowbot_contract_primitives import (
+    build_v4_recovery_result,
+    derive_v4_batch_semantics,
+)
 from shadowbot.test2.shadowbot_queue_worker import _v4_validate_request
 from scripts.patch_shadowbot_queue_request_fault import main as patch_request_fault_main
 
@@ -193,11 +200,7 @@ def _write_v4_result(
         "manifest_sha256": request["manifest_sha256"],
         "instruction_hash": request["instruction_hash"],
         "request_file_sha256": hashlib.sha256(request_path.read_bytes()).hexdigest(),
-        "batch_status": batch_status,
-        "status": batch_status,
-        "run_success_flag": batch_status == "VERIFIED",
-        "business_operation_completed": counts["attempted"] > 0,
-        "side_effect_state": "VERIFIED" if counts["verified"] else "NOT_STARTED",
+        **derive_v4_batch_semantics(counts),
         "retryable": False,
         "error_code": "" if batch_status == "VERIFIED" else "TEST_BATCH_STOPPED",
         "error_message": "" if batch_status == "VERIFIED" else "test batch stopped",
@@ -375,6 +378,10 @@ def test_formal_tasks_publish_once_and_result_updates_tasks_and_listing(tmp_path
         "instruction_hash": request["instruction_hash"],
         "manifest_sha256": request["manifest_sha256"],
         "batch_status": "VERIFIED",
+        "status": "VERIFIED",
+        "run_success_flag": True,
+        "business_operation_completed": True,
+        "side_effect_state": "VERIFIED",
         "items": result_items,
         "counts": {
             "total": 2,
@@ -394,7 +401,12 @@ def test_formal_tasks_publish_once_and_result_updates_tasks_and_listing(tmp_path
             row["internal_sku"]: row["current_price"]
             for row in connection.execute("SELECT internal_sku, current_price FROM listing_status")
         }
+        observed_times = {
+            row["internal_sku"]: row["updated_at"]
+            for row in connection.execute("SELECT internal_sku, updated_at FROM listing_status")
+        }
     assert prices == {"CAPPUCCINO-B-60-Z": "46.40", "AISHA-B-60-Z": "26.40"}
+    assert set(observed_times.values()) == {OBSERVED_AT}
 
 
 def test_v4_queue_importer_validates_imports_and_archives_verified_batch(tmp_path):
@@ -598,7 +610,7 @@ def test_v4_queue_importer_preserves_partial_and_unknown_item_states(tmp_path):
             "error_message": "提交后无法唯一回读",
         }),
     ]
-    result_path = _write_v4_result(queue_dir, request, result_items, "PARTIAL")
+    result_path = _write_v4_result(queue_dir, request, result_items, "UNKNOWN")
 
     event = ShadowBotResultImporter(repository, runner, queue_dir).import_one(result_path)
 
@@ -685,6 +697,10 @@ def test_v4_watchdog_recovers_partial_unknown_and_importer_preserves_boundary(tm
     ]
     old_time = datetime.now(timezone.utc) - timedelta(minutes=5)
     phase = {
+        "schema_version": "shadowbot-commit-batch-phase-1.0",
+        "contract_version": 4,
+        "batch_id": request["batch_id"],
+        "manifest_sha256": request["manifest_sha256"],
         "task_id": request["task_id"],
         "operation_id": request["operation_id"],
         "execution_attempt_id": request["execution_attempt_id"],
@@ -696,8 +712,33 @@ def test_v4_watchdog_recovers_partial_unknown_and_importer_preserves_boundary(tm
         "worker_id": "TEST-V4-WORKER",
         "current_source_task_id": second["source_task_id"],
         "execution_ordinal": 2,
+        "item_phase": {
+            **{
+                name: second[name]
+                for name in (
+                    "item_id",
+                    "source_task_id",
+                    "operation_id",
+                    "item_execution_attempt_id",
+                    "write_identity_key",
+                    "page_identity_key",
+                    "internal_sku",
+                    "expected_product_name",
+                    "expected_grade",
+                    "expected_old_price",
+                    "target_price",
+                    "item_payload_sha256",
+                )
+            },
+            "side_effect_state": "SUBMIT_CLICKED",
+            "submit_clicked_at": OBSERVED_AT,
+        },
         "batch_result_snapshot": {
             "contract_version": 4,
+            "batch_id": request["batch_id"],
+            "execution_attempt_id": request["execution_attempt_id"],
+            "instruction_hash": request["instruction_hash"],
+            "manifest_sha256": request["manifest_sha256"],
             "items": snapshot_items,
         },
         "updated_at": old_time.isoformat(),
@@ -724,7 +765,7 @@ def test_v4_watchdog_recovers_partial_unknown_and_importer_preserves_boundary(tm
     assert events[0]["status"] == "RECOVERY_RESULT_WRITTEN"
     result_path = Path(events[0]["result_path"])
     recovered = json.loads(result_path.read_text(encoding="utf-8"))
-    assert recovered["batch_status"] == "PARTIAL"
+    assert recovered["batch_status"] == "UNKNOWN"
     assert recovered["counts"] == {
         "total": 2,
         "attempted": 2,
@@ -740,6 +781,415 @@ def test_v4_watchdog_recovers_partial_unknown_and_importer_preserves_boundary(tm
     assert imported["status"] == "IMPORTED"
     assert repository.get_task(first["source_task_id"]).task_status is TaskStatus.SUCCESS
     assert repository.get_task(second["source_task_id"]).task_status is TaskStatus.MANUAL_REVIEW
+
+
+def test_v4_worker_recovers_final_phase_when_result_write_boundary_fails(tmp_path):
+    repository = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
+    repository.init_schema()
+    repository.insert_tasks(
+        [
+            _task("task-worker-boundary-a", "CAPPUCCINO-B-60-Z", "46.30", "46.40"),
+            _task("task-worker-boundary-b", "AISHA-B-60-Z", "26.30", "26.40"),
+        ]
+    )
+    _seed_listing_status(repository)
+    queue_dir = tmp_path / "queue"
+    request, _, runner = _publish_file_queue_batch(
+        repository,
+        queue_dir,
+        ["task-worker-boundary-a", "task-worker-boundary-b"],
+        "BATCH-T12-WORKER-BOUNDARY-0001",
+    )
+    first, second = request["items"]
+    attempt_id = request["execution_attempt_id"]
+    working_request = queue_dir / "working" / f"{attempt_id}.request.json"
+    working_checksum = working_request.with_suffix(working_request.suffix + ".sha256")
+    inbox_request = queue_dir / "inbox" / f"{attempt_id}.ready.json"
+    inbox_checksum = inbox_request.with_suffix(inbox_request.suffix + ".sha256")
+    os.replace(working_request, inbox_request)
+    os.replace(working_checksum, inbox_checksum)
+
+    def fail_after_durable_final_phase(args):
+        runtime = json.loads(args["request_json"])
+        verified = _complete_result_item(
+            {
+                **first,
+                "preflight_row": 1,
+                "preflight_price": first["expected_old_price"],
+                "execution_ordinal": 1,
+                "submit_attempted": True,
+                "actual_price": first["target_price"],
+                "status": "VERIFIED",
+                "error_code": "",
+                "error_message": "",
+            }
+        )
+        unknown = _complete_result_item(
+            {
+                **second,
+                "preflight_row": 2,
+                "preflight_price": second["expected_old_price"],
+                "execution_ordinal": 2,
+                "submit_attempted": True,
+                "actual_price": None,
+                "status": "UNKNOWN",
+                "error_code": "SUBMIT_RESULT_UNKNOWN",
+                "error_message": "提交后结果文件写入边界故障",
+            }
+        )
+        snapshot = {
+            "contract_version": 4,
+            "batch_id": request["batch_id"],
+            "execution_attempt_id": request["execution_attempt_id"],
+            "instruction_hash": request["instruction_hash"],
+            "manifest_sha256": request["manifest_sha256"],
+            "items": [verified, unknown],
+        }
+        phase = {
+            "schema_version": "shadowbot-commit-batch-phase-1.0",
+            "contract_version": 4,
+            "batch_id": request["batch_id"],
+            "manifest_sha256": request["manifest_sha256"],
+            "task_id": request["task_id"],
+            "operation_id": request["operation_id"],
+            "execution_attempt_id": request["execution_attempt_id"],
+            "execution_mode": "COMMIT",
+            "phase": "FINAL_VERIFICATION",
+            "side_effect_state": "UNKNOWN",
+            "request_file_sha256": runtime["request_file_sha256"],
+            "instruction_hash": request["instruction_hash"],
+            "worker_id": runtime["worker_id"],
+            "current_source_task_id": second["source_task_id"],
+            "execution_ordinal": 2,
+            "item_phase": {
+                **{
+                    name: second[name]
+                    for name in (
+                        "item_id",
+                        "source_task_id",
+                        "operation_id",
+                        "item_execution_attempt_id",
+                        "write_identity_key",
+                        "page_identity_key",
+                        "internal_sku",
+                        "expected_product_name",
+                        "expected_grade",
+                        "expected_old_price",
+                        "target_price",
+                        "item_payload_sha256",
+                    )
+                },
+                "side_effect_state": "UNKNOWN",
+                "submit_intent_at": OBSERVED_AT,
+                "submit_clicked_at": OBSERVED_AT,
+            },
+            "batch_result_snapshot": snapshot,
+            "updated_at": OBSERVED_AT,
+        }
+        Path(runtime["_phase_file_path"]).write_text(
+            json.dumps(phase, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        raise PermissionError("simulated _set_result boundary failure")
+
+    from shadowbot.test2 import shadowbot_queue_worker
+    import shadowbot.test2 as test2_package
+
+    fake_vertical = types.ModuleType("shadowbot.test2.vertical_slice_read_price")
+    fake_vertical.main = fail_after_durable_final_phase
+    with (
+        patch.dict(
+            sys.modules,
+            {"shadowbot.test2.vertical_slice_read_price": fake_vertical},
+        ),
+        patch.object(
+            test2_package,
+            "vertical_slice_read_price",
+            fake_vertical,
+            create=True,
+        ),
+    ):
+        run = shadowbot_queue_worker.QueueWorker(
+            {
+                "queue_dir": str(queue_dir),
+                "poll_seconds": 0.01,
+                "max_hours": 1,
+                "max_tasks": 1,
+                "heartbeat_seconds": 0.01,
+            }
+        ).run()
+
+    assert run["processed"] == 1
+    result_path = queue_dir / "results" / f"{request['execution_attempt_id']}.result.json"
+    recovered = json.loads(result_path.read_text(encoding="utf-8"))
+    assert recovered["batch_status"] == "UNKNOWN"
+    assert [item["status"] for item in recovered["items"]] == ["VERIFIED", "UNKNOWN"]
+
+    imported = ShadowBotResultImporter(repository, runner, queue_dir).import_one(result_path)
+    assert imported["status"] == "IMPORTED"
+    with repository.connect_read() as connection:
+        lock_states = {
+            row["item_execution_attempt_id"]: row["status"]
+            for row in connection.execute(
+                "SELECT item_execution_attempt_id, status FROM shadowbot_write_locks"
+            )
+        }
+    assert lock_states[first["item_execution_attempt_id"]] == "RELEASED"
+    assert lock_states[second["item_execution_attempt_id"]] == "UNKNOWN"
+
+
+def test_v4_recovery_preserves_bound_current_item_readback(tmp_path):
+    repository = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
+    repository.init_schema()
+    repository.insert_tasks(
+        [
+            _task("task-child-readback-a", "CAPPUCCINO-B-60-Z", "46.30", "46.40"),
+            _task("task-child-readback-b", "AISHA-B-60-Z", "26.30", "26.40"),
+        ]
+    )
+    _seed_listing_status(repository)
+    request, working, _ = _publish_file_queue_batch(
+        repository,
+        tmp_path / "queue",
+        ["task-child-readback-a", "task-child-readback-b"],
+        "BATCH-T12-CHILD-READBACK-0001",
+    )
+    first, second = request["items"]
+    first_verified = _complete_result_item(
+        {
+            **first,
+            "preflight_row": 1,
+            "preflight_price": first["expected_old_price"],
+            "execution_ordinal": 1,
+            "submit_attempted": True,
+            "actual_price": first["target_price"],
+            "status": "VERIFIED",
+            "error_code": "",
+            "error_message": "",
+        }
+    )
+    second_pending = _complete_result_item(
+        {
+            **second,
+            "preflight_row": 2,
+            "preflight_price": second["expected_old_price"],
+            "execution_ordinal": 2,
+            "submit_attempted": False,
+            "actual_price": None,
+            "status": "NOT_ATTEMPTED",
+            "error_code": "",
+            "error_message": "",
+        }
+    )
+    child_result = {
+        "task_id": second["source_task_id"],
+        "operation_id": second["operation_id"],
+        "execution_attempt_id": second["item_execution_attempt_id"],
+        "instruction_hash": second["item_payload_sha256"],
+        "status": "VERIFIED",
+        "side_effect_state": "VERIFIED",
+        "submit_intent_at": OBSERVED_AT,
+        "submit_clicked_at": OBSERVED_AT,
+        "readback_observed_at": OBSERVED_AT,
+        "actual_price": second["target_price"],
+        "error_code": "",
+        "error_message": "",
+    }
+    phase = {
+        "schema_version": "shadowbot-commit-batch-phase-1.0",
+        "contract_version": 4,
+        "batch_id": request["batch_id"],
+        "manifest_sha256": request["manifest_sha256"],
+        "execution_attempt_id": request["execution_attempt_id"],
+        "instruction_hash": request["instruction_hash"],
+        "request_file_sha256": hashlib.sha256(working.read_bytes()).hexdigest(),
+        "phase": "VERIFIED",
+        "side_effect_state": "VERIFIED",
+        "current_source_task_id": second["source_task_id"],
+        "execution_ordinal": 2,
+        "batch_result_snapshot": {
+            "contract_version": 4,
+            "batch_id": request["batch_id"],
+            "execution_attempt_id": request["execution_attempt_id"],
+            "instruction_hash": request["instruction_hash"],
+            "manifest_sha256": request["manifest_sha256"],
+            "items": [first_verified, second_pending],
+        },
+        "item_phase": {
+            **{
+                name: second[name]
+                for name in (
+                    "item_id",
+                    "source_task_id",
+                    "operation_id",
+                    "item_execution_attempt_id",
+                    "write_identity_key",
+                    "page_identity_key",
+                    "internal_sku",
+                    "expected_product_name",
+                    "expected_grade",
+                    "expected_old_price",
+                    "target_price",
+                    "item_payload_sha256",
+                )
+            },
+            **{
+                name: child_result[name]
+                for name in (
+                    "status",
+                    "side_effect_state",
+                    "submit_intent_at",
+                    "submit_clicked_at",
+                    "readback_observed_at",
+                    "actual_price",
+                    "error_code",
+                    "error_message",
+                )
+            },
+        },
+        "result_snapshot": child_result,
+    }
+    recovered = build_v4_recovery_result(
+        request,
+        phase,
+        request_file_sha256=phase["request_file_sha256"],
+        recovered_at=OBSERVED_AT,
+    )
+
+    assert recovered["batch_status"] == "VERIFIED"
+    assert [item["status"] for item in recovered["items"]] == ["VERIFIED", "VERIFIED"]
+    assert recovered["items"][1]["actual_price"] == second["target_price"]
+
+
+def test_v4_quarantine_result_written_phase_recovers_without_receipt(tmp_path):
+    repository = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
+    repository.init_schema()
+    repository.insert_task(
+        _task("task-quarantine-recovery", "CAPPUCCINO-B-60-Z", "46.30", "46.40")
+    )
+    _seed_listing_status(repository)
+    queue_dir = tmp_path / "queue"
+    request, working, runner = _publish_file_queue_batch(
+        repository,
+        queue_dir,
+        ["task-quarantine-recovery"],
+        "BATCH-T12-QUARANTINE-RECOVERY-0001",
+    )
+    item = _complete_result_item(
+        {
+            **request["items"][0],
+            "preflight_row": 1,
+            "preflight_price": "46.30",
+            "execution_ordinal": 1,
+            "submit_attempted": True,
+            "actual_price": "46.40",
+            "status": "VERIFIED",
+            "error_code": "",
+            "error_message": "",
+        }
+    )
+    old_time = datetime.now(timezone.utc) - timedelta(minutes=5)
+    phase = {
+        "schema_version": "shadowbot-commit-batch-phase-1.0",
+        "contract_version": 4,
+        "batch_id": request["batch_id"],
+        "manifest_sha256": request["manifest_sha256"],
+        "task_id": request["task_id"],
+        "operation_id": request["operation_id"],
+        "execution_attempt_id": request["execution_attempt_id"],
+        "execution_mode": "COMMIT",
+        "phase": "RESULT_WRITTEN",
+        "side_effect_state": "VERIFIED",
+        "request_file_sha256": hashlib.sha256(working.read_bytes()).hexdigest(),
+        "instruction_hash": request["instruction_hash"],
+        "worker_id": "TEST-V4-WORKER",
+        "batch_result_snapshot": {
+            "contract_version": 4,
+            "batch_id": request["batch_id"],
+            "execution_attempt_id": request["execution_attempt_id"],
+            "instruction_hash": request["instruction_hash"],
+            "manifest_sha256": request["manifest_sha256"],
+            "items": [item],
+        },
+        "updated_at": old_time.isoformat(),
+    }
+    phase_path = queue_dir / "working" / f"{request['execution_attempt_id']}.phase.json"
+    phase_path.write_text(json.dumps(phase, ensure_ascii=False), encoding="utf-8")
+    invalid_result = _write_v4_result(queue_dir, request, [item], "VERIFIED")
+    invalid_data = json.loads(invalid_result.read_text(encoding="utf-8"))
+    invalid_data["status"] = "FAILED"
+    invalid_bytes = (
+        json.dumps(invalid_data, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    ).encode("utf-8")
+    invalid_result.write_bytes(invalid_bytes)
+    invalid_result.with_suffix(invalid_result.suffix + ".sha256").write_text(
+        hashlib.sha256(invalid_bytes).hexdigest() + "\n",
+        encoding="ascii",
+    )
+
+    events = ShadowBotResultImporter(repository, runner, queue_dir).import_available()
+    assert events[0]["status"] == "QUARANTINED"
+    with repository.connect_read() as connection:
+        assert connection.execute(
+            "SELECT status FROM shadowbot_commit_batches WHERE batch_id = ?",
+            (request["batch_id"],),
+        ).fetchone()["status"] == "UNKNOWN"
+        assert connection.execute(
+            """
+            SELECT status FROM shadowbot_execution_attempts
+            WHERE execution_attempt_id = ?
+            """,
+            (item["item_execution_attempt_id"],),
+        ).fetchone()["status"] == "SIDE_EFFECT_UNKNOWN"
+        assert connection.execute(
+            "SELECT status FROM shadowbot_write_locks WHERE batch_id = ?",
+            (request["batch_id"],),
+        ).fetchone()["status"] == "UNKNOWN"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM shadowbot_commit_result_receipts WHERE batch_id = ?",
+            (request["batch_id"],),
+        ).fetchone()[0] == 0
+
+    recovered_event = ShadowBotQueueWatchdog(
+        queue_dir,
+        stale_seconds=30,
+        repository=repository,
+    ).inspect()[0]
+    assert recovered_event["status"] == "RECOVERY_RESULT_WRITTEN"
+    recovered_path = Path(recovered_event["result_path"])
+    recovered = json.loads(recovered_path.read_text(encoding="utf-8"))
+    assert recovered["batch_status"] == "VERIFIED"
+    assert recovered["items"][0]["status"] == "VERIFIED"
+    assert ShadowBotResultImporter(repository, runner, queue_dir).import_one(recovered_path)[
+        "status"
+    ] == "IMPORTED"
+    conflicting = dict(recovered)
+    conflicting["status"] = "FAILED"
+    conflicting_path = (
+        queue_dir / "results" / f"{request['execution_attempt_id']}.result.json"
+    )
+    conflicting_bytes = (
+        json.dumps(conflicting, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+    ).encode("utf-8")
+    conflicting_path.write_bytes(conflicting_bytes)
+    conflicting_path.with_suffix(conflicting_path.suffix + ".sha256").write_text(
+        hashlib.sha256(conflicting_bytes).hexdigest() + "\n",
+        encoding="ascii",
+    )
+    assert ShadowBotResultImporter(
+        repository,
+        runner,
+        queue_dir,
+    ).import_available()[0]["status"] == "QUARANTINED"
+    with repository.connect_read() as connection:
+        assert connection.execute(
+            "SELECT status FROM shadowbot_commit_batches WHERE batch_id = ?",
+            (request["batch_id"],),
+        ).fetchone()["status"] == "VERIFIED"
+        assert connection.execute(
+            "SELECT status FROM shadowbot_write_locks WHERE batch_id = ?",
+            (request["batch_id"],),
+        ).fetchone()["status"] == "RELEASED"
 
 
 def test_manifest_preview_does_not_persist_batch_or_claim_task(tmp_path):
@@ -809,6 +1259,10 @@ def test_not_attempted_task_returns_to_pending(tmp_path):
             "instruction_hash": request["instruction_hash"],
             "manifest_sha256": request["manifest_sha256"],
             "batch_status": "FAILED",
+            "status": "FAILED",
+            "run_success_flag": False,
+            "business_operation_completed": False,
+            "side_effect_state": "NOT_STARTED",
             "items": [item],
             "counts": {"total": 1, "attempted": 0, "verified": 0, "not_applied": 0, "failed": 0, "unknown": 0, "not_attempted": 1},
         },
@@ -858,6 +1312,9 @@ def test_pre_submit_failed_item_returns_to_pending_when_batch_never_started(tmp_
             "instruction_hash": request["instruction_hash"],
             "manifest_sha256": request["manifest_sha256"],
             "batch_status": "FAILED",
+            "status": "FAILED",
+            "run_success_flag": False,
+            "business_operation_completed": False,
             "side_effect_state": "NOT_STARTED",
             "items": [item],
             "counts": {
@@ -1017,6 +1474,10 @@ def test_import_rejects_truthy_string_bool_without_partial_write(tmp_path):
         "instruction_hash": request["instruction_hash"],
         "manifest_sha256": request["manifest_sha256"],
         "batch_status": "FAILED",
+        "status": "FAILED",
+        "run_success_flag": False,
+        "business_operation_completed": False,
+        "side_effect_state": "NOT_STARTED",
         "items": [item],
         "counts": {
             "total": 1,
@@ -1038,3 +1499,81 @@ def test_import_rejects_truthy_string_bool_without_partial_write(tmp_path):
             "SELECT COUNT(*) FROM shadowbot_commit_result_receipts"
         ).fetchone()[0]
     assert receipt_count == 0
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("status", "FAILED"),
+        ("run_success_flag", False),
+        ("business_operation_completed", False),
+        ("side_effect_state", "UNKNOWN"),
+        ("status", None),
+    ],
+)
+def test_v4_result_rejects_missing_or_conflicting_top_level_semantics(
+    tmp_path,
+    field_name,
+    invalid_value,
+):
+    repository = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
+    repository.init_schema()
+    repository.insert_task(
+        _task("task-strict-top-level", "CAPPUCCINO-B-60-Z", "46.30", "46.40")
+    )
+    _seed_listing_status(repository)
+    manifest = prepare_task_commit_batch(
+        repository,
+        task_ids=["task-strict-top-level"],
+        mapping_path=Path(MAPPING_PATH),
+        batch_id="BATCH-T12-STRICT-TOP-0001",
+        execution_profile="production",
+    )
+    request, _ = publish_task_commit_batch(
+        repository,
+        CapturingRunner(),
+        manifest=manifest,
+        execution_profile="production",
+        applet_uri="weixin://dl/business/?t=test",
+    )
+    item = _complete_result_item(
+        {
+            **request["items"][0],
+            "preflight_row": 1,
+            "preflight_price": "46.30",
+            "execution_ordinal": 1,
+            "submit_attempted": True,
+            "actual_price": "46.40",
+            "status": "VERIFIED",
+            "error_code": "",
+            "error_message": "",
+        }
+    )
+    counts = {
+        "total": 1,
+        "attempted": 1,
+        "verified": 1,
+        "not_applied": 0,
+        "failed": 0,
+        "unknown": 0,
+        "not_attempted": 0,
+    }
+    result = {
+        "schema_version": "shadowbot-commit-batch-result-1.1",
+        "contract_version": 4,
+        "result_id": "RESULT-T12-STRICT-TOP-0001",
+        "batch_id": request["batch_id"],
+        "execution_attempt_id": request["execution_attempt_id"],
+        "instruction_hash": request["instruction_hash"],
+        "manifest_sha256": request["manifest_sha256"],
+        **derive_v4_batch_semantics(counts),
+        "items": [item],
+        "counts": counts,
+    }
+    if invalid_value is None:
+        result.pop(field_name)
+    else:
+        result[field_name] = invalid_value
+
+    with pytest.raises(ValidationError, match="顶层语义"):
+        import_task_commit_result(repository, result)

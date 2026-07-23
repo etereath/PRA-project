@@ -100,8 +100,11 @@ UNKNOWN 写锁保持为 `UNKNOWN`，阻止相同 SKU 再次 COMMIT。RECONCILE �
 
 ## 8. 修复版实机验收
 
-修复版要求的两类真实证据均已取得。运行归档仍保存在
-`D:\PRA_Runtime\shadowbot_queue\archive`，未将包含本机路径的完整运行目录复制进仓库。
+修复版要求的两类真实证据均已取得。原始运行归档保存在
+`D:\PRA_Runtime\shadowbot_queue\archive`；经过脚本脱敏、重新绑定 request SHA
+并通过独立校验器复算的副本已提交到
+[`docs/evidence/task12`](../evidence/task12/index.md)。CI 同时执行
+`scripts/verify_task12_sanitized_evidence.py`，不再依赖人工抄写本机绝对路径和哈希。
 
 ### 8.1 正常四商品 COMMIT
 
@@ -156,3 +159,38 @@ RECONCILE ID，没有创建第二个对账或第二次写操作。
 代码、自动化回归、正常 COMMIT 和受控 UNKNOWN→RECONCILE 证据均已完成。
 本文仍不修改任务12状态；审查方需要核对代码、运行归档、SQLite 回读和本文
 列出的哈希后，再决定是否验收任务12。
+
+## 10. 复审第二轮接续修正
+
+本节接续记录复审基线 `9e35c7f` 之后的修正，不覆盖上文，也不修改任务12状态。
+
+- Worker 最外层异常改为读取并严格绑定 v4 phase；从
+  `batch_result_snapshot` 和 `item_phase` 恢复逐项事实。phase 缺失、损坏或
+  绑定无效时 fail-closed 为 `UNKNOWN`，不再假设 `NOT_STARTED`。
+- Watchdog 不再因为 `phase=RESULT_WRITTEN` 永久跳过。结果文件不存在时，以
+  SQLite `shadowbot_commit_result_receipts` 是否已接受为终止依据；无回执则
+  从 request + phase 生成恢复结果。
+- v4 结果隔离按 `batch_id` 冻结全部逐项 attempt、operation、任务和写锁，不再
+  错用不存在的批次级 attempt。
+- `VERIFIED + UNKNOWN` 的批次状态统一推导为 `UNKNOWN`。Worker、Watchdog 和
+  Importer 共用 `derive_v4_batch_semantics()`；`PARTIAL` 只表示没有 UNKNOWN
+  的明确成功/失败混合。
+- Importer 强制要求并核对 `status`、`run_success_flag`、
+  `business_operation_completed` 和 `side_effect_state`，缺失、类型错误或与
+  items 推导冲突的结果一律隔离。
+- v4 VERIFIED 价格状态使用逐项 `readback_observed_at`；RECONCILE 使用实际
+  `readback_observed_at/observed_at`。没有可靠观察时间时不刷新
+  `listing_status` 新鲜度。
+- PR 内证据包含正常成功批次和 UNKNOWN→唯一 RECONCILE 批次的脱敏
+  request/result/phase/manifest/receipt、执行序号和校验报告；索引与报告由脚本
+  生成，CI 重新计算绑定关系。
+- 最终源码全量回归：`556 passed, 3 skipped, 97 subtests passed`；系统冒烟
+  `16/16`，脱敏证据独立校验通过。
+
+任务14前的调度边界同时冻结如下：
+
+1. 任务12生产入口只能由操作人员明确传入一个或多个 `--task-id`。
+2. `pending update_price` 只表示候选任务，不能被调度器自动解释为已授权执行。
+3. 统一任务审查、授权状态和无人值守自动发布延期到任务14。
+4. 任务14完成并审查前，禁止接入“扫描全部 pending 后自动创建并发布 COMMIT”
+   的调度器。

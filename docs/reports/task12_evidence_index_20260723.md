@@ -80,14 +80,24 @@ C:\Users\etere\AppData\Local\ShadowBot\evidence\vertical_slice\RECONCILE-046a063
 SHA-256: 2329e5c823c4459d613d7dfd4f42ca5df5a39b9555357cdacff9b6f65d9cb141
 ```
 
+复审使用的脱敏 request/result/phase/manifest/receipt 和 UNKNOWN→RECONCILE
+原始链已进入仓库，统一入口为
+[`docs/evidence/task12/index.md`](../evidence/task12/index.md)。该目录由
+`scripts/export_task12_sanitized_evidence.py` 生成；CI 使用
+`scripts/verify_task12_sanitized_evidence.py` 复算脱敏 request SHA、
+instruction/manifest/batch/attempt 绑定、逐项身份、执行序号、计数恒等式和
+UNKNOWN→RECONCILE 来源关系。上表绝对路径和人工哈希只保留为历史原始归档
+定位，不再是 PR 复审的唯一证据。
+
 ## 6. 审查核对项
 
-1. 重新计算 `.result.json` SHA-256，与本索引一致。
-2. 校验同目录 request/result/phase 的 batch、attempt、instruction 和 manifest 绑定。
+1. 在干净 checkout 运行 `python scripts/verify_task12_sanitized_evidence.py`。
+2. 校验仓库内 request/result/phase 的 batch、attempt、instruction 和 manifest 绑定。
 3. 检查逐商品计数满足总数恒等式。
 4. 检查成功项 `actual_price=target_price` 且 `side_effect_state=VERIFIED`。
 5. 检查失败样本在提交前为 `NOT_STARTED`，剩余项没有被执行。
 6. 对照 SQLite 任务、批次、逐商品和 `listing_status` 回读。
-7. 确认归档中的敏感配置、本机路径和临时日志不会未经审查进入 GitHub。
+7. 确认脱敏证据中本机/UNC 路径和 Worker 设备标识已经替换，业务身份、价格、
+   时间和哈希字段仍保留。
 8. 确认受控 UNKNOWN 只有一个 COMMIT Run ID 和一个确定性 RECONCILE ID，
    历史 UNKNOWN 事实未被覆盖，最终 operation/任务/写锁/平台状态投影一致。

@@ -1,0 +1,8 @@
+{
+  "accepted_at": "2026-07-23T11:31:37.771320+00:00",
+  "batch_id": "BATCH-T12-CONTROLLED-UNKNOWN-20260723-02",
+  "execution_attempt_id": "ATTEMPT-0f30900b398045cc",
+  "result_file_sha256": "3c28f255fd0b675337d1e20f130b4602b1f292a5adbae2c933a5ac2ad666b84a",
+  "result_id": "RESULT-e7dd20c0353238bc4192ec36",
+  "schema_version": "shadowbot-commit-import-ack-1.0"
+}

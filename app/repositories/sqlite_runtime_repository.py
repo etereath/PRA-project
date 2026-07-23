@@ -2671,6 +2671,132 @@ class SQLiteRuntimeRepository:
         finally:
             connection.close()
 
+    def quarantine_shadowbot_commit_batch(
+        self,
+        batch_id: str,
+        *,
+        reason: str,
+        now: datetime,
+    ) -> bool:
+        """Freeze every v4 child ledger when its batch result is untrusted."""
+
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            batch = connection.execute(
+                "SELECT * FROM shadowbot_commit_batches WHERE batch_id = ?",
+                (batch_id,),
+            ).fetchone()
+            if batch is None:
+                connection.rollback()
+                return False
+            accepted_receipt = connection.execute(
+                """
+                SELECT 1 FROM shadowbot_commit_result_receipts
+                WHERE batch_id = ?
+                LIMIT 1
+                """,
+                (batch_id,),
+            ).fetchone()
+            if accepted_receipt is not None:
+                # A later malformed/conflicting file is evidence to quarantine,
+                # but it cannot roll an already accepted business projection
+                # back to UNKNOWN.
+                connection.rollback()
+                return False
+            now_text = _datetime_to_text(now)
+            items = connection.execute(
+                """
+                SELECT source_task_id, operation_id, item_execution_attempt_id,
+                       write_identity_key
+                FROM shadowbot_commit_batch_items
+                WHERE batch_id = ?
+                """,
+                (batch_id,),
+            ).fetchall()
+            for item in items:
+                attempt_id = str(item["item_execution_attempt_id"] or "")
+                attempt = connection.execute(
+                    """
+                    SELECT status, raw_output_json
+                    FROM shadowbot_execution_attempts
+                    WHERE execution_attempt_id = ?
+                    """,
+                    (attempt_id,),
+                ).fetchone()
+                if attempt is not None:
+                    raw = _json_load(attempt["raw_output_json"])
+                    raw["quarantine_reason"] = reason
+                    raw["quarantined_at"] = now_text
+                    connection.execute(
+                        """
+                        UPDATE shadowbot_execution_attempts
+                        SET status = 'SIDE_EFFECT_UNKNOWN',
+                            side_effect_state = 'UNKNOWN',
+                            ended_at = ?, raw_output_json = ?
+                        WHERE execution_attempt_id = ?
+                        """,
+                        (now_text, _json_dump(raw), attempt_id),
+                    )
+                connection.execute(
+                    """
+                    UPDATE shadowbot_operations
+                    SET status = 'NEEDS_RECONCILIATION', lock_owner = '',
+                        updated_at = ?
+                    WHERE operation_id = ?
+                    """,
+                    (now_text, str(item["operation_id"] or "")),
+                )
+                connection.execute(
+                    """
+                    UPDATE shadowbot_write_locks
+                    SET status = 'UNKNOWN', released_at = NULL, updated_at = ?
+                    WHERE write_identity_key = ?
+                      AND item_execution_attempt_id = ?
+                    """,
+                    (
+                        now_text,
+                        str(item["write_identity_key"] or ""),
+                        attempt_id,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET task_status = 'manual_review',
+                        result_message = ?, updated_at = ?
+                    WHERE task_id = ?
+                    """,
+                    (
+                        f"ShadowBot v4 结果已隔离，副作用状态待对账：{batch_id}",
+                        now_text,
+                        str(item["source_task_id"] or ""),
+                    ),
+                )
+            connection.execute(
+                """
+                UPDATE shadowbot_commit_batch_items
+                SET status = 'UNKNOWN', submit_attempted = 1,
+                    side_effect_state = 'UNKNOWN',
+                    error_code = 'RESULT_CONTRACT_INVALID',
+                    error_message = ?, updated_at = ?
+                WHERE batch_id = ?
+                """,
+                (reason, now_text, batch_id),
+            )
+            connection.execute(
+                """
+                UPDATE shadowbot_commit_batches
+                SET status = 'UNKNOWN', updated_at = ?
+                WHERE batch_id = ?
+                """,
+                (now_text, batch_id),
+            )
+            connection.commit()
+            return True
+        finally:
+            connection.close()
+
     @staticmethod
     def _next_shadowbot_lease_version(connection: sqlite3.Connection, operation_id: str) -> int:
         rows = connection.execute(

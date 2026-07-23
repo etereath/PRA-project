@@ -1164,13 +1164,25 @@ class ShadowBotExecutor:
         existing = self.repository.get_listing_status(operation.platform, variety, grade)
         if existing is None:
             return
+        observed_at = _parse_optional_datetime(
+            result.raw_output.get("readback_observed_at")
+            or result.raw_output.get("observed_at")
+        )
+        if str(result.execution_mode or "").upper() == EXECUTION_MODE_RECONCILE:
+            # RECONCILE may resolve a ledger state without performing a fresh
+            # platform read.  Never make listing_status look fresher than the
+            # actual readback evidence.
+            if observed_at is None:
+                return
+        else:
+            observed_at = observed_at or utc_now()
         self.repository.update_listing_price(
             platform_name=operation.platform,
             variety=variety,
             grade=grade,
             current_price=current_price,
             source="shadowbot",
-            updated_at=utc_now(),
+            updated_at=observed_at,
         )
 
     def open_login_verification_handoff(self, phase_data: dict[str, Any]) -> str:

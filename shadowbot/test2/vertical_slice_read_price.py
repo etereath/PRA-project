@@ -18,27 +18,33 @@ from . import package
 try:
     from app.shadowbot_contract_primitives import (
         contract_identity_key,
+        derive_v4_batch_semantics,
         normalize_contract_grade,
         normalize_contract_sku,
         normalize_contract_text,
         sha256_json,
+        v4_result_counts,
     )
 except ImportError:
     try:
         from .shadowbot_contract_primitives import (
             contract_identity_key,
+            derive_v4_batch_semantics,
             normalize_contract_grade,
             normalize_contract_sku,
             normalize_contract_text,
             sha256_json,
+            v4_result_counts,
         )
     except ImportError:
         from shadowbot_contract_primitives import (
             contract_identity_key,
+            derive_v4_batch_semantics,
             normalize_contract_grade,
             normalize_contract_sku,
             normalize_contract_text,
             sha256_json,
+            v4_result_counts,
         )
 
 
@@ -235,7 +241,30 @@ def _write_phase(request, result, phase, include_result_snapshot=False):
     if int(_get_arg(request, "contract_version", 0) or 0) == 4 or _get_arg(
         request, "commit_batch_id", ""
     ):
-        payload["schema_version"] = "shadowbot-commit-batch-phase-1.0"
+        payload.update(
+            {
+                "schema_version": "shadowbot-commit-batch-phase-1.0",
+                "contract_version": 4,
+                "batch_id": str(
+                    _get_arg(
+                        request,
+                        "phase_parent_batch_id",
+                        _get_arg(
+                            request,
+                            "batch_id",
+                            _get_arg(request, "commit_batch_id", ""),
+                        ),
+                    )
+                ),
+                "manifest_sha256": str(
+                    _get_arg(
+                        request,
+                        "phase_parent_manifest_sha256",
+                        _get_arg(request, "manifest_sha256", ""),
+                    )
+                ),
+            }
+        )
     parent_snapshot = _get_arg(request, "phase_parent_result_snapshot", None)
     if isinstance(parent_snapshot, dict):
         payload["batch_result_snapshot"] = _safe_output_payload(parent_snapshot)
@@ -260,13 +289,33 @@ def _write_phase(request, result, phase, include_result_snapshot=False):
             "page_identity_key": str(
                 _get_arg(request, "page_identity_key", "")
             ),
+            "internal_sku": str(_get_arg(request, "platform_sku", "")),
+            "expected_product_name": str(
+                _get_arg(request, "expected_product_name", "")
+            ),
+            "expected_grade": str(_get_arg(request, "expected_grade", "")),
+            "expected_old_price": str(
+                _get_arg(request, "expected_old_price", "")
+            ),
+            "target_price": str(_get_arg(request, "target_price", "")),
+            "item_payload_sha256": str(
+                _get_arg(request, "instruction_hash", "")
+            ),
             "phase": phase,
+            "status": str(result.get("status") or ""),
+            "submit_attempted": str(
+                result.get("side_effect_state") or "NOT_STARTED"
+            ).upper()
+            != "NOT_STARTED",
             "side_effect_state": str(
                 result.get("side_effect_state") or "NOT_STARTED"
             ),
             "submit_intent_at": result.get("submit_intent_at"),
             "submit_clicked_at": result.get("submit_clicked_at"),
             "readback_observed_at": result.get("readback_observed_at"),
+            "actual_price": result.get("actual_price"),
+            "error_code": str(result.get("error_code") or ""),
+            "error_message": str(result.get("error_message") or ""),
             "updated_at": payload["updated_at"],
         }
     if include_result_snapshot:
@@ -3209,6 +3258,10 @@ def _commit_v4_stable_request(request, item, row, execution_ordinal, batch_size)
         "phase_parent_task_id": str(request.get("task_id") or ""),
         "phase_parent_execution_attempt_id": parent_attempt_id,
         "phase_parent_instruction_hash": str(request.get("instruction_hash") or ""),
+        "phase_parent_batch_id": str(request.get("batch_id") or ""),
+        "phase_parent_manifest_sha256": str(
+            request.get("manifest_sha256") or ""
+        ),
         "phase_parent_current_source_task_id": item["source_task_id"],
         "phase_parent_execution_ordinal": execution_ordinal,
     }
@@ -3237,20 +3290,7 @@ def _commit_v4_stable_request(request, item, row, execution_ordinal, batch_size)
 
 
 def _commit_v4_counts(items):
-    counts = {
-        "total": len(items),
-        "attempted": 0,
-        "verified": 0,
-        "not_applied": 0,
-        "failed": 0,
-        "unknown": 0,
-        "not_attempted": 0,
-    }
-    for item in items:
-        if item.get("submit_attempted"):
-            counts["attempted"] += 1
-        counts[str(item["status"]).lower()] += 1
-    return counts
+    return v4_result_counts(items)
 
 
 def _commit_v4_prepare_product_list(window, timeout_seconds, result, stage):
@@ -3528,22 +3568,11 @@ def _run_commit_batch_v4(args, request, result):
         result["retryable"] = exc.retryable
 
     counts = _commit_v4_counts(item_results)
-    if counts["verified"] == counts["total"]:
-        batch_status = "VERIFIED"
-    elif counts["verified"]:
-        batch_status = "PARTIAL"
-    elif counts["unknown"]:
-        batch_status = "UNKNOWN"
-    else:
-        batch_status = "FAILED"
+    semantics = derive_v4_batch_semantics(counts)
     result.update(
         {
             "counts": counts,
-            "batch_status": batch_status,
-            "status": batch_status,
-            "run_success_flag": batch_status == "VERIFIED",
-            "business_operation_completed": counts["attempted"] > 0,
-            "side_effect_state": "VERIFIED" if batch_status == "VERIFIED" else result["side_effect_state"],
+            **semantics,
             "error_code": str(getattr(execution_error, "code", "") or result.get("error_code") or ""),
             "error_message": str(getattr(execution_error, "message", "") or result.get("error_message") or ""),
             "retryable": bool(getattr(execution_error, "retryable", False)),

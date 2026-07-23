@@ -6,6 +6,10 @@ import os
 import time
 from pathlib import Path
 
+from app.shadowbot_contract_primitives import (
+    derive_v4_batch_semantics,
+    v4_result_counts,
+)
 
 FLOW_PATH = (
     Path(__file__).resolve().parents[1]
@@ -56,6 +60,8 @@ def _load_functions():
         "WINDOW_HEIGHT_DEFAULT": 1056,
         "SINGLE_PRODUCT_SCROLL_START_POSITION": 4,
         "SINGLE_PRODUCT_MAX_SCROLL_ATTEMPTS": 3,
+        "derive_v4_batch_semantics": derive_v4_batch_semantics,
+        "v4_result_counts": v4_result_counts,
         "time": time,
     }
     exec(compile(module, str(FLOW_PATH), "exec"), namespace)
@@ -362,7 +368,7 @@ def test_v4_stops_on_unknown_and_leaves_later_items_not_attempted():
     result, calls = _execute([third, second, first], rows, outcomes)
 
     assert [call["task_id"] for call in calls] == ["TASK-1", "TASK-2"]
-    assert result["batch_status"] == "PARTIAL"
+    assert result["batch_status"] == "UNKNOWN"
     assert result["counts"] == {
         "total": 3,
         "attempted": 2,

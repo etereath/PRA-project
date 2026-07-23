@@ -1,0 +1,23 @@
+{
+  "batch_id": "BATCH-T12-CONTROLLED-UNKNOWN-20260723-02",
+  "development_confirmation_text": "确认授权批次 BATCH-T12-CONTROLLED-UNKNOWN-20260723-02 以上1项真实COMMIT",
+  "execution_mode": "COMMIT",
+  "items": [
+    {
+      "expected_grade": "B",
+      "expected_old_price": "10.20",
+      "expected_product_name": "艾莎",
+      "internal_sku": "AISHA-B-60-Z",
+      "item_id": "ITEM-5faed44bc39d75f6f65ad6d3c6ed6cf5",
+      "item_payload_sha256": "sha256:f64fc71b3e85a6eeb623db31b3ae7eef9c4a8da6354793e0bef83f2ed55f7cc8",
+      "operation_id": "OP-41df7c62855a90f6334f4fe682b40bbc",
+      "page_identity_key": "蚂蚁花团供应商|艾莎|B",
+      "source_task_id": "a95ea3dfd690",
+      "target_price": "10.30",
+      "write_identity_key": "蚂蚁花团供应商|AISHA-B-60-Z"
+    }
+  ],
+  "manifest_sha256": "sha256:7d82589c5773ec2156d4f5c30d7e0e2f6a58e747d92f00668b56e2c399beb8b2",
+  "platform_name": "蚂蚁花团供应商",
+  "schema_version": "shadowbot-commit-manifest-1.2"
+}
