@@ -59,6 +59,13 @@ def render_formal_boundary_markdown(payload: Mapping[str, Any]) -> str:
     queue = _require_mapping(report.get("final_queue_state"), "final_queue_state")
     encoding = _require_mapping(report.get("encoding_check"), "encoding_check")
     evidence_policy = report.get("evidence_policy")
+    raw_warnings = report.get("warnings", [])
+    if not isinstance(raw_warnings, list):
+        raise MarkdownReportError("warnings must be an array")
+    warnings = [
+        _require_mapping(item, f"warnings[{index}]")
+        for index, item in enumerate(raw_warnings, start=1)
+    ]
     if not isinstance(evidence_policy, Mapping):
         evidence_policy = {
             "capture_requested": False,
@@ -130,6 +137,23 @@ def render_formal_boundary_markdown(payload: Mapping[str, Any]) -> str:
         "## 逐商品读取结果与证据",
         "",
     ]
+    if warnings:
+        marker = lines.index("## 排序前后")
+        warning_lines = ["## 映射警告", ""]
+        for warning in warnings:
+            warning_lines.extend(
+                [
+                    (
+                        f"- `{_string(warning.get('warning_code'))}`："
+                        f"{_string(warning.get('product_name'))} "
+                        f"{_string(warning.get('grade'))}，"
+                        f"页面位置 `{_string(warning.get('row_identity'))}`；"
+                        "商品已读取，但尚未绑定正式 SKU。"
+                    ),
+                    "",
+                ]
+            )
+        lines[marker:marker] = warning_lines
     for index, item in enumerate(results, start=1):
         name = _string(item.get("product_name"), _string(item.get("expected_product_name")))
         grade = _string(item.get("grade"), _string(item.get("expected_grade")))

@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import ast
 import tempfile
-from datetime import datetime, time
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 from uuid import uuid4
 
 from openpyxl import Workbook, load_workbook
 
-from app.enums import ConditionType, ListingAction, ListingStrategy, PricingMethod, PricingSource, RoundingRule, TaskActionType, TaskStatus
+from app.enums import ListingStrategy, PricingMethod, PricingSource, RoundingRule, TaskActionType, TaskStatus
 from app.exceptions import TableValidationError, TableValidationIssue, ValidationError
 from app.models import (
     ColdStorageStatus,
@@ -145,6 +145,7 @@ TASK_HEADERS = [
     "priority",
     "task_status",
     "created_at",
+    "expected_old_price",
     "target_price",
     "target_status",
     "pricing_source",
@@ -247,32 +248,46 @@ def load_products(path: Path) -> list[Product]:
 
 def load_price_rules(path: Path) -> list[PriceRule]:
     rows = _read_rows(path, PRICE_RULE_HEADERS)
-    rules: list[PriceRule] = []
-    for row_number, row in enumerate(rows, start=2):
-        rules.append(
-            PriceRule(
-                rule_id=_required_text(row["rule_id"], "rule_id", row_number),
-                rule_name=_required_text(row["rule_name"], "rule_name", row_number),
-                variety_filter=_required_text(row["variety_filter"], "variety_filter", row_number),
-                grade_filter=_required_text(row["grade_filter"], "grade_filter", row_number),
-                platform_filter=_required_text(row["platform_filter"], "platform_filter", row_number),
-                pricing_method=PricingMethod(_required_text(row["pricing_method"], "pricing_method", row_number)),
-                markup_value=_parse_required_non_zero_decimal(
-                    row["markup_value"], f"price_rules row {row_number} markup_value"
-                ),
-                min_price=parse_decimal(row["min_price"], f"price_rules row {row_number} min_price")
-                if row.get("min_price") not in ("", None)
-                else None,
-                rounding_rule=RoundingRule(_required_text(row["rounding_rule"], "rounding_rule", row_number)),
-                rounding_step=parse_decimal(row["rounding_step"], f"price_rules row {row_number} rounding_step")
-                if row.get("rounding_step") not in ("", None)
-                else None,
-                active=parse_bool(row["active"], f"price_rules row {row_number} active"),
-                priority=parse_int(row["priority"], f"price_rules row {row_number} priority"),
-                remark=str(row.get("remark") or ""),
-            )
-        )
-    return rules
+    return [_price_rule_from_row(row, row_number) for row_number, row in enumerate(rows, start=2)]
+
+
+def load_price_rule(path: Path, rule_id: str) -> PriceRule:
+    selected_id = str(rule_id or "").strip()
+    matches = [
+        (row_number, row)
+        for row_number, row in enumerate(_read_rows(path, PRICE_RULE_HEADERS), start=2)
+        if str(row.get("rule_id") or "").strip() == selected_id
+    ]
+    if not selected_id or not matches:
+        raise ValidationError(f"未找到价格规则：{selected_id or '-'}")
+    if len(matches) > 1:
+        raise ValidationError(f"价格规则 ID 重复：{selected_id}")
+    row_number, row = matches[0]
+    return _price_rule_from_row(row, row_number)
+
+
+def _price_rule_from_row(row: dict[str, object], row_number: int) -> PriceRule:
+    return PriceRule(
+        rule_id=_required_text(row["rule_id"], "rule_id", row_number),
+        rule_name=_required_text(row["rule_name"], "rule_name", row_number),
+        variety_filter=_required_text(row["variety_filter"], "variety_filter", row_number),
+        grade_filter=_required_text(row["grade_filter"], "grade_filter", row_number),
+        platform_filter=_required_text(row["platform_filter"], "platform_filter", row_number),
+        pricing_method=PricingMethod(_required_text(row["pricing_method"], "pricing_method", row_number)),
+        markup_value=_parse_required_non_zero_decimal(
+            row["markup_value"], f"price_rules row {row_number} markup_value"
+        ),
+        min_price=parse_decimal(row["min_price"], f"price_rules row {row_number} min_price")
+        if row.get("min_price") not in ("", None)
+        else None,
+        rounding_rule=RoundingRule(_required_text(row["rounding_rule"], "rounding_rule", row_number)),
+        rounding_step=parse_decimal(row["rounding_step"], f"price_rules row {row_number} rounding_step")
+        if row.get("rounding_step") not in ("", None)
+        else None,
+        active=parse_bool(row["active"], f"price_rules row {row_number} active"),
+        priority=parse_int(row["priority"], f"price_rules row {row_number} priority"),
+        remark=str(row.get("remark") or ""),
+    )
 
 
 def _parse_required_non_zero_decimal(value: object, field_context: str):
@@ -286,25 +301,37 @@ def _parse_required_non_zero_decimal(value: object, field_context: str):
 
 def load_listing_rules(path: Path) -> list[ListingRule]:
     rows = _read_rows(path, LISTING_RULE_HEADERS)
-    rules: list[ListingRule] = []
-    for row_number, row in enumerate(rows, start=2):
-        rules.append(
-            ListingRule(
-                rule_id=_required_text(row["rule_id"], "rule_id", row_number),
-                rule_name=_required_text(row["rule_name"], "rule_name", row_number),
-                variety_filter=_required_text(row["variety_filter"], "variety_filter", row_number),
-                grade_filter=_required_text(row["grade_filter"], "grade_filter", row_number),
-                platform_filter=_required_text(row["platform_filter"], "platform_filter", row_number),
-                stock_threshold=parse_decimal(row["stock_threshold"], f"listing_rules row {row_number} stock_threshold"),
-                listing_strategy=ListingStrategy(
-                    _required_text(row["listing_strategy"], "listing_strategy", row_number)
-                ),
-                active=parse_bool(row["active"], f"listing_rules row {row_number} active"),
-                priority=parse_int(row["priority"], f"listing_rules row {row_number} priority"),
-                remark=str(row.get("remark") or ""),
-            )
-        )
-    return rules
+    return [_listing_rule_from_row(row, row_number) for row_number, row in enumerate(rows, start=2)]
+
+
+def load_listing_rule(path: Path, rule_id: str) -> ListingRule:
+    selected_id = str(rule_id or "").strip()
+    matches = [
+        (row_number, row)
+        for row_number, row in enumerate(_read_rows(path, LISTING_RULE_HEADERS), start=2)
+        if str(row.get("rule_id") or "").strip() == selected_id
+    ]
+    if not selected_id or not matches:
+        raise ValidationError(f"未找到上下架规则：{selected_id or '-'}")
+    if len(matches) > 1:
+        raise ValidationError(f"上下架规则 ID 重复：{selected_id}")
+    row_number, row = matches[0]
+    return _listing_rule_from_row(row, row_number)
+
+
+def _listing_rule_from_row(row: dict[str, object], row_number: int) -> ListingRule:
+    return ListingRule(
+        rule_id=_required_text(row["rule_id"], "rule_id", row_number),
+        rule_name=_required_text(row["rule_name"], "rule_name", row_number),
+        variety_filter=_required_text(row["variety_filter"], "variety_filter", row_number),
+        grade_filter=_required_text(row["grade_filter"], "grade_filter", row_number),
+        platform_filter=_required_text(row["platform_filter"], "platform_filter", row_number),
+        stock_threshold=parse_decimal(row["stock_threshold"], f"listing_rules row {row_number} stock_threshold"),
+        listing_strategy=ListingStrategy(_required_text(row["listing_strategy"], "listing_strategy", row_number)),
+        active=parse_bool(row["active"], f"listing_rules row {row_number} active"),
+        priority=parse_int(row["priority"], f"listing_rules row {row_number} priority"),
+        remark=str(row.get("remark") or ""),
+    )
 
 
 def load_harvest_forecasts(path: Path) -> list[HarvestForecast]:
@@ -521,6 +548,7 @@ def export_tasks(path: Path, tasks: Iterable[Task]) -> Path:
                 record["priority"],
                 record["task_status"],
                 record["created_at"],
+                serialize_decimal(task.expected_old_price),
                 serialize_decimal(task.target_price),
                 record["target_status"],
                 record["pricing_source"],
@@ -553,6 +581,11 @@ def load_tasks(path: Path) -> list[Task]:
                 priority=parse_int(row["priority"], f"tasks row {row_number} priority"),
                 task_status=TaskStatus(_required_text(row["task_status"], "task_status", row_number)),
                 created_at=datetime.fromisoformat(_required_text(row["created_at"], "created_at", row_number)),
+                expected_old_price=parse_decimal(
+                    row["expected_old_price"], f"tasks row {row_number} expected_old_price"
+                )
+                if row.get("expected_old_price") not in ("", None)
+                else None,
                 target_price=parse_decimal(row["target_price"], f"tasks row {row_number} target_price")
                 if row.get("target_price") not in ("", None)
                 else None,
@@ -1059,22 +1092,6 @@ def _try_parse_bool(
         issues.append(TableValidationIssue(row_number, field_name, "请输入 true/false、1/0、yes/no"))
 
 
-def _try_parse_time(
-    value: object,
-    row_number: int,
-    field_name: str,
-    issues: list[TableValidationIssue],
-    *,
-    required: bool,
-) -> None:
-    if value in (None, ""):
-        if required:
-            issues.append(TableValidationIssue(row_number, field_name, "该字段必填"))
-        return
-    if _normalize_time_value(value) is None:
-        issues.append(TableValidationIssue(row_number, field_name, "请输入时间，格式如 22:00"))
-
-
 def _try_parse_date(
     value: object,
     row_number: int,
@@ -1109,49 +1126,6 @@ def _try_parse_datetime(
         parse_datetime(value, f"row {row_number} {field_name}")
     except ValidationError:
         issues.append(TableValidationIssue(row_number, field_name, "请输入 ISO 时间"))
-
-def _parse_listing_condition_value(
-    *,
-    condition_type: ConditionType,
-    raw_value: object,
-    field_context: str,
-) -> Decimal | str | None:
-    if condition_type in {ConditionType.STOCK_LTE, ConditionType.STOCK_GTE}:
-        if raw_value in (None, ""):
-            raise ValidationError(f"{field_context} is required")
-        return parse_decimal(raw_value, field_context)
-    if condition_type == ConditionType.TIME_GTE:
-        if raw_value in (None, ""):
-            raise ValidationError(f"{field_context} is required")
-        normalized = _normalize_time_value(raw_value)
-        if normalized is None:
-            raise ValidationError(f"{field_context} must be HH:MM")
-        return normalized
-    return None
-
-
-def _normalize_time_value(raw_value: object) -> str | None:
-    if raw_value in (None, ""):
-        return None
-    if isinstance(raw_value, datetime):
-        return raw_value.time().strftime("%H:%M")
-    if isinstance(raw_value, time):
-        return raw_value.strftime("%H:%M")
-    text = str(raw_value).strip()
-    if len(text) >= 5 and ":" in text:
-        parts = text.split(":")
-        if len(parts) >= 2:
-            hour_part = parts[0]
-            minute_part = parts[1]
-            try:
-                hour = int(hour_part)
-                minute = int(minute_part)
-            except ValueError:
-                return None
-            if 0 <= hour <= 23 and 0 <= minute <= 59:
-                return f"{hour:02d}:{minute:02d}"
-    return None
-
 
 def _read_rows(path: Path, expected_headers: list[str]) -> list[dict[str, object]]:
     workbook = load_workbook(path)
@@ -1251,9 +1225,13 @@ def _read_task_rows(path: Path) -> list[dict[str, object]]:
     sheet = workbook.active
     header_row = [cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
     accepted_headers = TASK_HEADERS
-    legacy_headers = [header for header in TASK_HEADERS if header != "required_by"]
-    if header_row == legacy_headers:
-        accepted_headers = legacy_headers
+    legacy_header_variants = [
+        [header for header in TASK_HEADERS if header != "required_by"],
+        [header for header in TASK_HEADERS if header != "expected_old_price"],
+        [header for header in TASK_HEADERS if header not in {"expected_old_price", "required_by"}],
+    ]
+    if header_row in legacy_header_variants:
+        accepted_headers = header_row
     elif header_row != TASK_HEADERS:
         raise ValidationError(f"{path.name}: invalid headers. Expected {TASK_HEADERS}, got {header_row}")
 
@@ -1262,6 +1240,7 @@ def _read_task_rows(path: Path) -> list[dict[str, object]]:
         if all(_is_blank_cell(value) for value in raw_row):
             continue
         row = dict(zip(accepted_headers, raw_row, strict=True))
+        row.setdefault("expected_old_price", None)
         row.setdefault("required_by", None)
         rows.append(row)
     return rows

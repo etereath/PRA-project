@@ -1,0 +1,14 @@
+{
+  "execution_attempt_id": "RECONCILE-046a063ae885fcb4f352",
+  "execution_mode": "RECONCILE",
+  "instruction_hash": "sha256:f876995326ad025b701912b36d254f9be07a237931cf636996ce6c0c93eb7c33",
+  "lease_owner_token": "shadowbot_executor:69a86160b68f42aeab1890ec62464634",
+  "lease_version": 1,
+  "operation_id": "OP-41df7c62855a90f6334f4fe682b40bbc",
+  "phase": "RESULT_WRITTEN",
+  "request_file_sha256": "eab9728a7683755d0cb216fea585ea972d6d805758e36d1651d2e76e9e8b2d9f",
+  "side_effect_state": "VERIFIED",
+  "task_id": "a95ea3dfd690",
+  "updated_at": "2026-07-23T11:40:22.424183+00:00",
+  "worker_id": "<REDACTED_DEVICE>"
+}

@@ -16,6 +16,7 @@ from scripts.sync_shadowbot_test2 import validate_shadowbot_app_dir
 DEPLOYED_SOURCE_FILES = (
     "module1.py",
     "shadowbot_credentials.py",
+    "shadowbot_contract_primitives.py",
     "shadowbot_queue_worker.py",
     "vertical_slice_read_price.py",
 )

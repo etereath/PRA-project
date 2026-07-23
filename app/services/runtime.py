@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from app.enums import NotificationSendStatus, ReviewTaskStatus, TaskActionType, TaskStatus
 from app.exceptions import ValidationError
+from app.mobile_review import resolution_payload_summary
 from app.models import (
     ExecutionLog,
     NotificationLog,
@@ -32,13 +33,9 @@ from app.services.execution import ExecutionSimulationService
 from app.services.feishu import build_feishu_signature, is_feishu_success_response
 from app.services.manual_intervention import MANUAL_INTERVENTION_ACTIONS
 from app.services.notification_outbox import (
-    FakeSender,
-    NotificationOutboxService,
-    NotificationOutboxWorker,
     OutboxReviewNotificationService,
-    ScriptedSender,
 )
-from app.utils import serialize_decimal, utc_now
+from app.utils import serialize_decimal
 
 
 DEFAULT_RUNTIME_DB = Path("data/runtime/pra_runtime.sqlite3")
@@ -56,6 +53,7 @@ ALLOWED_TASK_TRANSITIONS = {
     TaskStatus.FAILED: {TaskStatus.PENDING, TaskStatus.CANCELLED},
     TaskStatus.MANUAL_REVIEW: {
         TaskStatus.PENDING,
+        TaskStatus.SUCCESS,
         TaskStatus.SKIPPED,
         TaskStatus.CANCELLED,
         TaskStatus.EXPIRED,
@@ -85,6 +83,14 @@ DEFAULT_MOBILE_REVIEW_ACTIONS = [
     ReviewTaskStatus.ADJUSTED.value,
     ReviewTaskStatus.CANCELLED.value,
 ]
+
+
+def _deadline_has_passed(deadline: datetime, now: datetime) -> bool:
+    if deadline.tzinfo is None:
+        comparable_now = now.replace(tzinfo=None)
+    else:
+        comparable_now = now.astimezone(deadline.tzinfo) if now.tzinfo is not None else now.astimezone()
+    return deadline <= comparable_now
 
 FEISHU_WEBHOOK_URL_REQUIRED = "FEISHU_WEBHOOK_URL is required for feishu notification"
 FEISHU_TOKEN_URL_CREATION_FAILED = "mobile_review_url creation failed"
@@ -146,6 +152,33 @@ class RuntimeTaskService:
             scope_type=scope_type,
             scope_key=scope_key,
         )
+
+    def expire_overdue_pending_tasks(
+        self,
+        *,
+        now: datetime | None = None,
+        changed_by: str = "system:auto_expire_tasks",
+    ) -> int:
+        """Move overdue pending tasks to expired and record an audit history row."""
+
+        current = now or datetime.now()
+        expired_count = 0
+        for task in self.repository.list_tasks(status=TaskStatus.PENDING):
+            if task.action_type in MANUAL_INTERVENTION_ACTIONS:
+                continue
+            deadline = task.expires_at or task.required_by
+            if deadline is None or not _deadline_has_passed(deadline, current):
+                continue
+            self.change_status(
+                task_id=task.task_id,
+                to_status=TaskStatus.EXPIRED,
+                changed_by=changed_by,
+                reason="required_by_deadline_passed",
+                metadata={"deadline": deadline.isoformat(), "detected_at": current.isoformat()},
+                result_message="任务已超过截止时间，系统自动标记为过期。",
+            )
+            expired_count += 1
+        return expired_count
 
     def change_status(
         self,
@@ -334,7 +367,7 @@ class ReviewTaskService:
                     "actor": actor,
                     "actor_source": actor_source,
                     "resolution_note": note,
-                    "resolution_payload_summary": _resolution_payload_summary(resolved_payload),
+                    "resolution_payload_summary": resolution_payload_summary(resolved_payload),
                 }
                 if source_task_metadata_extra:
                     metadata.update(source_task_metadata_extra)
@@ -439,7 +472,7 @@ class ReviewTaskService:
                             "actor": actor,
                             "actor_source": "system_timeout",
                             "resolution_note": "expired by required_by timeout",
-                            "resolution_payload_summary": _resolution_payload_summary(resolution_payload),
+                            "resolution_payload_summary": resolution_payload_summary(resolution_payload),
                             **metadata_extra,
                         },
                     )
@@ -1085,17 +1118,6 @@ def _review_task_from_source(task: Task, *, trade_date: date | None) -> ReviewTa
         created_at=task.created_at,
         updated_at=task.updated_at or task.created_at,
     )
-
-
-def _resolution_payload_summary(payload: dict[str, object]) -> dict[str, object]:
-    if not payload:
-        return {}
-    summary: dict[str, object] = {"keys": sorted(payload.keys())}
-    if "reviewer_code" in payload and payload.get("reviewer_code"):
-        summary["reviewer_code_present"] = True
-    if "adjustment" in payload:
-        summary["adjustment"] = payload.get("adjustment")
-    return summary
 
 
 def _allowed_mobile_actions_for_review_type(review_type: str) -> list[str]:

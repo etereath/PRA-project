@@ -9,11 +9,14 @@ import sys
 import types
 import unittest
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from app.exceptions import ValidationError
+from app.models import ListingStatus
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.repositories.workbook_repository import save_table_records
 from app.services.shadowbot_executor import (
     EXECUTION_MODE_COMMIT,
     EXECUTION_MODE_READ_ONLY,
@@ -99,6 +102,262 @@ class ShadowBotQueueTests(unittest.TestCase):
         self.assertEqual(request["contract_version"], 2)
         self.assertEqual(request["instruction_hash"], compute_multi_product_instruction_hash(request))
         self.assertEqual(request["products"][0]["item_id"], "ITEM-001")
+
+    def test_v2_read_result_persists_bound_inventory_observation(self) -> None:
+        repository = SQLiteRuntimeRepository(self.db_path)
+        repository.init_schema()
+        repository.upsert_listing_status(
+            ListingStatus(
+                listing_status_id="LISTING-001",
+                platform_name="ant_flower_wechat",
+                internal_sku="SKU-INTERNAL-001",
+                variety="A",
+                current_price=Decimal("19.00"),
+                grade="B",
+            )
+        )
+        importer = ShadowBotResultImporter(repository, Mock(), self.queue_dir)
+        completed_at = datetime(2026, 7, 21, 10, 30, tzinfo=UTC)
+        request = {
+            "contract_version": 2,
+            "execution_mode": "READ_ONLY",
+            "read_batch_id": "READ-BATCH-INVENTORY-001",
+            "products": [{
+                "item_id": "ITEM-001",
+                "platform": "ant_flower_wechat",
+                "expected_product_name": "A",
+                "expected_grade": "B",
+            }],
+        }
+        result = {
+            "contract_version": 2,
+            "read_batch_id": "READ-BATCH-INVENTORY-001",
+            "execution_attempt_id": "ATTEMPT-INVENTORY-001",
+            "status": "READ_COMPLETED",
+            "started_at": (completed_at - timedelta(seconds=10)).isoformat(),
+            "completed_at": completed_at.isoformat(),
+            "product_snapshots": [{
+                "item_id": "ITEM-001",
+                "item_status": "SUCCESS",
+                "listing_status": "ONLINE",
+                "price": "19.00",
+                "inventory": 27,
+                "error_code": None,
+                "evidence": [],
+            }],
+        }
+
+        ShadowBotResultImporter._validate_v2_result(
+            request,
+            result,
+            json.dumps(result, ensure_ascii=False).encode("utf-8"),
+        )
+        events = importer._import_v2_inventory_observations(request, result)
+
+        self.assertEqual(events[0]["status"], "UPDATED")
+        status = repository.get_listing_status("ant_flower_wechat", "A", "B级")
+        assert status is not None
+        self.assertEqual(status.platform_stock_qty, 27)
+        self.assertEqual(status.inventory_observed_at, completed_at)
+        self.assertEqual(status.inventory_source_attempt_id, "ATTEMPT-INVENTORY-001")
+
+    def test_v2_complete_page_snapshot_warns_unmapped_and_zeros_absent_existing_listing(self) -> None:
+        repository = SQLiteRuntimeRepository(self.db_path)
+        repository.init_schema()
+        repository.upsert_listing_status(
+            ListingStatus(
+                listing_status_id="LISTING-A",
+                platform_name="ant_flower_wechat",
+                internal_sku="AISHA-B-60-Z",
+                variety="Aisha",
+                current_price=Decimal("26.40"),
+                grade="B",
+                platform_stock_qty=8,
+                online_status="online",
+            )
+        )
+        repository.upsert_listing_status(
+            ListingStatus(
+                listing_status_id="LISTING-001",
+                platform_name="ant_flower_wechat",
+                internal_sku="SKU-INTERNAL-001",
+                variety="Cappuccino",
+                current_price=Decimal("46.40"),
+                grade="B",
+                platform_stock_qty=12,
+                online_status="online",
+            )
+        )
+        importer = ShadowBotResultImporter(repository, Mock(), self.queue_dir)
+        completed_at = datetime(2026, 7, 22, 7, 32, 55, tzinfo=UTC)
+        request = {
+            "contract_version": 2,
+            "execution_mode": "READ_ONLY",
+            "read_batch_id": "READ-BATCH-NOT-ONLINE-001",
+            "platform_name": "ant_flower_wechat",
+            "products": [
+                {
+                    "item_id": "ITEM-A",
+                    "platform": "ant_flower_wechat",
+                    "expected_product_name": "Aisha",
+                    "expected_grade": "B",
+                },
+                {
+                    "item_id": "ITEM-CAPPUCCINO-B",
+                    "platform": "ant_flower_wechat",
+                    "expected_product_name": "Cappuccino",
+                    "expected_grade": "B",
+                },
+            ],
+        }
+        result = {
+            "contract_version": 2,
+            "read_batch_id": "READ-BATCH-NOT-ONLINE-001",
+            "execution_attempt_id": "ATTEMPT-NOT-ONLINE-001",
+            "status": "READ_COMPLETED",
+            "active_listing_filter": "ONLINE",
+            "started_at": (completed_at - timedelta(seconds=10)).isoformat(),
+            "completed_at": completed_at.isoformat(),
+            "warnings": [{
+                "warning_code": "UNMAPPED_PRODUCT_DISCOVERED",
+                "item_id": "UNMAPPED-E",
+                "platform_name": "ant_flower_wechat",
+                "product_name": "Cappuccino",
+                "grade": "E",
+                "row_identity": "parent-index:17",
+            }],
+            "product_snapshots": [
+                {
+                    "item_id": "ITEM-A",
+                    "item_status": "SUCCESS",
+                    "mapping_status": "MAPPED",
+                    "listing_status": "ONLINE",
+                    "price": "26.40",
+                    "inventory": 3,
+                    "error_code": None,
+                    "evidence": [],
+                },
+                {
+                    "item_id": "UNMAPPED-E",
+                    "platform": "ant_flower_wechat",
+                    "product_name": "Cappuccino",
+                    "grade": "E",
+                    "item_status": "SUCCESS",
+                    "mapping_status": "UNMAPPED",
+                    "warning_code": "UNMAPPED_PRODUCT_DISCOVERED",
+                    "listing_status": "ONLINE",
+                    "price": "18.80",
+                    "inventory": 2,
+                    "row_identity": "parent-index:17",
+                    "error_code": None,
+                    "evidence": [],
+                },
+            ],
+        }
+
+        ShadowBotResultImporter._validate_v2_result(
+            request,
+            result,
+            json.dumps(result, ensure_ascii=False).encode("utf-8"),
+        )
+        events = importer._import_v2_inventory_observations(request, result)
+
+        self.assertEqual(events[0]["status"], "UPDATED")
+        warning = next(event for event in events if event.get("warning_code"))
+        self.assertEqual(warning["warning_code"], "UNMAPPED_PRODUCT_DISCOVERED")
+        self.assertEqual(warning["current_price"], "18.80")
+        absent = next(event for event in events if event.get("inference_basis"))
+        self.assertEqual(absent["inference_basis"], "ABSENT_FROM_COMPLETE_ONLINE_SNAPSHOT")
+        status = repository.get_listing_status("ant_flower_wechat", "Cappuccino", "B")
+        assert status is not None
+        self.assertEqual(status.platform_stock_qty, 0)
+        self.assertEqual(status.current_price, Decimal("46.40"))
+        self.assertEqual(status.online_status, "online")
+        self.assertEqual(status.source, "shadowbot_read_not_in_online")
+        self.assertEqual(status.inventory_source_attempt_id, "ATTEMPT-NOT-ONLINE-001")
+
+    def test_v2_unmapped_worker_row_is_promoted_from_inventory_and_created_online(self) -> None:
+        repository = SQLiteRuntimeRepository(self.db_path)
+        repository.init_schema()
+        products_path = self.root / "products.xlsx"
+        save_table_records(
+            "products",
+            products_path,
+            [
+                {
+                    "internal_sku": "CAPPUCCINO-E-45-Z",
+                    "product_name": "卡布奇诺",
+                    "grade": "E",
+                    "stem_length": "45",
+                    "unit": "扎",
+                    "base_cost": "10.00",
+                    "current_stock": 1,
+                    "sale_enabled": True,
+                }
+            ],
+        )
+        importer = ShadowBotResultImporter(
+            repository,
+            Mock(),
+            self.queue_dir,
+            inventory_products_path=products_path,
+        )
+        completed_at = datetime(2026, 7, 22, 8, 30, tzinfo=UTC)
+        request = {
+            "contract_version": 2,
+            "execution_mode": "READ_ONLY",
+            "read_batch_id": "READ-BATCH-INVENTORY-PROMOTE-001",
+            "platform_name": "蚂蚁花团供应商",
+            "products": [],
+        }
+        result = {
+            "contract_version": 2,
+            "read_batch_id": request["read_batch_id"],
+            "execution_attempt_id": "ATTEMPT-INVENTORY-PROMOTE-001",
+            "status": "READ_COMPLETED",
+            "active_listing_filter": "ONLINE",
+            "started_at": (completed_at - timedelta(seconds=10)).isoformat(),
+            "completed_at": completed_at.isoformat(),
+            "warnings": [
+                {
+                    "warning_code": "UNMAPPED_PRODUCT_DISCOVERED",
+                    "item_id": "UNMAPPED-E",
+                    "platform_name": "蚂蚁花团供应商",
+                    "product_name": "卡布奇诺",
+                    "grade": "E级",
+                    "row_identity": "parent-index:1",
+                }
+            ],
+            "product_snapshots": [
+                {
+                    "item_id": "UNMAPPED-E",
+                    "platform": "蚂蚁花团供应商",
+                    "product_name": "卡布奇诺",
+                    "grade": "E级",
+                    "item_status": "SUCCESS",
+                    "mapping_status": "UNMAPPED",
+                    "warning_code": "UNMAPPED_PRODUCT_DISCOVERED",
+                    "listing_status": "ONLINE",
+                    "price": "12.00",
+                    "inventory": 1,
+                    "row_identity": "parent-index:1",
+                    "error_code": None,
+                    "evidence": [],
+                }
+            ],
+        }
+
+        events = importer._import_v2_inventory_observations(request, result)
+
+        self.assertFalse(any(event.get("warning_code") == "UNMAPPED_PRODUCT_DISCOVERED" for event in events))
+        self.assertEqual(events[0]["status"], "CREATED")
+        self.assertEqual(events[0]["internal_sku"], "CAPPUCCINO-E-45-Z")
+        status = repository.get_listing_status("蚂蚁花团供应商", "卡布奇诺", "E")
+        assert status is not None
+        self.assertEqual(status.internal_sku, "CAPPUCCINO-E-45-Z")
+        self.assertEqual(status.current_price, Decimal("12.00"))
+        self.assertEqual(status.platform_stock_qty, 1)
+        self.assertEqual(status.online_status, "online")
 
     def test_file_queue_rejects_fault_injection_and_unsupported_spec_verification(self) -> None:
         runner = ShadowBotFileQueueRunner(self.queue_dir)
@@ -199,6 +458,46 @@ class ShadowBotQueueTests(unittest.TestCase):
         self.assertTrue(result_path.exists())
         self.assertFalse(list((self.queue_dir / "quarantine").glob("*.result.json")))
 
+    def test_terminal_result_reimport_repairs_interrupted_task_projection(self) -> None:
+        prepared, repository, runner, request, request_path = self._prepare_attempt(
+            "REPROJECT"
+        )
+        result_path = self._write_result(
+            request,
+            request_path,
+            status="VERIFIED",
+            side_effect_state="VERIFIED",
+        )
+        importer = ShadowBotResultImporter(repository, runner, self.queue_dir)
+
+        with patch.object(
+            importer.executor,
+            "_update_task_after_result",
+            side_effect=ValidationError("simulated projection interruption"),
+        ):
+            with self.assertRaisesRegex(
+                ValidationError,
+                "simulated projection interruption",
+            ):
+                importer.import_one(result_path)
+
+        interrupted_attempt = repository.get_shadowbot_execution_attempt(
+            prepared.execution_attempt_id
+        )
+        interrupted_task = repository.get_task(request["task_id"])
+        assert interrupted_attempt is not None
+        assert interrupted_task is not None
+        self.assertIsNotNone(interrupted_attempt.ended_at)
+        self.assertNotEqual(interrupted_task.task_status.value, "success")
+
+        event = importer.import_one(result_path)
+
+        repaired_task = repository.get_task(request["task_id"])
+        assert repaired_task is not None
+        self.assertEqual(event["status"], "ALREADY_IMPORTED")
+        self.assertEqual(repaired_task.task_status.value, "success")
+        self.assertFalse(result_path.exists())
+
     def test_queue_json_reader_retries_windows_file_collision(self) -> None:
         path = self.root / "heartbeat.json"
         path.write_text('{"status":"RUNNING"}', encoding="utf-8")
@@ -242,7 +541,7 @@ class ShadowBotQueueTests(unittest.TestCase):
             "scripts.run_shadowbot_queue_services.ShadowBotQueueWatchdog"
         ), patch(
             "scripts.run_shadowbot_queue_services.run_cycle",
-            return_value=[],
+            return_value=[{"status": "IMPORTED", "observed_at": datetime(2026, 7, 23, tzinfo=UTC)}],
         ), patch(
             "scripts.run_shadowbot_queue_services.msvcrt.locking"
         ), patch.object(

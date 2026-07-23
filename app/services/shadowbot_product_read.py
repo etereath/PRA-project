@@ -11,13 +11,24 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-import unicodedata
 from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from app.exceptions import ValidationError
+from app.listing_identity import (
+    listing_identity_key,
+)
+from app.repositories.workbook_repository import load_products
+from app.shadowbot_contract_primitives import (
+    contract_identity_key,
+    normalize_contract_grade,
+    normalize_contract_sku,
+    normalize_contract_text,
+    sha256_json,
+)
 
 
 CONTRACT_VERSION = 2
@@ -32,6 +43,9 @@ DEFAULT_MAX_SECONDS = 300
 HARD_MAX_SECONDS = 900
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_RESULT_BYTES = 4 * 1024 * 1024
+DEFAULT_INVENTORY_PRODUCTS_PATH = (
+    Path(__file__).resolve().parents[2] / "data" / "samples" / "products.xlsx"
+)
 
 LISTING_STATUSES = frozenset({"ONLINE", "OFFLINE", "UNKNOWN"})
 ITEM_STATUSES = frozenset({"SUCCESS", "FAILED", "SKIPPED", "MANUAL_CHECK_REQUIRED"})
@@ -68,11 +82,11 @@ class ProductTarget:
 
     @property
     def identity_key(self) -> str:
-        if self.platform_sku:
-            return f"{normalize_text(self.platform)}|sku:{normalize_text(self.platform_sku)}"
-        return (
-            f"{normalize_text(self.platform)}|name:{normalize_text(self.expected_product_name)}"
-            f"|grade:{normalize_grade(self.expected_grade)}"
+        return contract_identity_key(
+            self.platform,
+            self.platform_sku,
+            self.expected_product_name,
+            self.expected_grade,
         )
 
 
@@ -90,28 +104,25 @@ class ProductCandidate:
 
     @property
     def identity_key(self) -> str:
-        if self.platform_sku:
-            return f"{normalize_text(self.platform)}|sku:{normalize_text(self.platform_sku)}"
-        return (
-            f"{normalize_text(self.platform)}|name:{normalize_text(self.product_name)}"
-            f"|grade:{normalize_grade(self.grade)}"
+        return contract_identity_key(
+            self.platform,
+            self.platform_sku,
+            self.product_name,
+            self.grade,
         )
 
 
 def normalize_text(value: Any) -> str:
     """Normalize human-readable identity fields without changing their meaning."""
-
-    normalized = unicodedata.normalize("NFKC", str(value or ""))
-    return _WHITESPACE_RE.sub(" ", normalized).strip().casefold()
+    return normalize_contract_text(value)
 
 
 def normalize_grade(value: Any) -> str:
-    return normalize_text(value).upper()
+    return normalize_contract_grade(value)
 
 
 def normalize_sku(value: Any) -> str | None:
-    normalized = normalize_text(value)
-    return normalized.upper() if normalized else None
+    return normalize_contract_sku(value)
 
 
 def build_read_batch_id(seed: str | None = None) -> str:
@@ -124,12 +135,59 @@ def build_read_batch_id(seed: str | None = None) -> str:
     return f"{prefix.upper()}-{secrets.token_urlsafe(18)}"
 
 
+def build_inventory_read_targets(
+    platform_name: str,
+    *,
+    products_path: Path = DEFAULT_INVENTORY_PRODUCTS_PATH,
+) -> list[dict[str, Any]]:
+    """Build READ_ONLY identity hints from 商品资料与库存录入."""
+
+    normalized_platform = str(platform_name or "").strip()
+    if not normalized_platform:
+        raise ProductReadContractError("INPUT_INVALID: platform_name is required.")
+    try:
+        products = load_products(Path(products_path))
+    except (OSError, UnicodeError, ValidationError, ValueError) as exc:
+        raise ProductReadContractError(
+            f"INVENTORY_MAPPING_SOURCE_INVALID: {products_path}"
+        ) from exc
+    if not products:
+        raise ProductReadContractError("INVENTORY_MAPPING_SOURCE_EMPTY")
+
+    targets: list[dict[str, Any]] = []
+    seen_page_identities: dict[tuple[str, str, str], str] = {}
+    for product in products:
+        identity = listing_identity_key(
+            normalized_platform,
+            product.product_name,
+            product.grade,
+        )
+        previous_sku = seen_page_identities.get(identity)
+        if previous_sku is not None:
+            raise ProductReadContractError(
+                "INVENTORY_MAPPING_AMBIGUOUS: "
+                f"{previous_sku} and {product.internal_sku} share "
+                f"{product.product_name}/{product.grade}."
+            )
+        seen_page_identities[identity] = product.internal_sku
+        targets.append(
+            {
+                "item_id": f"ITEM-{product.internal_sku}",
+                "platform": normalized_platform,
+                # 当前平台页面不暴露 SKU，实际匹配仍使用页面可见的商品名+等级。
+                "platform_sku": None,
+                "expected_product_name": product.product_name,
+                "expected_grade": product.grade,
+            }
+        )
+    return targets
+
+
 def canonical_request_digest(payload: Mapping[str, Any]) -> str:
     """Hash only the normalized contract fields used for idempotency."""
 
     normalized = normalize_multi_product_request(payload, check_size=False)
-    encoded = json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return sha256_json(normalized, prefixed=False)
 
 
 def compute_multi_product_instruction_hash(payload: Mapping[str, Any]) -> str:
@@ -144,8 +202,7 @@ def compute_multi_product_instruction_hash(payload: Mapping[str, Any]) -> str:
         "applet_uri": str(payload.get("applet_uri") or ""),
         "window_title": str(payload.get("window_title") or ""),
     }
-    encoded = json.dumps(immutable, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+    return sha256_json(immutable)
 
 
 def normalize_multi_product_request(
@@ -159,17 +216,16 @@ def normalize_multi_product_request(
         _check_json_size(payload, MAX_REQUEST_BYTES, "request")
     if payload.get("contract_version") != CONTRACT_VERSION:
         raise ProductReadContractError("UNKNOWN_CONTRACT_VERSION")
-    if str(payload.get("execution_mode") or "").strip().upper() != EXECUTION_MODE_READ_ONLY:
+    execution_mode = str(payload.get("execution_mode") or "").strip().upper()
+    if execution_mode != EXECUTION_MODE_READ_ONLY:
         raise ProductReadContractError("READ_ONLY_REQUIRED")
     read_batch_id = str(payload.get("read_batch_id") or "").strip()
     if not _SAFE_BATCH_ID_RE.fullmatch(read_batch_id):
         raise ProductReadContractError("INPUT_INVALID: read_batch_id is missing or malformed.")
 
-    raw_products = payload.get("products")
+    raw_products = payload.get("products", [])
     if not isinstance(raw_products, Sequence) or isinstance(raw_products, (str, bytes, bytearray)):
-        raise ProductReadContractError("INPUT_INVALID: products must be a non-empty array.")
-    if not raw_products:
-        raise ProductReadContractError("INPUT_INVALID: products must be a non-empty array.")
+        raise ProductReadContractError("INPUT_INVALID: products must be an array.")
     if len(raw_products) > HARD_MAX_PRODUCTS:
         raise ProductReadContractError("PRODUCT_COUNT_LIMIT_EXCEEDED")
 
@@ -194,33 +250,39 @@ def normalize_multi_product_request(
         identities[target.identity_key] = item_id
         platforms.add(normalize_text(platform))
         targets.append(target)
-    if len(platforms) != 1:
-        raise ProductReadContractError("SINGLE_PLATFORM_REQUIRED")
     platform_name = str(payload.get("platform_name") or "").strip()
-    if platform_name and normalize_text(platform_name) not in platforms:
+    if not platform_name and targets:
+        platform_name = targets[0].platform
+    if not platform_name:
+        raise ProductReadContractError("INPUT_INVALID: platform_name is required.")
+    if len(platforms) > 1 or (platforms and normalize_text(platform_name) not in platforms):
         raise ProductReadContractError("SINGLE_PLATFORM_REQUIRED")
 
     limits = _normalize_limits(payload.get("limits"))
-    return {
+    normalized_products = []
+    for target, raw in zip(targets, raw_products, strict=True):
+        normalized_product = {
+            "item_id": target.item_id,
+            "platform": target.platform,
+            "platform_sku": target.platform_sku,
+            "expected_product_name": target.expected_product_name,
+            "expected_grade": target.expected_grade,
+        }
+        normalized_products.append(normalized_product)
+
+    normalized = {
         "contract_version": CONTRACT_VERSION,
-        "execution_mode": EXECUTION_MODE_READ_ONLY,
+        "execution_mode": execution_mode,
         "read_batch_id": read_batch_id,
+        "platform_name": platform_name,
         # Evidence capture is an explicit diagnostics/manual-review opt-in.
         # Section 17 makes structured accessibility-tree reads authoritative;
         # screenshots must not be an implicit completion gate.
         "capture_evidence": _normalize_optional_bool(payload.get("capture_evidence", False), "capture_evidence"),
-        "products": [
-            {
-                "item_id": target.item_id,
-                "platform": target.platform,
-                "platform_sku": target.platform_sku,
-                "expected_product_name": target.expected_product_name,
-                "expected_grade": target.expected_grade,
-            }
-            for target in targets
-        ],
+        "products": normalized_products,
         "limits": limits,
     }
+    return normalized
 
 
 def _normalize_optional_bool(value: Any, field_name: str) -> bool:

@@ -104,7 +104,7 @@ def test_summarize_evidence_status():
     assert summarize([{"upload_status": "SUCCESS"}, {"upload_status": "SKIPPED"}]) == "PARTIAL"
 
 
-def test_read_preview_reconcile_capture_calls_include_shared_evidence_arguments():
+def test_read_commit_reconcile_capture_calls_include_shared_evidence_arguments():
     source = FLOW_PATH.read_text(encoding="utf-8")
 
     assert source.count("_capture_window(") >= 5
@@ -112,8 +112,6 @@ def test_read_preview_reconcile_capture_calls_include_shared_evidence_arguments(
     assert source.count("evidence_storage_uri_prefix,") >= 5
     assert 'if execution_mode == "READ_ONLY":' in source
     assert 'elif execution_mode == "RECONCILE":' in source
-    assert 'if execution_mode == "FILL_PREVIEW":' in source
-    assert 'if execution_mode not in ("READ_ONLY", "FILL_PREVIEW", "COMMIT", "RECONCILE")' in source
+    assert 'if execution_mode not in ("READ_ONLY", "COMMIT", "RECONCILE")' in source
     assert "def _fill_target_price(" in source
     assert 'getattr(element, "clipboard_input", None)' in source
-    assert "PREVIEW_COMPLETED" in source

@@ -26,3 +26,10 @@ test_runtime_tmp/
 .tmp/
 .tmp_*/
 *_backup_before_*.xlsx
+
+# Local artifact-tool workspace; task12 handoff evidence lives in outputs/task12.
+outputs/019f8400-1a8d-7ea3-a5a1-e3fef7098eb4/
+
+# Console transport logs are local diagnostics, not durable task12 evidence.
+outputs/task12/*.stdout.log
+outputs/task12/*.stderr.log

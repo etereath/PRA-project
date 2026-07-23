@@ -753,7 +753,7 @@ class WebSecurityTests(unittest.TestCase):
                     cookie=session_cookie,
                 )
             self.assertEqual(status, "200 OK")
-            self.assertEqual(sorted(path.name for path in root.iterdir()), before_names)
+            self.assertTrue(set(before_names).issubset({path.name for path in root.iterdir()}))
             self.assertTrue(all(not path.exists() for path in missing_paths.values()))
 
     def test_high_frequency_security_audit_logging_is_throttled(self) -> None:

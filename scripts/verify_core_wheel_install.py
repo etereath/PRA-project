@@ -12,6 +12,10 @@ from typing import Sequence
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION  # noqa: E402
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -149,8 +153,13 @@ def verify_core_wheel(wheel: Path) -> None:
             env=env,
             isolated_root=isolated_root,
         )
-        if "schema_versions=[1, 2, 3, 4, 5, 6, 7]" not in init_output:
-            raise RuntimeError("schema initialization did not report the exact v1-v6 migration sequence")
+        expected_versions = "schema_versions=" + str(
+            list(range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1))
+        )
+        if expected_versions not in init_output:
+            raise RuntimeError(
+                "schema initialization did not report the exact latest migration sequence"
+            )
         health_output = _run_checked(
             "schema_health",
             [str(cli), "health", "--runtime-db", str(runtime_db)],
@@ -158,8 +167,10 @@ def verify_core_wheel(wheel: Path) -> None:
             env=env,
             isolated_root=isolated_root,
         )
-        if "ok=True" not in health_output or "schema_versions=[1, 2, 3, 4, 5, 6, 7]" not in health_output:
-            raise RuntimeError("health output did not confirm exact Runtime Schema v6 health")
+        if "ok=True" not in health_output or expected_versions not in health_output:
+            raise RuntimeError(
+                "health output did not confirm exact latest Runtime Schema health"
+            )
 
 
 def main() -> int:

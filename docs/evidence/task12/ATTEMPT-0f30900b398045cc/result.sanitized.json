@@ -1,0 +1,187 @@
+{
+  "actual_price": "",
+  "applet_launch": {
+    "source": "EXISTING_WINDOW",
+    "uri_opened": false,
+    "window_ready_at": "2026-07-23T19:31:13+08:00"
+  },
+  "batch_id": "BATCH-T12-CONTROLLED-UNKNOWN-20260723-02",
+  "batch_performance": {
+    "item_execution_seconds": [
+      {
+        "execution_ordinal": 1,
+        "full_page_enumeration_skipped": true,
+        "seconds": 10.531,
+        "source_task_id": "a95ea3dfd690"
+      }
+    ],
+    "preflight_seconds": 7.734,
+    "prepared_window_reused": true,
+    "total_seconds": 18.281,
+    "version": 1
+  },
+  "batch_status": "UNKNOWN",
+  "batch_viewport_preparation": {
+    "attempts": [],
+    "direction": "none",
+    "reason": "FIRST_TARGET_REQUIRES_DOWNWARD_SCROLL",
+    "status": "DEFERRED_TO_ITEM_SCROLL",
+    "target_position": 4
+  },
+  "business_operation_completed": true,
+  "contract_version": 4,
+  "counts": {
+    "attempted": 1,
+    "failed": 0,
+    "not_applied": 0,
+    "not_attempted": 0,
+    "total": 1,
+    "unknown": 1,
+    "verified": 0
+  },
+  "current_source_task_id": "a95ea3dfd690",
+  "current_step": "COMPLETE",
+  "ended_at": "2026-07-23T19:31:30+08:00",
+  "error_code": "SUBMIT_RESULT_UNKNOWN",
+  "error_message": "submit side effect may have happened; original_error_code=SUBMIT_RESULT_UNKNOWN; original_error_message=fault injection after submit click, before post-submit verification",
+  "evidence": [],
+  "evidence_status": "NONE",
+  "execution_attempt_id": "ATTEMPT-0f30900b398045cc",
+  "execution_mode": "COMMIT",
+  "expected_old_price": "",
+  "grade": "",
+  "instruction_hash": "sha256:abdb3e246051ab1bfe4219b4c4e5108c3a04c8cbed8219e817d6790edb42e337",
+  "items": [
+    {
+      "actual_price": "10.20",
+      "error_code": "SUBMIT_RESULT_UNKNOWN",
+      "error_message": "submit side effect may have happened; original_error_code=SUBMIT_RESULT_UNKNOWN; original_error_message=fault injection after submit click, before post-submit verification",
+      "execution_ordinal": 1,
+      "expected_grade": "B",
+      "expected_old_price": "10.20",
+      "expected_product_name": "艾莎",
+      "internal_sku": "AISHA-B-60-Z",
+      "item_execution_attempt_id": "ATTEMPT-0b137ed254c9fb59f81392fd9c3adf59",
+      "item_id": "ITEM-5faed44bc39d75f6f65ad6d3c6ed6cf5",
+      "item_payload_sha256": "sha256:f64fc71b3e85a6eeb623db31b3ae7eef9c4a8da6354793e0bef83f2ed55f7cc8",
+      "operation_id": "OP-41df7c62855a90f6334f4fe682b40bbc",
+      "page_identity_key": "蚂蚁花团供应商|艾莎|B",
+      "preflight_observed_at": "2026-07-23T11:31:20+00:00",
+      "preflight_price": "10.20",
+      "preflight_row": 4,
+      "readback_observed_at": null,
+      "side_effect_state": "UNKNOWN",
+      "source_task_id": "a95ea3dfd690",
+      "stable_execution_attempt_id": "ATTEMPT-0b137ed254c9fb59f81392fd9c3adf59",
+      "status": "UNKNOWN",
+      "submit_attempted": true,
+      "submit_clicked_at": "2026-07-23T19:31:30+08:00",
+      "submit_intent_at": "2026-07-23T19:31:27+08:00",
+      "target_price": "10.30",
+      "write_identity_key": "蚂蚁花团供应商|AISHA-B-60-Z"
+    }
+  ],
+  "login": {
+    "check_path": "BUSINESS_ENTRY_FAST_PATH",
+    "login_completed_at": "2026-07-23T19:31:14+08:00"
+  },
+  "manifest_sha256": "sha256:7d82589c5773ec2156d4f5c30d7e0e2f6a58e747d92f00668b56e2c399beb8b2",
+  "old_price": "",
+  "operation_id": "OP-0f30900b398045cc",
+  "page_snapshot": {
+    "capture_basis": "BATCH_PREFLIGHT_PLUS_COMMIT_READBACK",
+    "captured_at": "2026-07-23T11:31:20+00:00",
+    "finalized_at": "2026-07-23T11:31:20+00:00",
+    "platform_name": "蚂蚁花团供应商",
+    "products": [
+      {
+        "grade": "E级",
+        "inventory": 1,
+        "listing_status": "ONLINE",
+        "observed_at": "2026-07-23T11:31:20+00:00",
+        "parent_index": 1,
+        "position": 1,
+        "price": "12.60",
+        "price_status": "OBSERVED_AT_PREFLIGHT",
+        "product_name": "卡布奇诺"
+      },
+      {
+        "grade": "C级",
+        "inventory": 10,
+        "listing_status": "ONLINE",
+        "observed_at": "2026-07-23T11:31:20+00:00",
+        "parent_index": 17,
+        "position": 2,
+        "price": "7.90",
+        "price_status": "OBSERVED_AT_PREFLIGHT",
+        "product_name": "艾莎"
+      },
+      {
+        "grade": "D级",
+        "inventory": 3,
+        "listing_status": "ONLINE",
+        "observed_at": "2026-07-23T11:31:20+00:00",
+        "parent_index": 33,
+        "position": 3,
+        "price": "9.10",
+        "price_status": "OBSERVED_AT_PREFLIGHT",
+        "product_name": "艾莎"
+      },
+      {
+        "grade": "B级",
+        "inventory": 3,
+        "listing_status": "ONLINE",
+        "observed_at": "2026-07-23T11:31:20+00:00",
+        "parent_index": 49,
+        "position": 4,
+        "price": "10.20",
+        "price_status": "UNKNOWN_AFTER_SUBMIT",
+        "product_name": "艾莎"
+      }
+    ],
+    "total_count": 4
+  },
+  "platform_name": "蚂蚁花团供应商",
+  "preflight_page_order": [
+    "a95ea3dfd690"
+  ],
+  "product_keyword": "",
+  "product_list_refreshes": [
+    {
+      "ended_at": "2026-07-23T19:31:17+08:00",
+      "readable_row_count": 4,
+      "readiness": "STRUCTURED_PRODUCT_ROWS",
+      "refresh_entry": "CURRENT_PRODUCT_LIST",
+      "reused": true,
+      "stage": "BATCH_PREFLIGHT",
+      "started_at": "2026-07-23T19:31:14+08:00",
+      "status": "SUCCESS"
+    }
+  ],
+  "product_name": "",
+  "queue_phase": "RESULT_WRITTEN",
+  "request_file_sha256": "78f374b1a85dda38ce9be0beb5ec6d93818a62c9fd9f9aadb10c1d6822e39902",
+  "result_id": "RESULT-e7dd20c0353238bc4192ec36",
+  "result_path": "<REDACTED_PATH>/ATTEMPT-0f30900b398045cc.json",
+  "retryable": false,
+  "run_success_flag": false,
+  "schema_version": "shadowbot-commit-batch-result-1.1",
+  "selector_model": {
+    "inventory_index_offset": 6,
+    "inventory_text_index": 0,
+    "parent_class": "van-checkbox-group",
+    "price_index_offset": 9,
+    "row_index_start": 1,
+    "row_index_step": 16
+  },
+  "side_effect_state": "UNKNOWN",
+  "spec": "",
+  "spec_available": false,
+  "started_at": "2026-07-23T19:31:12+08:00",
+  "status": "UNKNOWN",
+  "target_price": "",
+  "task_id": "BATCHTASK-0f30900b398045cc",
+  "window_title": "",
+  "worker_heartbeat_at": "2026-07-23T11:31:30.804175+00:00",
+  "worker_id": "<REDACTED_DEVICE>"
+}

@@ -1,0 +1,45 @@
+{
+  "applet_uri": "weixin://launchapplet/?app_id=wxdc8ef8e770254c0e",
+  "batch_id": "BATCH-T12-FORMAL-COMMIT-20260722-02",
+  "capture_evidence": false,
+  "contract_version": 4,
+  "created_at": "2026-07-22T04:30:01.615620+00:00",
+  "development_confirmation": {
+    "confirmation_text": "确认授权批次 BATCH-T12-FORMAL-COMMIT-20260722-02 以上2项真实COMMIT",
+    "confirmed_at": "2026-07-22T04:30:01.615620+00:00",
+    "confirmed_by": "project-owner"
+  },
+  "execution_attempt_id": "ATTEMPT-c8976769bbcf471b",
+  "execution_mode": "COMMIT",
+  "execution_profile": "development",
+  "expires_at": "2026-07-22T05:00:01.615620+00:00",
+  "instruction_hash": "sha256:c3692ed0b201f609246fd98aedfef4ea1a49dd2e2640bd3ef60101183bca7e7a",
+  "items": [
+    {
+      "expected_grade": "B级",
+      "expected_old_price": "46.30",
+      "expected_product_name": "卡布奇诺",
+      "internal_sku": "CAPPUCCINO-B-60-Z",
+      "item_id": "ITEM-ccd693dde358",
+      "item_payload_sha256": "sha256:5b9c27125dc95b0f6aa47d4534796e591a704bcbc8fcef2a07aa2e18b04d3c8f",
+      "source_task_id": "ccd693dde358",
+      "target_price": "46.40"
+    },
+    {
+      "expected_grade": "B级",
+      "expected_old_price": "26.30",
+      "expected_product_name": "艾莎",
+      "internal_sku": "AISHA-B-60-Z",
+      "item_id": "ITEM-10fbaded17fa",
+      "item_payload_sha256": "sha256:eee9171fb58ad9dbdf3e69c365f5a48b3646f61bd5c9d8296b5edf757d0bd260",
+      "source_task_id": "10fbaded17fa",
+      "target_price": "26.40"
+    }
+  ],
+  "manifest_sha256": "sha256:a48afd35c7b32dc59dc59d258ea7ee80b74c342b343ae74a8d9eb1c5edb829e4",
+  "operation_id": "OP-c8976769bbcf471b",
+  "platform_name": "蚂蚁花团供应商",
+  "schema_version": "shadowbot-commit-batch-request-1.1",
+  "task_id": "BATCHTASK-c8976769bbcf471b",
+  "window_title": "蚂蚁花团供应商"
+}

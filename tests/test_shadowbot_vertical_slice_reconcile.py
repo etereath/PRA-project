@@ -96,7 +96,6 @@ def test_commit_mode_records_submit_intent_and_verifies_after_submit():
     commit_block = source[commit_start:]
 
     assert '"COMMIT"' in source
-    assert '"FILL_PREVIEW"' in source
     assert "SUBMIT_INTENT_RECORDED" in commit_block
     assert "CONFIRM_PRICE_DIALOG" in commit_block
     assert "CLICK_FINAL_SAVE" in commit_block
@@ -119,7 +118,9 @@ def test_commit_side_effect_exception_is_not_retryable_failed():
 
     assert "def _has_submit_side_effect(" in source
     assert "def _mark_submit_result_unknown(" in source
-    assert 'if execution_mode == "COMMIT" and _has_submit_side_effect(result):' in source
+    assert "def _prove_submit_intent_not_clicked(" in source
+    assert "and _has_submit_side_effect(result)" in source
+    assert "and not submit_proven_absent" in source
     assert '"status": "SIDE_EFFECT_UNKNOWN"' in source
     assert '"error_code": "SUBMIT_RESULT_UNKNOWN"' in source
     assert '"original_error_code": original_error_code' in source
@@ -149,9 +150,9 @@ def test_commit_side_effect_exception_helper_marks_reconciliation():
     assert result["retryable"] is False
 
 
-def test_main_initializes_execution_mode_before_input_validation():
+def test_single_product_flow_initializes_execution_mode_before_input_validation():
     source = FLOW_PATH.read_text(encoding="utf-8")
-    main_start = source.index("def main(args):")
+    main_start = source.index("def _run_single_product_flow(args, allow_contract_dispatch=False):")
     try_start = source.index("    try:", main_start)
     pre_try_block = source[main_start:try_start]
 
@@ -174,6 +175,7 @@ def test_product_locator_prefers_dynamically_discovered_parent_index():
             "_list_name_matches": lambda actual, expected_name, expected_grade: actual
             == expected_name,
             "_normalize_text": lambda value: value,
+            "_multi_product_grade": lambda value: str(value).removesuffix("级").upper(),
         }
     )
 
@@ -184,12 +186,36 @@ def test_product_locator_prefers_dynamically_discovered_parent_index():
     assert grade == "C级"
 
 
+def test_product_locator_normalizes_contract_grade_against_page_grade():
+    locate = _load_named_helpers("_locate_product_row")["_locate_product_row"]
+    locate.__globals__.update(
+        {
+            "_enumerate_product_rows": lambda window, timeout: [
+                {
+                    "source": "DYNAMIC",
+                    "parent_index": 49,
+                    "position": 4,
+                    "name": "艾莎",
+                    "grade": "B级",
+                }
+            ],
+            "_list_name_matches": lambda actual, expected_name, expected_grade: actual
+            == expected_name,
+            "_multi_product_grade": lambda value: str(value).removesuffix("级").upper(),
+        }
+    )
+
+    parent_index, name, grade = locate(object(), "艾莎", "B", 0, 15)
+
+    assert parent_index == 49
+    assert name == "艾莎"
+    assert grade == "B级"
+
+
 def test_product_locator_no_longer_relies_only_on_three_fixed_rows():
     source = FLOW_PATH.read_text(encoding="utf-8")
 
-    assert "def _generic_product_name_selector" in source
     assert "window.find_all(selector" in source
-    assert "def _row_parent_index" in source
     assert '"source": "DYNAMIC"' in source
     assert '"source": "FIXED_FALLBACK"' in source
 

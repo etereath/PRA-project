@@ -626,7 +626,7 @@ def migrate_runtime_database(
         _checkpoint_sqlite(staged_database)
         target_snapshot = _database_snapshot(staged_database)
         if not target_snapshot["ok"]:
-            raise ReleaseBackupError("migrated runtime database failed v6 health validation")
+            raise ReleaseBackupError("migrated runtime database failed latest-schema health validation")
 
         source_counts = source_snapshot["logical_table_counts"]
         target_counts = target_snapshot["logical_table_counts"]

@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from contextlib import contextmanager
 from dataclasses import replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import unquote, urlencode, urlparse
@@ -19,6 +19,7 @@ from uuid import uuid4
 from app.enums import NotificationSendStatus, ReviewTaskStatus, TaskActionType, TaskStatus
 from app.models import (
     ExecutionLog,
+    ListingStatus,
     MockPlatformProductState,
     NotificationLog,
     ReviewTask,
@@ -33,6 +34,7 @@ from app.repositories.workbook_repository import (
     load_price_rules,
     load_products,
     load_table_records,
+    load_tasks,
     save_table_records,
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
@@ -42,6 +44,7 @@ from app.services.shadowbot_executor import FileDropShadowBotTaskRunner
 from app.web import (
     TABLE_OPTIONS,
     _RUNTIME_SESSIONS,
+    _build_task_group_statuses,
     _resolve_table_path,
     application,
     default_dashboard_state,
@@ -231,6 +234,17 @@ class WebTests(unittest.TestCase):
         self.assertIn("任务生成", html)
         self.assertIn("库存策略", html)
         self.assertIn("业务数据", html)
+        self.assertIn("value='single_rule' selected", html)
+        self.assertNotIn('id="platform"', html)
+        self.assertNotIn('id="task_group_id"', html)
+        self.assertNotIn('id="products"', html)
+        self.assertNotIn('value="validate"', html)
+        self.assertNotIn("内置资源", html)
+        deadline_match = re.search(r'id="required_by"[^>]*value="([^"]+)"', html)
+        self.assertIsNotNone(deadline_match)
+        deadline = datetime.fromisoformat(deadline_match.group(1))
+        self.assertGreater(deadline, datetime.now() + timedelta(minutes=28))
+        self.assertLess(deadline, datetime.now() + timedelta(minutes=31))
 
     def test_render_table_editor_contains_management_ui(self) -> None:
         html = render_table_editor_page(
@@ -481,6 +495,7 @@ class WebTests(unittest.TestCase):
                 "/notifications",
                 "/execution-logs",
                 "/business-inputs",
+                "/task-generator",
                 "/system",
             ]
             for path in routes:
@@ -493,6 +508,280 @@ class WebTests(unittest.TestCase):
                     self.assertEqual(status, "200 OK")
                     self.assertIn("需要先登录", body)
                     self.assertNotIn("TASK-OPS-1", body)
+
+    def test_task_generator_is_available_on_new_authenticated_route(self) -> None:
+        db_path = self._existing_runtime_db("task-generator")
+        with patch.dict(
+            "os.environ",
+            {"RUNTIME_ADMIN_USER": "admin", "RUNTIME_ADMIN_PASSWORD": "secret"},
+            clear=False,
+        ):
+            cookie = self._runtime_login(db_path)
+            status, _, body = self._call_app(
+                path="/task-generator",
+                method="GET",
+                cookie=cookie,
+            )
+            self.assertEqual(status, "200 OK")
+            self.assertIn("任务生成", body)
+            self.assertNotIn("先校验数据", body)
+            self.assertIn("预览时会自动完成数据校验", body)
+            self.assertIn("预览任务", body)
+            self.assertIn("/task-generator", body)
+
+            status, _, body = self._call_app(
+                path="/task-generator",
+                method="POST",
+                body=urlencode({"action": "validate", "selected_rule": "price:PRICE-TEST-B"}),
+                cookie=cookie,
+            )
+            self.assertEqual(status, "200 OK")
+            self.assertNotIn("CSRF_REJECTED", body)
+            self.assertIn("任务生成", body)
+            self.assertIn("未知任务生成操作", body)
+
+            status, _, body = self._call_app(
+                path="/task-generator",
+                method="POST",
+                body=urlencode({"action": "preview", "csrf_token": "invalid"}),
+                cookie=cookie,
+            )
+            self.assertEqual(status, "403 Forbidden")
+            self.assertIn("CSRF_REJECTED", body)
+
+    def test_task_generator_previews_and_exports_one_selected_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "runtime.sqlite3"
+            products_path = root / "products.xlsx"
+            price_rules_path = root / "price_rules.xlsx"
+            listing_rules_path = root / "listing_rules.xlsx"
+            output_path = root / "selected_rule_tasks.xlsx"
+            repository = SQLiteRuntimeRepository(db_path)
+            RuntimeTaskService(repository).init_schema()
+            for sku, variety, price, online_status, platform_stock_qty in (
+                ("SKU-AISHA-A", "艾莎", "20", "online", 20),
+                ("SKU-CAPPUCCINO-A", "卡布奇诺", "30", "online", 30),
+                ("SKU-OFFLINE", "已下架品种", "40", "offline", 40),
+                ("SKU-ZERO-STOCK", "零库存品种", "50", "online", 0),
+            ):
+                repository.upsert_listing_status(
+                    ListingStatus(
+                        listing_status_id=f"LISTING-{sku}",
+                        platform_name="测试平台",
+                        internal_sku=sku,
+                        variety=variety,
+                        current_price=Decimal(price),
+                        grade="A",
+                        online_status=online_status,
+                        platform_stock_qty=platform_stock_qty,
+                    )
+                )
+            save_table_records(
+                "products",
+                products_path,
+                [
+                    {
+                        "internal_sku": "SKU-AISHA-A",
+                        "product_name": "艾莎",
+                        "grade": "A",
+                        "stem_length": "70",
+                        "unit": "扎",
+                        "base_cost": "10",
+                        "current_stock": "8",
+                        "sale_enabled": "True",
+                    },
+                    {
+                        "internal_sku": "SKU-CAPPUCCINO-A",
+                        "product_name": "卡布奇诺",
+                        "grade": "A",
+                        "stem_length": "70",
+                        "unit": "扎",
+                        "base_cost": "10",
+                        "current_stock": "8",
+                        "sale_enabled": "True",
+                    },
+                    {
+                        "internal_sku": "SKU-OFFLINE",
+                        "product_name": "已下架品种",
+                        "grade": "A",
+                        "stem_length": "70",
+                        "unit": "扎",
+                        "base_cost": "10",
+                        "current_stock": "8",
+                        "sale_enabled": "True",
+                    },
+                    {
+                        "internal_sku": "SKU-ZERO-STOCK",
+                        "product_name": "零库存品种",
+                        "grade": "A",
+                        "stem_length": "70",
+                        "unit": "扎",
+                        "base_cost": "10",
+                        "current_stock": "8",
+                        "sale_enabled": "True",
+                    },
+                    {
+                        "internal_sku": "SKU-WITHOUT-LISTING",
+                        "product_name": "未上架品种",
+                        "grade": "A",
+                        "stem_length": "70",
+                        "unit": "扎",
+                        "base_cost": "10",
+                        "current_stock": "8",
+                        "sale_enabled": "True",
+                    },
+                ],
+            )
+            save_table_records(
+                "price_rules",
+                price_rules_path,
+                [
+                    {
+                        "rule_id": "PRICE-AISHA",
+                        "rule_name": "全部商品加价",
+                        "variety_filter": "*",
+                        "grade_filter": "*",
+                        "platform_filter": "*",
+                        "pricing_method": "fixed_markup",
+                        "markup_value": "5",
+                        "min_price": "",
+                        "rounding_rule": "none",
+                        "rounding_step": "",
+                        "active": "True",
+                        "priority": "1",
+                        "remark": "",
+                    }
+                ],
+            )
+            save_table_records("listing_rules", listing_rules_path, [])
+            payload = {
+                "products": str(products_path),
+                "price_rules": str(price_rules_path),
+                "listing_rules": str(listing_rules_path),
+                "output": str(output_path),
+                "inventory_strategy": "conservative_v1",
+                "selected_rule": "price:PRICE-AISHA",
+            }
+
+            with patch.dict(
+                "os.environ",
+                {"RUNTIME_ADMIN_USER": "admin", "RUNTIME_ADMIN_PASSWORD": "secret"},
+                clear=False,
+            ):
+                cookie = self._runtime_login(db_path)
+                status, _, preview_body = self._call_app(
+                    path="/task-generator",
+                    method="POST",
+                    query=urlencode({"runtime_db": str(db_path)}),
+                    body=urlencode(payload | {"action": "preview"}),
+                    cookie=cookie,
+                )
+                self.assertEqual(status, "200 OK")
+                self.assertIn("已预览 2 条任务", preview_body)
+                self.assertIn("数据摘要", preview_body)
+                self.assertIn("SKU-AISHA-A", preview_body)
+                self.assertIn("SKU-CAPPUCCINO-A", preview_body)
+                self.assertNotIn("SKU-OFFLINE", preview_body)
+                self.assertNotIn("SKU-ZERO-STOCK", preview_body)
+                self.assertNotIn("SKU-WITHOUT-LISTING", preview_body)
+                group_match = re.search(r'name="task_group_id" value="([^"]+)"', preview_body)
+                deadline_match = re.search(r'name="required_by" value="([^"]+)"', preview_body)
+                self.assertIsNotNone(group_match)
+                self.assertIsNotNone(deadline_match)
+                generated_group_id = group_match.group(1)
+                generated_deadline = deadline_match.group(1)
+                self.assertTrue(generated_group_id.startswith("RULE-GROUP-"))
+                self.assertIn("测试平台", preview_body)
+                self.assertIn("确认生成并进入任务中心", preview_body)
+                self.assertFalse(output_path.exists())
+
+                status, _, generated_body = self._call_app(
+                    path="/task-generator",
+                    method="POST",
+                    query=urlencode({"runtime_db": str(db_path)}),
+                    body=urlencode(payload | {
+                        "action": "confirm_generate",
+                        "task_group_id": generated_group_id,
+                        "required_by": generated_deadline,
+                    }),
+                    cookie=cookie,
+                )
+                self.assertEqual(status, "200 OK")
+                self.assertIn("已生成 2 条任务", generated_body)
+                self.assertIn("2 条新任务已进入任务中心", generated_body)
+
+                status, _, tasks_body = self._call_app(
+                    path="/tasks",
+                    method="GET",
+                    query=urlencode({"runtime_db": str(db_path)}),
+                    cookie=cookie,
+                )
+                self.assertEqual(status, "200 OK")
+                self.assertIn("SKU-AISHA-A", tasks_body)
+                self.assertIn("SKU-CAPPUCCINO-A", tasks_body)
+                self.assertIn(generated_group_id, tasks_body)
+                self.assertIn("任务组状态", tasks_body)
+                self.assertIn("预期原价", tasks_body)
+                self.assertIn("old_price=20", tasks_body)
+
+                status, _, duplicate_body = self._call_app(
+                    path="/task-generator",
+                    method="POST",
+                    query=urlencode({"runtime_db": str(db_path)}),
+                    body=urlencode(payload | {
+                        "action": "confirm_generate",
+                        "task_group_id": generated_group_id,
+                        "required_by": generated_deadline,
+                    }),
+                    cookie=cookie,
+                )
+                self.assertEqual(status, "200 OK")
+                self.assertIn("0 条新任务已进入任务中心", duplicate_body)
+                self.assertIn("2 条因重复未再次入库", duplicate_body)
+
+            tasks = load_tasks(output_path)
+            self.assertEqual(
+                [task.internal_sku for task in tasks],
+                ["SKU-AISHA-A", "SKU-CAPPUCCINO-A"],
+            )
+            self.assertTrue(all(task.decision_trace["selected_rule_id"] == "PRICE-AISHA" for task in tasks))
+            self.assertEqual(len({task.decision_trace["task_group_id"] for task in tasks}), 1)
+            self.assertEqual(len({task.required_by for task in tasks}), 1)
+            self.assertEqual({task.platform_name for task in tasks}, {"测试平台"})
+            self.assertEqual({task.expected_old_price for task in tasks}, {Decimal("20"), Decimal("30")})
+            self.assertEqual({task.target_price for task in tasks}, {Decimal("25"), Decimal("35")})
+            runtime_tasks = RuntimeTaskService(SQLiteRuntimeRepository(db_path)).list_tasks()
+            self.assertEqual(
+                sorted(task.internal_sku for task in runtime_tasks),
+                ["SKU-AISHA-A", "SKU-CAPPUCCINO-A"],
+            )
+            self.assertEqual(len({task.decision_trace["task_group_id"] for task in runtime_tasks}), 1)
+            self.assertEqual(len({task.required_by for task in runtime_tasks}), 1)
+            self.assertEqual(
+                {task.expected_old_price for task in runtime_tasks},
+                {Decimal("20"), Decimal("30")},
+            )
+            self.assertEqual({task.task_status for task in runtime_tasks}, {TaskStatus.PENDING})
+
+    def test_task_group_status_is_shared_and_derived_from_item_statuses(self) -> None:
+        group_trace = {"task_group_id": "RULE-GROUP-STATUS-001"}
+        pending_a = replace(_runtime_task("TASK-GROUP-A"), decision_trace=group_trace)
+        pending_b = replace(_runtime_task("TASK-GROUP-B"), decision_trace=group_trace)
+        self.assertEqual(
+            _build_task_group_statuses([pending_a, pending_b]),
+            {"RULE-GROUP-STATUS-001": "待处理"},
+        )
+        partial = replace(pending_b, task_status=TaskStatus.SUCCESS)
+        self.assertEqual(
+            _build_task_group_statuses([pending_a, partial]),
+            {"RULE-GROUP-STATUS-001": "处理中（部分完成）"},
+        )
+        failed = replace(pending_b, task_status=TaskStatus.FAILED)
+        self.assertEqual(
+            _build_task_group_statuses([partial, failed]),
+            {"RULE-GROUP-STATUS-001": "部分失败"},
+        )
 
     def test_ops_pages_render_lists_and_empty_states_after_login(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -598,6 +887,80 @@ class WebTests(unittest.TestCase):
                     cookie=empty_cookie,
                 )
                 self.assertIn("当前还没有飞书或系统通知记录", empty_notifications_body)
+
+    def test_listing_status_page_is_read_only_but_debug_post_is_available(self) -> None:
+        with _workspace_temp_dir("web_listing_status") as temp_dir:
+            db_path = temp_dir / "runtime.sqlite3"
+            repository = SQLiteRuntimeRepository(db_path)
+            RuntimeTaskService(repository).init_schema()
+            repository.upsert_listing_status(
+                ListingStatus(
+                    listing_status_id="LISTING-VISIBLE",
+                    platform_name="蚂蚁花团供应商",
+                    internal_sku="",
+                    variety="页面可见品种",
+                    grade="A",
+                    current_price=Decimal("20"),
+                    platform_stock_qty=12,
+                    online_status="online",
+                )
+            )
+            repository.upsert_listing_status(
+                ListingStatus(
+                    listing_status_id="LISTING-ZERO-STOCK",
+                    platform_name="蚂蚁花团供应商",
+                    internal_sku="",
+                    variety="页面隐藏零库存品种",
+                    grade="A",
+                    current_price=Decimal("30"),
+                    platform_stock_qty=0,
+                    online_status="online",
+                )
+            )
+
+            with patch("app.web.DEFAULT_RUNTIME_DB", db_path), patch.dict(
+                "os.environ",
+                {"RUNTIME_ADMIN_USER": "admin", "RUNTIME_ADMIN_PASSWORD": "secret"},
+                clear=False,
+            ):
+                cookie = self._runtime_login(db_path)
+                status, _, body = self._call_app(
+                    path="/business-inputs",
+                    method="GET",
+                    query=urlencode({"runtime_db": str(db_path), "input_tab": "listing_status"}),
+                    cookie=cookie,
+                )
+                self.assertEqual(status, "200 OK")
+                self.assertIn("本页面只读，不提供人工录入或修改", body)
+                self.assertIn("页面可见品种", body)
+                self.assertNotIn("页面隐藏零库存品种", body)
+                self.assertNotIn('name="action" value="save_listing_status"', body)
+                self.assertNotIn('id="listing_platform"', body)
+
+                post_status, headers, _ = self._call_app(
+                    path="/business-inputs",
+                    method="POST",
+                    cookie=cookie,
+                    body=urlencode({
+                        "action": "save_listing_status",
+                        "runtime_db": str(db_path),
+                        "input_tab": "listing_status",
+                        "platform_name": "ant_flower_wechat",
+                        "variety": "艾莎",
+                        "grade": "C级",
+                        "current_price": "19.50",
+                        "sold_qty": "2",
+                        "online_status": "online",
+                    }),
+                )
+
+            self.assertEqual(post_status, "303 See Other")
+            self.assertIn("调试用上架状态已保存", unquote(headers["Location"]))
+            saved = repository.get_listing_status("ant_flower_wechat", "艾莎", "C")
+            self.assertIsNotNone(saved)
+            assert saved is not None
+            self.assertEqual(saved.current_price, Decimal("19.50"))
+            self.assertEqual(saved.source, "debug_web_request")
 
     def test_tasks_automation_tab_requires_login_and_shows_script_runs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1360,6 +1723,13 @@ class WebTests(unittest.TestCase):
                 status=TaskStatus.MANUAL_REVIEW,
                 required_by=now + timedelta(minutes=45),
             )
+            review_due_utc = _runtime_task(
+                "TASK-REVIEW-DUE-UTC",
+                status=TaskStatus.MANUAL_REVIEW,
+                required_by=(now + timedelta(minutes=45))
+                .replace(tzinfo=timezone(timedelta(hours=8)))
+                .astimezone(timezone.utc),
+            )
             review_later = _runtime_task(
                 "TASK-REVIEW-LATER",
                 status=TaskStatus.MANUAL_REVIEW,
@@ -1377,13 +1747,16 @@ class WebTests(unittest.TestCase):
                     expired_task,
                     failed_task,
                     review_due,
+                    review_due_utc,
                     review_later,
                     review_overdue,
                     review_expired_source,
                 ]
             )
             review_service = ReviewTaskService(repository, runtime_task_service=task_service)
-            review_service.create_from_tasks([review_due, review_later, review_overdue, review_expired_source])
+            review_service.create_from_tasks(
+                [review_due, review_due_utc, review_later, review_overdue, review_expired_source]
+            )
             expired_review = repository.list_review_tasks(status=ReviewTaskStatus.PENDING)[-1]
             repository.update_review_task(
                 replace(
@@ -1457,6 +1830,7 @@ class WebTests(unittest.TestCase):
                     cookie=cookie,
                 )
                 self.assertIn("TASK-REVIEW-DUE", due_reviews_body)
+                self.assertIn("TASK-REVIEW-DUE-UTC", due_reviews_body)
                 self.assertNotIn("TASK-REVIEW-LATER", due_reviews_body)
                 self.assertNotIn("TASK-REVIEW-OVERDUE", due_reviews_body)
 
@@ -2949,7 +3323,9 @@ class WebTests(unittest.TestCase):
             self.assertEqual(attempt.shadowbot_run_id, "filequeue:ATTEMPT-WEB-RECONCILE-1")
             self.assertEqual(operation.status, "RUNNING")
             self.assertTrue(request_file.exists())
-            self.assertIn('"execution_mode": "RECONCILE"', request_file.read_text(encoding="utf-8"))
+            request_text = request_file.read_text(encoding="utf-8")
+            self.assertIn('"execution_mode": "RECONCILE"', request_text)
+            self.assertIn('"platform_sku": ""', request_text)
 
     def test_execution_logs_post_confirms_shadowbot_manual_handled_without_resubmit(self) -> None:
         with _workspace_temp_dir("web_shadowbot_tests") as temp_dir:

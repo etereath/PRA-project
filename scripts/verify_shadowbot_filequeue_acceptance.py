@@ -19,7 +19,6 @@ from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 
 SUCCESS_STATUSES = {
     "READ_ONLY": {"READ_COMPLETED"},
-    "FILL_PREVIEW": {"PREVIEW_COMPLETED"},
     "COMMIT": {"SUCCESS", "ALREADY_APPLIED"},
     "RECONCILE": {"VERIFIED", "NOT_APPLIED", "START_UNKNOWN", "SIDE_EFFECT_UNKNOWN"},
 }
@@ -216,18 +215,7 @@ def verify_acceptance(
             check("v2_success_inventory_recorded", not invalid_inventory, invalid_inventory)
         else:
             check("actual_price_recorded", bool(result.get("actual_price") or result.get("old_price")), result.get("actual_price") or result.get("old_price"))
-    if profile == "NORMAL" and execution_mode == "FILL_PREVIEW":
-        check(
-            "preview_old_price_matches_request",
-            str(result.get("old_price") or "") == str(request.get("expected_old_price") or ""),
-            {"result": result.get("old_price"), "request": request.get("expected_old_price")},
-        )
-        check(
-            "preview_readback_matches_target",
-            str(result.get("input_price_readback") or "") == str(request.get("target_price") or ""),
-            {"result": result.get("input_price_readback"), "request": request.get("target_price")},
-        )
-    if profile == "NORMAL" and execution_mode in {"READ_ONLY", "FILL_PREVIEW"}:
+    if profile == "NORMAL" and execution_mode == "READ_ONLY":
         check("no_business_completion", result.get("business_operation_completed") is False, result.get("business_operation_completed"))
         check("no_side_effect", result.get("side_effect_state") == "NOT_STARTED", result.get("side_effect_state"))
     elif profile == "NORMAL" and execution_mode == "COMMIT":

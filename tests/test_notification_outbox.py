@@ -109,7 +109,7 @@ def repository():
 def test_schema_v6_has_outbox_and_attempt_health(repository):
     health = repository.check_schema_health()
     assert health.ok, health.summary
-    assert repository.schema_versions() == [1, 2, 3, 4, 5, 6, 7]
+    assert repository.schema_versions() == list(range(1, 13))
     connection = repository.connect_read()
     try:
         tables = {

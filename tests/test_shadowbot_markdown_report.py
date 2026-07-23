@@ -18,6 +18,14 @@ def _payload() -> dict[str, object]:
         "overall_status": "PASSED",
         "execution_mode": "READ_ONLY",
         "platform_name": "蚂蚁花团供应商",
+        "warnings": [
+            {
+                "warning_code": "UNMAPPED_PRODUCT_DISCOVERED",
+                "product_name": "卡布奇诺",
+                "grade": "E级",
+                "row_identity": "parent-index:49",
+            }
+        ],
         "run_identity": {
             "task_id": "TASK-T11",
             "execution_attempt_id": "ATTEMPT-T11",
@@ -106,6 +114,8 @@ class ShadowBotMarkdownReportTests(unittest.TestCase):
         self.assertIn("卡布奇诺", markdown)
         self.assertIn("不存在的花", markdown)
         self.assertIn("PRODUCT_NOT_FOUND", markdown)
+        self.assertIn("UNMAPPED_PRODUCT_DISCOVERED", markdown)
+        self.assertIn("尚未绑定正式 SKU", markdown)
         self.assertIn("数据库回读", markdown)
         self.assertIn("计数恒等式", markdown)
         self.assertIn("EVD-T11-CAPPUCCINO", markdown)

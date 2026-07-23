@@ -1,0 +1,50 @@
+{
+  "batch_id": "BATCH-T12-LATEST-TASKS-COMMIT-20260722-01",
+  "development_confirmation_text": "确认授权批次 BATCH-T12-LATEST-TASKS-COMMIT-20260722-01 以上4项真实COMMIT",
+  "execution_mode": "COMMIT",
+  "items": [
+    {
+      "expected_grade": "E",
+      "expected_old_price": "12.20",
+      "expected_product_name": "卡布奇诺",
+      "internal_sku": "CAPPUCCINO-E-45-Z",
+      "item_id": "ITEM-275b6a6b0c93",
+      "item_payload_sha256": "sha256:00de37f6f681c25a1472020a0e4d7f57485cc54792c15584cbfc3c53ab1efcb9",
+      "source_task_id": "275b6a6b0c93",
+      "target_price": "12.30"
+    },
+    {
+      "expected_grade": "D",
+      "expected_old_price": "16.70",
+      "expected_product_name": "艾莎",
+      "internal_sku": "AISHA-D-50-Z",
+      "item_id": "ITEM-4737dea568ba",
+      "item_payload_sha256": "sha256:2d7774009422e00e149c341db85d72fb02eb75e3ad12ef612b49e27f3093d3f9",
+      "source_task_id": "4737dea568ba",
+      "target_price": "16.80"
+    },
+    {
+      "expected_grade": "C",
+      "expected_old_price": "13.00",
+      "expected_product_name": "艾莎",
+      "internal_sku": "AISHA-C-55-Z",
+      "item_id": "ITEM-4bf715c8c5d6",
+      "item_payload_sha256": "sha256:5474829989a9588dfd11f2e5bb76f054cc6aa2367cbf25d55fd881f401b8c6ff",
+      "source_task_id": "4bf715c8c5d6",
+      "target_price": "13.10"
+    },
+    {
+      "expected_grade": "B",
+      "expected_old_price": "26.60",
+      "expected_product_name": "艾莎",
+      "internal_sku": "AISHA-B-60-Z",
+      "item_id": "ITEM-e697c8affa72",
+      "item_payload_sha256": "sha256:edb3d1ffcc28a6f224ede121d33cd9ddd34267a3327563ac72109d0e72009952",
+      "source_task_id": "e697c8affa72",
+      "target_price": "26.70"
+    }
+  ],
+  "manifest_sha256": "sha256:2b0a071a3dfd40d2cdea95beab96edb94888258b928f1a4b152a5c5651f7c00e",
+  "platform_name": "蚂蚁花团供应商",
+  "schema_version": "shadowbot-commit-manifest-1.1"
+}

@@ -4,7 +4,6 @@ import argparse
 import io
 import os
 import re
-import sqlite3
 import sys
 import tempfile
 from contextlib import closing, contextmanager
@@ -67,9 +66,17 @@ class SmokeRunner:
     def run(self) -> int:
         checks: list[tuple[str, str, Callable[[], None]]] = [
             ("runtime DB 初始化成功", "SQLiteRuntimeRepository / RuntimeTaskService.init_schema", self.check_init_db),
-            ("schema version exact v7", "runtime_schema_migrations", self.check_schema_version),
+            (
+                f"schema version exact v{LATEST_RUNTIME_SCHEMA_VERSION}",
+                "runtime_schema_migrations",
+                self.check_schema_version,
+            ),
             ("关键运行态表存在", "SQLite schema", self.check_required_tables),
-            ("v6 Outbox/RetryAuthorization 结构完整", "runtime schema health check", self.check_schema_integrity),
+            (
+                f"v{LATEST_RUNTIME_SCHEMA_VERSION} 任务原价/平台身份/库存观测/Outbox/COMMIT 批次结构完整",
+                "runtime schema health check",
+                self.check_schema_integrity,
+            ),
             ("创建 runtime task", "RuntimeTaskService.create_tasks", self.check_create_task),
             ("dedupe_key 去重有效", "tasks partial unique index", self.check_task_dedupe),
             ("创建 pending review_task", "ReviewTaskService.create_from_tasks", self.check_create_review_task),
@@ -292,7 +299,14 @@ class SmokeRunner:
             self.context.review_task_id,
             self.context.notification_id,
         ]
-        for path in ["/dashboard", "/tasks", "/reviews", "/notifications", "/system"]:
+        for path in [
+            "/dashboard",
+            "/tasks",
+            "/reviews",
+            "/notifications",
+            "/task-generator",
+            "/system",
+        ]:
             status, _, body = call_app(path=path, query=urlencode({"runtime_db": str(TEST_DB)}))
             if not status.startswith("200"):
                 raise AssertionError(f"{path} 未登录访问未返回 200：{status}")

@@ -46,6 +46,10 @@ def sync(app_dir: Path, *, check_only: bool) -> list[dict[str, str]]:
     mappings = (
         (SOURCE_DIR / "module1.py", app_dir / "module1.py"),
         (SOURCE_DIR / "shadowbot_credentials.py", app_dir / "shadowbot_credentials.py"),
+        (
+            PROJECT_ROOT / "app" / "shadowbot_contract_primitives.py",
+            app_dir / "shadowbot_contract_primitives.py",
+        ),
         (SOURCE_DIR / "vertical_slice_read_price.py", app_dir / "vertical_slice_read_price.py"),
         (SOURCE_DIR / "shadowbot_queue_worker.py", app_dir / "shadowbot_queue_worker.py"),
     )

@@ -902,7 +902,7 @@ Phase 1 已完成范围：
 - `DEFAULT_NOTIFICATION_CHANNEL=feishu` 时会继续检查 `FEISHU_WEBHOOK_URL` 和 `MOBILE_REVIEW_BASE_URL`，关键配置缺失时显示 `error`。
 - 已复用运行环境检查语义：后台密码长度、Review Token secret 长度、占位值、`FEISHU_MESSAGE_TYPE`、`FEISHU_WEBHOOK_TIMEOUT_SECONDS`、通知 channel 合法值。
 - 运行态数据库检查已展示 DB 文件名、是否存在、是否可读、已应用 schema version 列表和最新 schema 要求。
-- schema 检查统一引用 `app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION`，当前要求为迁移记录连续且精确匹配 v6，并由 health check 验证实际表、列、约束和索引。
+- schema 检查统一引用 `app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION`，当前要求为迁移记录连续且精确匹配 v11，并由 health check 验证实际表、列、约束和索引。
 - 运行态表计数已分项容错：`tasks / review_tasks / notification_logs / execution_logs / review_tokens / script_runs / script_run_items` 任一表缺失或查询失败时，仅该表显示 `error`，不会导致整个 `/system` 返回 500。
 - 运行状态摘要已展示 pending review、failed notification、expired task/review、pending task 和当前通知模式。
 - 外部连通性已明确标注为“未验证”：本阶段不自动发送飞书测试消息，不自动探测 cpolar 或 Mobile Review 外网入口。

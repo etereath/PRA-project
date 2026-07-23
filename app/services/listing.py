@@ -6,6 +6,7 @@ from datetime import datetime, time
 from app.enums import ListingAction, ListingStrategy
 from app.exceptions import ValidationError
 from app.models import ListingRule, Product
+from app.platform_identity import platform_names_match
 
 
 class ListingService:
@@ -46,7 +47,7 @@ class ListingService:
             return None
         if not self._matches_grade_filter(rule.grade_filter, product.grade):
             return None
-        if not self._matches_filter(rule.platform_filter, platform_name):
+        if not self._matches_platform_filter(rule.platform_filter, platform_name):
             return None
         threshold = int(rule.stock_threshold)
         if rule.listing_strategy == ListingStrategy.PROHIBIT_ONLINE:
@@ -70,6 +71,10 @@ class ListingService:
         if normalized_filter == "*":
             return True
         return normalized_filter == str(actual_value or "").strip().upper()
+
+    def _matches_platform_filter(self, filter_value: str, actual_value: str) -> bool:
+        normalized_filter = str(filter_value or "*").strip()
+        return normalized_filter == "*" or platform_names_match(normalized_filter, actual_value)
 
     def _raise_on_same_rank_conflicts(self, matches: list[tuple[ListingRule, ListingAction]]) -> None:
         by_rank: dict[tuple[int, int], list[tuple[ListingRule, ListingAction]]] = {}

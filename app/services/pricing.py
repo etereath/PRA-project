@@ -12,6 +12,7 @@ from app.models import (
     RulePricingInput,
     RulePricingResult,
 )
+from app.platform_identity import platform_names_match
 from app.services.ai import AISuggestionProvider, NullAISuggestionProvider
 
 
@@ -19,8 +20,23 @@ class PricingService:
     def __init__(self, ai_provider: AISuggestionProvider | None = None) -> None:
         self.ai_provider = ai_provider or NullAISuggestionProvider()
 
-    def calculate(self, product: Product, platform_name: str, rules: list[PriceRule]) -> FinalPricingDecision:
-        rule_result = self._calculate_rule_price(RulePricingInput(product=product, platform_name=platform_name, rules=rules))
+    def calculate(
+        self,
+        product: Product,
+        platform_name: str,
+        rules: list[PriceRule],
+        *,
+        old_price: Decimal | None = None,
+        require_old_price: bool = False,
+    ) -> FinalPricingDecision:
+        rule_result = self._calculate_rule_price(
+            RulePricingInput(
+                product=product,
+                platform_name=platform_name,
+                rules=rules,
+                old_price=old_price if old_price is not None else (None if require_old_price else product.base_cost),
+            )
+        )
         ai_input = AISuggestionInput(
             internal_sku=product.internal_sku,
             product_name=product.product_name,
@@ -53,6 +69,7 @@ class PricingService:
         return FinalPricingDecision(
             internal_sku=product.internal_sku,
             platform_name=platform_name,
+            expected_old_price=rule_result.old_price,
             rule_price=rule_result.rule_price,
             final_price=final_price,
             pricing_source=source,
@@ -69,10 +86,16 @@ class PricingService:
         selected_rule = self._select_winning_rule(applicable)
         matched_rule_ids: list[str] = []
         matched_rule_names: list[str] = []
-        steps: list[str] = [f"base_cost={request.product.base_cost}"]
-        price = request.product.base_cost
+        steps: list[str] = []
+        price = request.old_price
         if selected_rule is not None:
+            if price is None:
+                raise ValidationError(
+                    f"{request.platform_name} / {request.product.internal_sku} 缺少上架状态当前价格，"
+                    "无法生成相对改价任务。请先运行 ShadowBot READ_ONLY 同步平台价格。"
+                )
             rule = selected_rule
+            steps.append(f"old_price={price}")
             matched_rule_ids.append(rule.rule_id)
             matched_rule_names.append(rule.rule_name)
             steps.append(
@@ -86,9 +109,13 @@ class PricingService:
                 steps.append(f"rule:{rule.rule_id}:min_price->{price}")
             price = self._apply_rounding(price, rule)
             steps.append(f"rule:{rule.rule_id}:rounded->{price}")
+        if price is None:
+            price = request.product.base_cost
+            steps.append(f"no_matching_rule:base_cost={price}")
         return RulePricingResult(
             matched_rule_ids=matched_rule_ids,
             matched_rule_names=matched_rule_names,
+            old_price=request.old_price,
             rule_price=price.quantize(Decimal("0.01")),
             applied_steps=steps,
         )
@@ -135,7 +162,7 @@ def price_rule_matches(rule: PriceRule, product: Product, platform_name: str) ->
     return (
         _matches_filter(rule.variety_filter, product.product_name, kind="text")
         and _matches_filter(rule.grade_filter, product.grade, kind="grade")
-        and _matches_filter(rule.platform_filter, platform_name, kind="text")
+        and _matches_platform_filter(rule.platform_filter, platform_name)
     )
 
 
@@ -152,6 +179,11 @@ def _matches_filter(filter_value: object, actual_value: object, *, kind: str) ->
     if normalized_filter == "*":
         return True
     return normalized_filter == _normalize_filter_value(actual_value, kind=kind)
+
+
+def _matches_platform_filter(filter_value: object, actual_value: object) -> bool:
+    normalized_filter = _normalize_filter_value(filter_value, kind="text")
+    return normalized_filter == "*" or platform_names_match(filter_value, actual_value)
 
 
 def _normalize_filter_value(value: object, *, kind: str) -> str:

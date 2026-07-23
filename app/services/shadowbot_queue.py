@@ -12,47 +12,52 @@ from pathlib import Path
 from typing import Any
 
 from app.exceptions import ValidationError
+from app.listing_identity import listing_identity_key
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.repositories.workbook_repository import load_products
 from app.services.shadowbot_executor import (
     EXECUTION_MODE_COMMIT,
     SIDE_EFFECT_NOT_APPLIED,
     SIDE_EFFECT_NOT_STARTED,
     SIDE_EFFECT_UNKNOWN,
     STATUS_FAILED,
-    STATUS_NOT_APPLIED,
-    STATUS_PREVIEW_COMPLETED,
-    STATUS_READ_COMPLETED,
     STATUS_SIDE_EFFECT_UNKNOWN,
-    STATUS_START_FAILED,
     STATUS_START_UNKNOWN,
-    STATUS_VERIFIED,
-    TASK12_INSTRUCTION_HASH_FIELDS,
     ShadowBotExecutor,
     ShadowBotTaskRunner,
     shadowbot_result_contract_from_data,
 )
-from app.services.shadowbot_price_batch import (
-    MAX_RESULT_BYTES as PRICE_BATCH_MAX_RESULT_BYTES,
-    PRICE_BATCH_ERROR_CODES,
-    BatchItemStatus,
-    PriceBatchContractError,
-    PriceBatchErrorCode,
-    normalize_price_string,
-    aggregate_batch_counts,
-)
-from app.services.shadowbot_price_batch_orchestrator import ShadowBotPriceBatchOrchestrator
 from app.services.shadowbot_product_read import (
+    DEFAULT_INVENTORY_PRODUCTS_PATH,
     MAX_RESULT_BYTES,
     aggregate_product_snapshots,
-    normalize_grade,
     normalize_multi_product_request,
-    normalize_text,
     validate_evidence_binding,
+)
+from app.services.shadowbot_commit_batch import (
+    CONTRACT_VERSION as COMMIT_BATCH_CONTRACT_VERSION,
+    validate_request as validate_commit_batch_request,
+)
+from app.shadowbot_contract_primitives import (
+    build_v4_recovery_result,
 )
 
 
 SUBMIT_PHASES = {"SUBMIT_INTENT_RECORDED", "SUBMIT_CLICKED"}
 PRE_SUBMIT_PHASES = {"CLAIMED", "UI_STARTED", "PRICE_VERIFIED", "TARGET_FILLED"}
+
+
+def _parse_shadowbot_observed_at(value: Any) -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        raise ValidationError("RESULT_CONTRACT_INVALID: inventory observation time is required.")
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValidationError("RESULT_CONTRACT_INVALID: inventory observation time is invalid.") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,10 +117,17 @@ class ShadowBotResultImporter:
         repository: SQLiteRuntimeRepository,
         runner: ShadowBotTaskRunner,
         queue_dir: Path,
+        *,
+        inventory_products_path: Path | None = None,
     ) -> None:
         self.repository = repository
         self.executor = ShadowBotExecutor(repository, runner)
         self.paths = ShadowBotQueuePaths(queue_dir)
+        self.inventory_products_path = Path(
+            inventory_products_path
+            or os.environ.get("PRA_PRODUCTS_PATH")
+            or DEFAULT_INVENTORY_PRODUCTS_PATH
+        )
         self.paths.ensure()
 
     def import_available(self) -> list[dict[str, Any]]:
@@ -153,6 +165,12 @@ class ShadowBotResultImporter:
         execution_attempt_id = str(data.get("execution_attempt_id") or "").strip()
         if not execution_attempt_id:
             raise ValidationError("RESULT_CONTRACT_INVALID: execution_attempt_id is required.")
+        if data.get("contract_version") == COMMIT_BATCH_CONTRACT_VERSION:
+            return self._import_v4_commit_result(
+                result_path,
+                data=data,
+                result_bytes=result_bytes,
+            )
         attempt = self.repository.get_shadowbot_execution_attempt(execution_attempt_id)
         if attempt is None:
             raise ValidationError("RESULT_CONTRACT_INVALID: execution_attempt_id does not exist.")
@@ -164,12 +182,6 @@ class ShadowBotResultImporter:
             raise ValidationError("RESULT_CONTRACT_INVALID: archived request hash does not match attempt.")
         request_data = json.loads(request_bytes.decode("utf-8-sig"))
         self._validate_v2_result(request_data, data, result_bytes)
-        task12_context = self._validate_task12_result(
-            request_data,
-            data,
-            result_bytes,
-            execution_attempt_id=execution_attempt_id,
-        )
         result_file_sha256 = hashlib.sha256(result_bytes).hexdigest()
         data.setdefault("result_id", f"RESULT-{result_file_sha256[:24]}")
         lease_required = isinstance(attempt.raw_output.get("lease"), dict)
@@ -199,221 +211,492 @@ class ShadowBotResultImporter:
                 )
             if imported_result_id != contract.result_id or imported_result_sha256 != result_file_sha256:
                 raise ValidationError("RESULT_CONTRACT_INVALID: conflicting result evidence for completed attempt.")
-        task12_projection = None
-        if task12_context is not None:
-            task12_projection = self._project_task12_result(
-                task12_context,
-                contract,
-                result_file_sha256=result_file_sha256,
-            )
+            self.executor.reproject_terminal_result(contract)
+        inventory_events = self._import_v2_inventory_observations(request_data, data)
         archive_dir = self._archive_attempt(contract.execution_attempt_id, request_path, result_path)
-        event = {
+        return {
             "status": "IMPORTED" if attempt.ended_at is None else "ALREADY_IMPORTED",
             "execution_attempt_id": contract.execution_attempt_id,
             "archive_dir": str(archive_dir),
+            "inventory_events": inventory_events,
         }
-        if task12_projection is not None:
-            event["price_batch"] = task12_projection
-        return event
 
-    def _validate_task12_result(
+    def _import_v4_commit_result(
+        self,
+        result_path: Path,
+        *,
+        data: dict[str, Any],
+        result_bytes: bytes,
+    ) -> dict[str, Any]:
+        """Import one formal v4 batch without a legacy per-item attempt row."""
+
+        execution_attempt_id = str(data.get("execution_attempt_id") or "").strip()
+        request_path = self._find_v4_request(execution_attempt_id)
+        request_bytes = request_path.read_bytes()
+        _verify_checksum(request_path, request_bytes)
+        request_file_sha256 = hashlib.sha256(request_bytes).hexdigest()
+        request_data = json.loads(request_bytes.decode("utf-8-sig"))
+        if not isinstance(request_data, dict):
+            raise ValidationError("RESULT_CONTRACT_INVALID: v4 request JSON must be an object.")
+        # The Worker validates expiry before claiming. Import can legitimately
+        # happen after that deadline, so replay every immutable contract check
+        # except the wall-clock expiry check.
+        validate_commit_batch_request(request_data, check_expiry=False)
+        for field_name in (
+            "task_id",
+            "operation_id",
+            "execution_attempt_id",
+            "execution_mode",
+            "batch_id",
+            "manifest_sha256",
+            "instruction_hash",
+        ):
+            if str(data.get(field_name) or "") != str(request_data.get(field_name) or ""):
+                raise ValidationError(
+                    f"RESULT_CONTRACT_INVALID: v4 {field_name} mismatch."
+                )
+        if str(data.get("request_file_sha256") or "") != request_file_sha256:
+            raise ValidationError(
+                "RESULT_CONTRACT_INVALID: v4 request_file_sha256 mismatch."
+            )
+        result_file_sha256 = hashlib.sha256(result_bytes).hexdigest()
+        data.setdefault("result_id", f"RESULT-{result_file_sha256[:24]}")
+        data["result_file_sha256"] = result_file_sha256
+        from app.services.shadowbot_commit_pipeline import import_task_commit_result
+
+        with self.repository.connect_read() as connection:
+            batch_row = connection.execute(
+                "SELECT result_id FROM shadowbot_commit_batches WHERE batch_id = ?",
+                (str(data.get("batch_id") or ""),),
+            ).fetchone()
+        already_imported = bool(
+            batch_row is not None
+            and str(batch_row["result_id"] or "") == str(data["result_id"])
+        )
+        listing_observations = self._normalize_v4_page_snapshot(request_data, data)
+        counts = import_task_commit_result(
+            self.repository,
+            data,
+            listing_observations=listing_observations,
+            result_file_sha256=result_file_sha256,
+            source_result_path=str(result_path),
+        )
+        reconcile_events: list[dict[str, Any]] = []
+        for item in data.get("items") or []:
+            if str(item.get("status") or "").upper() != "UNKNOWN":
+                continue
+            try:
+                reconcile = self.executor.ensure_reconcile_attempt(
+                    operation_id=str(item.get("operation_id") or ""),
+                    source_execution_attempt_id=str(
+                        item.get("item_execution_attempt_id") or ""
+                    ),
+                    runner_payload={
+                        key: request_data[key]
+                        for key in ("applet_uri", "window_title")
+                        if request_data.get(key)
+                    },
+                )
+                reconcile_events.append(
+                    {
+                        "operation_id": str(item.get("operation_id") or ""),
+                        "execution_attempt_id": (
+                            reconcile.execution_attempt_id
+                            if reconcile is not None
+                            else ""
+                        ),
+                        "status": (
+                            reconcile.status if reconcile is not None else "NOT_REQUIRED"
+                        ),
+                    }
+                )
+            except (ValidationError, OSError) as exc:
+                reconcile_events.append(
+                    {
+                        "operation_id": str(item.get("operation_id") or ""),
+                        "execution_attempt_id": "",
+                        "status": "RETRY_PENDING",
+                        "error_message": str(exc),
+                    }
+                )
+        archive_dir = self.paths.archive / execution_attempt_id
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        ack_path = archive_dir / f"{execution_attempt_id}.import.ack.json"
+        try:
+            _atomic_write(
+                ack_path,
+                _json_bytes(
+                    {
+                        "schema_version": "shadowbot-commit-import-ack-1.0",
+                        "result_id": data["result_id"],
+                        "batch_id": data["batch_id"],
+                        "execution_attempt_id": execution_attempt_id,
+                        "result_file_sha256": result_file_sha256,
+                        "accepted_at": datetime.now(UTC).isoformat(),
+                    }
+                ),
+            )
+        except OSError as exc:
+            with self.repository.connect_write() as connection, connection:
+                connection.execute(
+                    """
+                    UPDATE shadowbot_commit_result_receipts
+                    SET ack_state = 'FAILED', ack_updated_at = ?,
+                        last_projection_error = ?
+                    WHERE result_id = ?
+                    """,
+                    (datetime.now(UTC).isoformat(), str(exc), data["result_id"]),
+                )
+            return {
+                "status": "IMPORTED_ACK_PENDING",
+                "contract_version": COMMIT_BATCH_CONTRACT_VERSION,
+                "batch_id": str(data.get("batch_id") or ""),
+                "execution_attempt_id": execution_attempt_id,
+                "archive_dir": str(archive_dir),
+                "counts": counts,
+                "listing_status_events": listing_observations,
+                "reconcile_events": reconcile_events,
+            }
+        archive_dir = self._archive_attempt(
+            execution_attempt_id,
+            request_path,
+            result_path,
+        )
+        with self.repository.connect_write() as connection, connection:
+            connection.execute(
+                """
+                UPDATE shadowbot_commit_result_receipts
+                SET ack_state = 'WRITTEN', ack_updated_at = ?,
+                    last_projection_error = ''
+                WHERE result_id = ?
+                """,
+                (datetime.now(UTC).isoformat(), data["result_id"]),
+            )
+        return {
+            "status": "ALREADY_IMPORTED" if already_imported else "IMPORTED",
+            "contract_version": COMMIT_BATCH_CONTRACT_VERSION,
+            "batch_id": str(data.get("batch_id") or ""),
+            "execution_attempt_id": execution_attempt_id,
+            "archive_dir": str(archive_dir),
+            "counts": counts,
+            "listing_status_events": listing_observations,
+            "reconcile_events": reconcile_events,
+        }
+
+    def _find_v4_request(self, execution_attempt_id: str) -> Path:
+        candidates = (
+            self.paths.working / f"{execution_attempt_id}.request.json",
+            self.paths.inbox / f"{execution_attempt_id}.ready.json",
+            self.paths.archive / execution_attempt_id / f"{execution_attempt_id}.request.json",
+            self.paths.archive / execution_attempt_id / f"{execution_attempt_id}.ready.json",
+        )
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        raise ValidationError("RESULT_CONTRACT_INVALID: v4 source request file is missing.")
+
+    def _normalize_v4_page_snapshot(
         self,
         request: dict[str, Any],
         result: dict[str, Any],
-        result_bytes: bytes,
-        *,
-        execution_attempt_id: str,
-    ) -> dict[str, Any] | None:
-        if request.get("batch_contract_version") != 3:
-            return None
-        if len(result_bytes) > PRICE_BATCH_MAX_RESULT_BYTES:
-            raise ValidationError("RESULT_TOO_LARGE: task 12 result exceeds 4 MiB.")
-        if result.get("batch_contract_version") != 3:
-            raise ValidationError("RESULT_CONTRACT_INVALID: task 12 contract version mismatch.")
-        for name in TASK12_INSTRUCTION_HASH_FIELDS:
-            if result.get(name) != request.get(name):
-                raise ValidationError(f"RESULT_CONTRACT_INVALID: task 12 {name} mismatch.")
-        for name in ("run_success_flag", "business_operation_completed"):
-            value = result.get(name)
-            if value is not None and not isinstance(value, bool):
-                raise ValidationError(f"RESULT_CONTRACT_INVALID: {name} must be boolean or null.")
-        if not isinstance(result.get("retryable"), bool):
-            raise ValidationError("RESULT_CONTRACT_INVALID: retryable must be boolean.")
+    ) -> list[dict[str, Any]]:
+        """Validate and normalize every observed product without mutating the database."""
 
-        batch_id = str(request.get("price_batch_id") or "").strip()
-        item_id = str(request.get("price_batch_item_id") or "").strip()
-        stage = str(request.get("price_batch_stage") or "").strip().upper()
-        batch = self.repository.get_shadowbot_batch(batch_id)
-        item = self.repository.get_shadowbot_batch_item(batch_id, item_id)
-        if batch is None or item is None:
-            raise ValidationError("BATCH_ITEM_BINDING_MISMATCH: batch item does not exist.")
-        expected_attempt_id = {
-            "FRESH_READ": item.fresh_read_attempt_id,
-            "WRITE": item.current_execution_attempt_id,
-            "RECONCILE": item.reconcile_attempt_id,
-        }.get(stage)
-        if not expected_attempt_id or expected_attempt_id != execution_attempt_id:
-            raise ValidationError("BATCH_ITEM_BINDING_MISMATCH: attempt is not bound to this item stage.")
-        expected_batch = {
-            "batch_execution_mode": batch.execution_mode,
-            "normalized_request_digest": batch.normalized_request_digest,
-            "source_read_batch_id": batch.source_read_batch_id,
-            "source_snapshot_sha256": batch.source_snapshot_sha256,
-            "source_page_context_sha256": batch.source_page_context_sha256,
-            "capture_evidence": batch.capture_evidence,
-        }
-        expected_item = {
-            "price_batch_ordinal": item.ordinal,
-            "page_identity_key": item.page_identity_key,
-            "write_identity_key": item.write_identity_key,
-            "approved_payload_hash": item.approved_payload_hash,
-        }
-        for name, expected in {**expected_batch, **expected_item}.items():
-            if request.get(name) != expected:
-                raise ValidationError(f"BATCH_ITEM_BINDING_MISMATCH: persisted {name} differs.")
-        if str(request.get("operation_id") or "") != item.operation_id:
-            raise ValidationError("BATCH_ITEM_BINDING_MISMATCH: operation_id differs.")
-        if str(request.get("task_id") or "") != item.task_id:
-            raise ValidationError("BATCH_ITEM_BINDING_MISMATCH: task_id differs.")
-        if stage != "RECONCILE" and str(request.get("approval_id") or "") != item.review_task_id:
-            raise ValidationError("BATCH_ITEM_BINDING_MISMATCH: approval_id differs.")
-        return {
-            "batch": batch,
-            "item": item,
-            "request": request,
-            "result": result,
-            "stage": stage,
-        }
-
-    def _project_task12_result(
-        self,
-        context: dict[str, Any],
-        contract,
-        *,
-        result_file_sha256: str,
-    ) -> dict[str, Any]:
-        batch = context["batch"]
-        item = context["item"]
-        result = context["result"]
-        stage = context["stage"]
-        orchestrator = ShadowBotPriceBatchOrchestrator(self.repository)
-        result_hash = "sha256:" + result_file_sha256
-        actual_price = _task12_optional_price(result.get("actual_price"))
-        if contract.status in {STATUS_READ_COMPLETED, STATUS_PREVIEW_COMPLETED, STATUS_VERIFIED, STATUS_NOT_APPLIED}:
-            if actual_price is None:
-                raise ValidationError("RESULT_CONTRACT_INVALID: successful task 12 readback requires actual_price.")
-            if contract.status != STATUS_NOT_APPLIED and str(result.get("error_code") or "").strip():
-                raise ValidationError("RESULT_CONTRACT_INVALID: successful task 12 result cannot carry error_code.")
-            if (
-                normalize_text(result.get("product_name")) != normalize_text(item.expected_product_name)
-                or normalize_grade(result.get("grade")) != normalize_grade(item.expected_grade)
-            ):
-                raise ValidationError("PRODUCT_IDENTITY_MISMATCH: result identity differs from batch item.")
-        normalized_error, adapter_error = _task12_batch_error(
-            str(result.get("error_code") or ""),
-            side_effect_state=contract.side_effect_state,
-        )
-        error_message = str(result.get("error_message") or "").strip()
-        if adapter_error and adapter_error != normalized_error:
-            error_message = (f"adapter_error_code={adapter_error}; {error_message}").strip("; ")
-        try:
-            if stage == "FRESH_READ":
-                if contract.status == STATUS_READ_COMPLETED:
-                    orchestrator.record_fresh_read(
-                        batch.batch_id,
-                        item.item_id,
-                        fresh_read_attempt_id=contract.execution_attempt_id,
-                        result_sha256=result_hash,
-                        observed_product_name=result.get("product_name"),
-                        observed_grade=result.get("grade"),
-                        observed_platform_sku=result.get("platform_sku"),
-                        observed_price=result.get("actual_price"),
-                        observed_at=result.get("observed_at"),
-                    )
-                else:
-                    orchestrator.record_item_result(
-                        batch.batch_id,
-                        item.item_id,
-                        status=BatchItemStatus.FAILED.value,
-                        execution_attempt_id=contract.execution_attempt_id,
-                        run_id=_attempt_run_id(self.repository, contract.execution_attempt_id),
-                        error_code=normalized_error or PriceBatchErrorCode.PLATFORM_EXECUTION_FAILED.value,
-                        error_message=error_message,
-                        result_id=contract.result_id,
-                        result_hash=result_hash,
-                        stop_requested=normalized_error == PriceBatchErrorCode.WORKER_STOP_REQUESTED.value,
-                    )
-            elif stage == "WRITE":
-                if contract.status == STATUS_PREVIEW_COMPLETED:
-                    item_status = BatchItemStatus.PREVIEWED.value
-                elif contract.status == STATUS_VERIFIED:
-                    item_status = BatchItemStatus.VERIFIED.value
-                elif contract.status in {STATUS_SIDE_EFFECT_UNKNOWN, STATUS_START_UNKNOWN} or contract.side_effect_state in {
-                    "SUBMIT_INTENT_RECORDED",
-                    "SUBMIT_CLICKED",
-                    "UNKNOWN",
-                }:
-                    item_status = BatchItemStatus.NEEDS_RECONCILIATION.value
-                    normalized_error = PriceBatchErrorCode.SUBMIT_RESULT_UNKNOWN.value
-                elif contract.status in {STATUS_FAILED, STATUS_NOT_APPLIED, STATUS_START_FAILED}:
-                    item_status = BatchItemStatus.FAILED.value
-                else:
-                    raise ValidationError("RESULT_CONTRACT_INVALID: unsupported task 12 write result status.")
-                orchestrator.record_item_result(
-                    batch.batch_id,
-                    item.item_id,
-                    status=item_status,
-                    execution_attempt_id=contract.execution_attempt_id,
-                    run_id=_attempt_run_id(self.repository, contract.execution_attempt_id),
-                    post_commit_price=actual_price,
-                    error_code=normalized_error,
-                    error_message=error_message,
-                    result_id=contract.result_id,
-                    result_hash=result_hash,
-                    stop_requested=normalized_error == PriceBatchErrorCode.WORKER_STOP_REQUESTED.value,
+        snapshot = result.get("page_snapshot")
+        if snapshot is None:
+            # Compatibility for v4 results written before page-wide feedback
+            # became part of the Worker result.
+            return []
+        if not isinstance(snapshot, dict):
+            raise ValidationError("RESULT_CONTRACT_INVALID: v4 page_snapshot must be an object.")
+        platform_name = str(snapshot.get("platform_name") or "").strip()
+        if platform_name != str(request.get("platform_name") or "").strip():
+            raise ValidationError(
+                "RESULT_CONTRACT_INVALID: v4 page_snapshot platform mismatch."
+            )
+        products = snapshot.get("products")
+        if not isinstance(products, list) or not products:
+            raise ValidationError(
+                "RESULT_CONTRACT_INVALID: v4 page_snapshot products must be non-empty."
+            )
+        if int(snapshot.get("total_count") or -1) != len(products):
+            raise ValidationError(
+                "RESULT_CONTRACT_INVALID: v4 page_snapshot total_count mismatch."
+            )
+        execution_attempt_id = str(result.get("execution_attempt_id") or "").strip()
+        seen_positions: set[int] = set()
+        seen_identities: set[tuple[str, str, str]] = set()
+        observations: list[dict[str, Any]] = []
+        for product in products:
+            if not isinstance(product, dict):
+                raise ValidationError(
+                    "RESULT_CONTRACT_INVALID: v4 page_snapshot product must be an object."
                 )
-            elif stage == "RECONCILE":
-                if contract.status == STATUS_VERIFIED and actual_price == item.target_price:
-                    outcome = "VERIFIED"
-                elif (
-                    contract.status in {STATUS_NOT_APPLIED, STATUS_FAILED}
-                    and contract.side_effect_state == "NOT_APPLIED"
-                    and actual_price in {item.fresh_old_price, item.approved_expected_old_price}
-                ):
-                    outcome = "NOT_APPLIED"
-                else:
-                    outcome = "UNCERTAIN"
-                    normalized_error = PriceBatchErrorCode.SUBMIT_RESULT_UNKNOWN.value
-                orchestrator.complete_reconcile(
-                    batch.batch_id,
-                    item.item_id,
-                    reconcile_attempt_id=contract.execution_attempt_id,
-                    outcome=outcome,
-                    post_commit_price=actual_price,
-                    error_code=normalized_error,
-                    error_message=error_message,
+            try:
+                position = int(product.get("position"))
+                inventory = int(product.get("inventory"))
+            except (TypeError, ValueError) as exc:
+                raise ValidationError(
+                    "RESULT_CONTRACT_INVALID: v4 page_snapshot position/inventory invalid."
+                ) from exc
+            if position < 1 or position in seen_positions or inventory < 0:
+                raise ValidationError(
+                    "RESULT_CONTRACT_INVALID: v4 page_snapshot position/inventory invalid."
                 )
+            seen_positions.add(position)
+            variety = str(product.get("product_name") or "").strip()
+            grade = str(product.get("grade") or "").strip()
+            identity = listing_identity_key(platform_name, variety, grade)
+            if identity in seen_identities:
+                raise ValidationError(
+                    "RESULT_CONTRACT_INVALID: v4 page_snapshot identity is not unique."
+                )
+            seen_identities.add(identity)
+            existing = self.repository.get_listing_status(*identity)
+            price_status = str(product.get("price_status") or "").upper()
+            if price_status not in {
+                "OBSERVED_AT_PREFLIGHT",
+                "VERIFIED_AFTER_COMMIT",
+                "UNKNOWN_AFTER_SUBMIT",
+            }:
+                raise ValidationError(
+                    "RESULT_CONTRACT_INVALID: v4 page_snapshot price_status invalid."
+                )
+            raw_price = product.get("price")
+            if price_status == "UNKNOWN_AFTER_SUBMIT":
+                if existing is None:
+                    raise ValidationError(
+                        "RESULT_CONTRACT_INVALID: unknown v4 price has no existing listing status."
+                    )
+                observed_price = None
             else:
-                raise ValidationError("RESULT_CONTRACT_INVALID: unsupported task 12 stage.")
-        except PriceBatchContractError as exc:
-            stored_after_error = self.repository.get_shadowbot_batch_item(batch.batch_id, item.item_id)
-            if stored_after_error is None or stored_after_error.status == BatchItemStatus.RUNNING.value:
-                raise
-            normalized_error = stored_after_error.error_code or exc.code
+                try:
+                    observed_price = Decimal(str(raw_price))
+                except (ArithmeticError, ValueError) as exc:
+                    raise ValidationError(
+                        "RESULT_CONTRACT_INVALID: v4 page_snapshot price invalid."
+                    ) from exc
+            listing_value = str(product.get("listing_status") or "UNKNOWN").upper()
+            if listing_value not in {"ONLINE", "OFFLINE", "UNKNOWN"}:
+                raise ValidationError(
+                    "RESULT_CONTRACT_INVALID: v4 page_snapshot listing_status invalid."
+                )
+            if listing_value == "UNKNOWN" and existing is None:
+                raise ValidationError(
+                    "RESULT_CONTRACT_INVALID: unknown v4 listing status has no existing row."
+                )
+            online_status = (
+                existing.online_status
+                if listing_value == "UNKNOWN" and existing is not None
+                else "online"
+                if listing_value == "ONLINE"
+                else "offline"
+            )
+            observations.append(
+                {
+                    "position": position,
+                    "identity": identity,
+                    "observed_price": observed_price,
+                    "preserve_existing_price": price_status
+                    == "UNKNOWN_AFTER_SUBMIT",
+                    "inventory": inventory,
+                    "online_status": online_status,
+                    "preserve_existing_online_status": listing_value == "UNKNOWN",
+                    "observed_at": _parse_shadowbot_observed_at(
+                        product.get("observed_at") or snapshot.get("captured_at")
+                    ),
+                    "execution_attempt_id": execution_attempt_id,
+                }
+            )
+        return observations
 
-        stored_batch = self.repository.get_shadowbot_batch(batch.batch_id)
-        stored_item = self.repository.get_shadowbot_batch_item(batch.batch_id, item.item_id)
-        assert stored_batch is not None and stored_item is not None
-        counts = _validate_persisted_batch_counts(self.repository, batch.batch_id)
-        return {
-            "batch_id": batch.batch_id,
-            "item_id": item.item_id,
-            "stage": stage,
-            "item_status": stored_item.status,
-            "batch_status": stored_batch.status,
-            "error_code": stored_item.error_code or normalized_error,
-            "counts": counts,
-        }
+    def _import_v2_inventory_observations(
+        self,
+        request: dict[str, Any],
+        result: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if request.get("contract_version") != 2 or result.get("status") != "READ_COMPLETED":
+            return []
+        normalized_request = normalize_multi_product_request(request)
+        aggregated = aggregate_product_snapshots(
+            read_batch_id=normalized_request["read_batch_id"],
+            contract_version=2,
+            started_at=str(result.get("started_at") or ""),
+            completed_at=str(result.get("ended_at") or result.get("completed_at") or ""),
+            snapshots=result.get("product_snapshots") or [],
+            expected_item_ids=(
+                None
+                if normalized_request["execution_mode"] == "READ_ONLY"
+                else [product["item_id"] for product in normalized_request["products"]]
+            ),
+        )
+        observed_at = _parse_shadowbot_observed_at(
+            result.get("ended_at") or result.get("completed_at")
+        )
+        execution_attempt_id = str(result.get("execution_attempt_id") or "").strip()
+        request_by_item = {product["item_id"]: product for product in normalized_request["products"]}
+        inventory_by_identity: dict[tuple[str, str, str], Any] = {}
+        ambiguous_inventory_identities: set[tuple[str, str, str]] = set()
+        try:
+            inventory_products = load_products(self.inventory_products_path)
+        except (OSError, UnicodeError, ValidationError, ValueError) as exc:
+            raise ValidationError(
+                f"INVENTORY_MAPPING_SOURCE_INVALID: {self.inventory_products_path}"
+            ) from exc
+        for product in inventory_products:
+            identity = listing_identity_key(
+                normalized_request["platform_name"],
+                product.product_name,
+                product.grade,
+            )
+            if identity in inventory_by_identity:
+                ambiguous_inventory_identities.add(identity)
+                continue
+            inventory_by_identity[identity] = product
+        active_listing_filter = str(result.get("active_listing_filter") or "").strip().upper()
+        events: list[dict[str, Any]] = []
+        observed_mapped_identities: set[tuple[str, str, str]] = set()
+        for snapshot in aggregated["product_snapshots"]:
+            item_id = str(snapshot.get("item_id") or "")
+            target = request_by_item.get(item_id)
+            mapping_status = str(snapshot.get("mapping_status") or "MAPPED").strip().upper()
+            snapshot_platform = str(
+                snapshot.get("platform") or normalized_request["platform_name"]
+            ).strip()
+            snapshot_variety = str(snapshot.get("product_name") or "").strip()
+            snapshot_grade = str(snapshot.get("grade") or "").strip()
+            snapshot_identity = listing_identity_key(
+                snapshot_platform,
+                snapshot_variety,
+                snapshot_grade,
+            )
+            inventory_product = inventory_by_identity.get(snapshot_identity)
+            if target is None or mapping_status == "UNMAPPED":
+                if snapshot_identity in ambiguous_inventory_identities:
+                    events.append(
+                        {
+                            "item_id": item_id,
+                            "warning_code": "INVENTORY_PRODUCT_MAPPING_AMBIGUOUS",
+                            "platform_name": snapshot_platform,
+                            "variety": snapshot_variety,
+                            "grade": snapshot_grade,
+                            "status": "WARNING",
+                        }
+                    )
+                    continue
+                if inventory_product is not None:
+                    target = {
+                        "item_id": item_id,
+                        "platform": snapshot_platform,
+                        "expected_product_name": inventory_product.product_name,
+                        "expected_grade": inventory_product.grade,
+                        "internal_sku": inventory_product.internal_sku,
+                    }
+                    mapping_status = "MAPPED"
+            if target is None or mapping_status == "UNMAPPED":
+                events.append(
+                    {
+                        "item_id": item_id,
+                        "warning_code": "UNMAPPED_PRODUCT_DISCOVERED",
+                        "platform_name": str(snapshot.get("platform") or normalized_request["platform_name"]),
+                        "variety": str(snapshot.get("product_name") or ""),
+                        "grade": str(snapshot.get("grade") or ""),
+                        "current_price": str(snapshot.get("price") or ""),
+                        "platform_stock_qty": snapshot.get("inventory"),
+                        "row_identity": str(snapshot.get("row_identity") or ""),
+                        "status": "WARNING",
+                    }
+                )
+                continue
+            platform_name = str(target.get("platform") or normalized_request["platform_name"]).strip()
+            variety = str(target.get("expected_product_name") or "").strip()
+            grade = str(target.get("expected_grade") or "").strip()
+            internal_sku = str(
+                target.get("internal_sku")
+                or (inventory_product.internal_sku if inventory_product is not None else "")
+            ).strip()
+            identity = listing_identity_key(platform_name, variety, grade)
+            observed_mapped_identities.add(identity)
+            existing = self.repository.get_listing_status(platform_name, variety, grade)
+            if snapshot.get("item_status") != "SUCCESS" or snapshot.get("inventory") is None:
+                continue
+            raw_price = snapshot.get("price")
+            if existing is None and raw_price in (None, ""):
+                events.append({"item_id": item_id, "status": "SKIPPED_PRICE_MISSING_FOR_NEW_STATUS"})
+                continue
+            listing_value = str(snapshot.get("listing_status") or "").upper()
+            if existing is None and listing_value == "UNKNOWN":
+                events.append({"item_id": item_id, "status": "SKIPPED_LISTING_STATUS_UNKNOWN"})
+                continue
+            online_status = (
+                existing.online_status
+                if existing is not None
+                else ("online" if listing_value == "ONLINE" else "offline")
+            )
+            update_status = self.repository.apply_shadowbot_inventory_observation(
+                platform_name=platform_name,
+                variety=variety,
+                grade=grade,
+                internal_sku=internal_sku,
+                observed_price=(
+                    Decimal(str(raw_price))
+                    if raw_price not in (None, "")
+                    else existing.current_price
+                ),
+                platform_stock_qty=int(snapshot["inventory"]),
+                online_status=online_status,
+                observed_at=observed_at,
+                execution_attempt_id=execution_attempt_id,
+            )
+            events.append(
+                {
+                    "item_id": item_id,
+                    "platform_name": platform_name,
+                    "variety": variety,
+                    "grade": grade,
+                    "internal_sku": internal_sku,
+                    "platform_stock_qty": int(snapshot["inventory"]),
+                    "status": update_status,
+                }
+            )
+        if (
+            normalized_request["execution_mode"] == "READ_ONLY"
+            and active_listing_filter == "ONLINE"
+            and aggregated["overall_status"] == "COMPLETED"
+        ):
+            for existing in self.repository.list_listing_statuses(
+                platform_name=normalized_request["platform_name"]
+            ):
+                identity = listing_identity_key(
+                    existing.platform_name,
+                    existing.variety,
+                    existing.grade,
+                )
+                if identity in observed_mapped_identities:
+                    continue
+                update_status = self.repository.apply_shadowbot_inventory_observation(
+                    platform_name=existing.platform_name,
+                    variety=existing.variety,
+                    grade=existing.grade,
+                    observed_price=existing.current_price,
+                    platform_stock_qty=0,
+                    online_status=existing.online_status,
+                    observed_at=observed_at,
+                    execution_attempt_id=execution_attempt_id,
+                    source="shadowbot_read_not_in_online",
+                )
+                events.append(
+                    {
+                        "item_id": "",
+                        "platform_name": existing.platform_name,
+                        "variety": existing.variety,
+                        "grade": existing.grade,
+                        "platform_stock_qty": 0,
+                        "inference_basis": "ABSENT_FROM_COMPLETE_ONLINE_SNAPSHOT",
+                        "status": update_status,
+                    }
+                )
+        return events
 
     @staticmethod
     def _validate_v2_result(request: dict[str, Any], result: dict[str, Any], result_bytes: bytes) -> None:
@@ -434,8 +717,23 @@ class ShadowBotResultImporter:
                 started_at=str(result.get("started_at") or ""),
                 completed_at=str(result.get("ended_at") or result.get("completed_at") or ""),
                 snapshots=snapshots,
-                expected_item_ids=[product["item_id"] for product in normalized_request["products"]],
+                expected_item_ids=(
+                    None
+                    if normalized_request["execution_mode"] == "READ_ONLY"
+                    else [product["item_id"] for product in normalized_request["products"]]
+                ),
             )
+            warnings = result.get("warnings", [])
+            if not isinstance(warnings, list):
+                raise ValidationError("RESULT_CONTRACT_INVALID: warnings must be an array.")
+            for warning in warnings:
+                if not isinstance(warning, dict) or str(warning.get("warning_code") or "") != "UNMAPPED_PRODUCT_DISCOVERED":
+                    raise ValidationError("RESULT_CONTRACT_INVALID: warning is invalid.")
+                if any(
+                    not str(warning.get(field) or "").strip()
+                    for field in ("item_id", "platform_name", "product_name", "grade", "row_identity")
+                ):
+                    raise ValidationError("RESULT_CONTRACT_INVALID: unmapped warning identity is incomplete.")
             execution_attempt_id = str(result.get("execution_attempt_id") or "")
             for snapshot in snapshots:
                 evidence = snapshot.get("evidence")
@@ -454,7 +752,6 @@ class ShadowBotResultImporter:
                     item_id=str(snapshot.get("item_id") or ""),
                     execution_attempt_id=execution_attempt_id,
                 )
-
     def _find_request(self, execution_attempt_id: str, recorded_path: str) -> Path:
         candidates = [
             self.paths.working / f"{execution_attempt_id}.request.json",
@@ -479,6 +776,8 @@ class ShadowBotResultImporter:
         )
         for source in related:
             destination = archive_dir / source.name
+            if source.resolve() == destination.resolve():
+                continue
             if source.exists() and destination.exists() and source.read_bytes() != destination.read_bytes():
                 raise ValidationError(
                     f"RESULT_CONTRACT_INVALID: archive evidence conflict for {source.name}."
@@ -486,6 +785,8 @@ class ShadowBotResultImporter:
         for source in related:
             if source.exists():
                 destination = archive_dir / source.name
+                if source.resolve() == destination.resolve():
+                    continue
                 if destination.exists():
                     source.unlink()
                 else:
@@ -499,7 +800,16 @@ class ShadowBotResultImporter:
         try:
             quarantined_data = json.loads(destination.read_text(encoding="utf-8-sig"))
             execution_attempt_id = str(quarantined_data.get("execution_attempt_id") or "")
-            if execution_attempt_id:
+            if (
+                quarantined_data.get("contract_version") == COMMIT_BATCH_CONTRACT_VERSION
+                and str(quarantined_data.get("batch_id") or "")
+            ):
+                self.repository.quarantine_shadowbot_commit_batch(
+                    str(quarantined_data["batch_id"]),
+                    reason=type(error).__name__ + ":" + str(error),
+                    now=datetime.now(UTC),
+                )
+            elif execution_attempt_id:
                 self.repository.quarantine_shadowbot_attempt(
                     execution_attempt_id,
                     reason=type(error).__name__ + ":" + str(error),
@@ -523,79 +833,6 @@ class ShadowBotResultImporter:
             ),
         )
         return destination
-
-
-_TASK12_ERROR_ALIASES = {
-    "DUPLICATE_TARGET_IDENTITY": PriceBatchErrorCode.AMBIGUOUS_MATCH.value,
-    "PRODUCT_MATCH_AMBIGUOUS": PriceBatchErrorCode.AMBIGUOUS_MATCH.value,
-    "OLD_PRICE_PARSE_FAILED": PriceBatchErrorCode.CURRENT_PRICE_PARSE_FAILED.value,
-    "FINAL_SAVE_NOT_FOUND": PriceBatchErrorCode.SUBMIT_RESULT_UNKNOWN.value,
-    "POST_SUBMIT_PRICE_MISMATCH": PriceBatchErrorCode.SUBMIT_RESULT_UNKNOWN.value,
-}
-
-_TASK12_LIST_LOAD_ERRORS = frozenset(
-    {
-        "APPLET_URI_INVALID",
-        "APPLET_URI_MISSING",
-        "APPLET_URI_OPEN_FAILED",
-        "ELEMENT_NOT_FOUND",
-        "PRODUCT_LIST_REFRESH_FAILED",
-        "SELECTOR_BUILD_FAILED",
-        "WINDOW_NOT_AVAILABLE",
-    }
-)
-
-
-def _task12_optional_price(value: Any) -> Decimal | None:
-    if value is None or str(value).strip() == "":
-        return None
-    return Decimal(
-        normalize_price_string(
-            value,
-            error_code=PriceBatchErrorCode.CURRENT_PRICE_PARSE_FAILED,
-        )
-    )
-
-
-def _task12_batch_error(raw_error: str, *, side_effect_state: str) -> tuple[str, str]:
-    adapter_error = str(raw_error or "").strip().upper()
-    if not adapter_error:
-        return "", ""
-    if adapter_error in PRICE_BATCH_ERROR_CODES:
-        return adapter_error, adapter_error
-    if adapter_error in _TASK12_ERROR_ALIASES:
-        return _TASK12_ERROR_ALIASES[adapter_error], adapter_error
-    if adapter_error in _TASK12_LIST_LOAD_ERRORS:
-        return PriceBatchErrorCode.LIST_NOT_LOADED.value, adapter_error
-    if side_effect_state in {"SUBMIT_INTENT_RECORDED", "SUBMIT_CLICKED", "UNKNOWN"}:
-        return PriceBatchErrorCode.SUBMIT_RESULT_UNKNOWN.value, adapter_error
-    return PriceBatchErrorCode.PLATFORM_EXECUTION_FAILED.value, adapter_error
-
-
-def _attempt_run_id(repository: SQLiteRuntimeRepository, execution_attempt_id: str) -> str:
-    attempt = repository.get_shadowbot_execution_attempt(execution_attempt_id)
-    return attempt.shadowbot_run_id if attempt is not None else ""
-
-
-def _validate_persisted_batch_counts(
-    repository: SQLiteRuntimeRepository,
-    batch_id: str,
-) -> dict[str, int]:
-    batch = repository.get_shadowbot_batch(batch_id)
-    items = repository.list_shadowbot_batch_items(batch_id)
-    if batch is None:
-        raise ValidationError("BATCH_ITEM_BINDING_MISMATCH: batch disappeared during import.")
-    counts = aggregate_batch_counts([item.status for item in items])
-    for name, expected in counts.items():
-        if name == "total_count":
-            actual = len(items)
-        else:
-            actual = getattr(batch, name)
-        if actual != expected:
-            raise ValidationError(
-                f"RESULT_CONTRACT_INVALID: persisted batch count mismatch for {name}."
-            )
-    return counts
 
 
 class ShadowBotLoginVerificationMonitor:
@@ -697,29 +934,72 @@ class ShadowBotQueueWatchdog:
                 attempt_id = str(request.get("execution_attempt_id") or "").strip()
                 if not attempt_id:
                     raise ValidationError("ready request has no execution_attempt_id")
-                attempt = self.repository.get_shadowbot_execution_attempt(attempt_id)
                 duplicate = attempt_id in seen or (self.paths.working / f"{attempt_id}.request.json").exists()
                 seen.add(attempt_id)
-                if attempt is None:
-                    reason = "ORPHAN_READY_REQUEST"
-                    target_root = self.paths.quarantine
-                elif duplicate:
+                if duplicate:
                     reason = "DUPLICATE_READY_REQUEST"
                     target_root = self.paths.quarantine
-                else:
-                    operation = self.repository.get_shadowbot_operation(attempt.operation_id)
-                    if operation is not None and operation.status in {"VERIFIED", "MANUAL_HANDLED"}:
+                elif request.get("contract_version") == COMMIT_BATCH_CONTRACT_VERSION:
+                    validate_commit_batch_request(request, check_expiry=False)
+                    with self.repository.connect_read() as connection:
+                        batch = connection.execute(
+                            """
+                            SELECT status, execution_attempt_id, instruction_hash,
+                                   manifest_sha256
+                            FROM shadowbot_commit_batches
+                            WHERE batch_id = ?
+                            """,
+                            (str(request.get("batch_id") or ""),),
+                        ).fetchone()
+                    if (
+                        batch is None
+                        or str(batch["execution_attempt_id"] or "") != attempt_id
+                        or str(batch["instruction_hash"] or "")
+                        != str(request.get("instruction_hash") or "")
+                        or str(batch["manifest_sha256"] or "")
+                        != str(request.get("manifest_sha256") or "")
+                    ):
+                        reason = "ORPHAN_READY_REQUEST"
+                        target_root = self.paths.quarantine
+                    elif str(batch["status"] or "") in {
+                        "VERIFIED",
+                        "PARTIAL",
+                        "FAILED",
+                    }:
                         reason = "STALE_TERMINAL_READY_REQUEST"
                         target_root = self.paths.archive / attempt_id
                         target_root.mkdir(parents=True, exist_ok=True)
-                    elif operation is not None and operation.status in {
-                        "NEEDS_RECONCILIATION",
-                        "MANUAL_REVIEW",
-                    }:
+                    elif str(batch["status"] or "") == "UNKNOWN":
                         reason = "FROZEN_READY_REQUEST"
                         target_root = self.paths.quarantine
-                    else:
+                    elif str(batch["status"] or "") in {
+                        "PUBLISHING",
+                        "QUEUED",
+                        "RUNNING",
+                    }:
                         continue
+                    else:
+                        reason = "ORPHAN_READY_REQUEST"
+                        target_root = self.paths.quarantine
+                else:
+                    attempt = self.repository.get_shadowbot_execution_attempt(attempt_id)
+                    if attempt is None:
+                        reason = "ORPHAN_READY_REQUEST"
+                        target_root = self.paths.quarantine
+                    else:
+                        operation = self.repository.get_shadowbot_operation(attempt.operation_id)
+                        if operation is not None and operation.status in {"VERIFIED", "MANUAL_HANDLED"}:
+                            reason = "STALE_TERMINAL_READY_REQUEST"
+                            target_root = self.paths.archive / attempt_id
+                            target_root.mkdir(parents=True, exist_ok=True)
+                        elif operation is not None and operation.status in {
+                            "NEEDS_RECONCILIATION",
+                            "MANUAL_REVIEW",
+                        }:
+                            reason = "FROZEN_READY_REQUEST"
+                            target_root = self.paths.quarantine
+                        else:
+                            continue
                 destination = target_root / f"{reason.lower()}-{request_path.name}"
                 os.replace(request_path, destination)
                 checksum = request_path.with_suffix(request_path.suffix + ".sha256")
@@ -756,12 +1036,32 @@ class ShadowBotQueueWatchdog:
         if not execution_attempt_id:
             raise ValidationError(f"phase file has no execution_attempt_id: {phase_path}")
         result_path = self.paths.results / f"{execution_attempt_id}.result.json"
-        if result_path.exists() or str(phase_data.get("phase") or "") == "RESULT_WRITTEN":
+        if result_path.exists():
             return None
         request_path = self.paths.working / f"{execution_attempt_id}.request.json"
         request_data = _read_json_object(request_path)
         phase_data.setdefault("request_file_sha256", hashlib.sha256(request_path.read_bytes()).hexdigest())
         phase = str(phase_data.get("phase") or "CLAIMED")
+        if request_data.get("contract_version") == COMMIT_BATCH_CONTRACT_VERSION:
+            if self.repository is not None:
+                with self.repository.connect_read() as connection:
+                    accepted = connection.execute(
+                        """
+                        SELECT 1
+                        FROM shadowbot_commit_result_receipts
+                        WHERE batch_id = ? AND execution_attempt_id = ?
+                        LIMIT 1
+                        """,
+                        (
+                            str(request_data.get("batch_id") or ""),
+                            execution_attempt_id,
+                        ),
+                    ).fetchone()
+                if accepted is not None:
+                    return None
+            return self._write_v4_recovery_result(request_data, phase_data, phase=phase)
+        if phase == "RESULT_WRITTEN":
+            return None
         if phase == "VERIFIED" and isinstance(phase_data.get("result_snapshot"), dict):
             return self._write_result(dict(phase_data["result_snapshot"]), execution_attempt_id)
         return self._write_recovery_result(request_data, phase_data, phase=phase)
@@ -773,6 +1073,8 @@ class ShadowBotQueueWatchdog:
         *,
         phase: str,
     ) -> dict[str, Any]:
+        if request.get("contract_version") == COMMIT_BATCH_CONTRACT_VERSION:
+            return self._write_v4_recovery_result(request, phase_data, phase=phase)
         execution_mode = str(request.get("execution_mode") or "")
         has_submit_risk = phase in SUBMIT_PHASES or phase == "VERIFIED" or (
             execution_mode == EXECUTION_MODE_COMMIT and str(phase_data.get("side_effect_state") or "") != SIDE_EFFECT_NOT_STARTED
@@ -814,24 +1116,25 @@ class ShadowBotQueueWatchdog:
             "recovered_phase": phase,
             "ended_at": datetime.now(UTC).isoformat(),
         }
-        if request.get("contract_version") == 2:
-            products = request.get("products")
-            product_count = len(products) if isinstance(products, list) else 0
-            result.update(
-                {
-                    "schema_version": "shadowbot-result-2.0",
-                    "contract_version": 2,
-                    "read_batch_id": request.get("read_batch_id", ""),
-                    "platform_name": request.get("platform_name", ""),
-                    "product_snapshots": [],
-                    "total_count": product_count,
-                    "success_count": 0,
-                    "failed_count": product_count,
-                    "skipped_count": 0,
-                    "manual_check_count": 0,
-                    "overall_status": "FAILED",
-                }
-            )
+        return self._write_result(result, str(request.get("execution_attempt_id") or ""))
+
+    def _write_v4_recovery_result(
+        self,
+        request: dict[str, Any],
+        phase_data: dict[str, Any],
+        *,
+        phase: str,
+    ) -> dict[str, Any]:
+        validate_commit_batch_request(request, check_expiry=False)
+        result = build_v4_recovery_result(
+            request,
+            phase_data,
+            request_file_sha256=str(phase_data.get("request_file_sha256") or ""),
+            recovered_at=datetime.now(UTC).isoformat(),
+            worker_id=str(phase_data.get("worker_id") or ""),
+            error_code="WORKER_INTERRUPTED",
+            error_message=f"stale ShadowBot v4 batch recovered at phase {phase}",
+        )
         return self._write_result(result, str(request.get("execution_attempt_id") or ""))
 
     def _write_result(self, result: dict[str, Any], execution_attempt_id: str) -> dict[str, Any]:

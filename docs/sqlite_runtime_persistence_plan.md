@@ -54,20 +54,16 @@
 
 并且初始化时会写入迁移历史：
 
-- `schema_version = 1`
-- `schema_version = 2`
-- `schema_version = 3`
-- `schema_version = 4`
-- `schema_version = 5`
+- `schema_version = 1..11` 连续记录
 
-当前最新 runtime schema 要求为 v6，权威常量为 `app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION`。
+当前最新 runtime schema 要求为 v11，权威常量为 `app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION`。v7-v9 增加并规范化 `listing_status`，v10 将 `tasks.expected_old_price` 结构化，v11 增加单次请求的 ShadowBot COMMIT 批次和逐商品账本。
 
 v5 migration 除了 ShadowBot 队列审计列外，还创建 `retry_authorizations` 持久化结构。该表包含
 `retry_authorization_id`、`operation_id`、`source_execution_attempt_id`、授权/证据字段、
 `status`、`max_uses`、消费尝试、过期时间、原因和创建/消费时间；约束要求主键、两个外键、
 `max_uses = 1`、状态仅允许 `ACTIVE / CONSUMED / EXPIRED / REVOKED`，并对
 `evidence_hash` 与非空消费尝试建立唯一索引，同时建立 operation/status/expires_at 索引。
-运行态 health check 会精确验证 v6 版本、必需表、v5/v6 列、约束和索引，拒绝只写入迁移记录但缺少实际结构的“伪 v6”。通知 Outbox 的状态机、lease fencing、delivery attempt 与 UNKNOWN_DELIVERY 语义见 `docs/notification_outbox.md`。
+运行态 health check 会精确验证 v11 版本、必需表、关键列、约束和索引，拒绝只写入迁移记录但缺少实际结构的“伪 v11”。通知 Outbox 的状态机、lease fencing、delivery attempt 与 UNKNOWN_DELIVERY 语义见 `docs/notification_outbox.md`。
 
 ### 2.2 `tasks` 表已实现
 
@@ -393,7 +389,7 @@ runtime schema v3 已新增：
 
 因此，这一阶段不应再描述为“纯计划中”，更准确的说法是：
 
-`SQLite 运行态持久化第一版已实现，运行态运营闭环增强第一版也已完成，当前已进入 schema v3 自动规则评估记录阶段，正在从可运行闭环向更完整运营后台扩展。`
+`SQLite 运行态持久化和运营闭环已经落地，当前 schema 为 v11；除自动规则评估外，已经包含平台状态快照、任务旧价和 ShadowBot 多商品 COMMIT 批次账本，仍在向更完整的运营与运维闭环扩展。`
 
 ---
 

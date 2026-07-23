@@ -8,6 +8,7 @@ import re
 import sqlite3
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from html import escape
 from hmac import compare_digest
 from http.cookies import SimpleCookie
@@ -15,6 +16,7 @@ from pathlib import Path
 from secrets import token_urlsafe
 from socketserver import ThreadingMixIn
 from threading import Lock
+from types import SimpleNamespace
 from urllib.parse import parse_qs, unquote, urlencode, urlparse
 from uuid import uuid4
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
@@ -22,7 +24,8 @@ from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 from app.enums import NotificationSendStatus, ReviewTaskStatus, TaskActionType, TaskStatus
 from app.exceptions import MobileReviewErrorCode, MobileReviewTransactionError, TableValidationError, ValidationError
 from app.field_labels import FIELD_LABELS, TABLE_LABELS
-from app.models import NotificationLog
+from app.models import ListingStatus, NotificationLog
+from app.listing_status_policy import has_current_platform_stock
 from app.repositories.sqlite_connection import SQLiteConnectionError, SQLiteConnectionFactory
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.mock_platform_repository import DEFAULT_MOCK_PLATFORM_DB, MockPlatformRepository
@@ -42,6 +45,7 @@ from app.services.workflow import (
     ValidationSummary,
     WorkflowInputs,
     generate_tasks_from_sources,
+    generate_tasks_from_selected_rule,
     get_runtime_notification_log,
     get_runtime_review_task,
     get_runtime_task,
@@ -53,17 +57,16 @@ from app.services.workflow import (
     list_runtime_tasks,
     list_manual_intervention_tasks,
     preview_tasks_from_sources,
+    preview_tasks_from_selected_rule,
+    persist_task_generation_summary,
     resolve_mobile_review,
     resolve_runtime_review_task,
     simulate_execution_from_tasks,
     source_task_status_for_review_resolution,
-    validate_sources,
 )
 from app.services.runtime import DEFAULT_RUNTIME_DB, NotificationLogService, NotificationSenderFactory
 from app.services.shadowbot_executor import ShadowBotExecutor, build_shadowbot_task_runner_from_environment
-from app.services.shadowbot_price_batch import PriceBatchContractError
-from app.services.shadowbot_price_batch_orchestrator import ShadowBotPriceBatchOrchestrator
-from app.services.business_rule_evaluation import BusinessRuleRunner
+from app.web_styles import common_styles
 from app.services.product_inventory_input import (
     FOLLOW_GRADE_VALUE,
     GRADE_STEM_LENGTH_MAP,
@@ -155,6 +158,7 @@ DEFAULT_COLD_STORAGE_STATUS = ROOT / "data" / "samples" / "cold_storage_status.x
 DEFAULT_MANUAL_TASKS = ROOT / "data" / "samples" / "web_generated_tasks.xlsx"
 BUSINESS_INPUT_TABS = {
     "inventory": "录入库存",
+    "listing_status": "上架状态",
     "price_rules": "价格规则管理",
     "listing_rules": "上下架规则管理",
     "capacity_plans": "包装产能计划",
@@ -210,8 +214,8 @@ CSRF_PROTECTED_WRITE_PATHS = frozenset({
     "/runtime/logout",
     "/reviews",
     "/execution-logs",
-    "/price-batches",
     "/business-inputs",
+    "/task-generator",
     "/system/test-feishu-notification",
 })
 LEGACY_WEB_ROUTES = frozenset({"/", "/tables", "/execution", "/manual-intervention"})
@@ -328,14 +332,14 @@ DISPLAY_ENUM_LABELS = {
 UI_TEXT = {
     "site_title": "PRA \u8fd0\u884c\u6001\u8fd0\u8425\u540e\u53f0",
     "dashboard_title": "PRA 业务数据与任务生成",
-    "dashboard_lede": "在这里维护业务表格、校验输入，并生成后续需要处理的任务。",
+    "dashboard_lede": "选择业务规则，预览并生成后续需要处理的任务。预览时会自动完成数据校验。",
     "dashboard_tab": "\u9996\u9875\u603b\u89c8",
     "tasks_tab": "\u4efb\u52a1\u4e2d\u5fc3",
     "reviews_tab": "\u590d\u6838\u4e2d\u5fc3",
     "notifications_tab": "\u901a\u77e5\u4e2d\u5fc3",
     "execution_logs_tab": "执行记录",
-    "price_batches_tab": "改价批次",
     "business_inputs_tab": "业务数据",
+    "task_generator_tab": "生成待处理任务",
     "system_tab": "系统维护",
     "tables_tab": "Excel \u8868\u683c\u7ba1\u7406",
     "execution_tab": "\u6267\u884c\u56de\u5199",
@@ -343,13 +347,21 @@ UI_TEXT = {
     "runtime_tab": "SQLite \u8fd0\u884c\u6001",
     "ops_dashboard_title": "PRA \u8fd0\u884c\u6001\u8fd0\u8425\u540e\u53f0",
     "ops_dashboard_lede": "首页总览用于查看今天是否有待处理复核、即将超时事项、通知失败和待执行任务。",
-    "legacy_root_notice": "\u65e7 /\u9875\u9762\u4ecd\u4fdd\u7559\u4efb\u52a1\u751f\u6210\u6d41\u7a0b\uff0c\u8fd0\u884c\u6001\u5bfc\u822a\u5df2\u8fc1\u79fb\u5230 /dashboard\u3002",
+    "legacy_root_notice": "原 / 页面中的任务生成流程已迁移到 /task-generator。",
     "legacy_tables_notice": "\u8be5\u9875\u5df2\u5f52\u5165\u4e1a\u52a1\u8f93\u5165\uff0c\u8fd0\u884c\u6001\u6570\u636e\u8bf7\u4ece\u65b0\u5bfc\u822a\u8fdb\u5165\u3002",
     "legacy_execution_notice": "\u8be5\u9875\u7528\u4e8e mock \u6267\u884c/\u65e7\u56de\u5199\u517c\u5bb9\uff0c\u6b63\u5f0f\u67e5\u770b\u8bf7\u8fdb\u5165\u6267\u884c\u65e5\u5fd7\u3002",
     "legacy_manual_notice": "\u65e7 Excel \u4eba\u5de5\u4ecb\u5165\u53ea\u8bfb\u517c\u5bb9\uff0c\u6b63\u5f0f\u590d\u6838\u8bf7\u8fdb\u5165\u590d\u6838\u4e2d\u5fc3\u3002",
     "legacy_runtime_notice": "\u8fd0\u884c\u6001\u80fd\u529b\u5df2\u62c6\u5206\u4e3a\u4efb\u52a1\u4e2d\u5fc3\u3001\u590d\u6838\u4e2d\u5fc3\u548c\u901a\u77e5\u4e2d\u5fc3\uff0c\u8fd9\u91cc\u4fdd\u7559\u805a\u5408\u517c\u5bb9\u5165\u53e3\u3002",
     "legacy_web_disabled": "\u65e7\u7248 Web \u8def\u7531\u5f53\u524d\u5df2\u5b89\u5168\u5173\u95ed\u3002",
     "task_panel_title": "\u4efb\u52a1\u751f\u6210",
+    "generation_mode": "生成模式",
+    "generation_mode_batch": "批量生成（全部适用规则）",
+    "generation_mode_single_rule": "单规则生成",
+    "selected_rule": "选择规则",
+    "selected_rule_placeholder": "请选择一条价格规则或上下架规则",
+    "single_rule_hint": "单规则模式只使用所选规则；一条规则可能按匹配商品生成多条待处理任务。",
+    "single_rule_validated": "所选规则校验通过，可继续预览任务。",
+    "runtime_tasks_created": "已生成 {total} 条任务；其中 {inserted} 条新任务已进入任务中心，{deduplicated} 条因重复未再次入库。",
     "ops_tasks_title": "\u4efb\u52a1\u4e2d\u5fc3",
     "ops_reviews_title": "\u590d\u6838\u4e2d\u5fc3",
     "ops_notifications_title": "\u901a\u77e5\u4e2d\u5fc3",
@@ -446,13 +458,17 @@ UI_TEXT = {
     "listing_rules_path": "\u4e0a\u4e0b\u67b6\u89c4\u5219\u8def\u5f84",
     "output_path": "\u4efb\u52a1\u8f93\u51fa\u8def\u5f84",
     "platform_name": "\u5e73\u53f0\u540d\u79f0",
+    "platform_placeholder": "请选择实际执行平台",
+    "task_group_id": "规则任务组 ID",
+    "task_group_required_by": "任务组截止时间",
+    "task_group_hint": "同一次单规则预览和确认共享组 ID、截止时间与组运行状态；商品任务 ID 仍保持唯一。",
     "inventory_strategy": "\u5e93\u5b58\u7b56\u7565",
     "inventory_strategy_conservative": "\u4fdd\u5b88\u7b56\u7565\uff08\u4f18\u5148\u63a7\u5236\u8d85\u552e\u98ce\u9669\uff09",
     "inventory_strategy_balanced": "\u5e73\u8861\u7b56\u7565\uff08\u5728\u98ce\u9669\u53ef\u63a7\u524d\u63d0\u4e0b\u63d0\u9ad8\u53ef\u552e\u91cf\uff09",
     "use_mock_ai": "\u4f7f\u7528 Mock AI \u5b9a\u4ef7\u5efa\u8bae",
     "validate_button": "\u5148\u6821\u9a8c\u6570\u636e",
     "preview_button": "\u9884\u89c8\u4efb\u52a1",
-    "confirm_button": "\u786e\u8ba4\u5bfc\u51fa\u4efb\u52a1",
+    "confirm_button": "确认生成并进入任务中心",
     "data_summary": "\u6570\u636e\u6458\u8981",
     "task_result": "\u4efb\u52a1\u7ed3\u679c",
     "output_file": "\u8f93\u51fa\u6587\u4ef6",
@@ -640,14 +656,14 @@ def _application(environ, start_response):
             status, body, headers = result
             return _respond(start_response, status, "text/html; charset=utf-8", body, headers=headers)
         return _respond(start_response, "200 OK", "text/html; charset=utf-8", result)
-    if path == "/price-batches":
-        result = _handle_price_batches(method, environ)
+    if path == "/business-inputs":
+        result = _handle_business_inputs_page(method, environ)
         if isinstance(result, tuple):
             status, body, headers = result
             return _respond(start_response, status, "text/html; charset=utf-8", body, headers=headers)
         return _respond(start_response, "200 OK", "text/html; charset=utf-8", result)
-    if path == "/business-inputs":
-        result = _handle_business_inputs_page(method, environ)
+    if path == "/task-generator":
+        result = _handle_task_generator_page(method, environ)
         if isinstance(result, tuple):
             status, body, headers = result
             return _respond(start_response, status, "text/html; charset=utf-8", body, headers=headers)
@@ -990,7 +1006,31 @@ def _is_exact_loopback_host(value: str) -> bool:
     return address.compressed in {"127.0.0.1", "::1"}
 
 
-def _handle_dashboard(method: str, environ) -> str:
+def _handle_task_generator_page(method: str, environ) -> str | tuple[str, str, list[tuple[str, str]]]:
+    if method not in {"GET", "POST"}:
+        return "405 Method Not Allowed", "Method Not Allowed.", []
+
+    runtime_db = _runtime_db_for_request(environ)
+    session_user = _get_runtime_session_user(environ)
+    if session_user is None:
+        return _render_login_required_page(
+            title=UI_TEXT["task_generator_tab"],
+            description=UI_TEXT["dashboard_lede"],
+            active_path="/task-generator",
+            runtime_db=runtime_db,
+            next_path="/task-generator",
+            message=UI_TEXT["ops_login_required"],
+        )
+    return _handle_dashboard(method, environ, session_user=session_user, runtime_db=Path(runtime_db))
+
+
+def _handle_dashboard(
+    method: str,
+    environ,
+    *,
+    session_user: str | None = None,
+    runtime_db: Path | None = None,
+) -> str:
     params = default_dashboard_state()
     message = ""
     level = "info"
@@ -1005,11 +1045,14 @@ def _handle_dashboard(method: str, environ) -> str:
             "price_rules": _first(parsed, "price_rules", params["price_rules"]),
             "listing_rules": _first(parsed, "listing_rules", params["listing_rules"]),
             "output": _first(parsed, "output", params["output"]),
-            "platform": _first(parsed, "platform", params["platform"]),
             "inventory_strategy": _first(parsed, "inventory_strategy", params["inventory_strategy"]),
+            "generation_mode": _first(parsed, "generation_mode", params["generation_mode"]),
+            "selected_rule": _first(parsed, "selected_rule", params["selected_rule"]),
+            "task_group_id": _first(parsed, "task_group_id", params["task_group_id"]),
+            "required_by": _first(parsed, "required_by", params["required_by"]),
             "use_mock_ai": "use_mock_ai" in parsed,
         }
-        action = _first(parsed, "action", "validate")
+        action = _first(parsed, "action", "preview")
 
         try:
             products_path = _resolve_request_or_trusted_default(
@@ -1024,38 +1067,98 @@ def _handle_dashboard(method: str, environ) -> str:
             output_path = _resolve_request_or_trusted_default(
                 params["output"], DEFAULT_OUTPUT, purpose="task_output", allow_create=True
             )
+            resolved_platform = (
+                ""
+                if params["generation_mode"] == "single_rule"
+                else _resolve_batch_rule_platform(price_rules_path, listing_rules_path)
+            )
             workflow_inputs = WorkflowInputs(
                 products_path=products_path,
                 price_rules_path=price_rules_path,
                 listing_rules_path=listing_rules_path,
                 output_path=output_path,
-                platform_name=str(params["platform"]),
+                platform_name=resolved_platform,
                 inventory_strategy=str(params["inventory_strategy"]),
                 use_mock_ai=bool(params["use_mock_ai"]),
+                runtime_db_path=runtime_db or Path(DEFAULT_RUNTIME_DB),
+                platform_names=tuple(_load_task_generator_platform_options(runtime_db)),
             )
-            if action == "validate":
-                validation_summary = validate_sources(workflow_inputs)
-                message = UI_TEXT["validated"]
-                level = "success"
-            elif action == "preview":
-                generation_summary = preview_tasks_from_sources(workflow_inputs)
-                validation_summary = generation_summary.validation
-                message = UI_TEXT["previewed"].format(count=len(generation_summary.tasks))
-                level = "success"
-                preview_ready = True
+            if params["generation_mode"] == "single_rule":
+                rule_type, rule_id = _parse_selected_rule(str(params["selected_rule"]))
+                task_group_id = str(params["task_group_id"] or "").strip() or f"RULE-GROUP-{uuid4().hex[:12]}"
+                required_by = _parse_task_group_required_by(str(params["required_by"] or ""))
+                params["task_group_id"] = task_group_id
+                params["required_by"] = required_by.strftime("%Y-%m-%dT%H:%M")
+                if action == "preview":
+                    generation_summary = preview_tasks_from_selected_rule(
+                        workflow_inputs,
+                        rule_type=rule_type,
+                        rule_id=rule_id,
+                        task_group_id=task_group_id,
+                        required_by=required_by,
+                    )
+                    validation_summary = generation_summary.validation
+                    message = UI_TEXT["previewed"].format(count=len(generation_summary.tasks))
+                    level = "success"
+                    preview_ready = True
+                elif action == "confirm_generate":
+                    generation_summary = generate_tasks_from_selected_rule(
+                        workflow_inputs,
+                        rule_type=rule_type,
+                        rule_id=rule_id,
+                        task_group_id=task_group_id,
+                        required_by=required_by,
+                    )
+                    validation_summary = generation_summary.validation
+                    runtime_summary = persist_task_generation_summary(
+                        generation_summary,
+                        db_path=runtime_db or Path(DEFAULT_RUNTIME_DB),
+                    )
+                    message = UI_TEXT["runtime_tasks_created"].format(
+                        total=len(generation_summary.tasks),
+                        path=generation_summary.output_path,
+                        inserted=runtime_summary.inserted_tasks_count,
+                        deduplicated=len(generation_summary.tasks) - runtime_summary.inserted_tasks_count,
+                    )
+                    level = "success"
+                else:
+                    raise ValidationError("未知任务生成操作，请先预览任务")
             else:
-                generation_summary = generate_tasks_from_sources(workflow_inputs)
-                validation_summary = generation_summary.validation
-                message = UI_TEXT["generated"].format(
-                    count=len(generation_summary.tasks),
-                    path=generation_summary.output_path,
-                )
-                level = "success"
+                if action == "preview":
+                    generation_summary = preview_tasks_from_sources(workflow_inputs)
+                    validation_summary = generation_summary.validation
+                    message = UI_TEXT["previewed"].format(count=len(generation_summary.tasks))
+                    level = "success"
+                    preview_ready = True
+                elif action == "confirm_generate":
+                    generation_summary = generate_tasks_from_sources(workflow_inputs)
+                    validation_summary = generation_summary.validation
+                    runtime_summary = persist_task_generation_summary(
+                        generation_summary,
+                        db_path=runtime_db or Path(DEFAULT_RUNTIME_DB),
+                    )
+                    message = UI_TEXT["runtime_tasks_created"].format(
+                        total=len(generation_summary.tasks),
+                        path=generation_summary.output_path,
+                        inserted=runtime_summary.inserted_tasks_count,
+                        deduplicated=len(generation_summary.tasks) - runtime_summary.inserted_tasks_count,
+                    )
+                    level = "success"
+                else:
+                    raise ValidationError("未知任务生成操作，请先预览任务")
         except PathPolicyError as exc:
             _redact_rejected_path_values(params, "products", "price_rules", "listing_rules", "output")
             message = exc.public_message
             level = "error"
         except (ValidationError, FileNotFoundError) as exc:
+            message = str(exc)
+            level = "error"
+
+    rule_options: list[tuple[str, str]] = []
+    try:
+        rule_options = _load_task_generator_rule_options(params)
+    except (PathPolicyError, ValidationError, FileNotFoundError) as exc:
+        if not message:
             message = str(exc)
             level = "error"
 
@@ -1066,7 +1169,102 @@ def _handle_dashboard(method: str, environ) -> str:
         validation_summary=validation_summary,
         generation_summary=generation_summary,
         preview_ready=preview_ready,
+        session_user=session_user,
+        rule_options=rule_options,
     )
+
+
+def _parse_selected_rule(value: str) -> tuple[str, str]:
+    rule_type, separator, rule_id = value.partition(":")
+    if separator != ":" or rule_type not in {"price", "listing"} or not rule_id.strip():
+        raise ValidationError(UI_TEXT["selected_rule_placeholder"])
+    return rule_type, rule_id.strip()
+
+
+def _resolve_batch_rule_platform(price_rules_path: Path, listing_rules_path: Path) -> str:
+    platforms: set[str] = set()
+    wildcard_found = False
+    for table_name, path in (("price_rules", price_rules_path), ("listing_rules", listing_rules_path)):
+        for row in load_table_records(table_name, path):
+            active = str(row.get("active") or "").strip().lower() in {"true", "1", "yes", "是"}
+            if not active:
+                continue
+            platform = str(row.get("platform_filter") or "").strip()
+            if not platform or platform == "*":
+                wildcard_found = True
+            else:
+                platforms.add(platform)
+    if wildcard_found:
+        raise ValidationError("批量生成要求所有启用规则指定具体平台；请先补全规则平台")
+    if len(platforms) != 1:
+        raise ValidationError("批量生成仅支持同一平台的规则；多平台请使用单规则生成")
+    return next(iter(platforms))
+
+
+def _parse_task_group_required_by(value: str) -> datetime:
+    text = str(value or "").strip()
+    if not text:
+        return datetime.now() + timedelta(minutes=30)
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValidationError("任务组截止时间格式无效") from exc
+    comparable = parsed.replace(tzinfo=None) if parsed.tzinfo is not None else parsed
+    if comparable <= datetime.now():
+        raise ValidationError("任务组截止时间必须晚于当前时间")
+    return parsed
+
+
+def _load_task_generator_rule_options(params: dict[str, str | bool]) -> list[tuple[str, str]]:
+    sources = (
+        (
+            "price",
+            "价格规则",
+            "price_rules",
+            _resolve_request_or_trusted_default(
+                params["price_rules"], DEFAULT_PRICE_RULES, purpose="price_rules", allow_create=False
+            ),
+        ),
+        (
+            "listing",
+            "上下架规则",
+            "listing_rules",
+            _resolve_request_or_trusted_default(
+                params["listing_rules"], DEFAULT_LISTING_RULES, purpose="listing_rules", allow_create=False
+            ),
+        ),
+    )
+    options: list[tuple[str, str]] = []
+    for rule_type, type_label, table_name, path in sources:
+        for row in load_table_records(table_name, path):
+            rule_id = str(row.get("rule_id") or "").strip()
+            if not rule_id:
+                continue
+            rule_name = str(row.get("rule_name") or rule_id).strip()
+            platform = str(row.get("platform_filter") or "").strip() or "未指定平台"
+            active = str(row.get("active") or "").strip().lower() in {"true", "1", "yes", "是"}
+            suffix = "" if active else "（停用）"
+            options.append(
+                (f"{rule_type}:{rule_id}", f"{type_label}｜{rule_name}（{rule_id}）｜平台：{platform}{suffix}")
+            )
+    return options
+
+
+def _load_task_generator_platform_options(runtime_db: Path | None = None) -> list[str]:
+    options = list(PLATFORM_OPTIONS)
+    # This is an application-owned resource, not a user-supplied path.
+    for row in load_table_records("platform_mappings", DEFAULT_PLATFORM_MAPPINGS):
+        platform_name = str(row.get("platform_name") or "").strip()
+        status = str(row.get("mapping_status") or "active").strip().lower()
+        if platform_name and status == "active" and platform_name not in options:
+            options.append(platform_name)
+    if runtime_db is not None:
+        repository = SQLiteRuntimeRepository(runtime_db)
+        repository.init_schema()
+        for listing_status in repository.list_listing_statuses():
+            if listing_status.platform_name not in options:
+                options.append(listing_status.platform_name)
+    return options
 
 
 def _handle_tables(method: str, environ) -> str:
@@ -1341,96 +1539,6 @@ def _parse_mobile_review_path(path: str) -> tuple[str, bool] | None:
     if len(parts) == 2 and parts[1] == "resolve":
         return (unquote(parts[0]), True)
     return None
-
-
-def _handle_price_batches(method: str, environ) -> str | tuple[str, str, list[tuple[str, str]]]:
-    runtime_db = _runtime_db_for_request(environ)
-    session_user = _get_runtime_session_user(environ)
-    if session_user is None:
-        return _redirect_response(
-            _append_query_to_path(
-                "/runtime/login",
-                {"runtime_db": runtime_db, "next": "/price-batches"},
-            )
-        )
-    query = _parse_query(environ)
-    batch_id = _first(query, "batch_id", "").strip()
-    message = _first(query, "message", "")
-    level = _first(query, "level", "info")
-    repository = SQLiteRuntimeRepository(Path(runtime_db))
-
-    if method == "POST":
-        parsed = _parse_body(environ)
-        batch_id = _first(parsed, "batch_id", "").strip()
-        action = _first(parsed, "action", "").strip().upper()
-        reason = _first(parsed, "reason", "").strip()[:500]
-        allowed = {"PAUSE", "RESUME", "CANCEL_PENDING"}
-        if action not in allowed:
-            record_security_event(
-                "PRICE_BATCH_CONTROL_REJECTED",
-                route="/price-batches",
-                outcome="rejected",
-                reason_code="ACTION_NOT_ALLOWED",
-                subject=session_user,
-            )
-            return "422 Unprocessable Entity", "不允许的批次操作。", []
-        try:
-            orchestrator = ShadowBotPriceBatchOrchestrator(repository)
-            if action == "PAUSE":
-                applied = orchestrator.pause(batch_id, actor=session_user, reason=reason)
-            elif action == "RESUME":
-                applied = orchestrator.resume(batch_id, actor=session_user, reason=reason)
-            else:
-                applied = orchestrator.cancel_pending(batch_id, actor=session_user, reason=reason)
-            record_security_event(
-                "PRICE_BATCH_CONTROL",
-                route="/price-batches",
-                outcome="applied" if applied else "no_change",
-                reason_code=action,
-                subject=session_user,
-            )
-            message = "批次控制操作已记录。" if applied else "批次状态未发生变化，操作记录已保留。"
-            level = "success" if applied else "info"
-        except (PriceBatchContractError, ValidationError) as exc:
-            record_security_event(
-                "PRICE_BATCH_CONTROL_REJECTED",
-                route="/price-batches",
-                outcome="rejected",
-                reason_code=action,
-                subject=session_user,
-            )
-            message = str(exc)
-            level = "error"
-        return _redirect_response(
-            _append_query_to_path(
-                "/price-batches",
-                {
-                    "runtime_db": runtime_db,
-                    "batch_id": batch_id,
-                    "message": message,
-                    "level": level,
-                },
-            )
-        )
-
-    batches = repository.list_shadowbot_batches(limit=100)
-    selected_batch = repository.get_shadowbot_batch(batch_id) if batch_id else None
-    selected_items = repository.list_shadowbot_batch_items(batch_id) if selected_batch else []
-    control_events = (
-        repository.list_shadowbot_batch_control_events(batch_id, limit=100)
-        if selected_batch
-        else []
-    )
-    return render_price_batches_page(
-        runtime_db=runtime_db,
-        session_user=session_user,
-        batches=batches,
-        selected_batch=selected_batch,
-        selected_items=selected_items,
-        control_events=control_events,
-        message=message,
-        message_level=level,
-    )
 
 
 def _handle_runtime(method: str, environ) -> str | tuple[str, str, list[tuple[str, str]]]:
@@ -1934,6 +2042,7 @@ def _handle_tasks_page(environ) -> str:
         )
     )
     paged_tasks, pagination = _paginate_items(tasks, page)
+    task_group_statuses = _build_task_group_statuses(tasks)
     selected_task = None
     task_history = []
     related_reviews = []
@@ -1985,6 +2094,7 @@ def _handle_tasks_page(environ) -> str:
         related_reviews=related_reviews,
         related_notifications=related_notifications,
         execution_logs=execution_logs,
+        task_group_statuses=task_group_statuses,
     )
 
 
@@ -2454,6 +2564,42 @@ def _handle_business_inputs_page(method: str, environ) -> str | tuple[str, str, 
                 rows = load_platform_mapping_rows(path)
                 result = apply_platform_input(rows, {key: _first(parsed, key, "") for key in parsed})
                 persist_platform_mapping_rows(path, result.rows)
+            elif action == "save_listing_status":
+                active_input_tab = "listing_status"
+                # Debug-only POST endpoint.  The business-inputs page does not
+                # render a form for this action; normal updates come from the
+                # validated ShadowBot READ_ONLY result importer.
+                platform_name = _first(parsed, "platform_name", "").strip()
+                variety = _first(parsed, "variety", "").strip()
+                grade = _first(parsed, "grade", "").strip()
+                if not platform_name or not variety or not grade:
+                    raise ValidationError("平台、品种和等级不能为空")
+                try:
+                    current_price = Decimal(_first(parsed, "current_price", ""))
+                    sold_qty = int(_first(parsed, "sold_qty", "0"))
+                except (InvalidOperation, ValueError) as exc:
+                    raise ValidationError("价格必须为有效数字，已销售数必须为非负整数") from exc
+                if current_price < 0 or sold_qty < 0:
+                    raise ValidationError("价格和已销售数不能为负数")
+                repository = SQLiteRuntimeRepository(Path(runtime_db))
+                repository.init_schema()
+                existing = repository.get_listing_status(platform_name, variety, grade)
+                repository.upsert_listing_status(
+                    ListingStatus(
+                        listing_status_id=existing.listing_status_id if existing else f"LISTING-{uuid4().hex[:16]}",
+                        platform_name=platform_name,
+                        internal_sku="",
+                        variety=variety,
+                        current_price=current_price,
+                        grade=grade,
+                        platform_stock_qty=100,
+                        sold_qty=sold_qty,
+                        online_status=_first(parsed, "online_status", "online"),
+                        source="debug_web_request",
+                        updated_at=datetime.now(timezone.utc),
+                    )
+                )
+                result = SimpleNamespace(message="调试用上架状态已保存到 SQLite。", level="success")
             else:
                 raise ProductInventoryInputError("未知操作，请重新提交。")
             return _redirect_response(
@@ -2522,6 +2668,11 @@ def _handle_business_inputs_page(method: str, environ) -> str | tuple[str, str, 
         message = message or str(exc)
         level = "error"
     platform_rows, platform_warning = _load_platform_rows_for_business_inputs(platform_mappings_path)
+    repository = SQLiteRuntimeRepository(Path(runtime_db))
+    repository.init_schema()
+    listing_status_rows = [
+        row for row in repository.list_listing_statuses() if has_current_platform_stock(row)
+    ]
     if platform_warning:
         message = message or platform_warning
         level = "info" if level != "error" else level
@@ -2541,6 +2692,7 @@ def _handle_business_inputs_page(method: str, environ) -> str | tuple[str, str, 
         capacity_plan_rows=capacity_plan_rows,
         cold_storage_rows=cold_storage_rows,
         platform_options=platform_options_from_rows(platform_rows),
+        listing_status_rows=listing_status_rows,
         active_input_tab=active_input_tab,
         message=message,
         message_level=level,
@@ -2637,8 +2789,11 @@ def default_dashboard_state() -> dict[str, str | bool]:
         "price_rules": str(DEFAULT_PRICE_RULES),
         "listing_rules": str(DEFAULT_LISTING_RULES),
         "output": str(DEFAULT_OUTPUT),
-        "platform": "default_platform",
         "inventory_strategy": "conservative_v1",
+        "generation_mode": "single_rule",
+        "selected_rule": "",
+        "task_group_id": "",
+        "required_by": (datetime.now() + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M"),
         "use_mock_ai": True,
     }
 
@@ -2691,6 +2846,8 @@ def render_dashboard_page(
     validation_summary: ValidationSummary | None,
     generation_summary: TaskGenerationSummary | None,
     preview_ready: bool,
+    session_user: str | None = None,
+    rule_options: list[tuple[str, str]] | None = None,
 ) -> str:
     summary_html = ""
     if validation_summary is not None:
@@ -2708,8 +2865,6 @@ def render_dashboard_page(
     tasks_html = ""
     if generation_summary is not None:
         confirm_html = ""
-        output_hint_label = UI_TEXT["output_file"] if generation_summary.output_written else UI_TEXT["planned_output_file"]
-        output_hint_value = generation_summary.output_path if generation_summary.output_written else params["output"]
         rows = []
         for task in generation_summary.tasks[:12]:
             rows.append(
@@ -2718,11 +2873,14 @@ def render_dashboard_page(
                 f"<td>{escape(task.action_type.value)}</td>"
                 f"<td>{escape(task.task_status.value)}</td>"
                 f"<td>{escape(task.platform_name)}</td>"
+                f"<td>{escape(str(task.expected_old_price) if task.expected_old_price is not None else '-')}</td>"
                 f"<td>{escape(str(task.target_price) if task.target_price is not None else '-')}</td>"
                 f"<td>{escape(task.pricing_source.value if task.pricing_source else '-')}</td>"
+                f"<td>{escape(format_display_datetime(task.required_by))}</td>"
+                f"<td>{escape(_task_price_calculation_summary(task))}</td>"
                 "</tr>"
             )
-        rows_html = "".join(rows) or f"<tr><td colspan='6'>{escape(UI_TEXT['no_tasks'])}</td></tr>"
+        rows_html = "".join(rows) or f"<tr><td colspan='9'>{escape(UI_TEXT['no_tasks'])}</td></tr>"
         task_counts = "".join(
             f"<div class='metric'><span class='label'>{escape(name)}</span><strong>{count}</strong></div>"
             for name, count in generation_summary.task_counts.items()
@@ -2733,12 +2891,11 @@ def render_dashboard_page(
           <div class="confirm-box">
             <p>{escape(UI_TEXT["preview_ready"])}</p>
             <form method="post" class="actions">
-              <input type="hidden" name="products" value="{escape(str(params["products"]))}">
-              <input type="hidden" name="price_rules" value="{escape(str(params["price_rules"]))}">
-              <input type="hidden" name="listing_rules" value="{escape(str(params["listing_rules"]))}">
-              <input type="hidden" name="output" value="{escape(str(params["output"]))}">
-              <input type="hidden" name="platform" value="{escape(str(params["platform"]))}">
               <input type="hidden" name="inventory_strategy" value="{escape(str(params["inventory_strategy"]))}">
+              <input type="hidden" name="generation_mode" value="{escape(str(params.get("generation_mode", "single_rule")))}">
+              <input type="hidden" name="selected_rule" value="{escape(str(params.get("selected_rule", "")))}">
+              <input type="hidden" name="task_group_id" value="{escape(str(params.get("task_group_id", "")))}">
+              <input type="hidden" name="required_by" value="{escape(str(params.get("required_by", "")))}">
               {mock_ai_hidden}
               <button class="primary" type="submit" name="action" value="confirm_generate">{escape(UI_TEXT["confirm_button"])}</button>
             </form>
@@ -2748,7 +2905,6 @@ def render_dashboard_page(
         <section class="panel">
           <h2>{escape(UI_TEXT["task_result"])}</h2>
           <div class="metrics">{task_counts}</div>
-          <p class="subtle">{escape(output_hint_label)}: {escape(str(output_hint_value))}</p>
           {confirm_html}
           <div class="table-wrap">
             <table>
@@ -2758,8 +2914,11 @@ def render_dashboard_page(
                   <th>action</th>
                   <th>status</th>
                   <th>platform</th>
+                  <th>expected_old_price</th>
                   <th>target_price</th>
                   <th>pricing_source</th>
+                  <th>required_by</th>
+                  <th>calculation</th>
                 </tr>
               </thead>
               <tbody>{rows_html}</tbody>
@@ -2780,6 +2939,22 @@ def render_dashboard_page(
         )
         for value, label in inventory_strategy_options
     )
+    generation_mode = str(params.get("generation_mode", "single_rule"))
+    generation_mode_html = "".join(
+        f"<option value='{value}'{' selected' if generation_mode == value else ''}>{escape(label)}</option>"
+        for value, label in (
+            ("batch", UI_TEXT["generation_mode_batch"]),
+            ("single_rule", UI_TEXT["generation_mode_single_rule"]),
+        )
+    )
+    selected_rule = str(params.get("selected_rule", ""))
+    rule_options_html = (
+        f"<option value=''>{escape(UI_TEXT['selected_rule_placeholder'])}</option>"
+        + "".join(
+            f"<option value='{escape(value)}'{' selected' if selected_rule == value else ''}>{escape(label)}</option>"
+            for value, label in (rule_options or [])
+        )
+    )
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -2791,7 +2966,8 @@ def render_dashboard_page(
 <body>
   <main class="shell">
     {_hero(UI_TEXT["dashboard_title"], UI_TEXT["dashboard_lede"])}
-    {navigation("/")}
+    {navigation("/task-generator")}
+    {_session_toolbar("", session_user, "/task-generator")}
     {_compat_notice(UI_TEXT["legacy_root_notice"])}
     {_banner(message, message_level)}
     <div class="layout">
@@ -2799,24 +2975,18 @@ def render_dashboard_page(
         <h2>{escape(UI_TEXT["task_panel_title"])}</h2>
         <form method="post" class="grid">
           <div class="field">
-            <label for="products">{escape(UI_TEXT["products_path"])}</label>
-            <input id="products" name="products" type="text" value="{escape(str(params["products"]))}">
+            <label for="generation_mode">{escape(UI_TEXT["generation_mode"])}</label>
+            <select id="generation_mode" name="generation_mode">{generation_mode_html}</select>
           </div>
           <div class="field">
-            <label for="price_rules">{escape(UI_TEXT["price_rules_path"])}</label>
-            <input id="price_rules" name="price_rules" type="text" value="{escape(str(params["price_rules"]))}">
+            <label for="selected_rule">{escape(UI_TEXT["selected_rule"])}</label>
+            <select id="selected_rule" name="selected_rule">{rule_options_html}</select>
+            <p class="subtle">{escape(UI_TEXT["single_rule_hint"])}</p>
           </div>
           <div class="field">
-            <label for="listing_rules">{escape(UI_TEXT["listing_rules_path"])}</label>
-            <input id="listing_rules" name="listing_rules" type="text" value="{escape(str(params["listing_rules"]))}">
-          </div>
-          <div class="field">
-            <label for="output">{escape(UI_TEXT["output_path"])}</label>
-            <input id="output" name="output" type="text" value="{escape(str(params["output"]))}">
-          </div>
-          <div class="field">
-            <label for="platform">{escape(UI_TEXT["platform_name"])}</label>
-            <input id="platform" name="platform" type="text" value="{escape(str(params["platform"]))}">
+            <label for="required_by">{escape(UI_TEXT["task_group_required_by"])}</label>
+            <input id="required_by" name="required_by" type="datetime-local" value="{escape(str(params.get("required_by", "")))}">
+            <p class="subtle">{escape(UI_TEXT["task_group_hint"])}</p>
           </div>
           <div class="field">
             <label for="inventory_strategy">{escape(UI_TEXT["inventory_strategy"])}</label>
@@ -2827,20 +2997,9 @@ def render_dashboard_page(
             {escape(UI_TEXT["use_mock_ai"])}
           </label>
           <div class="actions">
-            <button class="secondary" type="submit" name="action" value="validate">{escape(UI_TEXT["validate_button"])}</button>
             <button class="primary" type="submit" name="action" value="preview">{escape(UI_TEXT["preview_button"])}</button>
           </div>
         </form>
-      </section>
-
-      <section class="panel">
-        <h2>{escape(UI_TEXT["resources_title"])}</h2>
-        <div class="aside-list">
-          <div>{escape(UI_TEXT["products_path"])}<code>{escape(str(DEFAULT_PRODUCTS))}</code></div>
-          <div>{escape(UI_TEXT["price_rules_path"])}<code>{escape(str(DEFAULT_PRICE_RULES))}</code></div>
-          <div>{escape(UI_TEXT["listing_rules_path"])}<code>{escape(str(DEFAULT_LISTING_RULES))}</code></div>
-          <div>{escape(UI_TEXT["output_path"])}<code>{escape(str(DEFAULT_OUTPUT))}</code></div>
-        </div>
       </section>
     </div>
     {summary_html}
@@ -3264,281 +3423,6 @@ def render_runtime_page(
     session_user: str | None,
     selected_review,
     selected_task,
-    task_history,
-) -> str:
-    if session_user is None:
-        login_panel = f"""
-    <section class="panel">
-      <h2>{escape(UI_TEXT["runtime_login_title"])}</h2>
-      <form method="post" action="/runtime/login" class="grid two-col">
-        <input type="hidden" name="runtime_db" value="{escape(params["runtime_db"])}">
-        <div class="field">
-          <label for="runtime_username">{escape(UI_TEXT["runtime_login_user"])}</label>
-          <input id="runtime_username" name="username" type="text" value="{escape(_runtime_admin_user())}">
-        </div>
-        <div class="field">
-          <label for="runtime_password">{escape(UI_TEXT["runtime_login_password"])}</label>
-          <input id="runtime_password" name="password" type="password" value="">
-        </div>
-        <div class="actions">
-          <button class="primary" type="submit">{escape(UI_TEXT["runtime_login_button"])}</button>
-        </div>
-      </form>
-    </section>
-"""
-        return f"""<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{escape(UI_TEXT["runtime_tab"])}</title>
-  {common_styles()}
-</head>
-<body>
-  <main class="shell wide-shell">
-    {_hero(UI_TEXT["runtime_panel_title"], UI_TEXT["dashboard_lede"])}
-    {navigation("/runtime", params["runtime_db"])}
-    {_compat_notice(UI_TEXT["legacy_runtime_notice"])}
-    {_banner(message, message_level)}
-    {login_panel}
-  </main>
-</body>
-</html>
-"""
-
-    runtime_query = _build_runtime_query(
-        params["runtime_db"],
-        review_task_id=params.get("review_task_id", ""),
-        task_id=params.get("task_id", ""),
-    )
-    task_rows = "".join(
-        "<tr>"
-        f"<td><a href='/runtime?{escape(_build_runtime_query(params['runtime_db'], task_id=task.task_id, review_task_id=params.get('review_task_id', '')))}'>{escape(task.task_id)}</a></td>"
-        f"<td>{escape(task.trade_date.isoformat() if task.trade_date else '-')}</td>"
-        f"<td>{escape(task.scope_type)}:{escape(task.scope_key)}</td>"
-        f"<td>{escape(task.action_type.value)}</td>"
-        f"<td>{escape(task.task_status.value)}</td>"
-        f"<td>{escape(task.internal_sku or '-')}</td>"
-        f"<td>{escape(task.platform_name or '-')}</td>"
-        "</tr>"
-        for task in tasks[:PAGE_SIZE]
-    ) or "<tr><td colspan='7'>-</td></tr>"
-    review_rows = "".join(
-        "<tr>"
-        f"<td><a href='/runtime?{escape(_build_runtime_query(params['runtime_db'], review_task_id=review.review_task_id, task_id=review.source_task_id or ''))}'>{escape(review.review_task_id)}</a></td>"
-        f"<td>{escape(review.trade_date.isoformat() if review.trade_date else '-')}</td>"
-        f"<td>{escape(review.scope_type)}:{escape(review.scope_key)}</td>"
-        f"<td>{escape(review.review_type)}</td>"
-        f"<td>{escape(review.review_status.value)}</td>"
-        f"<td>{escape(review.source_task_id or '-')}</td>"
-        f"<td>{escape(review.reason)}</td>"
-        "</tr>"
-        for review in reviews[:PAGE_SIZE]
-    ) or "<tr><td colspan='7'>-</td></tr>"
-    notification_rows = "".join(
-        "<tr>"
-        f"<td>{escape(log.notification_id)}</td>"
-        f"<td>{escape(log.related_task_id or '-')}</td>"
-        f"<td>{escape(log.related_review_task_id or '-')}</td>"
-        f"<td>{escape(log.recipient_type)}:{escape(log.recipient)}</td>"
-        f"<td>{escape(log.channel)}</td>"
-        f"<td>{escape(log.send_status)}</td>"
-        f"<td>{escape(log.sent_at.isoformat() if log.sent_at else '-')}</td>"
-        f"<td>{escape(log.message)}</td>"
-        "</tr>"
-        for log in notifications[:PAGE_SIZE]
-    ) or "<tr><td colspan='8'>-</td></tr>"
-
-    selected_review_html = ""
-    if selected_review is not None:
-        next_source_status = _review_source_status_hint(selected_task)
-        details = [
-            ("review_task_id", selected_review.review_task_id),
-            ("review_type", selected_review.review_type),
-            ("review_status", selected_review.review_status.value),
-            ("scope", f"{selected_review.scope_type}:{selected_review.scope_key}"),
-            ("source_task_id", selected_review.source_task_id or "-"),
-            ("required_by", selected_review.required_by.isoformat() if selected_review.required_by else "-"),
-            ("reason", selected_review.reason or "-"),
-            ("resolved_by", selected_review.resolved_by or "-"),
-            ("resolved_at", selected_review.resolved_at.isoformat() if selected_review.resolved_at else "-"),
-        ]
-        detail_rows = "".join(
-            f"<tr><th>{escape(label)}</th><td>{escape(str(value))}</td></tr>" for label, value in details
-        )
-        resolution_pre = escape(_to_pretty_json(selected_review.resolution_payload))
-        review_payload_pre = escape(_to_pretty_json(selected_review.review_payload))
-        related_notifications = [
-            log for log in notifications if log.related_review_task_id == selected_review.review_task_id
-        ]
-        related_notification_rows = "".join(
-            "<tr>"
-            f"<td>{escape(log.notification_id)}</td>"
-            f"<td>{escape(log.recipient_type)}:{escape(log.recipient)}</td>"
-            f"<td>{escape(log.channel)}</td>"
-            f"<td>{escape(log.send_status)}</td>"
-            f"<td>{escape(log.sent_at.isoformat() if log.sent_at else '-')}</td>"
-            f"<td>{escape(log.message)}</td>"
-            "</tr>"
-            for log in related_notifications
-        ) or "<tr><td colspan='6'>-</td></tr>"
-        selected_review_html = f"""
-    <section class="panel">
-      <h2>{escape(UI_TEXT["runtime_review_detail"])}</h2>
-      <div class="table-wrap">
-        <table>
-          <tbody>{detail_rows}</tbody>
-        </table>
-      </div>
-      <div class="grid two-col">
-        <div class="field">
-          <label>review_payload_json</label>
-          <pre>{review_payload_pre}</pre>
-        </div>
-        <div class="field">
-          <label>resolution_payload_json</label>
-          <pre>{resolution_pre}</pre>
-        </div>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>notification_id</th><th>recipient</th><th>channel</th><th>send_status</th><th>sent_at</th><th>message</th></tr></thead>
-          <tbody>{related_notification_rows}</tbody>
-        </table>
-      </div>
-    </section>
-"""
-        if selected_review.review_status == ReviewTaskStatus.PENDING:
-            selected_review_html += f"""
-    <section class="panel">
-      <h2>{escape(UI_TEXT["runtime_review_handle"])}</h2>
-      <form method="post" action="/runtime" class="grid">
-        <input type="hidden" name="action" value="resolve_review">
-        <input type="hidden" name="runtime_db" value="{escape(params["runtime_db"])}">
-        <input type="hidden" name="review_task_id" value="{escape(selected_review.review_task_id)}">
-        <input type="hidden" name="task_id" value="{escape(selected_review.source_task_id or '')}">
-        <div class="field">
-          <label for="review_status">review_status</label>
-          <select id="review_status" name="review_status">
-            <option value="approved">approved</option>
-            <option value="rejected">rejected</option>
-            <option value="adjusted">adjusted</option>
-            <option value="cancelled">cancelled</option>
-          </select>
-        </div>
-        <div class="field">
-          <label>{escape(UI_TEXT["runtime_session_user"])}</label>
-          <input type="text" value="{escape(session_user)}" disabled>
-        </div>
-        <div class="field">
-          <label for="reviewer_code">{escape(UI_TEXT["runtime_reviewer_code"])}</label>
-          <input id="reviewer_code" name="reviewer_code" type="text" value="">
-        </div>
-        <div class="field">
-          <label for="resolution_note">{escape(UI_TEXT["runtime_resolution_note"])}</label>
-          <input id="resolution_note" name="resolution_note" type="text" value="">
-        </div>
-        <div class="field">
-          <label for="resolution_payload_json">{escape(UI_TEXT["runtime_resolution_payload"])}</label>
-          <textarea id="resolution_payload_json" name="resolution_payload_json" rows="8">{{}}</textarea>
-        </div>
-        <p class="subtle">来源任务后续状态：{escape(next_source_status)}</p>
-        <div class="actions">
-          <button class="primary" type="submit">{escape(UI_TEXT["runtime_submit_review"])}</button>
-        </div>
-      </form>
-    </section>
-"""
-
-    history_rows = "".join(
-        "<tr>"
-        f"<td>{escape(item.changed_at.isoformat())}</td>"
-        f"<td>{escape(item.from_status.value if item.from_status else '-')}</td>"
-        f"<td>{escape(item.to_status.value)}</td>"
-        f"<td>{escape(item.changed_by)}</td>"
-        f"<td>{escape(item.reason)}</td>"
-        f"<td><pre>{escape(_to_pretty_json(item.metadata))}</pre></td>"
-        "</tr>"
-        for item in task_history
-    ) or f"<tr><td colspan='6'>{escape(UI_TEXT['runtime_history_empty'])}</td></tr>"
-    history_panel = ""
-    if selected_task is not None:
-        history_panel = f"""
-    <section class="panel">
-      <h2>{escape(UI_TEXT["runtime_history"])}: {escape(selected_task.task_id)}</h2>
-      <div class="table-wrap">
-        <table>
-          <thead><tr><th>changed_at</th><th>from</th><th>to</th><th>changed_by</th><th>reason</th><th>metadata_json</th></tr></thead>
-          <tbody>{history_rows}</tbody>
-        </table>
-      </div>
-    </section>
-"""
-
-    return f"""<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{escape(UI_TEXT["runtime_tab"])}</title>
-  {common_styles()}
-</head>
-<body>
-  <main class="shell wide-shell">
-    {_hero(UI_TEXT["runtime_panel_title"], UI_TEXT["dashboard_lede"])}
-    {navigation("/runtime", params["runtime_db"])}
-    {_compat_notice(UI_TEXT["legacy_runtime_notice"])}
-    {_banner(message, message_level)}
-    <section class="panel">
-      <h2>{escape(UI_TEXT["runtime_panel_title"])}</h2>
-      <form method="get" action="/runtime" class="grid two-col">
-        <div class="field">
-          <label for="runtime_db">{escape(UI_TEXT["runtime_db_path"])}</label>
-          <input id="runtime_db" name="runtime_db" type="text" value="{escape(params["runtime_db"])}">
-        </div>
-        <div class="actions">
-          <button class="secondary" type="submit">{escape(UI_TEXT["runtime_load_button"])}</button>
-        </div>
-      </form>
-      <div class="actions">
-        <span class="subtle">{escape(UI_TEXT["runtime_session_user"])}: {escape(session_user)}</span>
-        <form method="post" action="/runtime/logout">
-          <input type="hidden" name="runtime_db" value="{escape(params["runtime_db"])}">
-          <button class="secondary" type="submit">{escape(UI_TEXT["runtime_logout_button"])}</button>
-        </form>
-      </div>
-    </section>
-    {selected_review_html}
-    {history_panel}
-    <section class="panel">
-      <h2>{escape(UI_TEXT["runtime_tasks"])}</h2>
-      <div class="table-wrap"><table><thead><tr><th>task_id</th><th>trade_date</th><th>scope</th><th>action</th><th>status</th><th>SKU</th><th>platform</th></tr></thead><tbody>{task_rows}</tbody></table></div>
-    </section>
-    <section class="panel">
-      <h2>{escape(UI_TEXT["runtime_reviews"])}</h2>
-      <div class="table-wrap"><table><thead><tr><th>review_task_id</th><th>trade_date</th><th>scope</th><th>type</th><th>status</th><th>source_task_id</th><th>reason</th></tr></thead><tbody>{review_rows}</tbody></table></div>
-    </section>
-    <section class="panel">
-      <h2>{escape(UI_TEXT["runtime_notifications"])}</h2>
-      <div class="table-wrap"><table><thead><tr><th>notification_id</th><th>related_task_id</th><th>related_review_task_id</th><th>recipient</th><th>channel</th><th>send_status</th><th>sent_at</th><th>message</th></tr></thead><tbody>{notification_rows}</tbody></table></div>
-    </section>
-  </main>
-</body>
-</html>
-"""
-
-
-def render_runtime_page(
-    *,
-    params: dict[str, str],
-    message: str,
-    message_level: str,
-    tasks,
-    reviews,
-    notifications,
-    session_user: str | None,
-    selected_review,
-    selected_task,
     selected_notification,
     task_history,
     login_csrf_token: str | None = None,
@@ -3932,7 +3816,7 @@ def render_ops_dashboard_page(
     <section class="panel">
       <h2>{escape(UI_TEXT["ops_business_inputs_title"])}</h2>
       <div class="actions">
-        <a class="nav-link utility-link" href="/business-inputs">{escape(UI_TEXT["ops_link_to_generator"])}</a>
+        <a class="nav-link utility-link" href="/task-generator">{escape(UI_TEXT["ops_link_to_generator"])}</a>
       </div>
     </section>
     """
@@ -3963,6 +3847,7 @@ def render_tasks_page(
     related_reviews=None,
     related_notifications=None,
     execution_logs=None,
+    task_group_statuses: dict[str, str] | None = None,
 ) -> str:
     rows = "".join(
         "<tr>"
@@ -3970,7 +3855,10 @@ def render_tasks_page(
         f"<td>{escape(display_enum_label('action_type', task.action_type.value))}</td>"
         f"<td>{escape(format_task_object(task))}</td>"
         f"<td>{escape(task.platform_name or '-')}</td>"
+        f"<td>{escape(_task_group_id(task) or '-')}</td>"
+        f"<td>{escape((task_group_statuses or {}).get(_task_group_id(task), '-'))}</td>"
         f"<td>{_status_badge(task.task_status.value, 'task_status')}</td>"
+        f"<td>{escape(str(task.expected_old_price) if task.expected_old_price is not None else '-')}</td>"
         f"<td>{escape(format_task_target(task))}</td>"
         f"<td>{escape(format_display_datetime(task.required_by))}</td>"
         f"<td>{escape(_task_reason_summary(task))}</td>"
@@ -4001,7 +3889,10 @@ def render_tasks_page(
                 "action_type",
                 "business_object",
                 "platform_name",
+                "task_group_id",
+                "task_group_status",
                 "task_status",
+                "expected_old_price",
                 "target_action_or_price",
                 "required_by",
                 "reason_summary",
@@ -4402,12 +4293,15 @@ def render_business_inputs_page(
     capacity_plan_rows: list[dict[str, object]],
     cold_storage_rows: list[dict[str, object]],
     platform_options: list[str],
+    listing_status_rows: list[ListingStatus],
     active_input_tab: str = "inventory",
     message: str = "",
     message_level: str = "info",
 ) -> str:
     active_input_tab = _normalize_business_input_tab(active_input_tab)
-    if active_input_tab == "price_rules":
+    if active_input_tab == "listing_status":
+        active_panel = _render_listing_status_management(listing_status_rows)
+    elif active_input_tab == "price_rules":
         active_panel = _render_price_rule_management(price_rules_path, product_rows, price_rule_rows, platform_options)
     elif active_input_tab == "listing_rules":
         active_panel = _render_listing_rule_management(
@@ -4492,6 +4386,34 @@ def _render_business_input_tabs(
         {''.join(links)}
       </div>
       <p class="subtle">请选择当前要维护的业务输入模块。库存录入和价格规则管理会分别保存到对应表格，保存后请重新生成待处理任务。</p>
+    </section>
+    """
+
+
+def _render_listing_status_management(
+    rows: list[ListingStatus],
+) -> str:
+    table_rows = "".join(
+        "<tr>"
+        f"<td>{escape(row.platform_name)}</td>"
+        f"<td>{escape(row.variety)}</td>"
+        f"<td>{escape(row.grade)}</td>"
+        f"<td>{escape(str(row.current_price))}</td>"
+        f"<td>{row.platform_stock_qty}</td>"
+        f"<td>{row.sold_qty}</td>"
+        f"<td>{'上架' if row.online_status == 'online' else '下架'}</td>"
+        f"<td>{escape(row.source)}</td>"
+        "</tr>"
+        for row in rows
+    ) or '<tr><td colspan="8">暂无上架状态。请先通过 ShadowBot READ_ONLY 读取平台商品。</td></tr>'
+    return f"""
+    <section class="panel">
+      <h2>上架状态</h2>
+      <p class="subtle">本页面只读，不提供人工录入或修改。正常业务更新仅接收经过合同校验的 ShadowBot READ_ONLY 结果，并按“平台 + 品种 + 等级”写入 SQLite。</p>
+    </section>
+    <section class="panel table-panel">
+      <h2>当前平台商品状态</h2>
+      <div class="table-wrap"><table><thead><tr><th>平台</th><th>品种</th><th>等级</th><th>价格</th><th>平台库存</th><th>已销售数</th><th>状态</th><th>来源</th></tr></thead><tbody>{table_rows}</tbody></table></div>
     </section>
     """
 
@@ -5097,7 +5019,6 @@ def _render_price_rule_row(
     platform_options: list[str],
     row: dict[str, object],
 ) -> str:
-    rule_id = str(row.get("rule_id") or "").strip()
     pricing_method = str(row.get("pricing_method") or "").strip()
     rounding_rule = str(row.get("rounding_rule") or "").strip()
     return f"""
@@ -5878,116 +5799,6 @@ def _render_login_required_page(
     )
 
 
-def render_price_batches_page(
-    *,
-    runtime_db: str,
-    session_user: str,
-    batches,
-    selected_batch,
-    selected_items,
-    control_events,
-    message: str = "",
-    message_level: str = "info",
-) -> str:
-    batch_rows = "".join(
-        "<tr>"
-        f"<td><a href='{escape(_append_query_to_path('/price-batches', {'batch_id': batch.batch_id}))}'><code>{escape(batch.batch_id)}</code></a></td>"
-        f"<td>{escape(batch.execution_mode)}</td>"
-        f"<td>{_status_badge(batch.status)}</td>"
-        f"<td>{batch.processed_count}/{batch.pending_count + batch.ready_count + batch.running_count + batch.processed_count}</td>"
-        f"<td>{batch.verified_count}</td><td>{batch.failed_count}</td>"
-        f"<td>{batch.needs_reconciliation_count}</td>"
-        f"<td>{escape(format_display_datetime(batch.updated_at))}</td>"
-        "</tr>"
-        for batch in batches
-    )
-    body = _render_table_panel(
-        "任务12批次摘要",
-        ["batch_id", "execution_mode", "status", "processed", "verified", "failed", "needs_reconciliation", "updated_at"],
-        batch_rows,
-        empty_message="当前没有改价批次。",
-    )
-    if selected_batch is not None:
-        total = (
-            selected_batch.pending_count
-            + selected_batch.ready_count
-            + selected_batch.running_count
-            + selected_batch.processed_count
-        )
-        controls = f"""
-        <section class="panel">
-          <h2>受控批次操作</h2>
-          <p class="subtle">只允许暂停、恢复和取消尚未开始的商品。这里不提供重试 COMMIT、跳过 UNKNOWN、修改审批哈希或批准全部。</p>
-          <form method="post" action="/price-batches">
-            <input type="hidden" name="batch_id" value="{escape(selected_batch.batch_id)}">
-            <div class="field"><label for="batch_reason">操作原因</label><input id="batch_reason" name="reason" maxlength="500"></div>
-            <div class="actions">
-              <button class="secondary" type="submit" name="action" value="pause">暂停</button>
-              <button class="secondary" type="submit" name="action" value="resume">恢复</button>
-              <button class="secondary" type="submit" name="action" value="cancel_pending">取消未开始商品</button>
-            </div>
-          </form>
-        </section>
-        """
-        summary = f"""
-        <section class="panel">
-          <h2>批次详情：<code>{escape(selected_batch.batch_id)}</code></h2>
-          <div class="metrics">
-            <div class="metric"><span class="label">批次状态</span><strong>{escape(selected_batch.status)}</strong></div>
-            <div class="metric"><span class="label">执行模式</span><strong>{escape(selected_batch.execution_mode)}</strong></div>
-            <div class="metric"><span class="label">商品总数</span><strong>{total}</strong></div>
-            <div class="metric"><span class="label">已处理</span><strong>{selected_batch.processed_count}</strong></div>
-          </div>
-          <p class="subtle">计数恒等式：{total} = {selected_batch.pending_count} pending + {selected_batch.ready_count} ready + {selected_batch.running_count} running + {selected_batch.processed_count} processed。</p>
-          <p class="subtle">来源读取批次：<code>{escape(selected_batch.source_read_batch_id)}</code>；请求摘要：<code>{escape(selected_batch.normalized_request_digest)}</code></p>
-        </section>
-        """
-        item_rows = "".join(
-            "<tr>"
-            f"<td>{item.ordinal}</td><td>{escape(item.expected_product_name)}</td><td>{escape(item.expected_grade)}</td>"
-            f"<td>{escape(str(item.approved_expected_old_price))}</td><td>{escape(str(item.target_price))}</td>"
-            f"<td>{escape(str(item.post_commit_price) if item.post_commit_price is not None else '-')}</td>"
-            f"<td>{_status_badge(item.status)}</td><td>{escape(item.error_code or '-')}</td>"
-            f"<td><code>{escape(item.task_id)}</code></td><td><code>{escape(item.review_task_id)}</code></td>"
-            f"<td><code>{escape(item.operation_id)}</code></td>"
-            f"<td><code>{escape(item.current_execution_attempt_id or item.fresh_read_attempt_id or '-')}</code></td>"
-            "</tr>"
-            for item in selected_items
-        )
-        items_panel = _render_table_panel(
-            "逐商品明细",
-            ["ordinal", "product", "grade", "old_price", "target_price", "post_price", "status", "error", "task_id", "review_task_id", "operation_id", "attempt_id"],
-            item_rows,
-            empty_message="该批次没有商品明细。",
-        )
-        event_rows = "".join(
-            "<tr>"
-            f"<td>{escape(format_display_datetime(event['created_at']))}</td>"
-            f"<td>{escape(event['action'])}</td><td>{escape(event['actor'])}</td>"
-            f"<td>{escape(event['previous_status'])} → {escape(event['resulting_status'])}</td>"
-            f"<td>{'是' if event['applied'] else '否'}</td><td>{escape(event['reason'] or '-')}</td>"
-            "</tr>"
-            for event in control_events
-        )
-        events_panel = _render_table_panel(
-            "批次控制审计",
-            ["created_at", "action", "actor", "status_change", "applied", "reason"],
-            event_rows,
-            empty_message="当前没有批次控制记录。",
-        )
-        body += summary + controls + items_panel + events_panel
-    return _render_ops_page(
-        title="任务12改价批次",
-        description="查看同一平台多商品串行改价状态，并执行受审计的暂停、恢复或取消未开始商品。",
-        active_path="/price-batches",
-        runtime_db=runtime_db,
-        session_user=session_user,
-        body_html=body,
-        message=message,
-        message_level=message_level,
-    )
-
-
 def _render_ops_page(
     *,
     title: str,
@@ -6398,6 +6209,7 @@ def _render_task_center_detail(
         ("action_type", display_enum_label("action_type", selected_task.action_type.value)),
         ("task_status", display_enum_label("task_status", selected_task.task_status.value)),
         ("priority", selected_task.priority),
+        ("expected_old_price", selected_task.expected_old_price if selected_task.expected_old_price is not None else "-"),
         ("target_price", selected_task.target_price if selected_task.target_price is not None else "-"),
         ("target_status", selected_task.target_status or "-"),
         ("pricing_source", selected_task.pricing_source.value if selected_task.pricing_source else "-"),
@@ -6635,6 +6447,7 @@ def _render_review_source_task_panel(source_task) -> str:
             ("task_status", display_enum_label("task_status", source_task.task_status.value)),
             ("action_type", display_enum_label("action_type", source_task.action_type.value)),
             ("scope", format_object_scope(source_task.scope_type, source_task.scope_key)),
+            ("expected_old_price", source_task.expected_old_price if source_task.expected_old_price is not None else "-"),
             ("target_price", source_task.target_price if source_task.target_price is not None else "-"),
             ("target_status", source_task.target_status or "-"),
             ("required_by", format_display_datetime(source_task.required_by)),
@@ -7055,18 +6868,6 @@ def _json_summary_rows(value: object) -> str:
     return "".join(rows) or "<tr><td colspan='2'>-</td></tr>"
 
 
-def _metadata_summary_rows(value: object) -> str:
-    if not isinstance(value, dict) or not value:
-        return "-"
-    selected = []
-    for key in ("review_task_id", "review_status", "actor", "actor_source", "timeout_policy"):
-        if key in value:
-            selected.append(f"{key}={_json_compact_value(value[key], 80)}")
-    if not selected:
-        selected = [f"{key}={_json_compact_value(item, 80)}" for key, item in list(value.items())[:3]]
-    return escape("; ".join(selected))
-
-
 def _json_details_block(value: object) -> str:
     json_text = _json_pretty_text(value)
     truncated_text = _truncate_text(json_text, 4000)
@@ -7156,6 +6957,44 @@ def format_task_target(task) -> str:
     return " / ".join(parts) if parts else "-"
 
 
+def _task_group_id(task) -> str:
+    trace = getattr(task, "decision_trace", None)
+    if not isinstance(trace, dict):
+        return ""
+    return str(trace.get("task_group_id") or "").strip()
+
+
+def _build_task_group_statuses(tasks: list) -> dict[str, str]:
+    grouped: dict[str, list[str]] = {}
+    for task in tasks:
+        group_id = _task_group_id(task)
+        if group_id:
+            grouped.setdefault(group_id, []).append(task.task_status.value)
+    statuses: dict[str, str] = {}
+    terminal = {"success", "failed", "skipped", "cancelled", "expired"}
+    for group_id, values in grouped.items():
+        unique = set(values)
+        if len(unique) == 1:
+            statuses[group_id] = display_status_label(values[0])
+        elif "failed" in unique:
+            statuses[group_id] = "部分失败"
+        elif any(value not in terminal for value in unique):
+            statuses[group_id] = "处理中（部分完成）"
+        else:
+            statuses[group_id] = "部分完成"
+    return statuses
+
+
+def _task_price_calculation_summary(task) -> str:
+    trace = getattr(task, "decision_trace", None)
+    if not isinstance(trace, dict):
+        return "-"
+    steps = trace.get("rule_steps")
+    if isinstance(steps, list) and steps:
+        return " → ".join(str(step) for step in steps)
+    return "-"
+
+
 def _task_reason_summary(task) -> str:
     if getattr(task, "result_message", None):
         return _truncate_text(_sanitize_notification_text(task.result_message), 120)
@@ -7164,6 +7003,9 @@ def _task_reason_summary(task) -> str:
         for key in ("reason", "review_reason", "message"):
             if decision_trace.get(key):
                 return _truncate_text(_sanitize_notification_text(str(decision_trace[key])), 120)
+        calculation = _task_price_calculation_summary(task)
+        if calculation != "-":
+            return _truncate_text(calculation, 120)
     return "-"
 
 
@@ -7307,11 +7149,24 @@ def _render_dashboard_metric_card(runtime_db: str, metric: dict[str, object]) ->
 
 
 def _is_review_due_soon(review, now: datetime) -> bool:
+    if review.review_status != ReviewTaskStatus.PENDING or review.required_by is None:
+        return False
+
+    comparable_now = _datetime_in_display_timezone(now)
+    comparable_deadline = _datetime_in_display_timezone(review.required_by)
     return (
-        review.review_status == ReviewTaskStatus.PENDING
-        and review.required_by is not None
-        and now <= review.required_by <= now + timedelta(hours=2)
+        comparable_now
+        <= comparable_deadline
+        <= comparable_now + timedelta(hours=2)
     )
+
+
+def _datetime_in_display_timezone(value: datetime) -> datetime:
+    """Normalize legacy naive and timezone-aware values for safe comparison."""
+
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=DISPLAY_TIMEZONE)
+    return value.astimezone(DISPLAY_TIMEZONE)
 
 
 def _field_label(name: str) -> str:
@@ -7385,19 +7240,6 @@ def _parse_optional_task_action_type(value: str) -> TaskActionType | None:
         return TaskActionType(text)
     except ValueError:
         return None
-
-
-def _review_runtime_action_link(runtime_db: str, review) -> str:
-    if review.review_status != ReviewTaskStatus.PENDING:
-        return "-"
-    href = _append_query_to_path(
-        "/runtime",
-        {
-            "review_task_id": review.review_task_id,
-            "task_id": review.source_task_id or "",
-        },
-    )
-    return f"<a href='{escape(href)}'>/runtime</a>"
 
 
 def _render_system_feishu_test_panel(runtime_db: str) -> str:
@@ -7903,7 +7745,7 @@ def _compat_notice(message: str) -> str:
 
 def navigation(active_path: str, runtime_db: str | None = None) -> str:
     normalized_active = {
-        "/": "/business-inputs",
+        "/": "/task-generator",
         "/tables": "/business-inputs",
         "/execution": "/execution-logs",
         "/manual-intervention": "/reviews",
@@ -7914,583 +7756,14 @@ def navigation(active_path: str, runtime_db: str | None = None) -> str:
         ("/reviews", UI_TEXT["reviews_tab"]),
         ("/notifications", UI_TEXT["notifications_tab"]),
         ("/execution-logs", UI_TEXT["execution_logs_tab"]),
-        ("/price-batches", UI_TEXT["price_batches_tab"]),
         ("/business-inputs", UI_TEXT["business_inputs_tab"]),
+        ("/task-generator", UI_TEXT["task_generator_tab"]),
     ]
     links = "".join(
         f"<a class='{'nav-link active' if normalized_active == path else 'nav-link'}' href='{escape(path)}'>{escape(label)}</a>"
         for path, label in items
     )
     return f"<nav class='nav-strip'>{links}</nav>"
-
-
-def common_styles() -> str:
-    return """
-  <style>
-    /* business-inputs-layout-v2 */
-    :root {
-      --bg: #f2ecdf;
-      --panel: rgba(255,255,255,0.92);
-      --ink: #1f2a30;
-      --muted: #5f6d73;
-      --accent: #b05833;
-      --accent-soft: #ecd7cb;
-      --success: #285844;
-      --success-bg: #dceddf;
-      --error: #8a2f2f;
-      --error-bg: #f6dddd;
-      --info-bg: #ece6da;
-      --line: rgba(31,42,48,0.12);
-      --shadow: 0 20px 60px rgba(91, 67, 49, 0.13);
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      color: var(--ink);
-      font-family: Georgia, "Times New Roman", "Noto Serif SC", serif;
-      background:
-        radial-gradient(circle at top left, rgba(176,88,51,0.14), transparent 28%),
-        radial-gradient(circle at 88% 10%, rgba(40,88,68,0.12), transparent 22%),
-        linear-gradient(180deg, #faf5eb 0%, var(--bg) 100%);
-      min-height: 100vh;
-    }
-    .shell {
-      width: min(1120px, calc(100% - 32px));
-      margin: 28px auto 44px;
-    }
-    .wide-shell {
-      width: min(1380px, calc(100% - 24px));
-    }
-    .hero {
-      padding: 28px 30px 24px;
-      border: 1px solid var(--line);
-      border-radius: 28px;
-      background: linear-gradient(135deg, rgba(255,255,255,0.86), rgba(255,248,243,0.94));
-      box-shadow: var(--shadow);
-      position: relative;
-      overflow: hidden;
-    }
-    .hero::after {
-      content: "";
-      position: absolute;
-      inset: auto -90px -90px auto;
-      width: 260px;
-      height: 260px;
-      background: radial-gradient(circle, rgba(176,88,51,0.12), transparent 72%);
-    }
-    h1 {
-      margin: 0 0 10px;
-      font-size: clamp(34px, 5vw, 58px);
-      line-height: 0.94;
-      letter-spacing: -0.03em;
-    }
-    h2 {
-      margin: 0 0 16px;
-      font-size: 24px;
-    }
-    .lede {
-      max-width: 820px;
-      margin: 0;
-      color: var(--muted);
-      font-size: 17px;
-      line-height: 1.55;
-    }
-    .nav-strip {
-      display: flex;
-      gap: 12px;
-      flex-wrap: wrap;
-      margin: 18px 0;
-    }
-    .nav-link {
-      text-decoration: none;
-      color: var(--ink);
-      padding: 12px 16px;
-      border-radius: 999px;
-      background: rgba(255,255,255,0.7);
-      border: 1px solid var(--line);
-      box-shadow: var(--shadow);
-    }
-    .nav-link.active {
-      background: var(--accent);
-      color: white;
-      border-color: transparent;
-    }
-    .business-input-tab-panel {
-      padding: 16px 18px;
-    }
-    .business-input-tabs {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      align-items: center;
-    }
-    .business-input-tab {
-      min-width: 150px;
-      text-align: center;
-      text-decoration: none;
-      color: var(--ink);
-      padding: 12px 18px;
-      border-radius: 999px;
-      border: 1px solid var(--line);
-      background: rgba(255,255,255,0.82);
-      box-shadow: 0 10px 28px rgba(91, 67, 49, 0.09);
-      font-weight: 700;
-    }
-    .business-input-tab.active {
-      background: var(--accent);
-      color: white;
-      border-color: transparent;
-    }
-    .layout {
-      display: grid;
-      grid-template-columns: 1.2fr 0.8fr;
-      gap: 18px;
-      margin-top: 18px;
-    }
-    .panel {
-      padding: 22px;
-      border: 1px solid var(--line);
-      border-radius: 24px;
-      background: var(--panel);
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(6px);
-      margin-top: 18px;
-    }
-    .grid {
-      display: grid;
-      gap: 14px;
-    }
-    .two-col {
-      grid-template-columns: 1fr 1.6fr;
-      align-items: end;
-    }
-    .inventory-form {
-      display: grid;
-      gap: 16px;
-      margin-top: 24px;
-    }
-    .inventory-row {
-      display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 14px;
-      align-items: stretch;
-      min-height: 118px;
-    }
-    .inventory-row .field {
-      align-content: start;
-    }
-    .inventory-row .align-with-primary-control {
-      padding-top: 0;
-    }
-    .inventory-submit-field {
-      align-content: start;
-    }
-    .submit-label-spacer {
-      min-height: 34px;
-    }
-    .inventory-submit-control {
-      min-height: 50px;
-      display: flex;
-      align-items: center;
-    }
-    .field {
-      display: grid;
-      gap: 8px;
-    }
-    .field label, .checkbox {
-      font-size: 13px;
-      color: var(--muted);
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-    }
-    .product-input-panel .field label,
-    .product-edit-form .field label {
-      font-size: 16px;
-      font-weight: 800;
-      color: var(--ink);
-      letter-spacing: 0;
-      text-transform: none;
-    }
-    .product-input-panel .help,
-    .product-edit-form .help {
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.35;
-      margin: 0;
-    }
-    .product-input-panel .help-placeholder {
-      min-height: 18px;
-      visibility: hidden;
-    }
-    .field-title-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      min-height: 34px;
-    }
-    .product-input-panel .field > label,
-    .product-edit-form .field > label {
-      display: flex;
-      align-items: center;
-      min-height: 34px;
-    }
-    .mini-button {
-      padding: 7px 12px;
-      font-size: 13px;
-      font-weight: 700;
-      background: var(--accent-soft);
-      color: var(--ink);
-      border: 1px solid rgba(176,88,51,0.2);
-      box-shadow: none;
-      white-space: nowrap;
-    }
-    input[type="text"], input[type="password"], input[type="number"], select, textarea {
-      width: 100%;
-      padding: 14px 16px;
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      font: inherit;
-      color: var(--ink);
-      background: rgba(255,255,255,0.95);
-    }
-    input[type="text"], input[type="password"], input[type="number"], select {
-      min-height: 50px;
-    }
-    .modal-card {
-      width: min(520px, calc(100% - 32px));
-      border: 1px solid var(--line);
-      border-radius: 22px;
-      padding: 22px;
-      color: var(--ink);
-      background: var(--panel);
-      box-shadow: var(--shadow);
-    }
-    .modal-card::backdrop {
-      background: rgba(31,42,48,0.28);
-      backdrop-filter: blur(2px);
-    }
-    .feedback-dialog h3 {
-      margin: 0;
-      font-size: 22px;
-    }
-    .feedback-dialog p {
-      margin: 0;
-      line-height: 1.65;
-      color: var(--ink);
-    }
-    textarea {
-      resize: vertical;
-      min-height: 120px;
-    }
-    .checkbox {
-      display: flex;
-      align-items: center;
-      gap: 10px;
-    }
-    .actions {
-      display: flex;
-      gap: 12px;
-      flex-wrap: wrap;
-      margin-top: 8px;
-    }
-    button {
-      border: 0;
-      border-radius: 999px;
-      padding: 13px 18px;
-      font: inherit;
-      cursor: pointer;
-      transition: transform 140ms ease, opacity 140ms ease;
-    }
-    button:hover { transform: translateY(-1px); }
-    .primary {
-      background: var(--accent);
-      color: white;
-    }
-    .secondary {
-      background: var(--accent-soft);
-      color: var(--ink);
-    }
-    .sticky-actions {
-      position: sticky;
-      bottom: 10px;
-      padding-top: 16px;
-      background: linear-gradient(180deg, rgba(255,255,255,0), rgba(255,255,255,0.92) 35%);
-    }
-    .confirm-box {
-      margin-top: 16px;
-      padding: 16px;
-      border-radius: 18px;
-      background: rgba(236, 215, 203, 0.5);
-      border: 1px solid rgba(176,88,51,0.18);
-    }
-    .banner {
-      margin-top: 18px;
-      padding: 14px 16px;
-      border-radius: 16px;
-      font-size: 15px;
-      border: 1px solid transparent;
-    }
-    .banner.success {
-      background: var(--success-bg);
-      color: var(--success);
-    }
-    .banner.error {
-      background: var(--error-bg);
-      color: var(--error);
-    }
-    .banner.info {
-      background: var(--info-bg);
-      color: var(--ink);
-    }
-    .metrics {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-      gap: 12px;
-    }
-    .metric {
-      padding: 14px 16px;
-      border-radius: 18px;
-      background: rgba(255,248,243,0.86);
-      border: 1px solid rgba(176,88,51,0.12);
-    }
-    .metric .label {
-      display: block;
-      color: var(--muted);
-      font-size: 12px;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-    }
-    .metric strong {
-      display: block;
-      margin-top: 6px;
-      font-size: 28px;
-      line-height: 1;
-    }
-    .metric-link {
-      display: block;
-      color: inherit;
-      text-decoration: none;
-      transition: transform 140ms ease, box-shadow 140ms ease;
-    }
-    .metric-link:hover {
-      transform: translateY(-1px);
-      box-shadow: 0 12px 30px rgba(91, 67, 49, 0.12);
-    }
-    .dashboard-metric {
-      min-height: 122px;
-    }
-    .metric-warn {
-      background: rgba(176,88,51,0.14);
-      border-color: rgba(176,88,51,0.24);
-    }
-    .metric-urgent {
-      background: rgba(211,113,35,0.18);
-      border-color: rgba(211,113,35,0.3);
-    }
-    .metric-error {
-      background: var(--error-bg);
-      border-color: rgba(138,47,47,0.2);
-    }
-    .metric-muted {
-      background: rgba(95,109,115,0.14);
-      border-color: rgba(95,109,115,0.2);
-    }
-    .metric-note {
-      display: block;
-      margin-top: 8px;
-      color: var(--muted);
-      font-size: 13px;
-    }
-    .metric-links {
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-      margin-top: 10px;
-      font-size: 13px;
-    }
-    .subtle {
-      color: var(--muted);
-      margin: 8px 0 0;
-      font-size: 14px;
-      word-break: break-all;
-    }
-    .table-wrap {
-      overflow-x: auto;
-      margin-top: 16px;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      min-width: 640px;
-    }
-    th, td {
-      padding: 12px 10px;
-      border-bottom: 1px solid var(--line);
-      text-align: left;
-      font-size: 14px;
-      vertical-align: top;
-    }
-    th {
-      color: var(--muted);
-      font-size: 12px;
-      letter-spacing: 0.04em;
-      white-space: nowrap;
-    }
-    .editor-table {
-      min-width: 980px;
-    }
-    .editor-table th:first-child,
-    .editor-table td:first-child {
-      position: sticky;
-      left: 0;
-      background: #f8f1e7;
-      z-index: 1;
-    }
-    .row-index {
-      color: var(--muted);
-      width: 44px;
-      white-space: nowrap;
-    }
-    .cell-input {
-      min-width: 140px;
-      padding: 10px 12px;
-      border-radius: 12px;
-    }
-    .cell-input.invalid {
-      border-color: rgba(138,47,47,0.5);
-      background: rgba(246,221,221,0.5);
-    }
-    .cell-issue {
-      margin-top: 6px;
-      color: var(--error);
-      font-size: 12px;
-      line-height: 1.35;
-    }
-    .issue-list {
-      margin: 16px 0 0;
-      padding-left: 20px;
-      color: var(--error);
-      line-height: 1.5;
-    }
-    .aside-list {
-      display: grid;
-      gap: 12px;
-      color: var(--muted);
-      font-size: 15px;
-      line-height: 1.5;
-    }
-    .aside-list code {
-      display: block;
-      margin-top: 4px;
-      padding: 10px 12px;
-      border-radius: 12px;
-      background: rgba(29,42,49,0.05);
-      color: var(--ink);
-      font-family: "Cascadia Mono", Consolas, monospace;
-      font-size: 13px;
-      word-break: break-all;
-    }
-    pre {
-      margin: 0;
-      padding: 12px 14px;
-      border-radius: 14px;
-      background: rgba(29,42,49,0.05);
-      color: var(--ink);
-      font-family: "Cascadia Mono", Consolas, monospace;
-      font-size: 12px;
-      white-space: pre-wrap;
-      word-break: break-word;
-    }
-    .toolbar-panel {
-      padding: 14px 18px;
-    }
-    .toolbar-row {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      flex-wrap: wrap;
-    }
-    .utility-link {
-      box-shadow: none;
-      background: rgba(255,248,243,0.92);
-    }
-    .notice-panel {
-      border-style: dashed;
-      background: rgba(236, 230, 218, 0.85);
-    }
-    .status-badge {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      min-width: 88px;
-      padding: 6px 10px;
-      border-radius: 999px;
-      font-size: 12px;
-      line-height: 1.2;
-      background: rgba(31,42,48,0.08);
-      color: var(--ink);
-    }
-    .status-success {
-      background: var(--success-bg);
-      color: var(--success);
-    }
-    .status-info {
-      background: var(--info-bg);
-      color: var(--ink);
-    }
-    .status-error {
-      background: var(--error-bg);
-      color: var(--error);
-    }
-    .status-muted {
-      background: rgba(95,109,115,0.16);
-      color: var(--muted);
-    }
-    .status-warn {
-      background: rgba(176,88,51,0.14);
-      color: var(--accent);
-    }
-    @media (max-width: 960px) {
-      .layout, .two-col, .inventory-row { grid-template-columns: 1fr; }
-      .inventory-row { min-height: auto; }
-      .inventory-row .align-with-primary-control { padding-top: 0; }
-      .submit-label-spacer { display: none; }
-      .shell, .wide-shell {
-        width: min(100% - 18px, 1380px);
-        margin-top: 18px;
-      }
-      .hero, .panel {
-        padding: 18px;
-        border-radius: 20px;
-      }
-      .nav-link {
-        flex: 1 1 auto;
-        text-align: center;
-      }
-    }
-  </style>
-  <script>
-    document.addEventListener("DOMContentLoaded", () => {
-      const cookie = document.cookie.split("; ").find((item) => item.startsWith("pra_runtime_csrf="));
-      if (!cookie) return;
-      const token = decodeURIComponent(cookie.substring("pra_runtime_csrf=".length));
-      document.querySelectorAll("form[method='post']").forEach((form) => {
-        const action = form.getAttribute("action") || window.location.pathname;
-        if (action === "/runtime/login" || action.startsWith("/mobile/review/")) return;
-        let input = form.querySelector("input[name='csrf_token']");
-        if (!input) {
-          input = document.createElement("input");
-          input.type = "hidden";
-          input.name = "csrf_token";
-          form.appendChild(input);
-        }
-        input.value = token;
-      });
-    });
-  </script>
-"""
 
 
 def _hero(title: str, description: str) -> str:
@@ -8807,6 +8080,7 @@ def _mobile_payload_summary_rows(payload: object) -> str:
     safe_keys = [
         "task_id",
         "action_type",
+        "expected_old_price",
         "target_price",
         "target_status",
         "pricing_source",

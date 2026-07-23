@@ -1,0 +1,19 @@
+{
+  "batch_id": "BATCH-T12-CONTROLLED-UNKNOWN-20260723-02",
+  "contract_version": 4,
+  "execution_attempt_id": "ATTEMPT-0f30900b398045cc",
+  "execution_mode": "COMMIT",
+  "instruction_hash": "sha256:abdb3e246051ab1bfe4219b4c4e5108c3a04c8cbed8219e817d6790edb42e337",
+  "lease_owner_token": "",
+  "lease_version": 0,
+  "manifest_sha256": "sha256:7d82589c5773ec2156d4f5c30d7e0e2f6a58e747d92f00668b56e2c399beb8b2",
+  "operation_id": "OP-0f30900b398045cc",
+  "phase": "RESULT_WRITTEN",
+  "request_file_sha256": "78f374b1a85dda38ce9be0beb5ec6d93818a62c9fd9f9aadb10c1d6822e39902",
+  "schema_version": "shadowbot-commit-batch-phase-1.0",
+  "side_effect_state": "UNKNOWN",
+  "task_id": "BATCHTASK-0f30900b398045cc",
+  "total_count": 1,
+  "updated_at": "2026-07-23T11:31:30.812365+00:00",
+  "worker_id": "<REDACTED_DEVICE>"
+}

@@ -28,7 +28,7 @@ if errorlevel 1 (
 )
 
 echo Starting PRA web console at http://%HOST%:%PORT% ...
-start "" "http://%HOST%:%PORT%/"
+start "" "http://%HOST%:%PORT%/dashboard"
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\start_local.ps1" -HostName "%HOST%" -Port %PORT% %SKIP_ENV_CHECK%
 set "EXIT_CODE=%ERRORLEVEL%"

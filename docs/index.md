@@ -2,13 +2,23 @@
 
 本文档是当前项目文档入口。项目说明文本以中文为主，英文键名和代码标识保持原样。
 
+运行态业务数据以 SQLite 为中心，当前结构版本为 v12。v9 使用“平台 + 品种 + 等级”作为 `listing_status` 业务身份，v10 将任务旧价结构化，v11 增加单次请求的 ShadowBot 多商品 COMMIT 批次账本，v12 增加逐商品操作/尝试身份、活动写锁、观察时间和技术回执。Excel 继续承担商品、规则等主数据输入，不是运行态任务数据库。
+
 ## 当前状态与入口
 
 - [project_current_status.md](project_current_status.md)：当前项目定位、已完成能力、主控流程、安全边界和下一步优先级。
+- [reports/task12_final_handoff_20260723.md](reports/task12_final_handoff_20260723.md)：任务12当前实现、正式合同、实机证据、已知限制和审查步骤的最终交接入口。
+- [reports/task12_review_remediation_20260723.md](reports/task12_review_remediation_20260723.md)：针对任务12审查问题的接续修复记录；以该文档说明 v12 合同、原子导入和待补实机证据，不覆盖原交接报告。
+- [evidence/task12/index.md](evidence/task12/index.md)：任务12正常 COMMIT 与 UNKNOWN→RECONCILE 的 PR 内脱敏原始证据及自动复算入口。
+- [reports/task12_development_report_20260723.md](reports/task12_development_report_20260723.md)：任务12开发成果、问题回溯、修复方法和防复发规则。
+- [reports/task12_evidence_index_20260723.md](reports/task12_evidence_index_20260723.md)：任务12代表性实机 Run ID、结果 SHA-256、归档位置和审查核对项。
+- [task12_reusable_assets.md](task12_reusable_assets.md)：后续任务可直接复用的代码、合同、测试、运行流程和安全门禁。
 - [../README.md](../README.md)：快速启动、环境变量、cpolar / Mobile Review、飞书测试通知和测试命令。
 - [../项目注意事项.md](../项目注意事项.md)：项目级注意事项。
 
 ## 业务与决策规则
+
+- [shadowbot_listing_status_integration.md](shadowbot_listing_status_integration.md)：当前任务12价格快照、正式任务字段、v4 多商品请求、页面身份、结果导入和状态回写规范。
 
 - [business_decision_spec.md](business_decision_spec.md)：鲜切花预测性销售业务决策规则。
 - [project_overview.md](project_overview.md)：项目背景和早期架构说明。当前真实进度以 `project_current_status.md` 为准。
@@ -50,20 +60,22 @@
 - `/notifications`：通知排障。
 - `/execution-logs`：执行日志入口。
 - `/business-inputs`：业务输入入口。
+- `/task-generator`：校验业务输入、预览并生成待处理任务；确认后同时导出工作簿并写入任务中心。单规则模式会解析实际平台，并为同一次生成的商品任务分配共享规则组 ID、截止时间和派生组状态；每个商品任务仍保留唯一任务 ID。
 - `/system`：配置检查与飞书测试通知。
 
-## 影刀与真实平台接入实验
+## 影刀与真实平台接入
 
-- [shadowbot_wechat_exploration_status_and_plan.md](shadowbot_wechat_exploration_status_and_plan.md)：影刀控制桌面微信小程序的探索状态、元素策略和后续计划。
-- [shadowbot_wechat_price_update_development_spec.md](shadowbot_wechat_price_update_development_spec.md)：影刀微信小程序商品改价流程开发规范。
-- [shadowbot_file_queue_operations.md](shadowbot_file_queue_operations.md)：无 OpenAPI 常驻文件队列、Worker、Result Importer、Queue Watchdog 和恢复操作手册。
+- [reports/task12_final_handoff_20260723.md](reports/task12_final_handoff_20260723.md)：任务12单平台多商品正式改价闭环的主交接文档。
+- [shadowbot_listing_status_integration.md](shadowbot_listing_status_integration.md)：任务中心、SKU 映射、v4 COMMIT、完整页面快照和 SQLite 回写合同。
+- [shadowbot_file_queue_operations.md](shadowbot_file_queue_operations.md)：无 OpenAPI 常驻文件队列、Worker、Result Importer、Queue Watchdog、生命周期记录和恢复操作手册。
+- [shadowbot_markdown_report.md](shadowbot_markdown_report.md)：人工可读报告的结果、逐商品证据、数据库回读和计数要求。
 - [reports/shadowbot_fault_injection_20260625.md](reports/shadowbot_fault_injection_20260625.md)：2026-06-25 核心故障注入结果报告。
 
 ## 运维与验收
 
 - [运行与排错手册.md](运行与排错手册.md)：运行与常见排错。
 - [阶段验收清单.md](阶段验收清单.md)：阶段验收检查项。
-- [shadowbot_filequeue_real_machine_acceptance.md](shadowbot_filequeue_real_machine_acceptance.md)：ShadowBot 文件队列分阶段实机验收、校验器和当前现场记录。
+- [reports/task12_final_handoff_20260723.md](reports/task12_final_handoff_20260723.md)：当前多商品 COMMIT 的正式成功、安全阻断、非默认视口和性能证据。
 - [reports/shadowbot_filequeue_real_machine_acceptance_20260701.md](reports/shadowbot_filequeue_real_machine_acceptance_20260701.md)：2026-07-01 文件队列实机总体验收结论、修复项和生产观察边界。
 - [reports/shadowbot_8h_observation_failure_20260702.md](reports/shadowbot_8h_observation_failure_20260702.md)：首轮 8 小时观察失败的时间线、Windows heartbeat 文件占用、固定索引商品漏捕获、Importer 瞬时 I/O 误隔离及修复方案。
 - [reports/shadowbot_8h_readonly_observation_pass_20260703.md](reports/shadowbot_8h_readonly_observation_pass_20260703.md)：修复后第三轮 8 小时 READ_ONLY 连续运行的检查点、证据、最终状态和通过结论。
@@ -76,31 +88,42 @@
 - [reports/risk_fix_report_20260610.md](reports/risk_fix_report_20260610.md)：Code Review 后高中低风险问题修复报告。
 - [reports/e2e_flow_report_20260610_055957.md](reports/e2e_flow_report_20260610_055957.md)：最新主控流程端到端测试报告。
 
+## 历史归档
+
+- [archive/README.md](archive/README.md)：归档规则和当前事实来源。
+- [archive/shadowbot_pre_task12/shadowbot_wechat_exploration_status_and_plan.md](archive/shadowbot_pre_task12/shadowbot_wechat_exploration_status_and_plan.md)：任务12之前的元素探索记录。
+- [archive/shadowbot_pre_task12/shadowbot_wechat_price_update_development_spec.md](archive/shadowbot_pre_task12/shadowbot_wechat_price_update_development_spec.md)：已被 v4 多商品合同替代的单商品开发规范。
+- [archive/shadowbot_pre_task12/shadowbot_filequeue_real_machine_acceptance.md](archive/shadowbot_pre_task12/shadowbot_filequeue_real_machine_acceptance.md)：2026-07-01 单商品分阶段验收流程。
+
+归档文档只用于历史追溯，不得覆盖当前状态、合同或运行手册。
+
 ## 当前下一步
 
 Code Review 后高中低风险问题已完成修复，系统冒烟测试、全量单元测试和端到端流程测试均已通过。
 
 当前真实平台 / RPA 状态：
 
-- 已完成影刀控制桌面微信小程序的真实平台 UI 自动化实验。
-- 已完成 `READ_ONLY/FILL_PREVIEW/COMMIT/RECONCILE` 垂直切片、安全边界验证和核心故障注入。
-- 已完成 `ShadowBotExecutor`、常驻文件队列 runner、Result Importer、Queue Watchdog、自动只读对账和 Web 队列状态入口。
+- 已完成任务中心到蚂蚁花团供应商小程序的单平台、多商品、单次请求 v4 COMMIT 闭环；按页面实时位置严格串行执行，不依赖任务输入顺序。
+- 已完成写操作前整页预扫描、全目标唯一匹配、全批次旧价门禁、提交后逐商品独立回读和完整页面状态回传。
+- 已完成 `ShadowBotExecutor`、v4 批次账本、常驻文件队列 runner、Result Importer、Queue Watchdog、自动只读对账和 Web 队列状态入口。
 - 已完成 8 小时 READ_ONLY 常驻 Worker 连续运行验收；长期证据归档和运营告警闭环仍待完成。
 - 已完成提交意图后 `stop.signal` 实机验收，以及真实商品 `COMMIT -> UNKNOWN -> 自动 RECONCILE -> VERIFIED` 验收。
+- 最终暖态四商品批次 4/4 `VERIFIED`，总用时 `51.094 秒`；READ_ONLY 完整页面结束标记样本为 1 次扫描、0 次滚动、`27.445 秒`。
 - 暂不承诺无人值守生产改价。
 
 下一步优先级：
 
-1. 持续运行系统冒烟测试脚本，保持主控流程测试基线稳定。
-2. 在已完成 8 小时观察、提交意图后停止和 UNKNOWN 自动对账验收的基础上，补充长期告警、磁盘清理、证据保留和服务账号运维样本。
-3. 为元素版本漂移和白屏建立可重复的专用测试夹具；登录、网络和证据上传失败的实机故障注入已经完成。
-4. 进入下一轮功能开发前，先做小范围设计审查，避免绕过运行态 service 边界。
-5. 继续打磨业务输入、Web 可用性和运行态排障体验。
+1. 任务12审查修复版的正常四商品 COMMIT 与受控 UNKNOWN→唯一 RECONCILE 实机证据均已完成，详见接续修复报告和证据索引。
+2. 整理最终 GitHub PR，由审查方检查任务12代码、原交接、接续修复文档和实机证据；审查通过后再修改任务状态。
+3. 进入任务13，复用任务12的合同、队列、身份、账本和副作用状态机，新增上下架及 OFFLINE 跨页面对账。
+4. 补充长期告警、磁盘清理、证据保留和服务账号运维样本，并分别定义冷态/暖态耗时口径。
+5. 为元素版本漂移和白屏建立可重复的专用测试夹具；登录、网络和证据上传失败的实机故障注入已经完成。
+6. 持续运行系统冒烟和 ShadowBot 成功基线测试，避免后续任务重写已验证 COMMIT 链路。
 
 当前不优先做：
 
 - 不承诺无人值守生产改价。
-- 不扩大到多平台、多 SKU 并发执行。
+- 不扩大到跨平台混合批次或多 Worker 并发执行；当前多商品仍由单 Worker 严格串行处理。
 - 不接 AI Agent 自动决策。
 - 不迁移 Excel 主数据。
 - 不新增完整权限系统。

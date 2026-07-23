@@ -92,6 +92,7 @@ class PricingServiceTests(unittest.TestCase):
         self.assertTrue(price_rule_matches(variety_rule, self.product, "蚂蚁"))
         self.assertTrue(price_rule_matches(grade_rule, self.product, "蚂蚁"))
         self.assertTrue(price_rule_matches(platform_rule, self.product, "蚂蚁"))
+        self.assertTrue(price_rule_matches(platform_rule, self.product, "蚂蚁花团供应商"))
         self.assertFalse(price_rule_matches(platform_rule, self.product, "珍情"))
         self.assertTrue(price_rule_matches(platform_grade_rule, self.product, "珍情"))
 
@@ -139,6 +140,30 @@ class PricingServiceTests(unittest.TestCase):
             ],
         )
         self.assertEqual(percent_decision.rule_price, Decimal("9.00"))
+
+    def test_relative_price_uses_current_platform_old_price(self) -> None:
+        service = PricingService(ai_provider=NullAISuggestionProvider())
+        decision = service.calculate(
+            self.product,
+            "蚂蚁",
+            [_rule("relative", markup_value="5", rounding_rule=RoundingRule.NONE)],
+            old_price=Decimal("23.40"),
+            require_old_price=True,
+        )
+        self.assertEqual(decision.rule_price, Decimal("28.40"))
+        self.assertEqual(decision.decision_trace["rule_steps"][0], "old_price=23.40")
+        self.assertEqual(decision.expected_old_price, Decimal("23.40"))
+
+    def test_relative_price_fails_closed_when_old_price_is_required(self) -> None:
+        service = PricingService(ai_provider=NullAISuggestionProvider())
+        with self.assertRaises(ValidationError) as context:
+            service.calculate(
+                self.product,
+                "蚂蚁",
+                [_rule("relative")],
+                require_old_price=True,
+            )
+        self.assertIn("缺少上架状态当前价格", str(context.exception))
 
 
 if __name__ == "__main__":

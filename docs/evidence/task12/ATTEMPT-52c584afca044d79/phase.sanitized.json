@@ -1,0 +1,19 @@
+{
+  "batch_id": "BATCH-T12-REMEDIATION-COMMIT-20260723-01",
+  "contract_version": 4,
+  "execution_attempt_id": "ATTEMPT-52c584afca044d79",
+  "execution_mode": "COMMIT",
+  "instruction_hash": "sha256:39068107702f6669b154e98cc070c33e02e2d547d04932433f55b8771d5743d6",
+  "lease_owner_token": "",
+  "lease_version": 0,
+  "manifest_sha256": "sha256:880a883c80b6e2af76def524e63429e628bd33d2de57a7ad2b941ab1602a7957",
+  "operation_id": "OP-52c584afca044d79",
+  "phase": "RESULT_WRITTEN",
+  "request_file_sha256": "8f3d9b3fea662637c07e23421459ef7b6b37837ab46d72f126fdb186c809c052",
+  "schema_version": "shadowbot-commit-batch-phase-1.0",
+  "side_effect_state": "VERIFIED",
+  "task_id": "BATCHTASK-52c584afca044d79",
+  "total_count": 4,
+  "updated_at": "2026-07-23T10:45:42.820028+00:00",
+  "worker_id": "<REDACTED_DEVICE>"
+}
