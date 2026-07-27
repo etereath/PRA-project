@@ -1550,8 +1550,9 @@ def _build_write_items(
                 raise ValidationError(str(exc)) from exc
         elif "target_price" in raw or "target_inventory" in raw:
             raise ValidationError("SET_OFFLINE 不得携带目标价格或目标库存。")
-        item["item_payload_sha256"] = sha256_json(
-            _item_payload(platform_name, item)
+        item["item_payload_sha256"] = compute_listing_item_payload_hash(
+            platform_name,
+            item,
         )
         item["item_id"] = _stable_id(
             "ITEM",
@@ -1669,9 +1670,9 @@ def _validate_write_items(
             item["expected_grade"],
         ):
             raise ValidationError("page_identity_key 不匹配。")
-        if item.get("item_payload_sha256") != sha256_json(
-            _item_payload(platform_name, item)
-        ):
+        if item.get(
+            "item_payload_sha256"
+        ) != compute_listing_item_payload_hash(platform_name, item):
             raise ValidationError("item_payload_sha256 不匹配。")
         if item.get("item_id") != _stable_id(
             "ITEM",
@@ -1899,6 +1900,15 @@ def _item_payload(platform_name: str, item: Mapping[str, Any]) -> dict[str, Any]
         "target_inventory": item.get("target_inventory"),
         "task_expires_at": item.get("task_expires_at"),
     }
+
+
+def compute_listing_item_payload_hash(
+    platform_name: str,
+    item: Mapping[str, Any],
+) -> str:
+    """Hash the normalized task execution payload bound to one v5 item."""
+
+    return sha256_json(_item_payload(platform_name, item))
 
 
 def _validate_development_confirmation(

@@ -17,12 +17,14 @@ try:
         build_v4_recovery_result,
         canonical_positive_price,
         derive_v4_batch_semantics,
+        derive_v5_batch_semantics,
         normalize_contract_grade,
         normalize_contract_sku,
         normalize_contract_text,
         sha256_json,
         v4_result_counts,
         v4_result_item_skeleton,
+        v5_result_counts,
     )
 except ImportError:
     try:
@@ -30,24 +32,28 @@ except ImportError:
             build_v4_recovery_result,
             canonical_positive_price,
             derive_v4_batch_semantics,
+            derive_v5_batch_semantics,
             normalize_contract_grade,
             normalize_contract_sku,
             normalize_contract_text,
             sha256_json,
             v4_result_counts,
             v4_result_item_skeleton,
+            v5_result_counts,
         )
     except ImportError:
         from shadowbot_contract_primitives import (
             build_v4_recovery_result,
             canonical_positive_price,
             derive_v4_batch_semantics,
+            derive_v5_batch_semantics,
             normalize_contract_grade,
             normalize_contract_sku,
             normalize_contract_text,
             sha256_json,
             v4_result_counts,
             v4_result_item_skeleton,
+            v5_result_counts,
         )
 
 
@@ -741,70 +747,8 @@ def _v5_failed_result(
         ):
             if name in phase_item:
                 items[-1][name] = phase_item.get(name)
-    counts = {
-        "batch_target_count": len(items),
-        "attempted_count": sum(
-            1
-            for item in items
-            if item["detail_save_clicked"] or item["action_confirm_clicked"]
-        ),
-        "verified_count": sum(
-            1
-            for item in items
-            if item["operation_result"] in {"VERIFIED", "ALREADY_APPLIED"}
-        ),
-        "verified_applied_count": sum(
-            1
-            for item in items
-            if item["operation_result"] == "VERIFIED"
-        ),
-        "already_applied_count": sum(
-            1
-            for item in items
-            if item["operation_result"] == "ALREADY_APPLIED"
-        ),
-        "unknown_count": sum(
-            1
-            for item in items
-            if item["operation_result"] == "NEEDS_RECONCILIATION"
-        ),
-        "partial_effect_count": sum(
-            1
-            for item in items
-            if item["operation_result"] == "PARTIALLY_APPLIED"
-        ),
-        "not_attempted_count": sum(
-            1
-            for item in items
-            if item["operation_result"] == "NOT_ATTEMPTED"
-        ),
-        "failed_count": sum(
-            1
-            for item in items
-            if item["operation_result"] == "NOT_APPLIED"
-        ),
-        "not_applied_count": sum(
-            1
-            for item in items
-            if item["operation_result"] == "NOT_APPLIED"
-        ),
-    }
-    if counts["unknown_count"]:
-        batch_status = "UNKNOWN"
-        side_effect_state = "UNKNOWN"
-    elif counts["partial_effect_count"]:
-        batch_status = "PARTIAL"
-        side_effect_state = "PARTIAL"
-    elif counts["verified_count"]:
-        batch_status = "PARTIAL"
-        side_effect_state = (
-            "VERIFIED"
-            if counts["verified_applied_count"]
-            else "NOT_APPLIED"
-        )
-    else:
-        batch_status = "FAILED"
-        side_effect_state = "NOT_APPLIED"
+    counts = v5_result_counts(items)
+    semantics = derive_v5_batch_semantics(counts)
     result = {
         "schema_version": V5_RESULT_SCHEMA_VERSION,
         "contract_version": V5_CONTRACT_VERSION,
@@ -829,16 +773,7 @@ def _v5_failed_result(
         "ended_at": observed_at,
         "items": items,
         "counts": counts,
-        "batch_status": batch_status,
-        "status": batch_status,
-        "run_success_flag": False,
-        "business_operation_completed": counts["attempted_count"] > 0,
-        "side_effect_state": side_effect_state,
-        "requires_manual_review": bool(
-            counts["unknown_count"] or counts["partial_effect_count"]
-        ),
-        "reconciliation_pending": counts["unknown_count"] > 0,
-        "partial_effect_count": counts["partial_effect_count"],
+        **semantics,
         "error_code": str(error_code or "WORKER_EXECUTION_FAILED"),
         "error_message": str(error_message or "")[:1000],
         "retryable": False,

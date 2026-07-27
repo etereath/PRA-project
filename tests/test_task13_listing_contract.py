@@ -625,6 +625,27 @@ def test_v5_count_identity_and_unknown_priority() -> None:
     assert semantics["requires_manual_review"] is True
 
 
+@pytest.mark.parametrize(
+    ("outcomes", "expected_status"),
+    [
+        (["NOT_ATTEMPTED"], "FAILED"),
+        (["NOT_APPLIED", "NOT_ATTEMPTED"], "FAILED"),
+        (["VERIFIED", "NOT_ATTEMPTED"], "PARTIAL"),
+        (["VERIFIED", "NEEDS_RECONCILIATION"], "UNKNOWN"),
+        (["PARTIALLY_APPLIED", "NOT_ATTEMPTED"], "PARTIAL"),
+    ],
+)
+def test_v5_shared_batch_terminal_semantics_matrix(
+    outcomes: list[str],
+    expected_status: str,
+) -> None:
+    counts = v5_result_counts(
+        [{"operation_result": outcome} for outcome in outcomes]
+    )
+
+    assert derive_v5_batch_semantics(counts)["batch_status"] == expected_status
+
+
 def test_v5_result_validator_uses_shared_semantics(
     identity_mapping: dict[str, dict[str, str]],
 ) -> None:

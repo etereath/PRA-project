@@ -28,6 +28,7 @@ from app.services.shadowbot_listing_action_contract import (
     build_listing_action_reconcile_request,
     build_listing_action_manifest,
     build_listing_action_request,
+    compute_listing_item_payload_hash,
     required_development_confirmation,
     validate_listing_action_request,
     validate_listing_action_result,
@@ -41,7 +42,13 @@ from app.services.shadowbot_listing_sync import (
     _project_online_status,
     mapping_source_version,
 )
-from app.shadowbot_listing_contract import V5_GATE_SUMMARY_SCHEMA_VERSION
+from app.shadowbot_contract_primitives import canonical_positive_price
+from app.shadowbot_listing_contract import (
+    V5_GATE_SUMMARY_SCHEMA_VERSION,
+    canonical_nonnegative_inventory,
+    derive_v5_batch_semantics,
+    v5_result_counts,
+)
 
 
 def load_identity_mapping(mapping_path: Path) -> dict[str, dict[str, str]]:
@@ -1182,7 +1189,8 @@ def _persist_prepared_write_batch(
     *,
     corrective_authorizations: list[dict[str, str]] | None = None,
 ) -> None:
-    now = datetime.now(UTC).isoformat()
+    now_value = datetime.now(UTC)
+    now = now_value.isoformat()
     connection = repository.connect_write()
     try:
         connection.execute("BEGIN IMMEDIATE")
@@ -1211,6 +1219,73 @@ def _persist_prepared_write_batch(
             ):
                 raise ValidationError(
                     "任务在 COMMIT 创建前已变化：" + item["source_task_id"]
+                )
+            try:
+                current_expires_at = _parse_aware(task["expires_at"])
+                current_action = str(task["action_type"])
+                expected_target_status = (
+                    "online" if current_action == "set_online" else "offline"
+                )
+                current_target_status = str(
+                    task["target_status"] or ""
+                ).strip().lower()
+                current_item = dict(item)
+                current_item.update(
+                    {
+                        "internal_sku": str(
+                            task["internal_sku"] or ""
+                        ).strip().upper(),
+                        "action_type": current_action,
+                        "expected_old_status": (
+                            "offline"
+                            if current_action == "set_online"
+                            else "online"
+                        ),
+                        "target_status": current_target_status,
+                        "task_expires_at": current_expires_at.isoformat(),
+                    }
+                )
+                if current_target_status != expected_target_status:
+                    raise ValueError("task target status changed")
+                if current_action == "set_online":
+                    current_item["target_price"] = canonical_positive_price(
+                        task["target_price"],
+                        reject_float=True,
+                    )
+                    current_item["target_inventory"] = (
+                        canonical_nonnegative_inventory(
+                            task["target_inventory"]
+                        )
+                    )
+                else:
+                    if (
+                        task["target_price"] is not None
+                        or task["target_inventory"] is not None
+                    ):
+                        raise ValueError(
+                            "set-offline task carries write detail"
+                        )
+                    current_item["target_price"] = None
+                    current_item["target_inventory"] = None
+                current_platform = str(
+                    task["platform_name"] or ""
+                ).strip()
+                current_payload_hash = compute_listing_item_payload_hash(
+                    current_platform,
+                    current_item,
+                )
+            except (TypeError, ValueError, ValidationError) as exc:
+                raise ValidationError(
+                    "任务在 COMMIT 创建前执行载荷已变化："
+                    + item["source_task_id"]
+                ) from exc
+            if (
+                current_expires_at <= now_value
+                or current_payload_hash != item["item_payload_sha256"]
+            ):
+                raise ValidationError(
+                    "任务在 COMMIT 创建前执行载荷已变化："
+                    + item["source_task_id"]
                 )
             blocking_lock = connection.execute(
                 """
@@ -1960,37 +2035,19 @@ def _recompute_listing_batch_counts(
         """,
         (batch_id,),
     ).fetchall()
-    counts: dict[str, Any] = {
-        "batch_target_count": len(rows),
-        "verified_count": 0,
-        "unknown_count": 0,
-        "partial_effect_count": 0,
-        "not_attempted_count": 0,
-        "failed_count": 0,
-    }
-    for row in rows:
-        outcome = str(row["operation_result"] or "").upper()
-        if outcome == "VERIFIED":
-            counts["verified_count"] += 1
-        elif outcome == "NEEDS_RECONCILIATION":
-            counts["unknown_count"] += 1
-        elif outcome == "PARTIALLY_APPLIED":
-            counts["partial_effect_count"] += 1
-        elif outcome in {"", "NOT_ATTEMPTED"}:
-            counts["not_attempted_count"] += 1
-        else:
-            counts["failed_count"] += 1
-    if counts["unknown_count"]:
-        batch_status = "UNKNOWN"
-    elif counts["partial_effect_count"]:
-        batch_status = "PARTIAL"
-    elif counts["verified_count"] == counts["batch_target_count"]:
-        batch_status = "VERIFIED"
-    elif counts["verified_count"] or counts["not_attempted_count"]:
-        batch_status = "PARTIAL"
-    else:
-        batch_status = "FAILED"
-    counts["batch_status"] = batch_status
+    result_items = [
+        {
+            "operation_result": (
+                str(row["operation_result"] or "").strip().upper()
+                or "NOT_ATTEMPTED"
+            )
+        }
+        for row in rows
+    ]
+    counts = v5_result_counts(result_items)
+    counts["batch_status"] = derive_v5_batch_semantics(counts)[
+        "batch_status"
+    ]
     return counts
 
 

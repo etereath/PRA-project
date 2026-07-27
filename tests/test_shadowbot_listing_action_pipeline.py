@@ -5,6 +5,7 @@ from decimal import Decimal
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -22,6 +23,7 @@ from app.services.shadowbot_listing_action_contract import (
 )
 from app.services.shadowbot_listing_action_pipeline import (
     _project_verified_listing,
+    _recompute_listing_batch_counts,
     ensure_listing_action_reconcile_attempt,
     import_listing_action_result,
     propose_listing_action_batch,
@@ -392,6 +394,147 @@ def test_review_created_after_proposal_is_rechecked_inside_publish_transaction(
             "WHERE batch_id = ?",
             (proposal["manifest"]["batch_id"],),
         ).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        ("platform_name", "其他平台"),
+        ("target_price", "23.00"),
+        ("target_inventory", 9),
+        ("target_status", "offline"),
+        (
+            "expires_at",
+            (datetime.now(UTC) - timedelta(minutes=1)).isoformat(),
+        ),
+    ],
+)
+def test_task_execution_payload_is_rechecked_inside_publish_transaction(
+    tmp_path: Path,
+    changed_field: str,
+    changed_value: object,
+) -> None:
+    repository = _repository(tmp_path)
+    _seed_waiting_snapshot(repository, tmp_path)
+    _insert_set_online_task(repository)
+    proposal = propose_listing_action_batch(
+        repository,
+        batch_id=(
+            "BATCH-SET-ONLINE-TASK-TOCTOU-"
+            + changed_field.replace("_", "-").upper()
+        ),
+        task_ids=["TASK-SET-ONLINE-0001"],
+        mapping_path=_mapping_file(
+            tmp_path / f"mapping-task-toctou-{changed_field}.json"
+        ),
+    )
+    with repository.connect_write() as connection, connection:
+        connection.execute(
+            f"UPDATE tasks SET {changed_field} = ? WHERE task_id = ?",
+            (changed_value, "TASK-SET-ONLINE-0001"),
+        )
+
+    queue_dir = tmp_path / f"queue-task-toctou-{changed_field}"
+    with pytest.raises(ValidationError, match="执行载荷已变化"):
+        publish_listing_action_batch(
+            repository,
+            ShadowBotFileQueueRunner(queue_dir),
+            proposal=proposal,
+            applet_uri="weixin://launchapplet/test",
+            confirmation_text=proposal["required_confirmation"],
+            confirmed_by="tester",
+            execution_attempt_id=(
+                "ATTEMPT-SET-ONLINE-TASK-TOCTOU-"
+                + changed_field.replace("_", "-").upper()
+            ),
+        )
+
+    batch_id = proposal["manifest"]["batch_id"]
+    item = proposal["manifest"]["items"][0]
+    with repository.connect_read() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM shadowbot_batch_registry "
+            "WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM shadowbot_listing_action_batches "
+            "WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM shadowbot_listing_action_batch_items "
+            "WHERE batch_id = ?",
+            (batch_id,),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM shadowbot_operations "
+            "WHERE operation_id = ?",
+            (item["operation_id"],),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM shadowbot_execution_attempts "
+            "WHERE operation_id = ?",
+            (item["operation_id"],),
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM shadowbot_write_locks "
+            "WHERE operation_id = ?",
+            (item["operation_id"],),
+        ).fetchone()[0] == 0
+    assert not list((queue_dir / "inbox").glob("*.json"))
+
+
+@pytest.mark.parametrize(
+    ("outcomes", "expected_status"),
+    [
+        (["NOT_ATTEMPTED"], "FAILED"),
+        (["NOT_APPLIED", "NOT_ATTEMPTED"], "FAILED"),
+        (["VERIFIED", "NOT_ATTEMPTED"], "PARTIAL"),
+        (["VERIFIED", "NEEDS_RECONCILIATION"], "UNKNOWN"),
+        (["PARTIALLY_APPLIED", "NOT_ATTEMPTED"], "PARTIAL"),
+    ],
+)
+def test_pipeline_batch_recompute_uses_shared_v5_terminal_semantics(
+    outcomes: list[str],
+    expected_status: str,
+) -> None:
+    connection = sqlite3.connect(":memory:")
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute(
+            """
+            CREATE TABLE shadowbot_listing_action_batch_items(
+                batch_id TEXT NOT NULL,
+                operation_result TEXT
+            )
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO shadowbot_listing_action_batch_items(
+                batch_id, operation_result
+            ) VALUES ('BATCH-SEMANTICS', ?)
+            """,
+            [(outcome,) for outcome in outcomes],
+        )
+
+        counts = _recompute_listing_batch_counts(
+            connection,
+            "BATCH-SEMANTICS",
+        )
+
+        assert counts["batch_status"] == expected_status
+        assert (
+            counts["verified_count"]
+            + counts["unknown_count"]
+            + counts["partial_effect_count"]
+            + counts["not_attempted_count"]
+            + counts["failed_count"]
+            == counts["batch_target_count"]
+        )
+    finally:
+        connection.close()
 
 
 def test_development_publish_requires_exact_confirmation(

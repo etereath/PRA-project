@@ -19,6 +19,7 @@ try:
     from app.shadowbot_contract_primitives import (
         contract_identity_key,
         derive_v4_batch_semantics,
+        derive_v5_batch_semantics,
         normalize_contract_grade,
         normalize_contract_sku,
         normalize_contract_text,
@@ -26,12 +27,14 @@ try:
         set_online_confirmation_matches,
         sha256_json,
         v4_result_counts,
+        v5_result_counts,
     )
 except ImportError:
     try:
         from .shadowbot_contract_primitives import (
             contract_identity_key,
             derive_v4_batch_semantics,
+            derive_v5_batch_semantics,
             normalize_contract_grade,
             normalize_contract_sku,
             normalize_contract_text,
@@ -39,11 +42,13 @@ except ImportError:
             set_online_confirmation_matches,
             sha256_json,
             v4_result_counts,
+            v5_result_counts,
         )
     except ImportError:
         from shadowbot_contract_primitives import (
             contract_identity_key,
             derive_v4_batch_semantics,
+            derive_v5_batch_semantics,
             normalize_contract_grade,
             normalize_contract_sku,
             normalize_contract_text,
@@ -51,6 +56,7 @@ except ImportError:
             set_online_confirmation_matches,
             sha256_json,
             v4_result_counts,
+            v5_result_counts,
         )
 
 
@@ -5185,75 +5191,8 @@ def _run_listing_sync_v5(args, request, result):
 
 
 def _v5_write_result_semantics(items):
-    counts = {
-        "batch_target_count": len(items),
-        "attempted_count": 0,
-        "verified_count": 0,
-        "verified_applied_count": 0,
-        "already_applied_count": 0,
-        "unknown_count": 0,
-        "partial_effect_count": 0,
-        "not_attempted_count": 0,
-        "failed_count": 0,
-        "not_applied_count": 0,
-    }
-    for item in items:
-        outcome = str(item.get("operation_result") or "").upper()
-        if item.get("detail_save_clicked") or item.get("action_confirm_clicked"):
-            counts["attempted_count"] += 1
-        if outcome == "VERIFIED":
-            counts["verified_count"] += 1
-            counts["verified_applied_count"] += 1
-        elif outcome == "ALREADY_APPLIED":
-            counts["verified_count"] += 1
-            counts["already_applied_count"] += 1
-        elif outcome == "NEEDS_RECONCILIATION":
-            counts["unknown_count"] += 1
-        elif outcome == "PARTIALLY_APPLIED":
-            counts["partial_effect_count"] += 1
-        elif outcome == "NOT_ATTEMPTED":
-            counts["not_attempted_count"] += 1
-        else:
-            counts["failed_count"] += 1
-            if outcome == "NOT_APPLIED":
-                counts["not_applied_count"] += 1
-    if counts["unknown_count"]:
-        status = "UNKNOWN"
-        side_effect = "UNKNOWN"
-    elif counts["partial_effect_count"]:
-        status = "PARTIAL"
-        side_effect = "PARTIAL"
-    elif counts["verified_count"] == counts["batch_target_count"]:
-        status = "VERIFIED"
-        side_effect = (
-            "VERIFIED"
-            if counts["verified_applied_count"]
-            else "NOT_STARTED"
-        )
-    elif counts["verified_count"]:
-        status = "PARTIAL"
-        side_effect = (
-            "VERIFIED"
-            if counts["verified_applied_count"]
-            else "NOT_APPLIED"
-        )
-    else:
-        status = "FAILED"
-        side_effect = (
-            "NOT_APPLIED" if counts["not_applied_count"] else "NOT_STARTED"
-        )
-    return counts, {
-        "batch_status": status,
-        "status": status,
-        "run_success_flag": status == "VERIFIED",
-        "business_operation_completed": counts["attempted_count"] > 0,
-        "side_effect_state": side_effect,
-        "requires_manual_review": bool(
-            counts["unknown_count"] or counts["partial_effect_count"]
-        ),
-        "reconciliation_pending": counts["unknown_count"] > 0,
-        "partial_effect_count": counts["partial_effect_count"],
-    }
+    counts = v5_result_counts(items)
+    return counts, derive_v5_batch_semantics(counts)
 
 
 def _v5_result_item(request_item):
