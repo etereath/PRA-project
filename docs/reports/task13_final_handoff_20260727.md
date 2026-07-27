@@ -226,7 +226,7 @@ UNKNOWN/RECONCILE 账本、历史写锁保留、外键完整性和失败事务�
 最终本地完整回归：
 
 ```text
-657 passed, 3 skipped, 97 subtests passed
+658 passed, 3 skipped, 97 subtests passed
 ```
 
 全部任务12/13脱敏证据校验器通过，包括：

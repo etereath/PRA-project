@@ -1268,14 +1268,18 @@ def _resolve_batch_rule_platform(price_rules_path: Path, listing_rules_path: Pat
 
 def _parse_task_group_required_by(value: str) -> datetime:
     text = str(value or "").strip()
+    current = datetime.now(DISPLAY_TIMEZONE)
     if not text:
-        return datetime.now() + timedelta(minutes=30)
+        return current + timedelta(minutes=30)
     try:
         parsed = datetime.fromisoformat(text)
     except ValueError as exc:
         raise ValidationError("任务组截止时间格式无效") from exc
-    comparable = parsed.replace(tzinfo=None) if parsed.tzinfo is not None else parsed
-    if comparable <= datetime.now():
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        parsed = parsed.replace(tzinfo=DISPLAY_TIMEZONE)
+    else:
+        parsed = parsed.astimezone(DISPLAY_TIMEZONE)
+    if parsed <= current:
         raise ValidationError("任务组截止时间必须晚于当前时间")
     return parsed
 
@@ -2869,7 +2873,9 @@ def default_dashboard_state() -> dict[str, str | bool]:
         "generation_mode": "single_rule",
         "selected_rule": "",
         "task_group_id": "",
-        "required_by": (datetime.now() + timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M"),
+        "required_by": (
+            datetime.now(DISPLAY_TIMEZONE) + timedelta(minutes=30)
+        ).strftime("%Y-%m-%dT%H:%M"),
         "use_mock_ai": True,
     }
 

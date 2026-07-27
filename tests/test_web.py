@@ -49,9 +49,11 @@ from app.repositories.mock_platform_repository import MockPlatformRepository
 from app.services.runtime import ReviewTaskService, ReviewTokenService, RuntimeTaskService
 from app.services.shadowbot_executor import FileDropShadowBotTaskRunner
 from app.web import (
+    DISPLAY_TIMEZONE,
     TABLE_OPTIONS,
     _RUNTIME_SESSIONS,
     _build_task_group_statuses,
+    _parse_task_group_required_by,
     _redact_request_log_value,
     _resolve_table_path,
     application,
@@ -68,6 +70,13 @@ from app.web import (
     render_table_editor_page,
     render_tasks_page,
 )
+
+
+def test_task_group_deadline_is_interpreted_in_beijing_timezone() -> None:
+    deadline = _parse_task_group_required_by("2099-07-27T12:30")
+
+    assert deadline.tzinfo == DISPLAY_TIMEZONE
+    assert deadline.utcoffset() == timedelta(hours=8)
 
 
 def test_request_log_redacts_mobile_review_token() -> None:

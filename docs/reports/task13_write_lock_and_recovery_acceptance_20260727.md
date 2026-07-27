@@ -27,7 +27,7 @@ operation 继续使用自己持有的 `ACTIVE` 锁，其他 operation 仍被阻�
 
 ## phase/result 中断恢复
 
-`tests/test_task13_worker_recovery.py` 覆盖两类关键中断：
+`tests/test_shadowbot_task13_worker_recovery.py` 覆盖两类关键中断：
 
 1. 上架资料已保存，但尚未完成正式上架：
    - 已可靠回读资料的前序商品恢复为 `PARTIALLY_APPLIED`；
@@ -46,7 +46,7 @@ operation 继续使用自己持有的 `ACTIVE` 锁，其他 operation 仍被阻�
 
 执行命令：
 
-`python -m pytest tests/test_task13_listing_contract.py::test_same_sku_write_lock_is_shared_across_all_write_actions tests/test_task13_listing_contract.py::test_post_publish_gate_only_allows_own_active_lock tests/test_task13_worker_recovery.py -q`
+`python -m pytest tests/test_task13_listing_contract.py::test_same_sku_write_lock_is_shared_across_all_write_actions tests/test_task13_listing_contract.py::test_post_publish_gate_only_allows_own_active_lock tests/test_shadowbot_task13_worker_recovery.py -q`
 
 结果：`7 passed`。
 

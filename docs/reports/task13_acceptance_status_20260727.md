@@ -31,7 +31,7 @@
 1. 通过独立 GitHub PR 运行 Windows/Linux/wheel/smoke 和全部证据复算。
 2. 交由审查方复核；审查通过后由审查方决定是否修改任务状态。
 
-最终本地回归已经通过：`657 passed, 3 skipped, 97 subtests passed`；全部现有
+最终本地回归已经通过：`658 passed, 3 skipped, 97 subtests passed`；全部现有
 任务12/13脱敏证据校验器通过，`core-ci.yml` 可被 YAML 解析。
 
 计划中的受控实机写操作已全部完成。后续收尾优先复用现有归档和自动测试，

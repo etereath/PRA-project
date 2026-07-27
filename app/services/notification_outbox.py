@@ -1090,7 +1090,10 @@ def _format_beijing_datetime(value: datetime) -> str:
         display_value = value.replace(tzinfo=BEIJING_TIMEZONE)
     else:
         display_value = value.astimezone(BEIJING_TIMEZONE)
-    return display_value.strftime("%Y-%m-%d %H:%M（北京时间）")
+    # Keep non-ASCII text outside strftime's format string. On Windows,
+    # strftime may encode the format through the active C locale even when
+    # Python UTF-8 mode is enabled.
+    return display_value.strftime("%Y-%m-%d %H:%M") + "（北京时间）"
 
 
 _PAYLOAD_FIELD_WHITELISTS = {
