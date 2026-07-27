@@ -15,7 +15,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from app.enums import TaskActionType, TaskStatus
 from app.exceptions import ValidationError
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.services.listing_automation_gate import evaluate_automation_gate
+from app.services.listing_automation_gate import (
+    evaluate_automation_gate,
+    review_block_reasons,
+)
 from app.services.shadowbot_executor import (
     ShadowBotFileQueueRunner,
     ShadowBotStartBoundaryError,
@@ -1217,6 +1220,22 @@ def _persist_prepared_write_batch(
                 """,
                 (item["write_identity_key"],),
             ).fetchone()
+            review_reasons = review_block_reasons(
+                request["action_type"],
+                _open_review_context(
+                    connection,
+                    platform_name=request["platform_name"],
+                    internal_sku=item["internal_sku"],
+                ),
+            )
+            if review_reasons:
+                raise ValidationError(
+                    "商品存在未解决的写入 Review："
+                    + item["internal_sku"]
+                    + "（"
+                    + ", ".join(review_reasons)
+                    + "）"
+                )
             corrective = corrective_by_key.get(item["write_identity_key"])
             authorized_old_lock = (
                 blocking_lock is not None
@@ -1497,6 +1516,19 @@ def _record_publish_failure(
     now = datetime.now(UTC).isoformat()
     batch_status = "UNKNOWN" if published else "FAILED"
     lock_status = "UNKNOWN" if published else "RELEASED"
+    attempt_status = "START_UNKNOWN" if published else "START_FAILED"
+    side_effect_state = "UNKNOWN" if published else "NOT_STARTED"
+    operation_status = "NEEDS_RECONCILIATION" if published else "PENDING"
+    operation_result = "NEEDS_RECONCILIATION" if published else "NOT_ATTEMPTED"
+    error_code = "RUNNER_START_UNKNOWN" if published else "RUNNER_START_FAILED"
+    error_message = "队列发布边界不确定" if published else "队列未发布，未开始执行"
+    raw_output = _json_text(
+        {
+            "error_code": error_code,
+            "error_message": error_message,
+            "published": published,
+        }
+    )
     with closing(repository.connect_write()) as connection, connection:
         connection.execute(
             "UPDATE shadowbot_listing_action_batches "
@@ -1504,6 +1536,53 @@ def _record_publish_failure(
             (batch_status, now, request["batch_id"]),
         )
         for item in request["items"]:
+            connection.execute(
+                """
+                UPDATE shadowbot_listing_action_batch_items
+                SET detail_effect_state = 'NOT_STARTED',
+                    listing_effect_state = 'NOT_STARTED',
+                    operation_result = ?, error_code = ?, error_message = ?,
+                    updated_at = ?
+                WHERE item_id = ? AND batch_id = ?
+                """,
+                (
+                    operation_result,
+                    error_code,
+                    error_message,
+                    now,
+                    item["item_id"],
+                    request["batch_id"],
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE shadowbot_operations
+                SET status = ?, operation_result = ?, lock_owner = '',
+                    updated_at = ?
+                WHERE operation_id = ?
+                """,
+                (
+                    operation_status,
+                    operation_result,
+                    now,
+                    item["operation_id"],
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE shadowbot_execution_attempts
+                SET status = ?, side_effect_state = ?, ended_at = ?,
+                    raw_output_json = ?
+                WHERE execution_attempt_id = ?
+                """,
+                (
+                    attempt_status,
+                    side_effect_state,
+                    now,
+                    raw_output,
+                    item["item_execution_attempt_id"],
+                ),
+            )
             connection.execute(
                 "UPDATE shadowbot_write_locks SET status = ?, released_at = ?, "
                 "updated_at = ? WHERE operation_id = ?",
@@ -1532,6 +1611,24 @@ def _record_publish_failure(
                     item["source_task_id"],
                 ),
             )
+        counts = _recompute_listing_batch_counts(connection, request["batch_id"])
+        connection.execute(
+            """
+            UPDATE shadowbot_listing_action_batches
+            SET verified_count = ?, unknown_count = ?, partial_effect_count = ?,
+                not_attempted_count = ?, failed_count = ?, updated_at = ?
+            WHERE batch_id = ?
+            """,
+            (
+                counts["verified_count"],
+                counts["unknown_count"],
+                counts["partial_effect_count"],
+                counts["not_attempted_count"],
+                counts["failed_count"],
+                now,
+                request["batch_id"],
+            ),
+        )
 
 
 def _latest_listing_context(
@@ -1614,22 +1711,58 @@ def _open_review_context(
 ) -> list[dict[str, Any]]:
     rows = connection.execute(
         """
-        SELECT reason_code FROM listing_anomaly_cases
+        SELECT reason_code, diagnostic_message, blocked_actions_json
+        FROM listing_anomaly_cases
         WHERE platform_name = ? AND internal_sku = ? AND cleared_at IS NULL
         """,
         (platform_name, internal_sku),
     ).fetchall()
-    return [
-        {
-            "reason_code": str(row["reason_code"]),
-            "blocked_actions": [
-                "update_price",
-                "set_online",
-                "set_offline",
-            ],
-        }
-        for row in rows
-    ]
+    contexts: list[dict[str, Any]] = []
+    for row in rows:
+        payload = _json_value(row["blocked_actions_json"])
+        contexts.append(
+            {
+                "reason_code": str(
+                    row["reason_code"]
+                    or row["diagnostic_message"]
+                    or "LISTING_ANOMALY_REVIEW_OPEN"
+                ),
+                "blocked_actions": payload
+                if isinstance(payload, list)
+                else payload.get("blocked_actions")
+                if isinstance(payload, dict)
+                else None,
+            }
+        )
+
+    review_rows = connection.execute(
+        """
+        SELECT review_task_id, review_type, reason, review_payload_json
+        FROM review_tasks
+        WHERE platform_name = ?
+          AND internal_sku = ?
+          AND review_status = 'pending'
+        ORDER BY created_at, review_task_id
+        """,
+        (platform_name, internal_sku),
+    ).fetchall()
+    for row in review_rows:
+        payload = _json_object(row["review_payload_json"])
+        contexts.append(
+            {
+                "review_task_id": str(row["review_task_id"]),
+                "reason_code": str(
+                    payload.get("reason_code")
+                    or row["reason"]
+                    or row["review_type"]
+                    or "REVIEW_TASK_OPEN"
+                ),
+                # Missing or malformed blocked_actions intentionally remains
+                # invalid so the gate fails closed.
+                "blocked_actions": payload.get("blocked_actions"),
+            }
+        )
+    return contexts
 
 
 def _corrective_retry_authorizations(
@@ -1779,6 +1912,13 @@ def _json_object(value: Any) -> dict[str, Any]:
     except (TypeError, ValueError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _json_value(value: Any) -> Any:
+    try:
+        return json.loads(str(value or ""))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def _outcome_projection(outcome: str) -> tuple[str, str, str, str]:

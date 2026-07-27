@@ -11,9 +11,12 @@ import pytest
 from app.enums import ReviewTaskStatus, TaskActionType, TaskStatus
 from app.exceptions import ValidationError
 from app.listing_identity import listing_identity_key
-from app.models import Task
+from app.models import ReviewTask, Task
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.services.shadowbot_executor import ShadowBotFileQueueRunner
+from app.services.shadowbot_executor import (
+    ShadowBotFileQueueRunner,
+    ShadowBotStartBoundaryError,
+)
 from app.services.shadowbot_listing_action_contract import (
     compute_listing_result_hash,
 )
@@ -200,6 +203,45 @@ def _write_result(request: dict, *, request_file_sha256: str) -> dict:
     return result
 
 
+def _insert_pending_review(
+    repository: SQLiteRuntimeRepository,
+    *,
+    review_task_id: str,
+    internal_sku: str = "SKU-WAITING-001",
+    blocked_actions: object = None,
+    status: ReviewTaskStatus = ReviewTaskStatus.PENDING,
+) -> None:
+    now = datetime.now(UTC)
+    payload = (
+        {}
+        if blocked_actions is None
+        else {
+            "blocked_actions": blocked_actions,
+            "reason_code": "LISTING_DATA_MISMATCH",
+        }
+    )
+    repository.insert_review_tasks(
+        [
+            ReviewTask(
+                review_task_id=review_task_id,
+                trade_date=None,
+                scope_type="sku",
+                scope_key=internal_sku,
+                dedupe_key=review_task_id,
+                source_task_id=None,
+                review_type="listing_data_mismatch",
+                review_status=status,
+                internal_sku=internal_sku,
+                platform_name=PLATFORM,
+                reason="pending review",
+                review_payload=payload,
+                created_at=now,
+                updated_at=now,
+            )
+        ]
+    )
+
+
 def test_proposal_uses_latest_waiting_snapshot_without_persisting_batch(
     tmp_path: Path,
 ) -> None:
@@ -223,6 +265,133 @@ def test_proposal_uses_latest_waiting_snapshot_without_persisting_batch(
             "WHERE batch_id = 'BATCH-SET-ONLINE-0001'"
         ).fetchone()[0]
     assert count == 0
+
+
+def test_pending_review_task_blocks_all_listing_writes(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    _seed_waiting_snapshot(repository, tmp_path)
+    _insert_set_online_task(repository)
+    _insert_pending_review(
+        repository,
+        review_task_id="REVIEW-PENDING-MISMATCH-0001",
+        blocked_actions=["set_online", "set_offline", "update_price"],
+    )
+
+    proposal = propose_listing_action_batch(
+        repository,
+        batch_id="BATCH-SET-ONLINE-REVIEW-BLOCKED-0001",
+        task_ids=["TASK-SET-ONLINE-0001"],
+        mapping_path=_mapping_file(tmp_path / "mapping-review.json"),
+    )
+
+    assert proposal["publishable"] is False
+    assert proposal["gate_items"][0]["decision"] == "BLOCKED"
+    assert "LISTING_DATA_MISMATCH" in proposal["gate_items"][0]["block_reasons"]
+
+
+def test_cancelled_review_task_does_not_block_listing_write(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    _seed_waiting_snapshot(repository, tmp_path)
+    _insert_set_online_task(repository)
+    _insert_pending_review(
+        repository,
+        review_task_id="REVIEW-CANCELLED-MISMATCH-0001",
+        blocked_actions=["set_online"],
+        status=ReviewTaskStatus.CANCELLED,
+    )
+
+    proposal = propose_listing_action_batch(
+        repository,
+        batch_id="BATCH-SET-ONLINE-REVIEW-CANCELLED-0001",
+        task_ids=["TASK-SET-ONLINE-0001"],
+        mapping_path=_mapping_file(tmp_path / "mapping-review-cancelled.json"),
+    )
+
+    assert proposal["publishable"] is True
+
+
+def test_multiple_pending_reviews_take_blocked_action_union_and_fail_closed(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    _seed_waiting_snapshot(repository, tmp_path)
+    _insert_set_online_task(repository)
+    _insert_pending_review(
+        repository,
+        review_task_id="REVIEW-UNION-ONLINE-0001",
+        blocked_actions=["set_online"],
+    )
+    _insert_pending_review(
+        repository,
+        review_task_id="REVIEW-UNION-OFFLINE-0001",
+        blocked_actions=["set_offline"],
+    )
+
+    proposal = propose_listing_action_batch(
+        repository,
+        batch_id="BATCH-SET-ONLINE-REVIEW-UNION-0001",
+        task_ids=["TASK-SET-ONLINE-0001"],
+        mapping_path=_mapping_file(tmp_path / "mapping-review-union.json"),
+    )
+    assert proposal["publishable"] is False
+    assert "LISTING_DATA_MISMATCH" in proposal["gate_items"][0]["block_reasons"]
+
+    repository2 = _repository(tmp_path / "malformed")
+    _seed_waiting_snapshot(repository2, tmp_path / "malformed")
+    _insert_set_online_task(repository2)
+    _insert_pending_review(
+        repository2,
+        review_task_id="REVIEW-MALFORMED-0001",
+        blocked_actions=None,
+    )
+    malformed = propose_listing_action_batch(
+        repository2,
+        batch_id="BATCH-SET-ONLINE-REVIEW-MALFORMED-0001",
+        task_ids=["TASK-SET-ONLINE-0001"],
+        mapping_path=_mapping_file(tmp_path / "mapping-review-malformed.json"),
+    )
+    assert malformed["publishable"] is False
+    assert "REVIEW_BLOCKED_ACTIONS_INVALID" in malformed["gate_items"][0][
+        "block_reasons"
+    ]
+
+
+def test_review_created_after_proposal_is_rechecked_inside_publish_transaction(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    _seed_waiting_snapshot(repository, tmp_path)
+    _insert_set_online_task(repository)
+    mapping_path = _mapping_file(tmp_path / "mapping-review-toctou.json")
+    proposal = propose_listing_action_batch(
+        repository,
+        batch_id="BATCH-SET-ONLINE-REVIEW-TOCTOU-0001",
+        task_ids=["TASK-SET-ONLINE-0001"],
+        mapping_path=mapping_path,
+    )
+    _insert_pending_review(
+        repository,
+        review_task_id="REVIEW-TOCTOU-MISMATCH-0001",
+        blocked_actions=["set_online"],
+    )
+
+    with pytest.raises(ValidationError, match="未解决的写入 Review"):
+        publish_listing_action_batch(
+            repository,
+            ShadowBotFileQueueRunner(tmp_path / "queue-review-toctou"),
+            proposal=proposal,
+            applet_uri="weixin://launchapplet/test",
+            confirmation_text=proposal["required_confirmation"],
+            confirmed_by="tester",
+            execution_attempt_id="ATTEMPT-SET-ONLINE-REVIEW-TOCTOU-0001",
+        )
+
+    with repository.connect_read() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM shadowbot_listing_action_batches "
+            "WHERE batch_id = ?",
+            (proposal["manifest"]["batch_id"],),
+        ).fetchone()[0] == 0
 
 
 def test_development_publish_requires_exact_confirmation(
@@ -255,6 +424,100 @@ def test_development_publish_requires_exact_confirmation(
             "WHERE batch_id = 'BATCH-SET-ONLINE-0002'"
         ).fetchone()[0]
     assert count == 0
+
+
+@pytest.mark.parametrize("published", [False, True])
+def test_publish_boundary_closes_v5_accounting_for_every_item(
+    tmp_path: Path,
+    published: bool,
+) -> None:
+    repository = _repository(tmp_path)
+    _seed_waiting_snapshot(repository, tmp_path)
+    task = _insert_set_online_task(
+        repository,
+        task_id=f"TASK-SET-ONLINE-BOUNDARY-{int(published)}",
+    )
+    proposal = propose_listing_action_batch(
+        repository,
+        batch_id=f"BATCH-SET-ONLINE-BOUNDARY-{int(published)}",
+        task_ids=[task.task_id],
+        mapping_path=_mapping_file(tmp_path / f"mapping-boundary-{int(published)}.json"),
+    )
+
+    class BoundaryRunner:
+        def __init__(self) -> None:
+            self.queue_dir = tmp_path / f"queue-boundary-{int(published)}"
+            for name in ("inbox", "working", "results"):
+                (self.queue_dir / name).mkdir(parents=True, exist_ok=True)
+
+        def start(self, request: dict) -> ShadowBotStartResult:
+            raise ShadowBotStartBoundaryError(
+                "controlled publish boundary",
+                published=published,
+            )
+
+    with pytest.raises(ShadowBotStartBoundaryError):
+        publish_listing_action_batch(
+            repository,
+            BoundaryRunner(),
+            proposal=proposal,
+            applet_uri="weixin://launchapplet/test",
+            confirmation_text=proposal["required_confirmation"],
+            confirmed_by="tester",
+            execution_attempt_id=f"ATTEMPT-SET-ONLINE-BOUNDARY-{int(published)}",
+        )
+
+    item_id = proposal["manifest"]["items"][0]["item_id"]
+    operation_id = proposal["manifest"]["items"][0]["operation_id"]
+    with repository.connect_read() as connection:
+        batch = connection.execute(
+            "SELECT status, unknown_count, not_attempted_count "
+            "FROM shadowbot_listing_action_batches WHERE batch_id = ?",
+            (proposal["manifest"]["batch_id"],),
+        ).fetchone()
+        item = connection.execute(
+            "SELECT operation_result, detail_effect_state, listing_effect_state, "
+            "item_execution_attempt_id "
+            "FROM shadowbot_listing_action_batch_items WHERE item_id = ?",
+            (item_id,),
+        ).fetchone()
+        attempt_id = item["item_execution_attempt_id"]
+        operation = connection.execute(
+            "SELECT status, operation_result FROM shadowbot_operations "
+            "WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+        attempt = connection.execute(
+            "SELECT status, side_effect_state, ended_at "
+            "FROM shadowbot_execution_attempts WHERE execution_attempt_id = ?",
+            (attempt_id,),
+        ).fetchone()
+        lock = connection.execute(
+            "SELECT status FROM shadowbot_write_locks WHERE operation_id = ?",
+            (operation_id,),
+        ).fetchone()
+
+    if published:
+        assert batch["status"] == "UNKNOWN"
+        assert batch["unknown_count"] == 1
+        assert item["operation_result"] == "NEEDS_RECONCILIATION"
+        assert operation["status"] == "NEEDS_RECONCILIATION"
+        assert operation["operation_result"] == "NEEDS_RECONCILIATION"
+        assert attempt["status"] == "START_UNKNOWN"
+        assert attempt["side_effect_state"] == "UNKNOWN"
+        assert lock["status"] == "UNKNOWN"
+    else:
+        assert batch["status"] == "FAILED"
+        assert batch["not_attempted_count"] == 1
+        assert item["operation_result"] == "NOT_ATTEMPTED"
+        assert operation["status"] == "PENDING"
+        assert operation["operation_result"] == "NOT_ATTEMPTED"
+        assert attempt["status"] == "START_FAILED"
+        assert attempt["side_effect_state"] == "NOT_STARTED"
+        assert lock["status"] == "RELEASED"
+    assert item["detail_effect_state"] == "NOT_STARTED"
+    assert item["listing_effect_state"] == "NOT_STARTED"
+    assert attempt["ended_at"] is not None
 
 
 def test_publish_reuses_released_write_lock_for_next_batch(

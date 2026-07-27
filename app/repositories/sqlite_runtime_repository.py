@@ -775,7 +775,7 @@ SCHEMA_V13_SQL = [
         readback_observed_at TEXT,
         operation_result TEXT NOT NULL DEFAULT '' CHECK (
             operation_result IN (
-                '', 'VERIFIED', 'NOT_APPLIED', 'PARTIALLY_APPLIED',
+                '', 'NOT_ATTEMPTED', 'VERIFIED', 'NOT_APPLIED', 'PARTIALLY_APPLIED',
                 'NEEDS_RECONCILIATION'
             )
         ),
@@ -1015,10 +1015,16 @@ def _migrate_shadowbot_operations_to_v13(
         "resolved_at",
         "superseded_by_operation_id",
     }
+    table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'shadowbot_operations'"
+    ).fetchone()
+    table_sql = str(table_row[0] or "").upper() if table_row else ""
     if (
         v13_columns.issubset(columns)
         and int(columns["expected_old_price"][3]) == 0
         and int(columns["target_price"][3]) == 0
+        and "'NOT_ATTEMPTED'" in table_sql
     ):
         return
 
@@ -1043,7 +1049,7 @@ def _migrate_shadowbot_operations_to_v13(
             status TEXT NOT NULL,
             operation_result TEXT NOT NULL DEFAULT '' CHECK (
                 operation_result IN (
-                    '', 'VERIFIED', 'NOT_APPLIED', 'PARTIALLY_APPLIED',
+                    '', 'NOT_ATTEMPTED', 'VERIFIED', 'NOT_APPLIED', 'PARTIALLY_APPLIED',
                     'NEEDS_RECONCILIATION'
                 )
             ),
@@ -1168,6 +1174,104 @@ def _migrate_shadowbot_operations_to_v13(
         "ALTER TABLE shadowbot_operations_v13_new "
         "RENAME TO shadowbot_operations"
     )
+
+
+def _migrate_listing_action_batch_items_to_v13(
+    connection: sqlite3.Connection,
+) -> None:
+    """Allow the explicit NOT_ATTEMPTED publish-boundary outcome on old v13 DBs."""
+
+    table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'shadowbot_listing_action_batch_items'"
+    ).fetchone()
+    table_sql = str(table_row[0] or "").upper() if table_row else ""
+    if not table_row or "'NOT_ATTEMPTED'" in table_sql:
+        return
+
+    connection.execute(
+        "ALTER TABLE shadowbot_listing_action_batch_items "
+        "RENAME TO shadowbot_listing_action_batch_items_v13_old"
+    )
+    connection.execute(
+        """
+        CREATE TABLE shadowbot_listing_action_batch_items (
+            item_id TEXT PRIMARY KEY,
+            batch_id TEXT NOT NULL,
+            source_task_id TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            item_execution_attempt_id TEXT NOT NULL,
+            internal_sku TEXT NOT NULL,
+            expected_product_name TEXT NOT NULL,
+            expected_grade TEXT NOT NULL,
+            item_payload_sha256 TEXT NOT NULL,
+            write_identity_key TEXT NOT NULL,
+            page_identity_key TEXT NOT NULL,
+            expected_old_status TEXT NOT NULL,
+            target_status TEXT NOT NULL,
+            target_price TEXT,
+            target_inventory INTEGER CHECK (
+                target_inventory IS NULL OR target_inventory >= 0
+            ),
+            detail_effect_state TEXT NOT NULL DEFAULT 'NOT_STARTED' CHECK (
+                detail_effect_state IN (
+                    'NOT_STARTED', 'NOT_APPLIED', 'VERIFIED', 'PARTIAL', 'UNKNOWN'
+                )
+            ),
+            listing_effect_state TEXT NOT NULL DEFAULT 'NOT_STARTED' CHECK (
+                listing_effect_state IN (
+                    'NOT_STARTED', 'NOT_APPLIED', 'VERIFIED', 'PARTIAL', 'UNKNOWN'
+                )
+            ),
+            observed_price_before_action TEXT,
+            observed_inventory_before_action INTEGER CHECK (
+                observed_inventory_before_action IS NULL
+                OR observed_inventory_before_action >= 0
+            ),
+            observed_price_after_detail_save TEXT,
+            observed_inventory_after_detail_save INTEGER CHECK (
+                observed_inventory_after_detail_save IS NULL
+                OR observed_inventory_after_detail_save >= 0
+            ),
+            detail_save_clicked_at TEXT,
+            action_clicked_at TEXT,
+            readback_observed_at TEXT,
+            operation_result TEXT NOT NULL DEFAULT '' CHECK (
+                operation_result IN (
+                    '', 'NOT_ATTEMPTED', 'VERIFIED', 'NOT_APPLIED',
+                    'PARTIALLY_APPLIED', 'NEEDS_RECONCILIATION'
+                )
+            ),
+            error_code TEXT NOT NULL DEFAULT '',
+            error_message TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(batch_id)
+                REFERENCES shadowbot_listing_action_batches(batch_id),
+            FOREIGN KEY(source_task_id) REFERENCES tasks(task_id),
+            FOREIGN KEY(operation_id) REFERENCES shadowbot_operations(operation_id),
+            FOREIGN KEY(item_execution_attempt_id)
+                REFERENCES shadowbot_execution_attempts(execution_attempt_id)
+        )
+        """
+    )
+    columns = [
+        "item_id", "batch_id", "source_task_id", "operation_id",
+        "item_execution_attempt_id", "internal_sku", "expected_product_name",
+        "expected_grade", "item_payload_sha256", "write_identity_key",
+        "page_identity_key", "expected_old_status", "target_status",
+        "target_price", "target_inventory", "detail_effect_state",
+        "listing_effect_state", "observed_price_before_action",
+        "observed_inventory_before_action", "observed_price_after_detail_save",
+        "observed_inventory_after_detail_save", "detail_save_clicked_at",
+        "action_clicked_at", "readback_observed_at", "operation_result",
+        "error_code", "error_message", "updated_at",
+    ]
+    names = ", ".join(columns)
+    connection.execute(
+        f"INSERT INTO shadowbot_listing_action_batch_items({names}) "
+        f"SELECT {names} FROM shadowbot_listing_action_batch_items_v13_old"
+    )
+    connection.execute("DROP TABLE shadowbot_listing_action_batch_items_v13_old")
 
 
 def _migrate_shadowbot_write_locks_to_v13(
@@ -1396,6 +1500,28 @@ def _requires_runtime_schema_v13_migration(
     }
     if "action_type" not in operation_columns:
         return True
+    operation_table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'shadowbot_operations'"
+    ).fetchone()
+    operation_table_sql = (
+        str(operation_table_row[0] or "").upper()
+        if operation_table_row is not None
+        else ""
+    )
+    if "'NOT_ATTEMPTED'" not in operation_table_sql:
+        return True
+    action_table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'shadowbot_listing_action_batch_items'"
+    ).fetchone()
+    action_table_sql = (
+        str(action_table_row[0] or "").upper()
+        if action_table_row is not None
+        else ""
+    )
+    if "'NOT_ATTEMPTED'" not in action_table_sql:
+        return True
     lock_foreign_keys = {
         (str(row[3]), str(row[2]), str(row[4]))
         for row in connection.execute(
@@ -1607,6 +1733,7 @@ class SQLiteRuntimeRepository:
                 _backfill_shadowbot_batch_registry(connection)
                 _migrate_shadowbot_operations_to_v13(connection)
                 _migrate_shadowbot_write_locks_to_v13(connection)
+                _migrate_listing_action_batch_items_to_v13(connection)
                 _ensure_listing_status_v13_columns(connection)
                 for statement in SCHEMA_V13_SQL:
                     connection.execute(statement)

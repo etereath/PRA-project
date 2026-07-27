@@ -38,6 +38,7 @@ V5_WRITE_LOCK_STATUSES = frozenset(
 )
 V5_OPERATION_RESULTS = frozenset(
     {
+        "NOT_ATTEMPTED",
         "VERIFIED",
         "NOT_APPLIED",
         "PARTIALLY_APPLIED",

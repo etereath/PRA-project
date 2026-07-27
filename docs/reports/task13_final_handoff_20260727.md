@@ -36,7 +36,11 @@
 - 脱敏实机证据进入仓库，由 Windows 和 Linux CI 独立复算合同、哈希、回执、
   ACK、数据库账本和计数恒等式。
 
-计划中的受控实机验收矩阵已经全部覆盖。当前剩余事项是 GitHub PR 检查和人工审查，
+计划中的平台实机验收项目已经覆盖正常上下架、完整同步、幂等零写、严格串行
+UNKNOWN 及 UNKNOWN→VERIFIED/NOT_APPLIED。资料阶段 `PARTIALLY_APPLIED`、
+`REVIEW_BLOCKED` 全动作阻断、UNKNOWN→RECONCILE→`PARTIALLY_APPLIED` 和人工
+接受部分结果的原子解锁，目前属于控制平面自动化验收，尚无独立真实副作用实机证据。
+这些项目不应再被表述为“平台实机验收全部覆盖”；当前仍需 PR 检查和人工审查，
 不是继续增加真实平台写操作。
 
 ## 2. 当前正式状态语义
@@ -213,8 +217,8 @@ UNKNOWN/RECONCILE 账本、历史写锁保留、外键完整性和失败事务�
 | 严格串行 UNKNOWN | `BATCH-T13-CONTROLLED-UNKNOWN-20260726-01` | 首项成功、次项 UNKNOWN、后续停止 |
 | UNKNOWN→VERIFIED | `BATCH-T13-AUTO-RECONCILE-CONTROLLED-UNKNOWN-20260727-03` | 唯一 RECONCILE 后 `VERIFIED` |
 | UNKNOWN→NOT_APPLIED | `BATCH-T13-UNKNOWN-NOT-APPLIED-20260727-01` | 授权外部恢复后唯一 RECONCILE 为 `NOT_APPLIED` |
-| 跨动作共享写锁 | 自动化交叉矩阵 | 三种动作均被 `ACTIVE / UNKNOWN / REVIEW_BLOCKED` 正确阻断 |
-| phase/result 中断恢复 | 自动化恢复矩阵 | 已知部分副作用不被误记为未尝试 |
+| 跨动作共享写锁 | 控制平面自动化交叉矩阵 | 三种动作均被 `ACTIVE / UNKNOWN / REVIEW_BLOCKED` 正确阻断；尚无独立实机副作用证据 |
+| phase/result 中断恢复 | 控制平面自动化恢复矩阵 | 已知部分副作用不被误记为未尝试；尚无独立实机副作用证据 |
 | Web 运营投影 | 当前真实 v13 数据库 | v5 批次、operation、attempt 和回读事实可见 |
 
 特别说明：`UNKNOWN→NOT_APPLIED` 样本在 UNKNOWN 与 RECONCILE 之间进行了用户明确
@@ -226,7 +230,7 @@ UNKNOWN/RECONCILE 账本、历史写锁保留、外键完整性和失败事务�
 最终本地完整回归：
 
 ```text
-658 passed, 3 skipped, 97 subtests passed
+664 passed, 3 skipped, 97 subtests passed
 ```
 
 全部任务12/13脱敏证据校验器通过，包括：

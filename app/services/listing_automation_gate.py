@@ -62,7 +62,7 @@ def evaluate_automation_gate(
         raise ValueError("invalid automation gate phase")
 
     reasons: list[str] = []
-    reasons.extend(_review_block_reasons(action, open_reviews))
+    reasons.extend(review_block_reasons(action, open_reviews))
     reasons.extend(
         _write_lock_block_reasons(
             phase,
@@ -129,7 +129,7 @@ def evaluate_automation_gate(
     return _blocked(action, sku, phase, ["EXPECTED_WAITING_ONLY"])
 
 
-def _review_block_reasons(
+def review_block_reasons(
     action: str,
     open_reviews: Iterable[Mapping[str, Any]],
 ) -> list[str]:
@@ -147,6 +147,11 @@ def _review_block_reasons(
             reason_code = str(review.get("reason_code") or "").strip().upper()
             reasons.append(reason_code or "LISTING_ANOMALY_REVIEW_OPEN")
     return reasons
+
+
+# Backwards-compatible private alias for callers that imported the helper while
+# the gate module was still internal-only.
+_review_block_reasons = review_block_reasons
 
 
 def _write_lock_block_reasons(
