@@ -29,6 +29,15 @@ from app.models import (
     TaskStatusHistory,
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.review_policy import (
+    allowed_review_statuses,
+    is_execution_failure_review,
+    review_business_decision,
+    review_source_task_ids,
+    review_task_group_id,
+    retry_task_deadline,
+    task_group_id,
+)
 from app.services.execution import ExecutionSimulationService
 from app.services.feishu import build_feishu_signature, is_feishu_success_response
 from app.services.manual_intervention import MANUAL_INTERVENTION_ACTIONS
@@ -265,12 +274,18 @@ class ReviewTaskService:
         self.runtime_task_service = runtime_task_service or RuntimeTaskService(repository)
         self.notification_service = notification_service or OutboxReviewNotificationService(repository)
 
-    def create_from_tasks(self, tasks: list[Task], *, trade_date: date | None = None) -> "ReviewTaskCreationSummary":
-        review_tasks = [
-            _review_task_from_source(task, trade_date=trade_date)
-            for task in tasks
-            if task.action_type in MANUAL_INTERVENTION_ACTIONS
-        ]
+    def create_from_tasks(
+        self,
+        tasks: list[Task],
+        *,
+        trade_date: date | None = None,
+        manual_review_created_at: datetime | None = None,
+    ) -> "ReviewTaskCreationSummary":
+        review_tasks = self._build_review_tasks(
+            tasks,
+            trade_date=trade_date,
+            manual_review_created_at=manual_review_created_at,
+        )
         inserted_review_tasks: list[ReviewTask] = []
         inserted_review_tasks_count = 0
         inserted_notification_logs_count = 0
@@ -315,6 +330,78 @@ class ReviewTaskService:
             notification_errors=notification_errors,
         )
 
+    def _build_review_tasks(
+        self,
+        tasks: list[Task],
+        *,
+        trade_date: date | None,
+        manual_review_created_at: datetime | None,
+    ) -> list[ReviewTask]:
+        eligible = [
+            task
+            for task in tasks
+            if (
+                task.action_type in MANUAL_INTERVENTION_ACTIONS
+                or task.task_status is TaskStatus.MANUAL_REVIEW
+            )
+        ]
+        review_tasks: list[ReviewTask] = []
+        execution_groups: dict[str, list[Task]] = {}
+        for task in eligible:
+            if (
+                task.task_status is TaskStatus.MANUAL_REVIEW
+                and task.action_type not in MANUAL_INTERVENTION_ACTIONS
+            ):
+                group_id = task_group_id(task)
+                execution_groups.setdefault(
+                    group_id or f"task:{task.task_id}",
+                    [],
+                ).append(task)
+                continue
+            review_tasks.append(
+                _review_task_from_source(
+                    task,
+                    trade_date=trade_date,
+                    manual_review_created_at=manual_review_created_at,
+                )
+            )
+
+        all_runtime_tasks = self.repository.list_tasks()
+        for group_key, supplied_tasks in execution_groups.items():
+            actual_group_id = (
+                group_key
+                if not group_key.startswith("task:")
+                else ""
+            )
+            if actual_group_id:
+                group_members = [
+                    task
+                    for task in all_runtime_tasks
+                    if task_group_id(task) == actual_group_id
+                ]
+                actionable_tasks = [
+                    task
+                    for task in group_members
+                    if (
+                        task.task_status is TaskStatus.MANUAL_REVIEW
+                        and task.action_type not in MANUAL_INTERVENTION_ACTIONS
+                    )
+                ]
+            else:
+                group_members = supplied_tasks
+                actionable_tasks = supplied_tasks
+            if not actionable_tasks:
+                continue
+            review_tasks.append(
+                _review_task_from_execution_group(
+                    actionable_tasks,
+                    group_members=group_members,
+                    trade_date=trade_date,
+                    manual_review_created_at=manual_review_created_at,
+                )
+            )
+        return review_tasks
+
     def list_review_tasks(
         self,
         *,
@@ -344,8 +431,60 @@ class ReviewTaskService:
         if review_task.review_status != ReviewTaskStatus.PENDING:
             raise ValidationError(f"review task already handled: {review_task_id}")
         self._validate_transition(review_task.review_status, status)
+        expected_source_task_ids = review_source_task_ids(review_task)
+        source_tasks = [
+            task
+            for task_id in expected_source_task_ids
+            if (task := self.runtime_task_service.get_task(task_id)) is not None
+        ]
+        source_task = source_tasks[0] if source_tasks else None
+        if (
+            status != ReviewTaskStatus.EXPIRED
+            and status not in allowed_review_statuses(review_task, source_task)
+        ):
+            raise ValidationError(
+                "执行失败复核只允许选择“重试任务”或“取消任务”。"
+            )
         now = datetime.now()
-        resolved_payload = resolution_payload or {}
+        resolved_payload = dict(resolution_payload or {})
+        business_decision = review_business_decision(
+            review_task,
+            source_task,
+            status,
+        )
+        if business_decision:
+            resolved_payload["decision"] = business_decision
+            resolved_payload["task_group_id"] = str(
+                review_task.review_payload.get("task_group_id") or ""
+            )
+            resolved_payload["affected_task_ids"] = [
+                task.task_id for task in source_tasks
+            ]
+            resolved_payload["affected_task_count"] = len(source_tasks)
+        retry_required_by = (
+            retry_task_deadline(now)
+            if business_decision == "retry_task"
+            else None
+        )
+        if retry_required_by is not None:
+            resolved_payload["retry_required_by"] = (
+                retry_required_by.isoformat()
+            )
+        if (
+            is_execution_failure_review(review_task, source_task)
+            and status != ReviewTaskStatus.EXPIRED
+        ):
+            expected_source_status = (
+                TaskStatus.PENDING
+                if status == ReviewTaskStatus.APPROVED
+                else TaskStatus.CANCELLED
+            )
+            if (
+                source_task_status is not None
+                and source_task_status != expected_source_status
+            ):
+                raise ValidationError("复核结果与来源任务状态不一致。")
+            source_task_status = expected_source_status
         updated = replace(
             review_task,
             review_status=status,
@@ -355,10 +494,73 @@ class ReviewTaskService:
             resolved_at=now,
             resolution_note=note,
         )
+        if (
+            is_execution_failure_review(review_task, source_task)
+            and source_task_status is not None
+        ):
+            if len(source_tasks) != len(expected_source_task_ids):
+                raise ValidationError("复核任务组中的来源任务不存在或已失效。")
+            task_updates = []
+            for grouped_task in source_tasks:
+                if grouped_task.task_status is not TaskStatus.MANUAL_REVIEW:
+                    raise ValidationError(
+                        f"任务组成员状态已变化，复核未提交：{grouped_task.task_id}"
+                    )
+                self.runtime_task_service._validate_transition(
+                    grouped_task.task_status,
+                    source_task_status,
+                )
+                metadata = {
+                    "review_task_id": review_task_id,
+                    "review_status": status.value,
+                    "business_decision": business_decision,
+                    "task_group_id": resolved_payload.get("task_group_id"),
+                    "affected_task_count": len(source_tasks),
+                    "retry_required_by": (
+                        retry_required_by.isoformat()
+                        if retry_required_by is not None
+                        else None
+                    ),
+                    "actor": actor,
+                    "actor_source": actor_source,
+                    "resolution_note": note,
+                    "resolution_payload_summary": resolution_payload_summary(
+                        resolved_payload
+                    ),
+                }
+                if source_task_metadata_extra:
+                    metadata.update(source_task_metadata_extra)
+                history = TaskStatusHistory(
+                    history_id=uuid4().hex[:12],
+                    task_id=grouped_task.task_id,
+                    from_status=grouped_task.task_status,
+                    to_status=source_task_status,
+                    changed_by=actor,
+                    changed_at=now,
+                    reason=(
+                        f"review_task_group:{review_task_id}:"
+                        f"{business_decision}"
+                    ),
+                    metadata=metadata,
+                )
+                task_updates.append(
+                    (
+                        grouped_task.task_id,
+                        grouped_task.task_status,
+                        source_task_status,
+                        history,
+                    )
+                )
+            self.repository.update_review_task_with_task_statuses(
+                updated,
+                task_updates=task_updates,
+                result_message=note,
+                retry_required_by=retry_required_by,
+            )
+            return updated
         source_task_id: str | None = None
         source_history: TaskStatusHistory | None = None
         if source_task_status is not None and review_task.source_task_id:
-            source_task = self.runtime_task_service.get_task(review_task.source_task_id)
             if source_task is not None and source_task.task_status in {TaskStatus.MANUAL_REVIEW, TaskStatus.PENDING}:
                 self.runtime_task_service._validate_transition(source_task.task_status, source_task_status)
                 metadata = {
@@ -368,6 +570,11 @@ class ReviewTaskService:
                     "actor_source": actor_source,
                     "resolution_note": note,
                     "resolution_payload_summary": resolution_payload_summary(resolved_payload),
+                    "retry_required_by": (
+                        retry_required_by.isoformat()
+                        if retry_required_by is not None
+                        else None
+                    ),
                 }
                 if source_task_metadata_extra:
                     metadata.update(source_task_metadata_extra)
@@ -388,6 +595,7 @@ class ReviewTaskService:
             task_status=source_task_status if source_task_id else None,
             history=source_history,
             result_message=note,
+            retry_required_by=retry_required_by,
         )
         return updated
 
@@ -518,6 +726,92 @@ class ReviewTaskService:
                         summary.notification_logs_created += 1
         return summary
 
+    def renew_overdue_manual_reviews(
+        self,
+        *,
+        now: datetime | None = None,
+        reminder_interval_minutes: int = 30,
+    ) -> "ReviewReminderSummary":
+        if reminder_interval_minutes <= 0:
+            raise ValueError("reminder_interval_minutes must be positive")
+        cutoff = now or datetime.now(timezone.utc)
+        pending_reviews = self.repository.list_pending_review_tasks_due_before(
+            cutoff
+        )
+        summary = ReviewReminderSummary(
+            scanned_review_tasks=len(pending_reviews)
+        )
+        if not isinstance(
+            self.notification_service,
+            OutboxReviewNotificationService,
+        ):
+            summary.errors.append(
+                "review reminder requires OutboxReviewNotificationService"
+            )
+            return summary
+        for review in pending_reviews:
+            source_task = (
+                self.runtime_task_service.get_task(review.source_task_id)
+                if review.source_task_id
+                else None
+            )
+            if (
+                source_task is None
+                or source_task.task_status is not TaskStatus.MANUAL_REVIEW
+            ):
+                summary.skipped_review_tasks += 1
+                continue
+            comparable_cutoff = cutoff
+            if (
+                review.required_by is not None
+                and review.required_by.tzinfo is None
+                and comparable_cutoff.tzinfo is not None
+            ):
+                comparable_cutoff = comparable_cutoff.replace(tzinfo=None)
+            new_required_by = comparable_cutoff + timedelta(
+                minutes=reminder_interval_minutes
+            )
+            renewed = replace(
+                review,
+                required_by=new_required_by,
+                updated_at=comparable_cutoff,
+            )
+            event_version = (
+                "reminder-"
+                + new_required_by.isoformat(timespec="seconds")
+            )
+            notification, compatibility_log = (
+                self.notification_service.outbox_service
+                .build_review_notification_candidate(
+                    renewed,
+                    event_version=event_version,
+                )
+            )
+            try:
+                updated_count, outbox_count = (
+                    self.repository
+                    .renew_review_task_with_notification_outbox(
+                        renewed,
+                        notification,
+                        compatibility_log,
+                        expected_required_by=review.required_by,
+                    )
+                )
+            except Exception as exc:
+                summary.errors.append(
+                    f"{review.review_task_id}: {type(exc).__name__}: {exc}"
+                )
+                continue
+            if updated_count != 1:
+                continue
+            ReviewTokenService(self.repository).revoke_tokens_for_review_task(
+                review.review_task_id,
+                revoked_at=comparable_cutoff,
+            )
+            summary.renewed_review_tasks += 1
+            summary.notification_logs_created += outbox_count
+        return summary
+
     def _validate_transition(self, from_status: ReviewTaskStatus, to_status: ReviewTaskStatus) -> None:
         if from_status == to_status:
             return
@@ -564,8 +858,29 @@ class ReviewTokenService:
 
         raw_token = secrets.token_urlsafe(32)
         token_hash = self._hash_raw_token(raw_token)
-        resolved_actions = allowed_actions or DEFAULT_MOBILE_REVIEW_ACTIONS
-        now = datetime.now()
+        source_task = (
+            self.repository.get_task(review_task.source_task_id)
+            if review_task.source_task_id
+            else None
+        )
+        policy_actions = [
+            status.value
+            for status in allowed_review_statuses(review_task, source_task)
+        ]
+        requested_actions = list(allowed_actions) if allowed_actions is not None else policy_actions
+        resolved_actions = (
+            [action for action in requested_actions if action in policy_actions]
+            if is_execution_failure_review(review_task, source_task)
+            else requested_actions
+        )
+        if not resolved_actions:
+            raise ValidationError(
+                "review token has no actions allowed by the review policy"
+            )
+        if review_task.required_by is not None and review_task.required_by.tzinfo is not None:
+            now = datetime.now(review_task.required_by.tzinfo)
+        else:
+            now = datetime.now()
         review_token = ReviewToken(
             token_id=uuid4().hex[:12],
             review_task_id=review_task_id,
@@ -605,7 +920,10 @@ class ReviewTokenService:
             )
         if review_token.review_task_id != review_task_id:
             return self._invalid("token review_task_id mismatch", review_token, review_task)
-        now = datetime.now()
+        if review_token.expires_at.tzinfo is not None:
+            now = datetime.now(review_token.expires_at.tzinfo)
+        else:
+            now = datetime.now()
         if review_token.expires_at <= now:
             return self._invalid("token expired", review_token, review_task)
         if review_token.revoked_at is not None:
@@ -617,7 +935,15 @@ class ReviewTokenService:
         if action is not None:
             if action not in review_token.allowed_actions:
                 return self._invalid("action not allowed by token", review_token, review_task)
-            if action not in _allowed_mobile_actions_for_review_type(review_task.review_type):
+            source_task = (
+                self.repository.get_task(review_task.source_task_id)
+                if review_task.source_task_id
+                else None
+            )
+            if action not in {
+                status.value
+                for status in allowed_review_statuses(review_task, source_task)
+            }:
                 return self._invalid("action not allowed by review_type", review_token, review_task)
         return ReviewTokenValidationResult(
             is_valid=True,
@@ -1050,6 +1376,19 @@ class ExpireReviewTasksSummary:
         self.errors = errors or []
 
 
+@dataclass(slots=True)
+class ReviewReminderSummary:
+    scanned_review_tasks: int
+    renewed_review_tasks: int = 0
+    skipped_review_tasks: int = 0
+    notification_logs_created: int = 0
+    errors: list[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.errors is None:
+            self.errors = []
+
+
 def _resolve_scope(task: Task, trade_date: date | None) -> tuple[str, str, str | None]:
     if task.scope_key and task.scope_type:
         internal_sku = None if task.internal_sku == "__operation__" else task.internal_sku
@@ -1082,19 +1421,39 @@ def _build_task_dedupe_key(
     )
 
 
-def _review_task_from_source(task: Task, *, trade_date: date | None) -> ReviewTask:
+def _review_task_from_source(
+    task: Task,
+    *,
+    trade_date: date | None,
+    manual_review_created_at: datetime | None = None,
+) -> ReviewTask:
     resolved_trade_date = task.trade_date or trade_date
     scope_type, scope_key, internal_sku = _resolve_scope(task, resolved_trade_date)
-    dedupe_key = "review|" + (
-        task.dedupe_key
-        or _build_task_dedupe_key(
-            trade_date=resolved_trade_date,
-            scope_type=scope_type,
-            scope_key=scope_key,
-            task=task,
-            internal_sku=internal_sku,
-        )
+    is_execution_review = (
+        task.task_status is TaskStatus.MANUAL_REVIEW
+        and task.action_type not in MANUAL_INTERVENTION_ACTIONS
     )
+    if is_execution_review:
+        return _review_task_from_execution_group(
+            [task],
+            group_members=[task],
+            trade_date=trade_date,
+            manual_review_created_at=manual_review_created_at,
+        )
+    else:
+        review_created_at = task.created_at
+        review_type = task.action_type.value
+        dedupe_key = "review|" + (
+            task.dedupe_key
+            or _build_task_dedupe_key(
+                trade_date=resolved_trade_date,
+                scope_type=scope_type,
+                scope_key=scope_key,
+                task=task,
+                internal_sku=internal_sku,
+            )
+        )
+        required_by = task.required_by
     return ReviewTask(
         review_task_id=uuid4().hex[:12],
         trade_date=resolved_trade_date,
@@ -1102,7 +1461,7 @@ def _review_task_from_source(task: Task, *, trade_date: date | None) -> ReviewTa
         scope_key=scope_key,
         dedupe_key=dedupe_key,
         source_task_id=task.task_id,
-        review_type=task.action_type.value,
+        review_type=review_type,
         review_status=ReviewTaskStatus.PENDING,
         internal_sku=internal_sku,
         platform_name=task.platform_name,
@@ -1110,18 +1469,107 @@ def _review_task_from_source(task: Task, *, trade_date: date | None) -> ReviewTa
         review_payload={
             "task_id": task.task_id,
             "action_type": task.action_type.value,
+            "task_status": task.task_status.value,
             "target_price": str(task.target_price) if isinstance(task.target_price, Decimal) else task.target_price,
             "target_status": task.target_status,
             "decision_trace": task.decision_trace,
         },
-        required_by=task.required_by,
-        created_at=task.created_at,
-        updated_at=task.updated_at or task.created_at,
+        required_by=required_by,
+        created_at=review_created_at,
+        updated_at=review_created_at,
     )
 
 
-def _allowed_mobile_actions_for_review_type(review_type: str) -> list[str]:
-    return DEFAULT_MOBILE_REVIEW_ACTIONS
+def _review_task_from_execution_group(
+    actionable_tasks: list[Task],
+    *,
+    group_members: list[Task],
+    trade_date: date | None,
+    manual_review_created_at: datetime | None = None,
+) -> ReviewTask:
+    ordered_actionable = sorted(
+        actionable_tasks,
+        key=lambda task: (task.created_at, task.task_id),
+    )
+    ordered_members = sorted(
+        group_members or actionable_tasks,
+        key=lambda task: (task.created_at, task.task_id),
+    )
+    representative = ordered_actionable[0]
+    resolved_trade_date = representative.trade_date or trade_date
+    resolved_group_id = task_group_id(representative)
+    review_created_at = manual_review_created_at or max(
+        task.updated_at or task.created_at
+        for task in ordered_actionable
+    )
+    platforms = {
+        str(task.platform_name or "").strip()
+        for task in ordered_members
+        if str(task.platform_name or "").strip()
+    }
+    action_types = list(
+        dict.fromkeys(task.action_type.value for task in ordered_members)
+    )
+    reasons = list(
+        dict.fromkeys(
+            task.result_message.strip()
+            for task in ordered_actionable
+            if task.result_message.strip()
+        )
+    )
+    scope_key = resolved_group_id or representative.task_id
+    dedupe_subject = (
+        f"group|{resolved_group_id}"
+        if resolved_group_id
+        else f"task|{representative.task_id}"
+    )
+    return ReviewTask(
+        review_task_id=uuid4().hex[:12],
+        trade_date=resolved_trade_date,
+        scope_type="task_group" if resolved_group_id else "task",
+        scope_key=scope_key,
+        dedupe_key=f"review|execution|{dedupe_subject}",
+        source_task_id=representative.task_id,
+        review_type=TaskActionType.MANUAL_REVIEW.value,
+        review_status=ReviewTaskStatus.PENDING,
+        internal_sku=None,
+        platform_name=next(iter(platforms)) if len(platforms) == 1 else None,
+        reason=(
+            reasons[0]
+            if len(reasons) == 1
+            else f"任务组中有 {len(ordered_actionable)} 条任务等待人工复核"
+        ),
+        review_payload={
+            "review_subject": "task_group" if resolved_group_id else "task",
+            "task_group_id": resolved_group_id,
+            "task_id": representative.task_id,
+            "task_ids": [task.task_id for task in ordered_members],
+            "affected_task_ids": [
+                task.task_id for task in ordered_actionable
+            ],
+            "task_count": len(ordered_members),
+            "affected_task_count": len(ordered_actionable),
+            "action_type": (
+                action_types[0]
+                if len(action_types) == 1
+                else "mixed"
+            ),
+            "action_types": action_types,
+            "task_status": TaskStatus.MANUAL_REVIEW.value,
+            "items": [
+                {
+                    "task_id": task.task_id,
+                    "internal_sku": task.internal_sku,
+                    "action_type": task.action_type.value,
+                    "task_status": task.task_status.value,
+                }
+                for task in ordered_members
+            ],
+        },
+        required_by=review_created_at + timedelta(minutes=30),
+        created_at=review_created_at,
+        updated_at=review_created_at,
+    )
 
 
 def _feishu_timeout_seconds() -> float:
@@ -1303,7 +1751,7 @@ def _format_feishu_datetime(value: datetime | None) -> str:
     display_value = value
     if value.tzinfo is not None and value.utcoffset() is not None:
         display_value = value.astimezone(FEISHU_DISPLAY_TIMEZONE)
-    return display_value.strftime("%Y-%m-%d %H:%M")
+    return display_value.strftime("%Y-%m-%d %H:%M（北京时间）")
 
 
 def _truncate_for_feishu(value: object, max_length: int) -> str:
@@ -1319,11 +1767,20 @@ def _build_review_notification_message(review_task: ReviewTask) -> str:
     reason = (review_task.reason or "-").strip()
     if len(reason) > 80:
         reason = f"{reason[:77]}..."
-    return (
+    message = (
         f"{_feishu_review_type_label(review_task.review_type)} | 业务日期={trade_date} | "
         f"对象={_feishu_scope_label(review_task.scope_type, review_task.scope_key)} | "
         f"截止时间={required_by} | 原因={reason}"
     )
+    group_id = review_task_group_id(review_task)
+    if group_id:
+        message = (
+            f"{message} | 任务组={group_id} | "
+            f"待复核任务数={review_task.review_payload.get('affected_task_count', '-')}"
+        )
+    if is_execution_failure_review(review_task):
+        message = f"{message} | 可选结果=重试任务/取消任务"
+    return message
 
 
 def _build_expired_review_notification_message(review_task: ReviewTask, *, timeout_at: datetime) -> str:

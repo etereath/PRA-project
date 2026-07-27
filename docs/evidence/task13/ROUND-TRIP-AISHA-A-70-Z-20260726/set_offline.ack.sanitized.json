@@ -1,0 +1,10 @@
+{
+  "batch_id": "BATCH-T13-AISHA-A-SET-OFFLINE-20260726-04",
+  "execution_attempt_id": "ATTEMPT-T13-AISHA-A-SET-OFFLINE-20260726-04",
+  "report_path": "<REDACTED_PATH>/ATTEMPT-T13-AISHA-A-SET-OFFLINE-20260726-04.listing-action-report.md",
+  "result_file_sha256": "b7a0106197789cc7bea38149ffc6bdbd44c3063797d5ccdb5511fe9103ad288b",
+  "result_id": "RESULT-76c9382f8e5b5e98d2ef84cd",
+  "schema_version": "shadowbot-listing-action-import-ack-1.0",
+  "status": "VERIFIED",
+  "written_at": "2026-07-25T20:30:50.397643+00:00"
+}

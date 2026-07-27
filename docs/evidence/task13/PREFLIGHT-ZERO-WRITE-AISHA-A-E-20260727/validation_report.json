@@ -1,0 +1,51 @@
+{
+  "batch_id": "BATCH-T13-PREFLIGHT-ZERO-WRITE-20260727-01",
+  "batch_result": "FAILED",
+  "bundle_id": "PREFLIGHT-ZERO-WRITE-AISHA-A-E-20260727",
+  "checks": {
+    "batch_preflight_all_or_nothing_valid": true,
+    "contract_binding_valid": true,
+    "database_ledger_valid": true,
+    "mismatch_item_not_applied_valid": true,
+    "no_open_review_valid": true,
+    "normal_item_not_attempted_valid": true,
+    "receipt_and_ack_binding_valid": true,
+    "redaction_valid": true,
+    "write_locks_released_valid": true,
+    "zero_detail_save_clicks_valid": true,
+    "zero_final_confirmation_clicks_valid": true,
+    "zero_listing_action_clicks_valid": true
+  },
+  "execution_attempt_id": "ATTEMPT-591f3a642e2b43f9",
+  "generated_at": "2026-07-27T08:25:44.241392+00:00",
+  "mismatch_internal_sku": "AISHA-E-45-Z",
+  "normal_internal_sku": "AISHA-A-70-Z",
+  "redaction_policy": {
+    "preserved": [
+      "business_identity",
+      "operation_and_attempt_ids",
+      "timestamps",
+      "preflight_observations",
+      "zero_click_facts",
+      "database_ledger_facts"
+    ],
+    "replaced": [
+      "local_or_unc_paths",
+      "worker_device_identifier"
+    ]
+  },
+  "sanitized_sha256": {
+    "commit.ack.sanitized.json": "72fd6b691fa4153c5ed9e24e676dc8f831b8638967d2408b42b7b833617e4e0e",
+    "commit.phase.sanitized.json": "3f2359c3219e7e65b7f426c0f67a1d2952a65705e5dbc5eda13e36df6056ed66",
+    "commit.receipt.sanitized.json": "f555ad2ec27a85416a0bccebb489c37e4ddd5555b4fd9c19449f5229adc8e88c",
+    "commit.report.sanitized.md": "a683849db8efa1cbf429e9a51b7b264192cf66f1c845b209579c22a072ec77c3",
+    "commit.request.sanitized.json": "9bf5502a6c65d2ec12a9a2a5ff682538bcab83b052c24467779f43d6f1431473",
+    "commit.result.sanitized.json": "7136922742efc28ccc527f4b0d867aa1fd5b9c779a1e89de5c18b941552b296a",
+    "database_backread.sanitized.json": "32b6662206239634567a8a8eb4801d8aab1da0be832138aebd7e03907b914417",
+    "evidence_manifest.json": "0b8ccbbe0ed6ed41b544fd0274a6bc0ef07ad9b1ca1d710b7acd84e63ac864d2",
+    "product_identity_mapping.json": "24f0dd9f88f0fe5e42587cc2b7866f035fef88bcbface3d0353afd99c4fa5ce6"
+  },
+  "schema_version": "task13-preflight-zero-write-evidence-validation-1.0",
+  "status": "VERIFIED",
+  "write_click_count": 0
+}

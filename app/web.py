@@ -28,6 +28,11 @@ from app.models import ListingStatus, NotificationLog
 from app.listing_status_policy import has_current_platform_stock
 from app.repositories.sqlite_connection import SQLiteConnectionError, SQLiteConnectionFactory
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.review_policy import (
+    allowed_review_statuses,
+    is_execution_failure_review,
+    review_action_label,
+)
 from app.repositories.mock_platform_repository import DEFAULT_MOCK_PLATFORM_DB, MockPlatformRepository
 from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION
 from app.repositories.workbook_repository import (
@@ -56,6 +61,7 @@ from app.services.workflow import (
     list_runtime_review_tasks,
     list_runtime_tasks,
     list_manual_intervention_tasks,
+    listing_task_override_key,
     preview_tasks_from_sources,
     preview_tasks_from_selected_rule,
     persist_task_generation_summary,
@@ -314,7 +320,8 @@ DISPLAY_ENUM_LABELS = {
     },
     "listing_strategy": {
         "allow_online": "允许上架",
-        "prohibit_online": "禁止上架",
+        "prohibit_online": "禁止上架（兼容旧规则）",
+        "set_offline": "直接下架（set_offline）",
         "stock_below_offline": "库存低于阈值下架",
         "stock_above_online": "库存高于阈值允许上架",
     },
@@ -555,6 +562,21 @@ UI_TEXT = {
 }
 
 
+def _redact_request_log_value(value: object) -> str:
+    return re.sub(
+        r"([?&]token=)[^&\s]+",
+        r"\1[REDACTED]",
+        str(value),
+        flags=re.IGNORECASE,
+    )
+
+
+class RedactingWSGIRequestHandler(WSGIRequestHandler):
+    def log_message(self, format: str, *args: object) -> None:
+        sanitized_args = tuple(_redact_request_log_value(value) for value in args)
+        super().log_message(format, *sanitized_args)
+
+
 class ThreadedWSGIServer(ThreadingMixIn, WSGIServer):
     daemon_threads = True
 
@@ -571,7 +593,7 @@ def serve(host: str = "127.0.0.1", port: int = 8765) -> None:
         port,
         application,
         server_class=ThreadedWSGIServer,
-        handler_class=WSGIRequestHandler,
+        handler_class=RedactingWSGIRequestHandler,
     ) as httpd:
         httpd.serve_forever()
 
@@ -1053,6 +1075,11 @@ def _handle_dashboard(
             "use_mock_ai": "use_mock_ai" in parsed,
         }
         action = _first(parsed, "action", "preview")
+        listing_task_overrides = (
+            _parse_listing_task_overrides(parsed)
+            if action == "confirm_generate"
+            else None
+        )
 
         try:
             products_path = _resolve_request_or_trusted_default(
@@ -1108,6 +1135,7 @@ def _handle_dashboard(
                         rule_id=rule_id,
                         task_group_id=task_group_id,
                         required_by=required_by,
+                        listing_task_overrides=listing_task_overrides,
                     )
                     validation_summary = generation_summary.validation
                     runtime_summary = persist_task_generation_summary(
@@ -1131,7 +1159,10 @@ def _handle_dashboard(
                     level = "success"
                     preview_ready = True
                 elif action == "confirm_generate":
-                    generation_summary = generate_tasks_from_sources(workflow_inputs)
+                    generation_summary = generate_tasks_from_sources(
+                        workflow_inputs,
+                        listing_task_overrides=listing_task_overrides,
+                    )
                     validation_summary = generation_summary.validation
                     runtime_summary = persist_task_generation_summary(
                         generation_summary,
@@ -1179,6 +1210,40 @@ def _parse_selected_rule(value: str) -> tuple[str, str]:
     if separator != ":" or rule_type not in {"price", "listing"} or not rule_id.strip():
         raise ValidationError(UI_TEXT["selected_rule_placeholder"])
     return rule_type, rule_id.strip()
+
+
+def _parse_listing_task_overrides(
+    parsed: dict[str, list[str]],
+) -> dict[tuple[str, str, str], tuple[str, str]]:
+    raw_count = _first(parsed, "listing_override_count", "0").strip()
+    try:
+        count = int(raw_count)
+    except ValueError as exc:
+        raise ValidationError("上下架任务目标输入数量无效，请重新预览") from exc
+    if count < 0 or count > 5000:
+        raise ValidationError("上下架任务目标输入数量超出允许范围，请重新预览")
+
+    overrides: dict[tuple[str, str, str], tuple[str, str]] = {}
+    for index in range(count):
+        raw_key = _first(parsed, f"listing_override_key_{index}", "")
+        try:
+            decoded_key = json.loads(raw_key)
+        except json.JSONDecodeError as exc:
+            raise ValidationError("上下架任务目标输入标识无效，请重新预览") from exc
+        if (
+            not isinstance(decoded_key, list)
+            or len(decoded_key) != 3
+            or any(not isinstance(value, str) for value in decoded_key)
+        ):
+            raise ValidationError("上下架任务目标输入标识无效，请重新预览")
+        key = tuple(decoded_key)
+        if key in overrides:
+            raise ValidationError("上下架任务目标输入重复，请重新预览")
+        overrides[key] = (
+            _first(parsed, f"listing_target_price_{index}", ""),
+            _first(parsed, f"listing_target_inventory_{index}", ""),
+        )
+    return overrides
 
 
 def _resolve_batch_rule_platform(price_rules_path: Path, listing_rules_path: Path) -> str:
@@ -2048,6 +2113,7 @@ def _handle_tasks_page(environ) -> str:
     related_reviews = []
     related_notifications = []
     execution_logs = []
+    listing_action_projections = []
     if selected_task_id:
         db_path = Path(runtime_db)
         selected_task = get_runtime_task(db_path, selected_task_id)
@@ -2078,6 +2144,15 @@ def _handle_tasks_page(environ) -> str:
                 (log, UI_TEXT["ops_task_notification_via_review"]) for log in review_notifications
             ]
             execution_logs = list_runtime_execution_logs(db_path, task_id=selected_task.task_id)
+            try:
+                listing_action_projections = (
+                    SQLiteRuntimeRepository(db_path)
+                    .list_shadowbot_listing_action_task_projection(
+                        task_id=selected_task.task_id,
+                    )
+                )
+            except sqlite3.Error:
+                listing_action_projections = []
     return render_tasks_page(
         runtime_db=runtime_db,
         session_user=session_user,
@@ -2094,6 +2169,7 @@ def _handle_tasks_page(environ) -> str:
         related_reviews=related_reviews,
         related_notifications=related_notifications,
         execution_logs=execution_logs,
+        listing_action_projections=listing_action_projections,
         task_group_statuses=task_group_statuses,
     )
 
@@ -2866,45 +2942,186 @@ def render_dashboard_page(
     if generation_summary is not None:
         confirm_html = ""
         rows = []
-        for task in generation_summary.tasks[:12]:
+        listing_override_index = 0
+        for task in generation_summary.tasks:
+            target_price_html = escape(
+                str(task.target_price) if task.target_price is not None else "-"
+            )
+            target_inventory_html = escape(
+                str(task.target_inventory)
+                if task.target_inventory is not None
+                else "-"
+            )
+            if preview_ready and task.action_type is TaskActionType.SET_ONLINE:
+                listing_default_source = str(
+                    task.decision_trace.get("listing_target_default_source")
+                    or "platform_snapshot"
+                )
+                uses_platform_snapshot = listing_default_source == "platform_snapshot"
+                price_default_title = (
+                    "默认值来自最新平台快照价格"
+                    if uses_platform_snapshot
+                    else "新商品无平台快照，默认值来自商品基础成本"
+                )
+                inventory_default_title = (
+                    "默认值来自最新平台快照库存"
+                    if uses_platform_snapshot
+                    else "新商品无平台快照，默认值来自商品当前库存"
+                )
+                override_key = json.dumps(
+                    list(listing_task_override_key(task)),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                price_value = (
+                    format(task.target_price, ".2f")
+                    if task.target_price is not None
+                    else ""
+                )
+                inventory_value = (
+                    str(task.target_inventory)
+                    if task.target_inventory is not None
+                    else ""
+                )
+                target_price_html = f"""
+                  <input type="hidden" name="listing_override_key_{listing_override_index}" value="{escape(override_key)}">
+                  <input
+                    class="task-target-number"
+                    name="listing_target_price_{listing_override_index}"
+                    type="number"
+                    min="0.01"
+                    step="0.01"
+                    required
+                    value="{escape(price_value)}"
+                    aria-label="{escape(str(task.internal_sku or ''))} 目标价格"
+                    title="{escape(price_default_title)}"
+                  >
+                """
+                target_inventory_html = f"""
+                  <input
+                    class="task-target-number"
+                    name="listing_target_inventory_{listing_override_index}"
+                    type="number"
+                    min="0"
+                    step="1"
+                    required
+                    value="{escape(inventory_value)}"
+                    aria-label="{escape(str(task.internal_sku or ''))} 目标库存"
+                    title="{escape(inventory_default_title)}"
+                  >
+                """
+                listing_override_index += 1
+            elif task.action_type is TaskActionType.SET_OFFLINE:
+                target_price_html = "不适用"
+                target_inventory_html = "不适用"
             rows.append(
                 "<tr>"
-                f"<td>{escape(task.internal_sku)}</td>"
+                f"<td>{escape(str(task.internal_sku or ''))}</td>"
                 f"<td>{escape(task.action_type.value)}</td>"
                 f"<td>{escape(task.task_status.value)}</td>"
-                f"<td>{escape(task.platform_name)}</td>"
+                f"<td>{escape(str(task.platform_name or ''))}</td>"
                 f"<td>{escape(str(task.expected_old_price) if task.expected_old_price is not None else '-')}</td>"
-                f"<td>{escape(str(task.target_price) if task.target_price is not None else '-')}</td>"
+                f"<td>{target_price_html}</td>"
+                f"<td>{target_inventory_html}</td>"
                 f"<td>{escape(task.pricing_source.value if task.pricing_source else '-')}</td>"
                 f"<td>{escape(format_display_datetime(task.required_by))}</td>"
                 f"<td>{escape(_task_price_calculation_summary(task))}</td>"
                 "</tr>"
             )
-        rows_html = "".join(rows) or f"<tr><td colspan='9'>{escape(UI_TEXT['no_tasks'])}</td></tr>"
+        rows_html = "".join(rows) or f"<tr><td colspan='10'>{escape(UI_TEXT['no_tasks'])}</td></tr>"
         task_counts = "".join(
             f"<div class='metric'><span class='label'>{escape(name)}</span><strong>{count}</strong></div>"
             for name, count in generation_summary.task_counts.items()
         )
+        ignored_candidates = generation_summary.ignored_candidates
+        if ignored_candidates:
+            task_counts += (
+                "<div class='metric'><span class='label'>已忽略</span>"
+                f"<strong>{len(ignored_candidates)}</strong></div>"
+            )
+        listing_state_labels = {
+            "online": "上架",
+            "offline": "下架",
+            "missing": "无平台状态",
+            "unavailable": "库存为 0（不参与）",
+            "unknown": "状态未知",
+        }
+        ignored_rows_html = "".join(
+            "<tr>"
+            f"<td>{escape(candidate.internal_sku)}</td>"
+            f"<td>{escape(candidate.product_name)}</td>"
+            f"<td>{escape(candidate.grade or '-')}</td>"
+            f"<td>{escape(candidate.platform_name)}</td>"
+            f"<td>{escape(display_enum_label('action_type', candidate.action_type.value))}</td>"
+            f"<td>{escape(listing_state_labels.get(candidate.current_listing_state, candidate.current_listing_state))}</td>"
+            f"<td>{escape(candidate.reason)}</td>"
+            "</tr>"
+            for candidate in ignored_candidates
+        )
+        ignored_candidates_html = (
+            f"""
+          <div class="ignored-task-candidates">
+            <h3>已忽略商品（{len(ignored_candidates)}）</h3>
+            <p class="subtle">以下商品命中了所选规则，但当前平台状态不符合任务生成条件，不会写入任务中心。</p>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>SKU</th>
+                    <th>商品</th>
+                    <th>等级</th>
+                    <th>平台</th>
+                    <th>原任务类型</th>
+                    <th>当前平台状态</th>
+                    <th>忽略原因</th>
+                  </tr>
+                </thead>
+                <tbody>{ignored_rows_html}</tbody>
+              </table>
+            </div>
+          </div>
+            """
+            if ignored_candidates
+            else ""
+        )
+        confirm_form_open = ""
+        confirm_form_close = ""
+        confirm_action_html = ""
         if preview_ready:
             mock_ai_hidden = "<input type='hidden' name='use_mock_ai' value='on'>" if params["use_mock_ai"] else ""
+            listing_input_hint = (
+                "<p class='subtle'>上架任务的目标价格和目标库存必须在创建前确认；"
+                "有平台快照时默认读取同一条最新快照；新商品没有平台快照时，"
+                "expected_old_price 和目标价格默认使用基础成本，目标库存默认使用商品当前库存。"
+                "下架任务仅变更状态，不携带目标价格和目标库存。</p>"
+                if listing_override_index
+                else ""
+            )
+            confirm_form_open = "<form method='post'>"
+            confirm_form_close = "</form>"
             confirm_html = f"""
           <div class="confirm-box">
             <p>{escape(UI_TEXT["preview_ready"])}</p>
-            <form method="post" class="actions">
-              <input type="hidden" name="inventory_strategy" value="{escape(str(params["inventory_strategy"]))}">
-              <input type="hidden" name="generation_mode" value="{escape(str(params.get("generation_mode", "single_rule")))}">
-              <input type="hidden" name="selected_rule" value="{escape(str(params.get("selected_rule", "")))}">
-              <input type="hidden" name="task_group_id" value="{escape(str(params.get("task_group_id", "")))}">
-              <input type="hidden" name="required_by" value="{escape(str(params.get("required_by", "")))}">
-              {mock_ai_hidden}
-              <button class="primary" type="submit" name="action" value="confirm_generate">{escape(UI_TEXT["confirm_button"])}</button>
-            </form>
+            {listing_input_hint}
+            <input type="hidden" name="inventory_strategy" value="{escape(str(params["inventory_strategy"]))}">
+            <input type="hidden" name="generation_mode" value="{escape(str(params.get("generation_mode", "single_rule")))}">
+            <input type="hidden" name="selected_rule" value="{escape(str(params.get("selected_rule", "")))}">
+            <input type="hidden" name="task_group_id" value="{escape(str(params.get("task_group_id", "")))}">
+            <input type="hidden" name="required_by" value="{escape(str(params.get("required_by", "")))}">
+            <input type="hidden" name="listing_override_count" value="{listing_override_index}">
+            {mock_ai_hidden}
           </div>
+        """
+            confirm_action_html = f"""
+            <div class="actions">
+              <button class="primary" type="submit" name="action" value="confirm_generate">{escape(UI_TEXT["confirm_button"])}</button>
+            </div>
         """
         tasks_html = f"""
         <section class="panel">
           <h2>{escape(UI_TEXT["task_result"])}</h2>
           <div class="metrics">{task_counts}</div>
+          {confirm_form_open}
           {confirm_html}
           <div class="table-wrap">
             <table>
@@ -2915,7 +3132,8 @@ def render_dashboard_page(
                   <th>status</th>
                   <th>platform</th>
                   <th>expected_old_price</th>
-                  <th>target_price</th>
+                  <th>目标价格</th>
+                  <th>目标库存</th>
                   <th>pricing_source</th>
                   <th>required_by</th>
                   <th>calculation</th>
@@ -2924,6 +3142,9 @@ def render_dashboard_page(
               <tbody>{rows_html}</tbody>
             </table>
           </div>
+          {ignored_candidates_html}
+          {confirm_action_html}
+          {confirm_form_close}
         </section>
         """
 
@@ -3309,7 +3530,8 @@ def render_mobile_review_page(*, detail, raw_token: str) -> str:
     )
     payload_rows = _mobile_payload_summary_rows(review.review_payload)
     actions_html = "".join(
-        f"<button class='primary' type='submit' name='action' value='{escape(action)}'>{escape(display_enum_label('review_status', action))}</button>"
+        f"<button class='primary' type='submit' name='action' value='{escape(action)}'>"
+        f"{escape(_review_action_display_label(review, detail.source_task, ReviewTaskStatus(action)))}</button>"
         for action in detail.allowed_actions
     )
     if not actions_html:
@@ -3529,7 +3751,10 @@ def render_runtime_page(
 
     selected_review_html = ""
     if selected_review is not None:
-        next_source_status = _review_source_status_hint(selected_task)
+        next_source_status = _review_source_status_hint(
+            selected_review,
+            selected_task,
+        )
         details = [
             ("review_task_id", selected_review.review_task_id),
             ("review_type", selected_review.review_type),
@@ -3580,14 +3805,10 @@ def render_runtime_page(
     </section>
 """
         if selected_review.review_status == ReviewTaskStatus.PENDING:
-            resolve_status_options = "".join(
-                f"<option value='{escape(option.value)}'>{escape(option.value)}</option>"
-                for option in (
-                    ReviewTaskStatus.APPROVED,
-                    ReviewTaskStatus.REJECTED,
-                    ReviewTaskStatus.ADJUSTED,
-                    ReviewTaskStatus.CANCELLED,
-                )
+            resolve_status_options = _review_status_options(
+                selected_review,
+                selected_task,
+                use_display_labels=False,
             )
             hidden_filters = "".join(
                 f"<input type='hidden' name='{escape(key)}' value='{escape(value)}'>"
@@ -3847,6 +4068,7 @@ def render_tasks_page(
     related_reviews=None,
     related_notifications=None,
     execution_logs=None,
+    listing_action_projections=None,
     task_group_statuses: dict[str, str] | None = None,
 ) -> str:
     rows = "".join(
@@ -3873,6 +4095,7 @@ def render_tasks_page(
         related_reviews=related_reviews or [],
         related_notifications=related_notifications or [],
         execution_logs=execution_logs or [],
+        listing_action_projections=listing_action_projections or [],
     )
     body = _task_center_tabs("tasks") + _task_filter_panel(
         runtime_db,
@@ -4808,7 +5031,7 @@ def _render_listing_rule_form(listing_rules_path: str, product_rows: list[dict[s
           <div class="field">
             <label for="listing_strategy">规则策略</label>
             <select id="listing_strategy" name="listing_strategy">{_labeled_options(LISTING_STRATEGY_OPTIONS, "stock_below_offline", "listing_strategy")}</select>
-            <p class="help">策略只决定是否建议上架或下架，不直接操作平台。</p>
+            <p class="help">“直接下架”生成 set_offline 任务；规则保存本身不会直接操作平台。</p>
           </div>
           <div class="field">
             <label for="stock_threshold">库存阈值</label>
@@ -6188,6 +6411,7 @@ def _render_task_center_detail(
     related_reviews,
     related_notifications,
     execution_logs,
+    listing_action_projections,
 ) -> str:
     if not selected_task_id:
         return ""
@@ -6233,7 +6457,75 @@ def _render_task_center_detail(
     {_render_review_history_panel(task_history)}
     {_render_task_related_reviews_panel(related_reviews)}
     {_render_task_related_notifications_panel(related_notifications)}
+    {_render_task_listing_action_projection_panel(listing_action_projections)}
     {_render_task_execution_logs_panel(execution_logs)}
+    """
+
+
+def _render_task_listing_action_projection_panel(projections) -> str:
+    if not projections:
+        return ""
+
+    rows = []
+    for projection in projections:
+        attempts = projection.get("attempts")
+        normalized_attempts = (
+            attempts if isinstance(attempts, list) else []
+        )
+        attempt_summary = "；".join(
+            (
+                f"{attempt.get('execution_mode') or '-'}:"
+                f"{attempt.get('execution_attempt_id') or '-'}:"
+                f"{attempt.get('status') or '-'}"
+            )
+            for attempt in normalized_attempts
+            if isinstance(attempt, dict)
+        ) or "-"
+        reconcile_status = "；".join(
+            (
+                f"{attempt.get('execution_attempt_id') or '-'}:"
+                f"{attempt.get('status') or '-'}"
+            )
+            for attempt in normalized_attempts
+            if isinstance(attempt, dict)
+            and str(attempt.get("execution_mode") or "").upper() == "RECONCILE"
+        ) or "-"
+        operation_result = str(projection.get("operation_result") or "")
+        if operation_result == "VERIFIED":
+            actual_status = str(projection.get("target_status") or "-")
+        elif operation_result == "NOT_APPLIED":
+            actual_status = str(projection.get("expected_old_status") or "-")
+        elif operation_result == "NEEDS_RECONCILIATION":
+            actual_status = "UNKNOWN"
+        else:
+            actual_status = "-"
+        rows.append(
+            "<tr>"
+            f"<td>{escape(str(projection.get('action_type') or '-'))}</td>"
+            f"<td>{escape(str(projection.get('expected_old_status') or '-'))}</td>"
+            f"<td>{escape(str(projection.get('target_status') or '-'))}</td>"
+            f"<td>{escape(actual_status)}</td>"
+            f"<td>{escape(str(projection.get('batch_id') or '-'))}</td>"
+            f"<td>{escape(str(projection.get('operation_id') or '-'))}</td>"
+            f"<td>{escape(attempt_summary)}</td>"
+            f"<td>{escape(str(projection.get('batch_status') or '-'))}</td>"
+            f"<td>{escape(str(projection.get('operation_status') or '-'))}</td>"
+            f"<td>{escape(reconcile_status)}</td>"
+            f"<td>{escape(str(projection.get('readback_observed_at') or '-'))}</td>"
+            f"<td>{escape(str(projection.get('error_code') or '-'))}</td>"
+            "</tr>"
+        )
+    return f"""
+    <section class="panel">
+      <h2>上下架运行投影</h2>
+      <p class="subtle">该面板只读展示 v5 批次、逐商品 operation、attempt、UNKNOWN 和 RECONCILE 事实；人工处理请使用关联复核任务，不在此处自动审批或重新发布。</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>动作</th><th>预期旧状态</th><th>目标状态</th><th>实际回读状态</th><th>批次 ID</th><th>operation ID</th><th>execution attempt</th><th>批次状态</th><th>operation 状态</th><th>RECONCILE</th><th>observed_at</th><th>错误代码</th></tr></thead>
+          <tbody>{''.join(rows)}</tbody>
+        </table>
+      </div>
+    </section>
     """
 
 
@@ -6550,16 +6842,12 @@ def _render_review_resolution_form(*, selected_review, source_task, review_statu
       <p class="subtle">{escape(UI_TEXT["ops_review_handled_hint"])}</p>
     </section>
     """
-    resolve_status_options = "".join(
-        f"<option value='{escape(option.value)}'>{escape(display_enum_label('review_status', option.value))}</option>"
-        for option in (
-            ReviewTaskStatus.APPROVED,
-            ReviewTaskStatus.REJECTED,
-            ReviewTaskStatus.ADJUSTED,
-            ReviewTaskStatus.CANCELLED,
-        )
+    resolve_status_options = _review_status_options(
+        selected_review,
+        source_task,
+        use_display_labels=True,
     )
-    next_source_status = _review_source_status_hint(source_task)
+    next_source_status = _review_source_status_hint(selected_review, source_task)
     return f"""
     <section class="panel">
       <h2>{escape(UI_TEXT["ops_review_handle_title"])}</h2>
@@ -6589,10 +6877,12 @@ def _render_review_resolution_form(*, selected_review, source_task, review_statu
     """
 
 
-def _review_source_status_hint(source_task) -> str:
+def _review_source_status_hint(selected_review, source_task) -> str:
     if source_task is None:
         return "-"
     if source_task.task_status == TaskStatus.MANUAL_REVIEW:
+        if is_execution_failure_review(selected_review, source_task):
+            return "重试任务后转为待处理；取消任务后转为已取消"
         return "通过后转为待处理；拒绝或调整后跳过；取消后取消"
     if source_task.task_status == TaskStatus.PENDING and source_task.action_type in {
         TaskActionType.CAPACITY_WARNING,
@@ -6606,6 +6896,32 @@ def _review_source_status_hint(source_task) -> str:
     }:
         return "通过、拒绝或调整后跳过；取消后取消"
     return "-"
+
+
+def _review_status_options(
+    review,
+    source_task,
+    *,
+    use_display_labels: bool,
+) -> str:
+    return "".join(
+        f"<option value='{escape(status.value)}'>"
+        f"{escape(_review_action_display_label(review, source_task, status) if use_display_labels else _review_action_raw_label(review, source_task, status))}"
+        "</option>"
+        for status in allowed_review_statuses(review, source_task)
+    )
+
+
+def _review_action_display_label(review, source_task, status: ReviewTaskStatus) -> str:
+    business_label = review_action_label(review, source_task, status)
+    if business_label:
+        return business_label
+    return display_enum_label("review_status", status.value)
+
+
+def _review_action_raw_label(review, source_task, status: ReviewTaskStatus) -> str:
+    business_label = review_action_label(review, source_task, status)
+    return business_label or status.value
 
 
 def _review_action_hint(review, review_status: str, due_filter: str) -> str:
@@ -8078,6 +8394,10 @@ def _parse_mobile_resolution_payload(payload_text: str) -> dict[str, object]:
 
 def _mobile_payload_summary_rows(payload: object) -> str:
     safe_keys = [
+        "task_group_id",
+        "task_count",
+        "affected_task_count",
+        "affected_task_ids",
         "task_id",
         "action_type",
         "expected_old_price",

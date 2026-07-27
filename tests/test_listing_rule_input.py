@@ -99,6 +99,33 @@ class ListingRuleInputTests(unittest.TestCase):
         self.assertEqual(saved["platform_filter"], "*")
         self.assertEqual(format_listing_rule_scope(saved), "全部商品")
 
+    def test_direct_set_offline_strategy_is_saved_and_loadable(self) -> None:
+        rows = load_listing_rule_input_rows(self.path)
+        form = validate_listing_rule_form(
+            {
+                "rule_name": "蚂蚁艾莎A直接下架",
+                "variety_filter": "艾莎",
+                "grade_filter": "A",
+                "platform_filter": "蚂蚁",
+                "stock_threshold": "0",
+                "listing_strategy": "set_offline",
+                "active": "是",
+                "priority": "1",
+                "remark": "人工配置的直接下架规则",
+            },
+            existing_rows=rows,
+            is_edit=False,
+            allowed_varieties=["艾莎"],
+            allowed_platforms=["蚂蚁"],
+        )
+        result = apply_listing_rule_input(rows, form)
+        persist_listing_rule_rows(self.path, result.rows)
+
+        saved_rows = load_listing_rule_input_rows(self.path)
+        self.assertEqual(saved_rows[-1]["listing_strategy"], "set_offline")
+        loaded_rules = load_listing_rules(self.path)
+        self.assertEqual(loaded_rules[-1].listing_strategy.value, "set_offline")
+
     def test_invalid_values_are_rejected_for_operator_friendly_reasons(self) -> None:
         rows = load_listing_rule_input_rows(self.path)
         cases = [

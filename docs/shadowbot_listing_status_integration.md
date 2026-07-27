@@ -20,7 +20,7 @@ SQLite 中的价格是“最近一次已确认的平台快照”，不是对平�
 
 ## 2. SQLite 平台状态快照
 
-当前运行库结构版本为 v12，物理状态表名为 `listing_status`。该表的“平台 + 品种 + 等级”唯一身份结构在 v9 引入；v10 增加任务旧价字段，v11 增加多商品 COMMIT 批次账本，v12 增加逐商品操作/尝试身份、活动写锁、观察时间和技术结果回执。
+当前运行库结构版本为 v13，物理状态表名为 `listing_status`。该表的“平台 + 品种 + 等级”唯一身份结构在 v9 引入；v10 增加任务旧价字段，v11 增加多商品 COMMIT 批次账本，v12 增加逐商品操作/尝试身份、活动写锁、观察时间和技术结果回执；v13 在不改变任务12 v4 合同的前提下增加公共批次注册表、上下架 operation 字段、位置快照失效字段和任务13专用账本。
 
 ### 2.1 平台商品业务键
 
@@ -41,8 +41,8 @@ SQLite 中的价格是“最近一次已确认的平台快照”，不是对平�
 | `internal_sku` | “商品资料与库存录入”中的 PRA 内部商品编码 | 仅供内部追踪，不是平台业务键；主数据可匹配时必须落库 |
 | `variety` | 品种/页面商品名 | 与平台、等级共同构成业务键 |
 | `grade` | 页面商品等级 | 与平台、品种共同构成业务键 |
-| `current_price` | 最近一次已确认的平台价格 | 下一次任务的 `expected_old_price`，不得从基础成本推导 |
-| `platform_stock_qty` | 最近一次平台库存观测值 | 新记录缺少观测时默认 `100`；有效 ShadowBot READ_ONLY 结果可更新 |
+| `current_price` | 最近一次已确认的平台价格 | 下一次任务的页面价格基线；不得从基础成本推导 |
+| `platform_stock_qty` | 最近一次平台库存观测值 | 新记录缺少观测时默认 `100`；有效 ShadowBot READ_ONLY 或完整 `SYNC_STATUS` 可更新 |
 | `sold_qty` | 已销售数 | 改价流程不得修改 |
 | `online_status` | 最近一次确认的上下架状态 | 改价流程只读取并保留，不得改写 |
 | `source` | 最近一次数据来源 | 例如 `manual`、`shadowbot` |
@@ -50,10 +50,23 @@ SQLite 中的价格是“最近一次已确认的平台快照”，不是对平�
 | `inventory_source` | 库存来源 | 默认 `default`，ShadowBot 观测为 `shadowbot` |
 | `inventory_observed_at` | 库存实际观测时间 | 用于阻止较旧结果覆盖新库存 |
 | `inventory_source_attempt_id` | 库存来源执行尝试 ID | 用于结果绑定和幂等导入 |
+| `price_source` | 价格观察来源 | `SYNC_STATUS` 投影为 `shadowbot_sync_status` |
+| `price_observed_at` | 价格实际观测时间 | 与库存观察时间共同判断任务生成基线是否有效 |
+| `price_source_attempt_id` | 价格来源执行尝试 ID | 必须与库存来源 attempt 一致，任务生成器才接受该组观察 |
+| `last_listing_change_at` | 最近一次已确认上下架写操作时间 | 早于该时间的页面位置、价格和库存观察不得用于新的上下架任务 |
 
 `/business-inputs?input_tab=listing_status` 仅用于查看当前快照，不显示人工录入或修改窗口。正常状态下由通过合同校验的 ShadowBot READ_ONLY 结果新增或更新记录。为开发调试保留受登录、CSRF、路径策略和字段校验保护的 `save_listing_status` POST 动作，但页面不暴露该入口，写入来源标记为 `debug_web_request`。同一“平台 + 品种 + 等级”再次写入时更新原记录，不新增重复记录。
 
-`100` 只是当前开发阶段在尚无平台观测时的新记录默认值，不是真实库存证据。任务11的 v2 READ_ONLY 请求以“商品资料与库存录入”的全部 SKU 生成 `platform`、`expected_product_name`、`expected_grade` 映射提示；逐商品结果为 `SUCCESS` 且 `inventory` 是非负整数时，Result Importer 按该平台身份更新库存、观测时间和执行尝试 ID。页面商品能在库存商品表中按“商品名 + 等级”唯一匹配时，状态记录必须写入对应 `internal_sku`。较旧观测不得覆盖较新库存。任务12价格回写始终保留库存，不能再次写入默认值。
+`100` 只是当前开发阶段在尚无平台观测时的新记录默认值，不是真实库存证据。任务11的 v2 READ_ONLY 请求以“商品资料与库存录入”的全部 SKU 生成 `platform`、`expected_product_name`、`expected_grade` 映射提示；逐商品结果为 `SUCCESS` 且 `inventory` 是非负整数时，Result Importer 按该平台身份更新库存、观测时间和执行尝试 ID。任务13的完整两页 `SYNC_STATUS` 则把同一次扫描观察到的价格和库存一起投影到 `listing_status`，并保留父快照和商品项作为原始证据。页面商品能在库存商品表中按“商品名 + 等级”唯一匹配时，状态记录必须写入对应 `internal_sku`。较旧观测不得覆盖较新观察；早于最近一次上下架写操作的观察也不得重新成为任务生成依据。任务12价格回写始终保留库存，不能再次写入默认值。
+
+任务生成器读取 `SET_ONLINE` 基线时只接受同时满足以下条件的状态行：
+
+1. 价格和库存均有实际观察时间；
+2. `price_source_attempt_id` 与 `inventory_source_attempt_id` 相同且非空；
+3. 两项观察均不早于 `last_listing_change_at`；
+4. 平台、商品名称和等级能唯一映射到目标 SKU。
+
+生成的 `SET_ONLINE` 任务把最近观察价格写入 `expected_old_price`，把观察价格和库存写入 `decision_trace.platform_observation`；目标价格仍由价格规则计算，目标库存仍来自商品库存与计划结果，不能把“页面当前值”误当成“业务目标值”。
 
 ## 3. 相对价格计算与正式任务输入
 

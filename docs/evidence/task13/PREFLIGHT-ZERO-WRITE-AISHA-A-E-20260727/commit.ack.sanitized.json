@@ -1,0 +1,10 @@
+{
+  "batch_id": "BATCH-T13-PREFLIGHT-ZERO-WRITE-20260727-01",
+  "execution_attempt_id": "ATTEMPT-591f3a642e2b43f9",
+  "report_path": "<REDACTED_PATH>/ATTEMPT-591f3a642e2b43f9.listing-action-report.md",
+  "result_file_sha256": "7136922742efc28ccc527f4b0d867aa1fd5b9c779a1e89de5c18b941552b296a",
+  "result_id": "RESULT-bb11f27201710cbcc5824bef",
+  "schema_version": "shadowbot-listing-action-import-ack-1.0",
+  "status": "FAILED",
+  "written_at": "2026-07-26T23:23:54.665993+00:00"
+}

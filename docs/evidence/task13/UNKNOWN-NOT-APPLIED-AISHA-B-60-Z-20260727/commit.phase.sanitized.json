@@ -1,0 +1,16 @@
+{
+  "action_type": "set_offline",
+  "batch_id": "BATCH-T13-UNKNOWN-NOT-APPLIED-20260727-01",
+  "contract_version": 5,
+  "detail_effect_state": "NOT_STARTED",
+  "execution_attempt_id": "ATTEMPT-T13-UNKNOWN-NOT-APPLIED-20260727-01",
+  "instruction_hash": "sha256:50b47e16972a80c9d864323e6c349e9770862242a4753f1aac480f132f613896",
+  "listing_effect_state": "NOT_STARTED",
+  "manifest_sha256": "sha256:b508bbb4c2c8458173b093d37aac33ef6c99421190b2413ccc117529d5654c7b",
+  "phase": "RESULT_WRITTEN",
+  "phase_at": "2026-07-27T10:33:31.181356+00:00",
+  "phase_snapshot_sha256": "sha256:af5131676becfa22bd891b6fd0dc810a67ae7d1ec4a29f9749ab81983af091b0",
+  "request_file_sha256": "sha256:52d76ba5fb1d89d3d299f64149085fce51d49f7fa5ff2ec172bc261f6e04f789",
+  "schema_version": "shadowbot-listing-action-batch-phase-1.0",
+  "worker_id": "<REDACTED_DEVICE>"
+}

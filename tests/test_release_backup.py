@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION
 import scripts.release_backup as release_backup
 from scripts.release_backup import (
     ROOT,
@@ -65,7 +66,10 @@ class ReleaseBackupTests(unittest.TestCase):
                 git_commit="eecd284c51e50f106a75c5504bab7f43afa9d632",
             )
             self.assertEqual(manifest["git_commit"], "eecd284c51e50f106a75c5504bab7f43afa9d632")
-            self.assertEqual(manifest["runtime_schema_version"], 12)
+            self.assertEqual(
+                manifest["runtime_schema_version"],
+                LATEST_RUNTIME_SCHEMA_VERSION,
+            )
             self.assertIn("CUSTOM_SETTING", manifest["configuration_item_names"])
             self.assertIn("YINGDAO_ACCESS_KEY_SECRET", manifest["configuration_item_names"])
             self.assertFalse(manifest["secret_values_included"])
@@ -146,7 +150,10 @@ class ReleaseBackupTests(unittest.TestCase):
             migrated_db = root / "migrated" / "pra_runtime.sqlite3"
             result = migrate_runtime_database(source_db=legacy_db, output_db=migrated_db)
             self.assertEqual(result["source_schema_version"], 5)
-            self.assertEqual(result["target_schema_version"], 12)
+            self.assertEqual(
+                result["target_schema_version"],
+                LATEST_RUNTIME_SCHEMA_VERSION,
+            )
             self.assertTrue(_database_snapshot(migrated_db)["ok"])
             self.assertEqual(_database_snapshot(legacy_db)["schema_health"]["actual_version"], 5)
 

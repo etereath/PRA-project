@@ -1,0 +1,87 @@
+{
+  "action_type": "set_online",
+  "applet_uri": "weixin://launchapplet/?app_id=wxdc8ef8e770254c0e",
+  "batch_id": "BATCH-T13-OPTIMIZED-SET-ONLINE-20260726-02",
+  "capture_evidence": false,
+  "contract_version": 5,
+  "created_at": "2026-07-26T11:06:07.170289+00:00",
+  "development_confirmation": {
+    "confirmation_text": "确认授权批次 BATCH-T13-OPTIMIZED-SET-ONLINE-20260726-02 以上2项真实COMMIT",
+    "confirmed_at": "2026-07-26T11:06:07.170289+00:00",
+    "confirmed_by": "local-operator"
+  },
+  "execution_attempt_id": "ATTEMPT-T13-OPTIMIZED-SET-ONLINE-20260726-02",
+  "execution_mode": "COMMIT",
+  "execution_profile": "development",
+  "expires_at": "2026-07-26T11:36:07.170289+00:00",
+  "gate_summary": {
+    "evaluated_at": "2026-07-26T11:06:07.170289+00:00",
+    "gate_phase": "PRE_PUBLISH",
+    "items": [
+      {
+        "block_reasons": [],
+        "decision": "EXECUTE",
+        "internal_sku": "AISHA-E-45-Z",
+        "lock_operation_id": "OP-4960d4f62c248f6dcd997384",
+        "lock_status": "ACTIVE",
+        "operation_id": "OP-4960d4f62c248f6dcd997384"
+      },
+      {
+        "block_reasons": [],
+        "decision": "EXECUTE",
+        "internal_sku": "CAPPUCCINO-E-45-Z",
+        "lock_operation_id": "OP-0eb5e3c926d2d100f6e3ac4f",
+        "lock_status": "ACTIVE",
+        "operation_id": "OP-0eb5e3c926d2d100f6e3ac4f"
+      }
+    ],
+    "schema_version": "shadowbot-listing-action-gate-summary-1.0"
+  },
+  "instruction_hash": "sha256:c3774e4a4fcab5c4199a47029ed9a56f2cb025513414dffeebb421a7cbaffc58",
+  "items": [
+    {
+      "action_type": "set_online",
+      "expected_grade": "E级",
+      "expected_old_status": "offline",
+      "expected_product_name": "艾莎",
+      "internal_sku": "AISHA-E-45-Z",
+      "item_execution_attempt_id": "ATTEMPT-afdcb0e111465342ef405813",
+      "item_id": "ITEM-45f2076142107a696049b67e",
+      "item_payload_sha256": "sha256:85772e24b77458893ed20bb9ff9fd801473f408731d4704ac757ed2fafd41775",
+      "operation_id": "OP-4960d4f62c248f6dcd997384",
+      "page_identity_key": "蚂蚁花团供应商|name:艾莎|grade:E",
+      "source_task_id": "13666be04e24",
+      "target_inventory": 1,
+      "target_price": "7.00",
+      "target_status": "online",
+      "task_expires_at": "2026-07-26T11:24:00+00:00",
+      "write_identity_key": "蚂蚁花团供应商|sku:AISHA-E-45-Z"
+    },
+    {
+      "action_type": "set_online",
+      "expected_grade": "E级",
+      "expected_old_status": "offline",
+      "expected_product_name": "卡布奇诺",
+      "internal_sku": "CAPPUCCINO-E-45-Z",
+      "item_execution_attempt_id": "ATTEMPT-54992d38097a3b2e11e7c314",
+      "item_id": "ITEM-4b77f418b171c72c110740b6",
+      "item_payload_sha256": "sha256:b85517848014a20b7f92643e0cfe7970dfcc44f5e25719fdb1fe0a6532d34471",
+      "operation_id": "OP-0eb5e3c926d2d100f6e3ac4f",
+      "page_identity_key": "蚂蚁花团供应商|name:卡布奇诺|grade:E",
+      "source_task_id": "54171c211425",
+      "target_inventory": 2,
+      "target_price": "7.50",
+      "target_status": "online",
+      "task_expires_at": "2026-07-26T11:24:00+00:00",
+      "write_identity_key": "蚂蚁花团供应商|sku:CAPPUCCINO-E-45-Z"
+    }
+  ],
+  "manifest_sha256": "sha256:86a7a533ce834e79be0b513406b97bb71cefab1cd669574f9e0af238d2560bd8",
+  "mapping_source_version": "sha256:24f0dd9f88f0fe5e42587cc2b7866f035fef88bcbface3d0353afd99c4fa5ce6",
+  "operation_id": "BATCH-OP-64cca8324ce54742e39072ee",
+  "platform_name": "蚂蚁花团供应商",
+  "scan_scope": "online_and_waiting",
+  "schema_version": "shadowbot-listing-action-batch-request-1.0",
+  "task_id": "BATCH-TASK-64cca8324ce54742e39072ee",
+  "window_title": "蚂蚁花团供应商"
+}

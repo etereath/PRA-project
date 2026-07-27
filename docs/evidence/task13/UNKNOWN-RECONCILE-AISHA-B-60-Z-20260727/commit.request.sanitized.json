@@ -1,0 +1,63 @@
+{
+  "action_type": "set_offline",
+  "applet_uri": "weixin://launchapplet/?app_id=wxdc8ef8e770254c0e",
+  "batch_id": "BATCH-T13-AUTO-RECONCILE-CONTROLLED-UNKNOWN-20260727-03",
+  "capture_evidence": false,
+  "contract_version": 5,
+  "created_at": "2026-07-26T21:06:02.290162+00:00",
+  "development_confirmation": {
+    "confirmation_text": "确认授权批次 BATCH-T13-AUTO-RECONCILE-CONTROLLED-UNKNOWN-20260727-03 以上1项真实COMMIT",
+    "confirmed_at": "2026-07-26T21:06:02.290162+00:00",
+    "confirmed_by": "user_confirmed_in_codex"
+  },
+  "execution_attempt_id": "ATTEMPT-664d3064fd864dcc",
+  "execution_mode": "COMMIT",
+  "execution_profile": "development",
+  "expires_at": "2026-07-26T21:36:02.290162+00:00",
+  "fault_injection": "AFTER_ACTION_CLICK_UNKNOWN",
+  "fault_injection_item_ordinal": 1,
+  "gate_summary": {
+    "evaluated_at": "2026-07-26T21:06:02.290162+00:00",
+    "gate_phase": "PRE_PUBLISH",
+    "items": [
+      {
+        "block_reasons": [],
+        "decision": "EXECUTE",
+        "internal_sku": "AISHA-B-60-Z",
+        "lock_operation_id": "OP-8d6fbb4aad301d6979fc864d",
+        "lock_status": "ACTIVE",
+        "operation_id": "OP-8d6fbb4aad301d6979fc864d"
+      }
+    ],
+    "schema_version": "shadowbot-listing-action-gate-summary-1.0"
+  },
+  "instruction_hash": "sha256:2942c64408d046d39100fc5d6ecddbb34590a7e3c738f470c602601266de3f90",
+  "items": [
+    {
+      "action_type": "set_offline",
+      "expected_grade": "B级",
+      "expected_old_status": "online",
+      "expected_product_name": "艾莎",
+      "internal_sku": "AISHA-B-60-Z",
+      "item_execution_attempt_id": "ATTEMPT-49a4e1b1e6d18b4fe9cc88ca",
+      "item_id": "ITEM-48cf8130fa7d74543a30d720",
+      "item_payload_sha256": "sha256:67d5c56177e169ce360a734b6dbef7c8c89ca7f669c9ae2cc6e043d39d5e7bde",
+      "operation_id": "OP-8d6fbb4aad301d6979fc864d",
+      "page_identity_key": "蚂蚁花团供应商|name:艾莎|grade:B",
+      "source_task_id": "cb9971574a07",
+      "target_inventory": null,
+      "target_price": null,
+      "target_status": "offline",
+      "task_expires_at": "2026-07-26T21:26:00+00:00",
+      "write_identity_key": "蚂蚁花团供应商|sku:AISHA-B-60-Z"
+    }
+  ],
+  "manifest_sha256": "sha256:2ebd9b5037f707994e0b9cf0629f2181a2c4e0d90228a26f8c1d34eccaa90a6f",
+  "mapping_source_version": "sha256:24f0dd9f88f0fe5e42587cc2b7866f035fef88bcbface3d0353afd99c4fa5ce6",
+  "operation_id": "BATCH-OP-2f9ec1fe463cf850c9be7d12",
+  "platform_name": "蚂蚁花团供应商",
+  "scan_scope": "online",
+  "schema_version": "shadowbot-listing-action-batch-request-1.0",
+  "task_id": "BATCH-TASK-2f9ec1fe463cf850c9be7d12",
+  "window_title": "蚂蚁花团供应商"
+}

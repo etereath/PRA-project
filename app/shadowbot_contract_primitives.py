@@ -15,6 +15,12 @@ from decimal import Decimal, InvalidOperation
 
 
 _WHITESPACE_RE = re.compile(r"\s+")
+_SET_ONLINE_CONFIRMATION_RE = re.compile(
+    r"^\s*您确定上架[【\[]\s*(?P<grade>.+?)\s+(?P<product_name>.+?)\s*[】\]]吗[？?]\s*$"
+)
+_SET_OFFLINE_CONFIRMATION_RE = re.compile(
+    r"^\s*您确定下架[【\[]\s*(?P<grade>.+?)\s+(?P<product_name>.+?)\s*[】\]]吗[？?]\s*$"
+)
 
 
 def normalize_contract_text(value):
@@ -41,6 +47,68 @@ def contract_identity_key(platform, sku, product_name, grade):
         normalized_platform,
         normalize_contract_text(product_name),
         normalize_contract_grade(grade),
+    )
+
+
+def parse_set_online_confirmation_identity(value):
+    """Return the exact visible grade/name identity from the final dialog."""
+
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    matched = _SET_ONLINE_CONFIRMATION_RE.fullmatch(normalized)
+    if matched is None:
+        raise ValueError("set-online confirmation prompt is invalid")
+    product_name = matched.group("product_name").strip()
+    grade = matched.group("grade").strip()
+    if not normalize_contract_text(product_name) or not normalize_contract_grade(
+        grade
+    ):
+        raise ValueError("set-online confirmation identity is incomplete")
+    return {
+        "product_name": product_name,
+        "grade": grade,
+    }
+
+
+def set_online_confirmation_matches(value, expected_product_name, expected_grade):
+    """Require exact name + grade; suffix variants are distinct products."""
+
+    identity = parse_set_online_confirmation_identity(value)
+    return (
+        normalize_contract_text(identity["product_name"])
+        == normalize_contract_text(expected_product_name)
+        and normalize_contract_grade(identity["grade"])
+        == normalize_contract_grade(expected_grade)
+    )
+
+
+def parse_set_offline_confirmation_identity(value):
+    """Return the exact visible grade/name identity from the final dialog."""
+
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    matched = _SET_OFFLINE_CONFIRMATION_RE.fullmatch(normalized)
+    if matched is None:
+        raise ValueError("set-offline confirmation prompt is invalid")
+    product_name = matched.group("product_name").strip()
+    grade = matched.group("grade").strip()
+    if not normalize_contract_text(product_name) or not normalize_contract_grade(
+        grade
+    ):
+        raise ValueError("set-offline confirmation identity is incomplete")
+    return {
+        "product_name": product_name,
+        "grade": grade,
+    }
+
+
+def set_offline_confirmation_matches(value, expected_product_name, expected_grade):
+    """Require exact name + grade before the final set-offline confirmation."""
+
+    identity = parse_set_offline_confirmation_identity(value)
+    return (
+        normalize_contract_text(identity["product_name"])
+        == normalize_contract_text(expected_product_name)
+        and normalize_contract_grade(identity["grade"])
+        == normalize_contract_grade(expected_grade)
     )
 
 

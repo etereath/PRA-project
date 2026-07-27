@@ -6,7 +6,7 @@ import threading
 import sqlite3
 from contextlib import closing
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.error import HTTPError
 
@@ -34,6 +34,7 @@ from app.models import (
     TaskStatusHistory,
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION
 from app.services.notification_outbox import (
     FakeSender,
     FeishuOutboxSender,
@@ -109,7 +110,9 @@ def repository():
 def test_schema_v6_has_outbox_and_attempt_health(repository):
     health = repository.check_schema_health()
     assert health.ok, health.summary
-    assert repository.schema_versions() == list(range(1, 13))
+    assert repository.schema_versions() == list(
+        range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1)
+    )
     connection = repository.connect_read()
     try:
         tables = {
@@ -1002,6 +1005,111 @@ def test_review_channel_is_normalized_before_key_and_worker_claim(repository, mo
     repository._clock = lambda: datetime(2026, 7, 17, 10, 0)
     worker = NotificationOutboxWorker.for_channel(repository, "FEISHU", registry=registry)
     assert worker.run_once().status == "SENT"
+
+
+def test_feishu_worker_sends_ephemeral_mobile_review_link_without_persisting_token(
+    repository,
+    monkeypatch,
+):
+    captured: dict[str, object] = {}
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def getcode(self):
+            return 200
+
+        def read(self):
+            return b'{"code":0,"msg":"success","request_id":"req-mobile"}'
+
+    def fake_urlopen(request, timeout):
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return Response()
+
+    monkeypatch.setattr(notification_outbox_module, "urlopen", fake_urlopen)
+    monkeypatch.setenv("DEFAULT_NOTIFICATION_CHANNEL", "feishu")
+    monkeypatch.setenv("FEISHU_WEBHOOK_URL", "https://example.invalid/hook/test")
+    monkeypatch.setenv("FEISHU_MESSAGE_TYPE", "post")
+    monkeypatch.setenv("REVIEW_TOKEN_SECRET", "test-review-token-secret")
+    monkeypatch.setenv("MOBILE_REVIEW_BASE_URL", "https://pra.example")
+    adapter = OutboxReviewNotificationService(repository)
+    review = _review("REVIEW-MOBILE-LINK")
+    inserted = adapter.create_review_task_atomically(review)
+
+    delivered = NotificationOutboxWorker.for_channel(
+        repository,
+        "feishu",
+    ).run_once()
+
+    assert delivered is not None and delivered.status == "SENT"
+    serialized_body = json.dumps(captured["body"], ensure_ascii=False)
+    assert (
+        "https://pra.example/mobile/review/REVIEW-MOBILE-LINK?token="
+        in serialized_body
+    )
+    persisted = repository.get_notification_outbox(inserted[2].notification_id)
+    assert persisted is not None
+    assert "token" not in json.dumps(persisted.payload).lower()
+    log = repository.get_notification_log(persisted.notification_id)
+    assert log is not None and "token=" not in log.message
+    tokens = repository.list_review_tokens_by_review_task_id(
+        review.review_task_id
+    )
+    assert len(tokens) == 1
+    assert tokens[0].revoked_at is None
+
+
+def test_review_notification_formats_aware_deadline_as_beijing_time(
+    repository,
+    monkeypatch,
+):
+    monkeypatch.setenv("DEFAULT_NOTIFICATION_CHANNEL", "feishu")
+    review = _review("REVIEW-BEIJING-DEADLINE")
+    review.required_by = datetime(2026, 7, 25, 23, 29, tzinfo=UTC)
+
+    outbox = OutboxReviewNotificationService(
+        repository
+    ).create_review_task_atomically(review)[2]
+
+    assert "复核截止：2026-07-26 07:29（北京时间）" in outbox.payload[
+        "message"
+    ]
+    assert "+00:00" not in outbox.payload["message"]
+
+
+def test_execution_failure_review_notification_names_retry_and_cancel_results(
+    repository,
+    monkeypatch,
+):
+    monkeypatch.setenv("DEFAULT_NOTIFICATION_CHANNEL", "feishu")
+    review = _review("REVIEW-EXECUTION-RESULTS")
+    review.review_payload = {
+        "review_subject": "task_group",
+        "task_group_id": "RULE-GROUP-NOTIFY-001",
+        "affected_task_count": 2,
+        "action_type": TaskActionType.UPDATE_PRICE.value,
+        "task_status": TaskStatus.MANUAL_REVIEW.value,
+        "items": [
+            {"task_id": "TASK-A", "internal_sku": "SKU-A"},
+            {"task_id": "TASK-B", "internal_sku": "SKU-B"},
+        ],
+    }
+    review.scope_type = "task_group"
+    review.scope_key = "RULE-GROUP-NOTIFY-001"
+
+    outbox = OutboxReviewNotificationService(
+        repository
+    ).create_review_task_atomically(review)[2]
+
+    assert "可选结果：重试任务 / 取消任务" in outbox.payload["message"]
+    assert "任务组：RULE-GROUP-NOTIFY-001（2 条待复核任务）" in outbox.payload[
+        "message"
+    ]
+    assert "商品：SKU-A、SKU-B" in outbox.payload["message"]
 
 
 @pytest.mark.parametrize("lease_before_resolve", [False, True])

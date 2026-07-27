@@ -54,9 +54,9 @@
 
 并且初始化时会写入迁移历史：
 
-- `schema_version = 1..11` 连续记录
+- `schema_version = 1..13` 连续记录
 
-当前最新 runtime schema 要求为 v11，权威常量为 `app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION`。v7-v9 增加并规范化 `listing_status`，v10 将 `tasks.expected_old_price` 结构化，v11 增加单次请求的 ShadowBot COMMIT 批次和逐商品账本。
+当前最新 runtime schema 要求为 v13，权威常量为 `app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION`。v7-v9 增加并规范化 `listing_status`，v10 将 `tasks.expected_old_price` 结构化，v11 增加单次请求的 ShadowBot COMMIT 批次和逐商品账本，v12 增加逐商品 operation/attempt、写锁和结果回执，v13 增加公共批次注册表、上下架 operation、v5 动作账本、两页快照和页面异常。
 
 v5 migration 除了 ShadowBot 队列审计列外，还创建 `retry_authorizations` 持久化结构。该表包含
 `retry_authorization_id`、`operation_id`、`source_execution_attempt_id`、授权/证据字段、
@@ -389,7 +389,7 @@ runtime schema v3 已新增：
 
 因此，这一阶段不应再描述为“纯计划中”，更准确的说法是：
 
-`SQLite 运行态持久化和运营闭环已经落地，当前 schema 为 v11；除自动规则评估外，已经包含平台状态快照、任务旧价和 ShadowBot 多商品 COMMIT 批次账本，仍在向更完整的运营与运维闭环扩展。`
+`SQLite 运行态持久化和运营闭环已经落地，当前 schema 为 v13；除自动规则评估外，已经包含平台状态、任务旧价、ShadowBot 多商品改价账本、共享写锁、上下架动作账本和两页位置快照结构，仍在向完整的状态对账和运营闭环扩展。`
 
 ---
 

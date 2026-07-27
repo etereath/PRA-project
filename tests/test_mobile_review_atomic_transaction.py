@@ -8,7 +8,7 @@ import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
@@ -21,12 +21,18 @@ from app.services.runtime import ReviewTaskService, ReviewTokenService, RuntimeT
 from app.services.workflow import resolve_mobile_review
 
 
-def _task(task_id: str, status: TaskStatus = TaskStatus.MANUAL_REVIEW) -> Task:
+def _task(
+    task_id: str,
+    status: TaskStatus = TaskStatus.MANUAL_REVIEW,
+    *,
+    action_type: TaskActionType = TaskActionType.MANUAL_REVIEW,
+    required_by: datetime | None = None,
+) -> Task:
     return Task(
         task_id=task_id,
         internal_sku="SKU-1",
         platform_name="platform",
-        action_type=TaskActionType.MANUAL_REVIEW,
+        action_type=action_type,
         priority=1,
         task_status=status,
         created_at=datetime(2026, 7, 15, 9, 0),
@@ -35,6 +41,7 @@ def _task(task_id: str, status: TaskStatus = TaskStatus.MANUAL_REVIEW) -> Task:
         scope_type="task",
         scope_key=task_id,
         dedupe_key=f"mobile-review|{task_id}",
+        required_by=required_by,
     )
 
 
@@ -198,6 +205,78 @@ class MobileReviewAtomicTransactionTests(unittest.TestCase):
         self.assertEqual(check.get_review_task(review_task_id).review_status, ReviewTaskStatus.PENDING)
         self.assertEqual(check.get_task("TASK-ATOMIC").task_status, TaskStatus.MANUAL_REVIEW)
         self.assertEqual(check.list_task_status_history("TASK-ATOMIC"), [])
+
+    def test_timezone_aware_future_token_can_be_resolved(self) -> None:
+        repository = SQLiteRuntimeRepository(self.db_path)
+        aware_expiry = datetime.now(UTC) + timedelta(hours=1)
+        with closing(repository.connect()) as connection, connection:
+            connection.execute(
+                "UPDATE review_tokens SET expires_at = ? WHERE review_task_id = ?",
+                (aware_expiry.isoformat(), self.review_task_id),
+            )
+
+        result = resolve_mobile_review(
+            self.db_path,
+            self.review_task_id,
+            self.raw_token,
+            "approved",
+        )
+
+        self.assertEqual(result.review_task.review_status, ReviewTaskStatus.APPROVED)
+        self.assertEqual(result.source_task_status, TaskStatus.PENDING)
+
+    def test_execution_retry_refreshes_stale_task_deadline(self) -> None:
+        db_path = Path(self.temp_dir.name) / "execution-retry-deadline.sqlite3"
+        repository = SQLiteRuntimeRepository(db_path)
+        runtime_service = RuntimeTaskService(repository)
+        runtime_service.init_schema()
+        source = _task(
+            "TASK-EXECUTION-RETRY",
+            action_type=TaskActionType.UPDATE_PRICE,
+            required_by=datetime(2026, 7, 26, 6, 18),
+        )
+        runtime_service.create_tasks([source])
+        review_service = ReviewTaskService(
+            repository,
+            runtime_task_service=runtime_service,
+        )
+        review = review_service.create_from_tasks([source]).review_tasks[0]
+        resolved_at = datetime(2026, 7, 26, 9, 0)
+        token = ReviewTokenService(repository).create_token(
+            review.review_task_id,
+            token_subject="mobile_reviewer",
+            expires_at=resolved_at + timedelta(hours=1),
+        )
+
+        result = repository.resolve_mobile_review_atomic(
+            review_task_id=review.review_task_id,
+            token_hash=token.review_token.token_hash,
+            status=ReviewTaskStatus.APPROVED,
+            actor_source="mobile_review_token",
+            now=resolved_at,
+        )
+
+        retried = repository.get_task(source.task_id)
+        expected_deadline = resolved_at + timedelta(minutes=30)
+        self.assertEqual(result.source_task_status, TaskStatus.PENDING)
+        self.assertEqual(retried.required_by, expected_deadline)
+        self.assertEqual(retried.expires_at, expected_deadline)
+        self.assertEqual(
+            result.review_task.resolution_payload["retry_required_by"],
+            expected_deadline.isoformat(),
+        )
+        self.assertEqual(
+            repository.list_task_status_history(source.task_id)[-1].metadata[
+                "retry_required_by"
+            ],
+            expected_deadline.isoformat(),
+        )
+        self.assertEqual(
+            runtime_service.expire_overdue_pending_tasks(
+                now=resolved_at + timedelta(minutes=1)
+            ),
+            0,
+        )
 
     def test_each_mobile_action_uses_the_expected_source_task_transition(self) -> None:
         expected = {

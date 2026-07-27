@@ -2,15 +2,15 @@ from __future__ import annotations
 
 import tempfile
 import unittest
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
 from openpyxl import Workbook
 
-from app.enums import ReviewTaskStatus, TaskStatus
-from app.models import ListingStatus
+from app.enums import ReviewTaskStatus, TaskActionType, TaskStatus
+from app.models import ListingStatus, Task
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import (
     CAPACITY_PLAN_HEADERS,
@@ -22,10 +22,13 @@ from app.repositories.workbook_repository import (
 from app.services.runtime import ReviewTaskService, RuntimeTaskService
 from app.services.workflow import (
     ExecutionSimulationInputs,
+    TaskGenerationSummary,
+    ValidationSummary,
     WorkflowInputs,
     generate_tasks_from_sources,
     generate_runtime_tasks_from_sources,
     generate_tasks_from_selected_rule,
+    persist_task_generation_summary,
     preview_tasks_from_sources,
     preview_tasks_from_selected_rule,
     simulate_execution_from_tasks,
@@ -154,6 +157,152 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(all(task.decision_trace["selected_rule_id"] == "LIST-LOW" for task in summary.tasks))
         self.assertEqual(len({task.decision_trace["task_group_id"] for task in summary.tasks}), 1)
         self.assertTrue(summary.output_written)
+
+    def test_selected_listing_rules_ignore_products_with_mismatched_platform_state(
+        self,
+    ) -> None:
+        runtime_db = Path(self.temp_dir.name) / "runtime-listing-state.sqlite3"
+        repository = SQLiteRuntimeRepository(runtime_db)
+        repository.init_schema()
+        repository.upsert_listing_status(
+            ListingStatus(
+                listing_status_id="LISTING-ONLINE-A",
+                platform_name="测试平台",
+                internal_sku="SKU-001",
+                variety="艾莎",
+                grade="A",
+                current_price=Decimal("18"),
+                online_status="online",
+                platform_stock_qty=20,
+            )
+        )
+        repository.upsert_listing_status(
+            ListingStatus(
+                listing_status_id="LISTING-OFFLINE-B",
+                platform_name="测试平台",
+                internal_sku="SKU-002",
+                variety="艾莎",
+                grade="B",
+                current_price=Decimal("16"),
+                online_status="offline",
+                platform_stock_qty=20,
+            )
+        )
+        self.inputs.runtime_db_path = runtime_db
+        self.inputs.output_path = None
+
+        online_preview = preview_tasks_from_selected_rule(
+            self.inputs,
+            rule_type="listing",
+            rule_id="LIST-RESTOCK",
+        )
+        offline_preview = preview_tasks_from_selected_rule(
+            self.inputs,
+            rule_type="listing",
+            rule_id="LIST-LOW",
+        )
+
+        self.assertEqual(online_preview.tasks, [])
+        self.assertEqual(offline_preview.tasks, [])
+        self.assertEqual(
+            [
+                (
+                    candidate.internal_sku,
+                    candidate.action_type.value,
+                    candidate.current_listing_state,
+                    candidate.reason,
+                )
+                for candidate in online_preview.ignored_candidates
+            ],
+            [
+                (
+                    "SKU-001",
+                    "set_online",
+                    "online",
+                    "当前商品已上架，无需重复上架",
+                )
+            ],
+        )
+        self.assertEqual(
+            [
+                (
+                    candidate.internal_sku,
+                    candidate.action_type.value,
+                    candidate.current_listing_state,
+                    candidate.reason,
+                )
+                for candidate in offline_preview.ignored_candidates
+            ],
+            [
+                (
+                    "SKU-002",
+                    "set_offline",
+                    "offline",
+                    "当前商品未上架，无需重复下架",
+                )
+            ],
+        )
+
+    def test_selected_set_offline_rule_only_targets_currently_online_products(
+        self,
+    ) -> None:
+        runtime_db = Path(self.temp_dir.name) / "runtime-direct-offline.sqlite3"
+        repository = SQLiteRuntimeRepository(runtime_db)
+        repository.init_schema()
+        for suffix, grade, online_status in (
+            ("A", "A", "online"),
+            ("B", "B", "offline"),
+        ):
+            repository.upsert_listing_status(
+                ListingStatus(
+                    listing_status_id=f"LISTING-DIRECT-{suffix}",
+                    platform_name="测试平台",
+                    internal_sku=f"SKU-00{1 if grade == 'A' else 2}",
+                    variety="艾莎",
+                    grade=grade,
+                    current_price=Decimal("18"),
+                    online_status=online_status,
+                    platform_stock_qty=20,
+                )
+            )
+        _write_workbook(
+            self.listing_rules_path,
+            LISTING_RULE_HEADERS,
+            [
+                [
+                    "LIST-DIRECT-OFFLINE",
+                    "艾莎直接下架",
+                    "艾莎",
+                    "*",
+                    "测试平台",
+                    0,
+                    "set_offline",
+                    True,
+                    1,
+                    "",
+                ]
+            ],
+        )
+        self.inputs.runtime_db_path = runtime_db
+        self.inputs.output_path = None
+
+        preview = preview_tasks_from_selected_rule(
+            self.inputs,
+            rule_type="listing",
+            rule_id="LIST-DIRECT-OFFLINE",
+        )
+
+        self.assertEqual(
+            [(task.internal_sku, task.action_type.value) for task in preview.tasks],
+            [("SKU-001", "set_offline")],
+        )
+        self.assertEqual(
+            [
+                (candidate.internal_sku, candidate.reason)
+                for candidate in preview.ignored_candidates
+            ],
+            [("SKU-002", "当前商品未上架，无需重复下架")],
+        )
 
     def test_selected_rule_loader_ignores_invalid_unselected_rule(self) -> None:
         _write_workbook(
@@ -327,6 +476,52 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue(all(review.source_task_id for review in reviews))
         self.assertTrue(all(task_service.get_task(str(review.source_task_id)) is not None for review in reviews))
         self.assertTrue(all(task.task_status == TaskStatus.PENDING for task in task_service.list_tasks()))
+
+    def test_runtime_generation_expires_overdue_duplicate_before_insert(self) -> None:
+        runtime_db = Path(self.temp_dir.name) / "runtime_expired_duplicate.sqlite3"
+        repository = SQLiteRuntimeRepository(runtime_db)
+        task_service = RuntimeTaskService(repository)
+        task_service.init_schema()
+        old_task = Task(
+            task_id="OLD-TASK",
+            internal_sku="AISHA-B-60-Z",
+            platform_name="蚂蚁花团供应商",
+            action_type=TaskActionType.SET_OFFLINE,
+            priority=1,
+            task_status=TaskStatus.PENDING,
+            created_at=datetime(2026, 7, 26, 14, 34, tzinfo=timezone.utc),
+            target_status="offline",
+            required_by=datetime(2026, 7, 26, 23, 4),
+        )
+        self.assertEqual(task_service.create_tasks([old_task]), 1)
+        new_task = Task(
+            task_id="NEW-TASK",
+            internal_sku="AISHA-B-60-Z",
+            platform_name="蚂蚁花团供应商",
+            action_type=TaskActionType.SET_OFFLINE,
+            priority=1,
+            task_status=TaskStatus.PENDING,
+            created_at=datetime(2026, 7, 26, 15, 33, tzinfo=timezone.utc),
+            target_status="offline",
+            required_by=datetime(2026, 7, 27, 0, 3),
+        )
+        summary = TaskGenerationSummary(
+            validation=ValidationSummary(
+                products=[],
+                price_rules_count=0,
+                listing_rules_count=0,
+            ),
+            tasks=[new_task],
+            output_path=None,
+        )
+
+        persisted = persist_task_generation_summary(summary, db_path=runtime_db)
+
+        self.assertEqual(persisted.inserted_tasks_count, 1)
+        self.assertEqual(task_service.get_task("OLD-TASK").task_status, TaskStatus.EXPIRED)
+        self.assertEqual(task_service.get_task("NEW-TASK").task_status, TaskStatus.PENDING)
+        history = task_service.list_status_history("OLD-TASK")
+        self.assertEqual(history[0].reason, "required_by_deadline_passed")
 
 
 if __name__ == "__main__":

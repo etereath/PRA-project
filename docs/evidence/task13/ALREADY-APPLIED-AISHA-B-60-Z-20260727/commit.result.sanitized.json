@@ -1,0 +1,140 @@
+{
+  "action_type": "set_offline",
+  "active_listing_filter": "ONLINE",
+  "active_listing_filter_selected_at": "2026-07-27T05:44:58+08:00",
+  "actual_price": "",
+  "applet_launch": {
+    "source": "EXISTING_WINDOW",
+    "uri_opened": false,
+    "window_ready_at": "2026-07-27T05:44:49+08:00"
+  },
+  "batch_id": "BATCH-T13-ALREADY-APPLIED-20260727-01",
+  "batch_status": "VERIFIED",
+  "business_operation_completed": false,
+  "contract_version": 5,
+  "counts": {
+    "already_applied_count": 1,
+    "attempted_count": 0,
+    "batch_target_count": 1,
+    "failed_count": 0,
+    "not_applied_count": 0,
+    "not_attempted_count": 0,
+    "partial_effect_count": 0,
+    "unknown_count": 0,
+    "verified_applied_count": 0,
+    "verified_count": 1
+  },
+  "current_step": "VALIDATE_INPUT",
+  "ended_at": "2026-07-26T21:46:02+00:00",
+  "error_code": "",
+  "error_message": "",
+  "evidence": [],
+  "evidence_status": "NONE",
+  "execution_attempt_id": "ATTEMPT-f2a0b9089ed84b7b",
+  "execution_mode": "COMMIT",
+  "expected_old_price": "",
+  "grade": "",
+  "instruction_hash": "sha256:93ed1466d6f6cc3936334ea25500adf67fe7795f97315389670908c25bc4412c",
+  "items": [
+    {
+      "action_clicked_at": null,
+      "action_confirm_clicked": false,
+      "actual_inventory": null,
+      "actual_price": null,
+      "detail_effect_state": "NOT_APPLIED",
+      "detail_save_clicked": false,
+      "detail_save_clicked_at": null,
+      "error_code": "",
+      "error_message": "",
+      "internal_sku": "AISHA-B-60-Z",
+      "item_execution_attempt_id": "ATTEMPT-6879d487c2143fecb6650575",
+      "item_payload_sha256": "sha256:0ba569573e6a46588f59dc2f9b03fb83e6aec22ac18a1d1e28cdf514941e9256",
+      "listing_effect_state": "NOT_APPLIED",
+      "observed_inventory_after_detail_save": null,
+      "observed_inventory_before_action": null,
+      "observed_price_after_detail_save": null,
+      "observed_price_before_action": null,
+      "operation_id": "OP-f832a7e45a9e092f5dac8078",
+      "operation_result": "ALREADY_APPLIED",
+      "readback_observed_at": "2026-07-26T21:46:02+00:00",
+      "source_task_id": "cd0546933d96"
+    }
+  ],
+  "login": {
+    "check_path": "BUSINESS_ENTRY_FAST_PATH",
+    "login_completed_at": "2026-07-27T05:44:51+08:00"
+  },
+  "manifest_sha256": "sha256:9f02091a1123925b26fcdf48ea13baf6dfb4dfd08c9f5672cc5c500771377f1b",
+  "old_price": "",
+  "partial_effect_count": 0,
+  "product_keyword": "",
+  "product_list_refreshes": [
+    {
+      "ended_at": "2026-07-27T05:46:02+08:00",
+      "readiness": "EMPTY_LIST_MARKER",
+      "refresh_entry": "蚂蚁_首页_商品管理_入口",
+      "stage": "BEFORE_SET_OFFLINE",
+      "started_at": "2026-07-27T05:44:51+08:00",
+      "status": "SUCCESS"
+    }
+  ],
+  "product_name": "",
+  "queue_phase": "RESULT_WRITTEN",
+  "reconciliation_pending": false,
+  "request_file_sha256": "sha256:1e5183a9bf34cc281a756f7c30cf6f02b6ce2def7e97d283d84cec3312d00361",
+  "requires_manual_review": false,
+  "result_id": "RESULT-7bfd59f8addfe713af030cf1",
+  "result_path": "<REDACTED_PATH>/ATTEMPT-f2a0b9089ed84b7b.json",
+  "result_payload_sha256": "sha256:abbc9e05a1ea501ff627cfbcbf35c7db7a7dd606f3f9470ce93f367dc876089a",
+  "retryable": false,
+  "run_success_flag": true,
+  "schema_version": "shadowbot-listing-action-batch-result-1.0",
+  "selector_model": {
+    "inventory_index_offset": 6,
+    "inventory_text_index": 0,
+    "parent_class": "van-checkbox-group",
+    "price_index_offset": 9,
+    "row_index_start": 1,
+    "row_index_step": 16,
+    "waiting_row_index_step": 15
+  },
+  "side_effect_state": "NOT_STARTED",
+  "spec": "",
+  "spec_available": false,
+  "started_at": "2026-07-26T21:44:48+00:00",
+  "status": "VERIFIED",
+  "target_price": "",
+  "task_id": "",
+  "timing_trace": [
+    {
+      "duration_ms": 1837,
+      "stage": "window_prepare"
+    },
+    {
+      "duration_ms": 471,
+      "stage": "login_check"
+    },
+    {
+      "duration_ms": 71056,
+      "stage": "product_list_refresh"
+    },
+    {
+      "duration_ms": 40,
+      "identity_rows": 0,
+      "inventory_reads": 0,
+      "non_target_rows_skipped": 0,
+      "page_type": "online",
+      "price_reads": 0,
+      "stage": "preflight_online_scan",
+      "target_rows_hydrated": 0
+    },
+    {
+      "duration_ms": 73419,
+      "item_count": 1,
+      "stage": "set_offline_total"
+    }
+  ],
+  "window_title": "",
+  "worker_heartbeat_at": "2026-07-26T21:46:02.235918+00:00",
+  "worker_id": "<REDACTED_DEVICE>"
+}

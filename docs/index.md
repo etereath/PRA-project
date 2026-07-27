@@ -2,17 +2,35 @@
 
 本文档是当前项目文档入口。项目说明文本以中文为主，英文键名和代码标识保持原样。
 
-运行态业务数据以 SQLite 为中心，当前结构版本为 v12。v9 使用“平台 + 品种 + 等级”作为 `listing_status` 业务身份，v10 将任务旧价结构化，v11 增加单次请求的 ShadowBot 多商品 COMMIT 批次账本，v12 增加逐商品操作/尝试身份、活动写锁、观察时间和技术回执。Excel 继续承担商品、规则等主数据输入，不是运行态任务数据库。
+运行态业务数据以 SQLite 为中心，当前结构版本为 v13。v9 使用“平台 + 品种 + 等级”作为 `listing_status` 业务身份，v10 将任务旧价结构化，v11 增加单次请求的 ShadowBot 多商品 COMMIT 批次账本，v12 增加逐商品操作/尝试身份、活动写锁、观察时间和技术回执，v13 增加公共批次注册表、通用上下架 operation、两页快照、页面异常和 v5 动作账本。Excel 继续承担商品、规则等主数据输入，不是运行态任务数据库。
 
 ## 当前状态与入口
 
 - [project_current_status.md](project_current_status.md)：当前项目定位、已完成能力、主控流程、安全边界和下一步优先级。
 - [reports/task12_final_handoff_20260723.md](reports/task12_final_handoff_20260723.md)：任务12当前实现、正式合同、实机证据、已知限制和审查步骤的最终交接入口。
+- [reports/task13_final_handoff_20260727.md](reports/task13_final_handoff_20260727.md)：任务13当前实现、四维状态模型、v5上下架合同、实机证据、运行边界和审查步骤的最终交接入口。
 - [reports/task12_review_remediation_20260723.md](reports/task12_review_remediation_20260723.md)：针对任务12审查问题的接续修复记录；以该文档说明 v12 合同、原子导入和待补实机证据，不覆盖原交接报告。
 - [evidence/task12/index.md](evidence/task12/index.md)：任务12正常 COMMIT 与 UNKNOWN→RECONCILE 的 PR 内脱敏原始证据及自动复算入口。
+- [evidence/task13/index.md](evidence/task13/index.md)：任务13 独立 SYNC_STATUS、单/多商品上下架、批次预检零写、严格串行 UNKNOWN 和唯一 RECONCILE 的脱敏证据及 CI 复算入口。
 - [reports/task12_development_report_20260723.md](reports/task12_development_report_20260723.md)：任务12开发成果、问题回溯、修复方法和防复发规则。
 - [reports/task12_evidence_index_20260723.md](reports/task12_evidence_index_20260723.md)：任务12代表性实机 Run ID、结果 SHA-256、归档位置和审查核对项。
 - [task12_reusable_assets.md](task12_reusable_assets.md)：后续任务可直接复用的代码、合同、测试、运行流程和安全门禁。
+- [plans/task13_ui_discovery_report.md](plans/task13_ui_discovery_report.md)：任务13 T13-0 已接受的无副作用页面结构、选择器规律和重复身份风险。
+- [plans/task13_t13_1_contract_freeze.md](plans/task13_t13_1_contract_freeze.md)：任务13 T13-1 四维状态模型、v5 合同、action gate 和两阶段副作用冻结。
+- [../任务13_单平台商品上下架与状态对账闭环_交接与实施计划.md](../任务13_单平台商品上下架与状态对账闭环_交接与实施计划.md)：任务13原始交接与实施计划；用于追溯阶段和完成定义，不覆盖最终交接事实。
+- [../任务13_单平台商品上下架与状态对账闭环_交接与实施计划_修改意见.md](../任务13_单平台商品上下架与状态对账闭环_交接与实施计划_修改意见.md)：任务13流程、点击边界和数据库合同的接续修改意见。
+- [../任务13_商品状态定义修改反馈.md](../任务13_商品状态定义修改反馈.md)：四维状态、位置快照、Review、UNKNOWN 和 v13 迁移语义的详细冻结反馈。
+- [reports/task13_t13_2_runtime_schema_v13.md](reports/task13_t13_2_runtime_schema_v13.md)：任务13 T13-2 Runtime Schema v13、无损迁移、结构健康检查和 v4 回归结果。
+- [reports/task13_t13_3_independent_sync_status.md](reports/task13_t13_3_independent_sync_status.md)：任务13 T13-3 独立两页 SYNC_STATUS、原子快照投影、异常 Review/Outbox、失败快照和人工报告。
+- [reports/task13_unknown_reconcile_acceptance_20260727.md](reports/task13_unknown_reconcile_acceptance_20260727.md)：任务13 最终确认点击后的受控 UNKNOWN、唯一自动只读 RECONCILE、数据库归并、写锁释放和可复算证据。
+- [reports/task13_unknown_not_applied_acceptance_20260727.md](reports/task13_unknown_not_applied_acceptance_20260727.md)：任务13 受控 UNKNOWN 后经授权外部恢复、唯一只读 RECONCILE 得出 `NOT_APPLIED`、任务失败和写锁释放的可复算证据。
+- [reports/task13_already_applied_acceptance_20260727.md](reports/task13_already_applied_acceptance_20260727.md)：任务13 已满足目标状态时的 `ALREADY_APPLIED`、0 写点击、账本归并和可复算证据。
+- [reports/task13_multi_success_acceptance_20260726.md](reports/task13_multi_success_acceptance_20260726.md)：任务13 两商品正常上架与下架的逐商品结果、数据库账本和 CI 复算入口。
+- [reports/task13_serial_unknown_acceptance_20260726.md](reports/task13_serial_unknown_acceptance_20260726.md)：任务13 首项成功、次项 UNKNOWN、后续停止及唯一 RECONCILE 的严格串行证据。
+- [reports/task13_preflight_zero_write_acceptance_20260727.md](reports/task13_preflight_zero_write_acceptance_20260727.md)：任务13 全批次前置不一致时 0 次资料保存和 0 次最终确认的验收证据。
+- [reports/task13_write_lock_and_recovery_acceptance_20260727.md](reports/task13_write_lock_and_recovery_acceptance_20260727.md)：任务13 跨动作共享写锁和 phase/result 中断恢复矩阵。
+- [reports/task13_web_projection_acceptance_20260727.md](reports/task13_web_projection_acceptance_20260727.md)：任务13 v5 批次、operation、attempt、UNKNOWN 和 RECONCILE 的只读运营投影。
+- [reports/task13_acceptance_status_20260727.md](reports/task13_acceptance_status_20260727.md)：任务13当前验收覆盖矩阵和剩余项；不代替审查方修改任务状态。
 - [../README.md](../README.md)：快速启动、环境变量、cpolar / Mobile Review、飞书测试通知和测试命令。
 - [../项目注意事项.md](../项目注意事项.md)：项目级注意事项。
 
@@ -108,14 +126,15 @@ Code Review 后高中低风险问题已完成修复，系统冒烟测试、全�
 - 已完成 `ShadowBotExecutor`、v4 批次账本、常驻文件队列 runner、Result Importer、Queue Watchdog、自动只读对账和 Web 队列状态入口。
 - 已完成 8 小时 READ_ONLY 常驻 Worker 连续运行验收；长期证据归档和运营告警闭环仍待完成。
 - 已完成提交意图后 `stop.signal` 实机验收，以及真实商品 `COMMIT -> UNKNOWN -> 自动 RECONCILE -> VERIFIED` 验收。
+- 任务13已完成独立两页 SYNC_STATUS、单商品往返、正常多商品上下架、整批预检零写、严格串行 UNKNOWN、`UNKNOWN -> 唯一自动 RECONCILE -> VERIFIED`、`UNKNOWN -> 唯一自动 RECONCILE -> NOT_APPLIED`、`ALREADY_APPLIED` 0 写点击、跨动作共享写锁、phase/result 恢复、Web 运营投影、最终本地回归和交接报告；任务13总状态仍等待 GitHub CI 与人工审查。
 - 最终暖态四商品批次 4/4 `VERIFIED`，总用时 `51.094 秒`；READ_ONLY 完整页面结束标记样本为 1 次扫描、0 次滚动、`27.445 秒`。
 - 暂不承诺无人值守生产改价。
 
 下一步优先级：
 
-1. 任务12审查修复版的正常四商品 COMMIT 与受控 UNKNOWN→唯一 RECONCILE 实机证据均已完成，详见接续修复报告和证据索引。
-2. 整理最终 GitHub PR，由审查方检查任务12代码、原交接、接续修复文档和实机证据；审查通过后再修改任务状态。
-3. 进入任务13，复用任务12的合同、队列、身份、账本和副作用状态机，新增上下架及 OFFLINE 跨页面对账。
+1. 任务12审查修复已通过 PR #18 合并；其 v4 改价链路继续作为任务13和后续任务的稳定基线。
+2. 任务13计划中的实现、受控实机验收、最终本地回归和交接报告均已覆盖；下一步通过独立 GitHub PR 运行 CI 并交由审查方复核，任务状态仍不修改。
+3. 任务14实现统一任务审查和正式调度授权；在此之前继续保持显式 `task_id` 门禁。
 4. 补充长期告警、磁盘清理、证据保留和服务账号运维样本，并分别定义冷态/暖态耗时口径。
 5. 为元素版本漂移和白屏建立可重复的专用测试夹具；登录、网络和证据上传失败的实机故障注入已经完成。
 6. 持续运行系统冒烟和 ShadowBot 成功基线测试，避免后续任务重写已验证 COMMIT 链路。

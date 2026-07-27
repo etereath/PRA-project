@@ -12,7 +12,8 @@ import json
 import os
 import re
 import time
-from datetime import datetime, timedelta
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Protocol, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -37,12 +38,17 @@ from app.models import (
     ReviewTask,
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.review_policy import (
+    is_execution_failure_review,
+    review_task_group_id,
+)
 from app.utils import utc_now
 
 
 DEFAULT_NOTIFICATION_MAX_ATTEMPTS = 3
 DEFAULT_NOTIFICATION_LEASE_SECONDS = 60
 DEFAULT_NOTIFICATION_RETRY_SECONDS = 2
+BEIJING_TIMEZONE = timezone(timedelta(hours=8))
 VERIFICATION_NOTIFICATION_TYPE = "verification_code_intervention"
 NOTIFICATION_KEY_VERSION = "v1"
 MAX_NOTIFICATION_PAYLOAD_BYTES = 16_384
@@ -600,6 +606,29 @@ class NotificationOutboxService:
         )
         return candidate, self._compatibility_log(candidate)
 
+    def build_review_notification_candidate(
+        self,
+        review_task: ReviewTask,
+        *,
+        event_version: str,
+    ) -> tuple[NotificationOutbox, NotificationLog]:
+        candidate = self._candidate_review_notification(
+            review_task,
+            recipient_type=os.getenv(
+                "DEFAULT_NOTIFICATION_RECIPIENT_TYPE",
+                "role",
+            ).strip()
+            or "role",
+            recipient_ref=os.getenv(
+                "DEFAULT_NOTIFICATION_RECIPIENT",
+                "operations",
+            ).strip()
+            or "operations",
+            channel=_configured_notification_channel(),
+            event_version=event_version,
+        )
+        return candidate, self._compatibility_log(candidate)
+
     def _ensure_compatibility_log(self, notification: NotificationOutbox) -> None:
         self.repository.insert_notification_logs([self._compatibility_log(notification)])
 
@@ -795,28 +824,53 @@ class NotificationOutboxService:
             lease_version=notification.lease_version,
             request_fingerprint=_fingerprint(notification.payload),
         )
+        delivery_notification = notification
+        review_token_id = ""
         try:
-            result = sender.send(notification, attempt)
-        except UnknownDelivery:
-            result = NotificationDeliveryResult(
-                classification=DeliveryClassification.UNKNOWN.value,
-                error_code="UNKNOWN_DELIVERY",
-                error_message="provider result was not provable",
-            )
-        except (TimeoutError, ConnectionError, OSError) as exc:
-            result = NotificationDeliveryResult(
-                classification=DeliveryClassification.UNKNOWN.value,
-                error_code="UNKNOWN_DELIVERY",
-                error_message=f"provider call was interrupted: {type(exc).__name__}",
+            delivery_notification, review_token_id = (
+                self._prepare_delivery_notification(notification, sender)
             )
         except Exception as exc:
-            # Once a sender has been called, retrying an unclassified exception
-            # could duplicate an external side effect; fence it as unknown.
             result = NotificationDeliveryResult(
-                classification=DeliveryClassification.UNKNOWN.value,
-                error_code="UNKNOWN_DELIVERY",
-                error_message=f"provider result was not provable: {type(exc).__name__}",
+                classification=DeliveryClassification.PERM_FAILED.value,
+                error_code="MOBILE_REVIEW_URL_CREATION_FAILED",
+                error_message=(
+                    "mobile review URL could not be created: "
+                    + type(exc).__name__
+                ),
             )
+        else:
+            try:
+                result = sender.send(delivery_notification, attempt)
+            except UnknownDelivery:
+                result = NotificationDeliveryResult(
+                    classification=DeliveryClassification.UNKNOWN.value,
+                    error_code="UNKNOWN_DELIVERY",
+                    error_message="provider result was not provable",
+                )
+            except (TimeoutError, ConnectionError, OSError) as exc:
+                result = NotificationDeliveryResult(
+                    classification=DeliveryClassification.UNKNOWN.value,
+                    error_code="UNKNOWN_DELIVERY",
+                    error_message=f"provider call was interrupted: {type(exc).__name__}",
+                )
+            except Exception as exc:
+                # Once a sender has been called, retrying an unclassified exception
+                # could duplicate an external side effect; fence it as unknown.
+                result = NotificationDeliveryResult(
+                    classification=DeliveryClassification.UNKNOWN.value,
+                    error_code="UNKNOWN_DELIVERY",
+                    error_message=f"provider result was not provable: {type(exc).__name__}",
+                )
+        if (
+            review_token_id
+            and result.classification
+            in {
+                DeliveryClassification.TEMP_FAILED.value,
+                DeliveryClassification.PERM_FAILED.value,
+            }
+        ):
+            self._revoke_unused_review_token(review_token_id)
         final = self.repository.complete_notification_delivery(
             notification.notification_id,
             attempt.delivery_attempt_id,
@@ -825,6 +879,39 @@ class NotificationOutboxService:
             result=result,
         )
         return final
+
+    def _prepare_delivery_notification(
+        self,
+        notification: NotificationOutbox,
+        sender: NotificationSender,
+    ) -> tuple[NotificationOutbox, str]:
+        if (
+            not isinstance(sender, FeishuOutboxSender)
+            or notification.channel != "feishu"
+            or notification.notification_type != "mobile_review_required"
+            or not notification.related_review_task_id
+        ):
+            return notification, ""
+        from app.services.runtime import ReviewTokenService
+
+        token = ReviewTokenService(self.repository).create_token(
+            notification.related_review_task_id,
+            created_by="notification_outbox_worker",
+            note="ephemeral Feishu mobile review link",
+        )
+        payload = dict(notification.payload)
+        payload["mobile_review_url"] = token.mobile_review_url
+        return replace(notification, payload=payload), token.review_token.token_id
+
+    def _revoke_unused_review_token(self, review_token_id: str) -> None:
+        from app.services.runtime import ReviewTokenService
+
+        try:
+            ReviewTokenService(self.repository).revoke_token(review_token_id)
+        except Exception:
+            # Delivery state remains authoritative. Token cleanup is best effort
+            # and must never replace a proven provider result.
+            return
 
     def watchdog(self, *, now: datetime | None = None) -> list[NotificationOutbox]:
         return self.repository.recover_expired_notification_leases()
@@ -967,7 +1054,43 @@ def _coerce_datetime_for_comparison(value: datetime, reference: datetime) -> dat
 def _review_notification_message(review_task: ReviewTask) -> str:
     label = REVIEW_TYPE_LABELS.get(review_task.review_type, review_task.review_type)
     reason = review_task.reason.strip()
-    return f"{label}：{reason}" if reason else label
+    lines = [f"{label}：{reason}" if reason else label]
+    if review_task.platform_name:
+        lines.append(f"平台：{review_task.platform_name}")
+    scope = review_task.internal_sku or review_task.scope_key
+    if scope:
+        lines.append(f"对象：{scope}")
+    group_id = review_task_group_id(review_task)
+    if group_id:
+        task_count = review_task.review_payload.get("affected_task_count")
+        suffix = f"（{task_count} 条待复核任务）" if task_count else ""
+        lines.append(f"任务组：{group_id}{suffix}")
+    item_skus = list(
+        dict.fromkeys(
+            str(item.get("internal_sku") or "").strip()
+            for item in review_task.review_payload.get("items", [])
+            if isinstance(item, dict)
+            and str(item.get("internal_sku") or "").strip()
+        )
+    )
+    if item_skus:
+        lines.append(f"商品：{'、'.join(item_skus)}")
+    if review_task.required_by is not None:
+        lines.append(
+            "复核截止："
+            + _format_beijing_datetime(review_task.required_by)
+        )
+    if is_execution_failure_review(review_task):
+        lines.append("可选结果：重试任务 / 取消任务")
+    return "\n".join(lines)
+
+
+def _format_beijing_datetime(value: datetime) -> str:
+    if value.tzinfo is None or value.utcoffset() is None:
+        display_value = value.replace(tzinfo=BEIJING_TIMEZONE)
+    else:
+        display_value = value.astimezone(BEIJING_TIMEZONE)
+    return display_value.strftime("%Y-%m-%d %H:%M（北京时间）")
 
 
 _PAYLOAD_FIELD_WHITELISTS = {
@@ -1167,18 +1290,32 @@ def _review_event_identity(review: ReviewTask, notification: NotificationOutbox)
 def _build_feishu_outbox_body(notification: NotificationOutbox, message_type: str) -> dict[str, object]:
     payload = notification.payload if isinstance(notification.payload, dict) else {}
     message = str(payload.get("message") or payload.get("reason") or notification.notification_type)[:2000]
+    mobile_review_url = str(payload.get("mobile_review_url") or "").strip()
     if message_type == "post":
+        content = [[{"tag": "text", "text": message}]]
+        if mobile_review_url:
+            content.append(
+                [
+                    {
+                        "tag": "a",
+                        "text": "打开手机复核",
+                        "href": mobile_review_url,
+                    }
+                ]
+            )
         return {
             "msg_type": "post",
             "content": {
                 "post": {
                     "zh_cn": {
-                        "title": str(payload.get("title") or notification.notification_type)[:200],
-                        "content": [[{"tag": "text", "text": message}],],
+                        "title": str(payload.get("title") or "PRA 人工复核")[:200],
+                        "content": content,
                     }
                 }
             },
         }
+    if mobile_review_url:
+        message = f"{message}\n打开手机复核：{mobile_review_url}"
     return {"msg_type": "text", "content": {"text": message}}
 
 

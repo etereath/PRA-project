@@ -7,7 +7,7 @@ import re
 import shutil
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -16,7 +16,13 @@ from urllib.parse import unquote, urlencode, urlparse
 from unittest.mock import patch
 from uuid import uuid4
 
-from app.enums import NotificationSendStatus, ReviewTaskStatus, TaskActionType, TaskStatus
+from app.enums import (
+    ListingStrategy,
+    NotificationSendStatus,
+    ReviewTaskStatus,
+    TaskActionType,
+    TaskStatus,
+)
 from app.models import (
     ExecutionLog,
     ListingStatus,
@@ -31,6 +37,7 @@ from app.models import (
 from app.repositories.workbook_repository import (
     load_capacity_plans,
     load_cold_storage_statuses,
+    load_listing_rules,
     load_price_rules,
     load_products,
     load_table_records,
@@ -45,6 +52,7 @@ from app.web import (
     TABLE_OPTIONS,
     _RUNTIME_SESSIONS,
     _build_task_group_statuses,
+    _redact_request_log_value,
     _resolve_table_path,
     application,
     default_dashboard_state,
@@ -58,7 +66,18 @@ from app.web import (
     render_manual_intervention_page,
     render_runtime_page,
     render_table_editor_page,
+    render_tasks_page,
 )
+
+
+def test_request_log_redacts_mobile_review_token() -> None:
+    value = (
+        "GET /mobile/review/REVIEW-1?token=secret-token&next=1 "
+        "HTTP/1.1"
+    )
+    redacted = _redact_request_log_value(value)
+    assert "secret-token" not in redacted
+    assert "token=[REDACTED]&next=1" in redacted
 
 
 @contextmanager
@@ -682,9 +701,16 @@ class WebTests(unittest.TestCase):
                 self.assertIn("数据摘要", preview_body)
                 self.assertIn("SKU-AISHA-A", preview_body)
                 self.assertIn("SKU-CAPPUCCINO-A", preview_body)
-                self.assertNotIn("SKU-OFFLINE", preview_body)
-                self.assertNotIn("SKU-ZERO-STOCK", preview_body)
-                self.assertNotIn("SKU-WITHOUT-LISTING", preview_body)
+                self.assertIn("已忽略商品（3）", preview_body)
+                self.assertIn("SKU-OFFLINE", preview_body)
+                self.assertIn("当前商品未上架，改价任务已忽略", preview_body)
+                self.assertIn("SKU-ZERO-STOCK", preview_body)
+                self.assertIn("平台库存为 0，商品不参与改价任务", preview_body)
+                self.assertIn("SKU-WITHOUT-LISTING", preview_body)
+                self.assertIn("未找到当前平台上架状态，改价任务已忽略", preview_body)
+                self.assertIn("原任务类型", preview_body)
+                self.assertIn("当前平台状态", preview_body)
+                self.assertIn("忽略原因", preview_body)
                 group_match = re.search(r'name="task_group_id" value="([^"]+)"', preview_body)
                 deadline_match = re.search(r'name="required_by" value="([^"]+)"', preview_body)
                 self.assertIsNotNone(group_match)
@@ -720,6 +746,9 @@ class WebTests(unittest.TestCase):
                 self.assertEqual(status, "200 OK")
                 self.assertIn("SKU-AISHA-A", tasks_body)
                 self.assertIn("SKU-CAPPUCCINO-A", tasks_body)
+                self.assertNotIn("SKU-OFFLINE", tasks_body)
+                self.assertNotIn("SKU-ZERO-STOCK", tasks_body)
+                self.assertNotIn("SKU-WITHOUT-LISTING", tasks_body)
                 self.assertIn(generated_group_id, tasks_body)
                 self.assertIn("任务组状态", tasks_body)
                 self.assertIn("预期原价", tasks_body)
@@ -763,6 +792,294 @@ class WebTests(unittest.TestCase):
                 {Decimal("20"), Decimal("30")},
             )
             self.assertEqual({task.task_status for task in runtime_tasks}, {TaskStatus.PENDING})
+
+    def test_listing_task_requires_editable_price_and_inventory_with_snapshot_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "runtime.sqlite3"
+            products_path = root / "products.xlsx"
+            price_rules_path = root / "price_rules.xlsx"
+            listing_rules_path = root / "listing_rules.xlsx"
+            output_path = root / "listing_tasks.xlsx"
+            repository = SQLiteRuntimeRepository(db_path)
+            RuntimeTaskService(repository).init_schema()
+            observed_at = datetime(2026, 7, 25, 8, 0, tzinfo=timezone.utc)
+            repository.upsert_listing_status(
+                ListingStatus(
+                    listing_status_id="LISTING-ROSE-A",
+                    platform_name="测试平台",
+                    internal_sku="SKU-ROSE-A",
+                    variety="测试玫瑰",
+                    current_price=Decimal("18.60"),
+                    grade="A",
+                    online_status="offline",
+                    platform_stock_qty=7,
+                    price_source="shadowbot_read",
+                    price_observed_at=observed_at,
+                    price_source_attempt_id="ATTEMPT-SNAPSHOT-1",
+                    inventory_source="shadowbot_read",
+                    inventory_observed_at=observed_at,
+                    inventory_source_attempt_id="ATTEMPT-SNAPSHOT-1",
+                )
+            )
+            save_table_records(
+                "products",
+                products_path,
+                [
+                    {
+                        "internal_sku": "SKU-ROSE-A",
+                        "product_name": "测试玫瑰",
+                        "grade": "A",
+                        "stem_length": "70",
+                        "unit": "扎",
+                        "base_cost": "10",
+                        "current_stock": "30",
+                        "sale_enabled": "True",
+                    }
+                ],
+            )
+            save_table_records("price_rules", price_rules_path, [])
+            save_table_records(
+                "listing_rules",
+                listing_rules_path,
+                [
+                    {
+                        "rule_id": "LIST-ONLINE",
+                        "rule_name": "库存充足时上架",
+                        "variety_filter": "测试玫瑰",
+                        "grade_filter": "A",
+                        "platform_filter": "测试平台",
+                        "stock_threshold": "10",
+                        "listing_strategy": "stock_above_online",
+                        "active": "True",
+                        "priority": "1",
+                        "remark": "",
+                    }
+                ],
+            )
+            payload = {
+                "products": str(products_path),
+                "price_rules": str(price_rules_path),
+                "listing_rules": str(listing_rules_path),
+                "output": str(output_path),
+                "inventory_strategy": "conservative_v1",
+                "generation_mode": "single_rule",
+                "selected_rule": "listing:LIST-ONLINE",
+            }
+
+            with patch.dict(
+                "os.environ",
+                {"RUNTIME_ADMIN_USER": "admin", "RUNTIME_ADMIN_PASSWORD": "secret"},
+                clear=False,
+            ):
+                cookie = self._runtime_login(db_path)
+                status, _, preview_body = self._call_app(
+                    path="/task-generator",
+                    method="POST",
+                    query=urlencode({"runtime_db": str(db_path)}),
+                    body=urlencode(payload | {"action": "preview"}),
+                    cookie=cookie,
+                )
+                self.assertEqual(status, "200 OK")
+                self.assertIn("已预览 1 条任务", preview_body)
+                self.assertIn("上架任务的目标价格和目标库存必须在创建前确认", preview_body)
+                self.assertEqual(
+                    preview_body.count('class="task-target-number"'),
+                    2,
+                )
+                self.assertIn(
+                    ".task-target-number::-webkit-inner-spin-button",
+                    preview_body,
+                )
+                self.assertIn("min-width: 120px", preview_body)
+                self.assertRegex(
+                    preview_body,
+                    r'name="listing_target_price_0"[\s\S]+?value="18\.60"',
+                )
+                self.assertRegex(
+                    preview_body,
+                    r'name="listing_target_inventory_0"[\s\S]+?value="7"',
+                )
+                group_match = re.search(
+                    r'name="task_group_id" value="([^"]+)"',
+                    preview_body,
+                )
+                deadline_match = re.search(
+                    r'name="required_by" value="([^"]+)"',
+                    preview_body,
+                )
+                self.assertIsNotNone(group_match)
+                self.assertIsNotNone(deadline_match)
+                group_id = group_match.group(1)
+                required_by = deadline_match.group(1)
+
+                status, _, missing_body = self._call_app(
+                    path="/task-generator",
+                    method="POST",
+                    query=urlencode({"runtime_db": str(db_path)}),
+                    body=urlencode(
+                        payload
+                        | {
+                            "action": "confirm_generate",
+                            "task_group_id": group_id,
+                            "required_by": required_by,
+                            "listing_override_count": "0",
+                        }
+                    ),
+                    cookie=cookie,
+                )
+                self.assertEqual(status, "200 OK")
+                self.assertIn("上架任务必须输入目标价格和目标库存", missing_body)
+                self.assertFalse(output_path.exists())
+                self.assertEqual(RuntimeTaskService(repository).list_tasks(), [])
+
+                override_key = json.dumps(
+                    ["测试平台", "SKU-ROSE-A", "set_online"],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                status, _, generated_body = self._call_app(
+                    path="/task-generator",
+                    method="POST",
+                    query=urlencode({"runtime_db": str(db_path)}),
+                    body=urlencode(
+                        payload
+                        | {
+                            "action": "confirm_generate",
+                            "task_group_id": group_id,
+                            "required_by": required_by,
+                            "listing_override_count": "1",
+                            "listing_override_key_0": override_key,
+                            "listing_target_price_0": "19.80",
+                            "listing_target_inventory_0": "9",
+                        }
+                    ),
+                    cookie=cookie,
+                )
+                self.assertEqual(status, "200 OK")
+                self.assertIn("已生成 1 条任务", generated_body)
+                self.assertIn("1 条新任务已进入任务中心", generated_body)
+
+            runtime_tasks = RuntimeTaskService(repository).list_tasks()
+            self.assertEqual(len(runtime_tasks), 1)
+            self.assertEqual(runtime_tasks[0].target_price, Decimal("19.80"))
+            self.assertEqual(runtime_tasks[0].target_inventory, 9)
+            self.assertEqual(
+                runtime_tasks[0].decision_trace["listing_target_input"],
+                {
+                    "source": "operator_confirm_form",
+                    "default_source": "platform_snapshot",
+                    "target_price": "19.80",
+                    "target_inventory": 9,
+                },
+            )
+            exported_tasks = load_tasks(output_path)
+            self.assertEqual(exported_tasks[0].target_price, Decimal("19.80"))
+            self.assertEqual(exported_tasks[0].target_inventory, 9)
+
+    def test_new_product_without_snapshot_is_recognized_for_set_online_preview(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "runtime.sqlite3"
+            products_path = root / "products.xlsx"
+            price_rules_path = root / "price_rules.xlsx"
+            listing_rules_path = root / "listing_rules.xlsx"
+            repository = SQLiteRuntimeRepository(db_path)
+            RuntimeTaskService(repository).init_schema()
+            repository.upsert_listing_status(
+                ListingStatus(
+                    listing_status_id="LISTING-AISHA-A",
+                    platform_name="蚂蚁花团供应商",
+                    internal_sku="AISHA-A-70-Z",
+                    variety="艾莎",
+                    grade="A",
+                    current_price=Decimal("18.00"),
+                    online_status="online",
+                    platform_stock_qty=10,
+                    source="shadowbot_read",
+                )
+            )
+            save_table_records(
+                "products",
+                products_path,
+                [
+                    {
+                        "internal_sku": "AISHA-E-45-Z",
+                        "product_name": "艾莎",
+                        "grade": "E",
+                        "stem_length": "45",
+                        "unit": "扎",
+                        "base_cost": "4",
+                        "current_stock": "20",
+                        "sale_enabled": "True",
+                    }
+                ],
+            )
+            save_table_records("price_rules", price_rules_path, [])
+            save_table_records(
+                "listing_rules",
+                listing_rules_path,
+                [
+                    {
+                        "rule_id": "LIST-AISHA-E-ONLINE",
+                        "rule_name": "蚂蚁艾莎E级上架",
+                        "variety_filter": "艾莎",
+                        "grade_filter": "E",
+                        "platform_filter": "蚂蚁",
+                        "stock_threshold": "0",
+                        "listing_strategy": "allow_online",
+                        "active": "True",
+                        "priority": "1",
+                        "remark": "",
+                    }
+                ],
+            )
+            payload = {
+                "products": str(products_path),
+                "price_rules": str(price_rules_path),
+                "listing_rules": str(listing_rules_path),
+                "inventory_strategy": "conservative_v1",
+                "generation_mode": "single_rule",
+                "selected_rule": "listing:LIST-AISHA-E-ONLINE",
+            }
+
+            with patch.dict(
+                "os.environ",
+                {"RUNTIME_ADMIN_USER": "admin", "RUNTIME_ADMIN_PASSWORD": "secret"},
+                clear=False,
+            ):
+                cookie = self._runtime_login(db_path)
+                status, _, preview_body = self._call_app(
+                    path="/task-generator",
+                    method="POST",
+                    query=urlencode({"runtime_db": str(db_path)}),
+                    body=urlencode(payload | {"action": "preview"}),
+                    cookie=cookie,
+                )
+
+            self.assertEqual(status, "200 OK")
+            self.assertIn("已预览 1 条任务", preview_body)
+            self.assertIn("AISHA-E-45-Z", preview_body)
+            self.assertIn(
+                "expected_old_price 和目标价格默认使用基础成本",
+                preview_body,
+            )
+            self.assertIn(
+                'title="新商品无平台快照，默认值来自商品基础成本"',
+                preview_body,
+            )
+            self.assertIn(
+                'title="新商品无平台快照，默认值来自商品当前库存"',
+                preview_body,
+            )
+            self.assertRegex(
+                preview_body,
+                r"<td>4</td>[\s\S]+?name=\"listing_target_price_0\"[\s\S]+?value=\"4\.00\"",
+            )
+            self.assertRegex(
+                preview_body,
+                r'name="listing_target_inventory_0"[\s\S]+?value="20"',
+            )
 
     def test_task_group_status_is_shared_and_derived_from_item_statuses(self) -> None:
         group_trace = {"task_group_id": "RULE-GROUP-STATUS-001"}
@@ -1396,6 +1713,72 @@ class WebTests(unittest.TestCase):
                 self.assertEqual(status, "200 OK")
                 self.assertIn("蚂蚁", body)
                 self.assertIn('name="platform_filter"', body)
+
+    def test_business_inputs_adds_direct_set_offline_listing_rule(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "runtime.sqlite3"
+            products_path = root / "products.xlsx"
+            price_rules_path = root / "price_rules.xlsx"
+            listing_rules_path = root / "listing_rules.xlsx"
+            RuntimeTaskService(SQLiteRuntimeRepository(db_path)).init_schema()
+            save_table_records("products", products_path, [])
+            save_table_records("price_rules", price_rules_path, [])
+            save_table_records("listing_rules", listing_rules_path, [])
+
+            query = urlencode(
+                {
+                    "runtime_db": str(db_path),
+                    "products_path": str(products_path),
+                    "price_rules_path": str(price_rules_path),
+                    "listing_rules_path": str(listing_rules_path),
+                    "input_tab": "listing_rules",
+                }
+            )
+            with patch.dict(
+                "os.environ",
+                {"RUNTIME_ADMIN_USER": "admin", "RUNTIME_ADMIN_PASSWORD": "secret"},
+                clear=False,
+            ):
+                cookie = self._runtime_login(db_path)
+                status, _, body = self._call_app(
+                    path="/business-inputs",
+                    method="GET",
+                    query=query,
+                    cookie=cookie,
+                )
+                self.assertEqual(status, "200 OK")
+                self.assertIn("value='set_offline'", body)
+                self.assertIn("直接下架（set_offline）", body)
+
+                status, headers, _ = self._call_app(
+                    path="/business-inputs",
+                    method="POST",
+                    query=query,
+                    body=urlencode(
+                        {
+                            "listing_rules_path": str(listing_rules_path),
+                            "input_tab": "listing_rules",
+                            "action": "add_listing_rule",
+                            "rule_name": "全部商品直接下架",
+                            "variety_filter": "*",
+                            "grade_filter": "*",
+                            "platform_filter": "*",
+                            "stock_threshold": "0",
+                            "listing_strategy": "set_offline",
+                            "active": "true",
+                            "priority": "1",
+                            "remark": "Web 表单录入",
+                        }
+                    ),
+                    cookie=cookie,
+                )
+                self.assertEqual(status, "303 See Other")
+                self.assertIn("input_tab=listing_rules", headers["Location"])
+
+            rules = load_listing_rules(listing_rules_path)
+            self.assertEqual(len(rules), 1)
+            self.assertEqual(rules[0].listing_strategy, ListingStrategy.SET_OFFLINE)
 
     def test_business_inputs_adds_capacity_plan_to_workbook(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2978,6 +3361,198 @@ class WebTests(unittest.TestCase):
             self.assertEqual(resolved_task.task_status, TaskStatus.PENDING)
             self.assertTrue(any(item.metadata.get("actor_source") == "mobile_review_token" for item in history))
 
+    def test_execution_failure_mobile_review_uses_retry_and_cancel_results(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "runtime.sqlite3"
+            repository = SQLiteRuntimeRepository(db_path)
+            task_service = RuntimeTaskService(repository)
+            task_service.init_schema()
+            review_created_at = datetime.now()
+            retry_task = replace(
+                _runtime_task(
+                    "TASK-EXECUTION-RETRY",
+                    status=TaskStatus.MANUAL_REVIEW,
+                    action_type=TaskActionType.UPDATE_PRICE,
+                ),
+                created_at=review_created_at,
+                updated_at=review_created_at,
+            )
+            cancel_task = replace(
+                _runtime_task(
+                    "TASK-EXECUTION-CANCEL",
+                    status=TaskStatus.MANUAL_REVIEW,
+                    action_type=TaskActionType.SET_ONLINE,
+                ),
+                created_at=review_created_at,
+                updated_at=review_created_at,
+            )
+            task_service.create_tasks([retry_task, cancel_task])
+            review_service = ReviewTaskService(
+                repository,
+                runtime_task_service=task_service,
+            )
+            review_service.create_from_tasks([retry_task, cancel_task])
+            reviews = {
+                review.source_task_id: review
+                for review in review_service.list_review_tasks()
+            }
+
+            with patch(
+                "app.web.DEFAULT_RUNTIME_DB",
+                db_path,
+            ), patch.dict(
+                "os.environ",
+                {"REVIEW_TOKEN_SECRET": "unit-test-secret"},
+                clear=False,
+            ):
+                retry_token = ReviewTokenService(repository).create_token(
+                    reviews[retry_task.task_id].review_task_id,
+                    token_subject="mobile_reviewer",
+                )
+                with closing(repository.connect()) as connection, connection:
+                    connection.execute(
+                        """
+                        UPDATE review_tokens
+                        SET allowed_actions = ?
+                        WHERE token_id = ?
+                        """,
+                        (
+                            '["approved","rejected","adjusted","cancelled"]',
+                            retry_token.review_token.token_id,
+                        ),
+                    )
+                page_status, _, page_body = self._call_app(
+                    path=f"/mobile/review/{reviews[retry_task.task_id].review_task_id}",
+                    method="GET",
+                    query=urlencode({"token": retry_token.raw_token}),
+                )
+                retry_status, _, _ = self._call_app(
+                    path=f"/mobile/review/{reviews[retry_task.task_id].review_task_id}/resolve",
+                    method="POST",
+                    body=urlencode(
+                        {
+                            "token": retry_token.raw_token,
+                            "action": "approved",
+                            "resolution_payload_json": "{}",
+                        }
+                    ),
+                )
+
+                cancel_token = ReviewTokenService(repository).create_token(
+                    reviews[cancel_task.task_id].review_task_id,
+                    token_subject="mobile_reviewer",
+                )
+                cancel_status, _, _ = self._call_app(
+                    path=f"/mobile/review/{reviews[cancel_task.task_id].review_task_id}/resolve",
+                    method="POST",
+                    body=urlencode(
+                        {
+                            "token": cancel_token.raw_token,
+                            "action": "cancelled",
+                            "resolution_payload_json": "{}",
+                        }
+                    ),
+                )
+
+            self.assertEqual(page_status, "200 OK")
+            self.assertIn(">重试任务</button>", page_body)
+            self.assertIn(">取消任务</button>", page_body)
+            self.assertNotIn(">已拒绝</button>", page_body)
+            self.assertNotIn(">已调整</button>", page_body)
+            self.assertEqual(retry_status, "303 See Other")
+            self.assertEqual(cancel_status, "303 See Other")
+            self.assertEqual(
+                task_service.get_task(retry_task.task_id).task_status,
+                TaskStatus.PENDING,
+            )
+            self.assertEqual(
+                task_service.get_task(cancel_task.task_id).task_status,
+                TaskStatus.CANCELLED,
+            )
+            self.assertEqual(
+                review_service.get_review_task(
+                    reviews[retry_task.task_id].review_task_id
+                ).resolution_payload["decision"],
+                "retry_task",
+            )
+            self.assertEqual(
+                review_service.get_review_task(
+                    reviews[cancel_task.task_id].review_task_id
+                ).resolution_payload["decision"],
+                "cancel_task",
+            )
+
+    def test_mobile_review_cancels_the_whole_task_group(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "runtime.sqlite3"
+            repository = SQLiteRuntimeRepository(db_path)
+            task_service = RuntimeTaskService(repository)
+            task_service.init_schema()
+            review_created_at = datetime.now()
+            tasks = []
+            for suffix in ("A", "B"):
+                task = replace(
+                    _runtime_task(
+                        f"TASK-GROUP-CANCEL-{suffix}",
+                        status=TaskStatus.MANUAL_REVIEW,
+                        action_type=TaskActionType.SET_ONLINE,
+                    ),
+                    created_at=review_created_at,
+                    updated_at=review_created_at,
+                )
+                task.decision_trace["task_group_id"] = "RULE-GROUP-CANCEL-001"
+                tasks.append(task)
+            task_service.create_tasks(tasks)
+            review_service = ReviewTaskService(
+                repository,
+                runtime_task_service=task_service,
+            )
+            summary = review_service.create_from_tasks(tasks)
+            review = summary.review_tasks[0]
+
+            with patch(
+                "app.web.DEFAULT_RUNTIME_DB",
+                db_path,
+            ), patch.dict(
+                "os.environ",
+                {"REVIEW_TOKEN_SECRET": "unit-test-secret"},
+                clear=False,
+            ):
+                token = ReviewTokenService(repository).create_token(
+                    review.review_task_id,
+                    token_subject="mobile_reviewer",
+                )
+                page_status, _, page_body = self._call_app(
+                    path=f"/mobile/review/{review.review_task_id}",
+                    method="GET",
+                    query=urlencode({"token": token.raw_token}),
+                )
+                resolve_status, _, _ = self._call_app(
+                    path=f"/mobile/review/{review.review_task_id}/resolve",
+                    method="POST",
+                    body=urlencode(
+                        {
+                            "token": token.raw_token,
+                            "action": "cancelled",
+                            "resolution_payload_json": "{}",
+                        }
+                    ),
+                )
+
+            self.assertEqual(summary.inserted_review_tasks_count, 1)
+            self.assertEqual(page_status, "200 OK")
+            self.assertIn("RULE-GROUP-CANCEL-001", page_body)
+            self.assertIn("affected_task_count", page_body)
+            self.assertEqual(resolve_status, "303 See Other")
+            for task in tasks:
+                self.assertEqual(
+                    task_service.get_task(task.task_id).task_status,
+                    TaskStatus.CANCELLED,
+                )
+            resolved = review_service.get_review_task(review.review_task_id)
+            self.assertEqual(resolved.resolution_payload["decision"], "cancel_task")
+            self.assertEqual(resolved.resolution_payload["affected_task_count"], 2)
+
     def test_mobile_review_closes_pending_operational_source_task(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "runtime.sqlite3"
@@ -3254,6 +3829,59 @@ class WebTests(unittest.TestCase):
         self.assertIn("BEFORE_SUBMIT", html)
         self.assertIn("abc123", html)
         self.assertNotIn("强制重新提交", html)
+
+    def test_tasks_page_displays_task13_listing_action_projection(self) -> None:
+        task = _runtime_task(
+            "TASK-T13-WEB-PROJECTION",
+            action_type=TaskActionType.SET_OFFLINE,
+            status=TaskStatus.RUNNING,
+        )
+        html = render_tasks_page(
+            runtime_db="runtime.sqlite3",
+            session_user="tester",
+            tasks=[task],
+            selected_task_id=task.task_id,
+            selected_task=task,
+            listing_action_projections=[
+                {
+                    "action_type": "set_offline",
+                    "expected_old_status": "online",
+                    "target_status": "offline",
+                    "operation_result": "NEEDS_RECONCILIATION",
+                    "batch_id": "BATCH-T13-WEB-001",
+                    "operation_id": "OP-T13-WEB-001",
+                    "batch_status": "UNKNOWN",
+                    "operation_status": "NEEDS_RECONCILIATION",
+                    "readback_observed_at": "2026-07-27T09:30:00+00:00",
+                    "error_code": "CONTROLLED_AFTER_ACTION_CLICK_UNKNOWN",
+                    "attempts": [
+                        {
+                            "execution_attempt_id": "ATTEMPT-T13-WEB-001",
+                            "execution_mode": "COMMIT",
+                            "status": "UNKNOWN",
+                        },
+                        {
+                            "execution_attempt_id": "RECONCILE-T13-WEB-001",
+                            "execution_mode": "RECONCILE",
+                            "status": "RUNNING",
+                        },
+                    ],
+                }
+            ],
+        )
+
+        self.assertIn("上下架运行投影", html)
+        self.assertIn("set_offline", html)
+        self.assertIn("online", html)
+        self.assertIn("offline", html)
+        self.assertIn("实际回读状态", html)
+        self.assertIn("BATCH-T13-WEB-001", html)
+        self.assertIn("OP-T13-WEB-001", html)
+        self.assertIn("ATTEMPT-T13-WEB-001", html)
+        self.assertIn("RECONCILE-T13-WEB-001", html)
+        self.assertIn("NEEDS_RECONCILIATION", html)
+        self.assertIn("CONTROLLED_AFTER_ACTION_CLICK_UNKNOWN", html)
+        self.assertNotIn("自动批准", html)
 
     def test_execution_logs_post_starts_shadowbot_reconcile_attempt(self) -> None:
         with _workspace_temp_dir("web_shadowbot_tests") as temp_dir:

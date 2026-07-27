@@ -1,0 +1,10 @@
+{
+  "batch_id": "BATCH-T13-CONTROLLED-UNKNOWN-20260726-01",
+  "execution_attempt_id": "ATTEMPT-T13-CONTROLLED-UNKNOWN-20260726-01",
+  "report_path": "<REDACTED_PATH>/ATTEMPT-T13-CONTROLLED-UNKNOWN-20260726-01.listing-action-report.md",
+  "result_file_sha256": "00e989cee649f20ba79b568839eba26a45d100418d52a7785ed133d2c7487777",
+  "result_id": "RESULT-b5fba286c48d34f2ab689511",
+  "schema_version": "shadowbot-listing-action-import-ack-1.0",
+  "status": "UNKNOWN",
+  "written_at": "2026-07-26T14:45:39.655989+00:00"
+}

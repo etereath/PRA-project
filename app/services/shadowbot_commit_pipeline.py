@@ -1166,6 +1166,19 @@ def _persist_prepared_manifest(
     with closing(repository.connect_write()) as connection, connection:
         connection.execute(
             """
+            INSERT INTO shadowbot_batch_registry(
+                batch_id, batch_type, contract_version, platform_name,
+                created_at
+            ) VALUES (?, 'update_price', 4, ?, ?)
+            """,
+            (
+                manifest["batch_id"],
+                manifest["platform_name"],
+                now,
+            ),
+        )
+        connection.execute(
+            """
             INSERT INTO shadowbot_commit_batches(
                 batch_id, contract_version, execution_profile, platform_name,
                 manifest_sha256, status, created_at, updated_at

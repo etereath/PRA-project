@@ -1,0 +1,10 @@
+{
+  "batch_id": "BATCH-T13-CONTROLLED-UNKNOWN-20260726-01",
+  "execution_attempt_id": "RECONCILE-e88fb8a4b4d60936236f0e0a",
+  "report_path": "<REDACTED_PATH>/RECONCILE-e88fb8a4b4d60936236f0e0a.listing-action-report.md",
+  "result_file_sha256": "f12668b4bc1b2cc19a58ce70eb4f5253d2921eedaee6b5f4cc50fe6dde02d1e2",
+  "result_id": "RESULT-29e5404d514b98f4c628fedb",
+  "schema_version": "shadowbot-listing-action-import-ack-1.0",
+  "status": "VERIFIED",
+  "written_at": "2026-07-26T15:09:55.657982+00:00"
+}

@@ -1,0 +1,40 @@
+{
+  "attempts": {
+    "commit": "ATTEMPT-664d3064fd864dcc",
+    "reconcile": "RECONCILE-ab020713eb4633c24441f141"
+  },
+  "expected": {
+    "batch_id": "BATCH-T13-AUTO-RECONCILE-CONTROLLED-UNKNOWN-20260727-03",
+    "commit_execution_attempt_id": "ATTEMPT-664d3064fd864dcc",
+    "commit_item_execution_attempt_id": "ATTEMPT-49a4e1b1e6d18b4fe9cc88ca",
+    "commit_result_id": "RESULT-8bbd70470b553034b30c7bb9",
+    "final_operation_result": "VERIFIED",
+    "final_task_status": "success",
+    "final_write_lock_status": "RELEASED",
+    "internal_sku": "AISHA-B-60-Z",
+    "operation_id": "OP-8d6fbb4aad301d6979fc864d",
+    "reconcile_execution_attempt_id": "RECONCILE-ab020713eb4633c24441f141",
+    "reconcile_item_execution_attempt_id": "ATTEMPT-452d0d19de48a2579c13a17f",
+    "reconcile_result_id": "RESULT-3e84f03182960053ceb93250"
+  },
+  "mapping_sha256": "24f0dd9f88f0fe5e42587cc2b7866f035fef88bcbface3d0353afd99c4fa5ce6",
+  "original_archive_sha256": {
+    "commit": {
+      "ack": "b8e2f603fdc235e4495c8d67f0905937b96dbbd7bb0db6128d170a9cad35306f",
+      "phase": "6b359882007a0689e3b91322874dc98b53f3cdc3d2986c77f879400ed2a17e56",
+      "receipt_canonical_json": "7337c51f5d448804a45b357d50091c7f14b08f2b65a886b27f40cda5fc009adf",
+      "report": "aafdb7d2aa97fccd67cb9bc015544550f69b334ec2470a757d65a74ef5f1bffa",
+      "request": "63f62b9c6a06004b5054c17a52856ce14332859aad6ee61709d827851f4ed4cf",
+      "result": "0379b802df0b2a5fb65d8373eec44d2af3af6793e95d3551f72ebc6f62695505"
+    },
+    "reconcile": {
+      "ack": "1ad0d0d54f5d0cf02458e017b0ad8180aef61b34343267b3ec57671046cebdac",
+      "phase": "6305a9df11274d23a9a830bcc41f810051901961995680605a771c2a0d39d787",
+      "receipt_canonical_json": "af0620a2f1a248521be5a446d495167ffff385a26c6955e0412fb5d6309edb99",
+      "report": "d49f4f6a0bb73431bec2c3c9e92059f615f458706d3fd0b47e7d3431e61ac907",
+      "request": "24c59e1a148cb0d5eb08c8abf8271c83d2013ffec4301548ddb443748780157e",
+      "result": "90fa38a5c51458532399eccacbb72ca09f227337e372865dd38600d56b5a8826"
+    }
+  },
+  "schema_version": "task13-unknown-reconcile-evidence-manifest-1.0"
+}

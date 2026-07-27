@@ -12,9 +12,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.exceptions import ValidationError
+from app.exceptions import NotificationDeliveryError, ValidationError
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.services.runtime import DEFAULT_RUNTIME_DB
+from app.services.notification_outbox import (
+    NotificationOutboxWorker,
+    is_test_notification_channel,
+)
+from app.services.runtime import DEFAULT_RUNTIME_DB, ReviewTaskService
 from app.services.shadowbot_executor import build_shadowbot_task_runner_from_environment
 from app.services.shadowbot_product_read import DEFAULT_INVENTORY_PRODUCTS_PATH
 from app.services.shadowbot_queue import (
@@ -40,6 +44,8 @@ def run_cycle(
     importer: ShadowBotResultImporter,
     watchdog: ShadowBotQueueWatchdog,
     login_monitor: ShadowBotLoginVerificationMonitor | None = None,
+    notification_worker: NotificationOutboxWorker | None = None,
+    review_service: ReviewTaskService | None = None,
 ) -> list[dict[str, object]]:
     events: list[dict[str, object]] = []
     if login_monitor is not None:
@@ -64,6 +70,70 @@ def run_cycle(
                 "error_message": str(exc),
             }
         )
+    if review_service is not None:
+        try:
+            reminder_summary = review_service.renew_overdue_manual_reviews()
+            if reminder_summary.renewed_review_tasks:
+                events.append(
+                    {
+                        "status": "REVIEW_REMINDERS_RENEWED",
+                        "scanned_review_tasks": (
+                            reminder_summary.scanned_review_tasks
+                        ),
+                        "renewed_review_tasks": (
+                            reminder_summary.renewed_review_tasks
+                        ),
+                        "notification_logs_created": (
+                            reminder_summary.notification_logs_created
+                        ),
+                    }
+                )
+            for error in reminder_summary.errors or []:
+                events.append(
+                    {
+                        "status": "RETRY_PENDING",
+                        "error_code": "REVIEW_REMINDER_FAILED",
+                        "error_message": error,
+                    }
+                )
+        except (OSError, ValueError) as exc:
+            events.append(
+                {
+                    "status": "RETRY_PENDING",
+                    "error_code": "REVIEW_REMINDER_SCAN_FAILED",
+                    "error_message": str(exc),
+                }
+            )
+    if notification_worker is not None:
+        try:
+            recovered = notification_worker.run_watchdog()
+            if recovered:
+                events.append(
+                    {
+                        "status": "NOTIFICATION_LEASES_RECOVERED",
+                        "recovered_count": len(recovered),
+                    }
+                )
+            for _ in range(10):
+                delivered = notification_worker.run_once()
+                if delivered is None:
+                    break
+                events.append(
+                    {
+                        "status": "NOTIFICATION_DELIVERED",
+                        "notification_id": delivered.notification_id,
+                        "delivery_status": delivered.status,
+                        "channel": delivered.channel,
+                    }
+                )
+        except (NotificationDeliveryError, OSError, ValueError) as exc:
+            events.append(
+                {
+                    "status": "RETRY_PENDING",
+                    "error_code": "NOTIFICATION_WORKER_FAILED",
+                    "error_message": str(exc),
+                }
+            )
     return events
 
 
@@ -83,6 +153,35 @@ def main() -> int:
     lock_path = paths.control / "pra_queue_services.lock"
     repository = SQLiteRuntimeRepository(args.runtime_db)
     repository.init_schema()
+    review_service = ReviewTaskService(repository)
+    notification_channel = os.environ.get(
+        "DEFAULT_NOTIFICATION_CHANNEL", ""
+    ).strip().lower()
+    notification_worker = None
+    if notification_channel:
+        allow_test_channels = (
+            os.environ.get("DEV_MODE", "false").strip().lower() == "true"
+        )
+        if (
+            is_test_notification_channel(notification_channel)
+            and not allow_test_channels
+        ):
+            print(
+                json.dumps(
+                    {
+                        "status": "CONFIGURATION_ERROR",
+                        "error_code": "TEST_NOTIFICATION_CHANNEL_DISABLED",
+                        "channel": notification_channel,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 2
+        notification_worker = NotificationOutboxWorker.for_channel(
+            repository,
+            notification_channel,
+            allow_test_channels=allow_test_channels,
+        )
     runner = build_shadowbot_task_runner_from_environment()
     importer = ShadowBotResultImporter(
         repository,
@@ -103,7 +202,13 @@ def main() -> int:
             print(json.dumps({"status": "ALREADY_RUNNING", "lock_path": str(lock_path)}, ensure_ascii=False))
             return 2
         while True:
-            for event in run_cycle(importer, watchdog, login_monitor):
+            for event in run_cycle(
+                importer,
+                watchdog,
+                login_monitor,
+                notification_worker,
+                review_service,
+            ):
                 print(json.dumps(event, ensure_ascii=False, sort_keys=True, default=str), flush=True)
             if args.once:
                 return 0

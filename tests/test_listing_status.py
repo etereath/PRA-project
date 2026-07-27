@@ -14,9 +14,57 @@ from app.services.listing import ListingService
 from app.services.pricing import PricingService
 from app.services.shadowbot_executor import ShadowBotExecutor, ShadowBotResultContract
 from app.services.task_generation import TaskGenerationService
+from app.services.workflow import (
+    WorkflowInputs,
+    _load_latest_platform_observations,
+    _resolve_selected_rule_platforms,
+)
 
 
 class ListingStatusTests(unittest.TestCase):
+    def test_listing_rule_platform_aliases_resolve_to_one_snapshot_platform(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "runtime.sqlite3"
+            repository = SQLiteRuntimeRepository(db_path)
+            repository.init_schema()
+            repository.upsert_listing_status(
+                ListingStatus(
+                    listing_status_id="LISTING-ALIAS",
+                    platform_name="蚂蚁花团供应商",
+                    internal_sku="SKU-A",
+                    variety="艾莎",
+                    grade="A",
+                    current_price=Decimal("18.00"),
+                    platform_stock_qty=28,
+                    online_status="offline",
+                )
+            )
+            inputs = WorkflowInputs(
+                products_path=root / "products.xlsx",
+                price_rules_path=root / "price_rules.xlsx",
+                listing_rules_path=root / "listing_rules.xlsx",
+                runtime_db_path=db_path,
+                platform_names=("蚂蚁", "蚂蚁花团供应商"),
+            )
+
+            self.assertEqual(
+                _resolve_selected_rule_platforms(
+                    "*",
+                    inputs,
+                    require_online_price=False,
+                ),
+                ["蚂蚁花团供应商"],
+            )
+            self.assertEqual(
+                _resolve_selected_rule_platforms(
+                    "蚂蚁",
+                    inputs,
+                    require_online_price=False,
+                ),
+                ["蚂蚁花团供应商"],
+            )
+
     def test_zero_platform_stock_is_not_current_or_price_task_eligible(self) -> None:
         zero_stock = ListingStatus(
             listing_status_id="LISTING-ZERO",
@@ -306,6 +354,33 @@ class ListingStatusTests(unittest.TestCase):
             self.assertEqual(status.inventory_source, "shadowbot")
             self.assertEqual(status.inventory_observed_at, newer)
             self.assertEqual(status.inventory_source_attempt_id, "READ-NEW")
+            self.assertEqual(status.price_source, "shadowbot")
+            self.assertEqual(status.price_observed_at, newer)
+            self.assertEqual(status.price_source_attempt_id, "READ-NEW")
+            observations = _load_latest_platform_observations(
+                repository.db_path,
+                "蚂蚁",
+            )
+            assert observations is not None
+            self.assertEqual(
+                observations[("蚂蚁", "艾莎", "C")],
+                (Decimal("19.25"), 23),
+            )
+
+            repository.update_listing_price(
+                platform_name="蚂蚁",
+                variety="艾莎",
+                grade="C",
+                current_price=Decimal("20.00"),
+                source="shadowbot_commit",
+                updated_at=newer + timedelta(minutes=1),
+            )
+            observations = _load_latest_platform_observations(
+                repository.db_path,
+                "蚂蚁",
+            )
+            assert observations is not None
+            self.assertNotIn(("蚂蚁", "艾莎", "C"), observations)
 
     def test_listing_identity_does_not_depend_on_internal_sku(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

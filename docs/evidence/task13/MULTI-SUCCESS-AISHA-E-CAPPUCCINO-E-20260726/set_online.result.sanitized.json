@@ -1,0 +1,246 @@
+{
+  "action_type": "set_online",
+  "active_listing_filter": "ONLINE",
+  "active_listing_filter_selected_at": "2026-07-26T19:07:19+08:00",
+  "actual_price": "",
+  "applet_launch": {
+    "source": "EXISTING_WINDOW",
+    "uri_opened": false,
+    "window_ready_at": "2026-07-26T19:06:09+08:00"
+  },
+  "batch_id": "BATCH-T13-OPTIMIZED-SET-ONLINE-20260726-02",
+  "batch_status": "VERIFIED",
+  "business_operation_completed": true,
+  "contract_version": 5,
+  "counts": {
+    "already_applied_count": 0,
+    "attempted_count": 2,
+    "batch_target_count": 2,
+    "failed_count": 0,
+    "not_applied_count": 0,
+    "not_attempted_count": 0,
+    "partial_effect_count": 0,
+    "unknown_count": 0,
+    "verified_applied_count": 2,
+    "verified_count": 2
+  },
+  "current_step": "VALIDATE_INPUT",
+  "ended_at": "2026-07-26T11:07:29+00:00",
+  "error_code": "",
+  "error_message": "",
+  "evidence": [],
+  "evidence_status": "NONE",
+  "execution_attempt_id": "ATTEMPT-T13-OPTIMIZED-SET-ONLINE-20260726-02",
+  "execution_mode": "COMMIT",
+  "expected_old_price": "",
+  "grade": "",
+  "instruction_hash": "sha256:c3774e4a4fcab5c4199a47029ed9a56f2cb025513414dffeebb421a7cbaffc58",
+  "items": [
+    {
+      "action_clicked_at": "2026-07-26T11:07:16+00:00",
+      "action_confirm_clicked": true,
+      "actual_inventory": 1,
+      "actual_price": "7.00",
+      "detail_effect_state": "VERIFIED",
+      "detail_save_clicked": true,
+      "detail_save_clicked_at": "2026-07-26T11:07:12+00:00",
+      "error_code": "",
+      "error_message": "",
+      "internal_sku": "AISHA-E-45-Z",
+      "item_execution_attempt_id": "ATTEMPT-afdcb0e111465342ef405813",
+      "item_payload_sha256": "sha256:85772e24b77458893ed20bb9ff9fd801473f408731d4704ac757ed2fafd41775",
+      "listing_effect_state": "VERIFIED",
+      "observed_inventory_after_detail_save": 1,
+      "observed_inventory_before_action": 2,
+      "observed_price_after_detail_save": "7.00",
+      "observed_price_before_action": "7.50",
+      "operation_id": "OP-4960d4f62c248f6dcd997384",
+      "operation_result": "VERIFIED",
+      "readback_observed_at": "2026-07-26T11:07:29+00:00",
+      "source_task_id": "13666be04e24"
+    },
+    {
+      "action_clicked_at": "2026-07-26T11:06:58+00:00",
+      "action_confirm_clicked": true,
+      "actual_inventory": 2,
+      "actual_price": "7.50",
+      "detail_effect_state": "VERIFIED",
+      "detail_save_clicked": true,
+      "detail_save_clicked_at": "2026-07-26T11:06:54+00:00",
+      "error_code": "",
+      "error_message": "",
+      "internal_sku": "CAPPUCCINO-E-45-Z",
+      "item_execution_attempt_id": "ATTEMPT-54992d38097a3b2e11e7c314",
+      "item_payload_sha256": "sha256:b85517848014a20b7f92643e0cfe7970dfcc44f5e25719fdb1fe0a6532d34471",
+      "listing_effect_state": "VERIFIED",
+      "observed_inventory_after_detail_save": 2,
+      "observed_inventory_before_action": 1,
+      "observed_price_after_detail_save": "7.50",
+      "observed_price_before_action": "8.00",
+      "operation_id": "OP-0eb5e3c926d2d100f6e3ac4f",
+      "operation_result": "VERIFIED",
+      "readback_observed_at": "2026-07-26T11:07:29+00:00",
+      "source_task_id": "54171c211425"
+    }
+  ],
+  "login": {
+    "check_path": "BUSINESS_ENTRY_FAST_PATH",
+    "login_completed_at": "2026-07-26T19:06:10+08:00"
+  },
+  "manifest_sha256": "sha256:86a7a533ce834e79be0b513406b97bb71cefab1cd669574f9e0af238d2560bd8",
+  "old_price": "",
+  "partial_effect_count": 0,
+  "product_keyword": "",
+  "product_list_refreshes": [
+    {
+      "ended_at": "2026-07-26T19:06:18+08:00",
+      "refresh_entry": "蚂蚁_首页_商品管理_入口",
+      "stage": "BEFORE_SET_ONLINE",
+      "started_at": "2026-07-26T19:06:10+08:00",
+      "status": "SUCCESS"
+    }
+  ],
+  "product_name": "",
+  "queue_phase": "RESULT_WRITTEN",
+  "reconciliation_pending": false,
+  "request_file_sha256": "sha256:3d47e419741be598373b736f0c09ffce5ea7c3abfc89363878f38af93980166c",
+  "requires_manual_review": false,
+  "result_id": "RESULT-00142e5fec216f54c8974021",
+  "result_path": "<REDACTED_PATH>/ATTEMPT-T13-OPTIMIZED-SET-ONLINE-20260726-02.json",
+  "result_payload_sha256": "sha256:c5540e067968dde2fac6d0070f969a5be5ef71159ca24444c6c87ff3f097a0a9",
+  "retryable": false,
+  "run_success_flag": true,
+  "schema_version": "shadowbot-listing-action-batch-result-1.0",
+  "selector_model": {
+    "inventory_index_offset": 6,
+    "inventory_text_index": 0,
+    "parent_class": "van-checkbox-group",
+    "price_index_offset": 9,
+    "row_index_start": 1,
+    "row_index_step": 16,
+    "waiting_row_index_step": 15
+  },
+  "side_effect_state": "VERIFIED",
+  "spec": "",
+  "spec_available": false,
+  "started_at": "2026-07-26T11:06:08+00:00",
+  "status": "VERIFIED",
+  "target_price": "",
+  "task_id": "",
+  "timing_trace": [
+    {
+      "duration_ms": 1353,
+      "stage": "window_prepare"
+    },
+    {
+      "duration_ms": 413,
+      "stage": "login_check"
+    },
+    {
+      "duration_ms": 7718,
+      "stage": "product_list_refresh"
+    },
+    {
+      "duration_ms": 9648,
+      "identity_rows": 3,
+      "inventory_reads": 0,
+      "non_target_rows_skipped": 3,
+      "page_type": "online",
+      "price_reads": 0,
+      "stage": "preflight_online_scan",
+      "target_rows_hydrated": 0
+    },
+    {
+      "duration_ms": 11457,
+      "identity_rows": 9,
+      "inventory_reads": 2,
+      "non_target_rows_skipped": 7,
+      "page_type": "waiting",
+      "price_reads": 2,
+      "stage": "preflight_waiting_scan",
+      "target_rows_hydrated": 2
+    },
+    {
+      "duration_ms": 0,
+      "internal_sku": "CAPPUCCINO-E-45-Z",
+      "stage": "item_visibility_prepare"
+    },
+    {
+      "changed": true,
+      "duration_ms": 6093,
+      "internal_sku": "CAPPUCCINO-E-45-Z",
+      "stage": "item_price_update"
+    },
+    {
+      "changed": true,
+      "duration_ms": 5983,
+      "internal_sku": "CAPPUCCINO-E-45-Z",
+      "stage": "item_inventory_update"
+    },
+    {
+      "duration_ms": 127,
+      "internal_sku": "CAPPUCCINO-E-45-Z",
+      "stage": "item_detail_readback"
+    },
+    {
+      "duration_ms": 0,
+      "internal_sku": "CAPPUCCINO-E-45-Z",
+      "stage": "item_action_visibility"
+    },
+    {
+      "duration_ms": 3686,
+      "internal_sku": "CAPPUCCINO-E-45-Z",
+      "stage": "item_action_confirm"
+    },
+    {
+      "duration_ms": 2421,
+      "internal_sku": "AISHA-E-45-Z",
+      "stage": "item_visibility_prepare"
+    },
+    {
+      "changed": true,
+      "duration_ms": 6108,
+      "internal_sku": "AISHA-E-45-Z",
+      "stage": "item_price_update"
+    },
+    {
+      "changed": true,
+      "duration_ms": 5972,
+      "internal_sku": "AISHA-E-45-Z",
+      "stage": "item_inventory_update"
+    },
+    {
+      "duration_ms": 124,
+      "internal_sku": "AISHA-E-45-Z",
+      "stage": "item_detail_readback"
+    },
+    {
+      "duration_ms": 39,
+      "internal_sku": "AISHA-E-45-Z",
+      "stage": "item_action_visibility"
+    },
+    {
+      "duration_ms": 3652,
+      "internal_sku": "AISHA-E-45-Z",
+      "stage": "item_action_confirm"
+    },
+    {
+      "duration_ms": 10371,
+      "identity_rows": 5,
+      "inventory_reads": 2,
+      "non_target_rows_skipped": 3,
+      "page_type": "online",
+      "price_reads": 2,
+      "stage": "final_online_scan",
+      "target_rows_hydrated": 2
+    },
+    {
+      "duration_ms": 80868,
+      "item_count": 2,
+      "stage": "set_online_total"
+    }
+  ],
+  "window_title": "",
+  "worker_heartbeat_at": "2026-07-26T11:07:29.781706+00:00",
+  "worker_id": "<REDACTED_DEVICE>"
+}

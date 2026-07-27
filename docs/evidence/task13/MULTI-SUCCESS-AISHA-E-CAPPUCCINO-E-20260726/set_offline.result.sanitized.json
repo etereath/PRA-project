@@ -1,0 +1,192 @@
+{
+  "action_type": "set_offline",
+  "active_listing_filter": "ONLINE",
+  "active_listing_filter_selected_at": "2026-07-26T16:52:32+08:00",
+  "actual_price": "",
+  "applet_launch": {
+    "source": "EXISTING_WINDOW",
+    "uri_opened": false,
+    "window_ready_at": "2026-07-26T16:52:24+08:00"
+  },
+  "batch_id": "BATCH-T13-OPTIMIZED-SET-OFFLINE-20260726-02",
+  "batch_status": "VERIFIED",
+  "business_operation_completed": true,
+  "contract_version": 5,
+  "counts": {
+    "already_applied_count": 0,
+    "attempted_count": 2,
+    "batch_target_count": 2,
+    "failed_count": 0,
+    "not_applied_count": 0,
+    "not_attempted_count": 0,
+    "partial_effect_count": 0,
+    "unknown_count": 0,
+    "verified_applied_count": 2,
+    "verified_count": 2
+  },
+  "current_step": "VALIDATE_INPUT",
+  "ended_at": "2026-07-26T08:53:00+00:00",
+  "error_code": "",
+  "error_message": "",
+  "evidence": [],
+  "evidence_status": "NONE",
+  "execution_attempt_id": "ATTEMPT-T13-OPTIMIZED-SET-OFFLINE-20260726-02",
+  "execution_mode": "COMMIT",
+  "expected_old_price": "",
+  "grade": "",
+  "instruction_hash": "sha256:2a479eb1fe424b378c177209788810b011411e6e8a51797af031494d616c197b",
+  "items": [
+    {
+      "action_clicked_at": "2026-07-26T08:52:50+00:00",
+      "action_confirm_clicked": true,
+      "actual_inventory": 2,
+      "actual_price": "7.50",
+      "detail_effect_state": "NOT_APPLIED",
+      "detail_save_clicked": false,
+      "detail_save_clicked_at": null,
+      "error_code": "",
+      "error_message": "",
+      "internal_sku": "AISHA-E-45-Z",
+      "item_execution_attempt_id": "ATTEMPT-8bdabd5125261fcc3b5dd374",
+      "item_payload_sha256": "sha256:19057e067d14f627ecd47bd9cd05bff7ad4709234208babedceb19700eefc356",
+      "listing_effect_state": "VERIFIED",
+      "observed_inventory_after_detail_save": null,
+      "observed_inventory_before_action": 2,
+      "observed_price_after_detail_save": null,
+      "observed_price_before_action": "7.50",
+      "operation_id": "OP-2a7278a54e74b07e611c11fa",
+      "operation_result": "VERIFIED",
+      "readback_observed_at": "2026-07-26T08:53:00+00:00",
+      "source_task_id": "5851c458db5c"
+    },
+    {
+      "action_clicked_at": "2026-07-26T08:52:47+00:00",
+      "action_confirm_clicked": true,
+      "actual_inventory": 1,
+      "actual_price": "8.00",
+      "detail_effect_state": "NOT_APPLIED",
+      "detail_save_clicked": false,
+      "detail_save_clicked_at": null,
+      "error_code": "",
+      "error_message": "",
+      "internal_sku": "CAPPUCCINO-E-45-Z",
+      "item_execution_attempt_id": "ATTEMPT-c06d384b6caa03a93068f1d3",
+      "item_payload_sha256": "sha256:47a2475b339762edd8f95c53f7c435fe0292e39ad673f9e964a001673970dfc4",
+      "listing_effect_state": "VERIFIED",
+      "observed_inventory_after_detail_save": null,
+      "observed_inventory_before_action": 1,
+      "observed_price_after_detail_save": null,
+      "observed_price_before_action": "8.00",
+      "operation_id": "OP-a5a36213199e0ed3ac53bc06",
+      "operation_result": "VERIFIED",
+      "readback_observed_at": "2026-07-26T08:53:00+00:00",
+      "source_task_id": "4b798ae81331"
+    }
+  ],
+  "login": {
+    "check_path": "BUSINESS_ENTRY_FAST_PATH",
+    "login_completed_at": "2026-07-26T16:52:25+08:00"
+  },
+  "manifest_sha256": "sha256:ae24d0284390f3689725209da00422138815fc616cb7b20a9c6e3088d856ef86",
+  "old_price": "",
+  "partial_effect_count": 0,
+  "product_keyword": "",
+  "product_list_refreshes": [
+    {
+      "ended_at": "2026-07-26T16:52:33+08:00",
+      "refresh_entry": "蚂蚁_首页_商品管理_入口",
+      "stage": "BEFORE_SET_OFFLINE",
+      "started_at": "2026-07-26T16:52:25+08:00",
+      "status": "SUCCESS"
+    }
+  ],
+  "product_name": "",
+  "queue_phase": "RESULT_WRITTEN",
+  "reconciliation_pending": false,
+  "request_file_sha256": "sha256:379c026286dad2b488dc8a8bd15834e9d85136cddad9872fbc8004c834267025",
+  "requires_manual_review": false,
+  "result_id": "RESULT-ffac69d7986ab86bcd8f7448",
+  "result_path": "<REDACTED_PATH>/ATTEMPT-T13-OPTIMIZED-SET-OFFLINE-20260726-02.json",
+  "result_payload_sha256": "sha256:17411353e221bf6de2af5a185bd84d0b993f34b6ef59c1c975ed2d240e0def55",
+  "retryable": false,
+  "run_success_flag": true,
+  "schema_version": "shadowbot-listing-action-batch-result-1.0",
+  "selector_model": {
+    "inventory_index_offset": 6,
+    "inventory_text_index": 0,
+    "parent_class": "van-checkbox-group",
+    "price_index_offset": 9,
+    "row_index_start": 1,
+    "row_index_step": 16,
+    "waiting_row_index_step": 15
+  },
+  "side_effect_state": "VERIFIED",
+  "spec": "",
+  "spec_available": false,
+  "started_at": "2026-07-26T08:52:23+00:00",
+  "status": "VERIFIED",
+  "target_price": "",
+  "task_id": "",
+  "timing_trace": [
+    {
+      "duration_ms": 1815,
+      "stage": "window_prepare"
+    },
+    {
+      "duration_ms": 443,
+      "stage": "login_check"
+    },
+    {
+      "duration_ms": 7736,
+      "stage": "product_list_refresh"
+    },
+    {
+      "duration_ms": 10252,
+      "identity_rows": 5,
+      "inventory_reads": 2,
+      "non_target_rows_skipped": 3,
+      "page_type": "online",
+      "price_reads": 2,
+      "stage": "preflight_online_scan",
+      "target_rows_hydrated": 2
+    },
+    {
+      "duration_ms": 0,
+      "internal_sku": "CAPPUCCINO-E-45-Z",
+      "stage": "item_action_visibility"
+    },
+    {
+      "duration_ms": 3584,
+      "internal_sku": "CAPPUCCINO-E-45-Z",
+      "stage": "item_action_confirm"
+    },
+    {
+      "duration_ms": 0,
+      "internal_sku": "AISHA-E-45-Z",
+      "stage": "item_action_visibility"
+    },
+    {
+      "duration_ms": 3504,
+      "internal_sku": "AISHA-E-45-Z",
+      "stage": "item_action_confirm"
+    },
+    {
+      "duration_ms": 9596,
+      "identity_rows": 3,
+      "inventory_reads": 0,
+      "non_target_rows_skipped": 3,
+      "page_type": "online",
+      "price_reads": 0,
+      "stage": "final_online_scan",
+      "target_rows_hydrated": 0
+    },
+    {
+      "duration_ms": 36942,
+      "item_count": 2,
+      "stage": "set_offline_total"
+    }
+  ],
+  "window_title": "",
+  "worker_heartbeat_at": "2026-07-26T08:53:00.500053+00:00",
+  "worker_id": "<REDACTED_DEVICE>"
+}

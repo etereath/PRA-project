@@ -1,0 +1,13 @@
+{
+  "accepted_at": "2026-07-26T11:07:31.803631+00:00",
+  "ack_state": "WRITTEN",
+  "ack_updated_at": "2026-07-26T11:07:31.864535+00:00",
+  "batch_id": "BATCH-T13-OPTIMIZED-SET-ONLINE-20260726-02",
+  "execution_attempt_id": "ATTEMPT-T13-OPTIMIZED-SET-ONLINE-20260726-02",
+  "instruction_hash": "sha256:c3774e4a4fcab5c4199a47029ed9a56f2cb025513414dffeebb421a7cbaffc58",
+  "last_projection_error": "",
+  "manifest_sha256": "sha256:86a7a533ce834e79be0b513406b97bb71cefab1cd669574f9e0af238d2560bd8",
+  "result_id": "RESULT-00142e5fec216f54c8974021",
+  "result_sha256": "03defb90a792750f5365b356b8287d4fa1de7042071189779ae3dca65b58cd9f",
+  "source_result_path": "<REDACTED_PATH>/ATTEMPT-T13-OPTIMIZED-SET-ONLINE-20260726-02.result.json"
+}

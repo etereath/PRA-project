@@ -38,8 +38,16 @@ from app.services.shadowbot_commit_batch import (
     CONTRACT_VERSION as COMMIT_BATCH_CONTRACT_VERSION,
     validate_request as validate_commit_batch_request,
 )
+from app.services.shadowbot_listing_action_contract import (
+    build_listing_action_phase,
+    build_listing_action_recovery_result,
+    compute_listing_result_hash,
+    validate_listing_action_request,
+    validate_listing_action_result,
+)
 from app.shadowbot_contract_primitives import (
     build_v4_recovery_result,
+    sha256_json,
 )
 
 
@@ -167,6 +175,21 @@ class ShadowBotResultImporter:
             raise ValidationError("RESULT_CONTRACT_INVALID: execution_attempt_id is required.")
         if data.get("contract_version") == COMMIT_BATCH_CONTRACT_VERSION:
             return self._import_v4_commit_result(
+                result_path,
+                data=data,
+                result_bytes=result_bytes,
+            )
+        if data.get("contract_version") == 5:
+            if (
+                str(data.get("action_type") or "").strip().lower()
+                == "sync_status"
+            ):
+                return self._import_v5_listing_sync_result(
+                    result_path,
+                    data=data,
+                    result_bytes=result_bytes,
+                )
+            return self._import_v5_listing_action_result(
                 result_path,
                 data=data,
                 result_bytes=result_bytes,
@@ -380,6 +403,250 @@ class ShadowBotResultImporter:
             "archive_dir": str(archive_dir),
             "counts": counts,
             "listing_status_events": listing_observations,
+            "reconcile_events": reconcile_events,
+        }
+
+    def _import_v5_listing_sync_result(
+        self,
+        result_path: Path,
+        *,
+        data: dict[str, Any],
+        result_bytes: bytes,
+    ) -> dict[str, Any]:
+        """Import one independent v5 SYNC_STATUS result and write its ACK."""
+
+        execution_attempt_id = str(
+            data.get("execution_attempt_id") or ""
+        ).strip()
+        request_path = self._find_v4_request(execution_attempt_id)
+        request_bytes = request_path.read_bytes()
+        _verify_checksum(request_path, request_bytes)
+        request_file_sha256 = hashlib.sha256(request_bytes).hexdigest()
+        request_data = json.loads(request_bytes.decode("utf-8-sig"))
+        if not isinstance(request_data, dict):
+            raise ValidationError(
+                "RESULT_CONTRACT_INVALID: v5 request JSON must be an object."
+            )
+        validate_listing_action_request(request_data, check_expiry=False)
+        validate_listing_action_result(
+            data,
+            request=request_data,
+            request_file_sha256="sha256:" + request_file_sha256,
+        )
+        result_file_sha256 = hashlib.sha256(result_bytes).hexdigest()
+        from app.services.shadowbot_listing_sync import (
+            import_listing_sync_result,
+            mark_listing_sync_ack,
+            render_listing_sync_markdown,
+        )
+
+        summary = import_listing_sync_result(
+            self.repository,
+            request=request_data,
+            result=data,
+            result_file_sha256=result_file_sha256,
+            source_result_path=str(result_path),
+        )
+        archive_dir = self._archive_attempt(
+            execution_attempt_id,
+            request_path,
+            result_path,
+        )
+        report_path = archive_dir / f"{execution_attempt_id}.sync-report.md"
+        ack_path = archive_dir / f"{execution_attempt_id}.import.ack.json"
+        try:
+            _atomic_write(
+                report_path,
+                (
+                    render_listing_sync_markdown(
+                        request=request_data,
+                        result=data,
+                        summary=summary,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+            )
+            _atomic_write(
+                ack_path,
+                _json_bytes(
+                    {
+                        "schema_version": "shadowbot-listing-sync-import-ack-1.0",
+                        "batch_id": request_data["batch_id"],
+                        "execution_attempt_id": execution_attempt_id,
+                        "result_id": data["result_id"],
+                        "result_file_sha256": result_file_sha256,
+                        "snapshot_id": data["snapshot"]["snapshot_id"],
+                        "status": summary["status"],
+                        "report_path": str(report_path),
+                        "written_at": datetime.now(UTC).isoformat(),
+                    }
+                ),
+            )
+        except OSError as exc:
+            mark_listing_sync_ack(
+                self.repository,
+                result_id=str(data["result_id"]),
+                written=False,
+                error_message=str(exc),
+            )
+            raise
+        mark_listing_sync_ack(
+            self.repository,
+            result_id=str(data["result_id"]),
+            written=True,
+        )
+        return {
+            "status": (
+                "ALREADY_IMPORTED"
+                if summary.get("already_imported")
+                else "IMPORTED"
+            ),
+            "contract_version": 5,
+            "action_type": "sync_status",
+            "batch_id": str(request_data["batch_id"]),
+            "execution_attempt_id": execution_attempt_id,
+            "archive_dir": str(archive_dir),
+            "report_path": str(report_path),
+            "ack_path": str(ack_path),
+            "summary": summary,
+        }
+
+    def _import_v5_listing_action_result(
+        self,
+        result_path: Path,
+        *,
+        data: dict[str, Any],
+        result_bytes: bytes,
+    ) -> dict[str, Any]:
+        """Import one v5 SET_ONLINE/SET_OFFLINE result and write its ACK."""
+
+        execution_attempt_id = str(
+            data.get("execution_attempt_id") or ""
+        ).strip()
+        request_path = self._find_v4_request(execution_attempt_id)
+        request_bytes = request_path.read_bytes()
+        _verify_checksum(request_path, request_bytes)
+        request_file_sha256 = hashlib.sha256(request_bytes).hexdigest()
+        request_data = json.loads(request_bytes.decode("utf-8-sig"))
+        validate_listing_action_request(request_data, check_expiry=False)
+        validate_listing_action_result(
+            data,
+            request=request_data,
+            request_file_sha256="sha256:" + request_file_sha256,
+        )
+        result_file_sha256 = hashlib.sha256(result_bytes).hexdigest()
+        from app.services.shadowbot_listing_action_pipeline import (
+            ensure_listing_action_reconcile_attempt,
+            import_listing_action_result,
+            mark_listing_action_ack,
+            render_listing_action_markdown,
+        )
+
+        summary = import_listing_action_result(
+            self.repository,
+            request=request_data,
+            result=data,
+            result_file_sha256=result_file_sha256,
+            source_result_path=str(result_path),
+        )
+        archive_dir = self._archive_attempt(
+            execution_attempt_id,
+            request_path,
+            result_path,
+        )
+        reconcile_events: list[dict[str, Any]] = []
+        if (
+            str(request_data.get("execution_mode") or "").upper()
+            == "COMMIT"
+        ):
+            for output in data.get("items") or []:
+                if (
+                    str(output.get("operation_result") or "").upper()
+                    != "NEEDS_RECONCILIATION"
+                ):
+                    continue
+                try:
+                    reconcile_events.append(
+                        ensure_listing_action_reconcile_attempt(
+                            self.repository,
+                            self.executor.runner,
+                            source_request=request_data,
+                            source_result=data,
+                            operation_id=str(
+                                output.get("operation_id") or ""
+                            ),
+                        )
+                    )
+                except (OSError, ValidationError, ValueError) as exc:
+                    reconcile_events.append(
+                        {
+                            "status": "RECONCILE_START_FAILED",
+                            "operation_id": str(
+                                output.get("operation_id") or ""
+                            ),
+                            "error_message": str(exc),
+                        }
+                    )
+        report_path = archive_dir / (
+            f"{execution_attempt_id}.listing-action-report.md"
+        )
+        ack_path = archive_dir / f"{execution_attempt_id}.import.ack.json"
+        try:
+            _atomic_write(
+                report_path,
+                (
+                    render_listing_action_markdown(
+                        request=request_data,
+                        result=data,
+                        summary=summary,
+                    )
+                    + "\n"
+                ).encode("utf-8"),
+            )
+            _atomic_write(
+                ack_path,
+                _json_bytes(
+                    {
+                        "schema_version": (
+                            "shadowbot-listing-action-import-ack-1.0"
+                        ),
+                        "batch_id": request_data["batch_id"],
+                        "execution_attempt_id": execution_attempt_id,
+                        "result_id": data["result_id"],
+                        "result_file_sha256": result_file_sha256,
+                        "status": summary["status"],
+                        "report_path": str(report_path),
+                        "written_at": datetime.now(UTC).isoformat(),
+                    }
+                ),
+            )
+        except OSError as exc:
+            mark_listing_action_ack(
+                self.repository,
+                result_id=str(data["result_id"]),
+                written=False,
+                error_message=str(exc),
+            )
+            raise
+        mark_listing_action_ack(
+            self.repository,
+            result_id=str(data["result_id"]),
+            written=True,
+        )
+        return {
+            "status": (
+                "ALREADY_IMPORTED"
+                if summary.get("already_imported")
+                else "IMPORTED"
+            ),
+            "contract_version": 5,
+            "action_type": str(request_data["action_type"]),
+            "batch_id": str(request_data["batch_id"]),
+            "execution_attempt_id": execution_attempt_id,
+            "archive_dir": str(archive_dir),
+            "report_path": str(report_path),
+            "ack_path": str(ack_path),
+            "summary": summary,
             "reconcile_events": reconcile_events,
         }
 
@@ -901,8 +1168,13 @@ class ShadowBotQueueWatchdog:
             if execution_attempt_id in phase_attempts or not _is_file_stale(request_path, current, self.stale_seconds):
                 continue
             request_data = _read_json_object(request_path)
+            request_digest = hashlib.sha256(request_path.read_bytes()).hexdigest()
             phase_data = {
-                "request_file_sha256": hashlib.sha256(request_path.read_bytes()).hexdigest(),
+                "request_file_sha256": (
+                    "sha256:" + request_digest
+                    if request_data.get("contract_version") == 5
+                    else request_digest
+                ),
                 "side_effect_state": SIDE_EFFECT_NOT_STARTED,
             }
             events.append(self._write_recovery_result(request_data, phase_data, phase="CLAIMED"))
@@ -939,6 +1211,128 @@ class ShadowBotQueueWatchdog:
                 if duplicate:
                     reason = "DUPLICATE_READY_REQUEST"
                     target_root = self.paths.quarantine
+                elif request.get("contract_version") == 5:
+                    validate_listing_action_request(request, check_expiry=False)
+                    if (
+                        str(request.get("execution_mode") or "").strip().upper()
+                        == "RECONCILE"
+                    ):
+                        items = list(request.get("items") or [])
+                        item_attempt_id = (
+                            str(
+                                items[0].get("item_execution_attempt_id")
+                                if len(items) == 1
+                                else ""
+                            ).strip()
+                        )
+                        attempt = (
+                            self.repository.get_shadowbot_execution_attempt(
+                                item_attempt_id
+                            )
+                            if item_attempt_id
+                            else None
+                        )
+                        request_digest = hashlib.sha256(
+                            request_path.read_bytes()
+                        ).hexdigest()
+                        attempt_payload = (
+                            dict(attempt.raw_output)
+                            if attempt is not None
+                            else {}
+                        )
+                        if (
+                            attempt is None
+                            or attempt.execution_mode != "RECONCILE"
+                            or attempt.instruction_hash
+                            != str(request.get("instruction_hash") or "")
+                            or attempt.request_file_sha256 != request_digest
+                            or str(
+                                attempt_payload.get(
+                                    "queue_execution_attempt_id"
+                                )
+                                or ""
+                            )
+                            != attempt_id
+                        ):
+                            reason = "ORPHAN_READY_REQUEST"
+                            target_root = self.paths.quarantine
+                        elif attempt.ended_at is not None:
+                            reason = "STALE_TERMINAL_READY_REQUEST"
+                            target_root = self.paths.archive / attempt_id
+                            target_root.mkdir(parents=True, exist_ok=True)
+                        elif attempt.status in {"STARTING", "RUNNING"}:
+                            continue
+                        else:
+                            reason = "FROZEN_READY_REQUEST"
+                            target_root = self.paths.quarantine
+                        destination = (
+                            target_root
+                            / f"{reason.lower()}-{request_path.name}"
+                        )
+                        os.replace(request_path, destination)
+                        checksum = request_path.with_suffix(
+                            request_path.suffix + ".sha256"
+                        )
+                        if checksum.exists():
+                            os.replace(
+                                checksum,
+                                destination.with_suffix(
+                                    destination.suffix + ".sha256"
+                                ),
+                            )
+                        events.append(
+                            {
+                                "status": (
+                                    "ARCHIVED"
+                                    if target_root != self.paths.quarantine
+                                    else "QUARANTINED"
+                                ),
+                                "error_code": reason,
+                                "execution_attempt_id": attempt_id,
+                                "path": str(destination),
+                            }
+                        )
+                        continue
+                    with self.repository.connect_read() as connection:
+                        batch = connection.execute(
+                            """
+                            SELECT status, execution_attempt_id,
+                                   instruction_hash, manifest_sha256
+                            FROM shadowbot_listing_action_batches
+                            WHERE batch_id = ?
+                            """,
+                            (str(request.get("batch_id") or ""),),
+                        ).fetchone()
+                    if (
+                        batch is None
+                        or str(batch["execution_attempt_id"] or "") != attempt_id
+                        or str(batch["instruction_hash"] or "")
+                        != str(request.get("instruction_hash") or "")
+                        or str(batch["manifest_sha256"] or "")
+                        != str(request.get("manifest_sha256") or "")
+                    ):
+                        reason = "ORPHAN_READY_REQUEST"
+                        target_root = self.paths.quarantine
+                    elif str(batch["status"] or "") in {
+                        "VERIFIED",
+                        "PARTIAL",
+                        "FAILED",
+                    }:
+                        reason = "STALE_TERMINAL_READY_REQUEST"
+                        target_root = self.paths.archive / attempt_id
+                        target_root.mkdir(parents=True, exist_ok=True)
+                    elif str(batch["status"] or "") == "UNKNOWN":
+                        reason = "FROZEN_READY_REQUEST"
+                        target_root = self.paths.quarantine
+                    elif str(batch["status"] or "") in {
+                        "PUBLISHING",
+                        "QUEUED",
+                        "RUNNING",
+                    }:
+                        continue
+                    else:
+                        reason = "ORPHAN_READY_REQUEST"
+                        target_root = self.paths.quarantine
                 elif request.get("contract_version") == COMMIT_BATCH_CONTRACT_VERSION:
                     validate_commit_batch_request(request, check_expiry=False)
                     with self.repository.connect_read() as connection:
@@ -1040,7 +1434,11 @@ class ShadowBotQueueWatchdog:
             return None
         request_path = self.paths.working / f"{execution_attempt_id}.request.json"
         request_data = _read_json_object(request_path)
-        phase_data.setdefault("request_file_sha256", hashlib.sha256(request_path.read_bytes()).hexdigest())
+        request_digest = hashlib.sha256(request_path.read_bytes()).hexdigest()
+        if request_data.get("contract_version") == 5:
+            phase_data.setdefault("request_file_sha256", "sha256:" + request_digest)
+        else:
+            phase_data.setdefault("request_file_sha256", request_digest)
         phase = str(phase_data.get("phase") or "CLAIMED")
         if request_data.get("contract_version") == COMMIT_BATCH_CONTRACT_VERSION:
             if self.repository is not None:
@@ -1062,6 +1460,12 @@ class ShadowBotQueueWatchdog:
             return self._write_v4_recovery_result(request_data, phase_data, phase=phase)
         if phase == "RESULT_WRITTEN":
             return None
+        if request_data.get("contract_version") == 5:
+            return self._write_v5_recovery_result(
+                request_data,
+                phase_data,
+                phase=phase,
+            )
         if phase == "VERIFIED" and isinstance(phase_data.get("result_snapshot"), dict):
             return self._write_result(dict(phase_data["result_snapshot"]), execution_attempt_id)
         return self._write_recovery_result(request_data, phase_data, phase=phase)
@@ -1075,6 +1479,24 @@ class ShadowBotQueueWatchdog:
     ) -> dict[str, Any]:
         if request.get("contract_version") == COMMIT_BATCH_CONTRACT_VERSION:
             return self._write_v4_recovery_result(request, phase_data, phase=phase)
+        if request.get("contract_version") == 5:
+            request_file_sha256 = str(
+                phase_data.get("request_file_sha256") or ""
+            )
+            synthetic_phase = build_listing_action_phase(
+                request,
+                request_file_sha256=request_file_sha256,
+                phase_name="CLAIMED",
+                worker_id=str(
+                    phase_data.get("worker_id") or "watchdog:recovery"
+                ),
+                current_item=(request.get("items") or [None])[0],
+            )
+            return self._write_v5_recovery_result(
+                request,
+                synthetic_phase,
+                phase="CLAIMED",
+            )
         execution_mode = str(request.get("execution_mode") or "")
         has_submit_risk = phase in SUBMIT_PHASES or phase == "VERIFIED" or (
             execution_mode == EXECUTION_MODE_COMMIT and str(phase_data.get("side_effect_state") or "") != SIDE_EFFECT_NOT_STARTED
@@ -1136,6 +1558,128 @@ class ShadowBotQueueWatchdog:
             error_message=f"stale ShadowBot v4 batch recovered at phase {phase}",
         )
         return self._write_result(result, str(request.get("execution_attempt_id") or ""))
+
+    def _write_v5_recovery_result(
+        self,
+        request: dict[str, Any],
+        phase_data: dict[str, Any],
+        *,
+        phase: str,
+    ) -> dict[str, Any]:
+        recovered_at = datetime.now(UTC).isoformat()
+        if str(request.get("action_type") or "") == "sync_status":
+            result_id = "RESULT-" + sha256_json(
+                {
+                    "batch_id": request.get("batch_id"),
+                    "execution_attempt_id": request.get(
+                        "execution_attempt_id"
+                    ),
+                    "recovery": True,
+                },
+                prefixed=False,
+            )[:24]
+            snapshot = {
+                "schema_version": "shadowbot-listing-sync-snapshot-1.0",
+                "snapshot_id": "SNAPSHOT-" + sha256_json(
+                    {
+                        "result_id": result_id,
+                        "recovery": True,
+                    },
+                    prefixed=False,
+                )[:24],
+                "platform_name": request.get("platform_name", ""),
+                "execution_attempt_id": request.get(
+                    "execution_attempt_id",
+                    "",
+                ),
+                "mapping_source_version": request.get(
+                    "mapping_source_version",
+                    "",
+                ),
+                "result_id": result_id,
+                "scan_started_at": recovered_at,
+                "scan_completed_at": recovered_at,
+                "online_scan_started_at": recovered_at,
+                "online_scan_completed_at": recovered_at,
+                "waiting_scan_started_at": recovered_at,
+                "waiting_scan_completed_at": recovered_at,
+                "online_scan_complete": False,
+                "waiting_scan_complete": False,
+                "online_end_marker_verified": False,
+                "waiting_end_marker_verified": False,
+                "snapshot_complete": False,
+                "instruction_hash": request.get("instruction_hash", ""),
+                "status": "FAILED",
+                "error_code": "WORKER_INTERRUPTED",
+                "evidence_manifest_sha256": sha256_json([]),
+                "items": [],
+            }
+            result = {
+                "schema_version": "shadowbot-listing-action-batch-result-1.0",
+                "contract_version": 5,
+                "action_type": "sync_status",
+                "batch_id": request.get("batch_id", ""),
+                "execution_attempt_id": request.get(
+                    "execution_attempt_id",
+                    "",
+                ),
+                "execution_mode": "READ_ONLY",
+                "manifest_sha256": request.get("manifest_sha256", ""),
+                "instruction_hash": request.get("instruction_hash", ""),
+                "request_file_sha256": str(
+                    phase_data.get("request_file_sha256") or ""
+                ),
+                "worker_id": str(
+                    phase_data.get("worker_id") or "watchdog:recovery"
+                ),
+                "queue_phase": "RESULT_WRITTEN",
+                "worker_heartbeat_at": recovered_at,
+                "result_id": result_id,
+                "started_at": recovered_at,
+                "ended_at": recovered_at,
+                "status": "FAILED",
+                "run_success_flag": False,
+                "business_operation_completed": False,
+                "side_effect_state": "NOT_STARTED",
+                "error_code": "WORKER_INTERRUPTED",
+                "error_message": (
+                    "stale ShadowBot v5 sync recovered at phase "
+                    + str(phase)
+                ),
+                "retryable": False,
+                "snapshot": snapshot,
+            }
+            result["result_payload_sha256"] = compute_listing_result_hash(
+                result
+            )
+            validate_listing_action_result(
+                result,
+                request=request,
+                request_file_sha256=str(
+                    phase_data.get("request_file_sha256") or ""
+                ),
+            )
+            return self._write_result(
+                result,
+                str(request.get("execution_attempt_id") or ""),
+            )
+        result = build_listing_action_recovery_result(
+            request,
+            phase_data,
+            request_file_sha256=str(
+                phase_data.get("request_file_sha256") or ""
+            ),
+            recovered_at=recovered_at,
+            worker_id=str(phase_data.get("worker_id") or ""),
+            error_code="WORKER_INTERRUPTED",
+            error_message=(
+                "stale ShadowBot v5 batch recovered at phase " + str(phase)
+            ),
+        )
+        return self._write_result(
+            result,
+            str(request.get("execution_attempt_id") or ""),
+        )
 
     def _write_result(self, result: dict[str, Any], execution_attempt_id: str) -> dict[str, Any]:
         if not execution_attempt_id:

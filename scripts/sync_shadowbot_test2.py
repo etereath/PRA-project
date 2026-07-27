@@ -52,6 +52,10 @@ def sync(app_dir: Path, *, check_only: bool) -> list[dict[str, str]]:
         ),
         (SOURCE_DIR / "vertical_slice_read_price.py", app_dir / "vertical_slice_read_price.py"),
         (SOURCE_DIR / "shadowbot_queue_worker.py", app_dir / "shadowbot_queue_worker.py"),
+        (
+            SOURCE_DIR / "product_identity_mapping.json",
+            app_dir / "product_identity_mapping.json",
+        ),
     )
     for source, destination in mappings:
         source_hash = sha256(source)

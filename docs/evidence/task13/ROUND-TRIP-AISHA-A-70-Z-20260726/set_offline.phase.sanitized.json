@@ -1,0 +1,16 @@
+{
+  "action_type": "set_offline",
+  "batch_id": "BATCH-T13-AISHA-A-SET-OFFLINE-20260726-04",
+  "contract_version": 5,
+  "detail_effect_state": "NOT_STARTED",
+  "execution_attempt_id": "ATTEMPT-T13-AISHA-A-SET-OFFLINE-20260726-04",
+  "instruction_hash": "sha256:d476060d35f4e076b7d94b8ad364d8f1f1ef8b54d7da72968442ec3d595ad2ba",
+  "listing_effect_state": "NOT_STARTED",
+  "manifest_sha256": "sha256:1f636c2975d6ac0edfe3419609f7505862175de08fbf02e88b480f310cdb38fc",
+  "phase": "RESULT_WRITTEN",
+  "phase_at": "2026-07-25T20:30:43.573225+00:00",
+  "phase_snapshot_sha256": "sha256:c6bafb6c134498f30f0093b4154f9280dc3d596c4204258e846d80b065126dd1",
+  "request_file_sha256": "sha256:107cec5de2a8d172b0310f5bf9f877ff3cde5f91f5b6c6065feb039ee6a8d3d8",
+  "schema_version": "shadowbot-listing-action-batch-phase-1.0",
+  "worker_id": "<REDACTED_DEVICE>"
+}

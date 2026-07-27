@@ -11,6 +11,11 @@ from app.services.shadowbot_commit_batch import (
     required_development_confirmation,
     validate_request,
 )
+from app.services.shadowbot_listing_action_contract import (
+    build_listing_action_manifest,
+    build_listing_action_request,
+)
+from app.shadowbot_listing_contract import V5_GATE_SUMMARY_SCHEMA_VERSION
 
 
 def _load_worker_module():
@@ -62,6 +67,62 @@ def _valid_v4_request(*, profile: str = "development") -> dict[str, object]:
     return request
 
 
+def _valid_v5_request() -> dict[str, object]:
+    batch_id = "BATCH-T13-FAULT-GATE-0001"
+    manifest = build_listing_action_manifest(
+        batch_id=batch_id,
+        action_type="set_offline",
+        task_items=[
+            {
+                "source_task_id": "TASK-T13-FAULT-0001",
+                "internal_sku": "AISHA-C-55-Z",
+                "expected_old_status": "online",
+                "target_status": "offline",
+                "expires_at": "2099-01-01T00:00:00+00:00",
+            }
+        ],
+        identity_mapping={
+            "AISHA-C-55-Z": {
+                "expected_product_name": "艾莎",
+                "expected_grade": "C级",
+            }
+        },
+        platform_name="蚂蚁花团供应商",
+        mapping_source_version="sha256:" + "1" * 64,
+    )
+    item = manifest["items"][0]
+    gate_summary = {
+        "schema_version": V5_GATE_SUMMARY_SCHEMA_VERSION,
+        "gate_phase": "PRE_PUBLISH",
+        "evaluated_at": "2026-07-26T12:00:00+00:00",
+        "items": [
+            {
+                "internal_sku": item["internal_sku"],
+                "operation_id": item["operation_id"],
+                "decision": "EXECUTE",
+                "lock_status": "ACTIVE",
+                "lock_operation_id": item["operation_id"],
+                "block_reasons": [],
+            }
+        ],
+    }
+    return build_listing_action_request(
+        manifest,
+        execution_profile="development",
+        execution_attempt_id="ATTEMPT-T13-FAULT-GATE-0001",
+        applet_uri="weixin://dl/business/?t=test",
+        gate_summary=gate_summary,
+        batch_task_id="TASK-BATCH-T13-FAULT-GATE-0001",
+        batch_operation_id="OPERATION-T13-FAULT-GATE-0001",
+        confirmation_text=(
+            "确认授权批次 BATCH-T13-FAULT-GATE-0001 以上1项真实COMMIT"
+        ),
+        confirmed_by="test",
+        fault_injection="AFTER_ACTION_CLICK_UNKNOWN",
+        fault_injection_item_ordinal=1,
+    )
+
+
 def test_queue_worker_rejects_fault_injection_by_default(tmp_path):
     worker_module = _load_worker_module()
     worker = worker_module.QueueWorker(
@@ -92,6 +153,40 @@ def test_queue_worker_allows_development_v4_fault_only_when_configured(tmp_path)
     request = _valid_v4_request()
 
     worker._validate_request(request)
+
+
+def test_queue_worker_allows_development_v5_fault_only_when_configured(
+    tmp_path,
+):
+    worker_module = _load_worker_module()
+    request = _valid_v5_request()
+    disabled = worker_module.QueueWorker(
+        {
+            "queue_dir": str(tmp_path / "disabled"),
+            "poll_seconds": 1,
+            "max_hours": 1,
+            "max_tasks": 1,
+            "heartbeat_seconds": 5,
+        }
+    )
+    enabled = worker_module.QueueWorker(
+        {
+            "queue_dir": str(tmp_path / "enabled"),
+            "poll_seconds": 1,
+            "max_hours": 1,
+            "max_tasks": 1,
+            "heartbeat_seconds": 5,
+            "allow_fault_injection": True,
+        }
+    )
+
+    try:
+        disabled._validate_request(request)
+    except ValueError as exc:
+        assert "UNSAFE_TEST_PARAMETER_REJECTED" in str(exc)
+    else:
+        raise AssertionError("v5 fault injection should be disabled by default")
+    enabled._validate_request(request)
 
 
 def test_queue_worker_rejects_production_fault_even_when_configured(tmp_path):

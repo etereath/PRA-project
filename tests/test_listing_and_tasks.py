@@ -6,6 +6,7 @@ from decimal import Decimal
 
 from app.enums import ListingAction, ListingStrategy, PricingMethod, RoundingRule, TaskActionType
 from app.exceptions import ValidationError
+from app.listing_identity import listing_identity_key
 from app.models import ListingRule, PriceRule, Product
 from app.services.ai import NullAISuggestionProvider
 from app.services.listing import ListingService
@@ -105,6 +106,213 @@ class ListingAndTaskTests(unittest.TestCase):
         self.assertIn(("SKU-OFFLINE", TaskActionType.SET_OFFLINE), actions)
         self.assertIn(("SKU-DISABLED", TaskActionType.SET_OFFLINE), actions)
         self.assertNotIn(("SKU-DISABLED", TaskActionType.UPDATE_PRICE), actions)
+
+    def test_task_generation_filters_actions_by_current_platform_state(self) -> None:
+        generator = TaskGenerationService(
+            pricing_service=PricingService(ai_provider=NullAISuggestionProvider()),
+            listing_service=ListingService(),
+        )
+        platform_name = "测试平台"
+        online_identity = listing_identity_key(platform_name, "online", "A")
+        offline_identity = listing_identity_key(platform_name, "offline", "B")
+        disabled_identity = listing_identity_key(platform_name, "disabled", "A")
+        ignored_candidates = []
+
+        tasks = generator.generate(
+            self.products,
+            self.price_rules,
+            self.listing_rules,
+            platform_name=platform_name,
+            old_prices={online_identity: Decimal("20")},
+            platform_listing_states={
+                online_identity: "online",
+                offline_identity: "offline",
+                disabled_identity: "online",
+            },
+            ignored_candidates=ignored_candidates,
+        )
+
+        actions = {(task.internal_sku, task.action_type) for task in tasks}
+        self.assertIn(("SKU-ONLINE", TaskActionType.UPDATE_PRICE), actions)
+        self.assertNotIn(("SKU-ONLINE", TaskActionType.SET_ONLINE), actions)
+        self.assertNotIn(("SKU-OFFLINE", TaskActionType.SET_OFFLINE), actions)
+        self.assertIn(("SKU-DISABLED", TaskActionType.SET_OFFLINE), actions)
+        self.assertEqual(
+            {
+                (candidate.internal_sku, candidate.action_type, candidate.reason)
+                for candidate in ignored_candidates
+            },
+            {
+                (
+                    "SKU-ONLINE",
+                    TaskActionType.SET_ONLINE,
+                    "当前商品已上架，无需重复上架",
+                ),
+                (
+                    "SKU-OFFLINE",
+                    TaskActionType.SET_OFFLINE,
+                    "当前商品未上架，无需重复下架",
+                ),
+            },
+        )
+
+    def test_zero_stock_platform_snapshot_is_excluded_from_all_platform_actions(
+        self,
+    ) -> None:
+        generator = TaskGenerationService(
+            pricing_service=PricingService(ai_provider=NullAISuggestionProvider()),
+            listing_service=ListingService(),
+        )
+        platform_name = "测试平台"
+        identity = listing_identity_key(platform_name, "online", "A")
+
+        ignored_candidates = []
+        tasks = generator.generate(
+            [self.products[0]],
+            self.price_rules,
+            self.listing_rules,
+            platform_name=platform_name,
+            old_prices={},
+            platform_listing_states={identity: "unavailable"},
+            ignored_candidates=ignored_candidates,
+        )
+
+        self.assertEqual(tasks, [])
+        self.assertEqual(
+            {
+                (candidate.action_type, candidate.reason)
+                for candidate in ignored_candidates
+            },
+            {
+                (
+                    TaskActionType.SET_ONLINE,
+                    "平台库存为 0，商品不参与上架任务",
+                ),
+                (
+                    TaskActionType.UPDATE_PRICE,
+                    "平台库存为 0，商品不参与改价任务",
+                ),
+            },
+        )
+
+    def test_direct_set_offline_strategy_generates_set_offline_task(self) -> None:
+        generator = TaskGenerationService(
+            pricing_service=PricingService(ai_provider=NullAISuggestionProvider()),
+            listing_service=ListingService(),
+        )
+        direct_offline_rule = ListingRule(
+            rule_id="LIST-DIRECT-OFFLINE",
+            rule_name="online A direct offline",
+            variety_filter="online",
+            grade_filter="A",
+            platform_filter="测试平台",
+            stock_threshold=Decimal("0"),
+            listing_strategy=ListingStrategy.SET_OFFLINE,
+            active=True,
+            priority=1,
+        )
+
+        tasks = generator.generate(
+            [self.products[0]],
+            [],
+            [direct_offline_rule],
+            platform_name="测试平台",
+            platform_listing_states={
+                listing_identity_key("测试平台", "online", "A"): "online"
+            },
+        )
+
+        offline_tasks = [
+            task
+            for task in tasks
+            if task.action_type is TaskActionType.SET_OFFLINE
+        ]
+        self.assertEqual(len(offline_tasks), 1)
+        self.assertEqual(
+            offline_tasks[0].target_status,
+            "offline",
+        )
+
+        ignored = generator.generate(
+            [self.products[0]],
+            [],
+            [direct_offline_rule],
+            platform_name="测试平台",
+            platform_listing_states={
+                listing_identity_key("测试平台", "online", "A"): "offline"
+            },
+        )
+        self.assertEqual(ignored, [])
+
+    def test_set_online_reads_latest_platform_price_and_inventory(self) -> None:
+        generator = TaskGenerationService(
+            pricing_service=PricingService(
+                ai_provider=NullAISuggestionProvider()
+            ),
+            listing_service=ListingService(),
+        )
+        identity = listing_identity_key(
+            "蚂蚁花团供应商",
+            "online",
+            "A",
+        )
+
+        tasks = generator.generate(
+            self.products,
+            self.price_rules,
+            self.listing_rules,
+            platform_name="蚂蚁花团供应商",
+            platform_observations={
+                identity: (Decimal("18.00"), 7),
+            },
+        )
+
+        task = next(
+            item
+            for item in tasks
+            if item.internal_sku == "SKU-ONLINE"
+            and item.action_type is TaskActionType.SET_ONLINE
+        )
+        self.assertEqual(task.expected_old_price, Decimal("18.00"))
+        self.assertEqual(task.target_price, Decimal("18.00"))
+        self.assertEqual(task.target_inventory, 7)
+        self.assertEqual(
+            task.decision_trace["platform_observation"],
+            {
+                "observed_price": "18.00",
+                "observed_inventory": 7,
+            },
+        )
+
+    def test_new_product_without_snapshot_uses_base_cost_and_stock_for_set_online(self) -> None:
+        generator = TaskGenerationService(
+            pricing_service=PricingService(
+                ai_provider=NullAISuggestionProvider()
+            ),
+            listing_service=ListingService(),
+        )
+
+        tasks = generator.generate(
+            self.products,
+            self.price_rules,
+            self.listing_rules,
+            platform_name="蚂蚁花团供应商",
+            platform_observations={},
+        )
+
+        task = next(
+            item
+            for item in tasks
+            if item.internal_sku == "SKU-ONLINE"
+            and item.action_type is TaskActionType.SET_ONLINE
+        )
+        self.assertEqual(task.expected_old_price, Decimal("10"))
+        self.assertEqual(task.target_price, Decimal("15.00"))
+        self.assertEqual(task.target_inventory, 12)
+        self.assertEqual(
+            task.decision_trace["listing_target_default_source"],
+            "product_base_cost_and_stock",
+        )
 
     def test_listing_platform_filter_can_force_online_for_matching_platform(self) -> None:
         service = ListingService(now_provider=lambda: datetime(2026, 4, 28, 22, 30, 0))

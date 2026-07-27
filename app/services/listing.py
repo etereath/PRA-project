@@ -50,7 +50,10 @@ class ListingService:
         if not self._matches_platform_filter(rule.platform_filter, platform_name):
             return None
         threshold = int(rule.stock_threshold)
-        if rule.listing_strategy == ListingStrategy.PROHIBIT_ONLINE:
+        if rule.listing_strategy in {
+            ListingStrategy.PROHIBIT_ONLINE,
+            ListingStrategy.SET_OFFLINE,
+        }:
             return ListingAction.SET_OFFLINE
         if rule.listing_strategy == ListingStrategy.ALLOW_ONLINE:
             return ListingAction.SET_ONLINE
