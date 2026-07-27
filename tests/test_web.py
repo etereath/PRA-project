@@ -271,8 +271,9 @@ class WebTests(unittest.TestCase):
         deadline_match = re.search(r'id="required_by"[^>]*value="([^"]+)"', html)
         self.assertIsNotNone(deadline_match)
         deadline = datetime.fromisoformat(deadline_match.group(1))
-        self.assertGreater(deadline, datetime.now() + timedelta(minutes=28))
-        self.assertLess(deadline, datetime.now() + timedelta(minutes=31))
+        current_beijing = datetime.now(DISPLAY_TIMEZONE).replace(tzinfo=None)
+        self.assertGreater(deadline, current_beijing + timedelta(minutes=28))
+        self.assertLess(deadline, current_beijing + timedelta(minutes=31))
 
     def test_render_table_editor_contains_management_ui(self) -> None:
         html = render_table_editor_page(
