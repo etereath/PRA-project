@@ -240,6 +240,10 @@ UNKNOWN/RECONCILE 账本、历史写锁保留、外键完整性和失败事务�
 - `ALREADY_APPLIED`。
 - 全批次预检零写。
 
+任务13证据中的商品映射文件按原始部署字节保留，避免 Git 在
+Windows/Linux 间转换换行符后破坏 `mapping_source_version` 的 SHA-256
+绑定；CI 在两个系统上复算同一原始字节哈希。
+
 `.github/workflows/core-ci.yml` 已同时在 Windows 和 Linux 作业中加入上述证据复算。
 本地还通过：
 
