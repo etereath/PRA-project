@@ -528,6 +528,58 @@ class ShadowBotQueueTests(unittest.TestCase):
         self.assertEqual(events[0]["status"], "RETRY_PENDING")
         self.assertEqual(events[0]["error_code"], "WATCHDOG_INSPECTION_FAILED")
 
+    def test_queue_service_cycle_dispatches_pending_notifications(self) -> None:
+        importer = Mock()
+        importer.import_available.return_value = []
+        watchdog = Mock()
+        watchdog.inspect.return_value = []
+        notification_worker = Mock()
+        notification_worker.run_watchdog.return_value = []
+        delivered = Mock(
+            notification_id="NOTICE-1",
+            status="SENT",
+            channel="feishu",
+        )
+        notification_worker.run_once.side_effect = [delivered, None]
+
+        events = run_cycle(
+            importer,
+            watchdog,
+            notification_worker=notification_worker,
+        )
+
+        self.assertEqual(events[0]["status"], "NOTIFICATION_DELIVERED")
+        self.assertEqual(events[0]["notification_id"], "NOTICE-1")
+        self.assertEqual(notification_worker.run_once.call_count, 2)
+
+    def test_queue_service_cycle_renews_overdue_reviews_before_delivery(self) -> None:
+        importer = Mock()
+        importer.import_available.return_value = []
+        watchdog = Mock()
+        watchdog.inspect.return_value = []
+        review_service = Mock()
+        review_service.renew_overdue_manual_reviews.return_value = Mock(
+            scanned_review_tasks=2,
+            renewed_review_tasks=2,
+            notification_logs_created=2,
+            errors=[],
+        )
+        notification_worker = Mock()
+        notification_worker.run_watchdog.return_value = []
+        notification_worker.run_once.return_value = None
+
+        events = run_cycle(
+            importer,
+            watchdog,
+            notification_worker=notification_worker,
+            review_service=review_service,
+        )
+
+        self.assertEqual(events[0]["status"], "REVIEW_REMINDERS_RENEWED")
+        self.assertEqual(events[0]["renewed_review_tasks"], 2)
+        review_service.renew_overdue_manual_reviews.assert_called_once()
+        notification_worker.run_once.assert_called_once()
+
     def test_queue_services_cli_sets_queue_env_for_executor_runner(self) -> None:
         with patch.dict(os.environ, {}, clear=True), patch(
             "scripts.run_shadowbot_queue_services.ShadowBotQueuePaths"

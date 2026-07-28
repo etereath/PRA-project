@@ -183,8 +183,11 @@ class PackagingTests(unittest.TestCase):
             (app_dir / "package.py").write_text("def selector(name): return name\n", encoding="utf-8")
             (app_dir / "selectorsV2.xml").write_text("<selectors />\n", encoding="utf-8")
             records = sync(app_dir, check_only=False)
-            self.assertEqual([record["status"] for record in records[:5]], ["SYNCED"] * 5)
-            self.assertEqual(records[5]["status"], "CREATED")
+            self.assertEqual(
+                [record["status"] for record in records[:6]],
+                ["SYNCED"] * 6,
+            )
+            self.assertEqual(records[6]["status"], "CREATED")
             self.assertEqual(verify_shadowbot_deployment(app_dir), [])
 
             (app_dir / "package.py").unlink()

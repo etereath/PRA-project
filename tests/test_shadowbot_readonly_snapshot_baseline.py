@@ -33,7 +33,8 @@ def test_read_only_uses_the_verified_index_sequence_instead_of_find_all():
     function = _function_source("_enumerate_product_rows")
 
     assert "INDEXED_ENUMERATION_MAX_ROWS" in function
-    assert "ROW_INDEX_START + ROW_INDEX_STEP * (position - 1)" in function
+    assert "ROW_INDEX_START + row_index_step * (position - 1)" in function
+    assert "WAITING_ROW_INDEX_STEP" in function
     assert '"source": "INDEXED_SEQUENCE"' in function
     assert ".find_all(" not in function
 
@@ -59,6 +60,7 @@ def test_commit_paths_use_the_grade_aware_identity_assertion():
 
 def test_row_hydration_supports_full_page_read_and_targeted_pre_commit():
     function = _function_source("_multi_product_enumerate_rows")
+    snapshot_items = _function_source("_v5_snapshot_items")
 
     assert "targets=None" in function
     assert "row_cache=None" in function
@@ -66,6 +68,8 @@ def test_row_hydration_supports_full_page_read_and_targeted_pre_commit():
     assert "is_target = not targets or any(" in function
     assert '"non_target_rows_skipped"' in function
     assert '"row_cache_hits"' in function
+    assert 'online_rows[0].get("inventory") is not None' in snapshot_items
+    assert 'waiting_rows[0].get("inventory") is not None' in snapshot_items
 
 
 def test_read_only_reports_the_verified_performance_strategy():
@@ -121,3 +125,102 @@ def test_v4_contract_remains_available_but_read_only_evidence_is_optional():
         'if execution_mode == "READ_ONLY":', 1
     )[1].split('elif execution_mode == "RECONCILE":', 1)[0]
     assert "if capture_evidence:" in read_only_branch
+
+
+def test_task13_sync_reuses_indexed_reader_with_page_specific_price_offset():
+    source = _source()
+    selector = _function_source("_row_field_selector")
+    sync_flow = _function_source("_run_listing_sync_v5")
+    page_scan = _function_source("_v5_scan_page")
+    v5_identity_scan = _function_source("_enumerate_product_rows")
+
+    assert "WAITING_PRICE_INDEX_OFFSET = 8" in source
+    assert "WAITING_ROW_INDEX_STEP = 15" in source
+    assert "PRICE_INDEX_OFFSET = 9" in source
+    assert "WAITING_SELECTOR_TEMPLATES" in selector
+    assert "page_type=page_type" in page_scan
+    assert "_enumerate_product_rows" in page_scan
+    assert "window.find_all" not in v5_identity_scan
+    assert "WAITING_ROW_INDEX_STEP" in v5_identity_scan
+    assert "row_index_step" in v5_identity_scan
+    assert 'page_type="online"' in sync_flow
+    assert 'page_type="waiting"' in sync_flow
+    assert sync_flow.index('page_type="online"') < sync_flow.index(
+        "_select_waiting_product_list"
+    )
+    assert sync_flow.index("_select_waiting_product_list") < sync_flow.index(
+        'page_type="waiting"'
+    )
+    assert sync_flow.count("targets=None") == 2
+    assert 'timing_stage="sync_online_scan"' in sync_flow
+    assert 'timing_stage="sync_waiting_scan"' in sync_flow
+    assert '"listing_sync_total"' in sync_flow
+
+
+def test_task13_sync_requires_complete_or_empty_markers_and_never_calls_write_actions():
+    source = _source()
+    page_scan = _function_source("_v5_scan_page")
+    sync_flow = _function_source("_run_listing_sync_v5")
+
+    assert "_product_list_end_marker_visible" in page_scan
+    assert "_product_list_empty_marker_visible" in page_scan
+    assert '"termination_reason": "EMPTY_LIST_MARKER"' in page_scan
+    assert page_scan.index("_product_list_empty_marker_visible") < page_scan.index(
+        "first_name = _find_element"
+    )
+    assert "END_MARKER_NOT_VERIFIED" in page_scan
+    assert "V5_KEYBOARD_LOAD_WAIT_SECONDS = 0.1" in source
+    assert "V5_KEYBOARD_END_LOAD_WAIT_SECONDS = 0.8" in source
+    assert "SCROLL_CONTROL_UNVERIFIED" not in sync_flow
+    assert "first_name.click()" in page_scan
+    assert '"{END}"' in page_scan
+    assert '"{HOME}"' in page_scan
+    assert "initial_rows" not in page_scan
+    assert "expected_top_identity" not in page_scan
+    assert page_scan.index("first_name.click()") < page_scan.index('"{END}"')
+    assert page_scan.index('"{END}"') < page_scan.index('"{HOME}"')
+    assert page_scan.index('"{HOME}"') < page_scan.index(
+        "_enumerate_product_rows("
+    )
+    assert page_scan.count("_enumerate_product_rows(") == 1
+    assert "preload_rows" not in page_scan
+    assert "current_rows = _enumerate_product_rows" not in page_scan
+    assert "LIST_TOP_NOT_VERIFIED" in page_scan
+    assert "FULL_LIST_NOT_MATERIALIZED_AFTER_HOME" in page_scan
+    assert "missing_after_home" not in page_scan
+    assert "_advance_product_list" not in page_scan
+    assert "_v5_reset_page_to_top" not in sync_flow
+    assert '"online_end_marker_verified": True' in sync_flow
+    assert '"waiting_end_marker_verified": True' in sync_flow
+    for forbidden in (
+        "_confirm_price_dialog",
+        "_fill_target_price",
+        "_commit_v4",
+        "ACTION_CLICKED",
+    ):
+        assert forbidden not in sync_flow
+
+
+def test_all_task13_listing_flows_share_end_load_then_home_full_scan():
+    page_scan = _function_source("_v5_scan_page")
+    sync_flow = _function_source("_run_listing_sync_v5")
+    online_flow = _function_source("_run_set_online_v5")
+    offline_flow = _function_source("_run_set_offline_v5")
+    post_failure_flow = _function_source("_v5_post_failure_snapshot")
+
+    assert "no row enumeration is allowed before HOME" in page_scan
+    assert page_scan.index('"{END}"') < page_scan.index(
+        "sleep(V5_KEYBOARD_END_LOAD_WAIT_SECONDS)"
+    )
+    assert page_scan.index(
+        "sleep(V5_KEYBOARD_END_LOAD_WAIT_SECONDS)"
+    ) < page_scan.index('"{HOME}"')
+    assert page_scan.index('"{HOME}"') < page_scan.index(
+        "_enumerate_product_rows("
+    )
+    assert sync_flow.count("_v5_scan_page(") == 2
+    assert online_flow.count("_v5_scan_page(") == 3
+    assert offline_flow.count("_v5_scan_page(") == 2
+    assert post_failure_flow.count("_v5_scan_page(") == 2
+    for flow in (sync_flow, online_flow, offline_flow, post_failure_flow):
+        assert '"{END}"' not in flow

@@ -4,7 +4,8 @@ import sqlite3
 import tempfile
 import unittest
 import json
-from datetime import date, datetime, timedelta
+from contextlib import closing
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,6 +18,7 @@ from app.enums import (
 )
 from app.models import NotificationLog, Task
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION
 from app.services.runtime import (
     FeishuWebhookNotificationSender,
     MockNotificationSender,
@@ -68,7 +70,10 @@ class RuntimePersistenceTests(unittest.TestCase):
 
     def test_schema_initializes_version_and_partial_unique_index(self) -> None:
         self.task_service.init_schema()
-        self.assertEqual(self.repository.schema_versions(), list(range(1, 13)))
+        self.assertEqual(
+            self.repository.schema_versions(),
+            list(range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1)),
+        )
         connection = sqlite3.connect(self.db_path)
         try:
             indexes = connection.execute("PRAGMA index_list(tasks)").fetchall()
@@ -108,7 +113,10 @@ class RuntimePersistenceTests(unittest.TestCase):
 
         repository = SQLiteRuntimeRepository(legacy_path)
         repository.init_schema()
-        self.assertEqual(repository.schema_versions(), list(range(1, 13)))
+        self.assertEqual(
+            repository.schema_versions(),
+            list(range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1)),
+        )
         connection = sqlite3.connect(legacy_path)
         try:
             token_table = connection.execute(
@@ -141,6 +149,37 @@ class RuntimePersistenceTests(unittest.TestCase):
         )
         self.assertEqual(self.task_service.create_tasks([duplicate]), 1)
         self.assertEqual(len(self.task_service.list_tasks()), 2)
+
+    def test_failed_task_does_not_block_regeneration_and_legacy_index_is_repaired(self) -> None:
+        failed = _runtime_task("TASK-FAILED", status=TaskStatus.FAILED)
+        regenerated = _runtime_task("TASK-REGENERATED")
+        regenerated.dedupe_key = failed.dedupe_key
+        self.assertEqual(self.task_service.create_tasks([failed]), 1)
+
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
+            connection.execute("DROP INDEX ux_tasks_open_dedupe")
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX ux_tasks_open_dedupe
+                ON tasks(dedupe_key)
+                WHERE dedupe_key <> ''
+                  AND task_status NOT IN ('success', 'skipped', 'cancelled', 'expired')
+                """
+            )
+        self.assertEqual(self.task_service.create_tasks([regenerated]), 0)
+
+        self.task_service.init_schema()
+
+        self.assertEqual(self.task_service.create_tasks([regenerated]), 1)
+        self.assertEqual(
+            self.repository.get_open_task_by_dedupe_key(failed.dedupe_key).task_id,
+            "TASK-REGENERATED",
+        )
+        with closing(sqlite3.connect(self.db_path)) as connection:
+            index_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE name = 'ux_tasks_open_dedupe'"
+            ).fetchone()[0]
+        self.assertIn("'failed'", index_sql)
 
     def test_status_transition_records_history_and_rejects_invalid_transition(self) -> None:
         self.task_service.create_tasks([_runtime_task("TASK-1")])
@@ -828,7 +867,70 @@ class RuntimePersistenceTests(unittest.TestCase):
         self.assertEqual(summary.expired_review_tasks, 1)
         self.assertEqual(summary.expired_source_tasks, 0)
         self.assertEqual(summary.skipped_source_tasks, 1)
-        self.assertEqual(self.task_service.get_task(source.task_id).task_status, TaskStatus.PENDING)
+        self.assertEqual(
+            self.task_service.get_task(source.task_id).task_status,
+            TaskStatus.PENDING,
+        )
+
+    def test_overdue_manual_review_is_renewed_and_re_notified(self) -> None:
+        now = datetime(2026, 7, 26, 0, 0, tzinfo=UTC)
+        source = _runtime_task(
+            "TASK-REVIEW-REMINDER",
+            status=TaskStatus.MANUAL_REVIEW,
+            required_by=now - timedelta(minutes=1),
+        )
+        self.task_service.create_tasks([source])
+        review_service = ReviewTaskService(
+            self.repository,
+            runtime_task_service=self.task_service,
+        )
+        with patch.dict(
+            "os.environ",
+            {
+                "DEFAULT_NOTIFICATION_CHANNEL": "mock",
+                "REVIEW_TOKEN_SECRET": "test-secret",
+            },
+            clear=False,
+        ):
+            review_service.create_from_tasks([source])
+            review = review_service.list_review_tasks(
+                status=ReviewTaskStatus.PENDING
+            )[0]
+            token = ReviewTokenService(self.repository).create_token(
+                review.review_task_id
+            )
+            summary = review_service.renew_overdue_manual_reviews(now=now)
+            repeated = review_service.renew_overdue_manual_reviews(now=now)
+
+        renewed = review_service.get_review_task(review.review_task_id)
+        self.assertIsNotNone(renewed)
+        self.assertEqual(
+            renewed.required_by,
+            now + timedelta(minutes=30),
+        )
+        self.assertEqual(
+            self.task_service.get_task(source.task_id).task_status,
+            TaskStatus.MANUAL_REVIEW,
+        )
+        self.assertEqual(summary.renewed_review_tasks, 1)
+        self.assertEqual(summary.notification_logs_created, 1)
+        self.assertEqual(repeated.renewed_review_tasks, 0)
+        self.assertIsNotNone(
+            self.repository.get_review_token(
+                token.review_token.token_id
+            ).revoked_at
+        )
+        outbox = self.repository.list_notification_outbox(
+            related_review_task_id=review.review_task_id
+        )
+        self.assertEqual(
+            [row.status for row in outbox],
+            ["CANCELLED", "PENDING"],
+        )
+        self.assertIn(
+            "复核截止：2026-07-26 08:30（北京时间）",
+            outbox[-1].payload["message"],
+        )
 
     def test_review_token_create_uses_hmac_hash_and_does_not_store_raw_token(self) -> None:
         source = _runtime_task("TASK-1")
@@ -853,6 +955,142 @@ class RuntimePersistenceTests(unittest.TestCase):
         self.assertEqual(row[0], result.review_token.token_hash)
         self.assertNotEqual(row[0], result.raw_token)
         self.assertTrue(result.mobile_review_url.startswith("/mobile/review/"))
+
+    def test_execution_failure_review_only_allows_retry_or_cancel(self) -> None:
+        source = _runtime_task(
+            "TASK-EXECUTION-REVIEW",
+            status=TaskStatus.MANUAL_REVIEW,
+            action_type=TaskActionType.UPDATE_PRICE,
+        )
+        self.task_service.create_tasks([source])
+        review_service = ReviewTaskService(
+            self.repository,
+            runtime_task_service=self.task_service,
+        )
+        review_service.create_from_tasks([source])
+        review = review_service.list_review_tasks(
+            status=ReviewTaskStatus.PENDING
+        )[0]
+
+        with patch.dict(
+            "os.environ",
+            {"REVIEW_TOKEN_SECRET": "test-secret"},
+            clear=False,
+        ):
+            token = ReviewTokenService(self.repository).create_token(
+                review.review_task_id
+            )
+            rejected = ReviewTokenService(self.repository).validate_token(
+                review.review_task_id,
+                token.raw_token,
+                ReviewTaskStatus.REJECTED.value,
+            )
+
+        self.assertEqual(
+            token.review_token.allowed_actions,
+            [
+                ReviewTaskStatus.APPROVED.value,
+                ReviewTaskStatus.CANCELLED.value,
+            ],
+        )
+        self.assertFalse(rejected.is_valid)
+        with self.assertRaisesRegex(
+            Exception,
+            "重试任务.*取消任务",
+        ):
+            review_service.resolve_review_task(
+                review_task_id=review.review_task_id,
+                status=ReviewTaskStatus.REJECTED,
+                actor="operator",
+                source_task_status=TaskStatus.SKIPPED,
+            )
+
+        retry_started_at = datetime.now()
+        resolved = review_service.resolve_review_task(
+            review_task_id=review.review_task_id,
+            status=ReviewTaskStatus.APPROVED,
+            actor="operator",
+            source_task_status=TaskStatus.PENDING,
+        )
+        retry_finished_at = datetime.now()
+        self.assertEqual(resolved.resolution_payload["decision"], "retry_task")
+        retried = self.task_service.get_task(source.task_id)
+        self.assertEqual(retried.task_status, TaskStatus.PENDING)
+        self.assertGreaterEqual(
+            retried.required_by,
+            retry_started_at + timedelta(minutes=30),
+        )
+        self.assertLessEqual(
+            retried.required_by,
+            retry_finished_at + timedelta(minutes=30),
+        )
+        self.assertEqual(retried.expires_at, retried.required_by)
+
+    def test_execution_failure_review_is_created_and_resolved_per_task_group(
+        self,
+    ) -> None:
+        first = _runtime_task(
+            "TASK-GROUP-RETRY-A",
+            status=TaskStatus.MANUAL_REVIEW,
+            action_type=TaskActionType.SET_ONLINE,
+        )
+        second = _runtime_task(
+            "TASK-GROUP-RETRY-B",
+            status=TaskStatus.MANUAL_REVIEW,
+            action_type=TaskActionType.SET_ONLINE,
+        )
+        first.decision_trace["task_group_id"] = "RULE-GROUP-REVIEW-001"
+        second.decision_trace["task_group_id"] = "RULE-GROUP-REVIEW-001"
+        self.task_service.create_tasks([first, second])
+        review_service = ReviewTaskService(
+            self.repository,
+            runtime_task_service=self.task_service,
+        )
+
+        summary = review_service.create_from_tasks([first, second])
+
+        self.assertEqual(summary.inserted_review_tasks_count, 1)
+        review = summary.review_tasks[0]
+        self.assertEqual(review.scope_type, "task_group")
+        self.assertEqual(review.scope_key, "RULE-GROUP-REVIEW-001")
+        self.assertEqual(
+            review.review_payload["affected_task_ids"],
+            [first.task_id, second.task_id],
+        )
+        self.assertEqual(review.review_payload["affected_task_count"], 2)
+
+        retry_started_at = datetime.now()
+        resolved = review_service.resolve_review_task(
+            review_task_id=review.review_task_id,
+            status=ReviewTaskStatus.APPROVED,
+            actor="operator",
+        )
+        retry_finished_at = datetime.now()
+
+        self.assertEqual(resolved.resolution_payload["decision"], "retry_task")
+        self.assertEqual(resolved.resolution_payload["affected_task_count"], 2)
+        retry_deadlines = set()
+        for task in (first, second):
+            retried = self.task_service.get_task(task.task_id)
+            self.assertEqual(retried.task_status, TaskStatus.PENDING)
+            self.assertGreaterEqual(
+                retried.required_by,
+                retry_started_at + timedelta(minutes=30),
+            )
+            self.assertLessEqual(
+                retried.required_by,
+                retry_finished_at + timedelta(minutes=30),
+            )
+            self.assertEqual(retried.expires_at, retried.required_by)
+            retry_deadlines.add(retried.required_by)
+            history = self.task_service.list_status_history(task.task_id)
+            self.assertEqual(history[-1].metadata["task_group_id"], "RULE-GROUP-REVIEW-001")
+            self.assertEqual(history[-1].metadata["business_decision"], "retry_task")
+            self.assertEqual(
+                history[-1].metadata["retry_required_by"],
+                retried.required_by.isoformat(),
+            )
+        self.assertEqual(len(retry_deadlines), 1)
 
     def test_review_token_requires_secret_and_pending_review_task(self) -> None:
         source = _runtime_task("TASK-1")
@@ -930,6 +1168,34 @@ class RuntimePersistenceTests(unittest.TestCase):
         self.assertFalse(wrong_review.is_valid)
         self.assertEqual(result.mobile_review_url.count("//"), 1)
         self.assertTrue(result.mobile_review_url.startswith("https://example.test/app/mobile/review/"))
+
+    def test_review_token_validation_supports_timezone_aware_expiry(self) -> None:
+        future = datetime.now(UTC) + timedelta(hours=2)
+        source = _runtime_task("TASK-AWARE-TOKEN", required_by=future)
+        self.task_service.create_tasks([source])
+        review_service = ReviewTaskService(
+            self.repository,
+            runtime_task_service=self.task_service,
+        )
+        review_service.create_from_tasks([source])
+        review = review_service.list_review_tasks(
+            status=ReviewTaskStatus.PENDING
+        )[0]
+        token_service = ReviewTokenService(self.repository)
+
+        with patch.dict(
+            "os.environ",
+            {"REVIEW_TOKEN_SECRET": "test-secret"},
+            clear=False,
+        ):
+            result = token_service.create_token(review.review_task_id)
+            validation = token_service.validate_token(
+                review.review_task_id,
+                result.raw_token,
+                "approved",
+            )
+
+        self.assertTrue(validation.is_valid)
 
     def test_review_token_usage_and_revoke_invalidate_token(self) -> None:
         source = _runtime_task("TASK-1")

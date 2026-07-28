@@ -1,0 +1,13 @@
+{
+  "accepted_at": "2026-07-27T10:35:15.146704+00:00",
+  "ack_state": "WRITTEN",
+  "ack_updated_at": "2026-07-27T10:35:15.278929+00:00",
+  "batch_id": "BATCH-T13-UNKNOWN-NOT-APPLIED-20260727-01",
+  "execution_attempt_id": "ATTEMPT-T13-UNKNOWN-NOT-APPLIED-20260727-01",
+  "instruction_hash": "sha256:50b47e16972a80c9d864323e6c349e9770862242a4753f1aac480f132f613896",
+  "last_projection_error": "",
+  "manifest_sha256": "sha256:b508bbb4c2c8458173b093d37aac33ef6c99421190b2413ccc117529d5654c7b",
+  "result_id": "RESULT-38cb43eadad7a6c14b48c29c",
+  "result_sha256": "fa288f79f0548327667fe806de1f2c5f0f91e0cfc86d7833d330bf03a8d62666",
+  "source_result_path": "<REDACTED_PATH>/ATTEMPT-T13-UNKNOWN-NOT-APPLIED-20260727-01.result.json"
+}

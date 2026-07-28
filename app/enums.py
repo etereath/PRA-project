@@ -29,6 +29,7 @@ class ListingAction(str, Enum):
 class ListingStrategy(str, Enum):
     ALLOW_ONLINE = "allow_online"
     PROHIBIT_ONLINE = "prohibit_online"
+    SET_OFFLINE = "set_offline"
     STOCK_BELOW_OFFLINE = "stock_below_offline"
     STOCK_ABOVE_ONLINE = "stock_above_online"
 

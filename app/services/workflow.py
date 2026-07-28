@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -10,11 +10,15 @@ from uuid import uuid4
 from app.enums import ReviewTaskStatus, TaskActionType, TaskStatus
 from app.exceptions import MobileReviewErrorCode, MobileReviewTransactionError, ValidationError
 from app.listing_identity import listing_identity_key
-from app.listing_status_policy import is_price_task_listing
+from app.listing_status_policy import (
+    has_current_platform_stock,
+    is_price_task_listing,
+)
 from app.models import (
     ColdStorageStatus,
     ExecutionLog,
     HarvestForecast,
+    IgnoredTaskCandidate,
     NotificationLog,
     PackingCapacityPlan,
     PriceForecast,
@@ -40,6 +44,7 @@ from app.repositories.workbook_repository import (
     load_tasks,
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.review_policy import allowed_review_statuses
 from app.services.ai import MockAISuggestionProvider, NullAISuggestionProvider
 from app.services.execution import ExecutionSimulationService
 from app.services.listing import ListingService
@@ -54,6 +59,8 @@ from app.services.runtime import (
     RuntimeTaskService,
 )
 from app.services.task_generation import TaskGenerationService
+from app.shadowbot_contract_primitives import canonical_positive_price
+from app.shadowbot_listing_contract import canonical_nonnegative_inventory
 
 
 @dataclass(slots=True)
@@ -100,6 +107,7 @@ class TaskGenerationSummary:
     tasks: list[Task]
     output_path: Path | None
     output_written: bool = False
+    ignored_candidates: list[IgnoredTaskCandidate] = field(default_factory=list)
 
     @property
     def task_counts(self) -> dict[str, int]:
@@ -237,6 +245,13 @@ def persist_task_generation_summary(
     repository = SQLiteRuntimeRepository(db_path)
     runtime_task_service = RuntimeTaskService(repository)
     runtime_task_service.init_schema()
+    if summary.tasks:
+        generation_time = max(task.created_at for task in summary.tasks)
+        if generation_time.tzinfo is not None:
+            generation_time = generation_time.astimezone(
+                timezone(timedelta(hours=8))
+            )
+        runtime_task_service.expire_overdue_pending_tasks(now=generation_time)
     inserted_task_rows = runtime_task_service.create_tasks_returning_inserted(
         summary.tasks,
         trade_date=trade_date,
@@ -336,10 +351,14 @@ def get_mobile_review_detail(db_path: Path, review_task_id: str, raw_token: str)
         if validation.review_task.source_task_id
         else None
     )
+    policy_actions = {
+        status.value
+        for status in allowed_review_statuses(validation.review_task, source_task)
+    }
     allowed_actions = [
         action
         for action in review_token.allowed_actions
-        if action in {"approved", "rejected", "adjusted", "cancelled"}
+        if action in policy_actions
     ]
     return MobileReviewDetail(
         review_task=validation.review_task,
@@ -477,7 +496,11 @@ def validate_sources(inputs: WorkflowInputs) -> ValidationSummary:
     )
 
 
-def generate_tasks_from_sources(inputs: WorkflowInputs) -> TaskGenerationSummary:
+def generate_tasks_from_sources(
+    inputs: WorkflowInputs,
+    *,
+    listing_task_overrides: dict[tuple[str, str, str], tuple[object, object]] | None = None,
+) -> TaskGenerationSummary:
     products = load_products(inputs.products_path)
     price_rules = load_price_rules(inputs.price_rules_path)
     listing_rules = load_listing_rules(inputs.listing_rules_path)
@@ -494,6 +517,15 @@ def generate_tasks_from_sources(inputs: WorkflowInputs) -> TaskGenerationSummary
     generator = TaskGenerationService(pricing_service=pricing_service, listing_service=listing_service)
     resolved_platform_name = _resolve_runtime_platform_name(inputs.runtime_db_path, inputs.platform_name)
     old_prices = _load_current_platform_prices(inputs.runtime_db_path, resolved_platform_name)
+    platform_observations = _load_latest_platform_observations(
+        inputs.runtime_db_path,
+        resolved_platform_name,
+    )
+    platform_listing_states = _load_platform_listing_states(
+        inputs.runtime_db_path,
+        resolved_platform_name,
+    )
+    ignored_candidates: list[IgnoredTaskCandidate] = []
     tasks = generator.generate(
         products=products,
         price_rules=price_rules,
@@ -507,7 +539,12 @@ def generate_tasks_from_sources(inputs: WorkflowInputs) -> TaskGenerationSummary
         now=inputs.now,
         inventory_strategy=inputs.inventory_strategy,
         old_prices=old_prices,
+        platform_observations=platform_observations,
+        platform_listing_states=platform_listing_states,
+        ignored_candidates=ignored_candidates,
     )
+    if listing_task_overrides is not None:
+        apply_listing_task_overrides(tasks, listing_task_overrides)
 
     output_written = inputs.output_path is not None
     if output_written:
@@ -526,6 +563,7 @@ def generate_tasks_from_sources(inputs: WorkflowInputs) -> TaskGenerationSummary
         tasks=tasks,
         output_path=inputs.output_path,
         output_written=output_written,
+        ignored_candidates=ignored_candidates,
     )
 
 
@@ -536,6 +574,7 @@ def generate_tasks_from_selected_rule(
     rule_id: str,
     task_group_id: str | None = None,
     required_by: datetime | None = None,
+    listing_task_overrides: dict[tuple[str, str, str], tuple[object, object]] | None = None,
 ) -> TaskGenerationSummary:
     normalized_type = str(rule_type or "").strip().lower()
     selected_id = str(rule_id or "").strip()
@@ -561,14 +600,32 @@ def generate_tasks_from_selected_rule(
         listing_service=ListingService(),
     )
     tasks: list[Task] = []
+    ignored_candidates: list[IgnoredTaskCandidate] = []
     for platform_name in platform_names:
         old_prices = _load_current_platform_prices(inputs.runtime_db_path, platform_name)
+        platform_observations = _load_latest_platform_observations(
+            inputs.runtime_db_path,
+            platform_name,
+        )
+        platform_listing_states = _load_platform_listing_states(
+            inputs.runtime_db_path,
+            platform_name,
+        )
+        platform_ignored_candidates: list[IgnoredTaskCandidate] = []
         generated = generator.generate(
             products=products,
             price_rules=price_rules,
             listing_rules=listing_rules,
             platform_name=platform_name,
             old_prices=old_prices,
+            platform_observations=platform_observations,
+            platform_listing_states=platform_listing_states,
+            ignored_candidates=platform_ignored_candidates,
+        )
+        ignored_candidates.extend(
+            candidate
+            for candidate in platform_ignored_candidates
+            if selected_id in candidate.matched_rule_ids
         )
         if normalized_type == "price":
             selected_tasks = [
@@ -596,6 +653,9 @@ def generate_tasks_from_selected_rule(
             task.required_by = resolved_required_by
         tasks.extend(selected_tasks)
 
+    if listing_task_overrides is not None:
+        apply_listing_task_overrides(tasks, listing_task_overrides)
+
     output_written = inputs.output_path is not None
     if output_written:
         export_tasks(inputs.output_path, tasks)
@@ -608,7 +668,60 @@ def generate_tasks_from_selected_rule(
         tasks=tasks,
         output_path=inputs.output_path,
         output_written=output_written,
+        ignored_candidates=ignored_candidates,
     )
+
+
+def listing_task_override_key(task: Task) -> tuple[str, str, str]:
+    return (
+        str(task.platform_name or ""),
+        str(task.internal_sku or ""),
+        task.action_type.value,
+    )
+
+
+def apply_listing_task_overrides(
+    tasks: list[Task],
+    overrides: dict[tuple[str, str, str], tuple[object, object]],
+) -> None:
+    online_tasks = {
+        listing_task_override_key(task): task
+        for task in tasks
+        if task.action_type is TaskActionType.SET_ONLINE
+    }
+    missing_keys = [key for key in online_tasks if key not in overrides]
+    if missing_keys:
+        task = online_tasks[missing_keys[0]]
+        raise ValidationError(
+            f"{task.platform_name} / {task.internal_sku} 的上架任务必须输入目标价格和目标库存"
+        )
+    unknown_keys = [key for key in overrides if key not in online_tasks]
+    if unknown_keys:
+        raise ValidationError("上下架任务目标输入已过期，请重新预览后再确认生成")
+
+    for key, task in online_tasks.items():
+        raw_price, raw_inventory = overrides[key]
+        try:
+            price_text = canonical_positive_price(raw_price)
+            target_inventory = canonical_nonnegative_inventory(raw_inventory)
+        except ValueError as exc:
+            raise ValidationError(
+                f"{task.platform_name} / {task.internal_sku} 的目标价格或目标库存格式不正确：{exc}"
+            ) from exc
+        target_price = Decimal(price_text)
+        task.target_price = target_price
+        task.target_inventory = target_inventory
+        task.decision_trace = dict(task.decision_trace) | {
+            "listing_target_input": {
+                "source": "operator_confirm_form",
+                "default_source": str(
+                    task.decision_trace.get("listing_target_default_source")
+                    or "platform_snapshot"
+                ),
+                "target_price": format(target_price, ".2f"),
+                "target_inventory": target_inventory,
+            }
+        }
 
 
 def preview_tasks_from_selected_rule(
@@ -650,43 +763,52 @@ def _resolve_selected_rule_platforms(
         if inputs.runtime_db_path is not None:
             repository = SQLiteRuntimeRepository(inputs.runtime_db_path)
             repository.init_schema()
-            matching_online_platforms = list(dict.fromkeys(
+            matching_platforms = list(dict.fromkeys(
                 status.platform_name
                 for status in repository.list_listing_statuses()
-                if is_price_task_listing(status)
+                if (not require_online_price or is_price_task_listing(status))
                 and platform_names_match(rule_platform, status.platform_name)
             ))
-            if matching_online_platforms:
+            if matching_platforms:
                 canonical_name = canonical_platform_name(rule_platform)
-                if canonical_name in matching_online_platforms:
+                if canonical_name in matching_platforms:
                     return [canonical_name]
-                return [matching_online_platforms[0]]
+                return [matching_platforms[0]]
         return [canonical_platform_name(rule_platform)]
     candidates = list(dict.fromkeys(
         platform
         for platform in (*inputs.platform_names, inputs.platform_name)
         if platform and platform != "default_platform"
     ))
-    if require_online_price and inputs.runtime_db_path is not None:
+    if inputs.runtime_db_path is not None:
         repository = SQLiteRuntimeRepository(inputs.runtime_db_path)
         repository.init_schema()
         listing_statuses = repository.list_listing_statuses()
-        online_platforms = list(dict.fromkeys(
+        snapshot_platforms = list(dict.fromkeys(
             status.platform_name
             for status in listing_statuses
-            if is_price_task_listing(status)
+            if not require_online_price or is_price_task_listing(status)
         ))
-        if not online_platforms and listing_statuses:
-            online_platforms = list(dict.fromkeys(status.platform_name for status in listing_statuses))
+        if require_online_price and not snapshot_platforms and listing_statuses:
+            snapshot_platforms = list(dict.fromkeys(
+                status.platform_name for status in listing_statuses
+            ))
         resolved_candidates: list[str] = []
         resolved_keys: set[str] = set()
         for candidate in candidates:
             matching_platform = next(
-                (platform for platform in online_platforms if platform_names_match(candidate, platform)),
+                (
+                    platform
+                    for platform in snapshot_platforms
+                    if platform_names_match(candidate, platform)
+                ),
                 None,
             )
-            if matching_platform is None:
+            if matching_platform is None and require_online_price:
                 continue
+            matching_platform = matching_platform or canonical_platform_name(
+                candidate
+            )
             identity = platform_identity_key(matching_platform)
             if identity not in resolved_keys:
                 resolved_keys.add(identity)
@@ -712,6 +834,75 @@ def _load_current_platform_prices(
         for status in repository.list_listing_statuses()
         if is_price_task_listing(status) and platform_names_match(platform_name, status.platform_name)
     }
+
+
+def _load_latest_platform_observations(
+    runtime_db_path: Path | None,
+    platform_name: str,
+) -> dict[tuple[str, str, str], tuple[Decimal, int]] | None:
+    if runtime_db_path is None:
+        return None
+    repository = SQLiteRuntimeRepository(runtime_db_path)
+    repository.init_schema()
+    observations: dict[
+        tuple[str, str, str],
+        tuple[Decimal, int],
+    ] = {}
+    for status in repository.list_listing_statuses():
+        if not platform_names_match(platform_name, status.platform_name):
+            continue
+        if (
+            status.price_observed_at is None
+            or status.inventory_observed_at is None
+            or not status.price_source_attempt_id
+            or status.price_source_attempt_id
+            != status.inventory_source_attempt_id
+        ):
+            continue
+        if (
+            status.last_listing_change_at is not None
+            and (
+                status.price_observed_at < status.last_listing_change_at
+                or status.inventory_observed_at
+                < status.last_listing_change_at
+            )
+        ):
+            continue
+        observations[
+            listing_identity_key(
+                platform_name,
+                status.variety,
+                status.grade,
+            )
+        ] = (status.current_price, status.platform_stock_qty)
+    return observations
+
+
+def _load_platform_listing_states(
+    runtime_db_path: Path | None,
+    platform_name: str,
+) -> dict[tuple[str, str, str], str] | None:
+    if runtime_db_path is None:
+        return None
+    repository = SQLiteRuntimeRepository(runtime_db_path)
+    repository.init_schema()
+    states: dict[tuple[str, str, str], str] = {}
+    for status in repository.list_listing_statuses():
+        if not platform_names_match(platform_name, status.platform_name):
+            continue
+        normalized_status = str(status.online_status or "").strip().lower()
+        if not has_current_platform_stock(status):
+            normalized_status = "unavailable"
+        elif normalized_status not in {"online", "offline"}:
+            normalized_status = "unknown"
+        states[
+            listing_identity_key(
+                platform_name,
+                status.variety,
+                status.grade,
+            )
+        ] = normalized_status
+    return states
 
 
 def _resolve_runtime_platform_name(runtime_db_path: Path | None, platform_name: str) -> str:

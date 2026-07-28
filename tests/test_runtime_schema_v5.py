@@ -322,7 +322,10 @@ class RuntimeSchemaV5Tests(unittest.TestCase):
         repository = SQLiteRuntimeRepository(self.db_path)
         repository.init_schema()
 
-        self.assertEqual(repository.schema_versions(), list(range(1, 13)))
+        self.assertEqual(
+            repository.schema_versions(),
+            list(range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1)),
+        )
         health = repository.check_schema_health()
         self.assertTrue(health.ok, health.summary)
         self.assertEqual(health.actual_version, LATEST_RUNTIME_SCHEMA_VERSION)
@@ -545,7 +548,10 @@ class RuntimeSchemaV5Tests(unittest.TestCase):
                         self.assertIn("shadowbot_operations", shadowbot_tables)
                         self.assertIn("shadowbot_execution_attempts", shadowbot_tables)
                 repository.init_schema()
-                self.assertEqual(repository.schema_versions(), list(range(1, 13)))
+                self.assertEqual(
+                    repository.schema_versions(),
+                    list(range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1)),
+                )
                 health = repository.check_schema_health()
                 self.assertTrue(health.ok, health.summary)
                 with sqlite3.connect(path) as connection:
@@ -585,7 +591,10 @@ class RuntimeSchemaV5Tests(unittest.TestCase):
                             )
                         )
                 repository.init_schema()
-                self.assertEqual(repository.schema_versions(), list(range(1, 13)))
+                self.assertEqual(
+                    repository.schema_versions(),
+                    list(range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1)),
+                )
                 self.assertTrue(repository.check_schema_health().ok)
                 with sqlite3.connect(path) as connection:
                     self.assertEqual(
@@ -623,7 +632,10 @@ class RuntimeSchemaV5Tests(unittest.TestCase):
             )
 
         repository.init_schema()
-        self.assertEqual(repository.schema_versions(), list(range(1, 13)))
+        self.assertEqual(
+            repository.schema_versions(),
+            list(range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1)),
+        )
         health = repository.check_schema_health()
         self.assertTrue(health.ok, health.summary)
         with sqlite3.connect(path) as connection:

@@ -235,6 +235,17 @@ def common_styles() -> str:
     input[type="text"], input[type="password"], input[type="number"], input[type="datetime-local"], select {
       min-height: 50px;
     }
+    .task-target-number {
+      width: 120px;
+      min-width: 120px;
+      appearance: textfield;
+      -moz-appearance: textfield;
+    }
+    .task-target-number::-webkit-inner-spin-button,
+    .task-target-number::-webkit-outer-spin-button {
+      margin: 0;
+      -webkit-appearance: none;
+    }
     .modal-card {
       width: min(520px, calc(100% - 32px));
       border: 1px solid var(--line);

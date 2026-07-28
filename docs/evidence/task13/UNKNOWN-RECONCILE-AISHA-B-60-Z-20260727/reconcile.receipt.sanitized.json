@@ -1,0 +1,13 @@
+{
+  "accepted_at": "2026-07-26T21:07:47.840055+00:00",
+  "ack_state": "WRITTEN",
+  "ack_updated_at": "2026-07-26T21:07:47.937483+00:00",
+  "batch_id": "BATCH-T13-AUTO-RECONCILE-CONTROLLED-UNKNOWN-20260727-03",
+  "execution_attempt_id": "RECONCILE-ab020713eb4633c24441f141",
+  "instruction_hash": "sha256:57b9a70ca8e2e4dee7d04f7e75b1d288ad6e0031cf18583f9b21c019ec9b85f0",
+  "last_projection_error": "",
+  "manifest_sha256": "sha256:062880402e1c352e7e2465ab5234bb32405a0f1b85f262435dd8c8adb1f6bb09",
+  "result_id": "RESULT-3e84f03182960053ceb93250",
+  "result_sha256": "526d2e140b5be424b114196ac3d3e00152b78c22bcb17ffdc0abe9a327679aa7",
+  "source_result_path": "<REDACTED_PATH>/RECONCILE-ab020713eb4633c24441f141.result.json"
+}

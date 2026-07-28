@@ -1,0 +1,20 @@
+{
+  "action_type": "sync_status",
+  "applet_uri": "weixin://launchapplet/?app_id=wxdc8ef8e770254c0e",
+  "batch_id": "BATCH-T13-POST-OFFLINE-SYNC-20260726-01",
+  "capture_evidence": false,
+  "contract_version": 5,
+  "created_at": "2026-07-25T20:39:42.159392+00:00",
+  "execution_attempt_id": "ATTEMPT-T13-POST-OFFLINE-SYNC-20260726-01",
+  "execution_mode": "READ_ONLY",
+  "execution_profile": "production",
+  "expires_at": "2026-07-25T21:09:42.159392+00:00",
+  "instruction_hash": "sha256:de5000a341270a507536a04818fb5e68a58e4ecfc4a27754b49100226e44f3cd",
+  "items": [],
+  "manifest_sha256": "sha256:d1d7ea73e4626e800fff44b03c210b542625ee6e9666c8e81f1c46414dd7c0a9",
+  "mapping_source_version": "sha256:c2217c91d8a00879867373f570f7e574141351f860fcc12481f68e4f559ab4b8",
+  "platform_name": "蚂蚁花团供应商",
+  "scan_scope": "online_and_waiting",
+  "schema_version": "shadowbot-listing-action-batch-request-1.0",
+  "window_title": "蚂蚁花团供应商"
+}

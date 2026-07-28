@@ -10,7 +10,7 @@ FLOW_PATH = (
 )
 
 
-def _load_refresh_helper(find_element, select_online=None):
+def _load_refresh_helper(find_element, select_online=None, require_ready=None):
     tree = ast.parse(FLOW_PATH.read_text(encoding="utf-8"))
     nodes = []
     for node in tree.body:
@@ -29,6 +29,17 @@ def _load_refresh_helper(find_element, select_online=None):
         "_find_element": find_element,
         "_find_product_list_container": lambda window, timeout_seconds: find_element(
             window, "蚂蚁_商品管理_目标商品_容器", timeout_seconds
+        ),
+        "_require_product_list_ready": require_ready
+        or (
+            lambda window, timeout_seconds: (
+                find_element(
+                    window,
+                    "蚂蚁_商品管理_目标商品_容器",
+                    timeout_seconds,
+                ),
+                "PRODUCT_LIST_CONTAINER",
+            )[1]
         ),
         "_now_iso": lambda: "2026-07-11T10:00:00+08:00",
         "_select_online_product_list": select_online
@@ -79,7 +90,40 @@ def test_refresh_clicks_management_even_when_list_container_is_already_available
     ]
     assert event["status"] == "SUCCESS"
     assert event["stage"] == "BEFORE_PRICE_READ"
+    assert event["readiness"] == "PRODUCT_LIST_CONTAINER"
     assert result["product_list_refreshes"] == [event]
+
+
+def test_refresh_accepts_explicit_empty_list_marker_as_ready():
+    calls = []
+
+    def find_element(_window, selector, _timeout):
+        calls.append(selector)
+        if selector == "价格弹窗_容器":
+            raise slice_error("ELEMENT_NOT_FOUND", "dialog is closed", True)
+        if selector == "蚂蚁_首页_商品管理_入口":
+            return _ClickTarget(calls)
+        raise AssertionError("container lookup must be replaced by empty readiness")
+
+    refresh, slice_error, _elements = _load_refresh_helper(
+        find_element,
+        select_online=lambda _window, _timeout_seconds, _result: calls.append(
+            "selected_online"
+        ),
+        require_ready=lambda _window, _timeout_seconds: "EMPTY_LIST_MARKER",
+    )
+    result = {"product_list_refreshes": []}
+
+    event = refresh(object(), 5, result, "BEFORE_SET_ONLINE")
+
+    assert event["status"] == "SUCCESS"
+    assert event["readiness"] == "EMPTY_LIST_MARKER"
+    assert calls == [
+        "价格弹窗_容器",
+        "蚂蚁_首页_商品管理_入口",
+        "clicked",
+        "selected_online",
+    ]
 
 
 def test_refresh_failure_is_normalized_and_audited():

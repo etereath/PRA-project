@@ -1,0 +1,34 @@
+{
+  "expected": {
+    "commit_batch_id": "BATCH-T13-CONTROLLED-UNKNOWN-20260726-01",
+    "commit_execution_attempt_id": "ATTEMPT-T13-CONTROLLED-UNKNOWN-20260726-01",
+    "commit_status": "UNKNOWN",
+    "not_attempted_internal_sku": "AISHA-B-60-Z",
+    "reconcile_execution_attempt_id": "RECONCILE-e88fb8a4b4d60936236f0e0a",
+    "reconcile_status": "VERIFIED",
+    "unknown_internal_sku": "AISHA-D-50-Z",
+    "verified_internal_sku": "AISHA-C-55-Z"
+  },
+  "mapping_sha256": "24f0dd9f88f0fe5e42587cc2b7866f035fef88bcbface3d0353afd99c4fa5ce6",
+  "original_archive_sha256": {
+    "commit": {
+      "ack": "34615b263f96a65e892bbecff2f53ebe6837c0e74b0066ffa85d6ce2d60adda4",
+      "phase": "736c083f4f9d58ac9a99106a39900b2dee3ce1c6cfb717af9558772ab6210d04",
+      "receipt_canonical_json": "eec980c6940148d360183390feb9a8108275eca030145a11476a05e1b8f4f940",
+      "report": "2da77177db4e3d11fc43b34ed4f0c175a35630bbbd0ce0588b9b88eeb5faaec9",
+      "request": "dc48648fe2c8ddb5d686c65722672e9d19c4d1f51998cc4cad0d404fd8c23317",
+      "result": "928a94c98c687119a7cb63d860ae5611744ae1274f422ecfa4315756411c3663",
+      "result_filename": "20260726T144411158146Z-ATTEMPT-T13-CONTROLLED-UNKNOWN-20260726-01.result.json"
+    },
+    "reconcile": {
+      "ack": "359138622315f3189575b510fb3ebb468289011ab7b78735212a10c786dd5777",
+      "phase": "3da7f748855b15fd4effee047dc88b4038e82e4e13e6eb3a4dbebc24ad769b54",
+      "receipt_canonical_json": "59b17ce31e87d71b4259be5f875d2035ae2f5586d798c7685deaa9a665d717e3",
+      "report": "f6fe5e15dd89c7da195f56e8d8fdc38c6477f189d43b99f9d707211ebeb8a4b7",
+      "request": "bcb60249c712d7905d1c83eead13963cddf10dda615dfa9e6f2021181ef0a111",
+      "result": "f61d0c6e279da8708c999167d5ebaa4138eab31d8689c51064d3eac4d8ff1118",
+      "result_filename": "RECONCILE-e88fb8a4b4d60936236f0e0a.result.json"
+    }
+  },
+  "schema_version": "task13-serial-unknown-evidence-manifest-1.0"
+}

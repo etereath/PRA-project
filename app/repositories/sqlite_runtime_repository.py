@@ -21,6 +21,12 @@ from app.exceptions import (
 )
 from app.listing_identity import normalize_listing_text, require_listing_identity
 from app.mobile_review import normalize_mobile_review_resolution_payload, resolution_payload_summary
+from app.review_policy import (
+    allowed_review_statuses,
+    review_business_decision,
+    review_source_task_ids,
+    retry_task_deadline,
+)
 from app.models import (
     ExecutionLog,
     MobileReviewAtomicResult,
@@ -58,6 +64,13 @@ from app.utils import utc_now
 
 
 TERMINAL_TASK_STATUSES = ("success", "skipped", "cancelled", "expired")
+
+OPEN_TASK_DEDUPE_INDEX_SQL = """
+CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_open_dedupe
+ON tasks(dedupe_key)
+WHERE dedupe_key <> ''
+  AND task_status NOT IN ('success', 'failed', 'skipped', 'cancelled', 'expired')
+"""
 
 MOBILE_REVIEW_ACTIONS = frozenset({
     ReviewTaskStatus.APPROVED.value,
@@ -118,6 +131,9 @@ SCHEMA_SQL = [
         expires_at TEXT,
         expected_old_price TEXT,
         target_price TEXT,
+        target_inventory INTEGER CHECK (
+            target_inventory IS NULL OR target_inventory >= 0
+        ),
         target_status TEXT,
         pricing_source TEXT,
         decision_trace_json TEXT NOT NULL DEFAULT '{}',
@@ -126,12 +142,7 @@ SCHEMA_SQL = [
         updated_at TEXT NOT NULL
     )
     """,
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS ux_tasks_open_dedupe
-    ON tasks(dedupe_key)
-    WHERE dedupe_key <> ''
-      AND task_status NOT IN ('success', 'skipped', 'cancelled', 'expired')
-    """,
+    OPEN_TASK_DEDUPE_INDEX_SQL,
     """
     CREATE TABLE IF NOT EXISTS review_tasks (
         review_task_id TEXT PRIMARY KEY,
@@ -667,6 +678,877 @@ SCHEMA_V12_SQL = [
     """,
 ]
 
+SCHEMA_V13_REGISTRY_SQL = """
+CREATE TABLE IF NOT EXISTS shadowbot_batch_registry (
+    batch_id TEXT PRIMARY KEY,
+    batch_type TEXT NOT NULL CHECK (batch_type IN (
+        'update_price', 'set_online', 'set_offline', 'sync_status'
+    )),
+    contract_version INTEGER NOT NULL CHECK (contract_version IN (4, 5)),
+    platform_name TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)
+"""
+
+SCHEMA_V13_SQL = [
+    """
+    CREATE INDEX IF NOT EXISTS ix_shadowbot_batch_registry_type
+    ON shadowbot_batch_registry(batch_type, created_at)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS shadowbot_listing_action_batches (
+        batch_id TEXT PRIMARY KEY,
+        contract_version INTEGER NOT NULL CHECK (contract_version = 5),
+        execution_profile TEXT NOT NULL CHECK (
+            execution_profile IN ('development', 'production')
+        ),
+        action_type TEXT NOT NULL CHECK (
+            action_type IN ('set_online', 'set_offline', 'sync_status')
+        ),
+        platform_name TEXT NOT NULL,
+        manifest_sha256 TEXT NOT NULL,
+        instruction_hash TEXT NOT NULL DEFAULT '',
+        execution_attempt_id TEXT NOT NULL DEFAULT '',
+        result_id TEXT NOT NULL DEFAULT '',
+        status TEXT NOT NULL CHECK (status IN (
+            'PREPARED', 'PUBLISHING', 'QUEUED', 'RUNNING',
+            'VERIFIED', 'PARTIAL', 'FAILED', 'UNKNOWN'
+        )),
+        batch_target_count INTEGER NOT NULL DEFAULT 0 CHECK (
+            batch_target_count >= 0
+        ),
+        verified_count INTEGER NOT NULL DEFAULT 0 CHECK (verified_count >= 0),
+        unknown_count INTEGER NOT NULL DEFAULT 0 CHECK (unknown_count >= 0),
+        partial_effect_count INTEGER NOT NULL DEFAULT 0 CHECK (
+            partial_effect_count >= 0
+        ),
+        not_attempted_count INTEGER NOT NULL DEFAULT 0 CHECK (
+            not_attempted_count >= 0
+        ),
+        failed_count INTEGER NOT NULL DEFAULT 0 CHECK (failed_count >= 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(batch_id) REFERENCES shadowbot_batch_registry(batch_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS shadowbot_listing_action_batch_items (
+        item_id TEXT PRIMARY KEY,
+        batch_id TEXT NOT NULL,
+        source_task_id TEXT NOT NULL,
+        operation_id TEXT NOT NULL,
+        item_execution_attempt_id TEXT NOT NULL,
+        internal_sku TEXT NOT NULL,
+        expected_product_name TEXT NOT NULL,
+        expected_grade TEXT NOT NULL,
+        item_payload_sha256 TEXT NOT NULL,
+        write_identity_key TEXT NOT NULL,
+        page_identity_key TEXT NOT NULL,
+        expected_old_status TEXT NOT NULL,
+        target_status TEXT NOT NULL,
+        target_price TEXT,
+        target_inventory INTEGER CHECK (
+            target_inventory IS NULL OR target_inventory >= 0
+        ),
+        detail_effect_state TEXT NOT NULL DEFAULT 'NOT_STARTED' CHECK (
+            detail_effect_state IN (
+                'NOT_STARTED', 'NOT_APPLIED', 'VERIFIED', 'PARTIAL', 'UNKNOWN'
+            )
+        ),
+        listing_effect_state TEXT NOT NULL DEFAULT 'NOT_STARTED' CHECK (
+            listing_effect_state IN (
+                'NOT_STARTED', 'NOT_APPLIED', 'VERIFIED', 'PARTIAL', 'UNKNOWN'
+            )
+        ),
+        observed_price_before_action TEXT,
+        observed_inventory_before_action INTEGER CHECK (
+            observed_inventory_before_action IS NULL
+            OR observed_inventory_before_action >= 0
+        ),
+        observed_price_after_detail_save TEXT,
+        observed_inventory_after_detail_save INTEGER CHECK (
+            observed_inventory_after_detail_save IS NULL
+            OR observed_inventory_after_detail_save >= 0
+        ),
+        detail_save_clicked_at TEXT,
+        action_clicked_at TEXT,
+        readback_observed_at TEXT,
+        operation_result TEXT NOT NULL DEFAULT '' CHECK (
+            operation_result IN (
+                '', 'NOT_ATTEMPTED', 'VERIFIED', 'NOT_APPLIED', 'PARTIALLY_APPLIED',
+                'NEEDS_RECONCILIATION'
+            )
+        ),
+        error_code TEXT NOT NULL DEFAULT '',
+        error_message TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(batch_id)
+            REFERENCES shadowbot_listing_action_batches(batch_id),
+        FOREIGN KEY(source_task_id) REFERENCES tasks(task_id),
+        FOREIGN KEY(operation_id)
+            REFERENCES shadowbot_operations(operation_id),
+        FOREIGN KEY(item_execution_attempt_id)
+            REFERENCES shadowbot_execution_attempts(execution_attempt_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_shadowbot_listing_action_batches_status
+    ON shadowbot_listing_action_batches(status, created_at)
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS
+        ux_shadowbot_listing_action_batch_items_batch_sku
+    ON shadowbot_listing_action_batch_items(batch_id, internal_sku)
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS
+        ux_shadowbot_listing_action_batch_items_operation_id
+    ON shadowbot_listing_action_batch_items(operation_id)
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS
+        ux_shadowbot_listing_action_batch_items_attempt_id
+    ON shadowbot_listing_action_batch_items(item_execution_attempt_id)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS shadowbot_listing_result_receipts (
+        result_id TEXT PRIMARY KEY,
+        batch_id TEXT NOT NULL,
+        execution_attempt_id TEXT NOT NULL,
+        instruction_hash TEXT NOT NULL,
+        manifest_sha256 TEXT NOT NULL,
+        result_sha256 TEXT NOT NULL,
+        source_result_path TEXT NOT NULL DEFAULT '',
+        accepted_at TEXT NOT NULL,
+        ack_state TEXT NOT NULL CHECK (
+            ack_state IN ('PENDING', 'WRITTEN', 'FAILED')
+        ),
+        ack_updated_at TEXT,
+        last_projection_error TEXT NOT NULL DEFAULT '',
+        FOREIGN KEY(batch_id)
+            REFERENCES shadowbot_listing_action_batches(batch_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_shadowbot_listing_result_receipts_batch_id
+    ON shadowbot_listing_result_receipts(batch_id)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS listing_sync_snapshots (
+        snapshot_id TEXT PRIMARY KEY,
+        batch_id TEXT NOT NULL,
+        platform_name TEXT NOT NULL,
+        execution_attempt_id TEXT NOT NULL,
+        scan_started_at TEXT NOT NULL,
+        scan_completed_at TEXT NOT NULL,
+        online_scan_started_at TEXT NOT NULL,
+        online_scan_completed_at TEXT NOT NULL,
+        waiting_scan_started_at TEXT NOT NULL,
+        waiting_scan_completed_at TEXT NOT NULL,
+        online_scan_complete INTEGER NOT NULL CHECK (
+            online_scan_complete IN (0, 1)
+        ),
+        waiting_scan_complete INTEGER NOT NULL CHECK (
+            waiting_scan_complete IN (0, 1)
+        ),
+        snapshot_complete INTEGER NOT NULL CHECK (
+            snapshot_complete IN (0, 1)
+        ),
+        online_end_marker_verified INTEGER NOT NULL CHECK (
+            online_end_marker_verified IN (0, 1)
+        ),
+        waiting_end_marker_verified INTEGER NOT NULL CHECK (
+            waiting_end_marker_verified IN (0, 1)
+        ),
+        instruction_hash TEXT NOT NULL,
+        result_id TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('VERIFIED', 'FAILED')),
+        error_code TEXT NOT NULL DEFAULT '',
+        evidence_manifest_sha256 TEXT NOT NULL,
+        CHECK (
+            snapshot_complete = CASE
+                WHEN online_scan_complete = 1
+                 AND waiting_scan_complete = 1
+                 AND online_end_marker_verified = 1
+                 AND waiting_end_marker_verified = 1
+                THEN 1 ELSE 0
+            END
+        ),
+        FOREIGN KEY(batch_id)
+            REFERENCES shadowbot_listing_action_batches(batch_id),
+        FOREIGN KEY(result_id)
+            REFERENCES shadowbot_listing_result_receipts(result_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_listing_sync_snapshots_platform_completed
+    ON listing_sync_snapshots(platform_name, scan_completed_at)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS listing_sync_snapshot_items (
+        snapshot_item_id TEXT PRIMARY KEY,
+        snapshot_id TEXT NOT NULL,
+        internal_sku TEXT,
+        product_name TEXT NOT NULL,
+        grade TEXT NOT NULL,
+        page_identity_key TEXT NOT NULL,
+        affected_internal_skus_json TEXT NOT NULL DEFAULT '[]',
+        online_occurrences INTEGER NOT NULL CHECK (online_occurrences >= 0),
+        waiting_occurrences INTEGER NOT NULL CHECK (waiting_occurrences >= 0),
+        listing_location TEXT NOT NULL CHECK (listing_location IN (
+            'online_only', 'waiting_only', 'both', 'neither', 'ambiguous'
+        )),
+        online_row_identities_json TEXT NOT NULL DEFAULT '[]',
+        waiting_row_identities_json TEXT NOT NULL DEFAULT '[]',
+        online_observed_price TEXT,
+        waiting_observed_price TEXT,
+        online_observed_inventory INTEGER CHECK (
+            online_observed_inventory IS NULL
+            OR online_observed_inventory >= 0
+        ),
+        waiting_observed_inventory INTEGER CHECK (
+            waiting_observed_inventory IS NULL
+            OR waiting_observed_inventory >= 0
+        ),
+        diagnostic_code TEXT NOT NULL DEFAULT '',
+        online_observed_at TEXT,
+        waiting_observed_at TEXT,
+        UNIQUE(snapshot_id, page_identity_key),
+        FOREIGN KEY(snapshot_id)
+            REFERENCES listing_sync_snapshots(snapshot_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_listing_sync_snapshot_items_snapshot
+    ON listing_sync_snapshot_items(snapshot_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_listing_sync_snapshot_items_internal_sku
+    ON listing_sync_snapshot_items(internal_sku, snapshot_id)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS listing_anomaly_cases (
+        anomaly_case_id TEXT PRIMARY KEY,
+        snapshot_id TEXT NOT NULL,
+        snapshot_item_id TEXT NOT NULL,
+        platform_name TEXT NOT NULL,
+        internal_sku TEXT,
+        page_identity_key TEXT NOT NULL,
+        affected_internal_skus_json TEXT NOT NULL DEFAULT '[]',
+        anomaly_subject_key TEXT NOT NULL,
+        dedupe_key TEXT NOT NULL,
+        reason_code TEXT NOT NULL CHECK (reason_code IN (
+            'UNMAPPED_PRODUCT', 'IDENTITY_MAPPING_CONFLICT',
+            'ABSENT_FROM_BOTH_LISTS', 'DUPLICATE_PAGE_IDENTITY',
+            'PRESENT_IN_BOTH_LISTS'
+        )),
+        diagnostic_message TEXT NOT NULL,
+        resolution_policy TEXT NOT NULL CHECK (resolution_policy IN (
+            'AUTO_CLEAR_BY_COMPLETE_SNAPSHOT', 'MANUAL_ONLY'
+        )),
+        blocked_actions_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        cleared_at TEXT,
+        cleared_by_snapshot_id TEXT,
+        review_task_id TEXT,
+        CHECK (
+            (cleared_at IS NULL AND cleared_by_snapshot_id IS NULL)
+            OR (cleared_at IS NOT NULL AND cleared_by_snapshot_id IS NOT NULL)
+        ),
+        FOREIGN KEY(snapshot_id)
+            REFERENCES listing_sync_snapshots(snapshot_id),
+        FOREIGN KEY(snapshot_item_id)
+            REFERENCES listing_sync_snapshot_items(snapshot_item_id),
+        FOREIGN KEY(cleared_by_snapshot_id)
+            REFERENCES listing_sync_snapshots(snapshot_id),
+        FOREIGN KEY(review_task_id) REFERENCES review_tasks(review_task_id)
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_listing_anomaly_cases_open_dedupe
+    ON listing_anomaly_cases(dedupe_key)
+    WHERE cleared_at IS NULL
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_listing_anomaly_cases_snapshot
+    ON listing_anomaly_cases(snapshot_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_listing_anomaly_cases_review
+    ON listing_anomaly_cases(review_task_id)
+    """,
+]
+
+
+def _backfill_shadowbot_batch_registry(
+    connection: sqlite3.Connection,
+) -> None:
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO shadowbot_batch_registry(
+            batch_id, batch_type, contract_version, platform_name, created_at
+        )
+        SELECT batch_id, 'update_price', 4, platform_name, created_at
+        FROM shadowbot_commit_batches
+        """
+    )
+
+
+def _migrate_shadowbot_operations_to_v13(
+    connection: sqlite3.Connection,
+) -> None:
+    columns = {
+        str(row[1]): row
+        for row in connection.execute(
+            "PRAGMA table_info(shadowbot_operations)"
+        ).fetchall()
+    }
+    v13_columns = {
+        "action_type",
+        "expected_old_status",
+        "target_status",
+        "target_inventory",
+        "approved_payload_json",
+        "operation_result",
+        "resolution_status",
+        "resolved_by",
+        "resolved_at",
+        "superseded_by_operation_id",
+    }
+    table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'shadowbot_operations'"
+    ).fetchone()
+    table_sql = str(table_row[0] or "").upper() if table_row else ""
+    if (
+        v13_columns.issubset(columns)
+        and int(columns["expected_old_price"][3]) == 0
+        and int(columns["target_price"][3]) == 0
+        and "'NOT_ATTEMPTED'" in table_sql
+    ):
+        return
+
+    connection.execute("DROP TABLE IF EXISTS shadowbot_operations_v13_new")
+    connection.execute(
+        """
+        CREATE TABLE shadowbot_operations_v13_new (
+            operation_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            product_identity_json TEXT NOT NULL DEFAULT '{}',
+            action_type TEXT NOT NULL DEFAULT 'update_price' CHECK (
+                action_type IN ('update_price', 'set_online', 'set_offline')
+            ),
+            expected_old_price TEXT,
+            target_price TEXT,
+            expected_old_status TEXT,
+            target_status TEXT,
+            target_inventory INTEGER CHECK (
+                target_inventory IS NULL OR target_inventory >= 0
+            ),
+            status TEXT NOT NULL,
+            operation_result TEXT NOT NULL DEFAULT '' CHECK (
+                operation_result IN (
+                    '', 'NOT_ATTEMPTED', 'VERIFIED', 'NOT_APPLIED', 'PARTIALLY_APPLIED',
+                    'NEEDS_RECONCILIATION'
+                )
+            ),
+            resolution_status TEXT NOT NULL DEFAULT 'UNRESOLVED' CHECK (
+                resolution_status IN (
+                    'UNRESOLVED', 'MANUAL_HANDLED',
+                    'CORRECTIVE_ACTION_AUTHORIZED'
+                )
+            ),
+            resolved_by TEXT NOT NULL DEFAULT '',
+            resolved_at TEXT,
+            superseded_by_operation_id TEXT,
+            lock_owner TEXT NOT NULL DEFAULT '',
+            approved_payload_hash TEXT NOT NULL DEFAULT '',
+            approved_payload_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            CHECK (
+                (
+                    action_type = 'update_price'
+                    AND expected_old_price IS NOT NULL
+                    AND target_price IS NOT NULL
+                    AND expected_old_status IS NULL
+                    AND target_status IS NULL
+                    AND target_inventory IS NULL
+                )
+                OR (
+                    action_type = 'set_online'
+                    AND expected_old_status = 'offline'
+                    AND target_status = 'online'
+                    AND target_price IS NOT NULL
+                    AND target_inventory IS NOT NULL
+                )
+                OR (
+                    action_type = 'set_offline'
+                    AND expected_old_price IS NULL
+                    AND target_price IS NULL
+                    AND expected_old_status = 'online'
+                    AND target_status = 'offline'
+                    AND target_inventory IS NULL
+                )
+            ),
+            FOREIGN KEY(task_id) REFERENCES tasks(task_id),
+            FOREIGN KEY(superseded_by_operation_id)
+                REFERENCES shadowbot_operations_v13_new(operation_id)
+        )
+        """
+    )
+    column_names = set(columns)
+    expressions = {
+        "action_type": (
+            "COALESCE(NULLIF(action_type, ''), 'update_price')"
+            if "action_type" in column_names
+            else "'update_price'"
+        ),
+        "expected_old_status": (
+            "expected_old_status"
+            if "expected_old_status" in column_names
+            else "NULL"
+        ),
+        "target_status": (
+            "target_status" if "target_status" in column_names else "NULL"
+        ),
+        "target_inventory": (
+            "target_inventory" if "target_inventory" in column_names else "NULL"
+        ),
+        "operation_result": (
+            "COALESCE(operation_result, '')"
+            if "operation_result" in column_names
+            else "''"
+        ),
+        "resolution_status": (
+            "COALESCE(NULLIF(resolution_status, ''), 'UNRESOLVED')"
+            if "resolution_status" in column_names
+            else "'UNRESOLVED'"
+        ),
+        "resolved_by": (
+            "COALESCE(resolved_by, '')"
+            if "resolved_by" in column_names
+            else "''"
+        ),
+        "resolved_at": "resolved_at" if "resolved_at" in column_names else "NULL",
+        "superseded_by_operation_id": (
+            "superseded_by_operation_id"
+            if "superseded_by_operation_id" in column_names
+            else "NULL"
+        ),
+        "approved_payload_json": (
+            "COALESCE(NULLIF(approved_payload_json, ''), '{}')"
+            if "approved_payload_json" in column_names
+            else "'{}'"
+        ),
+    }
+    connection.execute(
+        f"""
+        INSERT INTO shadowbot_operations_v13_new(
+            operation_id, task_id, platform, product_identity_json,
+            action_type, expected_old_price, target_price,
+            expected_old_status, target_status, target_inventory,
+            status, operation_result, resolution_status, resolved_by,
+            resolved_at, superseded_by_operation_id, lock_owner,
+            approved_payload_hash, approved_payload_json, created_at, updated_at
+        )
+        SELECT operation_id, task_id, platform, product_identity_json,
+               {expressions["action_type"]}, expected_old_price, target_price,
+               {expressions["expected_old_status"]},
+               {expressions["target_status"]},
+               {expressions["target_inventory"]},
+               status, {expressions["operation_result"]},
+               {expressions["resolution_status"]},
+               {expressions["resolved_by"]},
+               {expressions["resolved_at"]},
+               {expressions["superseded_by_operation_id"]},
+               lock_owner, approved_payload_hash,
+               {expressions["approved_payload_json"]},
+               created_at, updated_at
+        FROM shadowbot_operations
+        """
+    )
+    connection.execute("DROP TABLE shadowbot_operations")
+    connection.execute(
+        "ALTER TABLE shadowbot_operations_v13_new "
+        "RENAME TO shadowbot_operations"
+    )
+
+
+def _migrate_listing_action_batch_items_to_v13(
+    connection: sqlite3.Connection,
+) -> None:
+    """Allow the explicit NOT_ATTEMPTED publish-boundary outcome on old v13 DBs."""
+
+    table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'shadowbot_listing_action_batch_items'"
+    ).fetchone()
+    table_sql = str(table_row[0] or "").upper() if table_row else ""
+    if not table_row or "'NOT_ATTEMPTED'" in table_sql:
+        return
+
+    connection.execute(
+        "ALTER TABLE shadowbot_listing_action_batch_items "
+        "RENAME TO shadowbot_listing_action_batch_items_v13_old"
+    )
+    connection.execute(
+        """
+        CREATE TABLE shadowbot_listing_action_batch_items (
+            item_id TEXT PRIMARY KEY,
+            batch_id TEXT NOT NULL,
+            source_task_id TEXT NOT NULL,
+            operation_id TEXT NOT NULL,
+            item_execution_attempt_id TEXT NOT NULL,
+            internal_sku TEXT NOT NULL,
+            expected_product_name TEXT NOT NULL,
+            expected_grade TEXT NOT NULL,
+            item_payload_sha256 TEXT NOT NULL,
+            write_identity_key TEXT NOT NULL,
+            page_identity_key TEXT NOT NULL,
+            expected_old_status TEXT NOT NULL,
+            target_status TEXT NOT NULL,
+            target_price TEXT,
+            target_inventory INTEGER CHECK (
+                target_inventory IS NULL OR target_inventory >= 0
+            ),
+            detail_effect_state TEXT NOT NULL DEFAULT 'NOT_STARTED' CHECK (
+                detail_effect_state IN (
+                    'NOT_STARTED', 'NOT_APPLIED', 'VERIFIED', 'PARTIAL', 'UNKNOWN'
+                )
+            ),
+            listing_effect_state TEXT NOT NULL DEFAULT 'NOT_STARTED' CHECK (
+                listing_effect_state IN (
+                    'NOT_STARTED', 'NOT_APPLIED', 'VERIFIED', 'PARTIAL', 'UNKNOWN'
+                )
+            ),
+            observed_price_before_action TEXT,
+            observed_inventory_before_action INTEGER CHECK (
+                observed_inventory_before_action IS NULL
+                OR observed_inventory_before_action >= 0
+            ),
+            observed_price_after_detail_save TEXT,
+            observed_inventory_after_detail_save INTEGER CHECK (
+                observed_inventory_after_detail_save IS NULL
+                OR observed_inventory_after_detail_save >= 0
+            ),
+            detail_save_clicked_at TEXT,
+            action_clicked_at TEXT,
+            readback_observed_at TEXT,
+            operation_result TEXT NOT NULL DEFAULT '' CHECK (
+                operation_result IN (
+                    '', 'NOT_ATTEMPTED', 'VERIFIED', 'NOT_APPLIED',
+                    'PARTIALLY_APPLIED', 'NEEDS_RECONCILIATION'
+                )
+            ),
+            error_code TEXT NOT NULL DEFAULT '',
+            error_message TEXT NOT NULL DEFAULT '',
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(batch_id)
+                REFERENCES shadowbot_listing_action_batches(batch_id),
+            FOREIGN KEY(source_task_id) REFERENCES tasks(task_id),
+            FOREIGN KEY(operation_id) REFERENCES shadowbot_operations(operation_id),
+            FOREIGN KEY(item_execution_attempt_id)
+                REFERENCES shadowbot_execution_attempts(execution_attempt_id)
+        )
+        """
+    )
+    columns = [
+        "item_id", "batch_id", "source_task_id", "operation_id",
+        "item_execution_attempt_id", "internal_sku", "expected_product_name",
+        "expected_grade", "item_payload_sha256", "write_identity_key",
+        "page_identity_key", "expected_old_status", "target_status",
+        "target_price", "target_inventory", "detail_effect_state",
+        "listing_effect_state", "observed_price_before_action",
+        "observed_inventory_before_action", "observed_price_after_detail_save",
+        "observed_inventory_after_detail_save", "detail_save_clicked_at",
+        "action_clicked_at", "readback_observed_at", "operation_result",
+        "error_code", "error_message", "updated_at",
+    ]
+    names = ", ".join(columns)
+    connection.execute(
+        f"INSERT INTO shadowbot_listing_action_batch_items({names}) "
+        f"SELECT {names} FROM shadowbot_listing_action_batch_items_v13_old"
+    )
+    connection.execute("DROP TABLE shadowbot_listing_action_batch_items_v13_old")
+
+
+def _migrate_shadowbot_write_locks_to_v13(
+    connection: sqlite3.Connection,
+) -> None:
+    table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'shadowbot_write_locks'"
+    ).fetchone()
+    table_sql = str(table_row[0] or "") if table_row else ""
+    foreign_keys = {
+        (str(row[3]), str(row[2]), str(row[4]))
+        for row in connection.execute(
+            "PRAGMA foreign_key_list(shadowbot_write_locks)"
+        ).fetchall()
+    }
+    if (
+        "REVIEW_BLOCKED" in table_sql
+        and (
+            "batch_id",
+            "shadowbot_batch_registry",
+            "batch_id",
+        )
+        in foreign_keys
+    ):
+        return
+
+    connection.execute("DROP TABLE IF EXISTS shadowbot_write_locks_v13_new")
+    connection.execute(
+        """
+        CREATE TABLE shadowbot_write_locks_v13_new (
+            write_identity_key TEXT PRIMARY KEY,
+            operation_id TEXT NOT NULL UNIQUE,
+            item_execution_attempt_id TEXT NOT NULL,
+            batch_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN (
+                'ACTIVE', 'UNKNOWN', 'REVIEW_BLOCKED', 'RELEASED'
+            )),
+            acquired_at TEXT NOT NULL,
+            released_at TEXT,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(operation_id)
+                REFERENCES shadowbot_operations(operation_id),
+            FOREIGN KEY(item_execution_attempt_id)
+                REFERENCES shadowbot_execution_attempts(execution_attempt_id),
+            FOREIGN KEY(batch_id)
+                REFERENCES shadowbot_batch_registry(batch_id)
+        )
+        """
+    )
+    if table_row is not None:
+        connection.execute(
+            """
+            INSERT INTO shadowbot_write_locks_v13_new(
+                write_identity_key, operation_id, item_execution_attempt_id,
+                batch_id, status, acquired_at, released_at, updated_at
+            )
+            SELECT write_identity_key, operation_id, item_execution_attempt_id,
+                   batch_id, status, acquired_at, released_at, updated_at
+            FROM shadowbot_write_locks
+            """
+        )
+        connection.execute("DROP TABLE shadowbot_write_locks")
+    connection.execute(
+        "ALTER TABLE shadowbot_write_locks_v13_new "
+        "RENAME TO shadowbot_write_locks"
+    )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS "
+        "ux_shadowbot_write_locks_operation_id "
+        "ON shadowbot_write_locks(operation_id)"
+    )
+
+
+def _ensure_listing_status_v13_columns(
+    connection: sqlite3.Connection,
+) -> None:
+    for column, declaration in (
+        ("price_source", "TEXT NOT NULL DEFAULT 'default'"),
+        ("price_observed_at", "TEXT"),
+        ("price_source_attempt_id", "TEXT NOT NULL DEFAULT ''"),
+        ("last_listing_change_at", "TEXT"),
+        ("last_listing_operation_id", "TEXT"),
+        ("online_status_observed_at", "TEXT"),
+        ("online_status_source_type", "TEXT NOT NULL DEFAULT ''"),
+        ("online_status_source_id", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        _ensure_column(connection, "listing_status", column, declaration)
+
+
+def _backfill_listing_status_latest_scan_observations(
+    connection: sqlite3.Connection,
+) -> None:
+    """Project the newest complete v5 page observation after adding columns."""
+
+    rows = connection.execute(
+        """
+        SELECT snapshot.platform_name, snapshot.execution_attempt_id,
+               snapshot.scan_completed_at,
+               item.internal_sku, item.listing_location,
+               item.online_observed_price, item.waiting_observed_price,
+               item.online_observed_inventory, item.waiting_observed_inventory,
+               item.online_observed_at, item.waiting_observed_at
+        FROM listing_sync_snapshot_items AS item
+        JOIN listing_sync_snapshots AS snapshot
+          ON snapshot.snapshot_id = item.snapshot_id
+        WHERE snapshot.snapshot_complete = 1
+          AND snapshot.status = 'VERIFIED'
+          AND item.internal_sku IS NOT NULL
+          AND item.internal_sku <> ''
+          AND item.listing_location IN ('online_only', 'waiting_only', 'both')
+          AND NOT EXISTS (
+              SELECT 1
+              FROM listing_sync_snapshot_items AS newer_item
+              JOIN listing_sync_snapshots AS newer_snapshot
+                ON newer_snapshot.snapshot_id = newer_item.snapshot_id
+              WHERE newer_item.internal_sku = item.internal_sku
+                AND newer_snapshot.platform_name = snapshot.platform_name
+                AND newer_snapshot.snapshot_complete = 1
+                AND newer_snapshot.status = 'VERIFIED'
+                AND newer_snapshot.scan_completed_at
+                    > snapshot.scan_completed_at
+          )
+        """
+    ).fetchall()
+    for row in rows:
+        online_preferred = str(row["listing_location"]) in {
+            "online_only",
+            "both",
+        }
+        observed_price = row[
+            "online_observed_price"
+            if online_preferred
+            else "waiting_observed_price"
+        ]
+        observed_inventory = row[
+            "online_observed_inventory"
+            if online_preferred
+            else "waiting_observed_inventory"
+        ]
+        observed_at = row[
+            "online_observed_at"
+            if online_preferred
+            else "waiting_observed_at"
+        ]
+        if (
+            observed_price is None
+            or observed_inventory is None
+            or observed_at is None
+        ):
+            continue
+        connection.execute(
+            """
+            UPDATE listing_status
+            SET current_price = ?, platform_stock_qty = ?,
+                source = 'shadowbot_sync_status',
+                updated_at = ?,
+                inventory_source = 'shadowbot_sync_status',
+                inventory_observed_at = ?,
+                inventory_source_attempt_id = ?,
+                price_source = 'shadowbot_sync_status',
+                price_observed_at = ?,
+                price_source_attempt_id = ?
+            WHERE platform_name = ?
+              AND internal_sku = ?
+              AND (
+                  last_listing_change_at IS NULL
+                  OR last_listing_change_at <= ?
+              )
+              AND (
+                  price_observed_at IS NULL
+                  OR price_observed_at <= ?
+              )
+              AND (
+                  inventory_observed_at IS NULL
+                  OR inventory_observed_at <= ?
+              )
+            """,
+            (
+                str(observed_price),
+                int(observed_inventory),
+                str(row["scan_completed_at"]),
+                str(observed_at),
+                str(row["execution_attempt_id"]),
+                str(observed_at),
+                str(row["execution_attempt_id"]),
+                str(row["platform_name"]),
+                str(row["internal_sku"]),
+                str(observed_at),
+                str(observed_at),
+                str(observed_at),
+            ),
+        )
+
+
+def _requires_runtime_schema_v13_migration(
+    connection: sqlite3.Connection,
+) -> bool:
+    required_tables = {
+        "shadowbot_batch_registry",
+        "shadowbot_listing_action_batches",
+        "shadowbot_listing_action_batch_items",
+        "shadowbot_listing_result_receipts",
+        "listing_sync_snapshots",
+        "listing_sync_snapshot_items",
+        "listing_anomaly_cases",
+    }
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if "runtime_schema_migrations" not in tables:
+        return True
+    version_row = connection.execute(
+        "SELECT 1 FROM runtime_schema_migrations WHERE schema_version = 13"
+    ).fetchone()
+    if version_row is None or not required_tables.issubset(tables):
+        return True
+    operation_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(shadowbot_operations)"
+        ).fetchall()
+    }
+    if "action_type" not in operation_columns:
+        return True
+    operation_table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'shadowbot_operations'"
+    ).fetchone()
+    operation_table_sql = (
+        str(operation_table_row[0] or "").upper()
+        if operation_table_row is not None
+        else ""
+    )
+    if "'NOT_ATTEMPTED'" not in operation_table_sql:
+        return True
+    action_table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'shadowbot_listing_action_batch_items'"
+    ).fetchone()
+    action_table_sql = (
+        str(action_table_row[0] or "").upper()
+        if action_table_row is not None
+        else ""
+    )
+    if "'NOT_ATTEMPTED'" not in action_table_sql:
+        return True
+    lock_foreign_keys = {
+        (str(row[3]), str(row[2]), str(row[4]))
+        for row in connection.execute(
+            "PRAGMA foreign_key_list(shadowbot_write_locks)"
+        ).fetchall()
+    }
+    return (
+        "batch_id",
+        "shadowbot_batch_registry",
+        "batch_id",
+    ) not in lock_foreign_keys
+
+
+def _ensure_open_task_dedupe_index(connection: sqlite3.Connection) -> None:
+    row = connection.execute(
+        """
+        SELECT sql
+        FROM sqlite_master
+        WHERE type = 'index' AND name = 'ux_tasks_open_dedupe'
+        """
+    ).fetchone()
+    index_sql = str(row[0] or "").lower() if row is not None else ""
+    if "'failed'" in index_sql:
+        return
+    connection.execute("DROP INDEX IF EXISTS ux_tasks_open_dedupe")
+    connection.execute(OPEN_TASK_DEDUPE_INDEX_SQL)
+
 
 class SQLiteRuntimeRepository:
     def __init__(
@@ -720,85 +1602,199 @@ class SQLiteRuntimeRepository:
 
     def init_schema(self) -> None:
         def initialize_schema(connection: sqlite3.Connection) -> None:
-            for statement in SCHEMA_SQL:
-                connection.execute(statement)
-            _ensure_column(connection, "shadowbot_execution_attempts", "instruction_hash", "TEXT NOT NULL DEFAULT ''")
-            _ensure_column(connection, "shadowbot_execution_attempts", "request_file_sha256", "TEXT NOT NULL DEFAULT ''")
-            _ensure_column(connection, "shadowbot_execution_attempts", "queue_request_path", "TEXT NOT NULL DEFAULT ''")
-            _ensure_column(connection, "tasks", "expected_old_price", "TEXT")
-            _backfill_task_expected_old_price(connection)
-            migration_notes = {
-                1: "initial runtime schema",
-                2: "review token runtime schema",
-                3: "business rule evaluation runtime schema",
-                4: "shadowbot executor runtime schema",
-                5: "retry authorization persistence and shadowbot file queue audit fields",
-                6: "durable notification outbox and delivery attempt persistence",
-                7: "current platform listing status and price persistence",
-                8: "ShadowBot inventory observations with default stock and freshness fencing",
-                9: "platform listing identity uses platform, variety, and grade instead of SKU",
-                10: "task expected old price persisted as a first-class structured field",
-                11: "single-request ShadowBot commit batch ledger",
-                12: "per-item commit identity, write locks, observation times, and durable result receipts",
-            }
-            for statement in SCHEMA_V6_SQL:
-                connection.execute(statement)
-            for statement in SCHEMA_V7_SQL:
-                connection.execute(statement)
-            _migrate_listing_status_to_v9(connection)
-            for statement in SCHEMA_V11_SQL:
-                connection.execute(statement)
-            _ensure_column(connection, "shadowbot_commit_batch_items", "item_id", "TEXT NOT NULL DEFAULT ''")
-            _ensure_column(connection, "shadowbot_commit_batch_items", "operation_id", "TEXT NOT NULL DEFAULT ''")
-            _ensure_column(
-                connection,
-                "shadowbot_commit_batch_items",
-                "item_execution_attempt_id",
-                "TEXT NOT NULL DEFAULT ''",
+            connection.commit()
+            requires_v13_migration = _requires_runtime_schema_v13_migration(
+                connection
             )
-            _ensure_column(
-                connection,
-                "shadowbot_commit_batch_items",
-                "write_identity_key",
-                "TEXT NOT NULL DEFAULT ''",
-            )
-            _ensure_column(
-                connection,
-                "shadowbot_commit_batch_items",
-                "page_identity_key",
-                "TEXT NOT NULL DEFAULT ''",
-            )
-            _ensure_column(
-                connection,
-                "shadowbot_commit_batch_items",
-                "side_effect_state",
-                "TEXT NOT NULL DEFAULT 'NOT_STARTED'",
-            )
-            _ensure_column(connection, "shadowbot_commit_batch_items", "preflight_observed_at", "TEXT")
-            _ensure_column(connection, "shadowbot_commit_batch_items", "submit_intent_at", "TEXT")
-            _ensure_column(connection, "shadowbot_commit_batch_items", "submit_clicked_at", "TEXT")
-            _ensure_column(connection, "shadowbot_commit_batch_items", "readback_observed_at", "TEXT")
-            _backfill_commit_item_identities(connection)
-            connection.execute(
-                "DROP INDEX IF EXISTS ux_shadowbot_commit_batch_items_operation_id"
-            )
-            for statement in SCHEMA_V12_SQL:
-                connection.execute(statement)
-            for version in range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1):
-                connection.execute(
-                    """
-                    INSERT OR IGNORE INTO runtime_schema_migrations(schema_version, applied_at, note)
-                    VALUES (?, ?, ?)
-                    """,
-                    (version, _datetime_to_text(datetime.now()), migration_notes[version]),
+            if requires_v13_migration:
+                connection.execute("PRAGMA foreign_keys = OFF")
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                for statement in SCHEMA_SQL:
+                    connection.execute(statement)
+                _ensure_open_task_dedupe_index(connection)
+                _ensure_column(
+                    connection,
+                    "shadowbot_execution_attempts",
+                    "instruction_hash",
+                    "TEXT NOT NULL DEFAULT ''",
                 )
-            # Older builds recorded v5 for queue audit columns only.  Keep the
-            # applied timestamp stable while correcting the descriptive record
-            # so migration history reflects the complete physical v5 shape.
-            connection.execute(
-                "UPDATE runtime_schema_migrations SET note = ? WHERE schema_version = 5",
-                (migration_notes[5],),
-            )
+                _ensure_column(
+                    connection,
+                    "shadowbot_execution_attempts",
+                    "request_file_sha256",
+                    "TEXT NOT NULL DEFAULT ''",
+                )
+                _ensure_column(
+                    connection,
+                    "shadowbot_execution_attempts",
+                    "queue_request_path",
+                    "TEXT NOT NULL DEFAULT ''",
+                )
+                _ensure_column(connection, "tasks", "expected_old_price", "TEXT")
+                _ensure_column(
+                    connection,
+                    "tasks",
+                    "target_inventory",
+                    "INTEGER CHECK (target_inventory IS NULL OR target_inventory >= 0)",
+                )
+                _backfill_task_expected_old_price(connection)
+                migration_notes = {
+                    1: "initial runtime schema",
+                    2: "review token runtime schema",
+                    3: "business rule evaluation runtime schema",
+                    4: "shadowbot executor runtime schema",
+                    5: "retry authorization persistence and shadowbot file queue audit fields",
+                    6: "durable notification outbox and delivery attempt persistence",
+                    7: "current platform listing status and price persistence",
+                    8: "ShadowBot inventory observations with default stock and freshness fencing",
+                    9: "platform listing identity uses platform, variety, and grade instead of SKU",
+                    10: "task expected old price persisted as a first-class structured field",
+                    11: "single-request ShadowBot commit batch ledger",
+                    12: "per-item commit identity, write locks, observation times, and durable result receipts",
+                    13: "listing action batches, status snapshots, anomalies, and shared write locks",
+                }
+                for statement in SCHEMA_V6_SQL:
+                    connection.execute(statement)
+                for statement in SCHEMA_V7_SQL:
+                    connection.execute(statement)
+                _migrate_listing_status_to_v9(connection)
+                for statement in SCHEMA_V11_SQL:
+                    connection.execute(statement)
+                _ensure_column(
+                    connection,
+                    "shadowbot_commit_batch_items",
+                    "item_id",
+                    "TEXT NOT NULL DEFAULT ''",
+                )
+                _ensure_column(
+                    connection,
+                    "shadowbot_commit_batch_items",
+                    "operation_id",
+                    "TEXT NOT NULL DEFAULT ''",
+                )
+                _ensure_column(
+                    connection,
+                    "shadowbot_commit_batch_items",
+                    "item_execution_attempt_id",
+                    "TEXT NOT NULL DEFAULT ''",
+                )
+                _ensure_column(
+                    connection,
+                    "shadowbot_commit_batch_items",
+                    "write_identity_key",
+                    "TEXT NOT NULL DEFAULT ''",
+                )
+                _ensure_column(
+                    connection,
+                    "shadowbot_commit_batch_items",
+                    "page_identity_key",
+                    "TEXT NOT NULL DEFAULT ''",
+                )
+                _ensure_column(
+                    connection,
+                    "shadowbot_commit_batch_items",
+                    "side_effect_state",
+                    "TEXT NOT NULL DEFAULT 'NOT_STARTED'",
+                )
+                _ensure_column(
+                    connection,
+                    "shadowbot_commit_batch_items",
+                    "preflight_observed_at",
+                    "TEXT",
+                )
+                _ensure_column(
+                    connection,
+                    "shadowbot_commit_batch_items",
+                    "submit_intent_at",
+                    "TEXT",
+                )
+                _ensure_column(
+                    connection,
+                    "shadowbot_commit_batch_items",
+                    "submit_clicked_at",
+                    "TEXT",
+                )
+                _ensure_column(
+                    connection,
+                    "shadowbot_commit_batch_items",
+                    "readback_observed_at",
+                    "TEXT",
+                )
+                _backfill_commit_item_identities(connection)
+                connection.execute(
+                    "DROP INDEX IF EXISTS "
+                    "ux_shadowbot_commit_batch_items_operation_id"
+                )
+                for statement in SCHEMA_V12_SQL:
+                    connection.execute(statement)
+
+                connection.execute(SCHEMA_V13_REGISTRY_SQL)
+                _backfill_shadowbot_batch_registry(connection)
+                _migrate_shadowbot_operations_to_v13(connection)
+                _migrate_shadowbot_write_locks_to_v13(connection)
+                _migrate_listing_action_batch_items_to_v13(connection)
+                _ensure_listing_status_v13_columns(connection)
+                for statement in SCHEMA_V13_SQL:
+                    connection.execute(statement)
+                _backfill_listing_status_latest_scan_observations(connection)
+
+                for version in range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1):
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO runtime_schema_migrations(
+                            schema_version, applied_at, note
+                        ) VALUES (?, ?, ?)
+                        """,
+                        (
+                            version,
+                            _datetime_to_text(datetime.now()),
+                            migration_notes[version],
+                        ),
+                    )
+                # Older builds recorded v5 for queue audit columns only.  Keep
+                # the applied timestamp stable while correcting the
+                # descriptive record.
+                connection.execute(
+                    "UPDATE runtime_schema_migrations SET note = ? "
+                    "WHERE schema_version = 5",
+                    (migration_notes[5],),
+                )
+                if requires_v13_migration:
+                    foreign_key_rows = connection.execute(
+                        "PRAGMA foreign_key_check"
+                    ).fetchall()
+                    if foreign_key_rows:
+                        raise RuntimeError(
+                            "Runtime Schema v13 migration produced foreign "
+                            f"key violations: {len(foreign_key_rows)}"
+                        )
+                    integrity_rows = [
+                        str(row[0])
+                        for row in connection.execute(
+                            "PRAGMA integrity_check"
+                        )
+                    ]
+                    if integrity_rows != ["ok"]:
+                        raise RuntimeError(
+                            "Runtime Schema v13 migration failed "
+                            "integrity_check"
+                        )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                if requires_v13_migration:
+                    connection.execute("PRAGMA foreign_keys = ON")
+                enabled = connection.execute(
+                    "PRAGMA foreign_keys"
+                ).fetchone()
+                if enabled is None or int(enabled[0]) != 1:
+                    raise RuntimeError(
+                        "SQLite foreign key enforcement was not restored "
+                        "after Runtime Schema migration"
+                    )
 
         self.connection_factory.initialize_database(initialize_schema)
 
@@ -829,8 +1825,10 @@ class SQLiteRuntimeRepository:
                         listing_status_id, platform_name, internal_sku, variety, grade,
                         current_price, platform_stock_qty, sold_qty, online_status,
                         source, updated_at, inventory_source,
-                        inventory_observed_at, inventory_source_attempt_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        inventory_observed_at, inventory_source_attempt_id,
+                        price_source, price_observed_at,
+                        price_source_attempt_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(platform_name, variety, grade) DO UPDATE SET
                         internal_sku = CASE
                             WHEN excluded.internal_sku <> '' THEN excluded.internal_sku
@@ -840,7 +1838,10 @@ class SQLiteRuntimeRepository:
                         sold_qty = excluded.sold_qty,
                         online_status = excluded.online_status,
                         source = excluded.source,
-                        updated_at = excluded.updated_at
+                        updated_at = excluded.updated_at,
+                        price_source = excluded.source,
+                        price_observed_at = NULL,
+                        price_source_attempt_id = ''
                     """,
                     (
                         status.listing_status_id,
@@ -857,6 +1858,9 @@ class SQLiteRuntimeRepository:
                         status.inventory_source,
                         _datetime_to_text(status.inventory_observed_at),
                         status.inventory_source_attempt_id,
+                        status.price_source,
+                        _datetime_to_text(status.price_observed_at),
+                        status.price_source_attempt_id,
                     ),
                 )
                 connection.commit()
@@ -883,13 +1887,16 @@ class SQLiteRuntimeRepository:
                 cursor = connection.execute(
                     """
                     UPDATE listing_status
-                    SET current_price = ?, source = ?, updated_at = ?
+                    SET current_price = ?, source = ?, updated_at = ?,
+                        price_source = ?, price_observed_at = NULL,
+                        price_source_attempt_id = ''
                     WHERE platform_name = ? AND variety = ? AND grade = ?
                     """,
                     (
                         serialize_decimal(normalized_price),
                         source,
                         _datetime_to_text(updated_at),
+                        source,
                         platform_name,
                         variety,
                         grade,
@@ -953,8 +1960,10 @@ class SQLiteRuntimeRepository:
                         listing_status_id, platform_name, internal_sku, variety, grade,
                         current_price, platform_stock_qty, sold_qty, online_status,
                         source, updated_at, inventory_source, inventory_observed_at,
-                        inventory_source_attempt_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 'shadowbot', ?, ?)
+                        inventory_source_attempt_id, price_source,
+                        price_observed_at, price_source_attempt_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, 'shadowbot', ?, ?,
+                              'shadowbot', ?, ?)
                     ON CONFLICT(platform_name, variety, grade) DO UPDATE SET
                         internal_sku = CASE
                             WHEN excluded.internal_sku <> '' THEN excluded.internal_sku
@@ -967,6 +1976,9 @@ class SQLiteRuntimeRepository:
                         inventory_source = excluded.inventory_source,
                         inventory_observed_at = excluded.inventory_observed_at,
                         inventory_source_attempt_id = excluded.inventory_source_attempt_id,
+                        price_source = excluded.price_source,
+                        price_observed_at = excluded.price_observed_at,
+                        price_source_attempt_id = excluded.price_source_attempt_id,
                         updated_at = excluded.updated_at
                     WHERE listing_status.inventory_observed_at IS NULL
                        OR listing_status.inventory_observed_at < excluded.inventory_observed_at
@@ -986,6 +1998,8 @@ class SQLiteRuntimeRepository:
                         online_status,
                         normalized_source,
                         observed_text,
+                        observed_text,
+                        execution_attempt_id,
                         observed_text,
                         execution_attempt_id,
                     ),
@@ -1116,13 +2130,15 @@ class SQLiteRuntimeRepository:
                 INSERT OR IGNORE INTO tasks(
                     task_id, trade_date, scope_type, scope_key, dedupe_key, internal_sku,
                     platform_name, action_type, priority, task_status, created_at, scheduled_at,
-                    expires_at, expected_old_price, target_price, target_status, pricing_source, decision_trace_json,
+                    expires_at, expected_old_price, target_price, target_inventory,
+                    target_status, pricing_source, decision_trace_json,
                     result_message, required_by, updated_at
                 )
                 VALUES(
                     :task_id, :trade_date, :scope_type, :scope_key, :dedupe_key, :internal_sku,
                     :platform_name, :action_type, :priority, :task_status, :created_at, :scheduled_at,
-                    :expires_at, :expected_old_price, :target_price, :target_status, :pricing_source, :decision_trace_json,
+                    :expires_at, :expected_old_price, :target_price, :target_inventory,
+                    :target_status, :pricing_source, :decision_trace_json,
                     :result_message, :required_by, :updated_at
                 )
                 """,
@@ -1180,7 +2196,7 @@ class SQLiteRuntimeRepository:
                 """
                 SELECT * FROM tasks
                 WHERE dedupe_key = ?
-                  AND task_status NOT IN ('success', 'skipped', 'cancelled', 'expired')
+                  AND task_status NOT IN ('success', 'failed', 'skipped', 'cancelled', 'expired')
                 ORDER BY created_at DESC, task_id ASC
                 LIMIT 1
                 """,
@@ -1385,6 +2401,7 @@ class SQLiteRuntimeRepository:
         task_status: TaskStatus | None = None,
         history: TaskStatusHistory | None = None,
         result_message: str = "",
+        retry_required_by: datetime | None = None,
     ) -> None:
         review_row = _review_task_to_row(review_task)
         with closing(self.connect()) as connection, connection:
@@ -1413,10 +2430,21 @@ class SQLiteRuntimeRepository:
             connection.execute(
                 """
                 UPDATE tasks
-                SET task_status = ?, result_message = COALESCE(NULLIF(?, ''), result_message), updated_at = ?
+                SET task_status = ?,
+                    required_by = COALESCE(?, required_by),
+                    expires_at = COALESCE(?, expires_at),
+                    result_message = COALESCE(NULLIF(?, ''), result_message),
+                    updated_at = ?
                 WHERE task_id = ?
                 """,
-                (task_status.value, result_message, updated_at, task_id),
+                (
+                    task_status.value,
+                    _datetime_to_text(retry_required_by),
+                    _datetime_to_text(retry_required_by),
+                    result_message,
+                    updated_at,
+                    task_id,
+                ),
             )
             connection.execute(
                 """
@@ -1436,6 +2464,100 @@ class SQLiteRuntimeRepository:
                     _json_dump(history.metadata),
                 ),
             )
+
+    def update_review_task_with_task_statuses(
+        self,
+        review_task: ReviewTask,
+        *,
+        task_updates: list[
+            tuple[str, TaskStatus, TaskStatus, TaskStatusHistory]
+        ],
+        result_message: str = "",
+        retry_required_by: datetime | None = None,
+    ) -> None:
+        """Resolve one review and update every affected task in one transaction."""
+
+        review_row = _review_task_to_row(review_task)
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            review_updated = connection.execute(
+                """
+                UPDATE review_tasks
+                SET review_status = :review_status,
+                    resolution_payload_json = :resolution_payload_json,
+                    updated_at = :updated_at,
+                    resolved_by = :resolved_by,
+                    resolved_at = :resolved_at,
+                    resolution_note = :resolution_note
+                WHERE review_task_id = :review_task_id
+                  AND review_status = 'pending'
+                """,
+                review_row,
+            ).rowcount
+            if review_updated != 1:
+                raise ValueError(
+                    "review task was not pending during group resolution"
+                )
+            self._cancel_review_outbox_on_connection(
+                connection,
+                review_task.review_task_id,
+                changed_at=review_task.updated_at or self._clock(),
+            )
+            changed_at = _datetime_to_text(
+                review_task.updated_at or self._clock()
+            )
+            for task_id, from_status, to_status, history in task_updates:
+                task_updated = connection.execute(
+                    """
+                    UPDATE tasks
+                    SET task_status = ?,
+                        required_by = COALESCE(?, required_by),
+                        expires_at = COALESCE(?, expires_at),
+                        result_message = COALESCE(NULLIF(?, ''), result_message),
+                        updated_at = ?
+                    WHERE task_id = ? AND task_status = ?
+                    """,
+                    (
+                        to_status.value,
+                        _datetime_to_text(retry_required_by),
+                        _datetime_to_text(retry_required_by),
+                        result_message,
+                        changed_at,
+                        task_id,
+                        from_status.value,
+                    ),
+                ).rowcount
+                if task_updated != 1:
+                    raise ValueError(
+                        f"task changed during group review resolution: {task_id}"
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO task_status_history(
+                        history_id, task_id, from_status, to_status, changed_by,
+                        changed_at, reason, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        history.history_id,
+                        history.task_id,
+                        history.from_status.value
+                        if history.from_status is not None
+                        else None,
+                        history.to_status.value,
+                        history.changed_by,
+                        _datetime_to_text(history.changed_at),
+                        history.reason,
+                        _json_dump(history.metadata),
+                    ),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def expire_review_task_with_notification_outbox(
         self,
@@ -1545,6 +2667,75 @@ class SQLiteRuntimeRepository:
         finally:
             connection.close()
 
+    def renew_review_task_with_notification_outbox(
+        self,
+        review_task: ReviewTask,
+        notification: NotificationOutbox,
+        compatibility_log: NotificationLog,
+        *,
+        expected_required_by: datetime | None,
+    ) -> tuple[int, int]:
+        """Atomically extend one pending review and persist its reminder."""
+
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            updated_review = connection.execute(
+                """
+                UPDATE review_tasks
+                SET required_by = ?, updated_at = ?
+                WHERE review_task_id = ?
+                  AND review_status = 'pending'
+                  AND required_by = ?
+                """,
+                (
+                    _datetime_to_text(review_task.required_by),
+                    _datetime_to_text(review_task.updated_at),
+                    review_task.review_task_id,
+                    _datetime_to_text(expected_required_by),
+                ),
+            ).rowcount
+            if updated_review != 1:
+                connection.rollback()
+                return 0, 0
+            self._cancel_review_outbox_on_connection(
+                connection,
+                review_task.review_task_id,
+                changed_at=review_task.updated_at or self._clock(),
+            )
+            outbox_inserted = self._insert_notification_outbox_on_connection(
+                connection,
+                notification,
+            )
+            if outbox_inserted != 1:
+                raise ValueError("renewed review notification was not inserted")
+            log_row = _notification_log_to_row(compatibility_log)
+            inserted_log = connection.execute(
+                """
+                INSERT INTO notification_logs(
+                    notification_id, related_task_id, related_review_task_id,
+                    recipient_type, recipient, channel, sent_at, send_status,
+                    dedupe_key, message, error_message, created_at
+                ) VALUES(
+                    :notification_id, :related_task_id, :related_review_task_id,
+                    :recipient_type, :recipient, :channel, :sent_at, :send_status,
+                    :dedupe_key, :message, :error_message, :created_at
+                )
+                """,
+                log_row,
+            ).rowcount
+            if inserted_log != 1:
+                raise ValueError(
+                    "renewed review compatibility log was not inserted"
+                )
+            connection.commit()
+            return updated_review, outbox_inserted
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     @classmethod
     def _cancel_review_outbox_on_connection(
         cls,
@@ -1615,7 +2806,6 @@ class SQLiteRuntimeRepository:
         with closing(self.connect()) as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
-                timestamp = now if now is not None else datetime.now()
                 token_row = connection.execute(
                     "SELECT * FROM review_tokens WHERE token_hash = ?",
                     (token_hash,),
@@ -1642,6 +2832,10 @@ class SQLiteRuntimeRepository:
                     )
 
                 expires_at = _text_to_datetime(token_row["expires_at"])
+                timestamp = _timestamp_for_deadline(
+                    provided=now,
+                    deadline=expires_at,
+                )
                 if expires_at is not None and expires_at <= timestamp:
                     raise MobileReviewTransactionError(
                         MobileReviewErrorCode.TOKEN_EXPIRED,
@@ -1695,6 +2889,55 @@ class SQLiteRuntimeRepository:
                         MobileReviewErrorCode.SOURCE_TASK_NOT_FOUND,
                         "关联源任务不存在或已失效",
                     )
+                review_model = _row_to_review_task(review_row)
+                source_model = _row_to_task(source_row)
+                affected_task_ids = review_source_task_ids(review_model)
+                source_rows = [source_row]
+                if len(affected_task_ids) > 1:
+                    placeholders = ",".join("?" for _ in affected_task_ids)
+                    grouped_rows = connection.execute(
+                        f"SELECT * FROM tasks WHERE task_id IN ({placeholders})",
+                        affected_task_ids,
+                    ).fetchall()
+                    rows_by_id = {
+                        str(row["task_id"]): row for row in grouped_rows
+                    }
+                    if any(
+                        task_id not in rows_by_id
+                        for task_id in affected_task_ids
+                    ):
+                        raise MobileReviewTransactionError(
+                            MobileReviewErrorCode.SOURCE_TASK_NOT_FOUND,
+                            "复核任务组中的来源任务不存在或已失效",
+                        )
+                    source_rows = [
+                        rows_by_id[task_id]
+                        for task_id in affected_task_ids
+                    ]
+                if status not in allowed_review_statuses(review_model, source_model):
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.ACTION_NOT_ALLOWED_FOR_REVIEW_TYPE,
+                        "执行失败复核只允许选择“重试任务”或“取消任务”。",
+                    )
+                business_decision = review_business_decision(
+                    review_model,
+                    source_model,
+                    status,
+                )
+                if business_decision:
+                    payload["decision"] = business_decision
+                    payload["task_group_id"] = str(
+                        review_model.review_payload.get("task_group_id") or ""
+                    )
+                    payload["affected_task_ids"] = affected_task_ids
+                    payload["affected_task_count"] = len(affected_task_ids)
+                retry_required_by = (
+                    retry_task_deadline(timestamp)
+                    if business_decision == "retry_task"
+                    else None
+                )
+                if retry_required_by is not None:
+                    payload["retry_required_by"] = retry_required_by.isoformat()
                 source_task_status = _atomic_source_task_status(source_row, status)
                 if source_task_status is None:
                     raise MobileReviewTransactionError(
@@ -1781,73 +3024,102 @@ class SQLiteRuntimeRepository:
                 inject("after_review_update")
 
                 if source_row is not None and source_task_status is not None:
-                    current_source_status = TaskStatus(str(source_row["task_status"]))
-                    if source_task_status != current_source_status and source_task_status not in ATOMIC_TASK_TRANSITIONS.get(
-                        current_source_status, set()
-                    ):
-                        raise MobileReviewTransactionError(
-                            MobileReviewErrorCode.CONCURRENT_UPDATE,
-                            "源任务状态已变化，复核请求未提交",
+                    for grouped_source_row in source_rows:
+                        grouped_task_id = str(grouped_source_row["task_id"])
+                        current_source_status = TaskStatus(
+                            str(grouped_source_row["task_status"])
                         )
-                    task_updated = connection.execute(
-                        """
-                        UPDATE tasks
-                        SET task_status = ?,
-                            target_price = COALESCE(?, target_price),
-                            target_status = COALESCE(?, target_status),
-                            decision_trace_json = COALESCE(?, decision_trace_json),
-                            result_message = COALESCE(NULLIF(?, ''), result_message),
-                            updated_at = ?
-                        WHERE task_id = ?
-                          AND task_status = ?
-                        """,
-                        (
-                            source_task_status.value,
-                            adjusted_target_price,
-                            adjusted_target_status,
-                            adjusted_decision_trace_json,
-                            adjusted_result_message,
-                            _datetime_to_text(timestamp),
-                            source_task_id,
-                            current_source_status.value,
-                        ),
-                    ).rowcount
-                    if task_updated != 1:
-                        raise MobileReviewTransactionError(
-                            MobileReviewErrorCode.CONCURRENT_UPDATE,
-                            "源任务状态已变化，复核请求未提交",
-                        )
-                    inject("after_task_update")
+                        if (
+                            source_task_status != current_source_status
+                            and source_task_status
+                            not in ATOMIC_TASK_TRANSITIONS.get(
+                                current_source_status,
+                                set(),
+                            )
+                        ):
+                            raise MobileReviewTransactionError(
+                                MobileReviewErrorCode.CONCURRENT_UPDATE,
+                                "任务组成员状态已变化，复核请求未提交",
+                            )
+                        task_updated = connection.execute(
+                            """
+                            UPDATE tasks
+                            SET task_status = ?,
+                                target_price = COALESCE(?, target_price),
+                                target_status = COALESCE(?, target_status),
+                                decision_trace_json = COALESCE(?, decision_trace_json),
+                                required_by = COALESCE(?, required_by),
+                                expires_at = COALESCE(?, expires_at),
+                                result_message = COALESCE(NULLIF(?, ''), result_message),
+                                updated_at = ?
+                            WHERE task_id = ?
+                              AND task_status = ?
+                            """,
+                            (
+                                source_task_status.value,
+                                adjusted_target_price,
+                                adjusted_target_status,
+                                adjusted_decision_trace_json,
+                                _datetime_to_text(retry_required_by),
+                                _datetime_to_text(retry_required_by),
+                                adjusted_result_message,
+                                _datetime_to_text(timestamp),
+                                grouped_task_id,
+                                current_source_status.value,
+                            ),
+                        ).rowcount
+                        if task_updated != 1:
+                            raise MobileReviewTransactionError(
+                                MobileReviewErrorCode.CONCURRENT_UPDATE,
+                                "任务组成员状态已变化，复核请求未提交",
+                            )
+                        inject("after_task_update")
 
-                    history_metadata = {
-                        "review_task_id": review_task_id,
-                        "review_status": status.value,
-                        "actor": resolved_actor,
-                        "actor_source": actor_source,
-                        "resolution_note": note,
-                        "resolution_payload_summary": resolution_payload_summary(payload),
-                    }
-                    history_id = uuid4().hex[:12]
-                    inject("before_history_insert")
-                    connection.execute(
-                        """
-                        INSERT INTO task_status_history(
-                            history_id, task_id, from_status, to_status, changed_by, changed_at, reason, metadata_json
+                        history_metadata = {
+                            "review_task_id": review_task_id,
+                            "review_status": status.value,
+                            "business_decision": business_decision,
+                            "task_group_id": payload.get("task_group_id"),
+                            "affected_task_count": len(source_rows),
+                            "retry_required_by": (
+                                retry_required_by.isoformat()
+                                if retry_required_by is not None
+                                else None
+                            ),
+                            "actor": resolved_actor,
+                            "actor_source": actor_source,
+                            "resolution_note": note,
+                            "resolution_payload_summary": (
+                                resolution_payload_summary(payload)
+                            ),
+                        }
+                        history_id = uuid4().hex[:12]
+                        inject("before_history_insert")
+                        connection.execute(
+                            """
+                            INSERT INTO task_status_history(
+                                history_id, task_id, from_status, to_status,
+                                changed_by, changed_at, reason, metadata_json
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                history_id,
+                                grouped_task_id,
+                                current_source_status.value,
+                                source_task_status.value,
+                                resolved_actor,
+                                _datetime_to_text(timestamp),
+                                (
+                                    f"review_task_group:{review_task_id}:"
+                                    f"{business_decision}"
+                                    if business_decision
+                                    else f"review_task:{review_task_id}:{status.value}"
+                                ),
+                                _json_dump(history_metadata),
+                            ),
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            history_id,
-                            source_task_id,
-                            current_source_status.value,
-                            source_task_status.value,
-                            resolved_actor,
-                            _datetime_to_text(timestamp),
-                            f"review_task:{review_task_id}:{status.value}",
-                            _json_dump(history_metadata),
-                        ),
-                    )
-                    inject("after_history_insert")
+                        inject("after_history_insert")
 
                 committed_review_row = connection.execute(
                     "SELECT * FROM review_tasks WHERE review_task_id = ?",
@@ -2126,6 +3398,68 @@ class SQLiteRuntimeRepository:
             ).fetchall()
         return [_row_to_shadowbot_attempt(row) for row in rows]
 
+    def list_shadowbot_listing_action_task_projection(
+        self,
+        *,
+        task_id: str,
+    ) -> list[dict[str, object]]:
+        """Return the read-only v5 listing execution projection for one task."""
+
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    item.source_task_id,
+                    batch.action_type,
+                    batch.batch_id,
+                    batch.execution_attempt_id AS batch_execution_attempt_id,
+                    batch.status AS batch_status,
+                    item.operation_id,
+                    item.item_execution_attempt_id,
+                    item.internal_sku,
+                    item.expected_old_status,
+                    item.target_status,
+                    item.target_price,
+                    item.target_inventory,
+                    item.detail_effect_state,
+                    item.listing_effect_state,
+                    item.operation_result,
+                    item.observed_price_before_action,
+                    item.observed_inventory_before_action,
+                    item.observed_price_after_detail_save,
+                    item.observed_inventory_after_detail_save,
+                    item.action_clicked_at,
+                    item.readback_observed_at,
+                    item.error_code,
+                    item.error_message,
+                    operation.status AS operation_status
+                FROM shadowbot_listing_action_batch_items AS item
+                INNER JOIN shadowbot_listing_action_batches AS batch
+                    ON batch.batch_id = item.batch_id
+                INNER JOIN shadowbot_operations AS operation
+                    ON operation.operation_id = item.operation_id
+                WHERE item.source_task_id = ?
+                ORDER BY batch.created_at, item.item_id
+                """,
+                (task_id,),
+            ).fetchall()
+            projections: list[dict[str, object]] = []
+            for row in rows:
+                projection = dict(row)
+                attempts = connection.execute(
+                    """
+                    SELECT execution_attempt_id, execution_mode, status,
+                           side_effect_state, started_at, ended_at
+                    FROM shadowbot_execution_attempts
+                    WHERE operation_id = ?
+                    ORDER BY started_at, execution_attempt_id
+                    """,
+                    (row["operation_id"],),
+                ).fetchall()
+                projection["attempts"] = [dict(attempt) for attempt in attempts]
+                projections.append(projection)
+        return projections
+
     def list_active_shadowbot_execution_attempts(self) -> list[ShadowBotExecutionAttempt]:
         with closing(self.connect()) as connection:
             rows = connection.execute(
@@ -2349,6 +3683,7 @@ class SQLiteRuntimeRepository:
                     execution_attempt_id,
                 ),
             )
+
             connection.execute(
                 """
                 UPDATE shadowbot_operations
@@ -4308,6 +5643,7 @@ def _task_to_row(task: Task) -> dict[str, Any]:
         "expires_at": _datetime_to_text(task.expires_at),
         "expected_old_price": serialize_decimal(task.expected_old_price),
         "target_price": serialize_decimal(task.target_price),
+        "target_inventory": task.target_inventory,
         "target_status": task.target_status,
         "pricing_source": task.pricing_source.value if task.pricing_source else None,
         "decision_trace_json": _json_dump(task.decision_trace),
@@ -4330,6 +5666,12 @@ def _row_to_task(row: sqlite3.Row) -> Task:
         if row["expected_old_price"] not in ("", None)
         else None,
         target_price=Decimal(str(row["target_price"])) if row["target_price"] not in ("", None) else None,
+        target_inventory=(
+            int(row["target_inventory"])
+            if "target_inventory" in row.keys()
+            and row["target_inventory"] not in ("", None)
+            else None
+        ),
         target_status=row["target_status"],
         pricing_source=PricingSource(str(row["pricing_source"])) if row["pricing_source"] not in ("", None) else None,
         decision_trace=_json_load(row["decision_trace_json"]),
@@ -4361,6 +5703,18 @@ def _listing_status_from_row(row: sqlite3.Row) -> ListingStatus:
         inventory_source=str(row["inventory_source"]),
         inventory_observed_at=_text_to_datetime(row["inventory_observed_at"]),
         inventory_source_attempt_id=str(row["inventory_source_attempt_id"]),
+        price_source=str(row["price_source"]),
+        price_observed_at=_text_to_datetime(row["price_observed_at"]),
+        price_source_attempt_id=str(row["price_source_attempt_id"]),
+        last_listing_change_at=_text_to_datetime(row["last_listing_change_at"]),
+        last_listing_operation_id=str(row["last_listing_operation_id"] or ""),
+        online_status_observed_at=_text_to_datetime(
+            row["online_status_observed_at"]
+        ),
+        online_status_source_type=str(
+            row["online_status_source_type"] or ""
+        ),
+        online_status_source_id=str(row["online_status_source_id"] or ""),
     )
 
 
@@ -4970,6 +6324,24 @@ def _coerce_datetime_for_comparison(value: datetime | None, reference: datetime)
     if value.tzinfo is not None and reference.tzinfo is None:
         return value.replace(tzinfo=None)
     return value
+
+
+def _timestamp_for_deadline(
+    *,
+    provided: datetime | None,
+    deadline: datetime | None,
+) -> datetime:
+    """Return a timestamp comparable with a persisted naive or aware deadline."""
+
+    if deadline is None or deadline.tzinfo is None or deadline.utcoffset() is None:
+        if provided is None:
+            return datetime.now()
+        return provided.replace(tzinfo=None)
+    if provided is None:
+        return datetime.now(deadline.tzinfo)
+    if provided.tzinfo is None or provided.utcoffset() is None:
+        return provided.replace(tzinfo=deadline.tzinfo)
+    return provided.astimezone(deadline.tzinfo)
 
 
 def _sanitize_persisted_error(value: object) -> str:

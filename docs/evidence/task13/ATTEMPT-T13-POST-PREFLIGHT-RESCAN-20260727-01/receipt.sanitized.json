@@ -1,0 +1,13 @@
+{
+  "accepted_at": "2026-07-27T08:16:37.569835+00:00",
+  "ack_state": "WRITTEN",
+  "ack_updated_at": "2026-07-27T08:16:37.622409+00:00",
+  "batch_id": "BATCH-T13-POST-PREFLIGHT-RESCAN-20260727-01",
+  "execution_attempt_id": "ATTEMPT-T13-POST-PREFLIGHT-RESCAN-20260727-01",
+  "instruction_hash": "sha256:fa2d6d79f3b136733d0fc0c4afb3eff36a5f7f0ef313330acc58b3f6ec21b9f3",
+  "last_projection_error": "",
+  "manifest_sha256": "sha256:10377d76df0a256b32e03c6f64a7769df4bdd431f85874ddb7e9d221d6193c08",
+  "result_id": "RESULT-dfac7a5eb363ba8aa270e0e1",
+  "result_sha256": "5016a15dadaca15aae1d5ca2c64d931b1d7b23444b256531b82f0cbcb21029a9",
+  "source_result_path": "<REDACTED_PATH>/ATTEMPT-T13-POST-PREFLIGHT-RESCAN-20260727-01.result.json"
+}

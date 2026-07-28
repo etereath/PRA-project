@@ -1,0 +1,10 @@
+{
+  "batch_id": "BATCH-T13-OPTIMIZED-SET-ONLINE-20260726-02",
+  "execution_attempt_id": "ATTEMPT-T13-OPTIMIZED-SET-ONLINE-20260726-02",
+  "report_path": "<REDACTED_PATH>/ATTEMPT-T13-OPTIMIZED-SET-ONLINE-20260726-02.listing-action-report.md",
+  "result_file_sha256": "03defb90a792750f5365b356b8287d4fa1de7042071189779ae3dca65b58cd9f",
+  "result_id": "RESULT-00142e5fec216f54c8974021",
+  "schema_version": "shadowbot-listing-action-import-ack-1.0",
+  "status": "VERIFIED",
+  "written_at": "2026-07-26T11:07:31.854305+00:00"
+}

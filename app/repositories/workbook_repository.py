@@ -147,6 +147,7 @@ TASK_HEADERS = [
     "created_at",
     "expected_old_price",
     "target_price",
+    "target_inventory",
     "target_status",
     "pricing_source",
     "decision_trace",
@@ -550,6 +551,7 @@ def export_tasks(path: Path, tasks: Iterable[Task]) -> Path:
                 record["created_at"],
                 serialize_decimal(task.expected_old_price),
                 serialize_decimal(task.target_price),
+                task.target_inventory,
                 record["target_status"],
                 record["pricing_source"],
                 str(record["decision_trace"]),
@@ -588,6 +590,12 @@ def load_tasks(path: Path) -> list[Task]:
                 else None,
                 target_price=parse_decimal(row["target_price"], f"tasks row {row_number} target_price")
                 if row.get("target_price") not in ("", None)
+                else None,
+                target_inventory=parse_int(
+                    row["target_inventory"],
+                    f"tasks row {row_number} target_inventory",
+                )
+                if row.get("target_inventory") not in ("", None)
                 else None,
                 target_status=str(row["target_status"]) if row.get("target_status") not in ("", None) else None,
                 pricing_source=PricingSource(str(row["pricing_source"]))
@@ -1225,10 +1233,18 @@ def _read_task_rows(path: Path) -> list[dict[str, object]]:
     sheet = workbook.active
     header_row = [cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))]
     accepted_headers = TASK_HEADERS
+    legacy_optional_headers = (
+        ("target_inventory",),
+        ("required_by",),
+        ("expected_old_price",),
+        ("target_inventory", "required_by"),
+        ("target_inventory", "expected_old_price"),
+        ("expected_old_price", "required_by"),
+        ("target_inventory", "expected_old_price", "required_by"),
+    )
     legacy_header_variants = [
-        [header for header in TASK_HEADERS if header != "required_by"],
-        [header for header in TASK_HEADERS if header != "expected_old_price"],
-        [header for header in TASK_HEADERS if header not in {"expected_old_price", "required_by"}],
+        [header for header in TASK_HEADERS if header not in omitted]
+        for omitted in legacy_optional_headers
     ]
     if header_row in legacy_header_variants:
         accepted_headers = header_row
@@ -1241,6 +1257,7 @@ def _read_task_rows(path: Path) -> list[dict[str, object]]:
             continue
         row = dict(zip(accepted_headers, raw_row, strict=True))
         row.setdefault("expected_old_price", None)
+        row.setdefault("target_inventory", None)
         row.setdefault("required_by", None)
         rows.append(row)
     return rows

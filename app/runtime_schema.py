@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 
-LATEST_RUNTIME_SCHEMA_VERSION = 12
+LATEST_RUNTIME_SCHEMA_VERSION = 13
 RUNTIME_SCHEMA_VERSIONS = tuple(range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1))
 
 REQUIRED_RUNTIME_TABLES = frozenset(
@@ -39,6 +39,13 @@ REQUIRED_RUNTIME_TABLES = frozenset(
         "shadowbot_commit_batch_items",
         "shadowbot_write_locks",
         "shadowbot_commit_result_receipts",
+        "shadowbot_batch_registry",
+        "shadowbot_listing_action_batches",
+        "shadowbot_listing_action_batch_items",
+        "shadowbot_listing_result_receipts",
+        "listing_sync_snapshots",
+        "listing_sync_snapshot_items",
+        "listing_anomaly_cases",
     }
 )
 
@@ -154,6 +161,199 @@ V12_INDEX_SPECS: Mapping[str, tuple[str, ...]] = {
     "ix_shadowbot_commit_result_receipts_batch_id": ("batch_id",),
     "ix_shadowbot_commit_result_receipts_ack_state": ("ack_state", "accepted_at"),
 }
+
+V13_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
+    "tasks": ("target_inventory",),
+    "listing_status": (
+        "price_source",
+        "price_observed_at",
+        "price_source_attempt_id",
+        "last_listing_change_at",
+        "last_listing_operation_id",
+        "online_status_observed_at",
+        "online_status_source_type",
+        "online_status_source_id",
+    ),
+    "shadowbot_operations": (
+        "action_type",
+        "expected_old_status",
+        "target_status",
+        "target_inventory",
+        "approved_payload_json",
+        "operation_result",
+        "resolution_status",
+        "resolved_by",
+        "resolved_at",
+        "superseded_by_operation_id",
+    ),
+    "shadowbot_batch_registry": (
+        "batch_id",
+        "batch_type",
+        "contract_version",
+        "platform_name",
+        "created_at",
+    ),
+    "shadowbot_listing_action_batches": (
+        "batch_id",
+        "contract_version",
+        "execution_profile",
+        "action_type",
+        "platform_name",
+        "manifest_sha256",
+        "instruction_hash",
+        "execution_attempt_id",
+        "result_id",
+        "status",
+        "batch_target_count",
+        "verified_count",
+        "unknown_count",
+        "partial_effect_count",
+        "not_attempted_count",
+        "failed_count",
+        "created_at",
+        "updated_at",
+    ),
+    "shadowbot_listing_action_batch_items": (
+        "item_id",
+        "batch_id",
+        "source_task_id",
+        "operation_id",
+        "item_execution_attempt_id",
+        "internal_sku",
+        "expected_product_name",
+        "expected_grade",
+        "item_payload_sha256",
+        "write_identity_key",
+        "page_identity_key",
+        "expected_old_status",
+        "target_status",
+        "target_price",
+        "target_inventory",
+        "detail_effect_state",
+        "listing_effect_state",
+        "observed_price_before_action",
+        "observed_inventory_before_action",
+        "observed_price_after_detail_save",
+        "observed_inventory_after_detail_save",
+        "detail_save_clicked_at",
+        "action_clicked_at",
+        "readback_observed_at",
+        "operation_result",
+        "error_code",
+        "error_message",
+        "updated_at",
+    ),
+    "shadowbot_listing_result_receipts": (
+        "result_id",
+        "batch_id",
+        "execution_attempt_id",
+        "instruction_hash",
+        "manifest_sha256",
+        "result_sha256",
+        "source_result_path",
+        "accepted_at",
+        "ack_state",
+        "ack_updated_at",
+        "last_projection_error",
+    ),
+    "listing_sync_snapshots": (
+        "snapshot_id",
+        "batch_id",
+        "platform_name",
+        "execution_attempt_id",
+        "scan_started_at",
+        "scan_completed_at",
+        "online_scan_started_at",
+        "online_scan_completed_at",
+        "waiting_scan_started_at",
+        "waiting_scan_completed_at",
+        "online_scan_complete",
+        "waiting_scan_complete",
+        "snapshot_complete",
+        "online_end_marker_verified",
+        "waiting_end_marker_verified",
+        "instruction_hash",
+        "result_id",
+        "status",
+        "error_code",
+        "evidence_manifest_sha256",
+    ),
+    "listing_sync_snapshot_items": (
+        "snapshot_item_id",
+        "snapshot_id",
+        "internal_sku",
+        "product_name",
+        "grade",
+        "page_identity_key",
+        "online_occurrences",
+        "waiting_occurrences",
+        "listing_location",
+        "online_row_identities_json",
+        "waiting_row_identities_json",
+        "online_observed_price",
+        "waiting_observed_price",
+        "online_observed_inventory",
+        "waiting_observed_inventory",
+        "diagnostic_code",
+        "online_observed_at",
+        "waiting_observed_at",
+    ),
+    "listing_anomaly_cases": (
+        "anomaly_case_id",
+        "snapshot_id",
+        "snapshot_item_id",
+        "platform_name",
+        "internal_sku",
+        "page_identity_key",
+        "affected_internal_skus_json",
+        "anomaly_subject_key",
+        "dedupe_key",
+        "reason_code",
+        "diagnostic_message",
+        "resolution_policy",
+        "blocked_actions_json",
+        "created_at",
+        "cleared_at",
+        "cleared_by_snapshot_id",
+        "review_task_id",
+    ),
+}
+
+V13_INDEX_SPECS: Mapping[str, tuple[str, ...]] = {
+    "ix_shadowbot_batch_registry_type": ("batch_type", "created_at"),
+    "ix_shadowbot_listing_action_batches_status": ("status", "created_at"),
+    "ux_shadowbot_listing_action_batch_items_batch_sku": (
+        "batch_id",
+        "internal_sku",
+    ),
+    "ux_shadowbot_listing_action_batch_items_operation_id": ("operation_id",),
+    "ux_shadowbot_listing_action_batch_items_attempt_id": (
+        "item_execution_attempt_id",
+    ),
+    "ix_shadowbot_listing_result_receipts_batch_id": ("batch_id",),
+    "ix_listing_sync_snapshots_platform_completed": (
+        "platform_name",
+        "scan_completed_at",
+    ),
+    "ix_listing_sync_snapshot_items_snapshot": ("snapshot_id",),
+    "ix_listing_sync_snapshot_items_internal_sku": (
+        "internal_sku",
+        "snapshot_id",
+    ),
+    "ux_listing_anomaly_cases_open_dedupe": ("dedupe_key",),
+    "ix_listing_anomaly_cases_snapshot": ("snapshot_id",),
+    "ix_listing_anomaly_cases_review": ("review_task_id",),
+}
+
+V13_WRITE_LOCK_STATUS_VALUES = frozenset(
+    {"ACTIVE", "UNKNOWN", "REVIEW_BLOCKED", "RELEASED"}
+)
+V13_OPERATION_ACTION_VALUES = frozenset(
+    {"update_price", "set_online", "set_offline"}
+)
+V13_BATCH_TYPE_VALUES = frozenset(
+    {"update_price", "set_online", "set_offline", "sync_status"}
+)
 
 V5_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "shadowbot_execution_attempts": (
@@ -359,6 +559,7 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
             **V10_REQUIRED_COLUMNS,
             **V11_REQUIRED_COLUMNS,
             **V12_REQUIRED_COLUMNS,
+            **V13_REQUIRED_COLUMNS,
         }.items():
             if table not in tables:
                 continue
@@ -413,6 +614,10 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
                 constraint_errors.append(
                     f"{index_name} columns expected {expected_columns}, actual {actual_columns}"
                 )
+        if not missing_tables:
+            missing_index_names.update(
+                _check_v13_constraints(connection, constraint_errors)
+            )
         missing_indexes = tuple(sorted(missing_index_names))
 
         ok = not (
@@ -440,7 +645,14 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
             version_matches=False,
             missing_tables=tuple(sorted(REQUIRED_RUNTIME_TABLES)),
             missing_columns={},
-            missing_indexes=tuple(sorted(RETRY_AUTHORIZATION_INDEXES | NOTIFICATION_OUTBOX_INDEXES)),
+            missing_indexes=tuple(
+                sorted(
+                    RETRY_AUTHORIZATION_INDEXES
+                    | NOTIFICATION_OUTBOX_INDEXES
+                    | frozenset(V12_INDEX_SPECS)
+                    | frozenset(V13_INDEX_SPECS)
+                )
+            ),
             constraint_errors=(),
             error=f"sqlite error: {type(exc).__name__}",
         )
@@ -465,6 +677,227 @@ def assert_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealth
     if not result.ok:
         raise RuntimeError(result.summary)
     return result
+
+
+def _check_v13_constraints(
+    connection: sqlite3.Connection,
+    errors: list[str],
+) -> tuple[str, ...]:
+    missing_indexes: list[str] = []
+    for index_name, expected_columns in V13_INDEX_SPECS.items():
+        row = connection.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index_name,),
+        ).fetchone()
+        if row is None:
+            missing_indexes.append(index_name)
+            continue
+        actual_columns = tuple(
+            str(index_row[2])
+            for index_row in connection.execute(
+                f"PRAGMA index_info('{index_name}')"
+            ).fetchall()
+        )
+        if actual_columns != expected_columns:
+            errors.append(
+                f"{index_name} columns expected {expected_columns}, actual {actual_columns}"
+            )
+    anomaly_indexes = {
+        str(row[1]): row
+        for row in connection.execute(
+            "PRAGMA index_list('listing_anomaly_cases')"
+        ).fetchall()
+    }
+    anomaly_dedupe = anomaly_indexes.get(
+        "ux_listing_anomaly_cases_open_dedupe"
+    )
+    if anomaly_dedupe is not None:
+        if int(anomaly_dedupe[2]) != 1 or int(anomaly_dedupe[4]) != 1:
+            errors.append(
+                "ux_listing_anomaly_cases_open_dedupe must be unique and partial"
+            )
+        sql_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = "
+            "'ux_listing_anomaly_cases_open_dedupe'"
+        ).fetchone()
+        index_sql = str(sql_row[0] or "") if sql_row else ""
+        if not re.search(
+            r"WHERE\s+cleared_at\s+IS\s+NULL",
+            index_sql,
+            re.IGNORECASE,
+        ):
+            errors.append(
+                "ux_listing_anomaly_cases_open_dedupe must cover open cases only"
+            )
+
+    operation_info = {
+        str(row[1]): row
+        for row in connection.execute(
+            "PRAGMA table_info(shadowbot_operations)"
+        ).fetchall()
+    }
+    for nullable_price in ("expected_old_price", "target_price"):
+        row = operation_info.get(nullable_price)
+        if row is None or int(row[3]) != 0:
+            errors.append(
+                f"shadowbot_operations.{nullable_price} must be nullable"
+            )
+    operation_sql = _table_sql(connection, "shadowbot_operations")
+    _check_exact_status_values(
+        operation_sql,
+        column="action_type",
+        expected=V13_OPERATION_ACTION_VALUES,
+        label="shadowbot_operations.action_type",
+        errors=errors,
+    )
+    write_lock_sql = _table_sql(connection, "shadowbot_write_locks")
+    _check_exact_status_values(
+        write_lock_sql,
+        column="status",
+        expected=V13_WRITE_LOCK_STATUS_VALUES,
+        label="shadowbot_write_locks.status",
+        errors=errors,
+    )
+    registry_sql = _table_sql(connection, "shadowbot_batch_registry")
+    _check_exact_status_values(
+        registry_sql,
+        column="batch_type",
+        expected=V13_BATCH_TYPE_VALUES,
+        label="shadowbot_batch_registry.batch_type",
+        errors=errors,
+    )
+
+    foreign_key_requirements = {
+        "shadowbot_write_locks": {
+            ("operation_id", "shadowbot_operations", "operation_id"),
+            (
+                "item_execution_attempt_id",
+                "shadowbot_execution_attempts",
+                "execution_attempt_id",
+            ),
+            ("batch_id", "shadowbot_batch_registry", "batch_id"),
+        },
+        "shadowbot_listing_action_batches": {
+            ("batch_id", "shadowbot_batch_registry", "batch_id"),
+        },
+        "shadowbot_listing_action_batch_items": {
+            ("batch_id", "shadowbot_listing_action_batches", "batch_id"),
+            ("source_task_id", "tasks", "task_id"),
+            ("operation_id", "shadowbot_operations", "operation_id"),
+            (
+                "item_execution_attempt_id",
+                "shadowbot_execution_attempts",
+                "execution_attempt_id",
+            ),
+        },
+        "shadowbot_listing_result_receipts": {
+            ("batch_id", "shadowbot_listing_action_batches", "batch_id"),
+        },
+        "listing_sync_snapshots": {
+            ("batch_id", "shadowbot_listing_action_batches", "batch_id"),
+            (
+                "result_id",
+                "shadowbot_listing_result_receipts",
+                "result_id",
+            ),
+        },
+        "listing_sync_snapshot_items": {
+            ("snapshot_id", "listing_sync_snapshots", "snapshot_id"),
+        },
+        "listing_anomaly_cases": {
+            ("snapshot_id", "listing_sync_snapshots", "snapshot_id"),
+            (
+                "snapshot_item_id",
+                "listing_sync_snapshot_items",
+                "snapshot_item_id",
+            ),
+            ("review_task_id", "review_tasks", "review_task_id"),
+            (
+                "cleared_by_snapshot_id",
+                "listing_sync_snapshots",
+                "snapshot_id",
+            ),
+        },
+    }
+    for table, required in foreign_key_requirements.items():
+        actual = {
+            (str(row[3]), str(row[2]), str(row[4]))
+            for row in connection.execute(
+                f"PRAGMA foreign_key_list('{table}')"
+            ).fetchall()
+        }
+        for column, target_table, target_column in sorted(required - actual):
+            errors.append(
+                f"missing foreign key {table}.{column} -> "
+                f"{target_table}({target_column})"
+            )
+
+    for source_table in (
+        "shadowbot_commit_batches",
+        "shadowbot_listing_action_batches",
+    ):
+        missing_registry = int(
+            connection.execute(
+                f"""
+                SELECT COUNT(*)
+                FROM {source_table} AS source
+                LEFT JOIN shadowbot_batch_registry AS registry
+                  ON registry.batch_id = source.batch_id
+                WHERE registry.batch_id IS NULL
+                """
+            ).fetchone()[0]
+        )
+        if missing_registry:
+            errors.append(
+                f"{source_table} has {missing_registry} batch rows without registry"
+            )
+    try:
+        foreign_key_rows = connection.execute(
+            "PRAGMA foreign_key_check"
+        ).fetchall()
+    except sqlite3.DatabaseError:
+        errors.append("PRAGMA foreign_key_check could not validate malformed keys")
+    else:
+        if foreign_key_rows:
+            errors.append(
+                f"PRAGMA foreign_key_check returned {len(foreign_key_rows)} row(s)"
+            )
+    return tuple(sorted(missing_indexes))
+
+
+def _table_sql(connection: sqlite3.Connection, table: str) -> str:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table,),
+    ).fetchone()
+    return str(row[0] or "") if row else ""
+
+
+def _check_exact_status_values(
+    table_sql: str,
+    *,
+    column: str,
+    expected: frozenset[str],
+    label: str,
+    errors: list[str],
+) -> None:
+    match = re.search(
+        rf"\b{column}\b\s+[^,]*?\bCHECK\s*\(\s*{column}\s+IN\s*"
+        r"\((?P<values>[^)]*)\)\s*\)",
+        table_sql,
+        re.IGNORECASE | re.DOTALL,
+    )
+    actual = {
+        value.replace("''", "'")
+        for value in re.findall(
+            r"'((?:''|[^'])*)'",
+            match.group("values") if match else "",
+        )
+    }
+    if actual != expected:
+        errors.append(
+            f"{label} CHECK must allow exactly " + ", ".join(sorted(expected))
+        )
 
 
 def _check_retry_authorization_constraints(

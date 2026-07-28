@@ -19,32 +19,44 @@ try:
     from app.shadowbot_contract_primitives import (
         contract_identity_key,
         derive_v4_batch_semantics,
+        derive_v5_batch_semantics,
         normalize_contract_grade,
         normalize_contract_sku,
         normalize_contract_text,
+        set_offline_confirmation_matches,
+        set_online_confirmation_matches,
         sha256_json,
         v4_result_counts,
+        v5_result_counts,
     )
 except ImportError:
     try:
         from .shadowbot_contract_primitives import (
             contract_identity_key,
             derive_v4_batch_semantics,
+            derive_v5_batch_semantics,
             normalize_contract_grade,
             normalize_contract_sku,
             normalize_contract_text,
+            set_offline_confirmation_matches,
+            set_online_confirmation_matches,
             sha256_json,
             v4_result_counts,
+            v5_result_counts,
         )
     except ImportError:
         from shadowbot_contract_primitives import (
             contract_identity_key,
             derive_v4_batch_semantics,
+            derive_v5_batch_semantics,
             normalize_contract_grade,
             normalize_contract_sku,
             normalize_contract_text,
+            set_offline_confirmation_matches,
+            set_online_confirmation_matches,
             sha256_json,
             v4_result_counts,
+            v5_result_counts,
         )
 
 
@@ -67,8 +79,10 @@ APPLET_URI_PREFIXES = ("weixin://launchapplet/",)
 
 ROW_INDEX_START = 1
 ROW_INDEX_STEP = 16
+WAITING_ROW_INDEX_STEP = 15
 INDEXED_ENUMERATION_MAX_ROWS = 50
 PRICE_INDEX_OFFSET = 9
+WAITING_PRICE_INDEX_OFFSET = 8
 INVENTORY_INDEX_OFFSET = 6
 INVENTORY_TEXT_INDEX = 0
 DEFAULT_MAX_PRODUCT_ROWS = 3
@@ -90,6 +104,11 @@ SELECTOR_TEMPLATES = {
     "grade": "商品_2_等级",
     "inventory": "商品_1_库存",
 }
+WAITING_SELECTOR_TEMPLATES = {
+    "name": "待上架_商品1_名称",
+    "grade": "待上架_商品1_等级",
+    "inventory": "待上架_商品1_库存",
+}
 
 DIALOG_VALUE_CHILD_INDEXES = {
     ELEMENTS["dialog_product_name"]: 3,
@@ -97,7 +116,30 @@ DIALOG_VALUE_CHILD_INDEXES = {
     ELEMENTS["dialog_current_price"]: 7,
 }
 ONLINE_LIST_LABEL = "上架中"
+WAITING_LIST_LABEL = "待上架"
+WAITING_LIST_SELECTOR = "按钮_待上架"
+ONLINE_SET_OFFLINE_BUTTON_SELECTOR = "上架中_商品1_下架按钮"
+ONLINE_SET_OFFLINE_PROMPT_SELECTOR = "上架中_下架确认弹窗_提示文本"
+ONLINE_SET_OFFLINE_CONFIRM_SELECTOR = "上架中_下架确认弹窗_确认按钮"
+ONLINE_SET_OFFLINE_CANCEL_SELECTOR = "上架中_下架确认弹窗_取消按钮"
+WAITING_SET_ONLINE_BUTTON_SELECTOR = "待上架_商品1_上架按钮"
+WAITING_SET_ONLINE_PROMPT_SELECTOR = "待上架_上架确认弹窗_提示文本"
+WAITING_SET_ONLINE_CONFIRM_SELECTOR = "待上架_上架确认弹窗_确认按钮"
+WAITING_SET_ONLINE_CANCEL_SELECTOR = "待上架_上架确认弹窗_取消按钮"
+WAITING_PRICE_POPUP_SELECTOR = "待上架_商品1_修改价格弹窗"
+WAITING_PRICE_INPUT_SELECTOR = "待上架_商品1_修改价格弹窗_价格输入框"
+WAITING_PRICE_CANCEL_SELECTOR = "待上架_商品1_修改价格弹窗_取消按钮"
+WAITING_PRICE_CONFIRM_SELECTOR = "待上架_商品1_修改价格弹窗_确认按钮"
+WAITING_INVENTORY_POPUP_SELECTOR = "待上架_修改库存弹窗"
+WAITING_INVENTORY_INPUT_SELECTOR = "待上架_商品1_修改库存弹窗_库存输入框"
+WAITING_INVENTORY_CANCEL_SELECTOR = "待上架_商品1_修改库存弹窗_取消按钮"
+WAITING_INVENTORY_CONFIRM_SELECTOR = "待上架_商品1_修改库存弹窗_确认按钮"
+WAITING_SET_ONLINE_INDEX_OFFSET = 13
+ONLINE_SET_OFFLINE_INDEX_OFFSET = 14
 PRODUCT_LIST_END_LABEL = "没有更多了"
+PRODUCT_LIST_EMPTY_LABEL = "暂无商品"
+V5_KEYBOARD_LOAD_WAIT_SECONDS = 0.1
+V5_KEYBOARD_END_LOAD_WAIT_SECONDS = 0.8
 
 DEFAULT_REQUEST = {
     "execution_mode": "READ_ONLY",
@@ -633,36 +675,102 @@ def _clone_row_value_selector(base_name, inferred_name, target_index):
     return Selector(value)
 
 
-def _row_field_selector(row_parent_index, field):
+def _row_field_selector(row_parent_index, field, page_type="online"):
+    waiting = str(page_type or "online").strip().lower() == "waiting"
+    templates = WAITING_SELECTOR_TEMPLATES if waiting else SELECTOR_TEMPLATES
+    price_offset = WAITING_PRICE_INDEX_OFFSET if waiting else PRICE_INDEX_OFFSET
     if field == "name":
         return _clone_row_selector(
-            SELECTOR_TEMPLATES["name"],
+            templates["name"],
             "动态_index_%d_商品名称" % row_parent_index,
             row_parent_index,
             1,
         )
     if field == "grade":
         return _clone_row_selector(
-            SELECTOR_TEMPLATES["grade"],
+            templates["grade"],
             "动态_index_%d_商品等级" % row_parent_index,
             row_parent_index,
             0,
         )
     if field == "price":
         return _clone_row_selector(
-            SELECTOR_TEMPLATES["name"],
+            templates["name"],
             "动态_index_%d_商品价格" % row_parent_index,
-            row_parent_index + PRICE_INDEX_OFFSET,
+            row_parent_index + price_offset,
             0,
         )
     if field == "inventory":
         return _clone_row_value_selector(
-            SELECTOR_TEMPLATES["inventory"],
+            templates["inventory"],
             "动态_index_%d_商品库存" % row_parent_index,
             row_parent_index + INVENTORY_INDEX_OFFSET,
         )
     raise SliceError("SELECTOR_BUILD_FAILED", "不支持的行字段: " + field)
 
+
+def _waiting_row_action_selector(row_parent_index, base_name, inferred_name):
+    base = package.selector(base_name)
+    value = copy.deepcopy(base.__dict__["value"])
+    _remove_dynamic_page_id_constraints(value)
+    value["id"] = str(uuid.uuid4())
+    value["name"] = inferred_name
+    value["screenshot"] = ""
+    selected_nodes = [
+        node for node in value["path"] if node.get("selected") is True
+    ]
+    indexed_wx_views = [
+        node
+        for node in selected_nodes
+        if node.get("name") == "wx-view"
+        and any(
+            attribute.get("name") == "index"
+            for attribute in node.get("attributes", [])
+        )
+    ]
+    if not indexed_wx_views:
+        raise SliceError(
+            "SELECTOR_BUILD_FAILED",
+            "待上架动作选择器缺少可替换 wx-view index",
+        )
+    _set_path_attribute(
+        indexed_wx_views[-1],
+        "index",
+        int(row_parent_index) + WAITING_SET_ONLINE_INDEX_OFFSET,
+    )
+    return Selector(value)
+
+
+def _online_row_action_selector(row_parent_index, base_name, inferred_name):
+    base = package.selector(base_name)
+    value = copy.deepcopy(base.__dict__["value"])
+    _remove_dynamic_page_id_constraints(value)
+    value["id"] = str(uuid.uuid4())
+    value["name"] = inferred_name
+    value["screenshot"] = ""
+    selected_nodes = [
+        node for node in value["path"] if node.get("selected") is True
+    ]
+    indexed_wx_views = [
+        node
+        for node in selected_nodes
+        if node.get("name") == "wx-view"
+        and any(
+            attribute.get("name") == "index"
+            for attribute in node.get("attributes", [])
+        )
+    ]
+    if not indexed_wx_views:
+        raise SliceError(
+            "SELECTOR_BUILD_FAILED",
+            "上架中动作选择器缺少可替换 wx-view index",
+        )
+    _set_path_attribute(
+        indexed_wx_views[-1],
+        "index",
+        int(row_parent_index) + ONLINE_SET_OFFLINE_INDEX_OFFSET,
+    )
+    return Selector(value)
 
 
 def _generic_acc_node_selector(node_name, selector_name):
@@ -741,6 +849,96 @@ def _clone_dialog_value_selector(base_name, inferred_name):
     ]
     _set_path_attribute(target_node, "role", "StaticText")
     return Selector(value)
+
+
+def _clone_dynamic_static_text_selector(
+    base_name,
+    inferred_name,
+    expected_text=None,
+):
+    """Remove captured business text while retaining the dialog structure."""
+
+    base = package.selector(base_name)
+    value = copy.deepcopy(base.__dict__["value"])
+    _remove_dynamic_page_id_constraints(value)
+    value["id"] = str(uuid.uuid4())
+    value["name"] = inferred_name
+    value["screenshot"] = ""
+    static_nodes = [
+        node for node in value["path"] if node.get("name") == "StaticText"
+    ]
+    if not static_nodes:
+        raise SliceError(
+            "SELECTOR_BUILD_FAILED",
+            "弹窗文本模板缺少 StaticText",
+            retryable=False,
+        )
+    target_node = static_nodes[-1]
+    target_node["selected"] = True
+    target_node["attributes"] = [
+        attribute
+        for attribute in target_node.get("attributes", [])
+        if attribute.get("name")
+        not in {"acc-name", "explicit-name", "name-from", "value"}
+    ]
+    _set_path_attribute(target_node, "role", "StaticText")
+    if expected_text is not None:
+        _set_path_attribute(
+            target_node,
+            "acc-name",
+            str(expected_text),
+        )
+    return Selector(value)
+
+
+def _assert_set_online_confirmation_identity(
+    prompt_text,
+    expected_product_name,
+    expected_grade,
+):
+    try:
+        matched = set_online_confirmation_matches(
+            prompt_text,
+            expected_product_name,
+            expected_grade,
+        )
+    except ValueError as exc:
+        raise SliceError(
+            "SET_ONLINE_CONFIRMATION_INVALID",
+            "上架确认弹窗无法解析: " + str(exc),
+            retryable=False,
+        )
+    if not matched:
+        raise SliceError(
+            "PRODUCT_IDENTITY_MISMATCH",
+            "上架确认弹窗商品身份与目标不一致，拒绝确认",
+            retryable=False,
+        )
+
+
+def _assert_set_offline_confirmation_identity(
+    prompt_text,
+    expected_product_name,
+    expected_grade,
+):
+    try:
+        matched = set_offline_confirmation_matches(
+            prompt_text,
+            expected_product_name,
+            expected_grade,
+        )
+    except ValueError as exc:
+        raise SliceError(
+            "SET_OFFLINE_CONFIRMATION_INVALID",
+            "下架确认弹窗无法解析: " + str(exc),
+            retryable=False,
+        )
+    if not matched:
+        raise SliceError(
+            "PRODUCT_IDENTITY_MISMATCH",
+            "下架确认弹窗商品身份与目标不一致，拒绝确认",
+            retryable=False,
+        )
 
 
 def _element_attributes(element):
@@ -1324,9 +1522,19 @@ def _read_text(window, selector_or_name, timeout_seconds):
     return str(value or "").strip()
 
 
-def _enumerate_product_rows(window, timeout_seconds, scan_state=None):
-    """Probe only the deterministic product-row index sequence: 1, 17, 33..."""
+def _enumerate_product_rows(
+    window,
+    timeout_seconds,
+    scan_state=None,
+    page_type="online",
+):
+    """Probe the page-specific deterministic product-row index sequence."""
     row_timeout = min(timeout_seconds, 3)
+    row_index_step = (
+        WAITING_ROW_INDEX_STEP
+        if str(page_type or "online").strip().lower() == "waiting"
+        else ROW_INDEX_STEP
+    )
     rows = []
     if scan_state is not None:
         scan_state.clear()
@@ -1338,12 +1546,12 @@ def _enumerate_product_rows(window, timeout_seconds, scan_state=None):
             }
         )
     for position in range(1, INDEXED_ENUMERATION_MAX_ROWS + 1):
-        parent_index = ROW_INDEX_START + ROW_INDEX_STEP * (position - 1)
+        parent_index = ROW_INDEX_START + row_index_step * (position - 1)
         try:
             name = _strip_label(
                 _read_text(
                     window,
-                    _row_field_selector(parent_index, "name"),
+                    _row_field_selector(parent_index, "name", page_type),
                     row_timeout,
                 ),
                 ("商品名称", "名称"),
@@ -1374,7 +1582,7 @@ def _enumerate_product_rows(window, timeout_seconds, scan_state=None):
             grade = _strip_label(
                 _read_text(
                     window,
-                    _row_field_selector(parent_index, "grade"),
+                    _row_field_selector(parent_index, "grade", page_type),
                     row_timeout,
                 ),
                 ("商品等级", "等级"),
@@ -1454,6 +1662,20 @@ def _multi_product_utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _v5_record_timing(timing_trace, stage, started_at, **details):
+    if timing_trace is None:
+        return
+    entry = {
+        "stage": str(stage),
+        "duration_ms": max(
+            0,
+            int(round((time.perf_counter() - float(started_at)) * 1000)),
+        ),
+    }
+    entry.update(details)
+    timing_trace.append(entry)
+
+
 def _multi_product_grade(value):
     return normalize_contract_grade(value)
 
@@ -1511,15 +1733,21 @@ def _multi_product_enumerate_rows(
     row_cache=None,
     metrics=None,
     scan_state=None,
+    page_type="online",
+    identity_rows=None,
 ):
     """Read only target values and reuse hydrated rows across repeated viewports."""
     started = time.time()
     identity_started = time.time()
-    identity_rows = _enumerate_product_rows(
-        window,
-        timeout_seconds,
-        scan_state=scan_state,
-    )
+    if identity_rows is None:
+        identity_rows = _enumerate_product_rows(
+            window,
+            timeout_seconds,
+            scan_state=scan_state,
+            page_type=page_type,
+        )
+    else:
+        identity_rows = [dict(row) for row in identity_rows]
     _multi_product_metric_add(metrics, "identity_scan_calls")
     _multi_product_metric_add(metrics, "identity_rows_seen", len(identity_rows))
     if metrics is not None:
@@ -1561,7 +1789,10 @@ def _multi_product_enumerate_rows(
             _multi_product_metric_add(metrics, "target_rows_hydrated")
             try:
                 row["price"] = _read_row_price(
-                    window, row.get("parent_index"), timeout_seconds
+                    window,
+                    row.get("parent_index"),
+                    timeout_seconds,
+                    page_type=page_type,
                 )
                 _multi_product_metric_add(metrics, "price_reads")
             except SliceError as exc:
@@ -1569,7 +1800,10 @@ def _multi_product_enumerate_rows(
                 row["price_error_message"] = str(exc.message)
             try:
                 row["inventory"] = _read_row_inventory(
-                    window, row.get("parent_index"), timeout_seconds
+                    window,
+                    row.get("parent_index"),
+                    timeout_seconds,
+                    page_type=page_type,
                 )
                 _multi_product_metric_add(metrics, "inventory_reads")
             except SliceError as exc:
@@ -1588,15 +1822,96 @@ def _multi_product_enumerate_rows(
     return rows
 
 
-def _advance_product_list(window, timeout_seconds, direction="down"):
+def _advance_product_list(
+    window,
+    timeout_seconds,
+    direction="down",
+    *,
+    anchor_parent_index=None,
+    page_type="online",
+    wheel_times=SINGLE_PRODUCT_SCROLL_WHEEL_TIMES,
+    settle_seconds=0.75,
+    wheel_delay_after=1.0,
+    viewport=None,
+    keyboard_key=None,
+):
     """Best-effort bounded scroll hook; never claims progress without a call."""
     try:
-        container = _find_product_list_container(window, min(timeout_seconds, 3))
+        container = _find_product_scroll_view(window, min(timeout_seconds, 3))
     except Exception:
-        return False
+        try:
+            container = _find_product_list_container(
+                window,
+                min(timeout_seconds, 3),
+            )
+        except Exception:
+            return False
     try:
-        container.hover(True, 0.2)
-        win32.mouse_wheel(direction, SINGLE_PRODUCT_SCROLL_WHEEL_TIMES, "none", 1)
+        window.activate()
+        window.wait_active(timeout=min(float(timeout_seconds), 3.0))
+        if keyboard_key:
+            win32.send_keys(
+                str(keyboard_key),
+                50,
+                False,
+                float(wheel_delay_after),
+                True,
+                False,
+            )
+            sleep(float(settle_seconds))
+            return True
+        anchor = container
+        if anchor_parent_index is not None:
+            try:
+                anchor = _find_element(
+                    window,
+                    _row_field_selector(
+                        anchor_parent_index,
+                        "name",
+                        page_type,
+                    ),
+                    min(timeout_seconds, 3),
+                )
+            except Exception:
+                anchor = container
+        try:
+            if viewport is not None:
+                cursor_x = int(
+                    float(viewport["x"]) + (float(viewport["width"]) / 2.0)
+                )
+                cursor_y = int(
+                    float(viewport["y"])
+                    + min(
+                        max(float(viewport["height"]) * 0.65, 300.0),
+                        float(viewport["height"]) - 100.0,
+                    )
+                )
+            else:
+                bounding = _bounding_dict(container)
+                cursor_x = int(bounding["x"] + (bounding["width"] / 2.0))
+                cursor_y = int(
+                    bounding["y"]
+                    + min(
+                        max(bounding["height"] * 0.15, 120.0),
+                        350.0,
+                    )
+                )
+            win32.mouse_move(
+                cursor_x,
+                cursor_y,
+                "screen",
+                "instant",
+                0.2,
+            )
+        except Exception:
+            anchor.hover(True, 0.2)
+        win32.mouse_wheel(
+            direction,
+            int(wheel_times),
+            "none",
+            float(wheel_delay_after),
+        )
+        sleep(float(settle_seconds))
         return True
     except Exception:
         pass
@@ -2765,9 +3080,10 @@ def _refresh_product_list(window, timeout_seconds, result, stage):
         sleep(1)
         _select_online_product_list(window, timeout_seconds, result)
         # Require two independent observations so the first stale WebView frame is not accepted.
-        _find_product_list_container(window, timeout_seconds)
+        # A structured empty-list marker is also a complete, valid online page.
+        readiness = _require_product_list_ready(window, timeout_seconds)
         sleep(0.5)
-        _find_product_list_container(window, timeout_seconds)
+        readiness = _require_product_list_ready(window, timeout_seconds)
     except SliceError as exc:
         event.update(
             {
@@ -2782,7 +3098,13 @@ def _refresh_product_list(window, timeout_seconds, result, stage):
             "product list refresh failed: " + exc.message,
             retryable=exc.retryable,
         )
-    event.update({"status": "SUCCESS", "ended_at": _now_iso()})
+    event.update(
+        {
+            "status": "SUCCESS",
+            "readiness": readiness,
+            "ended_at": _now_iso(),
+        }
+    )
     return event
 
 
@@ -2809,6 +3131,60 @@ def _find_product_list_container(window, timeout_seconds):
             )
 
 
+def _product_list_empty_marker_visible(window, timeout_seconds):
+    selector = _exact_acc_label_selector(
+        PRODUCT_LIST_EMPTY_LABEL,
+        "dynamic_product_list_empty_marker",
+    )
+    try:
+        _find_element(window, selector, min(float(timeout_seconds), 1.0))
+        return True
+    except SliceError:
+        return False
+
+
+def _require_product_list_ready(window, timeout_seconds):
+    try:
+        _find_product_list_container(window, timeout_seconds)
+        return "PRODUCT_LIST_CONTAINER"
+    except SliceError:
+        if _product_list_empty_marker_visible(window, timeout_seconds):
+            return "EMPTY_LIST_MARKER"
+        raise
+
+
+def _find_product_scroll_view(window, timeout_seconds):
+    base = package.selector(ELEMENTS["target_container"])
+    value = copy.deepcopy(base.__dict__["value"])
+    _remove_dynamic_page_id_constraints(value)
+    scroll_index = None
+    for index, node in enumerate(value.get("path") or []):
+        node["selected"] = False
+        if node.get("name") == "wx-scroll-view":
+            scroll_index = index
+    if scroll_index is None:
+        raise SliceError(
+            "SELECTOR_BUILD_FAILED",
+            "商品列表容器选择器缺少 wx-scroll-view 节点",
+            False,
+        )
+    value["path"] = value["path"][: scroll_index + 1]
+    scroll_node = value["path"][-1]
+    scroll_node["selected"] = True
+    _set_path_attribute(scroll_node, "role", "Grouping")
+    _set_path_attribute(scroll_node, "tag", "wx-scroll-view")
+    _set_path_attribute(
+        scroll_node,
+        "class",
+        "scroll-view",
+        operator="Contains",
+    )
+    value["id"] = str(uuid.uuid4())
+    value["name"] = "动态_商品管理_滚动视口"
+    value["screenshot"] = ""
+    return _find_element(window, Selector(value), timeout_seconds)
+
+
 def _select_online_product_list(window, timeout_seconds, result):
     selector = _exact_acc_label_selector(
         ONLINE_LIST_LABEL,
@@ -2832,6 +3208,40 @@ def _select_online_product_list(window, timeout_seconds, result):
         )
     sleep(1)
     result["active_listing_filter"] = "ONLINE"
+    result["active_listing_filter_selected_at"] = _now_iso()
+
+
+def _select_waiting_product_list(window, timeout_seconds, result):
+    try:
+        try:
+            target = _find_element(
+                window,
+                WAITING_LIST_SELECTOR,
+                timeout_seconds,
+            )
+        except SliceError:
+            target = _find_element(
+                window,
+                _exact_acc_label_selector(
+                    WAITING_LIST_LABEL,
+                    "dynamic_waiting_listing_tab",
+                ),
+                timeout_seconds,
+            )
+        try:
+            target.click()
+        except Exception:
+            target.parent().click()
+    except Exception as exc:
+        detail = exc.message if isinstance(exc, SliceError) else str(exc)
+        raise SliceError(
+            "WAITING_LIST_NOT_FOUND",
+            "待上架 listing tab could not be selected: " + detail,
+            retryable=True,
+        )
+    sleep(1)
+    _require_product_list_ready(window, timeout_seconds)
+    result["active_listing_filter"] = "WAITING"
     result["active_listing_filter_selected_at"] = _now_iso()
 
 
@@ -2886,9 +3296,9 @@ def _reuse_current_product_list(window, timeout_seconds, result, stage):
             return event
 
         _select_online_product_list(window, timeout_seconds, result)
-        _find_product_list_container(window, timeout_seconds)
+        readiness = _require_product_list_ready(window, timeout_seconds)
         sleep(0.2)
-        _find_product_list_container(window, timeout_seconds)
+        readiness = _require_product_list_ready(window, timeout_seconds)
     except SliceError as exc:
         event.update(
             {
@@ -2899,7 +3309,13 @@ def _reuse_current_product_list(window, timeout_seconds, result, stage):
             }
         )
         raise
-    event.update({"status": "SUCCESS", "ended_at": _now_iso()})
+    event.update(
+        {
+            "status": "SUCCESS",
+            "readiness": readiness,
+            "ended_at": _now_iso(),
+        }
+    )
     return event
 
 
@@ -2918,11 +3334,28 @@ def _prepare_product_list(window, timeout_seconds, result, stage, reuse_requeste
     return _refresh_product_list(window, timeout_seconds, result, stage)
 
 
-def _open_price_dialog(window, row_index, timeout_seconds):
-    price_element = _find_element(window, _row_field_selector(row_index, "price"), timeout_seconds)
+def _open_price_dialog(
+    window,
+    row_index,
+    timeout_seconds,
+    page_type="online",
+    settle_seconds=0.8,
+):
+    price_element = _find_element(
+        window,
+        _row_field_selector(row_index, "price", page_type),
+        timeout_seconds,
+    )
     price_element.click()
-    sleep(0.8)
-    _find_element(window, ELEMENTS["price_popup"], timeout_seconds)
+    if float(settle_seconds) > 0:
+        sleep(float(settle_seconds))
+    _find_element(
+        window,
+        WAITING_PRICE_POPUP_SELECTOR
+        if str(page_type).lower() == "waiting"
+        else ELEMENTS["price_popup"],
+        timeout_seconds,
+    )
 
 
 def _read_optional_text(window, selector_or_name, timeout_seconds):
@@ -2970,8 +3403,20 @@ def _assert_dialog_context(context, expected_name, expected_grade, expected_old_
         )
 
 
-def _fill_target_price(window, target_price, timeout_seconds, fault_injection=""):
-    input_element = _find_element(window, ELEMENTS["price_input"], timeout_seconds)
+def _fill_target_price(
+    window,
+    target_price,
+    timeout_seconds,
+    fault_injection="",
+    page_type="online",
+):
+    input_element = _find_element(
+        window,
+        WAITING_PRICE_INPUT_SELECTOR
+        if str(page_type).lower() == "waiting"
+        else ELEMENTS["price_input"],
+        timeout_seconds,
+    )
     _set_input_value(input_element, target_price)
     readback = _read_price_input(input_element)
     if str(fault_injection or "").strip().upper() == "PRICE_READBACK_MISMATCH":
@@ -2985,18 +3430,80 @@ def _fill_target_price(window, target_price, timeout_seconds, fault_injection=""
     return readback
 
 
-def _cancel_price_dialog(window, timeout_seconds):
-    _find_element(window, ELEMENTS["price_cancel"], timeout_seconds).click()
+def _cancel_price_dialog(window, timeout_seconds, page_type="online"):
+    _find_element(
+        window,
+        WAITING_PRICE_CANCEL_SELECTOR
+        if str(page_type).lower() == "waiting"
+        else ELEMENTS["price_cancel"],
+        timeout_seconds,
+    ).click()
     sleep(0.5)
 
 
-def _confirm_price_dialog(window, timeout_seconds):
-    _find_element(window, ELEMENTS["price_confirm"], timeout_seconds).click()
+def _confirm_price_dialog(
+    window,
+    timeout_seconds,
+    page_type="online",
+    settle_seconds=1.2,
+):
+    _find_element(
+        window,
+        WAITING_PRICE_CONFIRM_SELECTOR
+        if str(page_type).lower() == "waiting"
+        else ELEMENTS["price_confirm"],
+        timeout_seconds,
+    ).click()
+    if float(settle_seconds) > 0:
+        sleep(float(settle_seconds))
+
+
+def _update_waiting_inventory(
+    window,
+    row_index,
+    target_inventory,
+    timeout_seconds,
+):
+    inventory_element = _find_element(
+        window,
+        _row_field_selector(row_index, "inventory", "waiting"),
+        timeout_seconds,
+    )
+    inventory_element.click()
+    sleep(0.8)
+    _find_element(window, WAITING_INVENTORY_POPUP_SELECTOR, timeout_seconds)
+    input_element = _find_element(
+        window,
+        WAITING_INVENTORY_INPUT_SELECTOR,
+        timeout_seconds,
+    )
+    _set_input_value(input_element, str(int(target_inventory)))
+    readback = _read_price_input(input_element)
+    if readback and str(int(Decimal(readback))) != str(int(target_inventory)):
+        _find_element(
+            window,
+            WAITING_INVENTORY_CANCEL_SELECTOR,
+            timeout_seconds,
+        ).click()
+        raise SliceError(
+            "TARGET_INVENTORY_VERIFY_FAILED",
+            "target inventory input readback mismatch",
+            retryable=True,
+        )
+    _find_element(
+        window,
+        WAITING_INVENTORY_CONFIRM_SELECTOR,
+        timeout_seconds,
+    ).click()
     sleep(1.2)
 
 
-def _read_row_price(window, row_index, timeout_seconds):
-    raw_price = _read_text(window, _row_field_selector(row_index, "price"), timeout_seconds)
+def _read_row_price(window, row_index, timeout_seconds, page_type="online"):
+    raw_price = _read_text(
+        window,
+        _row_field_selector(row_index, "price", page_type),
+        timeout_seconds,
+    )
     return _parse_price(raw_price)
 
 
@@ -3014,9 +3521,126 @@ def _parse_inventory(raw_text):
     return value
 
 
-def _read_row_inventory(window, row_index, timeout_seconds):
-    raw_inventory = _read_text(window, _row_field_selector(row_index, "inventory"), timeout_seconds)
+def _read_row_inventory(
+    window,
+    row_index,
+    timeout_seconds,
+    page_type="online",
+):
+    raw_inventory = _read_text(
+        window,
+        _row_field_selector(row_index, "inventory", page_type),
+        timeout_seconds,
+    )
     return _parse_inventory(raw_inventory)
+
+
+def _v5_wait_row_price(
+    window,
+    row_index,
+    timeout_seconds,
+    target_price,
+    page_type="waiting",
+):
+    deadline = time.time() + max(float(timeout_seconds), 1.0)
+    last_value = ""
+    while time.time() < deadline:
+        try:
+            last_value = _read_row_price(
+                window,
+                row_index,
+                min(float(timeout_seconds), 1.0),
+                page_type=page_type,
+            )
+            if str(last_value) == str(target_price):
+                return last_value
+        except SliceError:
+            pass
+        sleep(V5_KEYBOARD_LOAD_WAIT_SECONDS)
+    raise SliceError(
+        "DETAIL_PRICE_SETTLE_TIMEOUT",
+        "价格确认后行数据未更新到目标值，最后读取=%s" % str(last_value),
+        retryable=True,
+    )
+
+
+def _v5_wait_row_inventory(
+    window,
+    row_index,
+    timeout_seconds,
+    target_inventory,
+    page_type="waiting",
+):
+    deadline = time.time() + max(float(timeout_seconds), 1.0)
+    last_value = None
+    while time.time() < deadline:
+        try:
+            last_value = _read_row_inventory(
+                window,
+                row_index,
+                min(float(timeout_seconds), 1.0),
+                page_type=page_type,
+            )
+            if int(last_value) == int(target_inventory):
+                return last_value
+        except SliceError:
+            pass
+        sleep(V5_KEYBOARD_LOAD_WAIT_SECONDS)
+    raise SliceError(
+        "DETAIL_INVENTORY_SETTLE_TIMEOUT",
+        "库存确认后行数据未更新到目标值，最后读取=%s"
+        % str(last_value),
+        retryable=True,
+    )
+
+
+def _v5_wait_row_identity_changed(
+    window,
+    row_index,
+    timeout_seconds,
+    *,
+    page_type,
+    expected_name,
+    expected_grade,
+):
+    deadline = time.time() + max(float(timeout_seconds), 1.0)
+    expected_identity = (
+        _multi_product_text(expected_name),
+        _multi_product_grade(expected_grade),
+    )
+    while time.time() < deadline:
+        try:
+            current_name = _strip_label(
+                _read_text(
+                    window,
+                    _row_field_selector(row_index, "name", page_type),
+                    min(float(timeout_seconds), 1.0),
+                ),
+                ("商品名称", "名称"),
+            )
+            current_grade = _strip_label(
+                _read_text(
+                    window,
+                    _row_field_selector(row_index, "grade", page_type),
+                    min(float(timeout_seconds), 1.0),
+                ),
+                ("商品等级", "等级"),
+            )
+            current_identity = (
+                _multi_product_text(current_name),
+                _multi_product_grade(current_grade),
+            )
+            if current_identity != expected_identity:
+                return current_identity
+        except SliceError as exc:
+            if exc.code == "ELEMENT_NOT_FOUND":
+                return None
+        sleep(V5_KEYBOARD_LOAD_WAIT_SECONDS)
+    raise SliceError(
+        "ACTION_ROW_SETTLE_TIMEOUT",
+        "%s 操作确认后目标行仍未移出原位置" % str(page_type),
+        retryable=True,
+    )
 
 
 def _wait_after_submit_price(window, row_index, timeout_seconds, target_price):
@@ -3588,6 +4212,2301 @@ def _run_commit_batch_v4(args, request, result):
     return _set_result(args, result)
 
 
+def _v5_stable_id(prefix, payload):
+    return str(prefix) + "-" + sha256_json(payload, prefixed=False)[:24]
+
+
+def _v5_write_phase(
+    request,
+    phase,
+    current_item=None,
+    item_states=None,
+    clicked_at=None,
+    detail_effect_state="NOT_STARTED",
+    listing_effect_state="NOT_STARTED",
+):
+    phase_path = str(request.get("_phase_file_path") or "").strip()
+    if not phase_path:
+        return
+    payload = {
+        "schema_version": "shadowbot-listing-action-batch-phase-1.0",
+        "contract_version": 5,
+        "action_type": request.get("action_type", ""),
+        "batch_id": request.get("batch_id", ""),
+        "execution_attempt_id": request.get("execution_attempt_id", ""),
+        "instruction_hash": request.get("instruction_hash", ""),
+        "manifest_sha256": request.get("manifest_sha256", ""),
+        "request_file_sha256": request.get("request_file_sha256", ""),
+        "worker_id": request.get("worker_id", ""),
+        "phase": phase,
+        "phase_at": _multi_product_utc_now(),
+        "detail_effect_state": detail_effect_state,
+        "listing_effect_state": listing_effect_state,
+    }
+    if current_item is not None:
+        payload["current_item"] = {
+            name: current_item.get(name)
+            for name in (
+                "source_task_id",
+                "operation_id",
+                "item_execution_attempt_id",
+                "internal_sku",
+                "item_payload_sha256",
+            )
+        }
+    if item_states is not None:
+        payload["item_states"] = [
+            {
+                name: item.get(name)
+                for name in (
+                    "source_task_id",
+                    "operation_id",
+                    "item_execution_attempt_id",
+                    "internal_sku",
+                    "item_payload_sha256",
+                    "operation_result",
+                    "detail_effect_state",
+                    "listing_effect_state",
+                    "detail_save_clicked",
+                    "action_confirm_clicked",
+                    "observed_price_before_action",
+                    "observed_inventory_before_action",
+                    "observed_price_after_detail_save",
+                    "observed_inventory_after_detail_save",
+                    "actual_price",
+                    "actual_inventory",
+                    "detail_save_clicked_at",
+                    "action_clicked_at",
+                    "readback_observed_at",
+                    "error_code",
+                    "error_message",
+                )
+            }
+            for item in item_states
+        ]
+    if clicked_at:
+        payload["clicked_at"] = clicked_at
+    payload["phase_snapshot_sha256"] = sha256_json(dict(payload))
+    os.makedirs(os.path.dirname(phase_path), exist_ok=True)
+    temporary = phase_path + ".tmp_" + uuid.uuid4().hex
+    with open(temporary, "w", encoding="utf-8") as file_obj:
+        json.dump(
+            payload,
+            file_obj,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        file_obj.flush()
+        os.fsync(file_obj.fileno())
+    try:
+        _replace_file_with_retry(temporary, phase_path)
+    finally:
+        try:
+            os.remove(temporary)
+        except OSError:
+            pass
+
+
+def _v5_load_mapping(request):
+    mapping_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "product_identity_mapping.json",
+    )
+    with open(mapping_path, "rb") as file_obj:
+        mapping_bytes = file_obj.read()
+    actual_version = "sha256:" + hashlib.sha256(mapping_bytes).hexdigest()
+    if actual_version != str(request.get("mapping_source_version") or ""):
+        raise SliceError(
+            "MAPPING_SOURCE_VERSION_MISMATCH",
+            "Worker 商品映射版本与请求不一致",
+            retryable=False,
+        )
+    try:
+        mapping_data = json.loads(mapping_bytes.decode("utf-8-sig"))
+    except (ValueError, UnicodeError) as exc:
+        raise SliceError(
+            "MAPPING_SOURCE_INVALID",
+            "Worker 商品映射文件无法解析: " + type(exc).__name__,
+            retryable=False,
+        )
+    if str(mapping_data.get("platform_name") or "").strip() != str(
+        request.get("platform_name") or ""
+    ).strip():
+        raise SliceError(
+            "MAPPING_SOURCE_INVALID",
+            "Worker 商品映射平台不一致",
+            retryable=False,
+        )
+    mappings = []
+    for raw in mapping_data.get("mappings") or []:
+        if str(raw.get("status") or "active").strip().lower() != "active":
+            continue
+        sku = normalize_contract_sku(raw.get("internal_sku"))
+        name = str(raw.get("expected_product_name") or "").strip()
+        grade = str(raw.get("expected_grade") or "").strip()
+        if not sku or not name or not grade:
+            raise SliceError(
+                "MAPPING_SOURCE_INVALID",
+                "Worker 商品映射包含不完整项目",
+                retryable=False,
+            )
+        mappings.append(
+            {
+                "internal_sku": sku,
+                "product_name": name,
+                "grade": grade,
+                "page_identity_key": contract_identity_key(
+                    request["platform_name"],
+                    None,
+                    name,
+                    grade,
+                ),
+            }
+        )
+    return mappings
+
+
+def _v5_scan_page(
+    window,
+    request,
+    timeout_seconds,
+    *,
+    page_type,
+    targets=None,
+    timing_trace=None,
+    timing_stage="",
+    max_pages=20,
+    max_scrolls=100,
+):
+    """Materialize with END, return HOME, then perform one full page scan.
+
+    SET_ONLINE, SET_OFFLINE, post-failure reconciliation, and independent
+    SYNC_STATUS all call this shared reader.  END is only a loading action:
+    no row enumeration is allowed before HOME.
+    """
+    scan_timer = time.perf_counter()
+    scan_started_at = _multi_product_utc_now()
+    termination_reason = ""
+    if _product_list_empty_marker_visible(window, timeout_seconds):
+        completed_at = _multi_product_utc_now()
+        scan_duration_ms = max(
+            0,
+            int(round((time.perf_counter() - scan_timer) * 1000)),
+        )
+        if timing_trace is not None:
+            timing_trace.append(
+                {
+                    "stage": str(
+                        timing_stage
+                        or ("%s_page_scan" % str(page_type))
+                    ),
+                    "duration_ms": scan_duration_ms,
+                    "page_type": str(page_type),
+                    "identity_rows": 0,
+                    "target_rows_hydrated": 0,
+                    "price_reads": 0,
+                    "inventory_reads": 0,
+                    "non_target_rows_skipped": 0,
+                }
+            )
+        return {
+            "page_type": page_type,
+            "scan_started_at": scan_started_at,
+            "scan_completed_at": completed_at,
+            "duration_ms": scan_duration_ms,
+            "scan_complete": True,
+            "end_marker_verified": True,
+            "termination_reason": "EMPTY_LIST_MARKER",
+            "rows": [],
+        }
+    first_name = _find_element(
+        window,
+        _row_field_selector(ROW_INDEX_START, "name", page_type),
+        timeout_seconds,
+    )
+    first_name.click()
+    sleep(V5_KEYBOARD_LOAD_WAIT_SECONDS)
+    try:
+        stop_path = str(request.get("_stop_signal_path") or "").strip()
+        if stop_path and os.path.exists(stop_path):
+            raise SliceError(
+                "BATCH_STOPPED",
+                "worker stop requested during SYNC_STATUS",
+                True,
+            )
+        window.activate()
+        window.wait_active(timeout=min(float(timeout_seconds), 3.0))
+        win32.send_keys(
+            "{END}",
+            50,
+            False,
+            0.0,
+            True,
+            False,
+        )
+        sleep(V5_KEYBOARD_END_LOAD_WAIT_SECONDS)
+        if not _product_list_end_marker_visible(
+            window,
+            timeout_seconds,
+        ):
+            raise SliceError(
+                "END_MARKER_NOT_VERIFIED",
+                page_type + " 页面聚焦商品列表并发送 END 后仍未确认结束标记",
+                True,
+            )
+        termination_reason = "KEYBOARD_END_WITH_END_MARKER"
+    finally:
+        try:
+            window.activate()
+            window.wait_active(timeout=min(float(timeout_seconds), 3.0))
+            win32.send_keys(
+                "{HOME}",
+                50,
+                False,
+                0.0,
+                True,
+                False,
+            )
+            sleep(V5_KEYBOARD_LOAD_WAIT_SECONDS)
+        except Exception:
+            pass
+    if termination_reason != "KEYBOARD_END_WITH_END_MARKER":
+        raise SliceError(
+            "END_MARKER_NOT_VERIFIED",
+            page_type + " 页面未确认结束标记",
+            True,
+        )
+    home_ready_rows = []
+    home_ready_deadline = time.time() + min(float(timeout_seconds), 3.0)
+    while time.time() < home_ready_deadline:
+        candidate_rows = _enumerate_product_rows(
+            window,
+            timeout_seconds,
+            page_type=page_type,
+        )
+        if candidate_rows and not candidate_rows[0].get("error"):
+            home_ready_rows = candidate_rows
+            break
+        sleep(V5_KEYBOARD_LOAD_WAIT_SECONDS)
+    if not home_ready_rows:
+        raise SliceError(
+            "LIST_TOP_NOT_VERIFIED",
+            page_type + " 页面 HOME 后商品元素未恢复",
+            True,
+        )
+    scan_metrics = {}
+    rows = _multi_product_enumerate_rows(
+        window,
+        timeout_seconds,
+        targets=targets,
+        row_cache={},
+        metrics=scan_metrics,
+        page_type=page_type,
+        identity_rows=home_ready_rows,
+    )
+    if not rows:
+        raise SliceError(
+            "LIST_NOT_LOADED",
+            page_type + " 页面回到顶部后商品列表为空或未加载",
+            True,
+        )
+    for row in rows:
+        if row.get("error"):
+            raise SliceError(
+                str(row.get("error") or "ROW_READ_FAILED"),
+                str(row.get("detail") or "商品行读取失败"),
+                True,
+            )
+        if row.get("price_error_code") or row.get("inventory_error_code"):
+            raise SliceError(
+                str(
+                    row.get("price_error_code")
+                    or row.get("inventory_error_code")
+                ),
+                str(
+                    row.get("price_error_message")
+                    or row.get("inventory_error_message")
+                ),
+                True,
+            )
+    if not _product_list_end_marker_visible(
+        window,
+        timeout_seconds,
+    ):
+        raise SliceError(
+            "FULL_LIST_NOT_MATERIALIZED_AFTER_HOME",
+            page_type + " 页面 END 加载后回顶，完整元素树或结束标记不可验证",
+            True,
+        )
+    completed_at = _multi_product_utc_now()
+    rows = sorted(
+        rows,
+        key=lambda row: (
+            int(row.get("parent_index") or 0),
+            str(row.get("row_identity") or ""),
+        ),
+    )
+    for position, row in enumerate(rows, start=1):
+        row["position"] = position
+        row["page_type"] = page_type
+        row["observed_at"] = completed_at
+    scan_duration_ms = max(
+        0,
+        int(round((time.perf_counter() - scan_timer) * 1000)),
+    )
+    if timing_trace is not None:
+        timing_trace.append(
+            {
+                "stage": str(
+                    timing_stage
+                    or ("%s_page_scan" % str(page_type))
+                ),
+                "duration_ms": scan_duration_ms,
+                "page_type": str(page_type),
+                "identity_rows": len(rows),
+                "target_rows_hydrated": int(
+                    scan_metrics.get("target_rows_hydrated", 0)
+                ),
+                "price_reads": int(scan_metrics.get("price_reads", 0)),
+                "inventory_reads": int(
+                    scan_metrics.get("inventory_reads", 0)
+                ),
+                "non_target_rows_skipped": int(
+                    scan_metrics.get("non_target_rows_skipped", 0)
+                ),
+            }
+        )
+    return {
+        "page_type": page_type,
+        "scan_started_at": scan_started_at,
+        "scan_completed_at": completed_at,
+        "duration_ms": scan_duration_ms,
+        "scan_complete": True,
+        "end_marker_verified": True,
+        "termination_reason": termination_reason,
+        "rows": rows,
+    }
+
+
+def _v5_reset_page_to_top(window, request, timeout_seconds, page_type):
+    viewport = {
+        "x": _as_int(request, "window_x", WINDOW_X_DEFAULT),
+        "y": _as_int(request, "window_y", WINDOW_Y_DEFAULT),
+        "width": _as_int(
+            request,
+            "window_width",
+            WINDOW_WIDTH_DEFAULT,
+            minimum=100,
+        ),
+        "height": _as_int(
+            request,
+            "window_height",
+            WINDOW_HEIGHT_DEFAULT,
+            minimum=100,
+        ),
+    }
+    for _ in range(2):
+        if not _advance_product_list(
+            window,
+            timeout_seconds,
+            direction="up",
+            page_type=page_type,
+            wheel_times=1,
+            settle_seconds=1.0,
+            wheel_delay_after=0.2,
+            viewport=viewport,
+            keyboard_key="{HOME}",
+        ):
+            raise SliceError(
+                "SCROLL_UNAVAILABLE",
+                page_type + " 页面无法在扫描前回到列表顶部",
+                True,
+            )
+
+
+def _v5_prepare_row_for_click(
+    window,
+    request,
+    timeout_seconds,
+    *,
+    row,
+    page_type,
+    click_target="price",
+):
+    """Scroll only when the pre-scan proved that the target is row 4 or later.
+
+    The visibility probe must use the element that will actually be clicked.
+    A row's price can still be visible while the action button below it is
+    already outside the safe viewport.
+    """
+
+    position = int(row.get("position") or 0)
+    parent_index = int(row["parent_index"])
+    if position < SINGLE_PRODUCT_SCROLL_START_POSITION:
+        return
+    viewport = {
+        "window_x": _as_int(request, "window_x", WINDOW_X_DEFAULT),
+        "window_y": _as_int(request, "window_y", WINDOW_Y_DEFAULT),
+        "window_width": _as_int(
+            request,
+            "window_width",
+            WINDOW_WIDTH_DEFAULT,
+            minimum=100,
+        ),
+        "window_height": _as_int(
+            request,
+            "window_height",
+            WINDOW_HEIGHT_DEFAULT,
+            minimum=100,
+        ),
+    }
+    attempts = []
+    for attempt in range(0, SINGLE_PRODUCT_MAX_SCROLL_ATTEMPTS + 1):
+        if click_target == "set_online_action":
+            target_element = _find_element(
+                window,
+                _waiting_row_action_selector(
+                    parent_index,
+                    WAITING_SET_ONLINE_BUTTON_SELECTOR,
+                    "动态_index_%d_上架按钮" % parent_index,
+                ),
+                timeout_seconds,
+            )
+        elif click_target == "set_offline_action":
+            target_element = _find_element(
+                window,
+                _online_row_action_selector(
+                    parent_index,
+                    ONLINE_SET_OFFLINE_BUTTON_SELECTOR,
+                    "动态_index_%d_下架按钮" % parent_index,
+                ),
+                timeout_seconds,
+            )
+        else:
+            target_element = _find_element(
+                window,
+                _row_field_selector(parent_index, "price", page_type),
+                timeout_seconds,
+            )
+        clickable, bounding = _price_element_in_clickable_view(
+            target_element,
+            **viewport,
+        )
+        center_y = bounding["y"] + bounding["height"] / 2.0
+        safe_top = float(viewport["window_y"]) + SINGLE_PRODUCT_CLICK_TOP_MARGIN
+        keyboard_key = "NONE"
+        if not clickable:
+            keyboard_key = "PGUP" if center_y < safe_top else "PGDN"
+        attempts.append(
+            {
+                "attempt": attempt,
+                "position": position,
+                "keyboard_key": keyboard_key,
+                "click_target": click_target,
+                "target_bounding": bounding,
+                "clickable": clickable,
+            }
+        )
+        if clickable:
+            return attempts
+        if attempt >= SINGLE_PRODUCT_MAX_SCROLL_ATTEMPTS:
+            break
+        focus_element = _find_element(
+            window,
+            _row_field_selector(ROW_INDEX_START, "name", page_type),
+            timeout_seconds,
+        )
+        focus_element.click()
+        sleep(V5_KEYBOARD_LOAD_WAIT_SECONDS)
+        window.activate()
+        window.wait_active(timeout=min(float(timeout_seconds), 3.0))
+        win32.send_keys(
+            "{" + keyboard_key + "}",
+            50,
+            False,
+            0.0,
+            True,
+            False,
+        )
+        sleep(0.3)
+    raise SliceError(
+        "ELEMENT_NOT_VISIBLE",
+        "第%d个商品滚动后仍不在安全点击区域: %s"
+        % (position, json.dumps(attempts, ensure_ascii=False)),
+        retryable=True,
+    )
+
+
+def _v5_snapshot_items(request, snapshot_id, mappings, online_scan, waiting_scan):
+    mapping_by_identity = {}
+    for mapping in mappings:
+        mapping_by_identity.setdefault(mapping["page_identity_key"], []).append(
+            mapping
+        )
+    rows_by_page = {"online": {}, "waiting": {}}
+    for page_type, scan in (
+        ("online", online_scan),
+        ("waiting", waiting_scan),
+    ):
+        for row in scan["rows"]:
+            identity = contract_identity_key(
+                request["platform_name"],
+                None,
+                row.get("name"),
+                row.get("grade"),
+            )
+            rows_by_page[page_type].setdefault(identity, []).append(row)
+    identities = sorted(
+        set(mapping_by_identity)
+        | set(rows_by_page["online"])
+        | set(rows_by_page["waiting"])
+    )
+    items = []
+    for identity in identities:
+        mapping_candidates = mapping_by_identity.get(identity, [])
+        online_rows = rows_by_page["online"].get(identity, [])
+        waiting_rows = rows_by_page["waiting"].get(identity, [])
+        mapping_ambiguous = (
+            len(mapping_candidates) != 1
+            or len(online_rows) > 1
+            or len(waiting_rows) > 1
+        )
+        sample = (
+            online_rows[0]
+            if online_rows
+            else waiting_rows[0]
+            if waiting_rows
+            else mapping_candidates[0]
+        )
+        affected = sorted(
+            set(
+                mapping["internal_sku"]
+                for mapping in mapping_candidates
+            )
+        )
+        internal_sku = (
+            mapping_candidates[0]["internal_sku"]
+            if len(mapping_candidates) == 1
+            else None
+        )
+        if mapping_ambiguous:
+            listing_location = "ambiguous"
+        elif online_rows and waiting_rows:
+            listing_location = "both"
+        elif online_rows:
+            listing_location = "online_only"
+        elif waiting_rows:
+            listing_location = "waiting_only"
+        else:
+            listing_location = "neither"
+        diagnostic_code = ""
+        if not mapping_candidates:
+            diagnostic_code = "UNMAPPED_PRODUCT"
+        elif len(mapping_candidates) > 1:
+            diagnostic_code = "IDENTITY_MAPPING_CONFLICT"
+        elif len(online_rows) > 1 or len(waiting_rows) > 1:
+            diagnostic_code = "DUPLICATE_PAGE_IDENTITY"
+        elif listing_location == "both":
+            diagnostic_code = "PRESENT_IN_BOTH_LISTS"
+        elif listing_location == "neither":
+            diagnostic_code = "ABSENT_FROM_BOTH_LISTS"
+        item = {
+            "snapshot_item_id": _v5_stable_id(
+                "SNAPSHOT-ITEM",
+                {
+                    "snapshot_id": snapshot_id,
+                    "page_identity_key": identity,
+                },
+            ),
+            "internal_sku": internal_sku,
+            "product_name": str(
+                sample.get("name")
+                or sample.get("product_name")
+                or ""
+            ).strip(),
+            "grade": str(sample.get("grade") or "").strip(),
+            "page_identity_key": identity,
+            "affected_internal_skus": affected,
+            "online_occurrences": len(online_rows),
+            "waiting_occurrences": len(waiting_rows),
+            "mapping_ambiguous": mapping_ambiguous,
+            "listing_location": listing_location,
+            "online_row_identities": [
+                "online:" + str(row.get("row_identity") or "")
+                for row in online_rows
+            ],
+            "waiting_row_identities": [
+                "waiting:" + str(row.get("row_identity") or "")
+                for row in waiting_rows
+            ],
+            "online_observed_price": (
+                str(online_rows[0].get("price") or "") if online_rows else None
+            ),
+            "waiting_observed_price": (
+                str(waiting_rows[0].get("price") or "") if waiting_rows else None
+            ),
+            "online_observed_inventory": (
+                int(online_rows[0]["inventory"])
+                if online_rows
+                and online_rows[0].get("inventory") is not None
+                else None
+            ),
+            "waiting_observed_inventory": (
+                int(waiting_rows[0]["inventory"])
+                if waiting_rows
+                and waiting_rows[0].get("inventory") is not None
+                else None
+            ),
+            "diagnostic_code": diagnostic_code,
+            "online_observed_at": (
+                online_rows[0]["observed_at"] if online_rows else None
+            ),
+            "waiting_observed_at": (
+                waiting_rows[0]["observed_at"] if waiting_rows else None
+            ),
+        }
+        items.append(item)
+    return items
+
+
+def _v5_dismiss_unconfirmed_detail_or_listing_dialog(window):
+    """Best-effort cleanup before a read-only post-failure page scan."""
+
+    for selector_name in (
+        WAITING_SET_ONLINE_CANCEL_SELECTOR,
+        WAITING_PRICE_CANCEL_SELECTOR,
+        WAITING_INVENTORY_CANCEL_SELECTOR,
+    ):
+        try:
+            _find_element(window, selector_name, 1).click()
+            sleep(0.5)
+            return
+        except Exception:
+            continue
+    try:
+        window.activate()
+        win32.send_keys("{ESC}", 50, False, 0.0, True, False)
+        sleep(0.5)
+    except Exception:
+        pass
+
+
+def _v5_post_failure_snapshot(
+    window,
+    request,
+    result,
+    timeout_seconds,
+    mappings,
+):
+    """Capture final two-page facts without changing the write outcome."""
+
+    scan_started_at = _multi_product_utc_now()
+    snapshot_id = _v5_stable_id(
+        "SNAPSHOT-POSTFAIL",
+        {
+            "batch_id": request["batch_id"],
+            "execution_attempt_id": request["execution_attempt_id"],
+        },
+    )
+    _v5_dismiss_unconfirmed_detail_or_listing_dialog(window)
+    _select_online_product_list(window, timeout_seconds, result)
+    online_scan = _v5_scan_page(
+        window,
+        request,
+        timeout_seconds,
+        page_type="online",
+    )
+    _select_waiting_product_list(window, timeout_seconds, result)
+    waiting_scan = _v5_scan_page(
+        window,
+        request,
+        timeout_seconds,
+        page_type="waiting",
+    )
+    completed_at = _multi_product_utc_now()
+    return {
+        "schema_version": "shadowbot-listing-sync-snapshot-1.0",
+        "snapshot_id": snapshot_id,
+        "platform_name": request["platform_name"],
+        "execution_attempt_id": request["execution_attempt_id"],
+        "mapping_source_version": request["mapping_source_version"],
+        "result_id": "PENDING-" + request["execution_attempt_id"],
+        "scan_started_at": scan_started_at,
+        "scan_completed_at": completed_at,
+        "online_scan_started_at": online_scan["scan_started_at"],
+        "online_scan_completed_at": online_scan["scan_completed_at"],
+        "waiting_scan_started_at": waiting_scan["scan_started_at"],
+        "waiting_scan_completed_at": waiting_scan["scan_completed_at"],
+        "online_scan_complete": True,
+        "waiting_scan_complete": True,
+        "online_end_marker_verified": True,
+        "waiting_end_marker_verified": True,
+        "snapshot_complete": True,
+        "instruction_hash": request["instruction_hash"],
+        "status": "VERIFIED",
+        "error_code": "",
+        "evidence_manifest_sha256": sha256_json(
+            {
+                "online": online_scan,
+                "waiting": waiting_scan,
+            }
+        ),
+        "items": _v5_snapshot_items(
+            request,
+            snapshot_id,
+            mappings,
+            online_scan,
+            waiting_scan,
+        ),
+    }
+
+
+def _v5_failed_post_failure_snapshot(request, error):
+    completed_at = _multi_product_utc_now()
+    return {
+        "schema_version": "shadowbot-listing-sync-snapshot-1.0",
+        "snapshot_id": _v5_stable_id(
+            "SNAPSHOT-POSTFAIL",
+            {
+                "batch_id": request["batch_id"],
+                "execution_attempt_id": request["execution_attempt_id"],
+            },
+        ),
+        "platform_name": request["platform_name"],
+        "execution_attempt_id": request["execution_attempt_id"],
+        "mapping_source_version": request["mapping_source_version"],
+        "result_id": "PENDING-" + request["execution_attempt_id"],
+        "scan_started_at": completed_at,
+        "scan_completed_at": completed_at,
+        "online_scan_started_at": completed_at,
+        "online_scan_completed_at": completed_at,
+        "waiting_scan_started_at": completed_at,
+        "waiting_scan_completed_at": completed_at,
+        "online_scan_complete": False,
+        "waiting_scan_complete": False,
+        "online_end_marker_verified": False,
+        "waiting_end_marker_verified": False,
+        "snapshot_complete": False,
+        "instruction_hash": request["instruction_hash"],
+        "status": "FAILED",
+        "error_code": str(getattr(error, "code", "") or "POST_FAILURE_SCAN_FAILED"),
+        "evidence_manifest_sha256": sha256_json([]),
+        "items": [],
+    }
+
+
+def _run_listing_sync_v5(args, request, result):
+    flow_timer = time.perf_counter()
+    started_at = _multi_product_utc_now()
+    timing_trace = result.setdefault("timing_trace", [])
+    result_id = _v5_stable_id(
+        "RESULT",
+        {
+            "batch_id": request["batch_id"],
+            "execution_attempt_id": request["execution_attempt_id"],
+        },
+    )
+    snapshot_id = _v5_stable_id(
+        "SNAPSHOT",
+        {
+            "batch_id": request["batch_id"],
+            "execution_attempt_id": request["execution_attempt_id"],
+        },
+    )
+    timeout_seconds = _as_int(
+        request,
+        "element_timeout_seconds",
+        ELEMENT_TIMEOUT_DEFAULT,
+        minimum=1,
+    )
+    snapshot = None
+    try:
+        mappings = _v5_load_mapping(request)
+        _v5_write_phase(request, "UI_STARTED")
+        stage_timer = time.perf_counter()
+        window, launch = _get_or_open_and_prepare_window(
+            str(request.get("window_title") or WINDOW_TITLE_DEFAULT),
+            WINDOW_X_DEFAULT,
+            WINDOW_Y_DEFAULT,
+            WINDOW_WIDTH_DEFAULT,
+            WINDOW_HEIGHT_DEFAULT,
+            str(request.get("applet_uri") or ""),
+            APPLET_LAUNCH_TIMEOUT_DEFAULT,
+        )
+        result["applet_launch"] = launch
+        sleep(1)
+        _v5_record_timing(
+            timing_trace,
+            "window_prepare",
+            stage_timer,
+        )
+        login_config = _get_arg(args, "_login_config", {})
+        credential_provider = _get_arg(args, "_credential_provider", None)
+        stage_timer = time.perf_counter()
+        _recover_login_if_needed(
+            window,
+            request,
+            result,
+            timeout_seconds,
+            login_config,
+            credential_provider,
+        )
+        _v5_record_timing(
+            timing_trace,
+            "login_check",
+            stage_timer,
+        )
+        stage_timer = time.perf_counter()
+        _refresh_product_list(
+            window,
+            timeout_seconds,
+            result,
+            "BEFORE_LISTING_SYNC",
+        )
+        _v5_record_timing(
+            timing_trace,
+            "product_list_refresh",
+            stage_timer,
+        )
+        online_scan = _v5_scan_page(
+            window,
+            request,
+            timeout_seconds,
+            page_type="online",
+            targets=None,
+            timing_trace=timing_trace,
+            timing_stage="sync_online_scan",
+        )
+        _select_waiting_product_list(window, timeout_seconds, result)
+        waiting_scan = _v5_scan_page(
+            window,
+            request,
+            timeout_seconds,
+            page_type="waiting",
+            targets=None,
+            timing_trace=timing_trace,
+            timing_stage="sync_waiting_scan",
+        )
+        items = _v5_snapshot_items(
+            request,
+            snapshot_id,
+            mappings,
+            online_scan,
+            waiting_scan,
+        )
+        completed_at = _multi_product_utc_now()
+        snapshot = {
+            "schema_version": "shadowbot-listing-sync-snapshot-1.0",
+            "snapshot_id": snapshot_id,
+            "platform_name": request["platform_name"],
+            "execution_attempt_id": request["execution_attempt_id"],
+            "mapping_source_version": request["mapping_source_version"],
+            "result_id": result_id,
+            "scan_started_at": started_at,
+            "scan_completed_at": completed_at,
+            "online_scan_started_at": online_scan["scan_started_at"],
+            "online_scan_completed_at": online_scan["scan_completed_at"],
+            "waiting_scan_started_at": waiting_scan["scan_started_at"],
+            "waiting_scan_completed_at": waiting_scan["scan_completed_at"],
+            "online_scan_complete": True,
+            "waiting_scan_complete": True,
+            "online_end_marker_verified": True,
+            "waiting_end_marker_verified": True,
+            "snapshot_complete": True,
+            "instruction_hash": request["instruction_hash"],
+            "status": "VERIFIED",
+            "error_code": "",
+            "evidence_manifest_sha256": sha256_json(
+                {
+                    "online": online_scan,
+                    "waiting": waiting_scan,
+                }
+            ),
+            "items": items,
+        }
+        result.update(
+            {
+                "result_id": result_id,
+                "started_at": started_at,
+                "ended_at": completed_at,
+                "status": "VERIFIED",
+                "run_success_flag": True,
+                "business_operation_completed": False,
+                "side_effect_state": "NOT_STARTED",
+                "error_code": "",
+                "error_message": "",
+                "retryable": False,
+                "snapshot": snapshot,
+            }
+        )
+        _v5_write_phase(request, "FINAL_VERIFICATION")
+    except SliceError as exc:
+        completed_at = _multi_product_utc_now()
+        snapshot = {
+            "schema_version": "shadowbot-listing-sync-snapshot-1.0",
+            "snapshot_id": snapshot_id,
+            "platform_name": request["platform_name"],
+            "execution_attempt_id": request["execution_attempt_id"],
+            "mapping_source_version": request["mapping_source_version"],
+            "result_id": result_id,
+            "scan_started_at": started_at,
+            "scan_completed_at": completed_at,
+            "online_scan_started_at": started_at,
+            "online_scan_completed_at": completed_at,
+            "waiting_scan_started_at": completed_at,
+            "waiting_scan_completed_at": completed_at,
+            "online_scan_complete": False,
+            "waiting_scan_complete": False,
+            "online_end_marker_verified": False,
+            "waiting_end_marker_verified": False,
+            "snapshot_complete": False,
+            "instruction_hash": request["instruction_hash"],
+            "status": "FAILED",
+            "error_code": exc.code,
+            "evidence_manifest_sha256": sha256_json([]),
+            "items": [],
+        }
+        result.update(
+            {
+                "result_id": result_id,
+                "started_at": started_at,
+                "ended_at": completed_at,
+                "status": "FAILED",
+                "run_success_flag": False,
+                "business_operation_completed": False,
+                "side_effect_state": "NOT_STARTED",
+                "error_code": exc.code,
+                "error_message": exc.message,
+                "retryable": exc.retryable,
+                "snapshot": snapshot,
+            }
+        )
+    _v5_record_timing(
+        timing_trace,
+        "listing_sync_total",
+        flow_timer,
+    )
+    return _set_result(args, result)
+
+
+def _v5_write_result_semantics(items):
+    counts = v5_result_counts(items)
+    return counts, derive_v5_batch_semantics(counts)
+
+
+def _v5_result_item(request_item):
+    return {
+        name: request_item.get(name)
+        for name in (
+            "source_task_id",
+            "operation_id",
+            "item_execution_attempt_id",
+            "internal_sku",
+            "item_payload_sha256",
+        )
+    } | {
+        "operation_result": "NOT_ATTEMPTED",
+        "detail_effect_state": "NOT_STARTED",
+        "listing_effect_state": "NOT_STARTED",
+        "detail_save_clicked": False,
+        "action_confirm_clicked": False,
+        "observed_price_before_action": None,
+        "observed_inventory_before_action": None,
+        "observed_price_after_detail_save": None,
+        "observed_inventory_after_detail_save": None,
+        "actual_price": None,
+        "actual_inventory": None,
+        "detail_save_clicked_at": None,
+        "action_clicked_at": None,
+        "readback_observed_at": None,
+        "error_code": "",
+        "error_message": "",
+    }
+
+
+def _v5_item_identity(request, request_item):
+    return contract_identity_key(
+        request["platform_name"],
+        None,
+        request_item["expected_product_name"],
+        request_item["expected_grade"],
+    )
+
+
+def _v5_matching_rows(request, request_item, rows):
+    expected_identity = _v5_item_identity(request, request_item)
+    return [
+        row
+        for row in rows
+        if contract_identity_key(
+            request["platform_name"],
+            None,
+            row.get("name"),
+            row.get("grade"),
+        )
+        == expected_identity
+    ]
+
+
+def _v5_phase_for_items(
+    request,
+    phase,
+    request_item,
+    item_results,
+    *,
+    clicked_at=None,
+):
+    current = next(
+        (
+            item
+            for item in item_results
+            if item.get("operation_id") == request_item.get("operation_id")
+        ),
+        None,
+    )
+    _v5_write_phase(
+        request,
+        phase,
+        current_item=request_item,
+        item_states=item_results,
+        clicked_at=clicked_at,
+        detail_effect_state=(
+            str(current.get("detail_effect_state") or "NOT_STARTED")
+            if current
+            else "NOT_STARTED"
+        ),
+        listing_effect_state=(
+            str(current.get("listing_effect_state") or "NOT_STARTED")
+            if current
+            else "NOT_STARTED"
+        ),
+    )
+
+
+def _v5_classify_interrupted_items(
+    item_results,
+    *,
+    current_operation_id,
+    error_code,
+    error_message,
+    detail_intent_operation_id="",
+):
+    for item in item_results:
+        outcome = str(item.get("operation_result") or "").upper()
+        if outcome in {"VERIFIED", "ALREADY_APPLIED"}:
+            continue
+        operation_id = str(item.get("operation_id") or "")
+        is_current = operation_id == str(current_operation_id or "")
+        if item.get("action_confirm_clicked"):
+            item["operation_result"] = "NEEDS_RECONCILIATION"
+            item["listing_effect_state"] = "UNKNOWN"
+        elif operation_id == str(detail_intent_operation_id or ""):
+            item["operation_result"] = "NEEDS_RECONCILIATION"
+            item["detail_effect_state"] = "UNKNOWN"
+            item["listing_effect_state"] = "NOT_STARTED"
+        elif (
+            item.get("detail_save_clicked")
+            and str(item.get("detail_effect_state") or "").upper() == "UNKNOWN"
+        ):
+            item["operation_result"] = "NEEDS_RECONCILIATION"
+            item["listing_effect_state"] = "NOT_STARTED"
+        elif (
+            item.get("detail_save_clicked")
+            and str(item.get("detail_effect_state") or "").upper() == "VERIFIED"
+        ):
+            item["operation_result"] = "PARTIALLY_APPLIED"
+            item["listing_effect_state"] = "NOT_STARTED"
+        elif is_current:
+            item["operation_result"] = "NOT_APPLIED"
+            item["detail_effect_state"] = "NOT_APPLIED"
+            item["listing_effect_state"] = "NOT_APPLIED"
+        else:
+            item["operation_result"] = "NOT_ATTEMPTED"
+            item["detail_effect_state"] = "NOT_STARTED"
+            item["listing_effect_state"] = "NOT_STARTED"
+        if is_current:
+            item["error_code"] = str(error_code or "")
+            item["error_message"] = str(error_message or "")
+
+
+def _v5_raise_controlled_action_unknown(request, execution_ordinal):
+    fault_injection = str(
+        request.get("fault_injection") or ""
+    ).strip().upper()
+    fault_ordinal = request.get("fault_injection_item_ordinal")
+    if (
+        fault_injection == "AFTER_ACTION_CLICK_UNKNOWN"
+        and fault_ordinal == execution_ordinal
+    ):
+        raise SliceError(
+            "CONTROLLED_AFTER_ACTION_CLICK_UNKNOWN",
+            "受控故障：最终确认已点击，跳过结果回读",
+            retryable=False,
+        )
+
+
+def _run_listing_action_reconcile_v5(args, request, result):
+    """Read-only reconciliation for one UNKNOWN v5 listing operation."""
+
+    flow_timer = time.perf_counter()
+    started_at = _multi_product_utc_now()
+    timing_trace = result.setdefault("timing_trace", [])
+    request_item = dict((request.get("items") or [])[0])
+    output = _v5_result_item(request_item)
+    timeout_seconds = _as_int(
+        request,
+        "element_timeout_seconds",
+        ELEMENT_TIMEOUT_DEFAULT,
+        minimum=1,
+    )
+    execution_error = None
+    try:
+        _v5_load_mapping(request)
+        _v5_phase_for_items(
+            request,
+            "UI_STARTED",
+            request_item,
+            [output],
+        )
+        stage_timer = time.perf_counter()
+        window, launch = _get_or_open_and_prepare_window(
+            str(request.get("window_title") or WINDOW_TITLE_DEFAULT),
+            WINDOW_X_DEFAULT,
+            WINDOW_Y_DEFAULT,
+            WINDOW_WIDTH_DEFAULT,
+            WINDOW_HEIGHT_DEFAULT,
+            str(request.get("applet_uri") or ""),
+            APPLET_LAUNCH_TIMEOUT_DEFAULT,
+        )
+        result["applet_launch"] = launch
+        sleep(1)
+        _v5_record_timing(
+            timing_trace,
+            "window_prepare",
+            stage_timer,
+        )
+        stage_timer = time.perf_counter()
+        _recover_login_if_needed(
+            window,
+            request,
+            result,
+            timeout_seconds,
+            _get_arg(args, "_login_config", {}),
+            _get_arg(args, "_credential_provider", None),
+        )
+        _v5_record_timing(
+            timing_trace,
+            "login_check",
+            stage_timer,
+        )
+        stage_timer = time.perf_counter()
+        _refresh_product_list(
+            window,
+            timeout_seconds,
+            result,
+            "BEFORE_LISTING_RECONCILE",
+        )
+        _v5_record_timing(
+            timing_trace,
+            "product_list_refresh",
+            stage_timer,
+        )
+        online_scan = _v5_scan_page(
+            window,
+            request,
+            timeout_seconds,
+            page_type="online",
+            targets=[request_item],
+            timing_trace=timing_trace,
+            timing_stage="reconcile_online_scan",
+        )
+        online_rows = _v5_matching_rows(
+            request,
+            request_item,
+            online_scan["rows"],
+        )
+        waiting_rows = []
+        if request["action_type"] == "set_online":
+            _select_waiting_product_list(
+                window,
+                timeout_seconds,
+                result,
+            )
+            waiting_scan = _v5_scan_page(
+                window,
+                request,
+                timeout_seconds,
+                page_type="waiting",
+                targets=[request_item],
+                timing_trace=timing_trace,
+                timing_stage="reconcile_waiting_scan",
+            )
+            waiting_rows = _v5_matching_rows(
+                request,
+                request_item,
+                waiting_scan["rows"],
+            )
+            readback_at = waiting_scan["scan_completed_at"]
+        else:
+            readback_at = online_scan["scan_completed_at"]
+        _v5_phase_for_items(
+            request,
+            "PREFLIGHT_VALIDATED",
+            request_item,
+            [output],
+        )
+        if len(online_rows) > 1 or len(waiting_rows) > 1:
+            output.update(
+                {
+                    "operation_result": "NEEDS_RECONCILIATION",
+                    "listing_effect_state": "UNKNOWN",
+                    "readback_observed_at": readback_at,
+                    "error_code": "PRODUCT_IDENTITY_NOT_UNIQUE",
+                    "error_message": "对账扫描发现目标身份不唯一",
+                }
+            )
+        elif request["action_type"] == "set_offline":
+            if not online_rows:
+                output.update(
+                    {
+                        "operation_result": "VERIFIED",
+                        "detail_effect_state": "NOT_APPLIED",
+                        "listing_effect_state": "VERIFIED",
+                        "readback_observed_at": readback_at,
+                    }
+                )
+            else:
+                row = online_rows[0]
+                output.update(
+                    {
+                        "operation_result": "NOT_APPLIED",
+                        "detail_effect_state": "NOT_APPLIED",
+                        "listing_effect_state": "NOT_APPLIED",
+                        "observed_price_before_action": str(
+                            row.get("price")
+                        ),
+                        "observed_inventory_before_action": int(
+                            row.get("inventory")
+                        ),
+                        "actual_price": str(row.get("price")),
+                        "actual_inventory": int(row.get("inventory")),
+                        "readback_observed_at": readback_at,
+                    }
+                )
+        elif online_rows and waiting_rows:
+            output.update(
+                {
+                    "operation_result": "NEEDS_RECONCILIATION",
+                    "listing_effect_state": "UNKNOWN",
+                    "readback_observed_at": readback_at,
+                    "error_code": "PRESENT_IN_BOTH_LISTS",
+                    "error_message": "目标同时存在于上架中和待上架",
+                }
+            )
+        elif not online_rows and not waiting_rows:
+            output.update(
+                {
+                    "operation_result": "NEEDS_RECONCILIATION",
+                    "listing_effect_state": "UNKNOWN",
+                    "readback_observed_at": readback_at,
+                    "error_code": "ABSENT_FROM_BOTH_LISTS",
+                    "error_message": "目标在两个完整列表中均不存在",
+                }
+            )
+        elif waiting_rows:
+            row = waiting_rows[0]
+            output.update(
+                {
+                    "operation_result": "NOT_APPLIED",
+                    "detail_effect_state": "NOT_APPLIED",
+                    "listing_effect_state": "NOT_APPLIED",
+                    "observed_price_before_action": str(row.get("price")),
+                    "observed_inventory_before_action": int(
+                        row.get("inventory")
+                    ),
+                    "actual_price": str(row.get("price")),
+                    "actual_inventory": int(row.get("inventory")),
+                    "readback_observed_at": readback_at,
+                }
+            )
+        else:
+            row = online_rows[0]
+            observed_price = str(row.get("price"))
+            observed_inventory = int(row.get("inventory"))
+            output.update(
+                {
+                    "observed_price_before_action": observed_price,
+                    "observed_inventory_before_action": observed_inventory,
+                    "actual_price": observed_price,
+                    "actual_inventory": observed_inventory,
+                    "readback_observed_at": readback_at,
+                }
+            )
+            if (
+                observed_price == str(request_item.get("target_price"))
+                and observed_inventory
+                == int(request_item.get("target_inventory"))
+            ):
+                output.update(
+                    {
+                        "operation_result": "VERIFIED",
+                        "detail_effect_state": "VERIFIED",
+                        "listing_effect_state": "VERIFIED",
+                    }
+                )
+            else:
+                output.update(
+                    {
+                        "operation_result": "NEEDS_RECONCILIATION",
+                        "detail_effect_state": "UNKNOWN",
+                        "listing_effect_state": "VERIFIED",
+                        "error_code": "LISTING_DATA_MISMATCH",
+                        "error_message": "商品已在线但价格或库存不符合目标",
+                    }
+                )
+        _v5_phase_for_items(
+            request,
+            "FINAL_VERIFICATION",
+            request_item,
+            [output],
+        )
+    except SliceError as exc:
+        execution_error = exc
+        output.update(
+            {
+                "operation_result": "NEEDS_RECONCILIATION",
+                "listing_effect_state": "UNKNOWN",
+                "error_code": exc.code,
+                "error_message": exc.message,
+            }
+        )
+    _v5_record_timing(
+        timing_trace,
+        "listing_action_reconcile_total",
+        flow_timer,
+        internal_sku=request_item["internal_sku"],
+    )
+    counts, semantics = _v5_write_result_semantics([output])
+    result.update(
+        {
+            "started_at": started_at,
+            "ended_at": _multi_product_utc_now(),
+            "items": [output],
+            "counts": counts,
+            **semantics,
+            "error_code": str(
+                getattr(execution_error, "code", "")
+                or output.get("error_code")
+                or ""
+            ),
+            "error_message": str(
+                getattr(execution_error, "message", "")
+                or output.get("error_message")
+                or ""
+            ),
+            "retryable": False,
+        }
+    )
+    return _set_result(args, result)
+
+
+def _run_set_online_v5(args, request, result):
+    flow_timer = time.perf_counter()
+    started_at = _multi_product_utc_now()
+    timing_trace = result.setdefault("timing_trace", [])
+    request_items = list(request.get("items") or [])
+    item_results = [_v5_result_item(item) for item in request_items]
+    outputs_by_operation = {
+        item["operation_id"]: output
+        for item, output in zip(request_items, item_results)
+    }
+    timeout_seconds = _as_int(
+        request,
+        "element_timeout_seconds",
+        ELEMENT_TIMEOUT_DEFAULT,
+        minimum=1,
+    )
+    current_item = request_items[0]
+    detail_intent_operation_id = ""
+    execution_error = None
+    window = None
+    mappings = []
+    try:
+        mappings = _v5_load_mapping(request)
+        _v5_phase_for_items(
+            request,
+            "UI_STARTED",
+            current_item,
+            item_results,
+        )
+        stage_timer = time.perf_counter()
+        window, launch = _get_or_open_and_prepare_window(
+            str(request.get("window_title") or WINDOW_TITLE_DEFAULT),
+            WINDOW_X_DEFAULT,
+            WINDOW_Y_DEFAULT,
+            WINDOW_WIDTH_DEFAULT,
+            WINDOW_HEIGHT_DEFAULT,
+            str(request.get("applet_uri") or ""),
+            APPLET_LAUNCH_TIMEOUT_DEFAULT,
+        )
+        result["applet_launch"] = launch
+        sleep(1)
+        _v5_record_timing(
+            timing_trace,
+            "window_prepare",
+            stage_timer,
+        )
+        stage_timer = time.perf_counter()
+        _recover_login_if_needed(
+            window,
+            request,
+            result,
+            timeout_seconds,
+            _get_arg(args, "_login_config", {}),
+            _get_arg(args, "_credential_provider", None),
+        )
+        _v5_record_timing(
+            timing_trace,
+            "login_check",
+            stage_timer,
+        )
+        stage_timer = time.perf_counter()
+        _refresh_product_list(
+            window,
+            timeout_seconds,
+            result,
+            "BEFORE_SET_ONLINE",
+        )
+        _v5_record_timing(
+            timing_trace,
+            "product_list_refresh",
+            stage_timer,
+        )
+        online_scan = _v5_scan_page(
+            window,
+            request,
+            timeout_seconds,
+            page_type="online",
+            targets=request_items,
+            timing_trace=timing_trace,
+            timing_stage="preflight_online_scan",
+        )
+        _select_waiting_product_list(window, timeout_seconds, result)
+        waiting_scan = _v5_scan_page(
+            window,
+            request,
+            timeout_seconds,
+            page_type="waiting",
+            targets=request_items,
+            timing_trace=timing_trace,
+            timing_stage="preflight_waiting_scan",
+        )
+        snapshot_items = _v5_snapshot_items(
+            request,
+            _v5_stable_id(
+                "PREFLIGHT",
+                {
+                    "batch_id": request["batch_id"],
+                    "execution_attempt_id": request["execution_attempt_id"],
+                },
+            ),
+            mappings,
+            online_scan,
+            waiting_scan,
+        )
+        plans = []
+        for request_item in request_items:
+            current_item = request_item
+            output = outputs_by_operation[request_item["operation_id"]]
+            matched_snapshot_items = [
+                item
+                for item in snapshot_items
+                if item.get("internal_sku") == request_item["internal_sku"]
+            ]
+            if len(matched_snapshot_items) != 1:
+                raise SliceError(
+                    "PRODUCT_IDENTITY_NOT_UNIQUE",
+                    "预扫描无法按 SKU 唯一定位目标",
+                    retryable=False,
+                )
+            preflight = matched_snapshot_items[0]
+            target_price = str(request_item["target_price"])
+            target_inventory = int(request_item["target_inventory"])
+            location = str(preflight.get("listing_location") or "")
+            observed_price = (
+                preflight.get("waiting_observed_price")
+                if location == "waiting_only"
+                else preflight.get("online_observed_price")
+            )
+            observed_inventory = (
+                preflight.get("waiting_observed_inventory")
+                if location == "waiting_only"
+                else preflight.get("online_observed_inventory")
+            )
+            output["observed_price_before_action"] = observed_price
+            output["observed_inventory_before_action"] = observed_inventory
+            if location == "online_only":
+                if (
+                    str(observed_price) != target_price
+                    or int(observed_inventory) != target_inventory
+                ):
+                    raise SliceError(
+                        "LISTING_DATA_MISMATCH",
+                        "目标已在线但价格或库存不符合合同",
+                        retryable=False,
+                    )
+                output.update(
+                    {
+                        "operation_result": "ALREADY_APPLIED",
+                        "detail_effect_state": "NOT_APPLIED",
+                        "listing_effect_state": "NOT_APPLIED",
+                        "actual_price": observed_price,
+                        "actual_inventory": observed_inventory,
+                        "readback_observed_at": _multi_product_utc_now(),
+                    }
+                )
+                continue
+            if location != "waiting_only":
+                raise SliceError(
+                    "EXPECTED_WAITING_ONLY",
+                    "SET_ONLINE 目标不是唯一 waiting_only",
+                    retryable=False,
+                )
+            matching_rows = _v5_matching_rows(
+                request,
+                request_item,
+                waiting_scan["rows"],
+            )
+            if len(matching_rows) != 1:
+                raise SliceError(
+                    "PRODUCT_IDENTITY_NOT_UNIQUE",
+                    "待上架页面目标身份不唯一",
+                    retryable=False,
+                )
+            plans.append(
+                {
+                    "request_item": request_item,
+                    "row": matching_rows[0],
+                    "target_price": target_price,
+                    "target_inventory": target_inventory,
+                }
+            )
+        plans.sort(key=lambda item: int(item["row"]["parent_index"]))
+        _v5_phase_for_items(
+            request,
+            "PREFLIGHT_VALIDATED",
+            plans[0]["request_item"] if plans else current_item,
+            item_results,
+        )
+
+        removed_waiting_items = 0
+        for plan in plans:
+            item_timer = time.perf_counter()
+            request_item = plan["request_item"]
+            current_item = request_item
+            output = outputs_by_operation[request_item["operation_id"]]
+            row = dict(plan["row"])
+            row["parent_index"] = (
+                int(row["parent_index"])
+                - removed_waiting_items * WAITING_ROW_INDEX_STEP
+            )
+            row["position"] = (
+                int(row["position"]) - removed_waiting_items
+            )
+            if int(row["parent_index"]) < ROW_INDEX_START:
+                raise SliceError(
+                    "EXECUTION_TRAJECTORY_INVALID",
+                    "预扫描生成的待上架行轨迹无效",
+                    retryable=False,
+                )
+            plan["row"] = row
+            parent_index = int(row["parent_index"])
+            _v5_prepare_row_for_click(
+                window,
+                request,
+                timeout_seconds,
+                row=row,
+                page_type="waiting",
+            )
+            _v5_record_timing(
+                timing_trace,
+                "item_visibility_prepare",
+                item_timer,
+                internal_sku=request_item["internal_sku"],
+            )
+            observed_price = output["observed_price_before_action"]
+            observed_inventory = output["observed_inventory_before_action"]
+            target_price = plan["target_price"]
+            target_inventory = plan["target_inventory"]
+            price_timer = time.perf_counter()
+            if str(observed_price) != target_price:
+                _open_price_dialog(
+                    window,
+                    parent_index,
+                    timeout_seconds,
+                    page_type="waiting",
+                    settle_seconds=0.0,
+                )
+                _fill_target_price(
+                    window,
+                    target_price,
+                    timeout_seconds,
+                    page_type="waiting",
+                )
+                detail_intent_operation_id = request_item["operation_id"]
+                _v5_phase_for_items(
+                    request,
+                    "DETAIL_SAVE_INTENT_RECORDED",
+                    request_item,
+                    item_results,
+                )
+                _confirm_price_dialog(
+                    window,
+                    timeout_seconds,
+                    page_type="waiting",
+                    settle_seconds=0.0,
+                )
+                _v5_wait_row_price(
+                    window,
+                    parent_index,
+                    timeout_seconds,
+                    target_price,
+                    page_type="waiting",
+                )
+                detail_intent_operation_id = ""
+                output["detail_save_clicked"] = True
+                output["detail_save_clicked_at"] = _multi_product_utc_now()
+                output["detail_effect_state"] = "UNKNOWN"
+                _v5_phase_for_items(
+                    request,
+                    "DETAIL_SAVE_CLICKED",
+                    request_item,
+                    item_results,
+                )
+            _v5_record_timing(
+                timing_trace,
+                "item_price_update",
+                price_timer,
+                internal_sku=request_item["internal_sku"],
+                changed=str(observed_price) != target_price,
+            )
+            inventory_timer = time.perf_counter()
+            if int(observed_inventory) != target_inventory:
+                inventory_element = _find_element(
+                    window,
+                    _row_field_selector(
+                        parent_index,
+                        "inventory",
+                        "waiting",
+                    ),
+                    timeout_seconds,
+                )
+                inventory_element.click()
+                _find_element(
+                    window,
+                    WAITING_INVENTORY_POPUP_SELECTOR,
+                    timeout_seconds,
+                )
+                inventory_input = _find_element(
+                    window,
+                    WAITING_INVENTORY_INPUT_SELECTOR,
+                    timeout_seconds,
+                )
+                _set_input_value(inventory_input, str(target_inventory))
+                inventory_readback = _read_price_input(inventory_input)
+                if (
+                    inventory_readback
+                    and int(Decimal(inventory_readback)) != target_inventory
+                ):
+                    _find_element(
+                        window,
+                        WAITING_INVENTORY_CANCEL_SELECTOR,
+                        timeout_seconds,
+                    ).click()
+                    raise SliceError(
+                        "TARGET_INVENTORY_VERIFY_FAILED",
+                        "目标库存输入回读不一致",
+                        retryable=True,
+                    )
+                detail_intent_operation_id = request_item["operation_id"]
+                _v5_phase_for_items(
+                    request,
+                    "DETAIL_SAVE_INTENT_RECORDED",
+                    request_item,
+                    item_results,
+                )
+                _find_element(
+                    window,
+                    WAITING_INVENTORY_CONFIRM_SELECTOR,
+                    timeout_seconds,
+                ).click()
+                _v5_wait_row_inventory(
+                    window,
+                    parent_index,
+                    timeout_seconds,
+                    target_inventory,
+                    page_type="waiting",
+                )
+                detail_intent_operation_id = ""
+                output["detail_save_clicked"] = True
+                output["detail_save_clicked_at"] = _multi_product_utc_now()
+                output["detail_effect_state"] = "UNKNOWN"
+                _v5_phase_for_items(
+                    request,
+                    "DETAIL_SAVE_CLICKED",
+                    request_item,
+                    item_results,
+                )
+            _v5_record_timing(
+                timing_trace,
+                "item_inventory_update",
+                inventory_timer,
+                internal_sku=request_item["internal_sku"],
+                changed=int(observed_inventory) != target_inventory,
+            )
+            detail_readback_timer = time.perf_counter()
+            output["observed_price_after_detail_save"] = _read_row_price(
+                window,
+                parent_index,
+                timeout_seconds,
+                page_type="waiting",
+            )
+            output["observed_inventory_after_detail_save"] = (
+                _read_row_inventory(
+                    window,
+                    parent_index,
+                    timeout_seconds,
+                    page_type="waiting",
+                )
+            )
+            if (
+                str(output["observed_price_after_detail_save"])
+                != target_price
+                or int(output["observed_inventory_after_detail_save"])
+                != target_inventory
+            ):
+                raise SliceError(
+                    "DETAIL_READBACK_MISMATCH",
+                    "资料保存后价格或库存回读不符合目标",
+                    retryable=False,
+                )
+            output["detail_effect_state"] = (
+                "VERIFIED" if output["detail_save_clicked"] else "NOT_APPLIED"
+            )
+            _v5_phase_for_items(
+                request,
+                "DETAILS_VERIFIED",
+                request_item,
+                item_results,
+            )
+            _v5_record_timing(
+                timing_trace,
+                "item_detail_readback",
+                detail_readback_timer,
+                internal_sku=request_item["internal_sku"],
+            )
+            action_visibility_timer = time.perf_counter()
+            _v5_prepare_row_for_click(
+                window,
+                request,
+                timeout_seconds,
+                row=row,
+                page_type="waiting",
+                click_target="set_online_action",
+            )
+            _v5_record_timing(
+                timing_trace,
+                "item_action_visibility",
+                action_visibility_timer,
+                internal_sku=request_item["internal_sku"],
+            )
+            action_timer = time.perf_counter()
+            action_button = _find_element(
+                window,
+                _waiting_row_action_selector(
+                    parent_index,
+                    WAITING_SET_ONLINE_BUTTON_SELECTOR,
+                    "动态_index_%d_上架按钮" % parent_index,
+                ),
+                timeout_seconds,
+            )
+            action_button.click()
+            prompt_text = _read_text(
+                window,
+                WAITING_SET_ONLINE_PROMPT_SELECTOR,
+                timeout_seconds,
+            )
+            _assert_set_online_confirmation_identity(
+                prompt_text,
+                request_item["expected_product_name"],
+                request_item["expected_grade"],
+            )
+            _v5_phase_for_items(
+                request,
+                "ACTION_INTENT_RECORDED",
+                request_item,
+                item_results,
+            )
+            _find_element(
+                window,
+                WAITING_SET_ONLINE_CONFIRM_SELECTOR,
+                timeout_seconds,
+            ).click()
+            output["action_confirm_clicked"] = True
+            output["action_clicked_at"] = _multi_product_utc_now()
+            output["listing_effect_state"] = "UNKNOWN"
+            _v5_phase_for_items(
+                request,
+                "ACTION_CLICKED",
+                request_item,
+                item_results,
+                clicked_at=output["action_clicked_at"],
+            )
+            _v5_wait_row_identity_changed(
+                window,
+                parent_index,
+                timeout_seconds,
+                page_type="waiting",
+                expected_name=request_item["expected_product_name"],
+                expected_grade=request_item["expected_grade"],
+            )
+            removed_waiting_items += 1
+            _v5_record_timing(
+                timing_trace,
+                "item_action_confirm",
+                action_timer,
+                internal_sku=request_item["internal_sku"],
+            )
+
+        final_online_scan = online_scan
+        if plans:
+            _select_online_product_list(window, timeout_seconds, result)
+            final_online_scan = _v5_scan_page(
+                window,
+                request,
+                timeout_seconds,
+                page_type="online",
+                targets=request_items,
+                timing_trace=timing_trace,
+                timing_stage="final_online_scan",
+            )
+        for request_item in request_items:
+            current_item = request_item
+            output = outputs_by_operation[request_item["operation_id"]]
+            post_rows = _v5_matching_rows(
+                request,
+                request_item,
+                final_online_scan["rows"],
+            )
+            if len(post_rows) != 1:
+                raise SliceError(
+                    "POSTCHECK_NOT_ONLINE",
+                    "统一回读后未在上架中唯一找到目标",
+                    retryable=False,
+                )
+            post_row = post_rows[0]
+            target_price = str(request_item["target_price"])
+            target_inventory = int(request_item["target_inventory"])
+            if (
+                str(post_row.get("price")) != target_price
+                or int(post_row.get("inventory")) != target_inventory
+            ):
+                raise SliceError(
+                    "POSTCHECK_DATA_MISMATCH",
+                    "上架后价格或库存不符合目标",
+                    retryable=False,
+                )
+            output.update(
+                {
+                    "operation_result": "VERIFIED",
+                    "listing_effect_state": "VERIFIED",
+                    "actual_price": str(post_row.get("price")),
+                    "actual_inventory": int(post_row.get("inventory")),
+                    "readback_observed_at": post_row.get("observed_at"),
+                }
+            )
+        _v5_phase_for_items(
+            request,
+            "FINAL_VERIFICATION",
+            current_item,
+            item_results,
+        )
+    except SliceError as exc:
+        execution_error = exc
+        _v5_classify_interrupted_items(
+            item_results,
+            current_operation_id=current_item.get("operation_id"),
+            error_code=exc.code,
+            error_message=exc.message,
+            detail_intent_operation_id=detail_intent_operation_id,
+        )
+        if window is not None and mappings and any(
+            item.get("detail_save_clicked") or item.get("action_confirm_clicked")
+            for item in item_results
+        ):
+            _v5_phase_for_items(
+                request,
+                "POST_FAILURE_SCAN_STARTED",
+                current_item,
+                item_results,
+            )
+            try:
+                result["post_failure_snapshot"] = _v5_post_failure_snapshot(
+                    window,
+                    request,
+                    result,
+                    timeout_seconds,
+                    mappings,
+                )
+                _v5_phase_for_items(
+                    request,
+                    "POST_FAILURE_SCAN_COMPLETED",
+                    current_item,
+                    item_results,
+                )
+            except Exception as recovery_exc:
+                result["post_failure_snapshot"] = (
+                    _v5_failed_post_failure_snapshot(
+                        request,
+                        recovery_exc,
+                    )
+                )
+    _v5_record_timing(
+        timing_trace,
+        "set_online_total",
+        flow_timer,
+        item_count=len(request_items),
+    )
+    counts, semantics = _v5_write_result_semantics(item_results)
+    result.update(
+        {
+            "started_at": started_at,
+            "ended_at": _multi_product_utc_now(),
+            "items": item_results,
+            "counts": counts,
+            **semantics,
+            "error_code": str(getattr(execution_error, "code", "") or ""),
+            "error_message": str(getattr(execution_error, "message", "") or ""),
+            "retryable": False,
+        }
+    )
+    return _set_result(args, result)
+
+
+def _run_set_offline_v5(args, request, result):
+    flow_timer = time.perf_counter()
+    started_at = _multi_product_utc_now()
+    timing_trace = result.setdefault("timing_trace", [])
+    request_items = list(request.get("items") or [])
+    item_results = [_v5_result_item(item) for item in request_items]
+    outputs_by_operation = {
+        item["operation_id"]: output
+        for item, output in zip(request_items, item_results)
+    }
+    timeout_seconds = _as_int(
+        request,
+        "element_timeout_seconds",
+        ELEMENT_TIMEOUT_DEFAULT,
+        minimum=1,
+    )
+    current_item = request_items[0]
+    execution_error = None
+    try:
+        _v5_load_mapping(request)
+        _v5_phase_for_items(
+            request,
+            "UI_STARTED",
+            current_item,
+            item_results,
+        )
+        stage_timer = time.perf_counter()
+        window, launch = _get_or_open_and_prepare_window(
+            str(request.get("window_title") or WINDOW_TITLE_DEFAULT),
+            WINDOW_X_DEFAULT,
+            WINDOW_Y_DEFAULT,
+            WINDOW_WIDTH_DEFAULT,
+            WINDOW_HEIGHT_DEFAULT,
+            str(request.get("applet_uri") or ""),
+            APPLET_LAUNCH_TIMEOUT_DEFAULT,
+        )
+        result["applet_launch"] = launch
+        sleep(1)
+        _v5_record_timing(
+            timing_trace,
+            "window_prepare",
+            stage_timer,
+        )
+        stage_timer = time.perf_counter()
+        _recover_login_if_needed(
+            window,
+            request,
+            result,
+            timeout_seconds,
+            _get_arg(args, "_login_config", {}),
+            _get_arg(args, "_credential_provider", None),
+        )
+        _v5_record_timing(
+            timing_trace,
+            "login_check",
+            stage_timer,
+        )
+        stage_timer = time.perf_counter()
+        _refresh_product_list(
+            window,
+            timeout_seconds,
+            result,
+            "BEFORE_SET_OFFLINE",
+        )
+        _v5_record_timing(
+            timing_trace,
+            "product_list_refresh",
+            stage_timer,
+        )
+        online_scan = _v5_scan_page(
+            window,
+            request,
+            timeout_seconds,
+            page_type="online",
+            targets=request_items,
+            timing_trace=timing_trace,
+            timing_stage="preflight_online_scan",
+        )
+        plans = []
+        for request_item in request_items:
+            current_item = request_item
+            output = outputs_by_operation[request_item["operation_id"]]
+            matching_rows = _v5_matching_rows(
+                request,
+                request_item,
+                online_scan["rows"],
+            )
+            if len(matching_rows) > 1:
+                raise SliceError(
+                    "PRODUCT_IDENTITY_NOT_UNIQUE",
+                    "上架中页面目标身份不唯一",
+                    retryable=False,
+                )
+            if not matching_rows:
+                output.update(
+                    {
+                        "operation_result": "ALREADY_APPLIED",
+                        "detail_effect_state": "NOT_APPLIED",
+                        "listing_effect_state": "NOT_APPLIED",
+                        "readback_observed_at": online_scan["scan_completed_at"],
+                    }
+                )
+                continue
+            row = matching_rows[0]
+            output["observed_price_before_action"] = str(row.get("price"))
+            output["observed_inventory_before_action"] = int(
+                row.get("inventory")
+            )
+            output["detail_effect_state"] = "NOT_APPLIED"
+            plans.append({"request_item": request_item, "row": row})
+        plans.sort(key=lambda item: int(item["row"]["parent_index"]))
+        _v5_phase_for_items(
+            request,
+            "PREFLIGHT_VALIDATED",
+            plans[0]["request_item"] if plans else current_item,
+            item_results,
+        )
+
+        removed_online_items = 0
+        for execution_ordinal, plan in enumerate(plans, start=1):
+            item_timer = time.perf_counter()
+            request_item = plan["request_item"]
+            current_item = request_item
+            output = outputs_by_operation[request_item["operation_id"]]
+            row = dict(plan["row"])
+            row["parent_index"] = (
+                int(row["parent_index"])
+                - removed_online_items * ROW_INDEX_STEP
+            )
+            row["position"] = int(row["position"]) - removed_online_items
+            if int(row["parent_index"]) < ROW_INDEX_START:
+                raise SliceError(
+                    "EXECUTION_TRAJECTORY_INVALID",
+                    "预扫描生成的上架中行轨迹无效",
+                    retryable=False,
+                )
+            parent_index = int(row["parent_index"])
+            _v5_prepare_row_for_click(
+                window,
+                request,
+                timeout_seconds,
+                row=row,
+                page_type="online",
+                click_target="set_offline_action",
+            )
+            _v5_record_timing(
+                timing_trace,
+                "item_action_visibility",
+                item_timer,
+                internal_sku=request_item["internal_sku"],
+            )
+            action_timer = time.perf_counter()
+            action_button = _find_element(
+                window,
+                _online_row_action_selector(
+                    parent_index,
+                    ONLINE_SET_OFFLINE_BUTTON_SELECTOR,
+                    "动态_index_%d_下架按钮" % parent_index,
+                ),
+                timeout_seconds,
+            )
+            action_button.click()
+            expected_prompt_text = "您确定下架【%s %s】吗？" % (
+                request_item["expected_grade"],
+                request_item["expected_product_name"],
+            )
+            prompt_text = _read_text(
+                window,
+                _clone_dynamic_static_text_selector(
+                    ONLINE_SET_OFFLINE_PROMPT_SELECTOR,
+                    "动态_下架确认弹窗_提示文本",
+                    expected_prompt_text,
+                ),
+                timeout_seconds,
+            )
+            _assert_set_offline_confirmation_identity(
+                prompt_text,
+                request_item["expected_product_name"],
+                request_item["expected_grade"],
+            )
+            _v5_phase_for_items(
+                request,
+                "ACTION_INTENT_RECORDED",
+                request_item,
+                item_results,
+            )
+            _find_element(
+                window,
+                ONLINE_SET_OFFLINE_CONFIRM_SELECTOR,
+                timeout_seconds,
+            ).click()
+            output["action_confirm_clicked"] = True
+            output["action_clicked_at"] = _multi_product_utc_now()
+            output["listing_effect_state"] = "UNKNOWN"
+            _v5_phase_for_items(
+                request,
+                "ACTION_CLICKED",
+                request_item,
+                item_results,
+                clicked_at=output["action_clicked_at"],
+            )
+            _v5_raise_controlled_action_unknown(
+                request,
+                execution_ordinal,
+            )
+            _v5_wait_row_identity_changed(
+                window,
+                parent_index,
+                timeout_seconds,
+                page_type="online",
+                expected_name=request_item["expected_product_name"],
+                expected_grade=request_item["expected_grade"],
+            )
+            output.update(
+                {
+                    "operation_result": "VERIFIED",
+                    "listing_effect_state": "VERIFIED",
+                    "actual_price": output["observed_price_before_action"],
+                    "actual_inventory": output[
+                        "observed_inventory_before_action"
+                    ],
+                    "readback_observed_at": _multi_product_utc_now(),
+                }
+            )
+            _v5_phase_for_items(
+                request,
+                "FINAL_VERIFICATION",
+                request_item,
+                item_results,
+            )
+            removed_online_items += 1
+            _v5_record_timing(
+                timing_trace,
+                "item_action_confirm",
+                action_timer,
+                internal_sku=request_item["internal_sku"],
+            )
+
+        final_online_scan = online_scan
+        if plans:
+            final_online_scan = _v5_scan_page(
+                window,
+                request,
+                timeout_seconds,
+                page_type="online",
+                targets=request_items,
+                timing_trace=timing_trace,
+                timing_stage="final_online_scan",
+            )
+        for plan in plans:
+            request_item = plan["request_item"]
+            current_item = request_item
+            output = outputs_by_operation[request_item["operation_id"]]
+            post_rows = _v5_matching_rows(
+                request,
+                request_item,
+                final_online_scan["rows"],
+            )
+            if post_rows:
+                raise SliceError(
+                    "POSTCHECK_STILL_ONLINE",
+                    "最终确认后目标仍存在于上架中",
+                    retryable=False,
+                )
+            output.update(
+                {
+                    "operation_result": "VERIFIED",
+                    "listing_effect_state": "VERIFIED",
+                    "actual_price": output["observed_price_before_action"],
+                    "actual_inventory": output[
+                        "observed_inventory_before_action"
+                    ],
+                    "readback_observed_at": final_online_scan[
+                        "scan_completed_at"
+                    ],
+                }
+            )
+        _v5_phase_for_items(
+            request,
+            "FINAL_VERIFICATION",
+            current_item,
+            item_results,
+        )
+    except SliceError as exc:
+        execution_error = exc
+        _v5_classify_interrupted_items(
+            item_results,
+            current_operation_id=current_item.get("operation_id"),
+            error_code=exc.code,
+            error_message=exc.message,
+        )
+    _v5_record_timing(
+        timing_trace,
+        "set_offline_total",
+        flow_timer,
+        item_count=len(request_items),
+    )
+    counts, semantics = _v5_write_result_semantics(item_results)
+    result.update(
+        {
+            "started_at": started_at,
+            "ended_at": _multi_product_utc_now(),
+            "items": item_results,
+            "counts": counts,
+            **semantics,
+            "error_code": str(getattr(execution_error, "code", "") or ""),
+            "error_message": str(getattr(execution_error, "message", "") or ""),
+            "retryable": False,
+        }
+    )
+    return _set_result(args, result)
+
+
 def _run_single_product_flow(args, allow_contract_dispatch=False):
     started_at = _now_iso()
     current_step = "VALIDATE_INPUT"
@@ -3618,6 +6537,7 @@ def _run_single_product_flow(args, allow_contract_dispatch=False):
         "selector_model": {
             "row_index_start": ROW_INDEX_START,
             "row_index_step": ROW_INDEX_STEP,
+            "waiting_row_index_step": WAITING_ROW_INDEX_STEP,
             "price_index_offset": PRICE_INDEX_OFFSET,
             "inventory_index_offset": INVENTORY_INDEX_OFFSET,
             "inventory_text_index": INVENTORY_TEXT_INDEX,
@@ -3634,6 +6554,60 @@ def _run_single_product_flow(args, allow_contract_dispatch=False):
 
     try:
         request = _request_payload(args)
+        if allow_contract_dispatch and request.get("contract_version") == 5:
+            action_type = str(request.get("action_type") or "").strip().lower()
+            if (
+                str(request.get("execution_mode") or "").strip().upper()
+                == "RECONCILE"
+            ):
+                result.update(
+                    {
+                        "execution_attempt_id": str(
+                            request.get("execution_attempt_id") or ""
+                        ),
+                        "execution_mode": "RECONCILE",
+                    }
+                )
+                return _run_listing_action_reconcile_v5(
+                    args,
+                    request,
+                    result,
+                )
+            if action_type == "set_online":
+                result.update(
+                    {
+                        "execution_attempt_id": str(
+                            request.get("execution_attempt_id") or ""
+                        ),
+                        "execution_mode": "COMMIT",
+                    }
+                )
+                return _run_set_online_v5(args, request, result)
+            if action_type == "set_offline":
+                result.update(
+                    {
+                        "execution_attempt_id": str(
+                            request.get("execution_attempt_id") or ""
+                        ),
+                        "execution_mode": "COMMIT",
+                    }
+                )
+                return _run_set_offline_v5(args, request, result)
+            if action_type != "sync_status":
+                raise SliceError(
+                    "LISTING_ACTION_NOT_IMPLEMENTED",
+                    "当前 Worker 尚未实现 v5 写动作: " + action_type,
+                    retryable=False,
+                )
+            result.update(
+                {
+                    "execution_attempt_id": str(
+                        request.get("execution_attempt_id") or ""
+                    ),
+                    "execution_mode": "READ_ONLY",
+                }
+            )
+            return _run_listing_sync_v5(args, request, result)
         task_id = _required_text(request, "task_id")
         execution_attempt_id = _required_text(request, "execution_attempt_id")
         if os.path.exists(_result_output_path(execution_attempt_id)):

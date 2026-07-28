@@ -17,12 +17,14 @@ try:
         build_v4_recovery_result,
         canonical_positive_price,
         derive_v4_batch_semantics,
+        derive_v5_batch_semantics,
         normalize_contract_grade,
         normalize_contract_sku,
         normalize_contract_text,
         sha256_json,
         v4_result_counts,
         v4_result_item_skeleton,
+        v5_result_counts,
     )
 except ImportError:
     try:
@@ -30,24 +32,28 @@ except ImportError:
             build_v4_recovery_result,
             canonical_positive_price,
             derive_v4_batch_semantics,
+            derive_v5_batch_semantics,
             normalize_contract_grade,
             normalize_contract_sku,
             normalize_contract_text,
             sha256_json,
             v4_result_counts,
             v4_result_item_skeleton,
+            v5_result_counts,
         )
     except ImportError:
         from shadowbot_contract_primitives import (
             build_v4_recovery_result,
             canonical_positive_price,
             derive_v4_batch_semantics,
+            derive_v5_batch_semantics,
             normalize_contract_grade,
             normalize_contract_sku,
             normalize_contract_text,
             sha256_json,
             v4_result_counts,
             v4_result_item_skeleton,
+            v5_result_counts,
         )
 
 
@@ -91,6 +97,14 @@ V4_SCHEMA_VERSION = "shadowbot-commit-batch-request-1.2"
 V4_RESULT_SCHEMA_VERSION = "shadowbot-commit-batch-result-1.1"
 V4_PHASE_SCHEMA_VERSION = "shadowbot-commit-batch-phase-1.0"
 V4_DEVELOPMENT_FAULT_INJECTIONS = frozenset({"AFTER_SUBMIT_CLICK_UNKNOWN"})
+V5_CONTRACT_VERSION = 5
+V5_MANIFEST_SCHEMA_VERSION = "shadowbot-listing-action-manifest-1.0"
+V5_REQUEST_SCHEMA_VERSION = "shadowbot-listing-action-batch-request-1.0"
+V5_RESULT_SCHEMA_VERSION = "shadowbot-listing-action-batch-result-1.0"
+V5_PHASE_SCHEMA_VERSION = "shadowbot-listing-action-batch-phase-1.0"
+V5_DEVELOPMENT_FAULT_INJECTIONS = frozenset(
+    {"AFTER_ACTION_CLICK_UNKNOWN"}
+)
 def _v2_normalize_text(value):
     return normalize_contract_text(value)
 
@@ -282,6 +296,490 @@ def _v4_result_counts(items):
 
 def _v4_batch_status(counts):
     return derive_v4_batch_semantics(counts)["batch_status"]
+
+
+def _v5_manifest_hash(request):
+    manifest = {
+        "schema_version": V5_MANIFEST_SCHEMA_VERSION,
+        "contract_version": V5_CONTRACT_VERSION,
+        "batch_id": request.get("batch_id"),
+        "action_type": request.get("action_type"),
+        "execution_mode": request.get("execution_mode"),
+        "platform_name": request.get("platform_name"),
+        "mapping_source_version": request.get("mapping_source_version"),
+        "scan_scope": request.get("scan_scope"),
+        "items": sorted(
+            [
+                {
+                    name: item.get(name)
+                    for name in (
+                        "item_id",
+                        "source_task_id",
+                        "internal_sku",
+                        "expected_product_name",
+                        "expected_grade",
+                        "action_type",
+                        "expected_old_status",
+                        "target_status",
+                        "target_price",
+                        "target_inventory",
+                        "task_expires_at",
+                        "item_payload_sha256",
+                        "operation_id",
+                        "write_identity_key",
+                        "page_identity_key",
+                    )
+                    if name in item
+                }
+                for item in request.get("items") or []
+            ],
+            key=lambda item: (
+                str(item.get("source_task_id") or ""),
+                str(item.get("internal_sku") or ""),
+            ),
+        ),
+    }
+    return sha256_json(manifest)
+
+
+def _v5_instruction_hash(request):
+    fields = (
+        "schema_version",
+        "contract_version",
+        "execution_profile",
+        "execution_mode",
+        "action_type",
+        "task_id",
+        "operation_id",
+        "execution_attempt_id",
+        "batch_id",
+        "platform_name",
+        "mapping_source_version",
+        "scan_scope",
+        "items",
+        "manifest_sha256",
+        "gate_summary",
+        "development_confirmation",
+        "applet_uri",
+        "window_title",
+        "capture_evidence",
+        "fault_injection",
+        "fault_injection_item_ordinal",
+        "source_execution_attempt_id",
+        "source_result_id",
+        "created_at",
+        "expires_at",
+    )
+    return sha256_json(
+        {name: request.get(name) for name in fields if name in request}
+    )
+
+
+def _v5_validate_request(request):
+    if (
+        request.get("contract_version") != V5_CONTRACT_VERSION
+        or request.get("schema_version") != V5_REQUEST_SCHEMA_VERSION
+    ):
+        raise ValueError("LISTING_ACTION_REQUEST_INVALID")
+    action_type = str(request.get("action_type") or "").strip().lower()
+    if action_type not in {"sync_status", "set_online", "set_offline"}:
+        raise ValueError("UNSUPPORTED_V5_ACTION")
+    execution_mode = str(request.get("execution_mode") or "").upper()
+    allowed_modes = (
+        {"READ_ONLY"}
+        if action_type == "sync_status"
+        else {"COMMIT", "RECONCILE"}
+    )
+    if execution_mode not in allowed_modes:
+        raise ValueError("LISTING_ACTION_EXECUTION_MODE_INVALID")
+    expected_scope = (
+        "online_and_waiting"
+        if action_type in {"sync_status", "set_online"}
+        else "online"
+    )
+    if request.get("scan_scope") != expected_scope:
+        raise ValueError("LISTING_ACTION_SCAN_SCOPE_INVALID")
+    items = request.get("items")
+    if action_type == "sync_status":
+        if items != []:
+            raise ValueError("SYNC_STATUS_ITEMS_FORBIDDEN")
+        for forbidden in (
+            "task_id",
+            "operation_id",
+            "gate_summary",
+            "development_confirmation",
+        ):
+            if forbidden in request:
+                raise ValueError("SYNC_STATUS_WRITE_FIELD_FORBIDDEN")
+    else:
+        if not isinstance(items, list) or not items:
+            raise ValueError("LISTING_ACTION_ITEMS_REQUIRED")
+        if not str(request.get("task_id") or "").strip():
+            raise ValueError("invalid task_id")
+        if not str(request.get("operation_id") or "").strip():
+            raise ValueError("invalid operation_id")
+        if execution_mode == "COMMIT":
+            gate_summary = request.get("gate_summary")
+            gate_items = (
+                gate_summary.get("items")
+                if isinstance(gate_summary, dict)
+                else None
+            )
+            if (
+                not isinstance(gate_items, list)
+                or len(gate_items) != len(items)
+                or any(
+                    gate.get("decision")
+                    not in {"EXECUTE", "ALREADY_APPLIED"}
+                    or gate.get("lock_status") != "ACTIVE"
+                    or gate.get("block_reasons") != []
+                    for gate in gate_items
+                )
+            ):
+                raise ValueError("LISTING_ACTION_GATE_INVALID")
+            if (
+                str(request.get("execution_profile") or "").lower()
+                == "development"
+            ):
+                expected = (
+                    "确认授权批次 %s 以上%d项真实COMMIT"
+                    % (request.get("batch_id"), len(items))
+                )
+                confirmation = request.get(
+                    "development_confirmation"
+                )
+                if (
+                    not isinstance(confirmation, dict)
+                    or confirmation.get("confirmation_text") != expected
+                    or not str(
+                        confirmation.get("confirmed_by") or ""
+                    ).strip()
+                ):
+                    raise ValueError(
+                        "LISTING_ACTION_CONFIRMATION_INVALID"
+                    )
+            elif "development_confirmation" in request:
+                raise ValueError("PRODUCTION_CONFIRMATION_FORBIDDEN")
+            if (
+                "source_execution_attempt_id" in request
+                or "source_result_id" in request
+            ):
+                raise ValueError("LISTING_ACTION_RECONCILE_SOURCE_FORBIDDEN")
+        else:
+            if len(items) != 1:
+                raise ValueError("LISTING_ACTION_RECONCILE_ITEM_COUNT_INVALID")
+            for forbidden in (
+                "gate_summary",
+                "development_confirmation",
+                "fault_injection",
+                "fault_injection_item_ordinal",
+            ):
+                if forbidden in request:
+                    raise ValueError("LISTING_ACTION_RECONCILE_WRITE_FIELD_FORBIDDEN")
+            if not str(
+                request.get("source_execution_attempt_id") or ""
+            ).strip() or not str(request.get("source_result_id") or "").strip():
+                raise ValueError("LISTING_ACTION_RECONCILE_SOURCE_REQUIRED")
+            if request.get("task_id") != items[0].get("source_task_id"):
+                raise ValueError("LISTING_ACTION_RECONCILE_TASK_MISMATCH")
+            if request.get("operation_id") != items[0].get("operation_id"):
+                raise ValueError("LISTING_ACTION_RECONCILE_OPERATION_MISMATCH")
+    fault_injection = str(request.get("fault_injection") or "").strip()
+    fault_ordinal = request.get("fault_injection_item_ordinal")
+    if fault_injection:
+        if (
+            str(request.get("execution_profile") or "").lower()
+            != "development"
+            or execution_mode != "COMMIT"
+            or action_type != "set_offline"
+            or fault_injection not in V5_DEVELOPMENT_FAULT_INJECTIONS
+            or request.get("fault_injection") != fault_injection.upper()
+        ):
+            raise ValueError("UNSAFE_TEST_PARAMETER_REJECTED")
+        if (
+            isinstance(fault_ordinal, bool)
+            or not isinstance(fault_ordinal, int)
+            or not 1 <= fault_ordinal <= len(items)
+        ):
+            raise ValueError("UNSAFE_TEST_PARAMETER_REJECTED")
+    elif fault_ordinal is not None:
+        raise ValueError("UNSAFE_TEST_PARAMETER_REJECTED")
+    for name in (
+        "execution_attempt_id",
+        "batch_id",
+        "platform_name",
+        "mapping_source_version",
+        "manifest_sha256",
+        "instruction_hash",
+        "created_at",
+        "expires_at",
+    ):
+        if not str(request.get(name) or "").strip():
+            raise ValueError("invalid " + name)
+    if request.get("manifest_sha256") != _v5_manifest_hash(request):
+        raise ValueError("LISTING_ACTION_MANIFEST_HASH_MISMATCH")
+    if request.get("instruction_hash") != _v5_instruction_hash(request):
+        raise ValueError("LISTING_ACTION_INSTRUCTION_HASH_MISMATCH")
+    expires_at = datetime.fromisoformat(str(request["expires_at"]))
+    if (
+        expires_at.tzinfo is None
+        or expires_at.astimezone(timezone.utc) <= datetime.now(timezone.utc)
+    ):
+        raise ValueError("request expired")
+
+
+def _v5_validate_sync_request(request):
+    """Backward-compatible entrypoint retained for the v5 sync unit tests."""
+
+    _v5_validate_request(request)
+    if request.get("action_type") != "sync_status":
+        raise ValueError("UNSUPPORTED_V5_ACTION")
+
+
+def _v5_failed_sync_result(
+    request,
+    request_sha256,
+    *,
+    worker_id,
+    error_code,
+    error_message,
+):
+    observed_at = _now_iso()
+    result_id = _v4_stable_id(
+        "RESULT",
+        {
+            "batch_id": request.get("batch_id"),
+            "execution_attempt_id": request.get("execution_attempt_id"),
+        },
+    )
+    snapshot_id = _v4_stable_id(
+        "SNAPSHOT",
+        {
+            "batch_id": request.get("batch_id"),
+            "execution_attempt_id": request.get("execution_attempt_id"),
+        },
+    )
+    snapshot = {
+        "schema_version": "shadowbot-listing-sync-snapshot-1.0",
+        "snapshot_id": snapshot_id,
+        "platform_name": request.get("platform_name", ""),
+        "execution_attempt_id": request.get("execution_attempt_id", ""),
+        "mapping_source_version": request.get("mapping_source_version", ""),
+        "result_id": result_id,
+        "scan_started_at": observed_at,
+        "scan_completed_at": observed_at,
+        "online_scan_started_at": observed_at,
+        "online_scan_completed_at": observed_at,
+        "waiting_scan_started_at": observed_at,
+        "waiting_scan_completed_at": observed_at,
+        "online_scan_complete": False,
+        "waiting_scan_complete": False,
+        "online_end_marker_verified": False,
+        "waiting_end_marker_verified": False,
+        "snapshot_complete": False,
+        "instruction_hash": request.get("instruction_hash", ""),
+        "status": "FAILED",
+        "error_code": str(error_code or "WORKER_EXECUTION_FAILED"),
+        "evidence_manifest_sha256": sha256_json([]),
+        "items": [],
+    }
+    result = {
+        "schema_version": V5_RESULT_SCHEMA_VERSION,
+        "contract_version": V5_CONTRACT_VERSION,
+        "action_type": "sync_status",
+        "batch_id": request.get("batch_id", ""),
+        "execution_attempt_id": request.get("execution_attempt_id", ""),
+        "execution_mode": "READ_ONLY",
+        "manifest_sha256": request.get("manifest_sha256", ""),
+        "instruction_hash": request.get("instruction_hash", ""),
+        "request_file_sha256": "sha256:" + request_sha256,
+        "worker_id": worker_id,
+        "queue_phase": "RESULT_WRITTEN",
+        "worker_heartbeat_at": observed_at,
+        "result_id": result_id,
+        "started_at": observed_at,
+        "ended_at": observed_at,
+        "status": "FAILED",
+        "run_success_flag": False,
+        "business_operation_completed": False,
+        "side_effect_state": "NOT_STARTED",
+        "error_code": str(error_code or "WORKER_EXECUTION_FAILED"),
+        "error_message": str(error_message or "")[:1000],
+        "retryable": False,
+        "snapshot": snapshot,
+    }
+    result["result_payload_sha256"] = sha256_json(dict(result))
+    return result
+
+
+def _v5_failed_result(
+    request,
+    request_sha256,
+    *,
+    worker_id,
+    error_code,
+    error_message,
+    phase_data=None,
+):
+    if request.get("action_type") == "sync_status":
+        return _v5_failed_sync_result(
+            request,
+            request_sha256,
+            worker_id=worker_id,
+            error_code=error_code,
+            error_message=error_message,
+        )
+    observed_at = _now_iso()
+    phase_data = phase_data if isinstance(phase_data, dict) else {}
+    phase_name = str(phase_data.get("phase") or "").strip().upper()
+    current_operation = str(
+        (phase_data.get("current_item") or {}).get("operation_id") or ""
+    )
+    phase_items = {
+        str(item.get("operation_id") or ""): item
+        for item in phase_data.get("item_states") or []
+        if isinstance(item, dict)
+    }
+    is_reconcile = (
+        str(request.get("execution_mode") or "").upper()
+        == "RECONCILE"
+    )
+    items = []
+    for request_item in request.get("items") or []:
+        operation_id = str(request_item.get("operation_id") or "")
+        phase_item = phase_items.get(operation_id, {})
+        is_current = (
+            not current_operation
+            or current_operation == operation_id
+        )
+        recorded_outcome = str(
+            phase_item.get("operation_result") or ""
+        ).strip().upper()
+        if is_reconcile:
+            outcome = "NEEDS_RECONCILIATION"
+            detail_effect = "UNKNOWN"
+            listing_effect = "UNKNOWN"
+            action_clicked = False
+            detail_clicked = False
+        elif recorded_outcome in {"VERIFIED", "ALREADY_APPLIED"}:
+            outcome = recorded_outcome
+            detail_effect = str(
+                phase_item.get("detail_effect_state") or "NOT_APPLIED"
+            ).upper()
+            listing_effect = str(
+                phase_item.get("listing_effect_state") or "VERIFIED"
+            ).upper()
+            action_clicked = bool(phase_item.get("action_confirm_clicked"))
+            detail_clicked = bool(phase_item.get("detail_save_clicked"))
+        elif is_current and phase_name in {
+            "ACTION_INTENT_RECORDED",
+            "ACTION_CLICKED",
+        }:
+            outcome = "NEEDS_RECONCILIATION"
+            detail_effect = str(
+                phase_item.get("detail_effect_state")
+                or phase_data.get("detail_effect_state")
+                or "UNKNOWN"
+            ).upper()
+            listing_effect = "UNKNOWN"
+            action_clicked = (
+                phase_name == "ACTION_CLICKED"
+                or bool(phase_item.get("action_confirm_clicked"))
+            )
+            detail_clicked = bool(phase_item.get("detail_save_clicked"))
+        elif is_current and phase_name == "DETAIL_SAVE_INTENT_RECORDED":
+            outcome = "NEEDS_RECONCILIATION"
+            detail_effect = "UNKNOWN"
+            listing_effect = "NOT_STARTED"
+            action_clicked = False
+            detail_clicked = bool(phase_item.get("detail_save_clicked"))
+        elif bool(phase_item.get("detail_save_clicked")):
+            detail_effect = str(
+                phase_item.get("detail_effect_state")
+                or phase_data.get("detail_effect_state")
+                or "UNKNOWN"
+            ).upper()
+            outcome = (
+                "PARTIALLY_APPLIED"
+                if detail_effect == "VERIFIED"
+                else "NEEDS_RECONCILIATION"
+            )
+            listing_effect = "NOT_STARTED"
+            action_clicked = False
+            detail_clicked = True
+        else:
+            outcome = "NOT_APPLIED" if is_current else "NOT_ATTEMPTED"
+            detail_effect = "NOT_APPLIED" if is_current else "NOT_STARTED"
+            listing_effect = "NOT_APPLIED" if is_current else "NOT_STARTED"
+            action_clicked = False
+            detail_clicked = False
+        items.append(
+            {
+                name: request_item.get(name)
+                for name in (
+                    "source_task_id",
+                    "operation_id",
+                    "item_execution_attempt_id",
+                    "internal_sku",
+                    "item_payload_sha256",
+                )
+            }
+            | {
+                "operation_result": outcome,
+                "detail_effect_state": detail_effect,
+                "listing_effect_state": listing_effect,
+                "detail_save_clicked": detail_clicked,
+                "action_confirm_clicked": action_clicked,
+                "error_code": str(error_code or "WORKER_EXECUTION_FAILED"),
+                "error_message": str(error_message or "")[:1000],
+            }
+        )
+        for name in (
+            "observed_price_before_action",
+            "observed_inventory_before_action",
+            "observed_price_after_detail_save",
+            "observed_inventory_after_detail_save",
+            "actual_price",
+            "actual_inventory",
+            "detail_save_clicked_at",
+            "action_clicked_at",
+            "readback_observed_at",
+        ):
+            if name in phase_item:
+                items[-1][name] = phase_item.get(name)
+    counts = v5_result_counts(items)
+    semantics = derive_v5_batch_semantics(counts)
+    result = {
+        "schema_version": V5_RESULT_SCHEMA_VERSION,
+        "contract_version": V5_CONTRACT_VERSION,
+        "action_type": request.get("action_type", ""),
+        "batch_id": request.get("batch_id", ""),
+        "execution_attempt_id": request.get("execution_attempt_id", ""),
+        "execution_mode": request.get("execution_mode", "COMMIT"),
+        "manifest_sha256": request.get("manifest_sha256", ""),
+        "instruction_hash": request.get("instruction_hash", ""),
+        "request_file_sha256": "sha256:" + request_sha256,
+        "worker_id": worker_id,
+        "queue_phase": "RESULT_WRITTEN",
+        "worker_heartbeat_at": observed_at,
+        "result_id": _v4_stable_id(
+            "RESULT",
+            {
+                "batch_id": request.get("batch_id"),
+                "execution_attempt_id": request.get("execution_attempt_id"),
+            },
+        ),
+        "started_at": observed_at,
+        "ended_at": observed_at,
+        "items": items,
+        "counts": counts,
+        **semantics,
+        "error_code": str(error_code or "WORKER_EXECUTION_FAILED"),
+        "error_message": str(error_message or "")[:1000],
+        "retryable": False,
+    }
+    result["result_payload_sha256"] = sha256_json(dict(result))
+    return result
 
 
 def _v4_validate_request(request):
@@ -644,7 +1142,8 @@ class QueueWorker:
         fault_injection = str(request.get("fault_injection") or "").strip()
         if fault_injection and (
             not self.allow_fault_injection
-            or request.get("contract_version") != V4_CONTRACT_VERSION
+            or request.get("contract_version")
+            not in {V4_CONTRACT_VERSION, V5_CONTRACT_VERSION}
             or str(request.get("execution_profile") or "").strip().lower()
             != "development"
         ):
@@ -654,6 +1153,9 @@ class QueueWorker:
             return
         if request.get("contract_version") == V4_CONTRACT_VERSION:
             _v4_validate_request(request)
+            return
+        if request.get("contract_version") == V5_CONTRACT_VERSION:
+            _v5_validate_request(request)
             return
         required = (
             "task_id",
@@ -699,10 +1201,13 @@ class QueueWorker:
     def _execute_claimed(self, request, request_sha256, working_request, phase_path):
         attempt_id = str(request["execution_attempt_id"])
         is_v4 = request.get("contract_version") == V4_CONTRACT_VERSION
+        is_v5 = request.get("contract_version") == V5_CONTRACT_VERSION
         runtime_request = dict(request)
         runtime_request.update(
             {
-                "request_file_sha256": request_sha256,
+                "request_file_sha256": (
+                    "sha256:" + request_sha256 if is_v5 else request_sha256
+                ),
                 "lease_owner_token": request.get("lease_owner_token", ""),
                 "lease_version": request.get("lease_version", 0),
                 "worker_id": self.worker_id,
@@ -752,6 +1257,22 @@ class QueueWorker:
                     error_message="worker execution failed: "
                     + type(exc).__name__,
                 )
+            elif is_v5:
+                try:
+                    phase_data = json.loads(
+                        phase_path.read_text(encoding="utf-8-sig")
+                    )
+                except (OSError, ValueError, json.JSONDecodeError):
+                    phase_data = {}
+                result = _v5_failed_result(
+                    request,
+                    request_sha256,
+                    worker_id=self.worker_id,
+                    error_code="WORKER_EXECUTION_FAILED",
+                    error_message="worker execution failed: "
+                    + type(exc).__name__,
+                    phase_data=phase_data,
+                )
             else:
                 result = {
                     "status": "FAILED",
@@ -774,18 +1295,29 @@ class QueueWorker:
             result.pop("provider_error_code", None)
         result.update(
             {
-                "schema_version": V4_RESULT_SCHEMA_VERSION if is_v4 else "shadowbot-result-2.0" if request.get("contract_version") == V2_CONTRACT_VERSION else "shadowbot-result-1.0",
-                "task_id": request["task_id"],
-                "operation_id": request["operation_id"],
+                "schema_version": (
+                    V5_RESULT_SCHEMA_VERSION
+                    if is_v5
+                    else V4_RESULT_SCHEMA_VERSION
+                    if is_v4
+                    else "shadowbot-result-2.0"
+                    if request.get("contract_version") == V2_CONTRACT_VERSION
+                    else "shadowbot-result-1.0"
+                ),
                 "execution_attempt_id": attempt_id,
                 "execution_mode": request["execution_mode"],
                 "instruction_hash": request["instruction_hash"],
-                "request_file_sha256": request_sha256,
+                "request_file_sha256": (
+                    "sha256:" + request_sha256 if is_v5 else request_sha256
+                ),
                 "worker_id": self.worker_id,
                 "queue_phase": "RESULT_WRITTEN",
                 "worker_heartbeat_at": _now_iso(),
             }
         )
+        if not is_v5:
+            result["task_id"] = request["task_id"]
+            result["operation_id"] = request["operation_id"]
         if request.get("contract_version") == V2_CONTRACT_VERSION:
             result.setdefault("contract_version", V2_CONTRACT_VERSION)
             result.setdefault("read_batch_id", request.get("read_batch_id", ""))
@@ -798,9 +1330,30 @@ class QueueWorker:
                     "manifest_sha256": request.get("manifest_sha256", ""),
                 }
             )
+        if is_v5:
+            result.update(
+                {
+                    "contract_version": V5_CONTRACT_VERSION,
+                    "action_type": request.get("action_type", ""),
+                    "batch_id": request.get("batch_id", ""),
+                    "manifest_sha256": request.get("manifest_sha256", ""),
+                }
+            )
         if not result.get("result_id"):
             result_identity = json.dumps(result, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
             result["result_id"] = "RESULT-" + hashlib.sha256(result_identity).hexdigest()[:24]
+        if is_v5:
+            for snapshot_name in ("snapshot", "post_failure_snapshot"):
+                snapshot = result.get(snapshot_name)
+                if isinstance(snapshot, dict):
+                    snapshot["result_id"] = result["result_id"]
+            result["result_payload_sha256"] = sha256_json(
+                {
+                    name: value
+                    for name, value in result.items()
+                    if name != "result_payload_sha256"
+                }
+            )
         result_path = self.results / (attempt_id + ".result.json")
         content = _json_bytes(result)
         if request.get("contract_version") == V2_CONTRACT_VERSION and len(content) > V2_MAX_RESULT_BYTES:
@@ -908,7 +1461,7 @@ class QueueWorker:
             "RESULT_WRITTEN",
             str(result.get("side_effect_state") or "NOT_STARTED"),
             request_sha256,
-            result_snapshot=result if is_v4 else None,
+            result_snapshot=result if is_v4 or is_v5 else None,
         )
 
     def _build_credential_provider(self):
@@ -934,6 +1487,27 @@ class QueueWorker:
         *,
         result_snapshot=None,
     ):
+        if request.get("contract_version") == V5_CONTRACT_VERSION:
+            payload = {
+                "schema_version": V5_PHASE_SCHEMA_VERSION,
+                "contract_version": V5_CONTRACT_VERSION,
+                "action_type": request.get("action_type", ""),
+                "batch_id": request.get("batch_id", ""),
+                "execution_attempt_id": request.get(
+                    "execution_attempt_id", ""
+                ),
+                "instruction_hash": request.get("instruction_hash", ""),
+                "manifest_sha256": request.get("manifest_sha256", ""),
+                "request_file_sha256": "sha256:" + request_sha256,
+                "worker_id": self.worker_id,
+                "phase": phase,
+                "phase_at": _now_iso(),
+                "detail_effect_state": "NOT_STARTED",
+                "listing_effect_state": "NOT_STARTED",
+            }
+            payload["phase_snapshot_sha256"] = sha256_json(dict(payload))
+            _atomic_write(phase_path, _json_bytes(payload))
+            return
         payload = {
             "task_id": request.get("task_id", ""),
             "operation_id": request.get("operation_id", ""),
@@ -985,6 +1559,29 @@ class QueueWorker:
         os.replace(str(request_path), str(working_request))
         os.replace(str(checksum_path), str(working_checksum))
         phase_path = self.working / (attempt_id + ".phase.json")
+        if request.get("contract_version") == V5_CONTRACT_VERSION:
+            result = _v5_failed_result(
+                request,
+                request_sha256,
+                worker_id=self.worker_id,
+                error_code=error_code,
+                error_message=error_message,
+            )
+            result_path = self.results / (attempt_id + ".result.json")
+            content = _json_bytes(result)
+            _atomic_write(
+                result_path.with_suffix(result_path.suffix + ".sha256"),
+                (hashlib.sha256(content).hexdigest() + "\n").encode("ascii"),
+            )
+            _atomic_write(result_path, content)
+            self._write_phase(
+                request,
+                phase_path,
+                "RESULT_WRITTEN",
+                "NOT_STARTED",
+                request_sha256,
+            )
+            return
         result = {
             "schema_version": "shadowbot-result-1.0",
             "task_id": request["task_id"],

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from dataclasses import replace
 from datetime import date, datetime, timedelta
+from decimal import Decimal
 from uuid import uuid4
 
 from app.enums import TaskActionType, TaskStatus, TradePhase
@@ -11,6 +12,7 @@ from app.models import (
     ColdStorageStatus,
     FinalPricingDecision,
     HarvestForecast,
+    IgnoredTaskCandidate,
     ListingRule,
     PackingCapacityPlan,
     PriceForecast,
@@ -24,7 +26,7 @@ from app.services.harvest_forecast import HarvestForecastService, product_foreca
 from app.services.inventory_planning import InventoryPlanningService
 from app.services.listing_decision import ListingDecisionService
 from app.services.listing import ListingService
-from app.services.pricing import PricingService
+from app.services.pricing import PricingService, price_rule_matches
 from app.services.pricing_decision import PricingDecisionService
 from app.services.trade_window import TradeWindowService
 from app.utils import utc_now
@@ -61,6 +63,13 @@ class TaskGenerationService:
         now: datetime | None = None,
         inventory_strategy: str = "conservative_v1",
         old_prices: dict[tuple[str, str, str], Decimal] | None = None,
+        platform_observations: dict[
+            tuple[str, str, str],
+            tuple[Decimal, int],
+        ]
+        | None = None,
+        platform_listing_states: dict[tuple[str, str, str], str] | None = None,
+        ignored_candidates: list[IgnoredTaskCandidate] | None = None,
     ) -> list[Task]:
         if harvest_forecasts or price_forecasts or capacity_plan or cold_storage_status or trade_date:
             return self._generate_predictive_tasks(
@@ -73,6 +82,9 @@ class TaskGenerationService:
                 trade_date=trade_date,
                 now=now,
                 inventory_strategy=inventory_strategy,
+                platform_observations=platform_observations,
+                platform_listing_states=platform_listing_states,
+                ignored_candidates=ignored_candidates,
             )
 
         tasks: list[Task] = []
@@ -80,10 +92,53 @@ class TaskGenerationService:
 
         for product in products:
             listing_action, listing_trace = self.listing_service.evaluate(product, listing_rules, platform_name)
+            pricing_decision: FinalPricingDecision | None = None
+            identity = listing_identity_key(
+                platform_name,
+                product.product_name,
+                product.grade,
+            )
+            observed_listing = (
+                platform_observations.get(identity)
+                if platform_observations is not None
+                else None
+            )
+            current_listing_state = (
+                platform_listing_states.get(identity)
+                if platform_listing_states is not None
+                else None
+            )
 
             if product.sale_enabled and product.current_stock > 0:
-                identity = listing_identity_key(platform_name, product.product_name, product.grade)
-                participates_in_price_generation = old_prices is None or identity in old_prices
+                matched_price_rule_ids = [
+                    rule.rule_id
+                    for rule in price_rules
+                    if (
+                        rule.active
+                        and price_rule_matches(rule, product, platform_name)
+                    )
+                ]
+                price_rule_applies = bool(matched_price_rule_ids)
+                participates_in_price_generation = (
+                    (
+                        platform_listing_states is None
+                        or current_listing_state == "online"
+                    )
+                    and (old_prices is None or identity in old_prices)
+                )
+                if (
+                    price_rule_applies
+                    and not participates_in_price_generation
+                    and ignored_candidates is not None
+                ):
+                    self._append_ignored_candidate(
+                        ignored_candidates,
+                        product=product,
+                        platform_name=platform_name,
+                        action_type=TaskActionType.UPDATE_PRICE,
+                        current_listing_state=current_listing_state,
+                        matched_rule_ids=matched_price_rule_ids,
+                    )
                 if participates_in_price_generation:
                     old_price = old_prices.get(identity) if old_prices is not None else None
                     pricing_decision = self.pricing_service.calculate(
@@ -100,6 +155,25 @@ class TaskGenerationService:
 
             if listing_action:
                 action_type = TaskActionType(listing_action)
+                if not self._listing_state_allows_action(
+                    action_type,
+                    current_listing_state,
+                    platform_listing_states is not None,
+                ):
+                    if ignored_candidates is not None:
+                        self._append_ignored_candidate(
+                            ignored_candidates,
+                            product=product,
+                            platform_name=platform_name,
+                            action_type=action_type,
+                            current_listing_state=current_listing_state,
+                            matched_rule_ids=[
+                                str(step).split(":", 2)[1]
+                                for step in listing_trace
+                                if str(step).startswith("matched:")
+                            ],
+                        )
+                    continue
                 listing_key = (product.internal_sku, action_type.value, platform_name)
                 if listing_key not in dedupe:
                     dedupe.add(listing_key)
@@ -112,8 +186,56 @@ class TaskGenerationService:
                             priority=1 if action_type == TaskActionType.SET_OFFLINE else 5,
                             task_status=TaskStatus.PENDING,
                             created_at=utc_now(),
-                            target_status=listing_action,
-                            decision_trace={"listing_trace": listing_trace},
+                            target_price=(
+                                observed_listing[0]
+                                if action_type is TaskActionType.SET_ONLINE
+                                and observed_listing is not None
+                                else pricing_decision.final_price
+                                if action_type is TaskActionType.SET_ONLINE
+                                and pricing_decision is not None
+                                else product.base_cost
+                                if action_type is TaskActionType.SET_ONLINE
+                                else None
+                            ),
+                            expected_old_price=(
+                                observed_listing[0]
+                                if action_type is TaskActionType.SET_ONLINE
+                                and observed_listing is not None
+                                else product.base_cost
+                                if action_type is TaskActionType.SET_ONLINE
+                                else None
+                            ),
+                            target_inventory=(
+                                observed_listing[1]
+                                if action_type is TaskActionType.SET_ONLINE
+                                and observed_listing is not None
+                                else product.current_stock
+                                if action_type is TaskActionType.SET_ONLINE
+                                else None
+                            ),
+                            target_status=(
+                                "online"
+                                if action_type is TaskActionType.SET_ONLINE
+                                else "offline"
+                            ),
+                            decision_trace={
+                                "listing_trace": listing_trace,
+                                "platform_observation": (
+                                    {
+                                        "observed_price": str(
+                                            observed_listing[0]
+                                        ),
+                                        "observed_inventory": observed_listing[1],
+                                    }
+                                    if observed_listing is not None
+                                    else None
+                                ),
+                                "listing_target_default_source": (
+                                    "platform_snapshot"
+                                    if observed_listing is not None
+                                    else "product_base_cost_and_stock"
+                                ),
+                            },
                         )
                     )
 
@@ -132,6 +254,13 @@ class TaskGenerationService:
         trade_date: date | None,
         now: datetime | None,
         inventory_strategy: str,
+        platform_observations: dict[
+            tuple[str, str, str],
+            tuple[Decimal, int],
+        ]
+        | None,
+        platform_listing_states: dict[tuple[str, str, str], str] | None,
+        ignored_candidates: list[IgnoredTaskCandidate] | None,
     ) -> list[Task]:
         self.inventory_planning_service = InventoryPlanningService(strategy_name=inventory_strategy)
         resolved_trade_date = self._resolve_trade_date(trade_date, harvest_forecasts, price_forecasts, capacity_plan)
@@ -153,6 +282,21 @@ class TaskGenerationService:
         committable_total_qty = 0
 
         for product in products:
+            identity = listing_identity_key(
+                platform_name,
+                product.product_name,
+                product.grade,
+            )
+            observed_listing = (
+                platform_observations.get(identity)
+                if platform_observations is not None
+                else None
+            )
+            current_listing_state = (
+                platform_listing_states.get(identity)
+                if platform_listing_states is not None
+                else None
+            )
             group_key = product_forecast_group_key(product)
             harvest_forecast = harvest_by_group.get(group_key)
             price_forecast = price_by_group.get(group_key)
@@ -222,7 +366,28 @@ class TaskGenerationService:
                     ),
                 )
 
-            if listing_decision.should_offline:
+            if listing_decision.should_offline and not self._listing_state_allows_action(
+                TaskActionType.SET_OFFLINE,
+                current_listing_state,
+                platform_listing_states is not None,
+            ):
+                if ignored_candidates is not None:
+                    self._append_ignored_candidate(
+                        ignored_candidates,
+                        product=product,
+                        platform_name=platform_name,
+                        action_type=TaskActionType.SET_OFFLINE,
+                        current_listing_state=current_listing_state,
+                    )
+
+            if (
+                listing_decision.should_offline
+                and self._listing_state_allows_action(
+                    TaskActionType.SET_OFFLINE,
+                    current_listing_state,
+                    platform_listing_states is not None,
+                )
+            ):
                 self._append_task(
                     tasks,
                     dedupe,
@@ -234,13 +399,40 @@ class TaskGenerationService:
                         priority=1,
                         task_status=TaskStatus.PENDING,
                         created_at=utc_now(),
-                        target_status=TaskActionType.SET_OFFLINE.value,
+                        target_status="offline",
                         decision_trace=listing_decision.decision_trace,
                         result_message=listing_decision.reason,
                     ),
                 )
 
-            if listing_decision.should_online and trade_window.phase != TradePhase.CLOSED:
+            should_generate_online_action = (
+                listing_decision.should_online
+                and not pricing_decision.requires_manual_review
+                and pricing_decision.target_price is not None
+                and trade_window.phase != TradePhase.CLOSED
+            )
+            if should_generate_online_action and not self._listing_state_allows_action(
+                TaskActionType.SET_ONLINE,
+                current_listing_state,
+                platform_listing_states is not None,
+            ):
+                if ignored_candidates is not None:
+                    self._append_ignored_candidate(
+                        ignored_candidates,
+                        product=product,
+                        platform_name=platform_name,
+                        action_type=TaskActionType.SET_ONLINE,
+                        current_listing_state=current_listing_state,
+                    )
+
+            if (
+                should_generate_online_action
+                and self._listing_state_allows_action(
+                    TaskActionType.SET_ONLINE,
+                    current_listing_state,
+                    platform_listing_states is not None,
+                )
+            ):
                 self._append_task(
                     tasks,
                     dedupe,
@@ -252,16 +444,49 @@ class TaskGenerationService:
                         priority=5,
                         task_status=TaskStatus.PENDING,
                         created_at=utc_now(),
-                        target_status=TaskActionType.SET_ONLINE.value,
-                        decision_trace=listing_decision.decision_trace,
+                        expected_old_price=(
+                            observed_listing[0]
+                            if observed_listing is not None
+                            else product.base_cost
+                        ),
+                        target_price=(
+                            observed_listing[0]
+                            if observed_listing is not None
+                            else pricing_decision.target_price
+                        ),
+                        target_inventory=(
+                            observed_listing[1]
+                            if observed_listing is not None
+                            else inventory_plan.committable_qty
+                        ),
+                        target_status="online",
+                        decision_trace=listing_decision.decision_trace
+                        | {
+                            "platform_observation": (
+                                {
+                                    "observed_price": str(
+                                        observed_listing[0]
+                                    ),
+                                    "observed_inventory": observed_listing[1],
+                                }
+                                if observed_listing is not None
+                                else None
+                            ),
+                            "listing_target_default_source": (
+                                "platform_snapshot"
+                                if observed_listing is not None
+                                else "product_base_cost_and_planned_stock"
+                            ),
+                        },
                     ),
                 )
 
             if (
-                listing_decision.should_online
-                and not pricing_decision.requires_manual_review
-                and pricing_decision.target_price is not None
-                and trade_window.phase != TradePhase.CLOSED
+                should_generate_online_action
+                and (
+                    platform_listing_states is None
+                    or current_listing_state == "online"
+                )
             ):
                 self._append_task(
                     tasks,
@@ -278,6 +503,18 @@ class TaskGenerationService:
                         pricing_source=pricing_decision.pricing_source,
                         decision_trace=pricing_decision.decision_trace,
                     ),
+                )
+            elif (
+                should_generate_online_action
+                and platform_listing_states is not None
+                and ignored_candidates is not None
+            ):
+                self._append_ignored_candidate(
+                    ignored_candidates,
+                    product=product,
+                    platform_name=platform_name,
+                    action_type=TaskActionType.UPDATE_PRICE,
+                    current_listing_state=current_listing_state,
                 )
 
         if cold_storage_status is not None:
@@ -305,6 +542,74 @@ class TaskGenerationService:
             pricing_source=pricing_decision.pricing_source,
             decision_trace=pricing_decision.decision_trace,
         )
+
+    @staticmethod
+    def _listing_state_allows_action(
+        action_type: TaskActionType,
+        current_listing_state: str | None,
+        has_platform_state_snapshot: bool,
+    ) -> bool:
+        if not has_platform_state_snapshot:
+            return True
+        if action_type is TaskActionType.SET_ONLINE:
+            return current_listing_state in {None, "offline"}
+        if action_type is TaskActionType.SET_OFFLINE:
+            return current_listing_state == "online"
+        return True
+
+    @staticmethod
+    def _append_ignored_candidate(
+        ignored_candidates: list[IgnoredTaskCandidate],
+        *,
+        product: Product,
+        platform_name: str,
+        action_type: TaskActionType,
+        current_listing_state: str | None,
+        matched_rule_ids: list[str] | None = None,
+    ) -> None:
+        state = current_listing_state or "missing"
+        reasons = {
+            (TaskActionType.SET_ONLINE, "online"): "当前商品已上架，无需重复上架",
+            (TaskActionType.SET_ONLINE, "unavailable"): "平台库存为 0，商品不参与上架任务",
+            (TaskActionType.SET_ONLINE, "unknown"): "当前平台上架状态未知，上架任务已忽略",
+            (TaskActionType.SET_OFFLINE, "offline"): "当前商品未上架，无需重复下架",
+            (TaskActionType.SET_OFFLINE, "missing"): "未找到当前平台上架状态，下架任务已忽略",
+            (TaskActionType.SET_OFFLINE, "unavailable"): "平台库存为 0，商品不参与下架任务",
+            (TaskActionType.SET_OFFLINE, "unknown"): "当前平台上架状态未知，下架任务已忽略",
+            (TaskActionType.UPDATE_PRICE, "offline"): "当前商品未上架，改价任务已忽略",
+            (TaskActionType.UPDATE_PRICE, "missing"): "未找到当前平台上架状态，改价任务已忽略",
+            (TaskActionType.UPDATE_PRICE, "unavailable"): "平台库存为 0，商品不参与改价任务",
+            (TaskActionType.UPDATE_PRICE, "unknown"): "当前平台上架状态未知，改价任务已忽略",
+        }
+        candidate = IgnoredTaskCandidate(
+            internal_sku=product.internal_sku,
+            product_name=product.product_name,
+            grade=product.grade,
+            platform_name=platform_name,
+            action_type=action_type,
+            current_listing_state=state,
+            reason=reasons.get(
+                (action_type, state),
+                "当前平台状态不符合任务生成条件，任务已忽略",
+            ),
+            matched_rule_ids=list(matched_rule_ids or []),
+        )
+        key = (
+            candidate.internal_sku,
+            candidate.platform_name,
+            candidate.action_type,
+        )
+        if any(
+            (
+                existing.internal_sku,
+                existing.platform_name,
+                existing.action_type,
+            )
+            == key
+            for existing in ignored_candidates
+        ):
+            return
+        ignored_candidates.append(candidate)
 
     def _task_id(self) -> str:
         return uuid4().hex[:12]

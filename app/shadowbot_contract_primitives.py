@@ -15,6 +15,12 @@ from decimal import Decimal, InvalidOperation
 
 
 _WHITESPACE_RE = re.compile(r"\s+")
+_SET_ONLINE_CONFIRMATION_RE = re.compile(
+    r"^\s*您确定上架[【\[]\s*(?P<grade>.+?)\s+(?P<product_name>.+?)\s*[】\]]吗[？?]\s*$"
+)
+_SET_OFFLINE_CONFIRMATION_RE = re.compile(
+    r"^\s*您确定下架[【\[]\s*(?P<grade>.+?)\s+(?P<product_name>.+?)\s*[】\]]吗[？?]\s*$"
+)
 
 
 def normalize_contract_text(value):
@@ -41,6 +47,68 @@ def contract_identity_key(platform, sku, product_name, grade):
         normalized_platform,
         normalize_contract_text(product_name),
         normalize_contract_grade(grade),
+    )
+
+
+def parse_set_online_confirmation_identity(value):
+    """Return the exact visible grade/name identity from the final dialog."""
+
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    matched = _SET_ONLINE_CONFIRMATION_RE.fullmatch(normalized)
+    if matched is None:
+        raise ValueError("set-online confirmation prompt is invalid")
+    product_name = matched.group("product_name").strip()
+    grade = matched.group("grade").strip()
+    if not normalize_contract_text(product_name) or not normalize_contract_grade(
+        grade
+    ):
+        raise ValueError("set-online confirmation identity is incomplete")
+    return {
+        "product_name": product_name,
+        "grade": grade,
+    }
+
+
+def set_online_confirmation_matches(value, expected_product_name, expected_grade):
+    """Require exact name + grade; suffix variants are distinct products."""
+
+    identity = parse_set_online_confirmation_identity(value)
+    return (
+        normalize_contract_text(identity["product_name"])
+        == normalize_contract_text(expected_product_name)
+        and normalize_contract_grade(identity["grade"])
+        == normalize_contract_grade(expected_grade)
+    )
+
+
+def parse_set_offline_confirmation_identity(value):
+    """Return the exact visible grade/name identity from the final dialog."""
+
+    normalized = unicodedata.normalize("NFKC", str(value or ""))
+    matched = _SET_OFFLINE_CONFIRMATION_RE.fullmatch(normalized)
+    if matched is None:
+        raise ValueError("set-offline confirmation prompt is invalid")
+    product_name = matched.group("product_name").strip()
+    grade = matched.group("grade").strip()
+    if not normalize_contract_text(product_name) or not normalize_contract_grade(
+        grade
+    ):
+        raise ValueError("set-offline confirmation identity is incomplete")
+    return {
+        "product_name": product_name,
+        "grade": grade,
+    }
+
+
+def set_offline_confirmation_matches(value, expected_product_name, expected_grade):
+    """Require exact name + grade before the final set-offline confirmation."""
+
+    identity = parse_set_offline_confirmation_identity(value)
+    return (
+        normalize_contract_text(identity["product_name"])
+        == normalize_contract_text(expected_product_name)
+        and normalize_contract_grade(identity["grade"])
+        == normalize_contract_grade(expected_grade)
     )
 
 
@@ -193,6 +261,119 @@ def derive_v4_batch_semantics(counts):
         "run_success_flag": batch_status == "VERIFIED",
         "business_operation_completed": int(counts.get("attempted") or 0) > 0,
         "side_effect_state": side_effect_state,
+    }
+
+
+def v5_result_counts(items):
+    """Count v5 item outcomes using the worker-safe shared contract."""
+
+    if not isinstance(items, list) or not items:
+        raise ValueError("v5 result items must be a non-empty list")
+    valid_outcomes = {
+        "VERIFIED",
+        "ALREADY_APPLIED",
+        "NOT_APPLIED",
+        "PARTIALLY_APPLIED",
+        "NEEDS_RECONCILIATION",
+        "FAILED",
+        "NOT_ATTEMPTED",
+    }
+    counts = {
+        "batch_target_count": len(items),
+        "attempted_count": 0,
+        "verified_count": 0,
+        "verified_applied_count": 0,
+        "already_applied_count": 0,
+        "unknown_count": 0,
+        "partial_effect_count": 0,
+        "not_attempted_count": 0,
+        "failed_count": 0,
+        "not_applied_count": 0,
+    }
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("v5 result item must be an object")
+        outcome = str(item.get("operation_result") or "").strip().upper()
+        if outcome not in valid_outcomes:
+            raise ValueError("invalid v5 result item outcome")
+        if bool(item.get("action_confirm_clicked")) or bool(
+            item.get("detail_save_clicked")
+        ):
+            counts["attempted_count"] += 1
+        if outcome == "VERIFIED":
+            counts["verified_count"] += 1
+            counts["verified_applied_count"] += 1
+        elif outcome == "ALREADY_APPLIED":
+            counts["verified_count"] += 1
+            counts["already_applied_count"] += 1
+        elif outcome == "NEEDS_RECONCILIATION":
+            counts["unknown_count"] += 1
+        elif outcome == "PARTIALLY_APPLIED":
+            counts["partial_effect_count"] += 1
+        elif outcome == "NOT_ATTEMPTED":
+            counts["not_attempted_count"] += 1
+        else:
+            counts["failed_count"] += 1
+            if outcome == "NOT_APPLIED":
+                counts["not_applied_count"] += 1
+    if (
+        counts["verified_count"]
+        + counts["unknown_count"]
+        + counts["partial_effect_count"]
+        + counts["not_attempted_count"]
+        + counts["failed_count"]
+        != counts["batch_target_count"]
+    ):
+        raise ValueError("v5 result count identity failed")
+    return counts
+
+
+def derive_v5_batch_semantics(counts):
+    """Derive the only authoritative v5 batch terminal semantics."""
+
+    total = int(counts.get("batch_target_count") or 0)
+    if total <= 0:
+        raise ValueError("v5 result counts must contain at least one target")
+    verified = int(counts.get("verified_count") or 0)
+    unknown = int(counts.get("unknown_count") or 0)
+    partial_effect = int(counts.get("partial_effect_count") or 0)
+    not_attempted = int(counts.get("not_attempted_count") or 0)
+    failed = int(counts.get("failed_count") or 0)
+    if verified + unknown + partial_effect + not_attempted + failed != total:
+        raise ValueError("v5 result count identity failed")
+    if unknown:
+        batch_status = "UNKNOWN"
+    elif partial_effect:
+        batch_status = "PARTIAL"
+    elif verified == total:
+        batch_status = "VERIFIED"
+    elif verified:
+        batch_status = "PARTIAL"
+    else:
+        batch_status = "FAILED"
+    if unknown:
+        side_effect_state = "UNKNOWN"
+    elif partial_effect:
+        side_effect_state = "PARTIAL"
+    elif int(counts.get("verified_applied_count") or 0):
+        side_effect_state = "VERIFIED"
+    elif int(counts.get("not_applied_count") or 0):
+        side_effect_state = "NOT_APPLIED"
+    else:
+        side_effect_state = "NOT_STARTED"
+    requires_manual_review = unknown > 0 or partial_effect > 0
+    return {
+        "batch_status": batch_status,
+        "status": batch_status,
+        "run_success_flag": batch_status == "VERIFIED",
+        "business_operation_completed": int(
+            counts.get("attempted_count") or 0
+        )
+        > 0,
+        "side_effect_state": side_effect_state,
+        "requires_manual_review": requires_manual_review,
+        "reconciliation_pending": unknown > 0,
+        "partial_effect_count": partial_effect,
     }
 
 

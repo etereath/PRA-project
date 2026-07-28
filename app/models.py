@@ -268,6 +268,14 @@ class ListingStatus:
     inventory_source: str = "default"
     inventory_observed_at: datetime | None = None
     inventory_source_attempt_id: str = ""
+    price_source: str = "default"
+    price_observed_at: datetime | None = None
+    price_source_attempt_id: str = ""
+    last_listing_change_at: datetime | None = None
+    last_listing_operation_id: str = ""
+    online_status_observed_at: datetime | None = None
+    online_status_source_type: str = ""
+    online_status_source_id: str = ""
 
 
 @dataclass(slots=True)
@@ -322,6 +330,7 @@ class Task:
     created_at: datetime
     expected_old_price: Decimal | None = None
     target_price: Decimal | None = None
+    target_inventory: int | None = None
     target_status: str | None = None
     pricing_source: PricingSource | None = None
     decision_trace: dict[str, Any] = field(default_factory=dict)
@@ -347,6 +356,18 @@ class Task:
         data["expires_at"] = self.expires_at.isoformat() if self.expires_at else None
         data["updated_at"] = self.updated_at.isoformat() if self.updated_at else None
         return data
+
+
+@dataclass(slots=True)
+class IgnoredTaskCandidate:
+    internal_sku: str
+    product_name: str
+    grade: str
+    platform_name: str
+    action_type: TaskActionType
+    current_listing_state: str
+    reason: str
+    matched_rule_ids: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)

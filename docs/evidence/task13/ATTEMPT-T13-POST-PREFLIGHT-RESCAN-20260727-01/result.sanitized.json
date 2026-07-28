@@ -1,0 +1,538 @@
+{
+  "action_type": "sync_status",
+  "active_listing_filter": "WAITING",
+  "active_listing_filter_selected_at": "2026-07-27T16:16:19+08:00",
+  "actual_price": "",
+  "applet_launch": {
+    "source": "EXISTING_WINDOW",
+    "uri_opened": false,
+    "window_ready_at": "2026-07-27T16:15:58+08:00"
+  },
+  "batch_id": "BATCH-T13-POST-PREFLIGHT-RESCAN-20260727-01",
+  "business_operation_completed": false,
+  "contract_version": 5,
+  "current_step": "VALIDATE_INPUT",
+  "ended_at": "2026-07-27T08:16:34+00:00",
+  "error_code": "",
+  "error_message": "",
+  "evidence": [],
+  "evidence_status": "NONE",
+  "execution_attempt_id": "ATTEMPT-T13-POST-PREFLIGHT-RESCAN-20260727-01",
+  "execution_mode": "READ_ONLY",
+  "expected_old_price": "",
+  "grade": "",
+  "instruction_hash": "sha256:fa2d6d79f3b136733d0fc0c4afb3eff36a5f7f0ef313330acc58b3f6ec21b9f3",
+  "login": {
+    "check_path": "BUSINESS_ENTRY_FAST_PATH",
+    "login_completed_at": "2026-07-27T16:15:59+08:00"
+  },
+  "manifest_sha256": "sha256:10377d76df0a256b32e03c6f64a7769df4bdd431f85874ddb7e9d221d6193c08",
+  "old_price": "",
+  "product_keyword": "",
+  "product_list_refreshes": [
+    {
+      "ended_at": "2026-07-27T16:16:07+08:00",
+      "readiness": "PRODUCT_LIST_CONTAINER",
+      "refresh_entry": "蚂蚁_首页_商品管理_入口",
+      "stage": "BEFORE_LISTING_SYNC",
+      "started_at": "2026-07-27T16:15:59+08:00",
+      "status": "SUCCESS"
+    }
+  ],
+  "product_name": "",
+  "queue_phase": "RESULT_WRITTEN",
+  "request_file_sha256": "sha256:57c8a18e83703012ac744ca7e63d0db2a17c140a13e3d005693555cee6dbe005",
+  "result_id": "RESULT-dfac7a5eb363ba8aa270e0e1",
+  "result_path": "<REDACTED_PATH>/ATTEMPT-T13-POST-PREFLIGHT-RESCAN-20260727-01.json",
+  "result_payload_sha256": "sha256:f38ae5d2787342c44f2d236c44d1c6155977190f40764d8755892429a994f9f1",
+  "retryable": false,
+  "run_success_flag": true,
+  "schema_version": "shadowbot-listing-action-batch-result-1.0",
+  "selector_model": {
+    "inventory_index_offset": 6,
+    "inventory_text_index": 0,
+    "parent_class": "van-checkbox-group",
+    "price_index_offset": 9,
+    "row_index_start": 1,
+    "row_index_step": 16,
+    "waiting_row_index_step": 15
+  },
+  "side_effect_state": "NOT_STARTED",
+  "snapshot": {
+    "error_code": "",
+    "evidence_manifest_sha256": "sha256:cd8e4c05eb3b7a5ce5267957a9cb2f6dffff3bcec0327f182eb2089dc4166329",
+    "execution_attempt_id": "ATTEMPT-T13-POST-PREFLIGHT-RESCAN-20260727-01",
+    "instruction_hash": "sha256:fa2d6d79f3b136733d0fc0c4afb3eff36a5f7f0ef313330acc58b3f6ec21b9f3",
+    "items": [
+      {
+        "affected_internal_skus": [],
+        "diagnostic_code": "UNMAPPED_PRODUCT",
+        "grade": "A级",
+        "internal_sku": null,
+        "listing_location": "ambiguous",
+        "mapping_ambiguous": true,
+        "online_observed_at": null,
+        "online_observed_inventory": null,
+        "online_observed_price": null,
+        "online_occurrences": 0,
+        "online_row_identities": [],
+        "page_identity_key": "蚂蚁花团供应商|name:卡布奇诺(10枝)|grade:A",
+        "product_name": "卡布奇诺（10枝）",
+        "snapshot_item_id": "SNAPSHOT-ITEM-3860ae2b053e2b5fa78ad249",
+        "waiting_observed_at": "2026-07-27T08:16:34+00:00",
+        "waiting_observed_inventory": 0,
+        "waiting_observed_price": "9.80",
+        "waiting_occurrences": 1,
+        "waiting_row_identities": [
+          "waiting:parent-index:121"
+        ]
+      },
+      {
+        "affected_internal_skus": [],
+        "diagnostic_code": "UNMAPPED_PRODUCT",
+        "grade": "C级",
+        "internal_sku": null,
+        "listing_location": "ambiguous",
+        "mapping_ambiguous": true,
+        "online_observed_at": null,
+        "online_observed_inventory": null,
+        "online_observed_price": null,
+        "online_occurrences": 0,
+        "online_row_identities": [],
+        "page_identity_key": "蚂蚁花团供应商|name:卡布奇诺(10枝)|grade:C",
+        "product_name": "卡布奇诺（10枝）",
+        "snapshot_item_id": "SNAPSHOT-ITEM-89cf4bb8085e87db05486378",
+        "waiting_observed_at": "2026-07-27T08:16:34+00:00",
+        "waiting_observed_inventory": 10,
+        "waiting_observed_price": "7.50",
+        "waiting_occurrences": 1,
+        "waiting_row_identities": [
+          "waiting:parent-index:136"
+        ]
+      },
+      {
+        "affected_internal_skus": [
+          "CAPPUCCINO-A-70-Z"
+        ],
+        "diagnostic_code": "",
+        "grade": "A级",
+        "internal_sku": "CAPPUCCINO-A-70-Z",
+        "listing_location": "waiting_only",
+        "mapping_ambiguous": false,
+        "online_observed_at": null,
+        "online_observed_inventory": null,
+        "online_observed_price": null,
+        "online_occurrences": 0,
+        "online_row_identities": [],
+        "page_identity_key": "蚂蚁花团供应商|name:卡布奇诺|grade:A",
+        "product_name": "卡布奇诺",
+        "snapshot_item_id": "SNAPSHOT-ITEM-46c3fadad21f023ab0be9e34",
+        "waiting_observed_at": "2026-07-27T08:16:34+00:00",
+        "waiting_observed_inventory": 3,
+        "waiting_observed_price": "18.00",
+        "waiting_occurrences": 1,
+        "waiting_row_identities": [
+          "waiting:parent-index:46"
+        ]
+      },
+      {
+        "affected_internal_skus": [
+          "CAPPUCCINO-B-60-Z"
+        ],
+        "diagnostic_code": "ABSENT_FROM_BOTH_LISTS",
+        "grade": "B级",
+        "internal_sku": "CAPPUCCINO-B-60-Z",
+        "listing_location": "neither",
+        "mapping_ambiguous": false,
+        "online_observed_at": null,
+        "online_observed_inventory": null,
+        "online_observed_price": null,
+        "online_occurrences": 0,
+        "online_row_identities": [],
+        "page_identity_key": "蚂蚁花团供应商|name:卡布奇诺|grade:B",
+        "product_name": "卡布奇诺",
+        "snapshot_item_id": "SNAPSHOT-ITEM-4a4530244aea6e56fea9eb65",
+        "waiting_observed_at": null,
+        "waiting_observed_inventory": null,
+        "waiting_observed_price": null,
+        "waiting_occurrences": 0,
+        "waiting_row_identities": []
+      },
+      {
+        "affected_internal_skus": [
+          "CAPPUCCINO-C-55-Z"
+        ],
+        "diagnostic_code": "ABSENT_FROM_BOTH_LISTS",
+        "grade": "C级",
+        "internal_sku": "CAPPUCCINO-C-55-Z",
+        "listing_location": "neither",
+        "mapping_ambiguous": false,
+        "online_observed_at": null,
+        "online_observed_inventory": null,
+        "online_observed_price": null,
+        "online_occurrences": 0,
+        "online_row_identities": [],
+        "page_identity_key": "蚂蚁花团供应商|name:卡布奇诺|grade:C",
+        "product_name": "卡布奇诺",
+        "snapshot_item_id": "SNAPSHOT-ITEM-cbd769037e56c6b95a4aa5a5",
+        "waiting_observed_at": null,
+        "waiting_observed_inventory": null,
+        "waiting_observed_price": null,
+        "waiting_occurrences": 0,
+        "waiting_row_identities": []
+      },
+      {
+        "affected_internal_skus": [
+          "CAPPUCCINO-D-50-Z"
+        ],
+        "diagnostic_code": "ABSENT_FROM_BOTH_LISTS",
+        "grade": "D级",
+        "internal_sku": "CAPPUCCINO-D-50-Z",
+        "listing_location": "neither",
+        "mapping_ambiguous": false,
+        "online_observed_at": null,
+        "online_observed_inventory": null,
+        "online_observed_price": null,
+        "online_occurrences": 0,
+        "online_row_identities": [],
+        "page_identity_key": "蚂蚁花团供应商|name:卡布奇诺|grade:D",
+        "product_name": "卡布奇诺",
+        "snapshot_item_id": "SNAPSHOT-ITEM-665264ba698cfb9b93eb6e5a",
+        "waiting_observed_at": null,
+        "waiting_observed_inventory": null,
+        "waiting_observed_price": null,
+        "waiting_occurrences": 0,
+        "waiting_row_identities": []
+      },
+      {
+        "affected_internal_skus": [
+          "CAPPUCCINO-E-45-Z"
+        ],
+        "diagnostic_code": "",
+        "grade": "E级",
+        "internal_sku": "CAPPUCCINO-E-45-Z",
+        "listing_location": "waiting_only",
+        "mapping_ambiguous": false,
+        "online_observed_at": null,
+        "online_observed_inventory": null,
+        "online_observed_price": null,
+        "online_occurrences": 0,
+        "online_row_identities": [],
+        "page_identity_key": "蚂蚁花团供应商|name:卡布奇诺|grade:E",
+        "product_name": "卡布奇诺",
+        "snapshot_item_id": "SNAPSHOT-ITEM-3768a3527ca6ea57ebc6573d",
+        "waiting_observed_at": "2026-07-27T08:16:34+00:00",
+        "waiting_observed_inventory": 2,
+        "waiting_observed_price": "7.50",
+        "waiting_occurrences": 1,
+        "waiting_row_identities": [
+          "waiting:parent-index:16"
+        ]
+      },
+      {
+        "affected_internal_skus": [],
+        "diagnostic_code": "UNMAPPED_PRODUCT",
+        "grade": "O级",
+        "internal_sku": null,
+        "listing_location": "ambiguous",
+        "mapping_ambiguous": true,
+        "online_observed_at": null,
+        "online_observed_inventory": null,
+        "online_observed_price": null,
+        "online_occurrences": 0,
+        "online_row_identities": [],
+        "page_identity_key": "蚂蚁花团供应商|name:短枝单头玫—卡布奇诺|grade:O",
+        "product_name": "短枝单头玫—卡布奇诺",
+        "snapshot_item_id": "SNAPSHOT-ITEM-69def6522856cc8a6a823ebb",
+        "waiting_observed_at": "2026-07-27T08:16:34+00:00",
+        "waiting_observed_inventory": 30,
+        "waiting_observed_price": "4.00",
+        "waiting_occurrences": 1,
+        "waiting_row_identities": [
+          "waiting:parent-index:61"
+        ]
+      },
+      {
+        "affected_internal_skus": [],
+        "diagnostic_code": "UNMAPPED_PRODUCT",
+        "grade": "O级",
+        "internal_sku": null,
+        "listing_location": "ambiguous",
+        "mapping_ambiguous": true,
+        "online_observed_at": null,
+        "online_observed_inventory": null,
+        "online_observed_price": null,
+        "online_occurrences": 0,
+        "online_row_identities": [],
+        "page_identity_key": "蚂蚁花团供应商|name:短枝单头玫—艾莎|grade:O",
+        "product_name": "短枝单头玫—艾莎",
+        "snapshot_item_id": "SNAPSHOT-ITEM-e74df9b0bc0c43e1fd81c0d2",
+        "waiting_observed_at": "2026-07-27T08:16:34+00:00",
+        "waiting_observed_inventory": 15,
+        "waiting_observed_price": "24.80",
+        "waiting_occurrences": 1,
+        "waiting_row_identities": [
+          "waiting:parent-index:31"
+        ]
+      },
+      {
+        "affected_internal_skus": [
+          "ZIXIA-0-FG-Z"
+        ],
+        "diagnostic_code": "ABSENT_FROM_BOTH_LISTS",
+        "grade": "0级",
+        "internal_sku": "ZIXIA-0-FG-Z",
+        "listing_location": "neither",
+        "mapping_ambiguous": false,
+        "online_observed_at": null,
+        "online_observed_inventory": null,
+        "online_observed_price": null,
+        "online_occurrences": 0,
+        "online_row_identities": [],
+        "page_identity_key": "蚂蚁花团供应商|name:紫霞仙子|grade:0",
+        "product_name": "紫霞仙子",
+        "snapshot_item_id": "SNAPSHOT-ITEM-a67e1a4fef441ddac61d0b49",
+        "waiting_observed_at": null,
+        "waiting_observed_inventory": null,
+        "waiting_observed_price": null,
+        "waiting_occurrences": 0,
+        "waiting_row_identities": []
+      },
+      {
+        "affected_internal_skus": [
+          "ZIXIA-B-FG-Z"
+        ],
+        "diagnostic_code": "ABSENT_FROM_BOTH_LISTS",
+        "grade": "B级",
+        "internal_sku": "ZIXIA-B-FG-Z",
+        "listing_location": "neither",
+        "mapping_ambiguous": false,
+        "online_observed_at": null,
+        "online_observed_inventory": null,
+        "online_observed_price": null,
+        "online_occurrences": 0,
+        "online_row_identities": [],
+        "page_identity_key": "蚂蚁花团供应商|name:紫霞仙子|grade:B",
+        "product_name": "紫霞仙子",
+        "snapshot_item_id": "SNAPSHOT-ITEM-c4619d504aa1511252ab3b5c",
+        "waiting_observed_at": null,
+        "waiting_observed_inventory": null,
+        "waiting_observed_price": null,
+        "waiting_occurrences": 0,
+        "waiting_row_identities": []
+      },
+      {
+        "affected_internal_skus": [],
+        "diagnostic_code": "UNMAPPED_PRODUCT",
+        "grade": "A级",
+        "internal_sku": null,
+        "listing_location": "ambiguous",
+        "mapping_ambiguous": true,
+        "online_observed_at": null,
+        "online_observed_inventory": null,
+        "online_observed_price": null,
+        "online_occurrences": 0,
+        "online_row_identities": [],
+        "page_identity_key": "蚂蚁花团供应商|name:艾莎(10枝)|grade:A",
+        "product_name": "艾莎（10枝）",
+        "snapshot_item_id": "SNAPSHOT-ITEM-9445c350ec62e21d9ac0edfe",
+        "waiting_observed_at": "2026-07-27T08:16:34+00:00",
+        "waiting_observed_inventory": 19,
+        "waiting_observed_price": "12.00",
+        "waiting_occurrences": 1,
+        "waiting_row_identities": [
+          "waiting:parent-index:1"
+        ]
+      },
+      {
+        "affected_internal_skus": [
+          "AISHA-A-70-Z"
+        ],
+        "diagnostic_code": "",
+        "grade": "A级",
+        "internal_sku": "AISHA-A-70-Z",
+        "listing_location": "waiting_only",
+        "mapping_ambiguous": false,
+        "online_observed_at": null,
+        "online_observed_inventory": null,
+        "online_observed_price": null,
+        "online_occurrences": 0,
+        "online_row_identities": [],
+        "page_identity_key": "蚂蚁花团供应商|name:艾莎|grade:A",
+        "product_name": "艾莎",
+        "snapshot_item_id": "SNAPSHOT-ITEM-53506b15d493b42fcf3bc4d2",
+        "waiting_observed_at": "2026-07-27T08:16:34+00:00",
+        "waiting_observed_inventory": 28,
+        "waiting_observed_price": "18.00",
+        "waiting_occurrences": 1,
+        "waiting_row_identities": [
+          "waiting:parent-index:106"
+        ]
+      },
+      {
+        "affected_internal_skus": [
+          "AISHA-B-60-Z"
+        ],
+        "diagnostic_code": "",
+        "grade": "B级",
+        "internal_sku": "AISHA-B-60-Z",
+        "listing_location": "online_only",
+        "mapping_ambiguous": false,
+        "online_observed_at": "2026-07-27T08:16:16+00:00",
+        "online_observed_inventory": 1,
+        "online_observed_price": "10.50",
+        "online_occurrences": 1,
+        "online_row_identities": [
+          "online:parent-index:17"
+        ],
+        "page_identity_key": "蚂蚁花团供应商|name:艾莎|grade:B",
+        "product_name": "艾莎",
+        "snapshot_item_id": "SNAPSHOT-ITEM-f795ebba35fdf770d3d692ba",
+        "waiting_observed_at": null,
+        "waiting_observed_inventory": null,
+        "waiting_observed_price": null,
+        "waiting_occurrences": 0,
+        "waiting_row_identities": []
+      },
+      {
+        "affected_internal_skus": [
+          "AISHA-C-55-Z"
+        ],
+        "diagnostic_code": "",
+        "grade": "C级",
+        "internal_sku": "AISHA-C-55-Z",
+        "listing_location": "online_only",
+        "mapping_ambiguous": false,
+        "online_observed_at": "2026-07-27T08:16:16+00:00",
+        "online_observed_inventory": 2,
+        "online_observed_price": "6.00",
+        "online_occurrences": 1,
+        "online_row_identities": [
+          "online:parent-index:1"
+        ],
+        "page_identity_key": "蚂蚁花团供应商|name:艾莎|grade:C",
+        "product_name": "艾莎",
+        "snapshot_item_id": "SNAPSHOT-ITEM-750124d2cabdbc61819273eb",
+        "waiting_observed_at": null,
+        "waiting_observed_inventory": null,
+        "waiting_observed_price": null,
+        "waiting_occurrences": 0,
+        "waiting_row_identities": []
+      },
+      {
+        "affected_internal_skus": [
+          "AISHA-D-50-Z"
+        ],
+        "diagnostic_code": "",
+        "grade": "D级",
+        "internal_sku": "AISHA-D-50-Z",
+        "listing_location": "waiting_only",
+        "mapping_ambiguous": false,
+        "online_observed_at": null,
+        "online_observed_inventory": null,
+        "online_observed_price": null,
+        "online_occurrences": 0,
+        "online_row_identities": [],
+        "page_identity_key": "蚂蚁花团供应商|name:艾莎|grade:D",
+        "product_name": "艾莎",
+        "snapshot_item_id": "SNAPSHOT-ITEM-4a353e9eb50ad8088e712eb9",
+        "waiting_observed_at": "2026-07-27T08:16:34+00:00",
+        "waiting_observed_inventory": 1,
+        "waiting_observed_price": "5.50",
+        "waiting_occurrences": 1,
+        "waiting_row_identities": [
+          "waiting:parent-index:91"
+        ]
+      },
+      {
+        "affected_internal_skus": [
+          "AISHA-E-45-Z"
+        ],
+        "diagnostic_code": "",
+        "grade": "E级",
+        "internal_sku": "AISHA-E-45-Z",
+        "listing_location": "waiting_only",
+        "mapping_ambiguous": false,
+        "online_observed_at": null,
+        "online_observed_inventory": null,
+        "online_observed_price": null,
+        "online_occurrences": 0,
+        "online_row_identities": [],
+        "page_identity_key": "蚂蚁花团供应商|name:艾莎|grade:E",
+        "product_name": "艾莎",
+        "snapshot_item_id": "SNAPSHOT-ITEM-021f3a3729255822babef6d2",
+        "waiting_observed_at": "2026-07-27T08:16:34+00:00",
+        "waiting_observed_inventory": 2,
+        "waiting_observed_price": "7.50",
+        "waiting_occurrences": 1,
+        "waiting_row_identities": [
+          "waiting:parent-index:76"
+        ]
+      }
+    ],
+    "mapping_source_version": "sha256:24f0dd9f88f0fe5e42587cc2b7866f035fef88bcbface3d0353afd99c4fa5ce6",
+    "online_end_marker_verified": true,
+    "online_scan_complete": true,
+    "online_scan_completed_at": "2026-07-27T08:16:16+00:00",
+    "online_scan_started_at": "2026-07-27T08:16:07+00:00",
+    "platform_name": "蚂蚁花团供应商",
+    "result_id": "RESULT-dfac7a5eb363ba8aa270e0e1",
+    "scan_completed_at": "2026-07-27T08:16:34+00:00",
+    "scan_started_at": "2026-07-27T08:15:57+00:00",
+    "schema_version": "shadowbot-listing-sync-snapshot-1.0",
+    "snapshot_complete": true,
+    "snapshot_id": "SNAPSHOT-dfac7a5eb363ba8aa270e0e1",
+    "status": "VERIFIED",
+    "waiting_end_marker_verified": true,
+    "waiting_scan_complete": true,
+    "waiting_scan_completed_at": "2026-07-27T08:16:34+00:00",
+    "waiting_scan_started_at": "2026-07-27T08:16:19+00:00"
+  },
+  "spec": "",
+  "spec_available": false,
+  "started_at": "2026-07-27T08:15:57+00:00",
+  "status": "VERIFIED",
+  "target_price": "",
+  "task_id": "",
+  "timing_trace": [
+    {
+      "duration_ms": 1841,
+      "stage": "window_prepare"
+    },
+    {
+      "duration_ms": 645,
+      "stage": "login_check"
+    },
+    {
+      "duration_ms": 7838,
+      "stage": "product_list_refresh"
+    },
+    {
+      "duration_ms": 8941,
+      "identity_rows": 2,
+      "inventory_reads": 2,
+      "non_target_rows_skipped": 0,
+      "page_type": "online",
+      "price_reads": 2,
+      "stage": "sync_online_scan",
+      "target_rows_hydrated": 2
+    },
+    {
+      "duration_ms": 14982,
+      "identity_rows": 10,
+      "inventory_reads": 10,
+      "non_target_rows_skipped": 0,
+      "page_type": "waiting",
+      "price_reads": 10,
+      "stage": "sync_waiting_scan",
+      "target_rows_hydrated": 10
+    },
+    {
+      "duration_ms": 37417,
+      "stage": "listing_sync_total"
+    }
+  ],
+  "window_title": "",
+  "worker_heartbeat_at": "2026-07-27T08:16:34.868519+00:00",
+  "worker_id": "<REDACTED_DEVICE>"
+}
