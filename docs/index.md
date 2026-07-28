@@ -9,13 +9,17 @@
 - [project_current_status.md](project_current_status.md)：当前项目定位、已完成能力、主控流程、安全边界和下一步优先级。
 - [reports/task12_final_handoff_20260723.md](reports/task12_final_handoff_20260723.md)：任务12当前实现、正式合同、实机证据、已知限制和审查步骤的最终交接入口。
 - [reports/task13_final_handoff_20260727.md](reports/task13_final_handoff_20260727.md)：任务13当前实现、四维状态模型、v5上下架合同、实机证据、运行边界和审查步骤的最终交接入口。
+- [plans/task13_5_issue20_alignment_review.md](plans/task13_5_issue20_alignment_review.md)：GitHub Issue #20 与本地任务13.5计划的权威层级、差异裁决、Web实测补充和任务14新边界。
+- [plans/task13_5_0_kickoff_baseline.md](plans/task13_5_0_kickoff_baseline.md)：任务13.5-0 的 main/Schema/Worker/证据黄金基线、部署后完整 READ_ONLY、全脚本分类、禁止重写资产、合同草案、子PR顺序、验收清单和回滚点。
+- [plans/task13_5_operational_closed_loop_and_web_rewrite.md](plans/task13_5_operational_closed_loop_and_web_rewrite.md)：任务13.5双时间轴、自动扫描、历史订单观察、销售日结、S0–S4、受控紧急保护、任务来源对齐和Web主控重写实施计划。
+- [plans/task13_5_web_current_state_audit_20260729.md](plans/task13_5_web_current_state_audit_20260729.md)：带精确时间、main SHA、Runtime DB脱敏快照、浏览器/视口/角色、路由、页面规模和DOM hash的独立Web现状审计。
 - [reports/task12_review_remediation_20260723.md](reports/task12_review_remediation_20260723.md)：针对任务12审查问题的接续修复记录；以该文档说明 v12 合同、原子导入和待补实机证据，不覆盖原交接报告。
 - [evidence/task12/index.md](evidence/task12/index.md)：任务12正常 COMMIT 与 UNKNOWN→RECONCILE 的 PR 内脱敏原始证据及自动复算入口。
 - [evidence/task13/index.md](evidence/task13/index.md)：任务13 独立 SYNC_STATUS、单/多商品上下架、批次预检零写、严格串行 UNKNOWN 和唯一 RECONCILE 的脱敏证据及 CI 复算入口。
 - [reports/task12_development_report_20260723.md](reports/task12_development_report_20260723.md)：任务12开发成果、问题回溯、修复方法和防复发规则。
 - [reports/task12_evidence_index_20260723.md](reports/task12_evidence_index_20260723.md)：任务12代表性实机 Run ID、结果 SHA-256、归档位置和审查核对项。
 - [task12_reusable_assets.md](task12_reusable_assets.md)：后续任务可直接复用的代码、合同、测试、运行流程和安全门禁。
-- [shadowbot_task12_task13_reusable_lessons.md](shadowbot_task12_task13_reusable_lessons.md)：任务12与任务13的标准扩展路径、重复失败根因、防复发门禁和任务14前置清单。
+- [shadowbot_task12_task13_reusable_lessons.md](shadowbot_task12_task13_reusable_lessons.md)：任务12与任务13的标准扩展路径、重复失败根因、防复发门禁，以及任务13.5和任务14前置清单。
 - [plans/task13_ui_discovery_report.md](plans/task13_ui_discovery_report.md)：任务13 T13-0 已接受的无副作用页面结构、选择器规律和重复身份风险。
 - [plans/task13_t13_1_contract_freeze.md](plans/task13_t13_1_contract_freeze.md)：任务13 T13-1 四维状态模型、v5 合同、action gate 和两阶段副作用冻结。
 - [../任务13_单平台商品上下架与状态对账闭环_交接与实施计划.md](../任务13_单平台商品上下架与状态对账闭环_交接与实施计划.md)：任务13原始交接与实施计划；用于追溯阶段和完成定义，不覆盖最终交接事实。
@@ -61,6 +65,7 @@
 
 ## Web 后台
 
+- [plans/task13_5_web_rewrite_plan.md](plans/task13_5_web_rewrite_plan.md)：在 Issue #20 八个一级入口下，基于独立浏览器审计形成的 Web 实施计划，包含页面方案、`app/webapp/` 拆分、性能门禁和验收标准。
 - [web_frontend_refresh_plan.md](web_frontend_refresh_plan.md)：Web 运行态运营后台刷新计划和当前进度。
 - [web_localization_display_spec.md](web_localization_display_spec.md)：Web 与飞书通知的运营中文展示术语表。
 - [product_inventory_input_spec.md](product_inventory_input_spec.md)：商品资料与库存补充录入规则，说明 `products.xlsx` 兼容、公共库存、SKU 生成、新增品种弹窗和旧 `/tables` 入口边界。
@@ -135,11 +140,11 @@ Code Review 后高中低风险问题已完成修复，系统冒烟测试、全�
 
 1. 任务12审查修复已通过 PR #18 合并；其 v4 改价链路继续作为任务13和后续任务的稳定基线。
 2. 任务13计划中的实现、受控实机验收、最终本地回归、PR #19 审查修复和双平台 CI 均已覆盖；后续合并与任务状态由审查方处理。
-3. 任务14实现统一任务审查和正式调度授权；在此之前继续保持显式 `task_id` 门禁。
-4. 补充长期告警、磁盘清理、证据保留和服务账号运维样本，并分别定义冷态/暖态耗时口径。
+3. 以 [GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20) 合并后的正文为宏观权威，先评审[13.5-0开工基线](plans/task13_5_0_kickoff_baseline.md)和[本地实施计划](plans/task13_5_operational_closed_loop_and_web_rewrite.md)；六级质量矩阵与日结状态机冻结后才提交v14。
+4. 任务13.5完成双时间轴、自动化服务、商品/订单观察、销售日结、S0–S4、紧急保护、控制服务和Web产品化后，任务14只进行多品种/多动作/异常恢复、正式授权和观察版本冻结的综合验收。
 5. 为元素版本漂移和白屏建立可重复的专用测试夹具；登录、网络和证据上传失败的实机故障注入已经完成。
-6. 持续运行系统冒烟和 ShadowBot 成功基线测试，避免后续任务重写已验证 COMMIT 链路。
-7. 任务14开始前按[任务12—13复用路径与失败复盘](shadowbot_task12_task13_reusable_lessons.md)建立黄金基线卡、最小差异和禁止重写清单。
+6. 持续运行系统冒烟和 ShadowBot 成功基线测试，避免任务13.5或后续任务重写已验证 COMMIT 链路。
+7. 13.5-0 的黄金基线卡、脚本盘点、禁止重写清单和Web审计已形成；进入ShadowBot工作前仍须收敛生命周期记录与心跳不一致并完成部署hash对齐。普通写动作保持明确任务与授权，唯一自动写特例是在13.5-6完成正式策略后的版本化 `SYSTEM_EMERGENCY` 紧急下架。
 
 当前不优先做：
 
