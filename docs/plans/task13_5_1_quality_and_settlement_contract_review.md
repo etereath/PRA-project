@@ -1,12 +1,24 @@
-# 任务 13.5-1：双时间轴、六级数据质量与日结状态机合同评审稿
+# 任务 13.5-1：双时间轴、六级数据质量与日结状态机冻结合同
 
 - 形成日期：2026-07-29
 - 父级权威：[GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20)
 - 基线提交：`cb3be04af57e8004396d1cb4b2140e7435842762`
 - 工作分支：`codex/task13-5-1-contract-review`
-- 当前状态：`DRAFT_FOR_REVIEW`
-- 实施门禁：本文件从 `DRAFT_FOR_REVIEW` 更新为 `FROZEN` 前，不提交 Runtime
-  Schema v14、迁移或相关业务代码
+- 合同版本：`TASK13_5_1_CONTRACT_V1`
+- 当前状态：`FROZEN`
+- 实施门禁：六级质量矩阵与日结状态机已经冻结；后续可以提交 Runtime Schema v14
+  迁移和 13.5-1 业务代码，但不得超出本文边界
+
+冻结审查修正：
+
+- `fact_source` 保持 Issue 冻结的两个业务值；无事实使用 NULL，不增加事实级
+  `LEGACY`。
+- v14 表名使用 Issue 指定的 `automation_jobs`，并纳入
+  `incident_notification_state`。
+- 汇总质量明确采用覆盖率和最弱关键片段，并保存各事实来源占比。
+- v13 Schema 和旧 `TradeWindowService` 基线测试共 14 项通过；新时间合同通过新增
+  `OperationalTimeService` 落地，不原地改写旧预测窗口。
+- S4 仍属于任务 13.5；最终策略和自动紧急下架继续留在 13.5-6。
 
 ## 1. 评审目标与边界
 
@@ -147,15 +159,10 @@ ORDER_OBSERVED
 SCAN_ESTIMATED
 ```
 
-迁移兼容哨兵：
-
-```text
-LEGACY
-```
-
-`LEGACY` 只允许由 v13→v14 迁移写入无法证明来源的历史兼容行；常规 Repository 和
-Service API 必须拒绝新建 `LEGACY` 事实。它不等价于低质量扫描估算，也不得进入销售
-计划、规则 proposal 或自动动作。
+`fact_source` 不增加第三个 `LEGACY` 值。v13 没有历史销售汇总事实需要迁移；历史
+任务的未知来源由 `tasks.origin_type=LEGACY` 表达。没有任何可接受事实时，
+`fact_source` 必须为 NULL，并与 `quality_level=UNAVAILABLE` 成对出现，不能伪称
+存在订单事实或扫描估算。
 
 ### 4.2 `quality_level`
 
@@ -193,7 +200,8 @@ FINAL
 - 来源回答“事实怎么得到”。
 - 质量回答“事实在当前范围和指标上有多可靠”。
 - 状态回答“日结走到哪个审计阶段”。
-- 三列独立存储并分别使用 CHECK 约束。
+- 三列独立存储并分别使用 CHECK 约束；`fact_source` 仅在
+  `quality_level=UNAVAILABLE` 时允许为 NULL。
 - 任何质量等级和状态都不构成平台写授权。
 - UI 和报告不得把 `FINAL` 解释为“订单一定完整”；FINAL 的进入门禁已另行确保质量
   满足正式要求。
@@ -215,9 +223,9 @@ FINAL
 
 | `fact_source` | 允许的 `quality_level` |
 | --- | --- |
-| `ORDER_OBSERVED` | `ORDER_COMPLETE`、`ORDER_PARTIAL`、`UNAVAILABLE` |
-| `SCAN_ESTIMATED` | `SCAN_ESTIMATED_HIGH`、`SCAN_ESTIMATED_MEDIUM`、`SCAN_ESTIMATED_LOW`、`UNAVAILABLE` |
-| `LEGACY` | `UNAVAILABLE` |
+| `ORDER_OBSERVED` | `ORDER_COMPLETE`、`ORDER_PARTIAL` |
+| `SCAN_ESTIMATED` | `SCAN_ESTIMATED_HIGH`、`SCAN_ESTIMATED_MEDIUM`、`SCAN_ESTIMATED_LOW` |
+| NULL | `UNAVAILABLE` |
 
 非法组合必须由模型、Repository 和数据库 CHECK 同时拒绝。
 
@@ -230,7 +238,11 @@ FINAL
 4. `UNAVAILABLE` 不是 0；数量、金额和订单数保持空值，并记录原因码。
 5. 商品未映射、映射歧义和范围外事实不得进入 SKU 精确合计；平台总量是否可用按该
    汇总范围自己的完整性重新评价。
-6. “允许进入销售计划”不等于允许创建平台写任务；计划输入、proposal、Review 和
+6. 汇总质量按覆盖率和最弱关键片段计算，不能用高质量片段平均掉阻断片段；同时保存
+   各事实来源的数量、金额或覆盖占比，供日报解释和对账。
+7. S4 后续使用独立的完整价格观察、成本门禁和版本化策略；销售质量枚举不能替代
+   S4 价格与成本门禁，也不能单独触发 `SYSTEM_EMERGENCY`。
+8. “允许进入销售计划”不等于允许创建平台写任务；计划输入、proposal、Review 和
    写授权继续分层。
 
 ## 6. 决策 D4：日结状态机
@@ -267,7 +279,7 @@ RECONCILED -> FINAL
 - 唯一逻辑 settlement run 已取得租约并完成输入选择。
 - 保存实际输入事实、质量、时间策略版本和内容 hash。
 - 有合格扫描估算时使用 `SCAN_ESTIMATED`；没有可用事实时仍可创建
-  `quality_level=UNAVAILABLE` 的空值汇总。
+  `fact_source=NULL`、`quality_level=UNAVAILABLE` 的空值汇总。
 - 数量和金额不可用时必须为 NULL，不得写 0。
 - 生成下一销售计划输入时只使用质量矩阵允许的组件。
 
@@ -398,7 +410,7 @@ supersedes_policy_version
 
 v14 建立最小账本：
 
-- `automation_job_definitions`
+- `automation_jobs`
 - `automation_runs`
 - `automation_run_events`
 - `automation_run_links`
@@ -426,14 +438,21 @@ v14 建立最小账本：
 - `platform_trade_day_summary_inputs`
 
 `platform_trade_day_summaries` 至少保存三个正交维度、系列/版本、双日期、范围、数量、
-金额、质量原因、输入 manifest hash、映射/算法/时间策略版本和 current 标志。数量、
-金额和订单数必须允许 NULL，以表达 `UNAVAILABLE`。
+金额、质量原因、各来源占比、输入 manifest hash、映射/算法/时间策略版本和 current
+标志。`fact_source` 只在 `quality_level=UNAVAILABLE` 时允许 NULL；数量、金额和订单
+数必须允许 NULL，以表达 `UNAVAILABLE`。
 
 ### 8.5 Incident 核心
 
-v14 只建立 `operational_incidents` 的通用身份、来源、等级、状态和时间关系，供不完整
-数据和日结阻断使用。通知升级、人工闭环和 S4 自动保护由 13.5-6 完成；不得在 v14
-提前创建最终 `emergency_action_policies`。
+v14 建立：
+
+- `operational_incidents`
+- `incident_notification_state`
+
+`operational_incidents` 只冻结通用身份、来源、等级、状态和时间关系，供不完整数据和
+日结阻断使用；`incident_notification_state` 保存最低限度的通知去重、最近通知时间和
+待升级状态，不在 13.5-1 固化最终提醒渠道或升级策略。Incident 人工闭环在 13.5-6
+完成；不得在 v14 提前创建最终 `emergency_action_policies`。
 
 ### 8.6 现有任务扩展
 
@@ -529,18 +548,19 @@ LEGACY
 
 ## 11. 评审通过条件
 
-以下项目全部确认后，才能把本文状态改为 `FROZEN` 并进入 v14 编码：
+以下项目已在 Issue #20 权威正文、v13 代码事实和本轮冻结审查之间完成确认：
 
-- [ ] D1 双时间轴输入、边界、阶段和跨界语义已接受。
-- [ ] D2 三个正交维度及迁移专用 `LEGACY` 已接受。
-- [ ] D3 六级质量进入、降级、日报、计划和规则用途已接受。
-- [ ] D4 唯一日结状态机和 FINAL 门禁已接受。
-- [ ] D5 版本链、迟到数据、current 唯一和幂等规则已接受。
-- [ ] D6 v14 最小逻辑结构和延后冻结边界已接受。
-- [ ] D7 v13 兼容、无猜测回填和备份回滚规则已接受。
-- [ ] D8 时间、质量、状态机、迁移和失败注入矩阵已接受。
-- [ ] 确认 13.5-1 不冻结最终 S4 策略，也不实现自动紧急下架。
-- [ ] 确认质量、日结状态和 `SYSTEM_EMERGENCY` 来源均不构成写授权。
+- [x] D1 双时间轴输入、边界、阶段和跨界语义已接受。
+- [x] D2 三个正交维度、UNAVAILABLE 的 NULL 来源及任务迁移专用 `origin_type=LEGACY`
+  已接受。
+- [x] D3 六级质量进入、降级、日报、计划和规则用途已接受。
+- [x] D4 唯一日结状态机和 FINAL 门禁已接受。
+- [x] D5 版本链、迟到数据、current 唯一和幂等规则已接受。
+- [x] D6 v14 最小逻辑结构和延后冻结边界已接受。
+- [x] D7 v13 兼容、无猜测回填和备份回滚规则已接受。
+- [x] D8 时间、质量、状态机、迁移和失败注入矩阵已接受。
+- [x] 确认 13.5-1 不冻结最终 S4 策略，也不实现自动紧急下架。
+- [x] 确认质量、日结状态和 `SYSTEM_EMERGENCY` 来源均不构成写授权。
 
 ## 12. 编码后的 13.5-1 验收出口
 

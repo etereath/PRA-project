@@ -351,7 +351,7 @@ supporting_observation_ids
 
 - [x] 本文件和本地实施计划已纳入 13.5-0 分支的文档评审范围；仍待提交 PR 审查。
 - [x] 本轮 main 新鲜完整回归通过：`679 passed, 3 skipped, 97 subtests passed`。
-- [ ] 在 13.5-1 迁移编码前评审
+- [x] 在 13.5-1 迁移编码前已冻结
   [六级质量矩阵与日结状态机合同](task13_5_1_quality_and_settlement_contract_review.md)。
 - [x] 本轮 ShadowBot 请求和代码同步前置门禁已收敛；后续每次请求仍须逐次复核。
 - [x] 13.5-0 已建立独立分支、验收清单和回滚点；13.5-1 至 13.5-10 随各阶段建立。
