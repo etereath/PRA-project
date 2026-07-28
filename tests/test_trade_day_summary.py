@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import threading
 from contextlib import closing
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -65,6 +66,45 @@ def _input(name: str) -> tuple[TradeDaySummaryInput, ...]:
             input_sha256=f"sha256:{name}",
         ),
     )
+
+
+def _insert_blocking_incident(
+    runtime: SQLiteRuntimeRepository,
+    summary_id: str,
+    *,
+    incident_id: str,
+) -> None:
+    now = "2026-07-29T12:00:00+00:00"
+    with closing(runtime.connect_write()) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO operational_incidents(
+                incident_id, dedupe_key, category,
+                source_type, source_ref_id,
+                severity, incident_status, blocks_finalization,
+                subject_type, subject_key, title,
+                first_detected_at, last_detected_at,
+                created_at, updated_at
+            ) VALUES (
+                ?, ?,
+                'ORDER_DATA_INCONSISTENT',
+                'TRADE_DAY_SUMMARY', ?,
+                'S3', 'OPEN', 1,
+                'SUMMARY', ?, 'unclassified difference',
+                ?, ?, ?, ?
+            )
+            """,
+            (
+                incident_id,
+                f"summary-blocker:{incident_id}",
+                summary_id,
+                summary_id,
+                now,
+                now,
+                now,
+                now,
+            ),
+        )
 
 
 def _create_provisional(service: TradeDaySummaryService):
@@ -243,29 +283,194 @@ def test_finalization_is_blocked_by_open_s3_incident(
     summary_id = _create_provisional(service).summary.summary_id
     _observe(service, summary_id)
     _reconcile(service, summary_id)
-    now = "2026-07-29T12:00:00+00:00"
-    with closing(runtime.connect_write()) as connection, connection:
-        connection.execute(
-            """
-            INSERT INTO operational_incidents(
-                incident_id, dedupe_key, source_type, source_ref_id,
-                severity, incident_status, blocks_finalization,
-                subject_type, subject_key, title,
-                first_detected_at, last_detected_at,
-                created_at, updated_at
-            ) VALUES (
-                'INCIDENT-1', 'summary-blocker',
-                'TRADE_DAY_SUMMARY', ?,
-                'S2', 'OPEN', 1,
-                'SUMMARY', ?, 'unclassified difference',
-                ?, ?, ?, ?
-            )
-            """,
-            (summary_id, summary_id, now, now, now, now),
-        )
+    _insert_blocking_incident(
+        runtime,
+        summary_id,
+        incident_id="INCIDENT-1",
+    )
 
     with pytest.raises(ValueError, match="blocking S3/S4"):
         _finalize(service, summary_id)
+
+
+def test_finalization_rechecks_concurrent_incident_in_write_transaction(
+    summary_service,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, repository, runtime = summary_service
+    summary_id = _create_provisional(service).summary.summary_id
+    _observe(service, summary_id)
+    _reconcile(service, summary_id)
+    original_transition = repository.transition
+    writer_errors: list[BaseException] = []
+
+    def insert_concurrently() -> None:
+        try:
+            _insert_blocking_incident(
+                runtime,
+                summary_id,
+                incident_id="INCIDENT-CONCURRENT",
+            )
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            writer_errors.append(exc)
+
+    def transition_after_concurrent_insert(**kwargs):
+        writer = threading.Thread(
+            target=insert_concurrently,
+        )
+        writer.start()
+        writer.join(timeout=10)
+        assert not writer.is_alive()
+        assert not writer_errors
+        return original_transition(**kwargs)
+
+    monkeypatch.setattr(
+        repository,
+        "transition",
+        transition_after_concurrent_insert,
+    )
+
+    with pytest.raises(ValueError, match="blocking S3/S4"):
+        _finalize(service, summary_id)
+    persisted = repository.get_summary(summary_id)
+    assert persisted is not None
+    assert persisted.summary_status is SummaryStatus.RECONCILED
+
+
+def test_provisional_material_change_is_atomically_audited(
+    summary_service,
+) -> None:
+    service, repository, _ = summary_service
+    original = _create_provisional(service).summary
+
+    revision = service.transition(
+        original.summary_id,
+        to_status=SummaryStatus.PROVISIONAL,
+        fact_source=FactSource.SCAN_ESTIMATED,
+        quality_level=DataQualityLevel.SCAN_ESTIMATED_HIGH,
+        sold_qty=13,
+        order_count=None,
+        seller_received_amount=None,
+        quality_reason="new complete scan",
+        source_proportions={"SCAN_ESTIMATED": 1.0},
+        input_manifest_sha256="sha256:provisional-revised",
+        mapping_version="mapping-v2",
+        algorithm_version="estimate-v2",
+        inputs=_input("scan-2"),
+        changed_by="settlement-service",
+        trigger_type="SCAN_REPLACED",
+    )
+
+    assert revision.summary.summary_id == original.summary_id
+    assert revision.summary.version_no == 1
+    assert revision.summary.supersedes_summary_id is None
+    assert revision.summary.summary_status is SummaryStatus.PROVISIONAL
+    assert revision.summary.is_current
+    assert revision.event is not None
+    assert revision.event.from_status is SummaryStatus.PROVISIONAL
+    assert revision.event.to_status is SummaryStatus.PROVISIONAL
+    assert {
+        item.input_ref_id
+        for item in repository.list_inputs(original.summary_id)
+    } == {"scan-2"}
+
+    repeated = service.transition(
+        revision.summary.summary_id,
+        to_status=SummaryStatus.PROVISIONAL,
+        fact_source=FactSource.SCAN_ESTIMATED,
+        quality_level=DataQualityLevel.SCAN_ESTIMATED_HIGH,
+        sold_qty=13,
+        order_count=None,
+        seller_received_amount=None,
+        quality_reason="new complete scan",
+        source_proportions={"SCAN_ESTIMATED": 1.0},
+        input_manifest_sha256="sha256:provisional-revised",
+        mapping_version="mapping-v2",
+        algorithm_version="estimate-v2",
+        inputs=_input("scan-2"),
+        changed_by="settlement-service",
+        trigger_type="SCAN_REPLACED",
+    )
+    assert not repeated.changed
+    assert repeated.summary.summary_id == revision.summary.summary_id
+
+
+def test_observed_material_change_creates_new_observed_version(
+    summary_service,
+) -> None:
+    service, repository, _ = summary_service
+    original_id = _create_provisional(service).summary.summary_id
+    observed = _observe(service, original_id).summary
+
+    revision = service.transition(
+        observed.summary_id,
+        to_status=SummaryStatus.OBSERVED,
+        fact_source=FactSource.ORDER_OBSERVED,
+        quality_level=DataQualityLevel.ORDER_COMPLETE,
+        sold_qty=12,
+        order_count=6,
+        seller_received_amount=Decimal("130.00"),
+        quality_reason="replacement complete order batch",
+        source_proportions={"ORDER_OBSERVED": 1.0},
+        input_manifest_sha256="sha256:observed-revised",
+        mapping_version="mapping-v2",
+        algorithm_version="orders-v2",
+        inputs=_input("order-2"),
+        changed_by="order-importer",
+        trigger_type="ORDER_BATCH_REPLACED",
+    )
+
+    old = repository.get_summary(original_id)
+    assert old is not None
+    assert not old.is_current
+    assert revision.summary.version_no == 2
+    assert revision.summary.supersedes_summary_id == observed.summary_id
+    assert revision.summary.summary_status is SummaryStatus.OBSERVED
+    assert revision.event is not None
+    assert revision.event.from_status is SummaryStatus.OBSERVED
+    assert revision.event.to_status is SummaryStatus.OBSERVED
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("summary_series_id", "SERIES-OTHER"),
+        ("version_no", 99),
+        ("supersedes_summary_id", "SUMMARY-OTHER"),
+        ("platform_name", "other-platform"),
+        ("platform_trade_date", "2099-01-01"),
+        ("seller_operation_date", "2099-01-02"),
+        ("seller_phase", "PEAK_SALES"),
+        ("scope_type", "GRADE"),
+        ("scope_key", "other-scope"),
+        ("created_at", "2099-01-01T00:00:00+00:00"),
+        ("updated_at", "2099-01-01T00:00:00+00:00"),
+    ],
+)
+def test_final_database_trigger_protects_business_identity(
+    summary_service,
+    column: str,
+    value: object,
+) -> None:
+    service, _, runtime = summary_service
+    summary_id = _create_provisional(service).summary.summary_id
+    _observe(service, summary_id)
+    _reconcile(service, summary_id)
+    _finalize(service, summary_id)
+
+    with closing(runtime.connect_write()) as connection:
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="FINAL summary content is immutable",
+        ):
+            connection.execute(
+                f"""
+                UPDATE platform_trade_day_summaries
+                SET {column} = ?
+                WHERE summary_id = ?
+                """,
+                (value, summary_id),
+            )
 
 
 def test_final_late_data_creates_observed_revision(

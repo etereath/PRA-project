@@ -359,8 +359,11 @@ is_current
 - `FINAL` 后到达迟到订单或人工修正时，旧 FINAL 保持不可变。
 - 新版本以 `OBSERVED` 开始，`supersedes_summary_id` 指向旧 FINAL，再经过
   `RECONCILED → FINAL`。
-- 未到 FINAL 的重复输入若内容 hash 不变，只记录幂等事件，不增加版本。
-- 输入事实、映射版本、算法版本或金额/数量发生实质变化时才创建新版本。
+- 当前版本输入 hash 不变时直接幂等返回，不增加版本或重复事件。
+- `PROVISIONAL` 阶段的实质输入变化允许在同一事务中原子修订当前版本；必须整体替换
+  当前输入 manifest、写入完整状态事件，不能只改汇总数字。
+- `OBSERVED / RECONCILED / FINAL` 的实质输入、映射、算法、金额或数量变化必须撤销
+  旧 current 并创建同系列新 `OBSERVED` 版本；旧版本和输入保持可审计。
 
 ### 7.3 状态事件
 
@@ -404,7 +407,9 @@ supersedes_policy_version
 ```
 
 首个策略版本冻结为 `CN_SINGLE_PLATFORM_2026_V1`。同一时刻只能有一个生效策略；修改
-必须创建新版本，不能原地覆盖。
+必须创建新版本，不能原地覆盖。`effective_from/effective_to` 使用左闭右开的 UTC
+技术时间区间；Service 必须按观察时刻选择唯一策略并把 `observed_at` 归一化为 UTC。
+Schema 和 Service 都必须拒绝策略区间重叠，业务日期仍统一按 `Asia/Shanghai` 计算。
 
 ### 8.2 Automation 核心
 
@@ -416,6 +421,21 @@ v14 建立最小账本：
 - `automation_run_links`
 
 `automation_runs` 必须显式保存双日期、阶段、计划时间、实际时间、策略版本和状态。
+权威 `run_status` 精确集合为：
+
+```text
+SCHEDULED
+RUNNING
+SUCCESS
+PARTIAL
+FAILED
+MISSED
+MERGED
+SKIPPED
+CANCELLED
+```
+
+对外运营状态直接使用该字段，不再使用 `SUCCEEDED` 或建立第二套同义展示状态。
 `script_runs` 保持兼容，不改名；二者通过迁移说明和可选 link 对齐，不复制历史 JSON
 猜测来源。详细租约与调度算法由 13.5-3 实现。
 
@@ -442,6 +462,11 @@ v14 建立最小账本：
 标志。`fact_source` 只在 `quality_level=UNAVAILABLE` 时允许 NULL；数量、金额和订单
 数必须允许 NULL，以表达 `UNAVAILABLE`。
 
+`RECONCILED → FINAL` 必须在同一个 `BEGIN IMMEDIATE` 事务中重新查询阻断 Incident，
+然后完成 summary UPDATE、输入和事件写入。FINAL 后唯一允许的 UPDATE 是新版本建立
+事务内的 `is_current: 1 → 0`；系列、版本、平台、双日期、阶段、范围、事实、指标和
+全部审计字段都不可变。
+
 ### 8.5 Incident 核心
 
 v14 建立：
@@ -449,10 +474,26 @@ v14 建立：
 - `operational_incidents`
 - `incident_notification_state`
 
-`operational_incidents` 只冻结通用身份、来源、等级、状态和时间关系，供不完整数据和
-日结阻断使用；`incident_notification_state` 保存最低限度的通知去重、最近通知时间和
-待升级状态，不在 13.5-1 固化最终提醒渠道或升级策略。Incident 人工闭环在 13.5-6
-完成；不得在 v14 提前创建最终 `emergency_action_policies`。
+`operational_incidents` 冻结通用身份、来源、等级、时间关系，以及父 Issue 的稳定
+`category` 和精确状态集合：
+
+```text
+PLATFORM_LOGIN / PLATFORM_NETWORK / PAGE_STRUCTURE / SCAN_INCOMPLETE
+WORKER_UNAVAILABLE / QUEUE_BACKLOG / PRODUCT_MAPPING
+PRICE_ANOMALY / INVENTORY_ANOMALY
+ORDER_PAGE_UNAVAILABLE / ORDER_DATA_INCONSISTENT
+SALES_ESTIMATE_LOW_CONFIDENCE / NOTIFICATION_FAILURE / WRITE_UNKNOWN
+```
+
+```text
+OPEN / RETRYING / WAITING_HUMAN / ACKNOWLEDGED
+AUTO_PROTECTING / RESOLVED / CLOSED
+```
+
+只有 `RESOLVED/CLOSED` 允许且必须具有 `resolved_at`；其他状态必须保持
+`resolved_at=NULL`。`incident_notification_state` 保存最低限度的通知去重、最近通知
+时间和待升级状态，不在 13.5-1 固化最终提醒渠道或升级策略。Incident 人工闭环在
+13.5-6 完成；不得在 v14 提前创建最终 `emergency_action_policies`。
 
 ### 8.6 现有任务扩展
 
@@ -480,6 +521,11 @@ LEGACY
 
 `SYSTEM_EMERGENCY` 仅为扩展边界；13.5-1 不创建、批准或执行紧急任务。历史任务迁移为
 `origin_type=LEGACY`，其他新字段保持 NULL，除非存在结构化来源可证明。
+
+新建 `Task` 必须显式给出 `origin_type`，不提供 `MANUAL` 默认值。规则、预测和
+proposal 路径使用 `AUTOMATION` 并绑定生成运行或规则引用；Workbook/Web/CLI
+人工入口使用 `MANUAL` 并保存可追溯入口引用。Repository 继续拒绝缺少
+`origin_ref_id` 的自动任务。
 
 ## 9. 决策 D7：迁移与回滚
 

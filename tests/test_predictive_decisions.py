@@ -8,7 +8,13 @@ from pathlib import Path
 
 from openpyxl import Workbook
 
-from app.enums import PricingSource, ShortageRisk, TaskActionType, TradePhase
+from app.enums import (
+    PricingSource,
+    ShortageRisk,
+    TaskActionType,
+    TaskOriginType,
+    TradePhase,
+)
 from app.models import HarvestForecast, PackingCapacityPlan, PriceForecast, Product
 from app.repositories.workbook_repository import (
     HARVEST_FORECAST_HEADERS,
@@ -209,6 +215,7 @@ class PredictiveDecisionTests(unittest.TestCase):
             capacity_plan=PackingCapacityPlan(trade_date=date(2026, 5, 4)),
             trade_date=date(2026, 5, 4),
             now=datetime(2026, 5, 3, 23, 30),
+            origin_ref_id="automation-run:predictive-1",
         )
         actions = {(task.internal_sku, task.action_type) for task in tasks}
 
@@ -216,6 +223,13 @@ class PredictiveDecisionTests(unittest.TestCase):
         self.assertIn(("__operation__", TaskActionType.LABOR_REQUIRED), actions)
         self.assertIn(("SKU-A", TaskActionType.SET_ONLINE), actions)
         self.assertIn(("SKU-A", TaskActionType.UPDATE_PRICE), actions)
+        self.assertTrue(
+            all(
+                task.origin_type is TaskOriginType.AUTOMATION
+                and task.origin_ref_id == "automation-run:predictive-1"
+                for task in tasks
+            )
+        )
         labor_task = next(task for task in tasks if task.action_type == TaskActionType.LABOR_REQUIRED)
         self.assertEqual(labor_task.required_by, datetime(2026, 5, 3, 20, 0))
 

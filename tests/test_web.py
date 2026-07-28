@@ -21,6 +21,7 @@ from app.enums import (
     NotificationSendStatus,
     ReviewTaskStatus,
     TaskActionType,
+    TaskOriginType,
     TaskStatus,
 )
 from app.models import (
@@ -117,6 +118,7 @@ def _runtime_task(
         priority=2,
         task_status=status,
         created_at=datetime(2026, 5, 4, 9, 0),
+        origin_type=TaskOriginType.MANUAL,
         trade_date=trade_date,
         scope_type="global",
         scope_key=trade_date.isoformat(),
@@ -790,6 +792,13 @@ class WebTests(unittest.TestCase):
             self.assertEqual({task.platform_name for task in tasks}, {"测试平台"})
             self.assertEqual({task.expected_old_price for task in tasks}, {Decimal("20"), Decimal("30")})
             self.assertEqual({task.target_price for task in tasks}, {Decimal("25"), Decimal("35")})
+            self.assertTrue(
+                all(
+                    task.origin_type is TaskOriginType.AUTOMATION
+                    and bool(task.origin_ref_id)
+                    for task in tasks
+                )
+            )
             runtime_tasks = RuntimeTaskService(SQLiteRuntimeRepository(db_path)).list_tasks()
             self.assertEqual(
                 sorted(task.internal_sku for task in runtime_tasks),
@@ -986,6 +995,11 @@ class WebTests(unittest.TestCase):
             exported_tasks = load_tasks(output_path)
             self.assertEqual(exported_tasks[0].target_price, Decimal("19.80"))
             self.assertEqual(exported_tasks[0].target_inventory, 9)
+            self.assertIs(
+                exported_tasks[0].origin_type,
+                TaskOriginType.AUTOMATION,
+            )
+            self.assertTrue(exported_tasks[0].origin_ref_id)
 
     def test_new_product_without_snapshot_is_recognized_for_set_online_preview(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -8,7 +8,7 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
-from app.enums import TaskActionType, TaskStatus
+from app.enums import TaskActionType, TaskOriginType, TaskStatus
 from app.models import MockPlatformProductState, Task
 from app.repositories.mock_platform_repository import (
     MOCK_PLATFORM_OFFLINE,
@@ -221,6 +221,7 @@ class MockPlatformSyncLabTests(unittest.TestCase):
             priority=1,
             task_status=TaskStatus.PENDING,
             created_at=utc_now(),
+            origin_type=TaskOriginType.MANUAL,
             target_price=target_price,
             target_status=action_type.value if action_type in {TaskActionType.SET_ONLINE, TaskActionType.SET_OFFLINE} else None,
             trade_date=self.trade_date,

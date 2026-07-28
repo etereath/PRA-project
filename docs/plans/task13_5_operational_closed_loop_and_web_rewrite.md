@@ -528,7 +528,8 @@ Web 主控端以运营人员的工作问题组织页面：
    - 展示日结版本、质量等级、峰值份额、18:00–20:00 早期销售和预测输入。
 4. **自动化**
    - 调度计划、最近运行、下一次运行、暂停/恢复、手工补跑。
-   - 运行状态使用 `RUNNING / SUCCESS / FAILED / MISSED / MERGED / SKIPPED`。
+   - 运行状态使用 `SCHEDULED / RUNNING / SUCCESS / PARTIAL / FAILED / MISSED /
+     MERGED / SKIPPED / CANCELLED`。
 5. **待处理**
    - 集中 Review、登录、映射、页面、HIGH/CRITICAL、UNKNOWN、通知失败和低置信估算。
    - 确认不等于解决；支持指派、安全重试、处置时间线和恢复证据。
@@ -611,8 +612,8 @@ Web 主控端以运营人员的工作问题组织页面：
 - 同一 schedule 在同一计划时间只允许生成一个逻辑运行。
 - 使用数据库租约或等效单实例机制，不能仅依赖进程内锁。
 - 每次运行记录 `scheduled_for / started_at / heartbeat_at / finished_at`。
-- 自动化运行对外状态使用 `RUNNING / SUCCESS / FAILED / MISSED / MERGED / SKIPPED`；
-  详细步骤结果保存在事件中。
+- 自动化运行对外状态使用 `SCHEDULED / RUNNING / SUCCESS / PARTIAL / FAILED /
+  MISSED / MERGED / SKIPPED / CANCELLED`；详细步骤结果保存在事件中。
 - 重试必须复用逻辑运行身份并增加 attempt，不得产生无法关联的重复运行。
 - 错过小扫描时只补最近一次；完整扫描和日结按交易日策略补跑，避免启动后形成任务风暴。
 - 运行超时后先判断是否进入平台副作用区；只读扫描可以安全终止，写操作沿用现有恢复状态机。

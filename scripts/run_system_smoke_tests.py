@@ -22,7 +22,12 @@ try:
 except AttributeError:
     pass
 
-from app.enums import ReviewTaskStatus, TaskActionType, TaskStatus  # noqa: E402
+from app.enums import (  # noqa: E402
+    ReviewTaskStatus,
+    TaskActionType,
+    TaskOriginType,
+    TaskStatus,
+)
 from app.exceptions import ValidationError  # noqa: E402
 from app.models import Task  # noqa: E402
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository  # noqa: E402
@@ -391,6 +396,7 @@ def runtime_task(
         priority=2,
         task_status=status,
         created_at=datetime(2026, 5, 7, 9, 0),
+        origin_type=TaskOriginType.MANUAL,
         trade_date=date(2026, 5, 7),
         scope_type="global",
         scope_key="smoke",

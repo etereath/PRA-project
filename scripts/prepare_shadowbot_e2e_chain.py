@@ -13,7 +13,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from app.enums import ReviewTaskStatus, TaskActionType, TaskStatus
+from app.enums import (
+    ReviewTaskStatus,
+    TaskActionType,
+    TaskOriginType,
+    TaskStatus,
+)
 from app.models import ReviewTask, Task
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.runtime import DEFAULT_RUNTIME_DB, RuntimeTaskService
@@ -122,6 +127,7 @@ def prepare_shadowbot_chain_from_args(args: argparse.Namespace) -> PreparedShado
                 priority=1,
                 task_status=TaskStatus.PENDING,
                 created_at=created_at,
+                origin_type=TaskOriginType.MANUAL,
                 target_price=payload.target_price,
                 trade_date=trade_date,
                 scope_type="sku",

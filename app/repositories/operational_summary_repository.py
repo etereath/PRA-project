@@ -126,52 +126,99 @@ class OperationalSummaryRepository:
         input_rows = tuple(inputs)
         with closing(
             self.runtime_repository.connect_write()
-        ) as connection, connection:
-            cursor = connection.execute(
-                """
-                UPDATE platform_trade_day_summaries
-                SET fact_source = ?,
-                    quality_level = ?,
-                    summary_status = ?,
-                    sold_qty = ?,
-                    order_count = ?,
-                    seller_received_amount = ?,
-                    quality_reason = ?,
-                    source_proportions_json = ?,
-                    input_manifest_sha256 = ?,
-                    mapping_version = ?,
-                    algorithm_version = ?,
-                    finalized_at = ?,
-                    updated_at = ?
-                WHERE summary_id = ?
-                  AND summary_status = ?
-                  AND input_manifest_sha256 = ?
-                  AND is_current = 1
-                """,
-                (
-                    after.fact_source.value if after.fact_source else None,
-                    after.quality_level.value,
-                    after.summary_status.value,
-                    after.sold_qty,
-                    after.order_count,
-                    _decimal_to_text(after.seller_received_amount),
-                    after.quality_reason,
-                    _json_dump(after.source_proportions),
-                    after.input_manifest_sha256,
-                    after.mapping_version,
-                    after.algorithm_version,
-                    _datetime_to_text(after.finalized_at),
-                    _datetime_to_text(after.updated_at),
-                    before.summary_id,
-                    before.summary_status.value,
-                    before.input_manifest_sha256,
-                ),
-            )
-            if cursor.rowcount != 1:
-                return False
-            _insert_summary_inputs(connection, after.summary_id, input_rows)
-            _insert_event(connection, event)
-            return True
+        ) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                if after.summary_status is SummaryStatus.FINAL:
+                    blocking_count = int(
+                        connection.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM operational_incidents
+                            WHERE source_type = 'TRADE_DAY_SUMMARY'
+                              AND source_ref_id = ?
+                              AND blocks_finalization = 1
+                              AND resolved_at IS NULL
+                            """,
+                            (before.summary_id,),
+                        ).fetchone()[0]
+                    )
+                    if blocking_count:
+                        raise ValueError(
+                            "Cannot finalize while blocking S3/S4 "
+                            "incidents remain open"
+                        )
+                cursor = connection.execute(
+                    """
+                    UPDATE platform_trade_day_summaries
+                    SET fact_source = ?,
+                        quality_level = ?,
+                        summary_status = ?,
+                        sold_qty = ?,
+                        order_count = ?,
+                        seller_received_amount = ?,
+                        quality_reason = ?,
+                        source_proportions_json = ?,
+                        input_manifest_sha256 = ?,
+                        mapping_version = ?,
+                        algorithm_version = ?,
+                        finalized_at = ?,
+                        updated_at = ?
+                    WHERE summary_id = ?
+                      AND summary_status = ?
+                      AND input_manifest_sha256 = ?
+                      AND is_current = 1
+                    """,
+                    (
+                        (
+                            after.fact_source.value
+                            if after.fact_source
+                            else None
+                        ),
+                        after.quality_level.value,
+                        after.summary_status.value,
+                        after.sold_qty,
+                        after.order_count,
+                        _decimal_to_text(after.seller_received_amount),
+                        after.quality_reason,
+                        _json_dump(after.source_proportions),
+                        after.input_manifest_sha256,
+                        after.mapping_version,
+                        after.algorithm_version,
+                        _datetime_to_text(after.finalized_at),
+                        _datetime_to_text(after.updated_at),
+                        before.summary_id,
+                        before.summary_status.value,
+                        before.input_manifest_sha256,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    return False
+                if (
+                    before.summary_status is after.summary_status
+                    and before.input_manifest_sha256
+                    != after.input_manifest_sha256
+                ):
+                    connection.execute(
+                        """
+                        DELETE FROM platform_trade_day_summary_inputs
+                        WHERE summary_id = ?
+                        """,
+                        (after.summary_id,),
+                    )
+                _insert_summary_inputs(
+                    connection,
+                    after.summary_id,
+                    input_rows,
+                )
+                _insert_event(connection, event)
+                connection.commit()
+                return True
+            except Exception:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
 
     def insert_revision(
         self,
@@ -184,31 +231,40 @@ class OperationalSummaryRepository:
         input_rows = tuple(inputs)
         with closing(
             self.runtime_repository.connect_write()
-        ) as connection, connection:
-            cursor = connection.execute(
-                """
-                UPDATE platform_trade_day_summaries
-                SET is_current = 0
-                WHERE summary_id = ?
-                  AND summary_status = 'FINAL'
-                  AND is_current = 1
-                  AND input_manifest_sha256 = ?
-                """,
-                (
-                    previous.summary_id,
-                    previous.input_manifest_sha256,
-                ),
-            )
-            if cursor.rowcount != 1:
-                return False
-            _insert_summary(connection, revision)
-            _insert_summary_inputs(
-                connection,
-                revision.summary_id,
-                input_rows,
-            )
-            _insert_event(connection, event)
-            return True
+        ) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                cursor = connection.execute(
+                    """
+                    UPDATE platform_trade_day_summaries
+                    SET is_current = 0
+                    WHERE summary_id = ?
+                      AND summary_status = ?
+                      AND is_current = 1
+                      AND input_manifest_sha256 = ?
+                    """,
+                    (
+                        previous.summary_id,
+                        previous.summary_status.value,
+                        previous.input_manifest_sha256,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    return False
+                _insert_summary(connection, revision)
+                _insert_summary_inputs(
+                    connection,
+                    revision.summary_id,
+                    input_rows,
+                )
+                _insert_event(connection, event)
+                connection.commit()
+                return True
+            except Exception:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
 
     def count_blocking_incidents(self, summary_id: str) -> int:
         with closing(self.runtime_repository.connect_read()) as connection:

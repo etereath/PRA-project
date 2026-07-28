@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 import pytest
 
-from app.enums import TaskActionType, TaskStatus
+from app.enums import TaskActionType, TaskOriginType, TaskStatus
 from app.exceptions import ValidationError
 from app.models import Task
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
@@ -117,6 +117,7 @@ def _task(task_id, sku, old_price, target_price):
         priority=10,
         task_status=TaskStatus.PENDING,
         created_at=now,
+        origin_type=TaskOriginType.MANUAL,
         expected_old_price=Decimal(old_price),
         target_price=Decimal(target_price),
         expires_at=now + timedelta(hours=1),

@@ -14,6 +14,7 @@ from app.enums import (
     NotificationSendStatus,
     ReviewTaskStatus,
     TaskActionType,
+    TaskOriginType,
     TaskStatus,
 )
 from app.models import NotificationLog, Task
@@ -47,6 +48,7 @@ def _runtime_task(
         priority=2,
         task_status=status,
         created_at=datetime(2026, 5, 4, 9, 0),
+        origin_type=TaskOriginType.MANUAL,
         trade_date=date(2026, 5, 4),
         scope_type="global",
         scope_key="2026-05-04",

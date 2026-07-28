@@ -11,7 +11,13 @@ from uuid import uuid4
 
 from openpyxl import Workbook
 
-from app.enums import NotificationSendStatus, ReviewTaskStatus, TaskActionType, TaskStatus
+from app.enums import (
+    NotificationSendStatus,
+    ReviewTaskStatus,
+    TaskActionType,
+    TaskOriginType,
+    TaskStatus,
+)
 from app.models import MockPlatformProductState, Task
 from app.repositories.mock_platform_repository import MockPlatformRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
@@ -465,6 +471,7 @@ class E2EFlowRunner:
             priority=1,
             task_status=TaskStatus.PENDING,
             created_at=utc_now(),
+            origin_type=TaskOriginType.MANUAL,
             target_price=target_price,
             target_status=target_status,
             result_message=reason,

@@ -7,7 +7,14 @@ from pathlib import Path
 
 import pytest
 
-from app.enums import TaskActionType, TaskOriginType, TaskStatus
+from app.enums import (
+    AutomationRunStatus,
+    IncidentCategory,
+    IncidentStatus,
+    TaskActionType,
+    TaskOriginType,
+    TaskStatus,
+)
 from app.models import Task
 from app.repositories import sqlite_runtime_repository as runtime_module
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
@@ -90,7 +97,7 @@ def test_v14_new_database_has_frozen_tables_policy_and_task_origin(
             """
             SELECT timezone_name, platform_cutoff_local_time,
                    seller_cutoff_local_time, peak_start_local_time,
-                   effective_to
+                   effective_from, effective_to
             FROM operational_time_policies
             WHERE policy_version = 'CN_SINGLE_PLATFORM_2026_V1'
             """
@@ -100,6 +107,7 @@ def test_v14_new_database_has_frozen_tables_policy_and_task_origin(
             "18:00:00",
             "20:00:00",
             "16:00:00",
+            "2025-12-31T16:00:00+00:00",
             None,
         )
 
@@ -111,11 +119,32 @@ def test_v14_new_database_has_frozen_tables_policy_and_task_origin(
         priority=10,
         task_status=TaskStatus.PENDING,
         created_at=datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc),
+        origin_type=TaskOriginType.MANUAL,
     )
     assert repository.insert_task(task) == 1
     loaded = repository.get_task(task.task_id)
     assert loaded is not None
     assert loaded.origin_type is TaskOriginType.MANUAL
+
+
+def test_task_model_requires_explicit_origin() -> None:
+    with pytest.raises(TypeError, match="origin_type"):
+        Task(
+            task_id="TASK-MISSING-ORIGIN",
+            internal_sku="SKU-1",
+            platform_name="platform",
+            action_type=TaskActionType.MANUAL_REVIEW,
+            priority=10,
+            task_status=TaskStatus.PENDING,
+            created_at=datetime(
+                2026,
+                7,
+                29,
+                12,
+                0,
+                tzinfo=timezone.utc,
+            ),
+        )
 
 
 def test_v14_database_rejects_invalid_task_origin(
@@ -182,6 +211,153 @@ def test_v14_automation_task_requires_origin_reference(
 
     with pytest.raises(ValueError, match="origin_ref_id"):
         repository.insert_task(task)
+
+
+@pytest.mark.parametrize(
+    "run_status",
+    [
+        AutomationRunStatus.SUCCESS.value,
+        AutomationRunStatus.MERGED.value,
+        AutomationRunStatus.SKIPPED.value,
+    ],
+)
+def test_v14_automation_run_accepts_frozen_operational_statuses(
+    tmp_path: Path,
+    run_status: str,
+) -> None:
+    repository = _repository(tmp_path)
+    with closing(repository.connect_write()) as connection, connection:
+        _insert_automation_job(connection)
+        _insert_automation_run(connection, run_status=run_status)
+
+
+def test_v14_automation_run_rejects_legacy_succeeded_status(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    with closing(repository.connect_write()) as connection, connection:
+        _insert_automation_job(connection)
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_automation_run(connection, run_status="SUCCEEDED")
+
+
+def test_v14_incident_category_status_and_resolution_are_frozen(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    now = "2026-07-29T12:00:00+00:00"
+    with closing(repository.connect_write()) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO operational_incidents(
+                incident_id, dedupe_key, category,
+                source_type, severity, incident_status,
+                subject_type, subject_key, title,
+                first_detected_at, last_detected_at,
+                created_at, updated_at
+            ) VALUES (
+                'INCIDENT-VALID', 'incident-valid', ?,
+                'SCAN', 'S2', ?,
+                'PLATFORM', 'platform', 'valid incident',
+                ?, ?, ?, ?
+            )
+            """,
+            (
+                IncidentCategory.SCAN_INCOMPLETE.value,
+                IncidentStatus.OPEN.value,
+                now,
+                now,
+                now,
+                now,
+            ),
+        )
+        invalid_cases = (
+            ("INCIDENT-BAD-CATEGORY", "UNKNOWN", "OPEN", None),
+            (
+                "INCIDENT-BAD-STATUS",
+                IncidentCategory.SCAN_INCOMPLETE.value,
+                "DONE",
+                None,
+            ),
+            (
+                "INCIDENT-RESOLVED-WITHOUT-TIME",
+                IncidentCategory.SCAN_INCOMPLETE.value,
+                IncidentStatus.RESOLVED.value,
+                None,
+            ),
+            (
+                "INCIDENT-OPEN-WITH-TIME",
+                IncidentCategory.SCAN_INCOMPLETE.value,
+                IncidentStatus.OPEN.value,
+                now,
+            ),
+        )
+        for incident_id, category, status, resolved_at in invalid_cases:
+            with pytest.raises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO operational_incidents(
+                        incident_id, dedupe_key, category,
+                        source_type, severity, incident_status,
+                        subject_type, subject_key, title,
+                        first_detected_at, last_detected_at, resolved_at,
+                        created_at, updated_at
+                    ) VALUES (
+                        ?, ?, ?, 'SCAN', 'S2', ?,
+                        'PLATFORM', 'platform', 'invalid incident',
+                        ?, ?, ?, ?, ?
+                    )
+                    """,
+                    (
+                        incident_id,
+                        incident_id.lower(),
+                        category,
+                        status,
+                        now,
+                        now,
+                        resolved_at,
+                        now,
+                        now,
+                    ),
+                )
+
+
+def test_v14_time_policy_rejects_overlap_and_non_utc_storage(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    now = "2026-07-29T12:00:00+00:00"
+    with closing(repository.connect_write()) as connection, connection:
+        connection.execute(
+            """
+            UPDATE operational_time_policies
+            SET effective_to = '2026-07-29T10:00:00+00:00'
+            WHERE policy_version = 'CN_SINGLE_PLATFORM_2026_V1'
+            """
+        )
+        _insert_time_policy(
+            connection,
+            version="V2",
+            effective_from="2026-07-29T10:00:00+00:00",
+            effective_to=None,
+            created_at=now,
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="must not overlap"):
+            _insert_time_policy(
+                connection,
+                version="OVERLAP",
+                effective_from="2026-07-29T09:00:00+00:00",
+                effective_to="2026-07-29T11:00:00+00:00",
+                created_at=now,
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_time_policy(
+                connection,
+                version="NON-UTC",
+                effective_from="2026-07-30T00:00:00+08:00",
+                effective_to="2026-07-31T00:00:00+08:00",
+                created_at=now,
+            )
 
 
 @pytest.mark.parametrize(
@@ -537,4 +713,77 @@ def _insert_summary(
             now,
             now,
         ),
+    )
+
+
+def _insert_automation_job(connection) -> None:
+    now = "2026-07-29T12:00:00+00:00"
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO automation_jobs(
+            job_id, job_type, display_name,
+            schedule_kind, schedule_expression,
+            created_at, updated_at
+        ) VALUES (
+            'JOB-1', 'ONLINE_PULSE', 'Online pulse',
+            'INTERVAL', '10m', ?, ?
+        )
+        """,
+        (now, now),
+    )
+
+
+def _insert_automation_run(connection, *, run_status: str) -> None:
+    now = "2026-07-29T12:00:00+00:00"
+    connection.execute(
+        """
+        INSERT INTO automation_runs(
+            run_id, job_id, job_type, logical_run_key, run_status,
+            platform_name, platform_trade_date,
+            seller_operation_date, seller_phase,
+            time_policy_version, scheduled_for,
+            created_at, updated_at
+        ) VALUES (
+            ?, 'JOB-1', 'ONLINE_PULSE', ?, ?,
+            'platform', '2026-07-29',
+            '2026-07-29', 'NORMAL_SALES',
+            'CN_SINGLE_PLATFORM_2026_V1', ?,
+            ?, ?
+        )
+        """,
+        (
+            f"RUN-{run_status}",
+            f"logical-{run_status}",
+            run_status,
+            now,
+            now,
+            now,
+        ),
+    )
+
+
+def _insert_time_policy(
+    connection,
+    *,
+    version: str,
+    effective_from: str,
+    effective_to: str | None,
+    created_at: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO operational_time_policies(
+            policy_version, timezone_name,
+            platform_cutoff_local_time,
+            seller_cutoff_local_time,
+            peak_start_local_time,
+            effective_from, effective_to,
+            created_at, created_by
+        ) VALUES (
+            ?, 'Asia/Shanghai',
+            '18:00:00', '20:00:00', '16:00:00',
+            ?, ?, ?, 'test'
+        )
+        """,
+        (version, effective_from, effective_to, created_at),
     )

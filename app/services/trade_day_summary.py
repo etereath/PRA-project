@@ -184,19 +184,37 @@ class TradeDaySummaryService:
             and before.input_manifest_sha256 == input_manifest_sha256
         ):
             return SummaryMutationResult(summary=before, changed=False)
-        expected = ALLOWED_SUMMARY_TRANSITIONS.get(before.summary_status)
-        if expected is not to_status:
-            raise ValueError(
-                f"Illegal summary transition "
-                f"{before.summary_status.value} -> {to_status.value}"
-            )
+        same_status_material_revision = before.summary_status is to_status
         if (
-            to_status is SummaryStatus.FINAL
-            and self.repository.count_blocking_incidents(summary_id) > 0
+            same_status_material_revision
+            and before.summary_status is not SummaryStatus.PROVISIONAL
         ):
-            raise ValueError(
-                "Cannot finalize while blocking S3/S4 incidents remain open"
+            return self._create_revision(
+                previous=before,
+                fact_source=fact_source,
+                quality_level=quality_level,
+                sold_qty=sold_qty,
+                order_count=order_count,
+                seller_received_amount=seller_received_amount,
+                quality_reason=quality_reason,
+                source_proportions=source_proportions,
+                input_manifest_sha256=input_manifest_sha256,
+                mapping_version=mapping_version,
+                algorithm_version=algorithm_version,
+                inputs=inputs,
+                changed_by=changed_by,
+                trigger_type="MATERIAL_INPUT_REVISION",
+                trigger_ref_id=trigger_ref_id,
             )
+        if not same_status_material_revision:
+            expected = ALLOWED_SUMMARY_TRANSITIONS.get(
+                before.summary_status
+            )
+            if expected is not to_status:
+                raise ValueError(
+                    f"Illegal summary transition "
+                    f"{before.summary_status.value} -> {to_status.value}"
+                )
 
         now = _require_aware(self._clock())
         after = replace(
@@ -250,6 +268,65 @@ class TradeDaySummaryService:
             inputs=input_rows,
         )
 
+    def revise_current(
+        self,
+        summary_id: str,
+        *,
+        fact_source: FactSource | None,
+        quality_level: DataQualityLevel,
+        sold_qty: int | None,
+        order_count: int | None,
+        seller_received_amount: Decimal | None,
+        quality_reason: str,
+        source_proportions: dict,
+        input_manifest_sha256: str,
+        mapping_version: str,
+        algorithm_version: str,
+        inputs: Iterable[TradeDaySummaryInput],
+        changed_by: str,
+        trigger_type: str = "MATERIAL_INPUT_REVISION",
+        trigger_ref_id: str = "",
+    ) -> SummaryMutationResult:
+        """Audit a PROVISIONAL update or restart later states as OBSERVED."""
+
+        previous = self._require_current(summary_id)
+        if previous.summary_status is SummaryStatus.PROVISIONAL:
+            return self.transition(
+                summary_id,
+                to_status=SummaryStatus.PROVISIONAL,
+                fact_source=fact_source,
+                quality_level=quality_level,
+                sold_qty=sold_qty,
+                order_count=order_count,
+                seller_received_amount=seller_received_amount,
+                quality_reason=quality_reason,
+                source_proportions=source_proportions,
+                input_manifest_sha256=input_manifest_sha256,
+                mapping_version=mapping_version,
+                algorithm_version=algorithm_version,
+                inputs=inputs,
+                changed_by=changed_by,
+                trigger_type=trigger_type,
+                trigger_ref_id=trigger_ref_id,
+            )
+        return self._create_revision(
+            previous=previous,
+            fact_source=fact_source,
+            quality_level=quality_level,
+            sold_qty=sold_qty,
+            order_count=order_count,
+            seller_received_amount=seller_received_amount,
+            quality_reason=quality_reason,
+            source_proportions=source_proportions,
+            input_manifest_sha256=input_manifest_sha256,
+            mapping_version=mapping_version,
+            algorithm_version=algorithm_version,
+            inputs=inputs,
+            changed_by=changed_by,
+            trigger_type=trigger_type,
+            trigger_ref_id=trigger_ref_id,
+        )
+
     def revise_final(
         self,
         summary_id: str,
@@ -271,6 +348,43 @@ class TradeDaySummaryService:
         previous = self._require_current(summary_id)
         if previous.summary_status is not SummaryStatus.FINAL:
             raise ValueError("Only a current FINAL summary can be revised")
+        return self._create_revision(
+            previous=previous,
+            fact_source=fact_source,
+            quality_level=quality_level,
+            sold_qty=sold_qty,
+            order_count=order_count,
+            seller_received_amount=seller_received_amount,
+            quality_reason=quality_reason,
+            source_proportions=source_proportions,
+            input_manifest_sha256=input_manifest_sha256,
+            mapping_version=mapping_version,
+            algorithm_version=algorithm_version,
+            inputs=inputs,
+            changed_by=changed_by,
+            trigger_type="LATE_DATA_REVISION",
+            trigger_ref_id=trigger_ref_id,
+        )
+
+    def _create_revision(
+        self,
+        *,
+        previous: PlatformTradeDaySummary,
+        fact_source: FactSource | None,
+        quality_level: DataQualityLevel,
+        sold_qty: int | None,
+        order_count: int | None,
+        seller_received_amount: Decimal | None,
+        quality_reason: str,
+        source_proportions: dict,
+        input_manifest_sha256: str,
+        mapping_version: str,
+        algorithm_version: str,
+        inputs: Iterable[TradeDaySummaryInput],
+        changed_by: str,
+        trigger_type: str,
+        trigger_ref_id: str,
+    ) -> SummaryMutationResult:
         if previous.input_manifest_sha256 == input_manifest_sha256:
             return SummaryMutationResult(summary=previous, changed=False)
 
@@ -307,7 +421,7 @@ class TradeDaySummaryService:
             from_summary=previous,
             changed_at=now,
             changed_by=changed_by,
-            trigger_type="LATE_DATA_REVISION",
+            trigger_type=trigger_type,
             trigger_ref_id=trigger_ref_id,
             reason=quality_reason,
         )
@@ -319,7 +433,7 @@ class TradeDaySummaryService:
             inputs=input_rows,
         ):
             raise RuntimeError(
-                "FINAL summary changed concurrently; reload before retrying"
+                "Summary changed concurrently; reload before retrying"
             )
         return SummaryMutationResult(
             summary=revision,

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 
-from app.enums import TaskActionType, TaskStatus
+from app.enums import TaskActionType, TaskOriginType, TaskStatus
 from app.exceptions import ValidationError
 from app.models import ColdStorageStatus, HarvestForecast, ListingRule, PackingCapacityPlan, Product, ScriptRun, ScriptRunItem, Task
 from app.repositories.mock_platform_repository import DEFAULT_MOCK_PLATFORM_DB, MockPlatformRepository
@@ -910,6 +910,8 @@ def _task_from_review_proposal(proposal: Proposal, context: EvaluationContext) -
         priority=2,
         task_status=TaskStatus.PENDING,
         created_at=utc_now(),
+        origin_type=TaskOriginType.AUTOMATION,
+        origin_ref_id=f"proposal:{proposal.dedupe_key}",
         target_status=str(payload.get("target_status") or "") or None,
         result_message=str(payload.get("reason") or proposal.message),
         required_by=required_by,

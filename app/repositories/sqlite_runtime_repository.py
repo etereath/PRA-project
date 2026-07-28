@@ -990,7 +990,7 @@ SCHEMA_V14_SQL = [
     """
     CREATE TABLE IF NOT EXISTS operational_time_policies (
         policy_version TEXT PRIMARY KEY,
-        timezone_name TEXT NOT NULL,
+        timezone_name TEXT NOT NULL CHECK (timezone_name = 'Asia/Shanghai'),
         platform_cutoff_local_time TEXT NOT NULL,
         seller_cutoff_local_time TEXT NOT NULL,
         peak_start_local_time TEXT NOT NULL,
@@ -1000,9 +1000,23 @@ SCHEMA_V14_SQL = [
         created_by TEXT NOT NULL,
         supersedes_policy_version TEXT,
         CHECK (policy_version <> ''),
-        CHECK (timezone_name <> ''),
         CHECK (
-            effective_to IS NULL OR effective_to > effective_from
+            julianday(effective_from) IS NOT NULL
+            AND (
+                substr(effective_from, -6) = '+00:00'
+                OR substr(effective_from, -1) = 'Z'
+            )
+        ),
+        CHECK (
+            effective_to IS NULL
+            OR (
+                julianday(effective_to) IS NOT NULL
+                AND julianday(effective_to) > julianday(effective_from)
+                AND (
+                    substr(effective_to, -6) = '+00:00'
+                    OR substr(effective_to, -1) = 'Z'
+                )
+            )
         ),
         FOREIGN KEY(supersedes_policy_version)
             REFERENCES operational_time_policies(policy_version)
@@ -1012,6 +1026,47 @@ SCHEMA_V14_SQL = [
     CREATE UNIQUE INDEX IF NOT EXISTS ux_operational_time_policies_current
     ON operational_time_policies(timezone_name)
     WHERE effective_to IS NULL
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_operational_time_policy_no_overlap_insert
+    BEFORE INSERT ON operational_time_policies
+    FOR EACH ROW
+    WHEN EXISTS (
+        SELECT 1
+        FROM operational_time_policies AS existing
+        WHERE existing.timezone_name = NEW.timezone_name
+          AND julianday(NEW.effective_from)
+              < COALESCE(julianday(existing.effective_to), 5373484.499999)
+          AND julianday(existing.effective_from)
+              < COALESCE(julianday(NEW.effective_to), 5373484.499999)
+    )
+    BEGIN
+        SELECT RAISE(
+            ABORT,
+            'operational time policy effective ranges must not overlap'
+        );
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_operational_time_policy_no_overlap_update
+    BEFORE UPDATE ON operational_time_policies
+    FOR EACH ROW
+    WHEN EXISTS (
+        SELECT 1
+        FROM operational_time_policies AS existing
+        WHERE existing.policy_version <> OLD.policy_version
+          AND existing.timezone_name = NEW.timezone_name
+          AND julianday(NEW.effective_from)
+              < COALESCE(julianday(existing.effective_to), 5373484.499999)
+          AND julianday(existing.effective_from)
+              < COALESCE(julianday(NEW.effective_to), 5373484.499999)
+    )
+    BEGIN
+        SELECT RAISE(
+            ABORT,
+            'operational time policy effective ranges must not overlap'
+        );
+    END
     """,
     """
     CREATE TABLE IF NOT EXISTS automation_jobs (
@@ -1041,8 +1096,8 @@ SCHEMA_V14_SQL = [
         job_type TEXT NOT NULL,
         logical_run_key TEXT NOT NULL,
         run_status TEXT NOT NULL CHECK (run_status IN (
-            'SCHEDULED', 'RUNNING', 'SUCCEEDED', 'PARTIAL',
-            'FAILED', 'MISSED', 'CANCELLED'
+            'SCHEDULED', 'RUNNING', 'SUCCESS', 'PARTIAL',
+            'FAILED', 'MISSED', 'MERGED', 'SKIPPED', 'CANCELLED'
         )),
         platform_name TEXT NOT NULL,
         platform_trade_date TEXT NOT NULL,
@@ -1426,20 +1481,34 @@ SCHEMA_V14_SQL = [
     BEFORE UPDATE ON platform_trade_day_summaries
     FOR EACH ROW
     WHEN OLD.summary_status = 'FINAL'
-      AND (
-          NEW.summary_status IS NOT OLD.summary_status
-          OR NEW.fact_source IS NOT OLD.fact_source
-          OR NEW.quality_level IS NOT OLD.quality_level
-          OR NEW.sold_qty IS NOT OLD.sold_qty
-          OR NEW.order_count IS NOT OLD.order_count
-          OR NEW.seller_received_amount IS NOT OLD.seller_received_amount
-          OR NEW.quality_reason IS NOT OLD.quality_reason
-          OR NEW.source_proportions_json IS NOT OLD.source_proportions_json
-          OR NEW.input_manifest_sha256 IS NOT OLD.input_manifest_sha256
-          OR NEW.mapping_version IS NOT OLD.mapping_version
-          OR NEW.algorithm_version IS NOT OLD.algorithm_version
-          OR NEW.time_policy_version IS NOT OLD.time_policy_version
-          OR NEW.finalized_at IS NOT OLD.finalized_at
+      AND NOT (
+          OLD.is_current = 1
+          AND NEW.is_current = 0
+          AND NEW.summary_id IS OLD.summary_id
+          AND NEW.summary_series_id IS OLD.summary_series_id
+          AND NEW.version_no IS OLD.version_no
+          AND NEW.supersedes_summary_id IS OLD.supersedes_summary_id
+          AND NEW.platform_name IS OLD.platform_name
+          AND NEW.platform_trade_date IS OLD.platform_trade_date
+          AND NEW.seller_operation_date IS OLD.seller_operation_date
+          AND NEW.seller_phase IS OLD.seller_phase
+          AND NEW.scope_type IS OLD.scope_type
+          AND NEW.scope_key IS OLD.scope_key
+          AND NEW.fact_source IS OLD.fact_source
+          AND NEW.quality_level IS OLD.quality_level
+          AND NEW.summary_status IS OLD.summary_status
+          AND NEW.sold_qty IS OLD.sold_qty
+          AND NEW.order_count IS OLD.order_count
+          AND NEW.seller_received_amount IS OLD.seller_received_amount
+          AND NEW.quality_reason IS OLD.quality_reason
+          AND NEW.source_proportions_json IS OLD.source_proportions_json
+          AND NEW.input_manifest_sha256 IS OLD.input_manifest_sha256
+          AND NEW.mapping_version IS OLD.mapping_version
+          AND NEW.algorithm_version IS OLD.algorithm_version
+          AND NEW.time_policy_version IS OLD.time_policy_version
+          AND NEW.finalized_at IS OLD.finalized_at
+          AND NEW.created_at IS OLD.created_at
+          AND NEW.updated_at IS OLD.updated_at
       )
     BEGIN
         SELECT RAISE(ABORT, 'FINAL summary content is immutable');
@@ -1526,12 +1595,23 @@ SCHEMA_V14_SQL = [
     CREATE TABLE IF NOT EXISTS operational_incidents (
         incident_id TEXT PRIMARY KEY,
         dedupe_key TEXT NOT NULL,
+        category TEXT NOT NULL CHECK (category IN (
+            'PLATFORM_LOGIN', 'PLATFORM_NETWORK', 'PAGE_STRUCTURE',
+            'SCAN_INCOMPLETE', 'WORKER_UNAVAILABLE', 'QUEUE_BACKLOG',
+            'PRODUCT_MAPPING', 'PRICE_ANOMALY', 'INVENTORY_ANOMALY',
+            'ORDER_PAGE_UNAVAILABLE', 'ORDER_DATA_INCONSISTENT',
+            'SALES_ESTIMATE_LOW_CONFIDENCE', 'NOTIFICATION_FAILURE',
+            'WRITE_UNKNOWN'
+        )),
         source_type TEXT NOT NULL,
         source_ref_id TEXT NOT NULL DEFAULT '',
         severity TEXT NOT NULL CHECK (severity IN (
             'S0', 'S1', 'S2', 'S3', 'S4'
         )),
-        incident_status TEXT NOT NULL,
+        incident_status TEXT NOT NULL CHECK (incident_status IN (
+            'OPEN', 'RETRYING', 'WAITING_HUMAN', 'ACKNOWLEDGED',
+            'AUTO_PROTECTING', 'RESOLVED', 'CLOSED'
+        )),
         blocks_finalization INTEGER NOT NULL DEFAULT 0 CHECK (
             blocks_finalization IN (0, 1)
         ),
@@ -1547,7 +1627,16 @@ SCHEMA_V14_SQL = [
         resolved_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        CHECK (incident_status <> '')
+        CHECK (
+            (
+                incident_status IN ('RESOLVED', 'CLOSED')
+                AND resolved_at IS NOT NULL
+            )
+            OR (
+                incident_status NOT IN ('RESOLVED', 'CLOSED')
+                AND resolved_at IS NULL
+            )
+        )
     )
     """,
     """
@@ -2441,27 +2530,34 @@ class SQLiteRuntimeRepository:
                     connection.execute(statement)
                 connection.execute(
                     """
-                    INSERT OR IGNORE INTO operational_time_policies(
-                        policy_version, timezone_name,
-                        platform_cutoff_local_time,
-                        seller_cutoff_local_time,
+                INSERT INTO operational_time_policies(
+                    policy_version, timezone_name,
+                    platform_cutoff_local_time,
+                    seller_cutoff_local_time,
                         peak_start_local_time,
                         effective_from, effective_to,
-                        created_at, created_by,
-                        supersedes_policy_version
-                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL)
-                    """,
-                    (
-                        "CN_SINGLE_PLATFORM_2026_V1",
+                    created_at, created_by,
+                    supersedes_policy_version
+                )
+                SELECT ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM operational_time_policies
+                    WHERE policy_version = ?
+                )
+                """,
+                (
+                    "CN_SINGLE_PLATFORM_2026_V1",
                         "Asia/Shanghai",
                         "18:00:00",
                         "20:00:00",
                         "16:00:00",
-                        "2026-01-01T00:00:00+08:00",
-                        _datetime_to_text(datetime.now()),
-                        "runtime_schema_v14",
-                    ),
-                )
+                    "2025-12-31T16:00:00+00:00",
+                    _datetime_to_text(datetime.now()),
+                    "runtime_schema_v14",
+                    "CN_SINGLE_PLATFORM_2026_V1",
+                ),
+            )
                 connection.execute(
                     """
                     UPDATE tasks

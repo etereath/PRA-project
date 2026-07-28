@@ -166,6 +166,51 @@ class TaskOriginType(str, Enum):
     LEGACY = "LEGACY"
 
 
+class AutomationRunStatus(str, Enum):
+    """Canonical automation run states shared by storage and operations UI."""
+
+    SCHEDULED = "SCHEDULED"
+    RUNNING = "RUNNING"
+    SUCCESS = "SUCCESS"
+    PARTIAL = "PARTIAL"
+    FAILED = "FAILED"
+    MISSED = "MISSED"
+    MERGED = "MERGED"
+    SKIPPED = "SKIPPED"
+    CANCELLED = "CANCELLED"
+
+
+class IncidentCategory(str, Enum):
+    """Stable operational incident categories frozen by task 13.5."""
+
+    PLATFORM_LOGIN = "PLATFORM_LOGIN"
+    PLATFORM_NETWORK = "PLATFORM_NETWORK"
+    PAGE_STRUCTURE = "PAGE_STRUCTURE"
+    SCAN_INCOMPLETE = "SCAN_INCOMPLETE"
+    WORKER_UNAVAILABLE = "WORKER_UNAVAILABLE"
+    QUEUE_BACKLOG = "QUEUE_BACKLOG"
+    PRODUCT_MAPPING = "PRODUCT_MAPPING"
+    PRICE_ANOMALY = "PRICE_ANOMALY"
+    INVENTORY_ANOMALY = "INVENTORY_ANOMALY"
+    ORDER_PAGE_UNAVAILABLE = "ORDER_PAGE_UNAVAILABLE"
+    ORDER_DATA_INCONSISTENT = "ORDER_DATA_INCONSISTENT"
+    SALES_ESTIMATE_LOW_CONFIDENCE = "SALES_ESTIMATE_LOW_CONFIDENCE"
+    NOTIFICATION_FAILURE = "NOTIFICATION_FAILURE"
+    WRITE_UNKNOWN = "WRITE_UNKNOWN"
+
+
+class IncidentStatus(str, Enum):
+    """Frozen lifecycle for operational incident handling."""
+
+    OPEN = "OPEN"
+    RETRYING = "RETRYING"
+    WAITING_HUMAN = "WAITING_HUMAN"
+    ACKNOWLEDGED = "ACKNOWLEDGED"
+    AUTO_PROTECTING = "AUTO_PROTECTING"
+    RESOLVED = "RESOLVED"
+    CLOSED = "CLOSED"
+
+
 class ShortageRisk(str, Enum):
     LOW = "low"
     MANAGEABLE = "manageable"

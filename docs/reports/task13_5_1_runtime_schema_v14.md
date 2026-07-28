@@ -20,6 +20,9 @@
 - `seller_phase` 只允许 `NORMAL_SALES / PEAK_SALES /
   DELIVERY_OVERLAP`。
 - 输入必须是 timezone-aware datetime；naive datetime 直接拒绝。
+- `observed_at` 统一归一化为 UTC；等价的不同时区输入产生同一个技术时间。
+- 按 UTC `effective_from/effective_to` 左闭右开区间选择唯一策略，Service 和
+  Schema 都拒绝区间重叠。
 - 旧 `TradeWindowService` 保持不变，继续服务原预测窗口。
 
 ### 1.2 Runtime Schema v14
@@ -70,10 +73,15 @@ time_policy_version
 - 日结只允许 `PROVISIONAL → OBSERVED → RECONCILED → FINAL`。
 - 初版只能从 `PROVISIONAL` 开始；FINAL 后迟到数据创建从
   `OBSERVED` 开始的新版本。
+- PROVISIONAL 实质变化在单事务内原子修订并整体替换输入 manifest；
+  OBSERVED/RECONCILED/FINAL 实质变化创建新的 OBSERVED 版本。
 - 一个系列最多一个 `is_current=1`。
-- FINAL 内容不可修改；只允许在新版本建立时撤销旧版本 current 标志。
+- FINAL 的业务身份、版本、指标和审计字段全部不可修改；只允许在新版本建立事务中
+  执行 `is_current: 1 → 0`。
 - FINAL 必须为 `ORDER_COMPLETE`，并且不存在显式
   `blocks_finalization=1` 的未解决 Incident。
+- FINAL 门禁查询、summary UPDATE、输入与事件写入位于同一个
+  `BEGIN IMMEDIATE` 事务。
 - 所有转换写入不可变事件，实际输入写入输入关联表。
 
 ### 1.4 任务来源安全边界
@@ -89,7 +97,25 @@ LEGACY
 
 通用任务 Repository 当前拒绝新建 `LEGACY` 和
 `SYSTEM_EMERGENCY`；自动任务必须提供 `origin_ref_id`。
+`Task` 模型不再提供隐式 `MANUAL` 默认值；规则、预测和 proposal 生成路径显式使用
+`AUTOMATION` 并绑定来源运行，人工 Workbook 导入显式使用 `MANUAL`。当前 Web/CLI
+没有独立的 Task 构造旁路，后续入口也必须通过模型的必填来源门禁。
+任务 Workbook 导出/导入保留来源和授权字段；缺少这些列的旧 Workbook 只标记为
+`LEGACY`，不猜测为人工任务。
 `SYSTEM_EMERGENCY` 仍等待 13.5-6 的专用策略、授权与实机门禁。
+
+### 1.5 Automation 与 Incident 冻结集合
+
+Automation 权威运行状态为：
+
+```text
+SCHEDULED / RUNNING / SUCCESS / PARTIAL / FAILED
+MISSED / MERGED / SKIPPED / CANCELLED
+```
+
+不再接受 `SUCCEEDED`。Incident 增加父 Issue 冻结的 14 个 `category`，状态精确限制为
+`OPEN / RETRYING / WAITING_HUMAN / ACKNOWLEDGED / AUTO_PROTECTING /
+RESOLVED / CLOSED`；`resolved_at` 与 `RESOLVED/CLOSED` 双向一致。
 
 ## 2. 迁移和兼容
 
@@ -100,7 +126,7 @@ LEGACY
 - v4/v5 批次、operation/attempt、写锁、UNKNOWN、receipt、ACK、
   v13 两页快照和异常表保持原语义。
 - 精确健康检查覆盖 v14 表、列、索引、外键、冻结枚举、当前唯一索引、
-  三个日结触发器和时间策略种子。
+  三个日结触发器、时间策略防重叠触发器和 UTC 策略种子。
 
 真实库迁移必须按
 [Runtime Schema v14 迁移运行手册](../runtime_schema_v14_migration.md)
@@ -118,7 +144,7 @@ LEGACY
 
 ```text
 完整 pytest：
-708 passed, 3 skipped, 97 subtests passed
+733 passed, 3 skipped, 97 subtests passed
 
 系统冒烟：
 16 passed, 0 failed
@@ -131,16 +157,20 @@ secret_scan=PASS
 定向用例覆盖：
 
 - 六个时间边界、UTC 输入和 naive datetime 拒绝。
+- 策略版本切换、区间重叠拒绝和等价时区输入 UTC 归一化。
 - 新库 v14、v13→v14、v12→最新版本和重复迁移。
 - 迁移中途失败的事务回滚和外键恢复。
 - LEGACY 历史任务回填且不猜双日期。
 - 非法来源/质量组合、UNAVAILABLE 非零和 current 冲突。
 - 跳级、回退、直接 FINAL 和 FINAL 内容修改拒绝。
-- 幂等转换、Incident 阻断和 FINAL 后迟到数据版本链。
+- FINAL 全业务身份不可变和同事务 Incident 阻断。
+- PROVISIONAL 原子修订、OBSERVED/FINAL 新版本及输入 hash 幂等。
+- 自动化 `SUCCESS/MERGED/SKIPPED`、Incident 类别/状态和 resolved_at 一致性。
 
 ### 3.3 未执行项目
 
-- 未运行 Linux CI；由后续 PR 的 GitHub Actions 验证。
+- PR 初始版本的 Linux/Windows Core CI 均已通过；本轮评审修复将在推送后重新触发
+  GitHub Actions。
 - 未迁移真实 Runtime DB。
 - 未启动或同步 ShadowBot Worker。
 - 未读取订单页、执行平台扫描或产生真实平台写动作。

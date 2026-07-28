@@ -59,11 +59,15 @@ PRAGMA integrity_check = ok
 同时抽查：
 
 - `CN_SINGLE_PLATFORM_2026_V1` 为唯一当前时间策略。
+- 时间策略 `effective_from/effective_to` 使用 UTC，区间无重叠。
+- Automation 状态包含 `SUCCESS/MERGED/SKIPPED` 且不接受 `SUCCEEDED`。
+- Incident `category`、状态和 `resolved_at` 一致性 CHECK 生效。
 - 历史任务 `origin_type=LEGACY`。
 - 历史任务的新双日期、阶段和时间策略字段为 NULL。
 - v4/v5 批次、UNKNOWN、写锁、receipt、ACK 和 v13 快照计数不变。
 - 没有 `emergency_action_policies`，也没有新建
   `SYSTEM_EMERGENCY` 任务。
+- FINAL 触发器只允许受控 `is_current: 1 → 0`，其他业务身份与审计字段不可变。
 
 ### 3.4 切换
 

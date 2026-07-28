@@ -12,7 +12,13 @@ from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
 
-from app.enums import NotificationOutboxStatus, ReviewTaskStatus, TaskActionType, TaskStatus
+from app.enums import (
+    NotificationOutboxStatus,
+    ReviewTaskStatus,
+    TaskActionType,
+    TaskOriginType,
+    TaskStatus,
+)
 from app.exceptions import ValidationError
 from app.models import ReviewTask, Task
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
@@ -78,6 +84,7 @@ def _task(task_id: str = "TASK-SB-1") -> Task:
         priority=1,
         task_status=TaskStatus.PENDING,
         created_at=datetime(2026, 6, 23, 9, 0),
+        origin_type=TaskOriginType.MANUAL,
         target_price=Decimal("19.50"),
         trade_date=date(2026, 6, 23),
         scope_type="sku",

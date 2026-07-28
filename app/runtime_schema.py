@@ -584,6 +584,7 @@ V14_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "operational_incidents": (
         "incident_id",
         "dedupe_key",
+        "category",
         "source_type",
         "source_ref_id",
         "severity",
@@ -665,6 +666,48 @@ V14_INDEX_SPECS: Mapping[str, tuple[str, ...]] = {
 
 V14_TASK_ORIGIN_VALUES = frozenset(
     {"MANUAL", "AUTOMATION", "SYSTEM_EMERGENCY", "LEGACY"}
+)
+V14_AUTOMATION_RUN_STATUS_VALUES = frozenset(
+    {
+        "SCHEDULED",
+        "RUNNING",
+        "SUCCESS",
+        "PARTIAL",
+        "FAILED",
+        "MISSED",
+        "MERGED",
+        "SKIPPED",
+        "CANCELLED",
+    }
+)
+V14_INCIDENT_CATEGORY_VALUES = frozenset(
+    {
+        "PLATFORM_LOGIN",
+        "PLATFORM_NETWORK",
+        "PAGE_STRUCTURE",
+        "SCAN_INCOMPLETE",
+        "WORKER_UNAVAILABLE",
+        "QUEUE_BACKLOG",
+        "PRODUCT_MAPPING",
+        "PRICE_ANOMALY",
+        "INVENTORY_ANOMALY",
+        "ORDER_PAGE_UNAVAILABLE",
+        "ORDER_DATA_INCONSISTENT",
+        "SALES_ESTIMATE_LOW_CONFIDENCE",
+        "NOTIFICATION_FAILURE",
+        "WRITE_UNKNOWN",
+    }
+)
+V14_INCIDENT_STATUS_VALUES = frozenset(
+    {
+        "OPEN",
+        "RETRYING",
+        "WAITING_HUMAN",
+        "ACKNOWLEDGED",
+        "AUTO_PROTECTING",
+        "RESOLVED",
+        "CLOSED",
+    }
 )
 V14_FACT_SOURCE_VALUES = frozenset({"ORDER_OBSERVED", "SCAN_ESTIMATED"})
 V14_QUALITY_VALUES = frozenset(
@@ -1279,6 +1322,15 @@ def _check_v14_constraints(
         errors=errors,
     )
 
+    automation_run_sql = _table_sql(connection, "automation_runs")
+    _check_exact_status_values(
+        automation_run_sql,
+        column="run_status",
+        expected=V14_AUTOMATION_RUN_STATUS_VALUES,
+        label="automation_runs.run_status",
+        errors=errors,
+    )
+
     summary_sql = _table_sql(connection, "platform_trade_day_summaries")
     _check_exact_status_values(
         summary_sql,
@@ -1359,6 +1411,21 @@ def _check_v14_constraints(
         "trg_trade_day_summary_final_immutable": (
             "FINAL",
             "immutable",
+            "is_current",
+            "summary_series_id",
+            "platform_trade_date",
+            "scope_key",
+            "created_at",
+        ),
+        "trg_operational_time_policy_no_overlap_insert": (
+            "effective_from",
+            "effective_to",
+            "overlap",
+        ),
+        "trg_operational_time_policy_no_overlap_update": (
+            "effective_from",
+            "effective_to",
+            "overlap",
         ),
     }
     for trigger_name, required_terms in required_triggers.items():
@@ -1380,7 +1447,37 @@ def _check_v14_constraints(
                     f"{trigger_name} lacks required term {term}"
                 )
 
+    policy_sql = _table_sql(connection, "operational_time_policies")
+    if not re.search(
+        r"timezone_name\s+[^,]*CHECK\s*\(\s*"
+        r"timezone_name\s*=\s*'Asia/Shanghai'\s*\)",
+        policy_sql,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        errors.append(
+            "operational_time_policies.timezone_name must be Asia/Shanghai"
+        )
+    for column in ("effective_from", "effective_to"):
+        if f"substr({column}, -6) = '+00:00'" not in policy_sql:
+            errors.append(
+                f"operational_time_policies.{column} must require UTC storage"
+            )
+
     incident_sql = _table_sql(connection, "operational_incidents")
+    _check_exact_status_values(
+        incident_sql,
+        column="category",
+        expected=V14_INCIDENT_CATEGORY_VALUES,
+        label="operational_incidents.category",
+        errors=errors,
+    )
+    _check_exact_status_values(
+        incident_sql,
+        column="incident_status",
+        expected=V14_INCIDENT_STATUS_VALUES,
+        label="operational_incidents.incident_status",
+        errors=errors,
+    )
     if not re.search(
         r"CHECK\s*\(\s*blocks_finalization\s+IN\s*\(\s*0\s*,\s*1\s*\)"
         r"\s*\)",
@@ -1389,6 +1486,17 @@ def _check_v14_constraints(
     ):
         errors.append(
             "operational_incidents.blocks_finalization must be boolean"
+        )
+    if not re.search(
+        r"incident_status\s+IN\s*\(\s*'RESOLVED'\s*,\s*'CLOSED'\s*\)"
+        r".*?resolved_at\s+IS\s+NOT\s+NULL"
+        r".*?incident_status\s+NOT\s+IN\s*\(\s*'RESOLVED'\s*,\s*'CLOSED'\s*\)"
+        r".*?resolved_at\s+IS\s+NULL",
+        incident_sql,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        errors.append(
+            "operational_incidents status and resolved_at must be consistent"
         )
 
     foreign_key_requirements = {

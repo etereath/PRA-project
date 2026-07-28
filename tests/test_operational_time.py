@@ -9,6 +9,7 @@ from app.enums import SellerPhase
 from app.services.operational_time import (
     DEFAULT_OPERATIONAL_TIME_POLICY_VERSION,
     OperationalTimePolicy,
+    OperationalTimePolicyRegistry,
     OperationalTimeService,
 )
 
@@ -83,6 +84,7 @@ def test_operational_time_normalizes_utc_before_classification() -> None:
 
     context = OperationalTimeService().classify(observed_at)
 
+    assert context.observed_at == observed_at
     assert context.local_observed_at == datetime(
         2026,
         7,
@@ -94,6 +96,78 @@ def test_operational_time_normalizes_utc_before_classification() -> None:
     assert context.platform_trade_date == date(2026, 7, 30)
     assert context.seller_operation_date == date(2026, 7, 29)
     assert context.seller_phase is SellerPhase.DELIVERY_OVERLAP
+
+
+def test_equivalent_timezone_inputs_produce_same_utc_context() -> None:
+    utc_input = datetime(2026, 7, 29, 10, 0, tzinfo=timezone.utc)
+    shanghai_input = datetime(
+        2026,
+        7,
+        29,
+        18,
+        0,
+        tzinfo=SHANGHAI,
+    )
+    service = OperationalTimeService()
+
+    utc_context = service.classify(utc_input)
+    shanghai_context = service.classify(shanghai_input)
+
+    assert utc_context.observed_at == shanghai_context.observed_at
+    assert utc_context.observed_at == utc_input
+    assert utc_context.local_observed_at == shanghai_context.local_observed_at
+    assert utc_context.platform_trade_date == shanghai_context.platform_trade_date
+    assert utc_context.seller_operation_date == shanghai_context.seller_operation_date
+    assert utc_context.seller_phase is shanghai_context.seller_phase
+
+
+def test_operational_time_selects_policy_at_effective_boundary() -> None:
+    boundary = datetime(2026, 7, 29, 10, 0, tzinfo=timezone.utc)
+    policies = (
+        OperationalTimePolicy(
+            policy_version="V1",
+            effective_to=boundary,
+        ),
+        OperationalTimePolicy(
+            policy_version="V2",
+            platform_cutoff_local_time=time(17),
+            seller_cutoff_local_time=time(20),
+            peak_start_local_time=time(16),
+            effective_from=boundary,
+        ),
+    )
+    service = OperationalTimeService(policies=policies)
+
+    before = service.classify(
+        datetime(2026, 7, 29, 9, 59, 59, tzinfo=timezone.utc)
+    )
+    at_boundary = service.classify(boundary)
+
+    assert before.time_policy_version == "V1"
+    assert before.platform_trade_date == date(2026, 7, 29)
+    assert at_boundary.time_policy_version == "V2"
+    assert at_boundary.platform_trade_date == date(2026, 7, 30)
+    assert at_boundary.observed_at == boundary
+
+
+def test_operational_time_policy_registry_rejects_overlap() -> None:
+    with pytest.raises(ValueError, match="must not overlap"):
+        OperationalTimePolicyRegistry(
+            (
+                OperationalTimePolicy(policy_version="V1"),
+                OperationalTimePolicy(
+                    policy_version="V2",
+                    effective_from=datetime(
+                        2026,
+                        7,
+                        29,
+                        10,
+                        0,
+                        tzinfo=timezone.utc,
+                    ),
+                ),
+            )
+        )
 
 
 def test_operational_time_rejects_naive_datetime() -> None:

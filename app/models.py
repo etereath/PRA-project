@@ -339,7 +339,7 @@ class Task:
     result_message: str = ""
     required_by: datetime | None = None
     trade_date: date | None = None
-    origin_type: TaskOriginType = TaskOriginType.MANUAL
+    origin_type: TaskOriginType = field(kw_only=True)
     origin_ref_id: str | None = None
     approval_policy: str = "UNSPECIFIED"
     policy_version: str | None = None

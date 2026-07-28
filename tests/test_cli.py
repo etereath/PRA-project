@@ -10,7 +10,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.cli import main
-from app.enums import NotificationOutboxStatus, ReviewTaskStatus, TaskActionType, TaskStatus
+from app.enums import (
+    NotificationOutboxStatus,
+    ReviewTaskStatus,
+    TaskActionType,
+    TaskOriginType,
+    TaskStatus,
+)
 from app.models import ReviewTask, Task
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.runtime import ReviewTaskService, RuntimeTaskService
@@ -25,6 +31,7 @@ def _runtime_task(task_id: str, *, status: TaskStatus = TaskStatus.MANUAL_REVIEW
         priority=2,
         task_status=status,
         created_at=datetime(2026, 5, 4, 9, 0),
+        origin_type=TaskOriginType.MANUAL,
         trade_date=datetime(2026, 5, 4).date(),
         scope_type="global",
         scope_key="2026-05-04",
