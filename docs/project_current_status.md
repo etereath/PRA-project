@@ -8,13 +8,20 @@ PRA 当前定位为：
 
 鲜切花预测性销售决策系统 + 运行态任务运营后台。
 
-PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、多商品、受控 RPA 改价闭环；当前仍不承诺生产级无人值守调度，也未扩展到第二平台。系统核心职责是：
+PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、多商品、受控 RPA 改价与上下架闭环；任务 13.5 已插入任务 13 与任务 14 之间，用于补齐 18:00 平台交易日/20:00 卖家作业日双时间轴、持续只读扫描、历史订单观察、销售日结、S0–S4 异常治理、任务来源对齐、受控紧急保护和运营 Web 重写。当前已进入 13.5-0 基线冻结和审计准备，尚未提交 13.5 Schema 或业务实现，因此仍不承诺生产级无人值守写操作，也未扩展到第二平台。系统核心职责是：
 
 - 从 Excel 读取业务输入。
 - 根据规则和预测输入生成运行态任务。
 - 用 SQLite 保存运行态事实。
 - 通过 Web 后台、Mobile Review 和飞书通知完成运营复核闭环。
 - 为后续生产级真实平台调度、真实 RPA 和 AI Agent 预留边界。
+
+任务 13.5 的宏观权威是 [GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20)；
+[对齐评估](plans/task13_5_issue20_alignment_review.md)记录了其与本地计划的裁决，
+[本地实施计划](plans/task13_5_operational_closed_loop_and_web_rewrite.md)和
+[Web 重写计划](plans/task13_5_web_rewrite_plan.md)负责仓库内的具体落地；
+[13.5-0 开工基线](plans/task13_5_0_kickoff_baseline.md)和
+[Web 独立审计](plans/task13_5_web_current_state_audit_20260729.md)记录正式开工证据。
 
 ## 2. 当前已完成能力
 
@@ -199,6 +206,14 @@ SQLite 只承接运行态任务系统，不替代 Excel 主数据。
 - 最终暖态四商品实机批次 `BATCH-T12-WARM-FAST-PATH-20260723-01` 为 4/4 `VERIFIED`，总用时 `51.094 秒`。
 - READ_ONLY 完整页面结束判定样本 `ATTEMPT-PLATFORM-ENDMARKER-READONLY-20260722-01` 为 1 页、1 次扫描、0 次滚动、`27.445 秒`。
 
+13.5-0 于 2026-07-29 首次只读审计发现生命周期、心跳与部署 hash 不一致；随后已按
+停机与编辑器关闭门禁完成 4 个差异文件备份和官方同步，6 个受控部署文件全部
+`CURRENT`，部署验证通过。应用从列表重启后 Worker 保持新鲜 `RUNNING`。部署后
+`ATTEMPT-POST-DEPLOY-READONLY-20260729-03` 完整扫描“上架中/待上架”，结果、
+快照、ACK 与 Runtime DB 回读均为 `VERIFIED`，副作用为 `NOT_STARTED`，队列已
+清空。此前两次失败发生在用户确认的特殊页面状态，不定性为已确认选择器漂移。详情见
+[13.5-0 开工基线](plans/task13_5_0_kickoff_baseline.md)。
+
 历史垂直切片、故障注入和运维验证仍作为当前安全边界的基础：
 - 已完成文件队列真实 `READ_ONLY -> FILL_PREVIEW -> 后置 READ_ONLY` 验收：实际旧价 `9.80`，预览目标和输入回读均为 `10.30`，取消后列表实际价仍为 `9.80`；请求、结果、phase、数据库、执行日志和共享证据 SHA-256 均通过自动校验。
 - 已新增 `scripts/verify_shadowbot_filequeue_acceptance.py`；当时的单商品验收流程已移入 [archive/shadowbot_pre_task12/shadowbot_filequeue_real_machine_acceptance.md](archive/shadowbot_pre_task12/shadowbot_filequeue_real_machine_acceptance.md)。
@@ -222,7 +237,7 @@ SQLite 只承接运行态任务系统，不替代 Excel 主数据。
 - 已新增 `check-yingdao-app-params` 只读预检命令，可在真实启动前确认影刀应用已暴露 `request_json` 入参和 `shadowbot_result_json` 出参。
 - 已新增 `scripts/check_shadowbot_readiness.py` 离线就绪检查命令，可在真实启动前检查 runner、runtime DB 和必需环境变量；该命令不启动影刀、不访问影刀 OpenAPI，也不会输出密钥明文。
 - 已新增 `poll-yingdao-result` 桥接命令，可通过影刀 `job/query` 读取 `shadowbot_result_json` 出参并回写 PRA `execution_logs`、operation 和 task。
-- 当前项目不再使用环境变量 SKU/平台白名单；任务14完成前，production 入口只接受操作人员明确传入的一个或多个 `--task-id`，再校验这些任务仍为有效 `pending update_price`。`pending` 只是候选状态，不能由调度器自动解释为执行授权。明确选择后的批次由 v4 批次/逐项哈希、单 Worker 多商品严格串行、旧价门禁和可对账状态机共同约束。
+- 当前项目不再使用环境变量 SKU/平台白名单；现有普通 production 入口只接受操作人员明确传入的一个或多个 `--task-id`，再校验这些任务仍为有效 `pending update_price`。`pending` 只是候选状态，不能由调度器自动解释为执行授权。任务 13.5 未来允许的 `SYSTEM_EMERGENCY` 必须走独立版本化策略、二次观察和明确 `SET_OFFLINE` 任务，不改变当前入口事实。明确选择后的批次由 v4 批次/逐项哈希、单 Worker 多商品严格串行、旧价门禁和可对账状态机共同约束。
 - 已新增 `scripts/prepare_shadowbot_e2e_chain.py`，可一键准备首条 `update_price` task、approved review、批准载荷 hash，并在显式 `--start` 时调用 Executor 启动 `COMMIT`。
 - 已新增 `scripts/run_shadowbot_e2e_local_demo.py`，可在本地 runtime DB 中演练成功、提交前失败、提交后未知再对账三条结果分支，并通过 Web 执行日志查看字段、告警和证据链接。
 - 已新增 `scripts/run_shadowbot_executor.py` 桥接脚本，可从已批准 review 启动 ShadowBot 执行尝试，也可导入影刀结果 JSON 回灌 PRA 运行态。
@@ -269,7 +284,7 @@ Mock 平台测试流程在当前阶段作为本地验证链路：
 
 真实平台价格更新流程：
 
-1. 操作人员从任务中心明确选择同一平台的一个或多个 `update_price task_id`；任务14前禁止自动扫描并发布全部 pending。
+1. 普通改价由操作人员从任务中心明确选择同一平台的一个或多个 `update_price task_id`；任何阶段都禁止自动扫描并发布全部 pending。
 2. PRA 以 `products.xlsx` 将 SKU 唯一映射为页面商品名称和等级。
 3. 批次管线创建一个 v4 COMMIT 合同并原子发布一次。
 4. ShadowBot 读取当前页面、匹配全部目标并校验全部旧价。
@@ -441,17 +456,27 @@ UNKNOWN→唯一 RECONCILE 继续作为稳定基线。任务13的实现、受控
 
 Code Review 后的高中低风险问题已完成修复，系统冒烟测试、全量单元测试和主控端到端流程测试均已通过。修复详情见 [reports/risk_fix_report_20260610.md](reports/risk_fix_report_20260610.md)。
 
+13.5-0 准备阶段于 2026-07-29 在当前 main 新鲜复跑完整 pytest：
+`679 passed, 3 skipped, 97 subtests passed in 144.54s`。该结果证明当前代码回归通过，
+不代替后续 v14、Automation、订单、S4、Web 或实机验收。
+
 推荐顺序：
 
 1. 以 [reports/task13_final_handoff_20260727.md](reports/task13_final_handoff_20260727.md) 为任务13审查入口，复核四维状态模型、Runtime Schema v13、v5上下架流水线、运行边界和证据矩阵。
 2. 任务13独立 PR #19 的 COMMENT Review 修复、Windows Core 和 Linux Core 已通过；后续合并和任务状态仍由审查方处理。
-3. 任务14实现统一任务审查和正式调度授权；在此之前保持显式 `--task-id` 门禁，禁止无人值守扫描全部 pending 并自动发布。
-4. 任务12 PR #18 已合并；任务13也已完成 T13-0 页面探索、T13-1 合同、T13-2 Runtime Schema v13、独立两页 SYNC_STATUS、单商品状态往返、正常多商品严格串行上下架、整批预检异常零写、严格串行 UNKNOWN、最终确认点击后的 `UNKNOWN → 唯一自动 RECONCILE → VERIFIED` 和 `UNKNOWN → 唯一自动 RECONCILE → NOT_APPLIED`、`ALREADY_APPLIED` 0 写点击、跨动作共享写锁、phase/result 恢复、Web 运营投影、最终回归、PR #19 COMMENT Review 修复和双平台 CI。仓库内已保存脱敏证据、自然语言报告、数据库回读及 CI 复算入口；本轮文档整理不执行合并或任务状态变更。
-5. 补充长期告警、磁盘清理、证据保留和服务账号运维样本，并分别定义冷态/暖态性能指标。
-6. 继续运行系统冒烟、完整单元测试和 ShadowBot 成功基线测试，任何新功能不得重写已验证 COMMIT 动作链路。
-7. 基于自动规则评估框架继续规划上下架、冷库、包装产能等 evaluator，但保持 dry-run/apply 和 service 边界。
+3. 以 [GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20) 合并后的正文为
+   宏观权威，先按[13.5-0 开工基线](plans/task13_5_0_kickoff_baseline.md)完成评审：
+   当前 ShadowBot 生命周期、部署 hash 和部署后完整 READ_ONLY 基线已经收敛；六级
+   质量矩阵和日结状态机冻结前仍不提交 v14。
+4. 任务13.5通过验收后，任务14只进行多品种、多动作、异常恢复、正式授权和观察版本冻结的综合验收。普通写动作保持明确任务与授权；唯一自动写特例是验收后的版本化 `SYSTEM_EMERGENCY` 紧急下架。
+5. 任务12 PR #18 已合并；任务13也已完成 T13-0 页面探索、T13-1 合同、T13-2 Runtime Schema v13、独立两页 SYNC_STATUS、单商品状态往返、正常多商品严格串行上下架、整批预检异常零写、严格串行 UNKNOWN、最终确认点击后的 `UNKNOWN → 唯一自动 RECONCILE → VERIFIED` 和 `UNKNOWN → 唯一自动 RECONCILE → NOT_APPLIED`、`ALREADY_APPLIED` 0 写点击、跨动作共享写锁、phase/result 恢复、Web 运营投影、最终回归、PR #19 COMMENT Review 修复和双平台 CI。仓库内已保存脱敏证据、自然语言报告、数据库回读及 CI 复算入口；本轮文档整理不执行合并或任务状态变更。
+6. 继续运行系统冒烟、完整单元测试和 ShadowBot 成功基线测试，任务13.5不得重写已验证 COMMIT 动作链路。
+7. 基于自动规则评估框架继续完善上下架、冷库、包装产能等 evaluator，但保持 dry-run/apply 和 service 边界。
 8. AI Agent 自动决策应放在真实平台执行和运维边界通过更长期审查后再推进。
-9. 任务14及后续真实平台任务开始前，按[任务12—13复用路径与失败复盘](shadowbot_task12_task13_reusable_lessons.md)冻结黄金基线、最小差异、状态维度和禁止重写点。
+9. 13.5-0 已建立独立分支、黄金基线、脚本/路由盘点、禁止重写点、Web 独立审计、
+   验收清单和 main 回滚点；正式编码仍按
+   [任务12—13复用路径与失败复盘](shadowbot_task12_task13_reusable_lessons.md)
+   逐子 PR 建立最小差异和回归门禁。
 
 ## 9. 后续可复用资产
 

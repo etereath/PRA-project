@@ -1,5 +1,11 @@
 # Web 前端整体更新计划：PRA 运行态运营后台
 
+> 状态说明：本文保留早期 Web 刷新计划和各阶段落地记录。[GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20)
+> 是任务 13.5 的宏观权威，[任务 13.5 Web 主控端重写计划](plans/task13_5_web_rewrite_plan.md)
+> 是当前本地实施权威；本文中的历史范围、页面排列和阶段编号不得覆盖新的八入口运营
+> 信息架构。[2026-07-29 Web 现状独立审计](plans/task13_5_web_current_state_audit_20260729.md)
+> 是页面数量、尺寸、视口和 DOM 摘要的快照证据；这些数字不是长期常量。
+
 ## 1. 背景与目标
 
 当前 Web 页面起步于 Excel 原型验证阶段，主要围绕“校验 Excel、生成任务、模拟执行、人工介入、查看 SQLite 运行态”展开。
