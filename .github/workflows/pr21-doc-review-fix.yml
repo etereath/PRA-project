@@ -1,0 +1,136 @@
+name: Apply PR21 documentation review fixes
+
+on:
+  push:
+    branches:
+      - codex/task13-5-0-baseline-and-inventory
+
+permissions:
+  contents: write
+
+jobs:
+  apply-fixes:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/task13-5-0-baseline-and-inventory
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Apply exact documentation fixes
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace_once(text: str, old: str, new: str, label: str) -> str:
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{label}: expected exactly one match, found {count}")
+              return text.replace(old, new, 1)
+
+          agents_path = Path("AGENTS.md")
+          agents = agents_path.read_text(encoding="utf-8")
+          agents = replace_once(
+              agents,
+              "- S4 不在 13.5-1 或核心 v14 中冻结最终策略，但不得移出任务 13.5：必须在\n  13.5-6 先完成 Incident 人工闭环，再依据真实数据冻结策略、迁移正式结构并实现\n  受控自动紧急下架。",
+              "- S4 不在 13.5-1 或核心 v14 中冻结最终策略，但不得移出任务 13.5：必须在\n  13.5-6 先完成 Incident 人工闭环，再依据真实数据冻结策略、迁移正式结构并实现\n  受控自动紧急下架。\n- 当前自动紧急下架必须保持禁用：`automatic_emergency_offline=false`。在 13.5-6\n  完成人工 Incident 闭环、策略评审、策略结构迁移、实机验收并由管理员显式启用前，\n  任何 Agent、Web、Scheduler 或脚本都不得创建或执行 `SYSTEM_EMERGENCY` 自动下架。",
+              "AGENTS S4 disabled gate",
+          )
+          agents = replace_once(
+              agents,
+              "- 任务 13.5 允许唯一的受控无人值守写动作：满足版本化 S4 策略、等待一个完整 `ONLINE_PULSE`、二次读取、人工干预检查和全部禁止条件后的 `SYSTEM_EMERGENCY` 紧急下架。它必须创建明确授权和单一 `SET_OFFLINE` 任务，复用 v5、Importer、写锁和唯一 RECONCILE，且不得自动重新上架。",
+              "- 任务 13.5 规划中的唯一无人值守写动作是受控 `SYSTEM_EMERGENCY` 紧急下架；当前必须保持禁用。只有在 13.5-6 完成人工 Incident 闭环、策略评审、策略结构迁移、实机验收并由管理员显式启用后，才允许按照版本化 S4 策略、一个完整 `ONLINE_PULSE` 等待周期、二次读取、人工干预检查和全部禁止条件创建明确授权与单一 `SET_OFFLINE` 任务。该动作必须复用 v5、Importer、写锁和唯一 RECONCILE，且不得自动重新上架。",
+              "AGENTS future emergency wording",
+          )
+          agents = replace_once(
+              agents,
+              "- AI 自动定价、AI 自动审批、扫描全部 `pending` 或普通业务任务自动发起 COMMIT；版本化 `SYSTEM_EMERGENCY` 是唯一例外。",
+              "- AI 自动定价、AI 自动审批、扫描全部 `pending` 或普通业务任务自动发起 COMMIT；尚未通过 13.5-6 启用门禁的 `SYSTEM_EMERGENCY` 也不得执行。",
+              "AGENTS current out-of-scope gate",
+          )
+          agents_path.write_text(agents, encoding="utf-8", newline="\n")
+
+          plan_path = Path("docs/plans/task13_5_operational_closed_loop_and_web_rewrite.md")
+          plan = plan_path.read_text(encoding="utf-8")
+          plan = replace_once(
+              plan,
+              "- 实际价格变化。\n- 平台库存变化。\n- 上架状态变化。\n- 商品消失、重复身份或页面读取不完整。\n- 上次成功观察时间是否过旧。",
+              "- 实际价格变化。\n- 平台库存变化。\n- 已映射目标本轮未观察到、重复身份或页面读取不完整。\n- 上次成功观察时间是否过旧。\n\n未观察到商品只表示 `NOT_OBSERVED / UNKNOWN` 或扫描异常，不能推断为待上架、下架或不存在。",
+              "ONLINE_PULSE observation scope",
+          )
+          plan = replace_once(
+              plan,
+              "- 扫描结果必须带父快照、页面范围、起止时间、完整性和证据绑定。\n- 只在完整性门禁通过后更新当前状态投影；失败快照保留，但不能覆盖最后一个可信快照。\n- 连续无变化可以保存摘要和内容哈希，避免重复保存大体积相同证据。",
+              "- 扫描结果必须带父快照、页面范围、起止时间、完整性和证据绑定。\n- 小扫描只写入正向 `ONLINE` 观察；未出现商品不得改变完整 `listing_location`。\n- 只有完整两页 `LISTING_STATUS_SCAN` 可以更新完整位置事实。\n- 只在完整性门禁通过后更新本轮正向观察投影；失败快照保留，但不能覆盖最后一个可信快照。\n- 连续无变化可以保存摘要和内容哈希，避免重复保存大体积相同证据。",
+              "ONLINE_PULSE projection boundary",
+          )
+          plan = replace_once(
+              plan,
+              "- 18:00 前后分别执行完整扫描，用相邻观察证明交易日边界；跨界记录按 `observed_at`\n  单条归属。",
+              "- 18:00 前执行 `PRE_CUTOFF_FULL_SCAN`，18:00 后执行 `POST_CUTOFF_PULSE`；\n  用相邻观察证明交易日边界，跨界记录按 `observed_at` 单条归属。",
+              "18:00 scan contract",
+          )
+          plan = replace_once(
+              plan,
+              "| `S1` | `LOW` | 进入待办，可在预算内安全重试 |\n| `S2` | `MEDIUM` | 创建明确处置项并跟踪恢复 |\n| `S3` | `HIGH` | 通知并默认每 10 分钟重复提醒，直到确认或降级 |",
+              "| `S1` | `LOW` | 日报汇总 |\n| `S2` | `MEDIUM` | 首次提醒；未解决时按较长周期提醒 |\n| `S3` | `HIGH` | 立即通知并默认每 10 分钟重复提醒，直到介入或解决 |",
+              "severity matrix",
+          )
+          plan = replace_once(
+              plan,
+              "3. 策略结构完成迁移、管理员预审批并启用后，才允许编码和开放自动保护。",
+              "3. 策略结构完成迁移、管理员预审批并启用后，才允许编码和开放自动保护。\n\n在上述门禁全部完成前，`automatic_emergency_offline=false`，任何 Agent、Web、Scheduler\n或脚本都不得创建或执行 `SYSTEM_EMERGENCY` 自动下架。",
+              "operational S4 disabled gate",
+          )
+          plan_path.write_text(plan, encoding="utf-8", newline="\n")
+
+          workflow_path = Path(".github/workflows/pr21-doc-review-fix.yml")
+          if workflow_path.exists():
+              workflow_path.unlink()
+          PY
+
+      - name: Verify exact fixes and clean diff
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          agents = Path("AGENTS.md").read_text(encoding="utf-8")
+          plan = Path("docs/plans/task13_5_operational_closed_loop_and_web_rewrite.md").read_text(encoding="utf-8")
+          required = [
+              "automatic_emergency_offline=false",
+              "任何 Agent、Web、Scheduler 或脚本都不得创建或执行 `SYSTEM_EMERGENCY` 自动下架",
+              "未观察到商品只表示 `NOT_OBSERVED / UNKNOWN` 或扫描异常",
+              "只有完整两页 `LISTING_STATUS_SCAN` 可以更新完整位置事实",
+              "18:00 前执行 `PRE_CUTOFF_FULL_SCAN`，18:00 后执行 `POST_CUTOFF_PULSE`",
+              "| `S1` | `LOW` | 日报汇总 |",
+              "| `S2` | `MEDIUM` | 首次提醒；未解决时按较长周期提醒 |",
+          ]
+          joined = agents + "\n" + plan
+          missing = [item for item in required if item not in joined]
+          if missing:
+              raise SystemExit(f"missing expected fixes: {missing}")
+          forbidden = [
+              "- 上架状态变化。",
+              "18:00 前后分别执行完整扫描",
+              "| `S1` | `LOW` | 进入待办，可在预算内安全重试 |",
+              "| `S2` | `MEDIUM` | 创建明确处置项并跟踪恢复 |",
+          ]
+          present = [item for item in forbidden if item in joined]
+          if present:
+              raise SystemExit(f"stale conflicting text remains: {present}")
+          PY
+          git diff --check
+
+      - name: Commit fixes to PR branch
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add AGENTS.md docs/plans/task13_5_operational_closed_loop_and_web_rewrite.md .github/workflows/pr21-doc-review-fix.yml
+          git commit -m "docs: resolve PR21 review findings"
+          git push origin HEAD:codex/task13-5-0-baseline-and-inventory
