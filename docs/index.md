@@ -11,6 +11,7 @@
 - [reports/task13_final_handoff_20260727.md](reports/task13_final_handoff_20260727.md)：任务13当前实现、四维状态模型、v5上下架合同、实机证据、运行边界和审查步骤的最终交接入口。
 - [plans/task13_5_issue20_alignment_review.md](plans/task13_5_issue20_alignment_review.md)：GitHub Issue #20 与本地任务13.5计划的权威层级、差异裁决、Web实测补充和任务14新边界。
 - [plans/task13_5_0_kickoff_baseline.md](plans/task13_5_0_kickoff_baseline.md)：任务13.5-0 的 main/Schema/Worker/证据黄金基线、部署后完整 READ_ONLY、全脚本分类、禁止重写资产、合同草案、子PR顺序、验收清单和回滚点。
+- [plans/task13_5_1_quality_and_settlement_contract_review.md](plans/task13_5_1_quality_and_settlement_contract_review.md)：任务13.5-1 双时间轴、三个正交维度、六级数据质量、唯一 FINAL 日结状态机、v14 最小结构及迁移回滚的正式评审稿；冻结前不授权编码。
 - [plans/task13_5_operational_closed_loop_and_web_rewrite.md](plans/task13_5_operational_closed_loop_and_web_rewrite.md)：任务13.5双时间轴、自动扫描、历史订单观察、销售日结、S0–S4、受控紧急保护、任务来源对齐和Web主控重写实施计划。
 - [plans/task13_5_web_current_state_audit_20260729.md](plans/task13_5_web_current_state_audit_20260729.md)：带精确时间、main SHA、Runtime DB脱敏快照、浏览器/视口/角色、路由、页面规模和DOM hash的独立Web现状审计。
 - [reports/task12_review_remediation_20260723.md](reports/task12_review_remediation_20260723.md)：针对任务12审查问题的接续修复记录；以该文档说明 v12 合同、原子导入和待补实机证据，不覆盖原交接报告。

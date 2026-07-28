@@ -2,8 +2,9 @@
 
 - 计划日期：2026-07-28；按父 Issue 合并正文修订于 2026-07-29
 - 插入位置：任务 13 完成后、任务 14 开始前
-- 当前状态：13.5-0 独立分支已建立，黄金基线、部署 hash 和部署后 READ_ONLY 已收敛；
-  正式实现前等待文档 PR 与 13.5-1 合同评审
+- 当前状态：13.5-0 已通过 PR #21 合并；13.5-1
+  [双时间轴、质量与日结合同评审稿](task13_5_1_quality_and_settlement_contract_review.md)
+  已建立，评审冻结前不提交 v14 迁移或业务代码
 - 适用对象：PRA Web 主控端、SQLite 运行态、自动化服务、ShadowBot 单平台执行端
 - 宏观权威：[GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20)
 - 对齐评估：[Issue #20 与本地实施计划对齐评估](task13_5_issue20_alignment_review.md)
