@@ -8,7 +8,7 @@ PRA 当前定位为：
 
 鲜切花预测性销售决策系统 + 运行态任务运营后台。
 
-PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、多商品、受控 RPA 改价与上下架闭环；任务 13.5 已插入任务 13 与任务 14 之间，用于补齐 18:00 平台交易日/20:00 卖家作业日双时间轴、持续只读扫描、历史订单观察、销售日结、S0–S4 异常治理、任务来源对齐、受控紧急保护和运营 Web 重写。当前已进入 13.5-0 基线冻结和审计准备，尚未提交 13.5 Schema 或业务实现，因此仍不承诺生产级无人值守写操作，也未扩展到第二平台。系统核心职责是：
+PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、多商品、受控 RPA 改价与上下架闭环；任务 13.5 已插入任务 13 与任务 14 之间，用于补齐 18:00 平台交易日/20:00 卖家作业日双时间轴、持续只读扫描、历史订单观察、销售日结、S0–S4 异常治理、任务来源对齐、受控紧急保护和运营 Web 重写。当前 13.5-1 已在独立分支完成双时间轴、Runtime Schema v14、六级质量约束和日结状态机的本地实现与验收；真实 Runtime DB 尚未迁移，13.5-2 扫描闭环也尚未开始，因此仍不承诺生产级无人值守写操作，也未扩展到第二平台。系统核心职责是：
 
 - 从 Excel 读取业务输入。
 - 根据规则和预测输入生成运行态任务。
@@ -23,8 +23,9 @@ PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、�
 [13.5-0 开工基线](plans/task13_5_0_kickoff_baseline.md)和
 [Web 独立审计](plans/task13_5_web_current_state_audit_20260729.md)记录正式开工证据。
 [13.5-1 冻结合同](plans/task13_5_1_quality_and_settlement_contract_review.md)已经冻结
-双时间轴、六级质量、唯一 FINAL 日结状态机和 v14 兼容边界；现在可以在合同范围内
-开始 13.5-1 迁移编码。
+双时间轴、六级质量、唯一 FINAL 日结状态机和 v14 兼容边界；
+[v14 实施报告](reports/task13_5_1_runtime_schema_v14.md)记录本地代码与临时数据库
+验收结果，[迁移手册](runtime_schema_v14_migration.md)负责后续真实库升级。
 
 ## 2. 当前已完成能力
 
@@ -77,7 +78,7 @@ SQLite 当前保存以下运行态表：
 
 SQLite 只承接运行态任务系统，不替代 Excel 主数据。
 
-当前 runtime schema 最新版本为 v13。v3 新增自动规则评估运行记录，v4 新增 ShadowBot Executor 账本，v5 新增队列审计字段和 `retry_authorizations`，v6 新增事务型通知 Outbox，v7-v9 建立 `listing_status` 并将业务身份统一为“平台 + 品种 + 等级”，v10 将 `tasks.expected_old_price` 结构化，v11 新增单次请求的 `shadowbot_commit_batches` 和 `shadowbot_commit_batch_items`，v12 新增逐商品操作/尝试身份、活动写锁、观察时间和持久化结果回执，v13 新增公共批次注册表、通用上下架 operation、共享写锁、v5 动作账本、两页快照和页面异常事实表。`app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION` 是唯一版本权威来源。
+当前代码中的 runtime schema 最新版本为 v14。v3 新增自动规则评估运行记录，v4 新增 ShadowBot Executor 账本，v5 新增队列审计字段和 `retry_authorizations`，v6 新增事务型通知 Outbox，v7-v9 建立 `listing_status` 并将业务身份统一为“平台 + 品种 + 等级”，v10 将 `tasks.expected_old_price` 结构化，v11 新增单次请求的 `shadowbot_commit_batches` 和 `shadowbot_commit_batch_items`，v12 新增逐商品操作/尝试身份、活动写锁、观察时间和持久化结果回执，v13 新增公共批次注册表、通用上下架 operation、共享写锁、v5 动作账本、两页快照和页面异常事实表，v14 新增双时间轴、Automation、不可变观察、日结、Incident 和任务来源结构。真实 Runtime DB 是否已升级必须单独核实；`app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION` 是代码版本唯一权威来源。
 
 ### 2.3 人工复核闭环
 

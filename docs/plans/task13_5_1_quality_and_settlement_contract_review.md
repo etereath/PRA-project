@@ -575,3 +575,11 @@ LEGACY
 7. 更新后的 Schema 报告、迁移运行手册和 13.5-2 输入合同。
 
 上述出口不包含 Scheduler、订单实机采集、销售估算算法、S4 自动保护或 Web 重写。
+
+实施记录（2026-07-29）：
+
+- [x] 第 1 至 5 项已在本地分支完成。
+- [x] 临时数据库 smoke、完整 pytest、Windows 本地验证和 wheel 验证通过。
+- [ ] Linux CI 等待分支推送后的 GitHub Actions。
+- [x] v14 Schema 报告、迁移运行手册和 13.5-2 输入合同已更新。
+- [x] 真实 Runtime DB、ShadowBot Worker 和平台业务均未在本轮变更。

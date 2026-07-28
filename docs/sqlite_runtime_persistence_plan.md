@@ -56,7 +56,7 @@
 
 - `schema_version = 1..13` 连续记录
 
-当前最新 runtime schema 要求为 v13，权威常量为 `app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION`。v7-v9 增加并规范化 `listing_status`，v10 将 `tasks.expected_old_price` 结构化，v11 增加单次请求的 ShadowBot COMMIT 批次和逐商品账本，v12 增加逐商品 operation/attempt、写锁和结果回执，v13 增加公共批次注册表、上下架 operation、v5 动作账本、两页快照和页面异常。
+当前代码最新 runtime schema 要求为 v14，权威常量为 `app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION`。v7-v9 增加并规范化 `listing_status`，v10 将 `tasks.expected_old_price` 结构化，v11 增加单次请求的 ShadowBot COMMIT 批次和逐商品账本，v12 增加逐商品 operation/attempt、写锁和结果回执，v13 增加公共批次注册表、上下架 operation、v5 动作账本、两页快照和页面异常，v14 增加双时间轴、Automation 运行账本、不可变商品/订单观察、销售估算、平台交易日日结、Incident 和任务来源字段。真实 Runtime DB 需按迁移手册单独升级。
 
 v5 migration 除了 ShadowBot 队列审计列外，还创建 `retry_authorizations` 持久化结构。该表包含
 `retry_authorization_id`、`operation_id`、`source_execution_attempt_id`、授权/证据字段、
