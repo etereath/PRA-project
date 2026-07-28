@@ -122,6 +122,50 @@ class TradePhase(str, Enum):
     CLOSED = "closed"
 
 
+class SellerPhase(str, Enum):
+    """Operational phase on the seller's 20:00-to-20:00 work day."""
+
+    NORMAL_SALES = "NORMAL_SALES"
+    PEAK_SALES = "PEAK_SALES"
+    DELIVERY_OVERLAP = "DELIVERY_OVERLAP"
+
+
+class FactSource(str, Enum):
+    """How an accepted sales fact was obtained."""
+
+    ORDER_OBSERVED = "ORDER_OBSERVED"
+    SCAN_ESTIMATED = "SCAN_ESTIMATED"
+
+
+class DataQualityLevel(str, Enum):
+    """Frozen six-level sales data quality vocabulary."""
+
+    ORDER_COMPLETE = "ORDER_COMPLETE"
+    ORDER_PARTIAL = "ORDER_PARTIAL"
+    SCAN_ESTIMATED_HIGH = "SCAN_ESTIMATED_HIGH"
+    SCAN_ESTIMATED_MEDIUM = "SCAN_ESTIMATED_MEDIUM"
+    SCAN_ESTIMATED_LOW = "SCAN_ESTIMATED_LOW"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+class SummaryStatus(str, Enum):
+    """Single forward-only platform trade-day summary lifecycle."""
+
+    PROVISIONAL = "PROVISIONAL"
+    OBSERVED = "OBSERVED"
+    RECONCILED = "RECONCILED"
+    FINAL = "FINAL"
+
+
+class TaskOriginType(str, Enum):
+    """Origin boundary for manual, automation, and future emergency tasks."""
+
+    MANUAL = "MANUAL"
+    AUTOMATION = "AUTOMATION"
+    SYSTEM_EMERGENCY = "SYSTEM_EMERGENCY"
+    LEGACY = "LEGACY"
+
+
 class ShortageRisk(str, Enum):
     LOW = "low"
     MANAGEABLE = "manageable"

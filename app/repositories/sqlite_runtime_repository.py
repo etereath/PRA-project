@@ -12,7 +12,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from uuid import uuid4
 
-from app.enums import PricingSource, ReviewTaskStatus, TaskActionType, TaskStatus
+from app.enums import (
+    PricingSource,
+    ReviewTaskStatus,
+    SellerPhase,
+    TaskActionType,
+    TaskOriginType,
+    TaskStatus,
+)
 from app.exceptions import (
     MobileReviewErrorCode,
     MobileReviewTransactionError,
@@ -979,6 +986,602 @@ SCHEMA_V13_SQL = [
     """,
 ]
 
+SCHEMA_V14_SQL = [
+    """
+    CREATE TABLE IF NOT EXISTS operational_time_policies (
+        policy_version TEXT PRIMARY KEY,
+        timezone_name TEXT NOT NULL,
+        platform_cutoff_local_time TEXT NOT NULL,
+        seller_cutoff_local_time TEXT NOT NULL,
+        peak_start_local_time TEXT NOT NULL,
+        effective_from TEXT NOT NULL,
+        effective_to TEXT,
+        created_at TEXT NOT NULL,
+        created_by TEXT NOT NULL,
+        supersedes_policy_version TEXT,
+        CHECK (policy_version <> ''),
+        CHECK (timezone_name <> ''),
+        CHECK (
+            effective_to IS NULL OR effective_to > effective_from
+        ),
+        FOREIGN KEY(supersedes_policy_version)
+            REFERENCES operational_time_policies(policy_version)
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_operational_time_policies_current
+    ON operational_time_policies(timezone_name)
+    WHERE effective_to IS NULL
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS automation_jobs (
+        job_id TEXT PRIMARY KEY,
+        job_type TEXT NOT NULL,
+        display_name TEXT NOT NULL,
+        enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+        schedule_kind TEXT NOT NULL,
+        schedule_expression TEXT NOT NULL,
+        priority INTEGER NOT NULL DEFAULT 100,
+        config_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK (job_id <> ''),
+        CHECK (job_type <> ''),
+        CHECK (schedule_kind <> '')
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_automation_jobs_type_enabled
+    ON automation_jobs(job_type, enabled)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS automation_runs (
+        run_id TEXT PRIMARY KEY,
+        job_id TEXT NOT NULL,
+        job_type TEXT NOT NULL,
+        logical_run_key TEXT NOT NULL,
+        run_status TEXT NOT NULL CHECK (run_status IN (
+            'SCHEDULED', 'RUNNING', 'SUCCEEDED', 'PARTIAL',
+            'FAILED', 'MISSED', 'CANCELLED'
+        )),
+        platform_name TEXT NOT NULL,
+        platform_trade_date TEXT NOT NULL,
+        seller_operation_date TEXT NOT NULL,
+        seller_phase TEXT NOT NULL CHECK (seller_phase IN (
+            'NORMAL_SALES', 'PEAK_SALES', 'DELIVERY_OVERLAP'
+        )),
+        time_policy_version TEXT NOT NULL,
+        scheduled_for TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT,
+        lease_owner TEXT NOT NULL DEFAULT '',
+        lease_version INTEGER NOT NULL DEFAULT 0 CHECK (lease_version >= 0),
+        lease_expires_at TEXT,
+        input_manifest_sha256 TEXT NOT NULL DEFAULT '',
+        output_manifest_sha256 TEXT NOT NULL DEFAULT '',
+        error_code TEXT NOT NULL DEFAULT '',
+        error_message TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY(job_id) REFERENCES automation_jobs(job_id),
+        FOREIGN KEY(time_policy_version)
+            REFERENCES operational_time_policies(policy_version)
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_automation_runs_logical_key
+    ON automation_runs(logical_run_key)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_automation_runs_status_scheduled
+    ON automation_runs(run_status, scheduled_for)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS automation_run_events (
+        event_id TEXT PRIMARY KEY,
+        run_id TEXT NOT NULL,
+        event_type TEXT NOT NULL,
+        from_status TEXT,
+        to_status TEXT,
+        payload_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(run_id) REFERENCES automation_runs(run_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_automation_run_events_run
+    ON automation_run_events(run_id, created_at)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS automation_run_links (
+        parent_run_id TEXT NOT NULL,
+        child_run_id TEXT NOT NULL,
+        relation_type TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(parent_run_id, child_run_id, relation_type),
+        CHECK (parent_run_id <> child_run_id),
+        FOREIGN KEY(parent_run_id) REFERENCES automation_runs(run_id),
+        FOREIGN KEY(child_run_id) REFERENCES automation_runs(run_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_automation_run_links_child
+    ON automation_run_links(child_run_id, relation_type)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS product_observation_batches (
+        observation_batch_id TEXT PRIMARY KEY,
+        automation_run_id TEXT NOT NULL,
+        platform_name TEXT NOT NULL,
+        scan_type TEXT NOT NULL,
+        batch_status TEXT NOT NULL CHECK (batch_status IN (
+            'ACCEPTED', 'PARTIAL', 'UNAVAILABLE', 'FAILED'
+        )),
+        scan_started_at TEXT NOT NULL,
+        scan_completed_at TEXT NOT NULL,
+        requested_scope_json TEXT NOT NULL DEFAULT '{}',
+        scope_complete INTEGER NOT NULL CHECK (scope_complete IN (0, 1)),
+        end_marker_verified INTEGER NOT NULL CHECK (
+            end_marker_verified IN (0, 1)
+        ),
+        content_sha256 TEXT NOT NULL,
+        time_policy_version TEXT NOT NULL,
+        error_code TEXT NOT NULL DEFAULT '',
+        error_message TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(automation_run_id) REFERENCES automation_runs(run_id),
+        FOREIGN KEY(time_policy_version)
+            REFERENCES operational_time_policies(policy_version)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_product_observation_batches_run
+    ON product_observation_batches(automation_run_id)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS product_observation_items (
+        observation_item_id TEXT PRIMARY KEY,
+        observation_batch_id TEXT NOT NULL,
+        internal_sku TEXT,
+        platform_product_name TEXT NOT NULL,
+        grade TEXT NOT NULL,
+        observed_price TEXT,
+        observed_inventory INTEGER CHECK (
+            observed_inventory IS NULL OR observed_inventory >= 0
+        ),
+        observed_online INTEGER NOT NULL CHECK (observed_online IN (0, 1)),
+        observed_at TEXT NOT NULL,
+        platform_trade_date TEXT NOT NULL,
+        seller_operation_date TEXT NOT NULL,
+        seller_phase TEXT NOT NULL CHECK (seller_phase IN (
+            'NORMAL_SALES', 'PEAK_SALES', 'DELIVERY_OVERLAP'
+        )),
+        page_identity_key TEXT NOT NULL,
+        mapping_status TEXT NOT NULL CHECK (mapping_status IN (
+            'VERIFIED', 'UNMAPPED', 'AMBIGUOUS', 'DISABLED'
+        )),
+        mapping_version TEXT NOT NULL DEFAULT '',
+        evidence_sha256 TEXT NOT NULL DEFAULT '',
+        FOREIGN KEY(observation_batch_id)
+            REFERENCES product_observation_batches(observation_batch_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_product_observation_items_batch
+    ON product_observation_items(observation_batch_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_product_observation_items_sku_trade_date
+    ON product_observation_items(
+        internal_sku, platform_trade_date, observed_at
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS order_observation_batches (
+        observation_batch_id TEXT PRIMARY KEY,
+        automation_run_id TEXT NOT NULL,
+        platform_name TEXT NOT NULL,
+        requested_platform_trade_date TEXT NOT NULL,
+        capability_result TEXT NOT NULL CHECK (capability_result IN (
+            'SUCCEEDED', 'UNSUPPORTED', 'UNAVAILABLE', 'FAILED'
+        )),
+        batch_status TEXT NOT NULL CHECK (batch_status IN (
+            'ACCEPTED', 'PARTIAL', 'UNAVAILABLE', 'FAILED'
+        )),
+        scan_started_at TEXT NOT NULL,
+        scan_completed_at TEXT NOT NULL,
+        requested_range_json TEXT NOT NULL DEFAULT '{}',
+        scope_complete INTEGER NOT NULL CHECK (scope_complete IN (0, 1)),
+        end_marker_verified INTEGER NOT NULL CHECK (
+            end_marker_verified IN (0, 1)
+        ),
+        content_sha256 TEXT NOT NULL,
+        time_policy_version TEXT NOT NULL,
+        error_code TEXT NOT NULL DEFAULT '',
+        error_message TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(automation_run_id) REFERENCES automation_runs(run_id),
+        FOREIGN KEY(time_policy_version)
+            REFERENCES operational_time_policies(policy_version)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_order_observation_batches_run
+    ON order_observation_batches(automation_run_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_order_observation_batches_trade_date
+    ON order_observation_batches(
+        platform_name, requested_platform_trade_date, scan_completed_at
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS order_observation_items (
+        observation_item_id TEXT PRIMARY KEY,
+        observation_batch_id TEXT NOT NULL,
+        platform_trade_date TEXT NOT NULL,
+        platform_product_name TEXT NOT NULL,
+        grade TEXT NOT NULL,
+        internal_sku TEXT,
+        mapping_status TEXT NOT NULL CHECK (mapping_status IN (
+            'VERIFIED', 'UNMAPPED', 'AMBIGUOUS', 'DISABLED'
+        )),
+        mapping_version TEXT NOT NULL DEFAULT '',
+        order_created_at TEXT NOT NULL,
+        ordered_qty INTEGER NOT NULL CHECK (ordered_qty >= 0),
+        effective_qty INTEGER CHECK (
+            effective_qty IS NULL OR effective_qty >= 0
+        ),
+        cancelled_qty INTEGER CHECK (
+            cancelled_qty IS NULL OR cancelled_qty >= 0
+        ),
+        cancellation_derivation_method TEXT NOT NULL DEFAULT '',
+        seller_received_amount TEXT,
+        purchase_sequence INTEGER CHECK (
+            purchase_sequence IS NULL OR purchase_sequence > 0
+        ),
+        observed_at TEXT NOT NULL,
+        seller_operation_date TEXT NOT NULL,
+        seller_phase TEXT NOT NULL CHECK (seller_phase IN (
+            'NORMAL_SALES', 'PEAK_SALES', 'DELIVERY_OVERLAP'
+        )),
+        source_row_fingerprint TEXT NOT NULL,
+        occurrence_no INTEGER NOT NULL CHECK (occurrence_no > 0),
+        raw_observation_sha256 TEXT NOT NULL,
+        FOREIGN KEY(observation_batch_id)
+            REFERENCES order_observation_batches(observation_batch_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_order_observation_items_batch
+    ON order_observation_items(observation_batch_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_order_observation_items_trade_date
+    ON order_observation_items(
+        platform_trade_date, internal_sku, order_created_at
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS sales_estimate_segments (
+        estimate_segment_id TEXT PRIMARY KEY,
+        platform_name TEXT NOT NULL,
+        internal_sku TEXT NOT NULL,
+        platform_trade_date TEXT NOT NULL,
+        interval_started_at TEXT NOT NULL,
+        interval_ended_at TEXT NOT NULL,
+        inventory_before INTEGER NOT NULL CHECK (inventory_before >= 0),
+        inventory_after INTEGER NOT NULL CHECK (inventory_after >= 0),
+        known_inventory_adjustment INTEGER NOT NULL DEFAULT 0,
+        known_adjustment_source_refs_json TEXT NOT NULL DEFAULT '[]',
+        estimated_sold_qty INTEGER CHECK (
+            estimated_sold_qty IS NULL OR estimated_sold_qty >= 0
+        ),
+        estimation_eligible INTEGER NOT NULL CHECK (
+            estimation_eligible IN (0, 1)
+        ),
+        estimation_reason TEXT NOT NULL,
+        quality_level TEXT NOT NULL CHECK (quality_level IN (
+            'SCAN_ESTIMATED_HIGH', 'SCAN_ESTIMATED_MEDIUM',
+            'SCAN_ESTIMATED_LOW'
+        )),
+        mapping_version TEXT NOT NULL,
+        supporting_observation_ids_json TEXT NOT NULL,
+        algorithm_version TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        CHECK (interval_ended_at > interval_started_at)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_sales_estimate_segments_scope
+    ON sales_estimate_segments(
+        platform_name, platform_trade_date, internal_sku
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS platform_trade_day_summaries (
+        summary_id TEXT PRIMARY KEY,
+        summary_series_id TEXT NOT NULL,
+        version_no INTEGER NOT NULL CHECK (version_no > 0),
+        supersedes_summary_id TEXT,
+        is_current INTEGER NOT NULL CHECK (is_current IN (0, 1)),
+        platform_name TEXT NOT NULL,
+        platform_trade_date TEXT NOT NULL,
+        seller_operation_date TEXT NOT NULL,
+        seller_phase TEXT NOT NULL CHECK (seller_phase IN (
+            'NORMAL_SALES', 'PEAK_SALES', 'DELIVERY_OVERLAP'
+        )),
+        scope_type TEXT NOT NULL CHECK (scope_type IN (
+            'PLATFORM', 'VARIETY', 'GRADE', 'SKU', 'TIME_BUCKET'
+        )),
+        scope_key TEXT NOT NULL,
+        fact_source TEXT CHECK (
+            fact_source IS NULL OR fact_source IN (
+                'ORDER_OBSERVED', 'SCAN_ESTIMATED'
+            )
+        ),
+        quality_level TEXT NOT NULL CHECK (quality_level IN (
+            'ORDER_COMPLETE', 'ORDER_PARTIAL',
+            'SCAN_ESTIMATED_HIGH', 'SCAN_ESTIMATED_MEDIUM',
+            'SCAN_ESTIMATED_LOW', 'UNAVAILABLE'
+        )),
+        summary_status TEXT NOT NULL CHECK (summary_status IN (
+            'PROVISIONAL', 'OBSERVED', 'RECONCILED', 'FINAL'
+        )),
+        sold_qty INTEGER CHECK (sold_qty IS NULL OR sold_qty >= 0),
+        order_count INTEGER CHECK (order_count IS NULL OR order_count >= 0),
+        seller_received_amount TEXT,
+        quality_reason TEXT NOT NULL DEFAULT '',
+        source_proportions_json TEXT NOT NULL DEFAULT '{}',
+        input_manifest_sha256 TEXT NOT NULL,
+        mapping_version TEXT NOT NULL DEFAULT '',
+        algorithm_version TEXT NOT NULL,
+        time_policy_version TEXT NOT NULL,
+        finalized_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK (
+            (
+                fact_source IS NULL
+                AND quality_level = 'UNAVAILABLE'
+                AND sold_qty IS NULL
+                AND order_count IS NULL
+                AND seller_received_amount IS NULL
+            )
+            OR (
+                fact_source = 'ORDER_OBSERVED'
+                AND quality_level IN ('ORDER_COMPLETE', 'ORDER_PARTIAL')
+            )
+            OR (
+                fact_source = 'SCAN_ESTIMATED'
+                AND quality_level IN (
+                    'SCAN_ESTIMATED_HIGH', 'SCAN_ESTIMATED_MEDIUM',
+                    'SCAN_ESTIMATED_LOW'
+                )
+            )
+        ),
+        CHECK (
+            summary_status <> 'FINAL'
+            OR quality_level = 'ORDER_COMPLETE'
+        ),
+        CHECK (
+            (summary_status = 'FINAL' AND finalized_at IS NOT NULL)
+            OR (summary_status <> 'FINAL' AND finalized_at IS NULL)
+        ),
+        UNIQUE(summary_series_id, version_no),
+        FOREIGN KEY(supersedes_summary_id)
+            REFERENCES platform_trade_day_summaries(summary_id),
+        FOREIGN KEY(time_policy_version)
+            REFERENCES operational_time_policies(policy_version)
+    )
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_trade_day_summary_initial_status
+    BEFORE INSERT ON platform_trade_day_summaries
+    FOR EACH ROW
+    WHEN NOT (
+        (
+            NEW.version_no = 1
+            AND NEW.summary_status = 'PROVISIONAL'
+            AND NEW.supersedes_summary_id IS NULL
+        )
+        OR (
+            NEW.version_no > 1
+            AND NEW.summary_status = 'OBSERVED'
+            AND NEW.supersedes_summary_id IS NOT NULL
+        )
+    )
+    BEGIN
+        SELECT RAISE(
+            ABORT,
+            'summary must start PROVISIONAL or a revision must start OBSERVED'
+        );
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_trade_day_summary_status_transition
+    BEFORE UPDATE OF summary_status ON platform_trade_day_summaries
+    FOR EACH ROW
+    WHEN OLD.summary_status <> NEW.summary_status
+      AND NOT (
+          (
+              OLD.summary_status = 'PROVISIONAL'
+              AND NEW.summary_status = 'OBSERVED'
+          )
+          OR (
+              OLD.summary_status = 'OBSERVED'
+              AND NEW.summary_status = 'RECONCILED'
+          )
+          OR (
+              OLD.summary_status = 'RECONCILED'
+              AND NEW.summary_status = 'FINAL'
+          )
+      )
+    BEGIN
+        SELECT RAISE(ABORT, 'illegal trade-day summary transition');
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_trade_day_summary_final_immutable
+    BEFORE UPDATE ON platform_trade_day_summaries
+    FOR EACH ROW
+    WHEN OLD.summary_status = 'FINAL'
+      AND (
+          NEW.summary_status IS NOT OLD.summary_status
+          OR NEW.fact_source IS NOT OLD.fact_source
+          OR NEW.quality_level IS NOT OLD.quality_level
+          OR NEW.sold_qty IS NOT OLD.sold_qty
+          OR NEW.order_count IS NOT OLD.order_count
+          OR NEW.seller_received_amount IS NOT OLD.seller_received_amount
+          OR NEW.quality_reason IS NOT OLD.quality_reason
+          OR NEW.source_proportions_json IS NOT OLD.source_proportions_json
+          OR NEW.input_manifest_sha256 IS NOT OLD.input_manifest_sha256
+          OR NEW.mapping_version IS NOT OLD.mapping_version
+          OR NEW.algorithm_version IS NOT OLD.algorithm_version
+          OR NEW.time_policy_version IS NOT OLD.time_policy_version
+          OR NEW.finalized_at IS NOT OLD.finalized_at
+      )
+    BEGIN
+        SELECT RAISE(ABORT, 'FINAL summary content is immutable');
+    END
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_trade_day_summaries_current
+    ON platform_trade_day_summaries(summary_series_id)
+    WHERE is_current = 1
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_trade_day_summaries_scope
+    ON platform_trade_day_summaries(
+        platform_name, platform_trade_date, scope_type, scope_key
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS platform_trade_day_summary_events (
+        event_id TEXT PRIMARY KEY,
+        summary_id TEXT NOT NULL,
+        from_status TEXT CHECK (
+            from_status IS NULL OR from_status IN (
+                'PROVISIONAL', 'OBSERVED', 'RECONCILED', 'FINAL'
+            )
+        ),
+        to_status TEXT NOT NULL CHECK (to_status IN (
+            'PROVISIONAL', 'OBSERVED', 'RECONCILED', 'FINAL'
+        )),
+        trigger_type TEXT NOT NULL,
+        trigger_ref_id TEXT NOT NULL DEFAULT '',
+        fact_source_before TEXT CHECK (
+            fact_source_before IS NULL OR fact_source_before IN (
+                'ORDER_OBSERVED', 'SCAN_ESTIMATED'
+            )
+        ),
+        fact_source_after TEXT CHECK (
+            fact_source_after IS NULL OR fact_source_after IN (
+                'ORDER_OBSERVED', 'SCAN_ESTIMATED'
+            )
+        ),
+        quality_level_before TEXT CHECK (
+            quality_level_before IS NULL OR quality_level_before IN (
+                'ORDER_COMPLETE', 'ORDER_PARTIAL',
+                'SCAN_ESTIMATED_HIGH', 'SCAN_ESTIMATED_MEDIUM',
+                'SCAN_ESTIMATED_LOW', 'UNAVAILABLE'
+            )
+        ),
+        quality_level_after TEXT NOT NULL CHECK (
+            quality_level_after IN (
+                'ORDER_COMPLETE', 'ORDER_PARTIAL',
+                'SCAN_ESTIMATED_HIGH', 'SCAN_ESTIMATED_MEDIUM',
+                'SCAN_ESTIMATED_LOW', 'UNAVAILABLE'
+            )
+        ),
+        input_manifest_sha256 TEXT NOT NULL,
+        changed_at TEXT NOT NULL,
+        changed_by TEXT NOT NULL,
+        reason TEXT NOT NULL DEFAULT '',
+        FOREIGN KEY(summary_id)
+            REFERENCES platform_trade_day_summaries(summary_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_trade_day_summary_events_summary
+    ON platform_trade_day_summary_events(summary_id, changed_at)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS platform_trade_day_summary_inputs (
+        summary_id TEXT NOT NULL,
+        input_type TEXT NOT NULL,
+        input_ref_id TEXT NOT NULL,
+        input_sha256 TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(summary_id, input_type, input_ref_id),
+        FOREIGN KEY(summary_id)
+            REFERENCES platform_trade_day_summaries(summary_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_trade_day_summary_inputs_ref
+    ON platform_trade_day_summary_inputs(input_type, input_ref_id)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS operational_incidents (
+        incident_id TEXT PRIMARY KEY,
+        dedupe_key TEXT NOT NULL,
+        source_type TEXT NOT NULL,
+        source_ref_id TEXT NOT NULL DEFAULT '',
+        severity TEXT NOT NULL CHECK (severity IN (
+            'S0', 'S1', 'S2', 'S3', 'S4'
+        )),
+        incident_status TEXT NOT NULL,
+        blocks_finalization INTEGER NOT NULL DEFAULT 0 CHECK (
+            blocks_finalization IN (0, 1)
+        ),
+        platform_name TEXT,
+        platform_trade_date TEXT,
+        seller_operation_date TEXT,
+        subject_type TEXT NOT NULL,
+        subject_key TEXT NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        first_detected_at TEXT NOT NULL,
+        last_detected_at TEXT NOT NULL,
+        resolved_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK (incident_status <> '')
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_operational_incidents_open_dedupe
+    ON operational_incidents(dedupe_key)
+    WHERE resolved_at IS NULL
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_operational_incidents_status
+    ON operational_incidents(incident_status, severity, last_detected_at)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS incident_notification_state (
+        incident_id TEXT NOT NULL,
+        channel TEXT NOT NULL,
+        notification_count INTEGER NOT NULL DEFAULT 0 CHECK (
+            notification_count >= 0
+        ),
+        last_notified_at TEXT,
+        next_notification_at TEXT,
+        escalation_state TEXT NOT NULL DEFAULT '',
+        payload_sha256 TEXT NOT NULL DEFAULT '',
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(incident_id, channel),
+        FOREIGN KEY(incident_id)
+            REFERENCES operational_incidents(incident_id)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_incident_notification_state_due
+    ON incident_notification_state(next_notification_at)
+    """,
+]
+
 
 def _backfill_shadowbot_batch_registry(
     connection: sqlite3.Connection,
@@ -1535,6 +2138,55 @@ def _requires_runtime_schema_v13_migration(
     ) not in lock_foreign_keys
 
 
+def _requires_runtime_schema_v14_migration(
+    connection: sqlite3.Connection,
+) -> bool:
+    required_tables = {
+        "operational_time_policies",
+        "automation_jobs",
+        "automation_runs",
+        "automation_run_events",
+        "automation_run_links",
+        "product_observation_batches",
+        "product_observation_items",
+        "order_observation_batches",
+        "order_observation_items",
+        "sales_estimate_segments",
+        "platform_trade_day_summaries",
+        "platform_trade_day_summary_events",
+        "platform_trade_day_summary_inputs",
+        "operational_incidents",
+        "incident_notification_state",
+    }
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if "runtime_schema_migrations" not in tables:
+        return True
+    version_row = connection.execute(
+        "SELECT 1 FROM runtime_schema_migrations WHERE schema_version = 14"
+    ).fetchone()
+    if version_row is None or not required_tables.issubset(tables):
+        return True
+    task_columns = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
+    }
+    return not {
+        "origin_type",
+        "origin_ref_id",
+        "approval_policy",
+        "policy_version",
+        "platform_trade_date",
+        "seller_operation_date",
+        "seller_phase",
+        "time_policy_version",
+    }.issubset(task_columns)
+
+
 def _ensure_open_task_dedupe_index(connection: sqlite3.Connection) -> None:
     row = connection.execute(
         """
@@ -1606,6 +2258,12 @@ class SQLiteRuntimeRepository:
             requires_v13_migration = _requires_runtime_schema_v13_migration(
                 connection
             )
+            requires_v14_migration = _requires_runtime_schema_v14_migration(
+                connection
+            )
+            requires_runtime_migration = (
+                requires_v13_migration or requires_v14_migration
+            )
             if requires_v13_migration:
                 connection.execute("PRAGMA foreign_keys = OFF")
             connection.execute("BEGIN IMMEDIATE")
@@ -1638,6 +2296,46 @@ class SQLiteRuntimeRepository:
                     "target_inventory",
                     "INTEGER CHECK (target_inventory IS NULL OR target_inventory >= 0)",
                 )
+                _ensure_column(
+                    connection,
+                    "tasks",
+                    "origin_type",
+                    "TEXT NOT NULL DEFAULT 'LEGACY' CHECK (origin_type IN "
+                    "('MANUAL', 'AUTOMATION', 'SYSTEM_EMERGENCY', 'LEGACY'))",
+                )
+                _ensure_column(connection, "tasks", "origin_ref_id", "TEXT")
+                _ensure_column(
+                    connection,
+                    "tasks",
+                    "approval_policy",
+                    "TEXT NOT NULL DEFAULT 'UNSPECIFIED'",
+                )
+                _ensure_column(connection, "tasks", "policy_version", "TEXT")
+                _ensure_column(
+                    connection,
+                    "tasks",
+                    "platform_trade_date",
+                    "TEXT",
+                )
+                _ensure_column(
+                    connection,
+                    "tasks",
+                    "seller_operation_date",
+                    "TEXT",
+                )
+                _ensure_column(
+                    connection,
+                    "tasks",
+                    "seller_phase",
+                    "TEXT CHECK (seller_phase IS NULL OR seller_phase IN "
+                    "('NORMAL_SALES', 'PEAK_SALES', 'DELIVERY_OVERLAP'))",
+                )
+                _ensure_column(
+                    connection,
+                    "tasks",
+                    "time_policy_version",
+                    "TEXT",
+                )
                 _backfill_task_expected_old_price(connection)
                 migration_notes = {
                     1: "initial runtime schema",
@@ -1653,6 +2351,7 @@ class SQLiteRuntimeRepository:
                     11: "single-request ShadowBot commit batch ledger",
                     12: "per-item commit identity, write locks, observation times, and durable result receipts",
                     13: "listing action batches, status snapshots, anomalies, and shared write locks",
+                    14: "operational time, automation, immutable observations, sales summaries, and incidents",
                 }
                 for statement in SCHEMA_V6_SQL:
                     connection.execute(statement)
@@ -1738,6 +2437,38 @@ class SQLiteRuntimeRepository:
                 for statement in SCHEMA_V13_SQL:
                     connection.execute(statement)
                 _backfill_listing_status_latest_scan_observations(connection)
+                for statement in SCHEMA_V14_SQL:
+                    connection.execute(statement)
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO operational_time_policies(
+                        policy_version, timezone_name,
+                        platform_cutoff_local_time,
+                        seller_cutoff_local_time,
+                        peak_start_local_time,
+                        effective_from, effective_to,
+                        created_at, created_by,
+                        supersedes_policy_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL)
+                    """,
+                    (
+                        "CN_SINGLE_PLATFORM_2026_V1",
+                        "Asia/Shanghai",
+                        "18:00:00",
+                        "20:00:00",
+                        "16:00:00",
+                        "2026-01-01T00:00:00+08:00",
+                        _datetime_to_text(datetime.now()),
+                        "runtime_schema_v14",
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET origin_type = 'LEGACY'
+                    WHERE origin_type IS NULL OR origin_type = ''
+                    """
+                )
 
                 for version in range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1):
                     connection.execute(
@@ -1760,13 +2491,13 @@ class SQLiteRuntimeRepository:
                     "WHERE schema_version = 5",
                     (migration_notes[5],),
                 )
-                if requires_v13_migration:
+                if requires_runtime_migration:
                     foreign_key_rows = connection.execute(
                         "PRAGMA foreign_key_check"
                     ).fetchall()
                     if foreign_key_rows:
                         raise RuntimeError(
-                            "Runtime Schema v13 migration produced foreign "
+                            "Runtime Schema migration produced foreign "
                             f"key violations: {len(foreign_key_rows)}"
                         )
                     integrity_rows = [
@@ -1777,7 +2508,7 @@ class SQLiteRuntimeRepository:
                     ]
                     if integrity_rows != ["ok"]:
                         raise RuntimeError(
-                            "Runtime Schema v13 migration failed "
+                            "Runtime Schema migration failed "
                             "integrity_check"
                         )
                 connection.commit()
@@ -2120,7 +2851,26 @@ class SQLiteRuntimeRepository:
         return self.check_schema_health()
 
     def insert_tasks(self, tasks: Iterable[Task]) -> int:
-        rows = [_task_to_row(task) for task in tasks]
+        task_rows = list(tasks)
+        for task in task_rows:
+            if task.origin_type is TaskOriginType.LEGACY:
+                raise ValueError(
+                    "LEGACY is migration-only and cannot be created "
+                    "through the task repository"
+                )
+            if task.origin_type is TaskOriginType.SYSTEM_EMERGENCY:
+                raise ValueError(
+                    "SYSTEM_EMERGENCY creation remains disabled until "
+                    "the dedicated 13.5-6 authorization service"
+                )
+            if (
+                task.origin_type is TaskOriginType.AUTOMATION
+                and not str(task.origin_ref_id or "").strip()
+            ):
+                raise ValueError(
+                    "AUTOMATION tasks require an origin_ref_id"
+                )
+        rows = [_task_to_row(task) for task in task_rows]
         if not rows:
             return 0
         with closing(self.connect()) as connection, connection:
@@ -2132,14 +2882,20 @@ class SQLiteRuntimeRepository:
                     platform_name, action_type, priority, task_status, created_at, scheduled_at,
                     expires_at, expected_old_price, target_price, target_inventory,
                     target_status, pricing_source, decision_trace_json,
-                    result_message, required_by, updated_at
+                    result_message, required_by, updated_at,
+                    origin_type, origin_ref_id, approval_policy, policy_version,
+                    platform_trade_date, seller_operation_date, seller_phase,
+                    time_policy_version
                 )
                 VALUES(
                     :task_id, :trade_date, :scope_type, :scope_key, :dedupe_key, :internal_sku,
                     :platform_name, :action_type, :priority, :task_status, :created_at, :scheduled_at,
                     :expires_at, :expected_old_price, :target_price, :target_inventory,
                     :target_status, :pricing_source, :decision_trace_json,
-                    :result_message, :required_by, :updated_at
+                    :result_message, :required_by, :updated_at,
+                    :origin_type, :origin_ref_id, :approval_policy, :policy_version,
+                    :platform_trade_date, :seller_operation_date, :seller_phase,
+                    :time_policy_version
                 )
                 """,
                 rows,
@@ -5650,6 +6406,14 @@ def _task_to_row(task: Task) -> dict[str, Any]:
         "result_message": task.result_message,
         "required_by": _datetime_to_text(task.required_by),
         "updated_at": _datetime_to_text(updated_at),
+        "origin_type": task.origin_type.value,
+        "origin_ref_id": task.origin_ref_id,
+        "approval_policy": task.approval_policy,
+        "policy_version": task.policy_version,
+        "platform_trade_date": _date_to_text(task.platform_trade_date),
+        "seller_operation_date": _date_to_text(task.seller_operation_date),
+        "seller_phase": task.seller_phase.value if task.seller_phase else None,
+        "time_policy_version": task.time_policy_version,
     }
 
 
@@ -5678,6 +6442,18 @@ def _row_to_task(row: sqlite3.Row) -> Task:
         result_message=str(row["result_message"] or ""),
         required_by=_text_to_datetime(row["required_by"]),
         trade_date=_text_to_date(row["trade_date"]),
+        origin_type=TaskOriginType(str(row["origin_type"])),
+        origin_ref_id=row["origin_ref_id"],
+        approval_policy=str(row["approval_policy"] or "UNSPECIFIED"),
+        policy_version=row["policy_version"],
+        platform_trade_date=_text_to_date(row["platform_trade_date"]),
+        seller_operation_date=_text_to_date(row["seller_operation_date"]),
+        seller_phase=(
+            SellerPhase(str(row["seller_phase"]))
+            if row["seller_phase"] not in ("", None)
+            else None
+        ),
+        time_policy_version=row["time_policy_version"],
         scope_type=str(row["scope_type"]),
         scope_key=str(row["scope_key"]),
         dedupe_key=str(row["dedupe_key"] or ""),

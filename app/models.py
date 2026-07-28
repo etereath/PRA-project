@@ -11,8 +11,10 @@ from app.enums import (
     PricingSource,
     ReviewTaskStatus,
     RoundingRule,
+    SellerPhase,
     ShortageRisk,
     TaskActionType,
+    TaskOriginType,
     TaskStatus,
     TradePhase,
 )
@@ -337,6 +339,14 @@ class Task:
     result_message: str = ""
     required_by: datetime | None = None
     trade_date: date | None = None
+    origin_type: TaskOriginType = TaskOriginType.MANUAL
+    origin_ref_id: str | None = None
+    approval_policy: str = "UNSPECIFIED"
+    policy_version: str | None = None
+    platform_trade_date: date | None = None
+    seller_operation_date: date | None = None
+    seller_phase: SellerPhase | None = None
+    time_policy_version: str | None = None
     scope_type: str = "sku"
     scope_key: str = ""
     dedupe_key: str = ""
@@ -352,6 +362,20 @@ class Task:
         data["created_at"] = self.created_at.isoformat()
         data["required_by"] = self.required_by.isoformat() if self.required_by else None
         data["trade_date"] = self.trade_date.isoformat() if self.trade_date else None
+        data["origin_type"] = self.origin_type.value
+        data["platform_trade_date"] = (
+            self.platform_trade_date.isoformat()
+            if self.platform_trade_date
+            else None
+        )
+        data["seller_operation_date"] = (
+            self.seller_operation_date.isoformat()
+            if self.seller_operation_date
+            else None
+        )
+        data["seller_phase"] = (
+            self.seller_phase.value if self.seller_phase else None
+        )
         data["scheduled_at"] = self.scheduled_at.isoformat() if self.scheduled_at else None
         data["expires_at"] = self.expires_at.isoformat() if self.expires_at else None
         data["updated_at"] = self.updated_at.isoformat() if self.updated_at else None

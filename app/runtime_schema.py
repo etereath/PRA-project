@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping
 
 
-LATEST_RUNTIME_SCHEMA_VERSION = 13
+LATEST_RUNTIME_SCHEMA_VERSION = 14
 RUNTIME_SCHEMA_VERSIONS = tuple(range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1))
 
 REQUIRED_RUNTIME_TABLES = frozenset(
@@ -46,6 +46,21 @@ REQUIRED_RUNTIME_TABLES = frozenset(
         "listing_sync_snapshots",
         "listing_sync_snapshot_items",
         "listing_anomaly_cases",
+        "operational_time_policies",
+        "automation_jobs",
+        "automation_runs",
+        "automation_run_events",
+        "automation_run_links",
+        "product_observation_batches",
+        "product_observation_items",
+        "order_observation_batches",
+        "order_observation_items",
+        "sales_estimate_segments",
+        "platform_trade_day_summaries",
+        "platform_trade_day_summary_events",
+        "platform_trade_day_summary_inputs",
+        "operational_incidents",
+        "incident_notification_state",
     }
 )
 
@@ -345,6 +360,330 @@ V13_INDEX_SPECS: Mapping[str, tuple[str, ...]] = {
     "ix_listing_anomaly_cases_review": ("review_task_id",),
 }
 
+V14_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
+    "tasks": (
+        "origin_type",
+        "origin_ref_id",
+        "approval_policy",
+        "policy_version",
+        "platform_trade_date",
+        "seller_operation_date",
+        "seller_phase",
+        "time_policy_version",
+    ),
+    "operational_time_policies": (
+        "policy_version",
+        "timezone_name",
+        "platform_cutoff_local_time",
+        "seller_cutoff_local_time",
+        "peak_start_local_time",
+        "effective_from",
+        "effective_to",
+        "created_at",
+        "created_by",
+        "supersedes_policy_version",
+    ),
+    "automation_jobs": (
+        "job_id",
+        "job_type",
+        "display_name",
+        "enabled",
+        "schedule_kind",
+        "schedule_expression",
+        "priority",
+        "config_json",
+        "created_at",
+        "updated_at",
+    ),
+    "automation_runs": (
+        "run_id",
+        "job_id",
+        "job_type",
+        "logical_run_key",
+        "run_status",
+        "platform_name",
+        "platform_trade_date",
+        "seller_operation_date",
+        "seller_phase",
+        "time_policy_version",
+        "scheduled_for",
+        "started_at",
+        "finished_at",
+        "lease_owner",
+        "lease_version",
+        "lease_expires_at",
+        "input_manifest_sha256",
+        "output_manifest_sha256",
+        "error_code",
+        "error_message",
+        "created_at",
+        "updated_at",
+    ),
+    "automation_run_events": (
+        "event_id",
+        "run_id",
+        "event_type",
+        "from_status",
+        "to_status",
+        "payload_json",
+        "created_at",
+    ),
+    "automation_run_links": (
+        "parent_run_id",
+        "child_run_id",
+        "relation_type",
+        "created_at",
+    ),
+    "product_observation_batches": (
+        "observation_batch_id",
+        "automation_run_id",
+        "platform_name",
+        "scan_type",
+        "batch_status",
+        "scan_started_at",
+        "scan_completed_at",
+        "requested_scope_json",
+        "scope_complete",
+        "end_marker_verified",
+        "content_sha256",
+        "time_policy_version",
+        "error_code",
+        "error_message",
+        "created_at",
+    ),
+    "product_observation_items": (
+        "observation_item_id",
+        "observation_batch_id",
+        "internal_sku",
+        "platform_product_name",
+        "grade",
+        "observed_price",
+        "observed_inventory",
+        "observed_online",
+        "observed_at",
+        "platform_trade_date",
+        "seller_operation_date",
+        "seller_phase",
+        "page_identity_key",
+        "mapping_status",
+        "mapping_version",
+        "evidence_sha256",
+    ),
+    "order_observation_batches": (
+        "observation_batch_id",
+        "automation_run_id",
+        "platform_name",
+        "requested_platform_trade_date",
+        "capability_result",
+        "batch_status",
+        "scan_started_at",
+        "scan_completed_at",
+        "requested_range_json",
+        "scope_complete",
+        "end_marker_verified",
+        "content_sha256",
+        "time_policy_version",
+        "error_code",
+        "error_message",
+        "created_at",
+    ),
+    "order_observation_items": (
+        "observation_item_id",
+        "observation_batch_id",
+        "platform_trade_date",
+        "platform_product_name",
+        "grade",
+        "internal_sku",
+        "mapping_status",
+        "mapping_version",
+        "order_created_at",
+        "ordered_qty",
+        "effective_qty",
+        "cancelled_qty",
+        "cancellation_derivation_method",
+        "seller_received_amount",
+        "purchase_sequence",
+        "observed_at",
+        "seller_operation_date",
+        "seller_phase",
+        "source_row_fingerprint",
+        "occurrence_no",
+        "raw_observation_sha256",
+    ),
+    "sales_estimate_segments": (
+        "estimate_segment_id",
+        "platform_name",
+        "internal_sku",
+        "platform_trade_date",
+        "interval_started_at",
+        "interval_ended_at",
+        "inventory_before",
+        "inventory_after",
+        "known_inventory_adjustment",
+        "known_adjustment_source_refs_json",
+        "estimated_sold_qty",
+        "estimation_eligible",
+        "estimation_reason",
+        "quality_level",
+        "mapping_version",
+        "supporting_observation_ids_json",
+        "algorithm_version",
+        "created_at",
+    ),
+    "platform_trade_day_summaries": (
+        "summary_id",
+        "summary_series_id",
+        "version_no",
+        "supersedes_summary_id",
+        "is_current",
+        "platform_name",
+        "platform_trade_date",
+        "seller_operation_date",
+        "seller_phase",
+        "scope_type",
+        "scope_key",
+        "fact_source",
+        "quality_level",
+        "summary_status",
+        "sold_qty",
+        "order_count",
+        "seller_received_amount",
+        "quality_reason",
+        "source_proportions_json",
+        "input_manifest_sha256",
+        "mapping_version",
+        "algorithm_version",
+        "time_policy_version",
+        "finalized_at",
+        "created_at",
+        "updated_at",
+    ),
+    "platform_trade_day_summary_events": (
+        "event_id",
+        "summary_id",
+        "from_status",
+        "to_status",
+        "trigger_type",
+        "trigger_ref_id",
+        "fact_source_before",
+        "fact_source_after",
+        "quality_level_before",
+        "quality_level_after",
+        "input_manifest_sha256",
+        "changed_at",
+        "changed_by",
+        "reason",
+    ),
+    "platform_trade_day_summary_inputs": (
+        "summary_id",
+        "input_type",
+        "input_ref_id",
+        "input_sha256",
+        "created_at",
+    ),
+    "operational_incidents": (
+        "incident_id",
+        "dedupe_key",
+        "source_type",
+        "source_ref_id",
+        "severity",
+        "incident_status",
+        "blocks_finalization",
+        "platform_name",
+        "platform_trade_date",
+        "seller_operation_date",
+        "subject_type",
+        "subject_key",
+        "title",
+        "description",
+        "first_detected_at",
+        "last_detected_at",
+        "resolved_at",
+        "created_at",
+        "updated_at",
+    ),
+    "incident_notification_state": (
+        "incident_id",
+        "channel",
+        "notification_count",
+        "last_notified_at",
+        "next_notification_at",
+        "escalation_state",
+        "payload_sha256",
+        "updated_at",
+    ),
+}
+
+V14_INDEX_SPECS: Mapping[str, tuple[str, ...]] = {
+    "ux_operational_time_policies_current": ("timezone_name",),
+    "ix_automation_jobs_type_enabled": ("job_type", "enabled"),
+    "ux_automation_runs_logical_key": ("logical_run_key",),
+    "ix_automation_runs_status_scheduled": ("run_status", "scheduled_for"),
+    "ix_automation_run_events_run": ("run_id", "created_at"),
+    "ix_automation_run_links_child": ("child_run_id", "relation_type"),
+    "ix_product_observation_batches_run": ("automation_run_id",),
+    "ix_product_observation_items_batch": ("observation_batch_id",),
+    "ix_product_observation_items_sku_trade_date": (
+        "internal_sku",
+        "platform_trade_date",
+        "observed_at",
+    ),
+    "ix_order_observation_batches_run": ("automation_run_id",),
+    "ix_order_observation_batches_trade_date": (
+        "platform_name",
+        "requested_platform_trade_date",
+        "scan_completed_at",
+    ),
+    "ix_order_observation_items_batch": ("observation_batch_id",),
+    "ix_order_observation_items_trade_date": (
+        "platform_trade_date",
+        "internal_sku",
+        "order_created_at",
+    ),
+    "ix_sales_estimate_segments_scope": (
+        "platform_name",
+        "platform_trade_date",
+        "internal_sku",
+    ),
+    "ux_trade_day_summaries_current": ("summary_series_id",),
+    "ix_trade_day_summaries_scope": (
+        "platform_name",
+        "platform_trade_date",
+        "scope_type",
+        "scope_key",
+    ),
+    "ix_trade_day_summary_events_summary": ("summary_id", "changed_at"),
+    "ix_trade_day_summary_inputs_ref": ("input_type", "input_ref_id"),
+    "ux_operational_incidents_open_dedupe": ("dedupe_key",),
+    "ix_operational_incidents_status": (
+        "incident_status",
+        "severity",
+        "last_detected_at",
+    ),
+    "ix_incident_notification_state_due": ("next_notification_at",),
+}
+
+V14_TASK_ORIGIN_VALUES = frozenset(
+    {"MANUAL", "AUTOMATION", "SYSTEM_EMERGENCY", "LEGACY"}
+)
+V14_FACT_SOURCE_VALUES = frozenset({"ORDER_OBSERVED", "SCAN_ESTIMATED"})
+V14_QUALITY_VALUES = frozenset(
+    {
+        "ORDER_COMPLETE",
+        "ORDER_PARTIAL",
+        "SCAN_ESTIMATED_HIGH",
+        "SCAN_ESTIMATED_MEDIUM",
+        "SCAN_ESTIMATED_LOW",
+        "UNAVAILABLE",
+    }
+)
+V14_SUMMARY_STATUS_VALUES = frozenset(
+    {"PROVISIONAL", "OBSERVED", "RECONCILED", "FINAL"}
+)
+V14_SELLER_PHASE_VALUES = frozenset(
+    {"NORMAL_SALES", "PEAK_SALES", "DELIVERY_OVERLAP"}
+)
+
 V13_WRITE_LOCK_STATUS_VALUES = frozenset(
     {"ACTIVE", "UNKNOWN", "REVIEW_BLOCKED", "RELEASED"}
 )
@@ -560,6 +899,7 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
             **V11_REQUIRED_COLUMNS,
             **V12_REQUIRED_COLUMNS,
             **V13_REQUIRED_COLUMNS,
+            **V14_REQUIRED_COLUMNS,
         }.items():
             if table not in tables:
                 continue
@@ -618,6 +958,9 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
             missing_index_names.update(
                 _check_v13_constraints(connection, constraint_errors)
             )
+            missing_index_names.update(
+                _check_v14_constraints(connection, constraint_errors)
+            )
         missing_indexes = tuple(sorted(missing_index_names))
 
         ok = not (
@@ -651,6 +994,7 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
                     | NOTIFICATION_OUTBOX_INDEXES
                     | frozenset(V12_INDEX_SPECS)
                     | frozenset(V13_INDEX_SPECS)
+                    | frozenset(V14_INDEX_SPECS)
                 )
             ),
             constraint_errors=(),
@@ -862,6 +1206,313 @@ def _check_v13_constraints(
             errors.append(
                 f"PRAGMA foreign_key_check returned {len(foreign_key_rows)} row(s)"
             )
+    return tuple(sorted(missing_indexes))
+
+
+def _check_v14_constraints(
+    connection: sqlite3.Connection,
+    errors: list[str],
+) -> tuple[str, ...]:
+    missing_indexes: list[str] = []
+    for index_name, expected_columns in V14_INDEX_SPECS.items():
+        row = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index_name,),
+        ).fetchone()
+        if row is None:
+            missing_indexes.append(index_name)
+            continue
+        actual_columns = tuple(
+            str(index_row[2])
+            for index_row in connection.execute(
+                f"PRAGMA index_info('{index_name}')"
+            ).fetchall()
+        )
+        if actual_columns != expected_columns:
+            errors.append(
+                f"{index_name} columns expected {expected_columns}, "
+                f"actual {actual_columns}"
+            )
+
+    for table, index_name, where_pattern in (
+        (
+            "operational_time_policies",
+            "ux_operational_time_policies_current",
+            r"WHERE\s+effective_to\s+IS\s+NULL",
+        ),
+        (
+            "platform_trade_day_summaries",
+            "ux_trade_day_summaries_current",
+            r"WHERE\s+is_current\s*=\s*1",
+        ),
+        (
+            "operational_incidents",
+            "ux_operational_incidents_open_dedupe",
+            r"WHERE\s+resolved_at\s+IS\s+NULL",
+        ),
+    ):
+        index_rows = {
+            str(row[1]): row
+            for row in connection.execute(
+                f"PRAGMA index_list('{table}')"
+            ).fetchall()
+        }
+        index_row = index_rows.get(index_name)
+        if index_row is None:
+            continue
+        if int(index_row[2]) != 1 or int(index_row[4]) != 1:
+            errors.append(f"{index_name} must be unique and partial")
+        sql_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index_name,),
+        ).fetchone()
+        index_sql = str(sql_row[0] or "") if sql_row else ""
+        if not re.search(where_pattern, index_sql, re.IGNORECASE):
+            errors.append(f"{index_name} has the wrong partial predicate")
+
+    task_sql = _table_sql(connection, "tasks")
+    _check_exact_status_values(
+        task_sql,
+        column="origin_type",
+        expected=V14_TASK_ORIGIN_VALUES,
+        label="tasks.origin_type",
+        errors=errors,
+    )
+
+    summary_sql = _table_sql(connection, "platform_trade_day_summaries")
+    _check_exact_status_values(
+        summary_sql,
+        column="quality_level",
+        expected=V14_QUALITY_VALUES,
+        label="platform_trade_day_summaries.quality_level",
+        errors=errors,
+    )
+    _check_exact_status_values(
+        summary_sql,
+        column="summary_status",
+        expected=V14_SUMMARY_STATUS_VALUES,
+        label="platform_trade_day_summaries.summary_status",
+        errors=errors,
+    )
+    _check_exact_status_values(
+        summary_sql,
+        column="seller_phase",
+        expected=V14_SELLER_PHASE_VALUES,
+        label="platform_trade_day_summaries.seller_phase",
+        errors=errors,
+    )
+    fact_source_match = re.search(
+        r"\bfact_source\b\s+[^,]*?\bCHECK\s*\(\s*"
+        r"fact_source\s+IS\s+NULL\s+OR\s+fact_source\s+IN\s*"
+        r"\((?P<values>[^)]*)\)\s*\)",
+        summary_sql,
+        re.IGNORECASE | re.DOTALL,
+    )
+    fact_source_values = {
+        value.replace("''", "'")
+        for value in re.findall(
+            r"'((?:''|[^'])*)'",
+            fact_source_match.group("values")
+            if fact_source_match
+            else "",
+        )
+    }
+    if fact_source_values != V14_FACT_SOURCE_VALUES:
+        errors.append(
+            "platform_trade_day_summaries.fact_source CHECK must allow "
+            "NULL or exactly " + ", ".join(sorted(V14_FACT_SOURCE_VALUES))
+        )
+    if not re.search(
+        r"fact_source\s+IS\s+NULL.*?"
+        r"quality_level\s*=\s*'UNAVAILABLE'.*?"
+        r"sold_qty\s+IS\s+NULL.*?"
+        r"order_count\s+IS\s+NULL.*?"
+        r"seller_received_amount\s+IS\s+NULL",
+        summary_sql,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        errors.append(
+            "platform_trade_day_summaries lacks the UNAVAILABLE NULL-fact "
+            "constraint"
+        )
+    if not re.search(
+        r"summary_status\s*<>\s*'FINAL'\s+OR\s+"
+        r"quality_level\s*=\s*'ORDER_COMPLETE'",
+        summary_sql,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        errors.append(
+            "platform_trade_day_summaries FINAL must require ORDER_COMPLETE"
+        )
+
+    required_triggers = {
+        "trg_trade_day_summary_initial_status": (
+            "PROVISIONAL",
+            "OBSERVED",
+        ),
+        "trg_trade_day_summary_status_transition": (
+            "PROVISIONAL",
+            "OBSERVED",
+            "RECONCILED",
+            "FINAL",
+        ),
+        "trg_trade_day_summary_final_immutable": (
+            "FINAL",
+            "immutable",
+        ),
+    }
+    for trigger_name, required_terms in required_triggers.items():
+        trigger_row = connection.execute(
+            """
+            SELECT sql
+            FROM sqlite_master
+            WHERE type = 'trigger' AND name = ?
+            """,
+            (trigger_name,),
+        ).fetchone()
+        trigger_sql = str(trigger_row[0] or "") if trigger_row else ""
+        if not trigger_sql:
+            errors.append(f"missing trigger {trigger_name}")
+            continue
+        for term in required_terms:
+            if term.lower() not in trigger_sql.lower():
+                errors.append(
+                    f"{trigger_name} lacks required term {term}"
+                )
+
+    incident_sql = _table_sql(connection, "operational_incidents")
+    if not re.search(
+        r"CHECK\s*\(\s*blocks_finalization\s+IN\s*\(\s*0\s*,\s*1\s*\)"
+        r"\s*\)",
+        incident_sql,
+        re.IGNORECASE,
+    ):
+        errors.append(
+            "operational_incidents.blocks_finalization must be boolean"
+        )
+
+    foreign_key_requirements = {
+        "operational_time_policies": {
+            (
+                "supersedes_policy_version",
+                "operational_time_policies",
+                "policy_version",
+            ),
+        },
+        "automation_runs": {
+            ("job_id", "automation_jobs", "job_id"),
+            (
+                "time_policy_version",
+                "operational_time_policies",
+                "policy_version",
+            ),
+        },
+        "automation_run_events": {
+            ("run_id", "automation_runs", "run_id"),
+        },
+        "automation_run_links": {
+            ("parent_run_id", "automation_runs", "run_id"),
+            ("child_run_id", "automation_runs", "run_id"),
+        },
+        "product_observation_batches": {
+            ("automation_run_id", "automation_runs", "run_id"),
+            (
+                "time_policy_version",
+                "operational_time_policies",
+                "policy_version",
+            ),
+        },
+        "product_observation_items": {
+            (
+                "observation_batch_id",
+                "product_observation_batches",
+                "observation_batch_id",
+            ),
+        },
+        "order_observation_batches": {
+            ("automation_run_id", "automation_runs", "run_id"),
+            (
+                "time_policy_version",
+                "operational_time_policies",
+                "policy_version",
+            ),
+        },
+        "order_observation_items": {
+            (
+                "observation_batch_id",
+                "order_observation_batches",
+                "observation_batch_id",
+            ),
+        },
+        "platform_trade_day_summaries": {
+            (
+                "supersedes_summary_id",
+                "platform_trade_day_summaries",
+                "summary_id",
+            ),
+            (
+                "time_policy_version",
+                "operational_time_policies",
+                "policy_version",
+            ),
+        },
+        "platform_trade_day_summary_events": {
+            (
+                "summary_id",
+                "platform_trade_day_summaries",
+                "summary_id",
+            ),
+        },
+        "platform_trade_day_summary_inputs": {
+            (
+                "summary_id",
+                "platform_trade_day_summaries",
+                "summary_id",
+            ),
+        },
+        "incident_notification_state": {
+            (
+                "incident_id",
+                "operational_incidents",
+                "incident_id",
+            ),
+        },
+    }
+    for table, required in foreign_key_requirements.items():
+        actual = {
+            (str(row[3]), str(row[2]), str(row[4]))
+            for row in connection.execute(
+                f"PRAGMA foreign_key_list('{table}')"
+            ).fetchall()
+        }
+        for column, target_table, target_column in sorted(required - actual):
+            errors.append(
+                f"missing foreign key {table}.{column} -> "
+                f"{target_table}({target_column})"
+            )
+
+    policy_row = connection.execute(
+        """
+        SELECT timezone_name, platform_cutoff_local_time,
+               seller_cutoff_local_time, peak_start_local_time,
+               effective_to
+        FROM operational_time_policies
+        WHERE policy_version = 'CN_SINGLE_PLATFORM_2026_V1'
+        """
+    ).fetchone()
+    expected_policy = (
+        "Asia/Shanghai",
+        "18:00:00",
+        "20:00:00",
+        "16:00:00",
+        None,
+    )
+    if policy_row is None or tuple(policy_row) != expected_policy:
+        errors.append(
+            "CN_SINGLE_PLATFORM_2026_V1 operational time policy is missing "
+            "or has incorrect frozen cutoffs"
+        )
+
     return tuple(sorted(missing_indexes))
 
 
