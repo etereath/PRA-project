@@ -436,25 +436,27 @@ Web 复核主入口：
 
 任务12审查修复版已通过 PR #18 合并，其正常 COMMIT 与受控
 UNKNOWN→唯一 RECONCILE 继续作为稳定基线。任务13的实现、受控实机验收、
-脱敏证据、最终本地回归和交接报告均已完成；当前下一步是通过独立 GitHub PR
-运行 CI 并交由审查方复核，不是修改任务状态，也不是扩大无人值守真实 RPA。
+脱敏证据、最终本地回归、PR #19 审查修复和 Windows/Linux Core 均已完成。
+本轮文档整理不代替审查方执行合并或任务状态变更，也不扩大无人值守真实 RPA。
 
 Code Review 后的高中低风险问题已完成修复，系统冒烟测试、全量单元测试和主控端到端流程测试均已通过。修复详情见 [reports/risk_fix_report_20260610.md](reports/risk_fix_report_20260610.md)。
 
 推荐顺序：
 
 1. 以 [reports/task13_final_handoff_20260727.md](reports/task13_final_handoff_20260727.md) 为任务13审查入口，复核四维状态模型、Runtime Schema v13、v5上下架流水线、运行边界和证据矩阵。
-2. 通过任务13独立 GitHub PR 运行 Windows/Linux/wheel/smoke 和全部证据复算；审查通过后再由审查方决定任务13状态。
+2. 任务13独立 PR #19 的 COMMENT Review 修复、Windows Core 和 Linux Core 已通过；后续合并和任务状态仍由审查方处理。
 3. 任务14实现统一任务审查和正式调度授权；在此之前保持显式 `--task-id` 门禁，禁止无人值守扫描全部 pending 并自动发布。
-4. 任务12 PR #18 已合并；任务13也已完成 T13-0 页面探索、T13-1 合同、T13-2 Runtime Schema v13、独立两页 SYNC_STATUS、单商品状态往返、正常多商品严格串行上下架、整批预检异常零写、严格串行 UNKNOWN、最终确认点击后的 `UNKNOWN → 唯一自动 RECONCILE → VERIFIED` 和 `UNKNOWN → 唯一自动 RECONCILE → NOT_APPLIED`、`ALREADY_APPLIED` 0 写点击、跨动作共享写锁、phase/result 恢复、Web 运营投影、最终本地回归和交接报告。仓库内已保存脱敏证据、自然语言报告、数据库回读及 CI 复算入口；任务状态继续等待审查方修改。
+4. 任务12 PR #18 已合并；任务13也已完成 T13-0 页面探索、T13-1 合同、T13-2 Runtime Schema v13、独立两页 SYNC_STATUS、单商品状态往返、正常多商品严格串行上下架、整批预检异常零写、严格串行 UNKNOWN、最终确认点击后的 `UNKNOWN → 唯一自动 RECONCILE → VERIFIED` 和 `UNKNOWN → 唯一自动 RECONCILE → NOT_APPLIED`、`ALREADY_APPLIED` 0 写点击、跨动作共享写锁、phase/result 恢复、Web 运营投影、最终回归、PR #19 COMMENT Review 修复和双平台 CI。仓库内已保存脱敏证据、自然语言报告、数据库回读及 CI 复算入口；本轮文档整理不执行合并或任务状态变更。
 5. 补充长期告警、磁盘清理、证据保留和服务账号运维样本，并分别定义冷态/暖态性能指标。
 6. 继续运行系统冒烟、完整单元测试和 ShadowBot 成功基线测试，任何新功能不得重写已验证 COMMIT 动作链路。
 7. 基于自动规则评估框架继续规划上下架、冷库、包装产能等 evaluator，但保持 dry-run/apply 和 service 边界。
 8. AI Agent 自动决策应放在真实平台执行和运维边界通过更长期审查后再推进。
+9. 任务14及后续真实平台任务开始前，按[任务12—13复用路径与失败复盘](shadowbot_task12_task13_reusable_lessons.md)冻结黄金基线、最小差异、状态维度和禁止重写点。
 
 ## 9. 后续可复用资产
 
-完整清单见 [task12_reusable_assets.md](task12_reusable_assets.md)。优先复用：
+完整资产见[任务12—13可复用资产清单](task12_reusable_assets.md)，工程路径和
+重复失败门禁见[任务12—13复用路径与失败复盘](shadowbot_task12_task13_reusable_lessons.md)。优先复用：
 
 - v4 单次请求多商品合同、批次/逐项哈希和原有 v12 批次/逐项/技术回执账本；Runtime Schema v13 通过公共批次注册表继续兼容这些历史数据。
 - 文件队列原子发布、Worker 租约、phase、Importer、Watchdog 和归档。
@@ -464,6 +466,7 @@ Code Review 后的高中低风险问题已完成修复，系统冒烟测试、�
 - 每项提交后的独立回读和 `listing_status` 新鲜度保护。
 - 长驻 `test2` 生命周期记录和 `stop.signal → STOPPED → 关闭.flow` 收尾。
 - 成功动作基线、v4 编排、READ_ONLY 快照和状态回写测试。
+- v5 单次完整队列、两页父子快照、统一 action gate、跨动作写锁和共享批次终态语义。
 
 ## 10. 推荐验收命令
 

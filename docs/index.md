@@ -15,6 +15,7 @@
 - [reports/task12_development_report_20260723.md](reports/task12_development_report_20260723.md)：任务12开发成果、问题回溯、修复方法和防复发规则。
 - [reports/task12_evidence_index_20260723.md](reports/task12_evidence_index_20260723.md)：任务12代表性实机 Run ID、结果 SHA-256、归档位置和审查核对项。
 - [task12_reusable_assets.md](task12_reusable_assets.md)：后续任务可直接复用的代码、合同、测试、运行流程和安全门禁。
+- [shadowbot_task12_task13_reusable_lessons.md](shadowbot_task12_task13_reusable_lessons.md)：任务12与任务13的标准扩展路径、重复失败根因、防复发门禁和任务14前置清单。
 - [plans/task13_ui_discovery_report.md](plans/task13_ui_discovery_report.md)：任务13 T13-0 已接受的无副作用页面结构、选择器规律和重复身份风险。
 - [plans/task13_t13_1_contract_freeze.md](plans/task13_t13_1_contract_freeze.md)：任务13 T13-1 四维状态模型、v5 合同、action gate 和两阶段副作用冻结。
 - [../任务13_单平台商品上下架与状态对账闭环_交接与实施计划.md](../任务13_单平台商品上下架与状态对账闭环_交接与实施计划.md)：任务13原始交接与实施计划；用于追溯阶段和完成定义，不覆盖最终交接事实。
@@ -126,18 +127,19 @@ Code Review 后高中低风险问题已完成修复，系统冒烟测试、全�
 - 已完成 `ShadowBotExecutor`、v4 批次账本、常驻文件队列 runner、Result Importer、Queue Watchdog、自动只读对账和 Web 队列状态入口。
 - 已完成 8 小时 READ_ONLY 常驻 Worker 连续运行验收；长期证据归档和运营告警闭环仍待完成。
 - 已完成提交意图后 `stop.signal` 实机验收，以及真实商品 `COMMIT -> UNKNOWN -> 自动 RECONCILE -> VERIFIED` 验收。
-- 任务13已完成独立两页 SYNC_STATUS、单商品往返、正常多商品上下架、整批预检零写、严格串行 UNKNOWN、`UNKNOWN -> 唯一自动 RECONCILE -> VERIFIED`、`UNKNOWN -> 唯一自动 RECONCILE -> NOT_APPLIED`、`ALREADY_APPLIED` 0 写点击、跨动作共享写锁、phase/result 恢复、Web 运营投影、最终本地回归和交接报告；任务13总状态仍等待 GitHub CI 与人工审查。
+- 任务13已完成独立两页 SYNC_STATUS、单商品往返、正常多商品上下架、整批预检零写、严格串行 UNKNOWN、`UNKNOWN -> 唯一自动 RECONCILE -> VERIFIED`、`UNKNOWN -> 唯一自动 RECONCILE -> NOT_APPLIED`、`ALREADY_APPLIED` 0 写点击、跨动作共享写锁、phase/result 恢复、Web 运营投影、最终本地回归和交接报告；PR #19 审查修复和 Windows/Linux Core 已通过。本轮文档整理不代替审查方执行合并或任务状态变更。
 - 最终暖态四商品批次 4/4 `VERIFIED`，总用时 `51.094 秒`；READ_ONLY 完整页面结束标记样本为 1 次扫描、0 次滚动、`27.445 秒`。
 - 暂不承诺无人值守生产改价。
 
 下一步优先级：
 
 1. 任务12审查修复已通过 PR #18 合并；其 v4 改价链路继续作为任务13和后续任务的稳定基线。
-2. 任务13计划中的实现、受控实机验收、最终本地回归和交接报告均已覆盖；下一步通过独立 GitHub PR 运行 CI 并交由审查方复核，任务状态仍不修改。
+2. 任务13计划中的实现、受控实机验收、最终本地回归、PR #19 审查修复和双平台 CI 均已覆盖；后续合并与任务状态由审查方处理。
 3. 任务14实现统一任务审查和正式调度授权；在此之前继续保持显式 `task_id` 门禁。
 4. 补充长期告警、磁盘清理、证据保留和服务账号运维样本，并分别定义冷态/暖态耗时口径。
 5. 为元素版本漂移和白屏建立可重复的专用测试夹具；登录、网络和证据上传失败的实机故障注入已经完成。
 6. 持续运行系统冒烟和 ShadowBot 成功基线测试，避免后续任务重写已验证 COMMIT 链路。
+7. 任务14开始前按[任务12—13复用路径与失败复盘](shadowbot_task12_task13_reusable_lessons.md)建立黄金基线卡、最小差异和禁止重写清单。
 
 当前不优先做：
 

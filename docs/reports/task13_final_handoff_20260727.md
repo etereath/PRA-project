@@ -14,6 +14,12 @@
 > 本报告不修改任务13状态。只有 GitHub CI、代码审查、证据复核和运行边界均通过
 > 后，审查方才应决定是否将任务13标记为完成。
 
+审查后接续（2026-07-28）：PR #19 COMMENT Review 的任务载荷事务复核、Review
+复核、发布失败账本和 v5 批次终态统一修复已完成。最终修复 Head 为
+`65232e2af9fde3fd446c8ecfa3ab1c619036fcda`，本地完整回归为
+`679 passed, 3 skipped, 97 subtests passed`，GitHub Windows Core 与
+Linux Core 均通过。本接续记录不代替审查方执行合并或任务状态变更。
+
 ## 1. 交接结论
 
 任务13已经形成从任务中心到真实平台的单平台上下架与状态对账闭环：
@@ -227,10 +233,16 @@ UNKNOWN/RECONCILE 账本、历史写锁保留、外键完整性和失败事务�
 
 ## 7. 自动化回归和 CI
 
-最终本地完整回归：
+首次交接冻结时的本地完整回归为：
 
 ```text
 664 passed, 3 skipped, 97 subtests passed
+```
+
+PR #19 COMMENT Review 修复后的最终本地完整回归为：
+
+```text
+679 passed, 3 skipped, 97 subtests passed
 ```
 
 全部任务12/13脱敏证据校验器通过，包括：
@@ -257,8 +269,9 @@ Windows/Linux 间转换换行符后破坏 `mapping_source_version` 的 SHA-256
 - UTF-8/UTF-8-SIG 编码自检；
 - `git diff --check`。
 
-PR 创建后仍必须等待 GitHub Windows Core、Linux Core、wheel、smoke、打包审计和
-证据复算全部通过；本报告不把本地测试替代为远端 CI 结论。
+PR #19 当前最终修复 Head 的 GitHub Windows Core 和 Linux Core 均已通过；
+PR 描述已同步最终 Head、测试数量、实机证据范围和任务14前的显式 `task_id`
+边界。本报告仍区分本地测试、远端 CI 和实机副作用证据，三者不能互相替代。
 
 ## 8. Worker 最终运行状态
 
@@ -346,3 +359,6 @@ Worker 继续按长期监听规范运行。该记录只是最后一次已核实�
 - 长期 Worker 生命周期和正常/异常恢复规范。
 
 后续不得为了接入自动调度而重写已验收的上架、下架、改价或 RECONCILE 动作链路。
+任务14及后续开发还必须遵守
+[任务12—13复用路径与失败复盘](../shadowbot_task12_task13_reusable_lessons.md)
+中的黄金基线、最小差异、事务复核、共享终态语义和防复发清单。
