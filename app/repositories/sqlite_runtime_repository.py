@@ -1002,6 +1002,15 @@ SCHEMA_V14_SQL = [
         supersedes_policy_version TEXT,
         CHECK (policy_version <> ''),
         CHECK (
+            time(peak_start_local_time) IS NOT NULL
+            AND time(platform_cutoff_local_time) IS NOT NULL
+            AND time(seller_cutoff_local_time) IS NOT NULL
+            AND time(peak_start_local_time)
+                < time(platform_cutoff_local_time)
+            AND time(platform_cutoff_local_time)
+                < time(seller_cutoff_local_time)
+        ),
+        CHECK (
             julianday(effective_from) IS NOT NULL
             AND (
                 substr(effective_from, -6) = '+00:00'
@@ -1757,6 +1766,19 @@ SCHEMA_V14_SQL = [
         SELECT RAISE(
             ABORT,
             'MANUAL and AUTOMATION tasks require an origin_ref_id'
+        );
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_tasks_origin_immutable
+    BEFORE UPDATE OF origin_type, origin_ref_id ON tasks
+    FOR EACH ROW
+    WHEN NEW.origin_type IS NOT OLD.origin_type
+      OR NEW.origin_ref_id IS NOT OLD.origin_ref_id
+    BEGIN
+        SELECT RAISE(
+            ABORT,
+            'task origin identity is immutable after creation'
         );
     END
     """,
@@ -2728,6 +2750,13 @@ class SQLiteRuntimeRepository:
                 _migrate_trade_day_summary_inputs_manifest_dimension(
                     connection
                 )
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET origin_type = 'LEGACY'
+                    WHERE origin_type IS NULL OR origin_type = ''
+                    """
+                )
                 for statement in SCHEMA_V14_SQL:
                     connection.execute(statement)
                 connection.execute(
@@ -2760,14 +2789,6 @@ class SQLiteRuntimeRepository:
                     "CN_SINGLE_PLATFORM_2026_V1",
                 ),
             )
-                connection.execute(
-                    """
-                    UPDATE tasks
-                    SET origin_type = 'LEGACY'
-                    WHERE origin_type IS NULL OR origin_type = ''
-                    """
-                )
-
                 for version in range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1):
                     connection.execute(
                         """
@@ -3147,6 +3168,147 @@ class SQLiteRuntimeRepository:
         """Alias used by HTTP/CLI health-check adapters."""
 
         return self.check_schema_health()
+
+    def replace_current_operational_time_policy(
+        self,
+        *,
+        expected_current_policy_version: str,
+        successor_policy_version: str,
+        effective_from: datetime,
+        platform_cutoff_local_time: str,
+        seller_cutoff_local_time: str,
+        peak_start_local_time: str,
+        created_by: str,
+        timezone_name: str = "Asia/Shanghai",
+    ) -> None:
+        """Atomically close the current policy and install its successor."""
+
+        expected_version = str(expected_current_policy_version).strip()
+        successor_version = str(successor_policy_version).strip()
+        normalized_created_by = str(created_by).strip()
+        normalized_timezone = str(timezone_name).strip()
+        cutoff_values = tuple(
+            str(value).strip()
+            for value in (
+                platform_cutoff_local_time,
+                seller_cutoff_local_time,
+                peak_start_local_time,
+            )
+        )
+        if not expected_version:
+            raise ValueError(
+                "expected_current_policy_version must not be blank"
+            )
+        if not successor_version:
+            raise ValueError("successor_policy_version must not be blank")
+        if successor_version == expected_version:
+            raise ValueError(
+                "successor_policy_version must differ from the current policy"
+            )
+        if not normalized_created_by:
+            raise ValueError("created_by must not be blank")
+        if any(not value for value in cutoff_values):
+            raise ValueError("operational cutoff times must not be blank")
+        if effective_from.tzinfo is None or effective_from.utcoffset() is None:
+            raise ValueError("effective_from must be timezone-aware")
+        effective_from_utc = effective_from.astimezone(timezone.utc)
+        effective_from_text = effective_from_utc.isoformat()
+
+        def replace_policy() -> None:
+            connection = self.connect_write()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                current_rows = connection.execute(
+                    """
+                    SELECT policy_version, timezone_name
+                    FROM operational_time_policies
+                    WHERE effective_to IS NULL
+                    ORDER BY policy_version
+                    """
+                ).fetchall()
+                if len(current_rows) != 1:
+                    raise RuntimeError(
+                        "operational time policy replacement requires "
+                        "exactly one current policy"
+                    )
+                current_version = str(current_rows[0]["policy_version"])
+                current_timezone = str(current_rows[0]["timezone_name"])
+                if current_version != expected_version:
+                    raise ValueError(
+                        "current operational time policy changed: "
+                        f"expected {expected_version}, found {current_version}"
+                    )
+                if current_timezone != normalized_timezone:
+                    raise ValueError(
+                        "successor timezone must match the current policy"
+                    )
+
+                updated = connection.execute(
+                    """
+                    UPDATE operational_time_policies
+                    SET effective_to = ?
+                    WHERE policy_version = ?
+                      AND effective_to IS NULL
+                    """,
+                    (effective_from_text, expected_version),
+                )
+                if updated.rowcount != 1:
+                    raise RuntimeError(
+                        "current operational time policy could not be closed"
+                    )
+
+                connection.execute(
+                    """
+                    INSERT INTO operational_time_policies(
+                        policy_version, timezone_name,
+                        platform_cutoff_local_time,
+                        seller_cutoff_local_time,
+                        peak_start_local_time,
+                        effective_from, effective_to,
+                        created_at, created_by,
+                        supersedes_policy_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+                    """,
+                    (
+                        successor_version,
+                        normalized_timezone,
+                        cutoff_values[0],
+                        cutoff_values[1],
+                        cutoff_values[2],
+                        effective_from_text,
+                        _datetime_to_text(self._clock()),
+                        normalized_created_by,
+                        expected_version,
+                    ),
+                )
+                current_after = connection.execute(
+                    """
+                    SELECT policy_version
+                    FROM operational_time_policies
+                    WHERE effective_to IS NULL
+                    """
+                ).fetchall()
+                if (
+                    len(current_after) != 1
+                    or str(current_after[0]["policy_version"])
+                    != successor_version
+                ):
+                    raise RuntimeError(
+                        "operational time policy replacement did not leave "
+                        "exactly one expected current policy"
+                    )
+                connection.commit()
+            except Exception:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        self._run_sqlite_retry(
+            replace_policy,
+            operation_name="operational time policy replacement",
+        )
 
     def insert_tasks(self, tasks: Iterable[Task]) -> int:
         task_rows = list(tasks)

@@ -1474,6 +1474,11 @@ def _check_v14_constraints(
             "AUTOMATION",
             "origin_ref_id",
         ),
+        "trg_tasks_origin_immutable": (
+            "origin_type",
+            "origin_ref_id",
+            "immutable",
+        ),
     }
     for table_name in V14_APPEND_ONLY_TABLES:
         required_triggers[
@@ -1670,7 +1675,7 @@ def _check_v14_constraints(
         """
         SELECT timezone_name, platform_cutoff_local_time,
                seller_cutoff_local_time, peak_start_local_time,
-               effective_to
+               effective_from, supersedes_policy_version
         FROM operational_time_policies
         WHERE policy_version = 'CN_SINGLE_PLATFORM_2026_V1'
         """
@@ -1680,12 +1685,13 @@ def _check_v14_constraints(
         "18:00:00",
         "20:00:00",
         "16:00:00",
+        "2025-12-31T16:00:00+00:00",
         None,
     )
     if policy_row is None or tuple(policy_row) != expected_policy:
         errors.append(
             "CN_SINGLE_PLATFORM_2026_V1 operational time policy is missing "
-            "or has incorrect frozen cutoffs"
+            "or has incorrect frozen semantics"
         )
 
     return tuple(sorted(missing_indexes))

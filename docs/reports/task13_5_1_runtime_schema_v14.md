@@ -103,13 +103,19 @@ LEGACY
 `Task` 模型不再提供隐式 `MANUAL` 默认值；规则、预测和 proposal 生成路径显式使用
 `AUTOMATION` 并绑定来源运行，人工 Workbook 导入显式使用 `MANUAL`。当前 Web/CLI
 没有独立的 Task 构造旁路，后续入口也必须通过模型的必填来源门禁。
+`origin_type/origin_ref_id` 创建后由数据库触发器保持不可变，不能把普通任务改写为
+另一入口、`LEGACY` 或 `SYSTEM_EMERGENCY`。父 Issue 的 `MANUAL_WEB`、
+`AUTOMATION_SCAN` 等细分语义由 `MANUAL/AUTOMATION` 与 `web:/scan:` 等不可变
+引用前缀组合表达。
 任务 Workbook 导出/导入保留来源和授权字段；缺少这些列的旧 Workbook 只标记为
 `LEGACY`，不猜测为人工任务。
 `SYSTEM_EMERGENCY` 仍等待 13.5-6 的专用策略、授权与实机门禁。
 
 时间策略版本创建后不可改写或删除；唯一允许的 UPDATE 是把当前版本的
 `effective_to` 从 NULL 关闭为合法 UTC 时间。后继版本必须指向被替代版本并从同一
-边界相邻开始，已关闭版本不得重新打开。
+边界相邻开始，已关闭版本不得重新打开。关闭与新增只能通过原子替换入口在同一个
+`BEGIN IMMEDIATE` 事务内完成；后继插入失败会回滚旧策略关闭，并发替换最多一个
+成功，替换后 health 必须继续通过。
 
 ### 1.5 Automation 与 Incident 冻结集合
 
@@ -133,7 +139,8 @@ RESOLVED / CLOSED`；`resolved_at` 与 `RESOLVED/CLOSED` 双向一致。
 - v4/v5 批次、operation/attempt、写锁、UNKNOWN、receipt、ACK、
   v13 两页快照和异常表保持原语义。
 - 精确健康检查覆盖 v14 表、列、索引、外键、冻结枚举、当前唯一索引、
-  三个日结触发器、时间策略防重叠触发器和 UTC 策略种子。
+  三个日结触发器、时间策略防重叠/不可变触发器、任务来源不可变触发器和 UTC
+  策略种子。
 
 真实库迁移必须按
 [Runtime Schema v14 迁移运行手册](../runtime_schema_v14_migration.md)
@@ -151,7 +158,7 @@ RESOLVED / CLOSED`；`resolved_at` 与 `RESOLVED/CLOSED` 双向一致。
 
 ```text
 完整 pytest：
-739 passed, 3 skipped, 97 subtests passed
+744 passed, 3 skipped, 97 subtests passed
 
 系统冒烟：
 16 passed, 0 failed
@@ -165,9 +172,12 @@ secret_scan=PASS
 
 - 六个时间边界、UTC 输入和 naive datetime 拒绝。
 - 策略版本切换、区间重叠拒绝和等价时区输入 UTC 归一化。
+- 策略原子替换、后继插入失败整体回滚、并发替换单一成功和替换后 health。
 - 新库 v14、v13→v14、v12→最新版本和重复迁移。
 - 迁移中途失败的事务回滚和外键恢复。
 - LEGACY 历史任务回填且不猜双日期。
+- 任务来源创建后不可变，拒绝改写入口、迁移为 LEGACY 或提升为
+  SYSTEM_EMERGENCY。
 - 非法来源/质量组合、UNAVAILABLE 非零和 current 冲突。
 - 跳级、回退、直接 FINAL 和 FINAL 内容修改拒绝。
 - FINAL 全业务身份不可变和同事务 Incident 阻断。

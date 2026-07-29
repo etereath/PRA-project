@@ -58,10 +58,12 @@ PRAGMA integrity_check = ok
 
 同时抽查：
 
-- `CN_SINGLE_PLATFORM_2026_V1` 为唯一当前时间策略。
+- 首次迁移时 `CN_SINGLE_PLATFORM_2026_V1` 为唯一当前时间策略；后续替换后仍应
+  恰有一个当前策略，且 V1 的冻结语义保持不变。
 - 时间策略 `effective_from/effective_to` 使用 UTC，区间无重叠。
-- 时间策略禁止删除或原地改写；只允许关闭当前 `effective_to`，随后新增
-  `effective_from` 相邻且显式 supersedes 的后继版本。
+- 时间策略禁止删除或原地改写；替换只能通过原子 Repository/Service 入口，在同一个
+  `BEGIN IMMEDIATE` 中关闭当前策略并新增 `effective_from` 相邻且显式 supersedes
+  的后继版本，失败必须整体回滚。
 - Automation 状态包含 `SUCCESS/MERGED/SKIPPED` 且不接受 `SUCCEEDED`。
 - Incident `category`、状态和 `resolved_at` 一致性 CHECK 生效。
 - 历史任务 `origin_type=LEGACY`。
@@ -73,7 +75,8 @@ PRAGMA integrity_check = ok
 - v14 观察事实、销售估算、日结事件和带 manifest 维度的日结输入均为
   append-only，数据库拒绝 UPDATE/DELETE。
 - 新建 `MANUAL/AUTOMATION` 任务必须具有非空 `origin_ref_id`；旧任务仍按
-  `LEGACY` 无猜测迁移。
+  `LEGACY` 无猜测迁移。任务创建后 `origin_type/origin_ref_id` 均不可修改，不能
+  通过 UPDATE 获得 `LEGACY` 或 `SYSTEM_EMERGENCY`。
 
 ### 3.4 切换
 

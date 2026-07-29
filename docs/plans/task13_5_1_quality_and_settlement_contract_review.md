@@ -414,7 +414,10 @@ Schema 和 Service 都必须拒绝策略区间重叠，业务日期仍统一按 
 策略记录禁止删除；创建后唯一允许的 UPDATE 是把当前版本的 `effective_to` 从 NULL
 关闭为合法 UTC 时间。已关闭版本不得重新打开或二次修改；后继版本必须通过
 `supersedes_policy_version` 指向旧版本，并以旧版本 `effective_to` 作为相邻
-`effective_from`。
+`effective_from`。业务代码不得分别提交“关闭旧策略”和“新增后继策略”，只能调用
+唯一的策略替换 Repository/Service 入口；该入口必须在同一个 `BEGIN IMMEDIATE`
+事务内确认唯一当前策略、关闭旧策略、插入相邻后继、再次确认恰有一个当前策略后
+提交，任一步失败都整体回滚。并发替换必须最多一个成功。
 
 ### 8.2 Automation 核心
 
@@ -537,7 +540,16 @@ LEGACY
 proposal 路径使用 `AUTOMATION` 并绑定生成运行或规则引用；Workbook/Web/CLI
 人工入口使用 `MANUAL` 并保存可追溯入口引用。模型、Workbook、Repository 和数据库
 触发器统一拒绝缺少 `origin_ref_id` 的 `MANUAL` 或 `AUTOMATION` 新任务；历史数据
-继续使用 `LEGACY`，不得伪造来源。
+继续使用 `LEGACY`，不得伪造来源。`origin_type` 与 `origin_ref_id` 是创建时审计
+身份，写入后不得修改；因此通用 UPDATE 不能把普通任务提升为
+`SYSTEM_EMERGENCY`，也不能把新任务改写成 `LEGACY`。
+
+父计划中的细分来源语义通过粗粒度枚举和不可变引用前缀实现：
+
+- `MANUAL_WEB / MANUAL_CLI` → `MANUAL + web:/cli:`；
+- `AUTOMATION_RULE / AUTOMATION_SCAN` → `AUTOMATION + rule:/scan:`；
+- `SYSTEM_RECONCILE` → `AUTOMATION + reconcile:`；
+- `SYSTEM_EMERGENCY / LEGACY` 保持独立枚举。
 
 ## 9. 决策 D7：迁移与回滚
 

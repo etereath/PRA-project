@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -210,6 +212,83 @@ def test_v14_database_rejects_invalid_task_origin(
                         origin_type,
                     ),
                 )
+
+
+def test_v14_task_origin_is_immutable_after_creation(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    task = Task(
+        task_id="TASK-IMMUTABLE-ORIGIN",
+        internal_sku="SKU-1",
+        platform_name="platform",
+        action_type=TaskActionType.MANUAL_REVIEW,
+        priority=10,
+        task_status=TaskStatus.PENDING,
+        created_at=datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc),
+        origin_type=TaskOriginType.MANUAL,
+        origin_ref_id="web:request-1",
+    )
+    assert repository.insert_task(task) == 1
+
+    with closing(repository.connect_write()) as connection:
+        for statement, parameters in (
+            (
+                """
+                UPDATE tasks
+                SET origin_ref_id = ?
+                WHERE task_id = ?
+                """,
+                ("cli:run-2", task.task_id),
+            ),
+            (
+                """
+                UPDATE tasks
+                SET origin_type = ?, origin_ref_id = ?
+                WHERE task_id = ?
+                """,
+                (
+                    TaskOriginType.SYSTEM_EMERGENCY.value,
+                    "emergency:forged",
+                    task.task_id,
+                ),
+            ),
+            (
+                """
+                UPDATE tasks
+                SET origin_type = ?, origin_ref_id = NULL
+                WHERE task_id = ?
+                """,
+                (TaskOriginType.LEGACY.value, task.task_id),
+            ),
+        ):
+            with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                connection.execute(statement, parameters)
+            connection.rollback()
+
+        connection.execute(
+            """
+            UPDATE tasks
+            SET result_message = 'allowed non-origin update'
+            WHERE task_id = ?
+            """,
+            (task.task_id,),
+        )
+        connection.commit()
+        row = connection.execute(
+            """
+            SELECT origin_type, origin_ref_id, result_message
+            FROM tasks
+            WHERE task_id = ?
+            """,
+            (task.task_id,),
+        ).fetchone()
+
+    assert tuple(row) == (
+        TaskOriginType.MANUAL.value,
+        "web:request-1",
+        "allowed non-origin update",
+    )
 
 
 @pytest.mark.parametrize(
@@ -484,6 +563,144 @@ def test_v14_time_policy_rejects_overlap_after_adjacent_chain(
             )
 
 
+def test_v14_time_policy_replacement_is_atomic_and_healthy(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    effective_from = datetime(
+        2026,
+        7,
+        29,
+        10,
+        0,
+        tzinfo=timezone.utc,
+    )
+
+    repository.replace_current_operational_time_policy(
+        expected_current_policy_version="CN_SINGLE_PLATFORM_2026_V1",
+        successor_policy_version="V2",
+        effective_from=effective_from,
+        platform_cutoff_local_time="18:00:00",
+        seller_cutoff_local_time="20:00:00",
+        peak_start_local_time="16:00:00",
+        created_by="test-harness:policy-replacement",
+    )
+
+    with closing(repository.connect_read()) as connection:
+        rows = connection.execute(
+            """
+            SELECT policy_version, effective_from, effective_to,
+                   supersedes_policy_version
+            FROM operational_time_policies
+            ORDER BY effective_from
+            """
+        ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        (
+            "CN_SINGLE_PLATFORM_2026_V1",
+            "2025-12-31T16:00:00+00:00",
+            effective_from.isoformat(),
+            None,
+        ),
+        (
+            "V2",
+            effective_from.isoformat(),
+            None,
+            "CN_SINGLE_PLATFORM_2026_V1",
+        ),
+    ]
+    assert repository.check_schema_health().ok
+
+
+def test_v14_time_policy_replacement_rolls_back_on_successor_failure(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        repository.replace_current_operational_time_policy(
+            expected_current_policy_version="CN_SINGLE_PLATFORM_2026_V1",
+            successor_policy_version="V2",
+            effective_from=datetime(
+                2026,
+                7,
+                29,
+                10,
+                0,
+                tzinfo=timezone.utc,
+            ),
+            platform_cutoff_local_time="21:00:00",
+            seller_cutoff_local_time="20:00:00",
+            peak_start_local_time="16:00:00",
+            created_by="test-harness:policy-failure",
+        )
+
+    with closing(repository.connect_read()) as connection:
+        rows = connection.execute(
+            """
+            SELECT policy_version, effective_to
+            FROM operational_time_policies
+            ORDER BY policy_version
+            """
+        ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        ("CN_SINGLE_PLATFORM_2026_V1", None)
+    ]
+    assert repository.check_schema_health().ok
+
+
+def test_v14_concurrent_time_policy_replacement_has_one_winner(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    barrier = Barrier(2)
+
+    def replace(version: str) -> tuple[str, str]:
+        barrier.wait()
+        try:
+            repository.replace_current_operational_time_policy(
+                expected_current_policy_version=(
+                    "CN_SINGLE_PLATFORM_2026_V1"
+                ),
+                successor_policy_version=version,
+                effective_from=datetime(
+                    2026,
+                    7,
+                    29,
+                    10,
+                    0,
+                    tzinfo=timezone.utc,
+                ),
+                platform_cutoff_local_time="18:00:00",
+                seller_cutoff_local_time="20:00:00",
+                peak_start_local_time="16:00:00",
+                created_by=f"test-harness:{version}",
+            )
+        except ValueError as exc:
+            return ("rejected", str(exc))
+        return ("success", version)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(replace, ("V2-A", "V2-B")))
+
+    successes = [value for status, value in results if status == "success"]
+    rejections = [value for status, value in results if status == "rejected"]
+    assert len(successes) == 1
+    assert len(rejections) == 1
+    assert "current operational time policy changed" in rejections[0]
+
+    with closing(repository.connect_read()) as connection:
+        current_rows = connection.execute(
+            """
+            SELECT policy_version
+            FROM operational_time_policies
+            WHERE effective_to IS NULL
+            """
+        ).fetchall()
+    assert [str(row["policy_version"]) for row in current_rows] == successes
+    assert repository.check_schema_health().ok
+
+
 def test_v14_observation_and_summary_fact_tables_are_append_only(
     tmp_path: Path,
 ) -> None:
@@ -742,6 +959,22 @@ def test_v14_health_detects_missing_append_only_trigger(
     )
 
 
+def test_v14_health_detects_missing_task_origin_immutable_trigger(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    trigger_name = "trg_tasks_origin_immutable"
+    with closing(repository.connect_write()) as connection, connection:
+        connection.execute(f"DROP TRIGGER {trigger_name}")
+
+    health = repository.check_schema_health()
+
+    assert not health.ok
+    assert any(
+        trigger_name in error for error in health.constraint_errors
+    )
+
+
 def test_v13_to_v14_migration_backfills_legacy_without_guessing_dates(
     tmp_path: Path,
 ) -> None:
@@ -937,6 +1170,9 @@ def _downgrade_fixture_to_v13(
             )
             connection.execute(
                 "DROP TRIGGER IF EXISTS trg_tasks_traceable_origin_update"
+            )
+            connection.execute(
+                "DROP TRIGGER IF EXISTS trg_tasks_origin_immutable"
             )
             for column in V14_TASK_COLUMNS:
                 connection.execute(

@@ -382,15 +382,28 @@ supporting_observation_ids
 入口使用 `web:`、`cli:`、`workbook:`、`acceptance:` 等可追溯前缀，测试工具使用
 `test-harness:`。历史记录缺少结构化来源时只标记 `LEGACY`，不得猜测。
 
-`origin_type` 只能取：
+核心 `origin_type` 只能取：
 
-- `MANUAL_WEB`
-- `MANUAL_CLI`
-- `AUTOMATION_RULE`
-- `AUTOMATION_SCAN`
+- `MANUAL`
+- `AUTOMATION`
 - `SYSTEM_EMERGENCY`
-- `SYSTEM_RECONCILE`
 - `LEGACY`
+
+Issue #20 中的细分来源名称是运营语义，不扩张为第二套数据库枚举，固定映射为：
+
+| 运营语义 | 核心来源 |
+| --- | --- |
+| `MANUAL_WEB` | `MANUAL + web:<request-or-form-id>` |
+| `MANUAL_CLI` | `MANUAL + cli:<command-run-id>` |
+| `AUTOMATION_RULE` | `AUTOMATION + rule:<rule-or-run-id>` |
+| `AUTOMATION_SCAN` | `AUTOMATION + scan:<automation-run-id>` |
+| `SYSTEM_RECONCILE` | `AUTOMATION + reconcile:<execution-attempt-id>` |
+| `SYSTEM_EMERGENCY` | `SYSTEM_EMERGENCY + emergency:<authorized-run-id>` |
+| `LEGACY` | `LEGACY + NULL` |
+
+`origin_type` 与 `origin_ref_id` 创建后均不可修改。通用 Repository 不得新建
+`LEGACY` 或 `SYSTEM_EMERGENCY`；数据库不可通过 UPDATE 把既有任务改成这两种来源。
+`SYSTEM_EMERGENCY` 仍只能由 13.5-6 的专用授权入口创建。
 
 自动化运行使用 `automation_jobs`、`automation_runs`、`automation_run_events` 和
 `automation_run_links` 独立建模。扫描不是普通任务；只有扫描或规则产生的业务处置才
