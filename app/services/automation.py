@@ -113,30 +113,12 @@ class AutomationExecutionContext:
         child_job = self.repository.get_job(child_job_id)
         if child_job is None:
             raise ValueError("Child automation job does not exist")
-        if child_job.schedule_kind != CHILD_ONLY:
-            raise ValueError("Child automation job must use CHILD_ONLY")
-        parent = self.claim.run
-        scheduled_for = parent.scheduled_for
-        child_context = self.operational_time.classify(scheduled_for)
-        child_run, created = self.repository.ensure_run(
-            job=child_job,
-            scheduled_for=scheduled_for,
-            time_context=child_context,
-            initial_status=AutomationRunStatus.SCHEDULED,
-            now=self.clock(),
-            logical_run_key=(
-                f"{parent.logical_run_key}:child:{child_job.job_id}"
-            ),
-            event_type="CHILD_RUN_SCHEDULED",
-            event_payload={"parent_run_id": parent.run_id},
-        )
-        self.repository.ensure_link(
-            parent_run_id=parent.run_id,
-            child_run_id=child_run.run_id,
+        return self.repository.ensure_child_run_fenced(
+            self.claim,
+            child_job,
             relation_type=relation_type,
             now=self.clock(),
         )
-        return child_run, created
 
 
 class AutomationSchedulePlanner:
@@ -161,7 +143,6 @@ class AutomationSchedulePlanner:
         missed_ids: list[str] = []
         merged_ids: list[str] = []
         truncated_total = 0
-        considered_runs: list[AutomationRun] = []
 
         for job in self.repository.list_jobs(enabled_only=True):
             if job.schedule_kind == CHILD_ONLY:
@@ -177,6 +158,12 @@ class AutomationSchedulePlanner:
             )
             truncated_total += truncated
             if not windows:
+                missed_ids.extend(
+                    self.repository.reconcile_scheduled_runs_for_job(
+                        job,
+                        now=current,
+                    )
+                )
                 continue
             statuses = _window_statuses(job, len(windows))
             max_lateness = job.config.get("max_lateness_seconds")
@@ -236,7 +223,6 @@ class AutomationSchedulePlanner:
                     },
                 )
                 first_run = first_run or run
-                considered_runs.append(run)
                 if created:
                     created_ids.append(run.run_id)
                     if initial_status is AutomationRunStatus.MISSED:
@@ -251,10 +237,22 @@ class AutomationSchedulePlanner:
                         "max_windows_per_job": self.max_windows_per_job,
                     },
                 )
+            missed_ids.extend(
+                self.repository.reconcile_scheduled_runs_for_job(
+                    job,
+                    now=current,
+                )
+            )
 
         by_platform: dict[str, list[AutomationRun]] = {}
-        for run in considered_runs:
-            if run.run_status is AutomationRunStatus.SCHEDULED:
+        for run in self.repository.list_runs(
+            statuses=(AutomationRunStatus.SCHEDULED,)
+        ):
+            if run.job_type in {
+                ONLINE_PULSE,
+                FULL_MARKET_SCAN,
+                PRE_CUTOFF_FULL_SCAN,
+            }:
                 by_platform.setdefault(run.platform_name, []).append(run)
         for platform_runs in by_platform.values():
             full_runs = [
@@ -334,7 +332,13 @@ class AutomationService:
             raise ValueError("max_runs_per_cycle must be positive")
         self.repository = repository
         self.handlers = dict(handlers or {})
-        self.operational_time = operational_time or OperationalTimeService()
+        self._reload_operational_time = operational_time is None
+        self.operational_time = (
+            operational_time
+            or OperationalTimeService(
+                policies=repository.load_operational_time_policies()
+            )
+        )
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.owner_token = owner_token or f"automation-{uuid4().hex}"
         self.lease_seconds = lease_seconds
@@ -346,22 +350,29 @@ class AutomationService:
         )
 
     def run_cycle(self) -> AutomationCycleResult:
+        if self._reload_operational_time:
+            self.operational_time = OperationalTimeService(
+                policies=self.repository.load_operational_time_policies()
+            )
+            self.planner.operational_time = self.operational_time
         scheduled = self.planner.materialize(now=self.clock())
         allowed_job_types = set(self.handlers)
-        blocker = self.repository.active_ui_blocker()
-        if blocker:
-            allowed_job_types.difference_update(UI_JOB_TYPES)
 
         claimed_ids: list[str] = []
         completed_ids: list[str] = []
         errors: list[str] = []
+        blocker = ""
         for _ in range(self.max_runs_per_cycle):
-            claim = self.repository.claim_next(
-                owner_token=self.owner_token,
-                now=self.clock(),
-                lease_seconds=self.lease_seconds,
-                allowed_job_types=allowed_job_types,
+            claim, observed_blocker = (
+                self.repository.claim_next_with_ui_gate(
+                    owner_token=self.owner_token,
+                    now=self.clock(),
+                    lease_seconds=self.lease_seconds,
+                    allowed_job_types=allowed_job_types,
+                    ui_job_types=UI_JOB_TYPES,
+                )
             )
+            blocker = observed_blocker or blocker
             if claim is None:
                 break
             claimed_ids.append(claim.run.run_id)
@@ -384,13 +395,13 @@ class AutomationService:
                 outcome = AutomationRunOutcome(
                     status=AutomationRunStatus.FAILED,
                     error_code="AUTOMATION_HANDLER_TIMEOUT",
-                    error_message=_safe_error_message(exc),
+                    error_message=safe_automation_error_message(exc),
                 )
             except Exception as exc:
                 outcome = AutomationRunOutcome(
                     status=AutomationRunStatus.FAILED,
                     error_code="AUTOMATION_HANDLER_FAILED",
-                    error_message=_safe_error_message(exc),
+                    error_message=safe_automation_error_message(exc),
                 )
             completed = self.repository.finish_run(
                 context.claim,
@@ -472,6 +483,7 @@ def ensure_default_automation_jobs(
     for job in jobs:
         existing = repository.get_job(job.job_id)
         if existing is not None:
+            repository.validate_job_static_identity(job)
             stored.append(existing)
             continue
         stored.append(repository.upsert_job(job, now=current))
@@ -741,7 +753,7 @@ def _as_utc(value: datetime, field_name: str) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def _safe_error_message(error: BaseException) -> str:
+def safe_automation_error_message(error: BaseException) -> str:
     message = str(error).strip() or type(error).__name__
     message = re.sub(
         r"(?i)(?:[A-Z]:\\|\\\\)[^\s\"']+",

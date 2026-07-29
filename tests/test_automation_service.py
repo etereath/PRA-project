@@ -25,6 +25,7 @@ from app.repositories.automation_repository import AutomationRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.automation import (
     AutomationHeartbeatStore,
+    AutomationExecutionContext,
     AutomationSchedulePlanner,
     AutomationService,
     CHILD_ONLY,
@@ -33,10 +34,17 @@ from app.services.automation import (
     INTERVAL_MINUTES,
     LISTING_STATUS_SCAN,
     ONLINE_PULSE,
+    PLATFORM_TRADE_DAY_SETTLEMENT,
     ensure_default_automation_jobs,
 )
-from app.services.operational_time import OperationalTimeService
-from scripts.run_automation_service import ProcessFileLock
+from app.services.operational_time import (
+    DEFAULT_OPERATIONAL_TIME_POLICY_VERSION,
+    OperationalTimeService,
+)
+from scripts.run_automation_service import (
+    ProcessFileLock,
+    automation_service_lock_path,
+)
 
 
 PLATFORM = "蚂蚁花团供应商"
@@ -177,7 +185,7 @@ def test_sleep_records_missed_pulses_and_only_catches_latest_window(
 
     pulse_runs = repository.list_runs(job_id=pulse.job_id)
     full_runs = repository.list_runs(job_id=full.job_id)
-    assert len(result.missed_run_ids) == 5
+    assert len(result.missed_run_ids) == 6
     assert sum(
         run.run_status is AutomationRunStatus.MISSED
         for run in pulse_runs
@@ -187,10 +195,10 @@ def test_sleep_records_missed_pulses_and_only_catches_latest_window(
         for run in pulse_runs
     ) == 2
     assert len(full_runs) == 2
-    assert all(
-        run.run_status is AutomationRunStatus.SCHEDULED
-        for run in full_runs
-    )
+    assert [run.run_status for run in full_runs] == [
+        AutomationRunStatus.SCHEDULED,
+        AutomationRunStatus.MISSED,
+    ]
 
 
 def test_merge_never_crosses_platform_trade_date_cutoff(
@@ -248,7 +256,7 @@ def test_long_sleep_is_bounded_to_prevent_task_storm(
     result = planner.materialize(now=first_now + timedelta(days=1))
 
     assert len(result.created_run_ids) == 4
-    assert len(result.missed_run_ids) == 3
+    assert len(result.missed_run_ids) == 4
     assert result.truncated_window_count == 140
     runs = repository.list_runs(job_id=job.job_id)
     assert len(runs) == 5
@@ -257,6 +265,133 @@ def test_long_sleep_is_bounded_to_prevent_task_storm(
         event.event_type == "MISSED_WINDOWS_TRUNCATED"
         for event in events
     )
+
+
+def test_existing_scheduled_window_expires_without_a_new_due_window(
+    repository: AutomationRepository,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    job = AutomationJob(
+        job_id="DAILY",
+        job_type="DAILY_TEST",
+        display_name="每日测试",
+        enabled=True,
+        schedule_kind=DAILY_LOCAL_TIME,
+        schedule_expression="10:00",
+        priority=50,
+        config={
+            "platform_name": PLATFORM,
+            "catchup_policy": "LATEST_ONLY",
+            "max_lateness_seconds": 60,
+        },
+    )
+    _store_job(repository, job, now=now)
+    planner = AutomationSchedulePlanner(repository)
+    first = planner.materialize(now=now)
+    run_id = first.created_run_ids[0]
+
+    second = planner.materialize(now=now + timedelta(minutes=2))
+
+    assert second.created_run_ids == ()
+    assert second.missed_run_ids == (run_id,)
+    assert repository.get_run(
+        run_id
+    ).run_status is AutomationRunStatus.MISSED
+
+
+def test_restart_reconciles_preexisting_scheduled_merge_candidates(
+    repository: AutomationRepository,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    pulse_job = _store_job(
+        repository,
+        _job(job_id="PULSE", job_type=ONLINE_PULSE, priority=60),
+        now=now,
+    )
+    full_job = _store_job(
+        repository,
+        _job(
+            job_id="FULL",
+            job_type=FULL_MARKET_SCAN,
+            minutes=60,
+            priority=50,
+        ),
+        now=now,
+    )
+    pulse = _ensure_run(repository, pulse_job, scheduled_for=now)
+    full = _ensure_run(repository, full_job, scheduled_for=now)
+
+    result = AutomationSchedulePlanner(repository).materialize(now=now)
+
+    assert result.created_run_ids == ()
+    assert result.merged_run_ids == (pulse.run_id,)
+    assert repository.get_run(
+        pulse.run_id
+    ).run_status is AutomationRunStatus.MERGED
+    assert repository.list_links(child_run_id=pulse.run_id)[
+        0
+    ].parent_run_id == full.run_id
+
+
+def test_disabled_regular_job_is_not_claimed_but_expired_run_is_recovered(
+    repository: AutomationRepository,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    job = _store_job(
+        repository,
+        _job(job_id="PULSE", job_type=ONLINE_PULSE),
+        now=now,
+    )
+    scheduled = _ensure_run(repository, job, scheduled_for=now)
+    repository.upsert_job(
+        AutomationJob(
+            job_id=job.job_id,
+            job_type=job.job_type,
+            display_name=job.display_name,
+            enabled=False,
+            schedule_kind=job.schedule_kind,
+            schedule_expression=job.schedule_expression,
+            priority=job.priority,
+            config=job.config,
+        ),
+        now=now,
+    )
+    assert repository.claim_next(
+        owner_token="owner",
+        now=now,
+        lease_seconds=10,
+        allowed_job_types=[ONLINE_PULSE],
+    ) is None
+
+    repository.upsert_job(job, now=now)
+    first = repository.claim_run(
+        run_id=scheduled.run_id,
+        owner_token="first",
+        now=now,
+        lease_seconds=10,
+    )
+    assert first is not None
+    repository.upsert_job(
+        AutomationJob(
+            job_id=job.job_id,
+            job_type=job.job_type,
+            display_name=job.display_name,
+            enabled=False,
+            schedule_kind=job.schedule_kind,
+            schedule_expression=job.schedule_expression,
+            priority=job.priority,
+            config=job.config,
+        ),
+        now=now,
+    )
+    recovered = repository.claim_next(
+        owner_token="second",
+        now=now + timedelta(seconds=11),
+        lease_seconds=10,
+        allowed_job_types=[ONLINE_PULSE],
+    )
+    assert recovered is not None
+    assert recovered.reclaimed is True
 
 
 def test_run_claim_is_single_owner_until_lease_expires(
@@ -543,6 +678,255 @@ def test_full_scan_handler_can_create_idempotent_child_run_and_link(
     ]
 
 
+def test_expired_or_reclaimed_parent_cannot_create_orphan_child(
+    repository: AutomationRepository,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    parent_job = _store_job(
+        repository,
+        _job(
+            job_id="FULL",
+            job_type=FULL_MARKET_SCAN,
+            minutes=60,
+        ),
+        now=now,
+    )
+    child_job = _store_job(
+        repository,
+        _job(
+            job_id="CHILD",
+            job_type=LISTING_STATUS_SCAN,
+            enabled=False,
+            schedule_kind=CHILD_ONLY,
+        ),
+        now=now,
+    )
+    parent = _ensure_run(repository, parent_job, scheduled_for=now)
+    old_claim = repository.claim_run(
+        run_id=parent.run_id,
+        owner_token="old",
+        now=now,
+        lease_seconds=10,
+    )
+    assert old_claim is not None
+    reclaimed = repository.claim_next(
+        owner_token="new",
+        now=now + timedelta(seconds=11),
+        lease_seconds=10,
+        allowed_job_types=[FULL_MARKET_SCAN],
+    )
+    assert reclaimed is not None
+    old_context = AutomationExecutionContext(
+        claim=old_claim,
+        repository=repository,
+        operational_time=OperationalTimeService(),
+        clock=MutableClock(now + timedelta(seconds=11)),
+        lease_seconds=10,
+    )
+
+    with pytest.raises(RuntimeError, match="lease was lost"):
+        old_context.ensure_child_run(
+            child_job_id=child_job.job_id,
+            relation_type="LISTING_STATUS_CHILD",
+        )
+
+    assert repository.list_runs(job_id=child_job.job_id) == []
+
+
+def test_child_creation_rolls_back_when_link_insert_fails(
+    repository: AutomationRepository,
+    runtime_repository: SQLiteRuntimeRepository,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    parent_job = _store_job(
+        repository,
+        _job(
+            job_id="FULL",
+            job_type=FULL_MARKET_SCAN,
+            minutes=60,
+        ),
+        now=now,
+    )
+    child_job = _store_job(
+        repository,
+        _job(
+            job_id="CHILD",
+            job_type=LISTING_STATUS_SCAN,
+            enabled=False,
+            schedule_kind=CHILD_ONLY,
+        ),
+        now=now,
+    )
+    parent = _ensure_run(repository, parent_job, scheduled_for=now)
+    claim = repository.claim_run(
+        run_id=parent.run_id,
+        owner_token="owner",
+        now=now,
+        lease_seconds=60,
+    )
+    assert claim is not None
+    with runtime_repository.connect_write() as connection:
+        connection.execute(
+            """
+            CREATE TRIGGER reject_test_child_link
+            BEFORE INSERT ON automation_run_links
+            BEGIN
+                SELECT RAISE(ABORT, 'test link failure');
+            END
+            """
+        )
+        connection.commit()
+    context = AutomationExecutionContext(
+        claim=claim,
+        repository=repository,
+        operational_time=OperationalTimeService(),
+        clock=MutableClock(now),
+        lease_seconds=60,
+    )
+
+    with pytest.raises(Exception, match="test link failure"):
+        context.ensure_child_run(
+            child_job_id=child_job.job_id,
+            relation_type="LISTING_STATUS_CHILD",
+        )
+
+    assert repository.list_runs(job_id=child_job.job_id) == []
+
+
+def test_child_inherits_frozen_parent_policy_and_rejects_cross_platform(
+    repository: AutomationRepository,
+    runtime_repository: SQLiteRuntimeRepository,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    parent_job = _store_job(
+        repository,
+        _job(
+            job_id="FULL",
+            job_type=FULL_MARKET_SCAN,
+            minutes=60,
+        ),
+        now=now,
+    )
+    child_job = _store_job(
+        repository,
+        _job(
+            job_id="CHILD",
+            job_type=LISTING_STATUS_SCAN,
+            enabled=False,
+            schedule_kind=CHILD_ONLY,
+        ),
+        now=now,
+    )
+    cross_platform = AutomationJob(
+        job_id="CROSS-CHILD",
+        job_type=LISTING_STATUS_SCAN,
+        display_name="跨平台子任务",
+        enabled=False,
+        schedule_kind=CHILD_ONLY,
+        schedule_expression="-",
+        priority=50,
+        config={"platform_name": "其他平台"},
+    )
+    _store_job(repository, cross_platform, now=now)
+    parent = _ensure_run(repository, parent_job, scheduled_for=now)
+    claim = repository.claim_run(
+        run_id=parent.run_id,
+        owner_token="owner",
+        now=now,
+        lease_seconds=60,
+    )
+    assert claim is not None
+    runtime_repository.replace_current_operational_time_policy(
+        expected_current_policy_version=(
+            DEFAULT_OPERATIONAL_TIME_POLICY_VERSION
+        ),
+        successor_policy_version="CN_SINGLE_PLATFORM_2026_V2",
+        effective_from=now + timedelta(seconds=1),
+        platform_cutoff_local_time="19:00",
+        seller_cutoff_local_time="21:00",
+        peak_start_local_time="17:00",
+        created_by="pytest",
+    )
+    context = AutomationExecutionContext(
+        claim=claim,
+        repository=repository,
+        operational_time=OperationalTimeService(),
+        clock=MutableClock(now + timedelta(seconds=2)),
+        lease_seconds=60,
+    )
+    child, _ = context.ensure_child_run(
+        child_job_id=child_job.job_id,
+        relation_type="LISTING_STATUS_CHILD",
+    )
+    assert child.time_policy_version == parent.time_policy_version
+    assert child.platform_trade_date == parent.platform_trade_date
+    assert child.seller_operation_date == parent.seller_operation_date
+    assert child.seller_phase == parent.seller_phase
+
+    with pytest.raises(ValueError, match="platform_name must match"):
+        context.ensure_child_run(
+            child_job_id=cross_platform.job_id,
+            relation_type="LISTING_STATUS_CHILD",
+        )
+
+
+def test_child_only_run_requires_valid_parent_link_before_claim(
+    repository: AutomationRepository,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    parent_job = _store_job(
+        repository,
+        _job(
+            job_id="FULL",
+            job_type=FULL_MARKET_SCAN,
+            minutes=60,
+        ),
+        now=now,
+    )
+    child_job = _store_job(
+        repository,
+        _job(
+            job_id="CHILD",
+            job_type=LISTING_STATUS_SCAN,
+            enabled=False,
+            schedule_kind=CHILD_ONLY,
+        ),
+        now=now,
+    )
+    orphan = _ensure_run(repository, child_job, scheduled_for=now)
+    assert repository.claim_next(
+        owner_token="owner",
+        now=now,
+        lease_seconds=60,
+        allowed_job_types=[LISTING_STATUS_SCAN],
+    ) is None
+
+    parent = _ensure_run(repository, parent_job, scheduled_for=now)
+    parent_claim = repository.claim_run(
+        run_id=parent.run_id,
+        owner_token="parent-owner",
+        now=now,
+        lease_seconds=60,
+    )
+    assert parent_claim is not None
+    child, _ = repository.ensure_child_run_fenced(
+        parent_claim,
+        child_job,
+        relation_type="LISTING_STATUS_CHILD",
+        now=now,
+    )
+
+    claimed = repository.claim_next(
+        owner_token="child-owner",
+        now=now,
+        lease_seconds=60,
+        allowed_job_types=[LISTING_STATUS_SCAN],
+    )
+    assert claimed is not None
+    assert claimed.run.run_id == child.run_id
+    assert claimed.run.run_id != orphan.run_id
+
+
 def test_unknown_reconcile_blocks_scan_dispatch_but_not_scheduling(
     repository: AutomationRepository,
     runtime_repository: SQLiteRuntimeRepository,
@@ -601,6 +985,85 @@ def test_unknown_reconcile_blocks_scan_dispatch_but_not_scheduling(
     ).run_status is AutomationRunStatus.SCHEDULED
 
 
+def test_ui_blocker_is_rechecked_atomically_before_each_claim(
+    repository: AutomationRepository,
+    runtime_repository: SQLiteRuntimeRepository,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    non_ui_job = _store_job(
+        repository,
+        _job(
+            job_id="SETTLEMENT",
+            job_type=PLATFORM_TRADE_DAY_SETTLEMENT,
+            priority=1,
+        ),
+        now=now,
+    )
+    ui_job = _store_job(
+        repository,
+        _job(
+            job_id="PULSE",
+            job_type=ONLINE_PULSE,
+            priority=60,
+        ),
+        now=now,
+    )
+    non_ui_run = _ensure_run(
+        repository,
+        non_ui_job,
+        scheduled_for=now,
+    )
+    ui_run = _ensure_run(repository, ui_job, scheduled_for=now)
+
+    def create_blocker(run, context):
+        runtime_repository.insert_task(
+            Task(
+                task_id="TASK-BETWEEN-CLAIMS",
+                internal_sku="SKU-A",
+                platform_name=PLATFORM,
+                action_type=TaskActionType.UPDATE_PRICE,
+                priority=1,
+                task_status=TaskStatus.PENDING,
+                created_at=now,
+                origin_type=TaskOriginType.MANUAL,
+                origin_ref_id="test:between-claims",
+                target_price=Decimal("10.00"),
+                dedupe_key="TASK-BETWEEN-CLAIMS",
+            )
+        )
+        runtime_repository.insert_shadowbot_operation(
+            ShadowBotOperationLedger(
+                operation_id="OP-BETWEEN-CLAIMS",
+                task_id="TASK-BETWEEN-CLAIMS",
+                platform=PLATFORM,
+                product_identity={"internal_sku": "SKU-A"},
+                expected_old_price=Decimal("9.00"),
+                target_price=Decimal("10.00"),
+                status="NEEDS_RECONCILIATION",
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        return AutomationRunOutcome(status=AutomationRunStatus.SUCCESS)
+
+    cycle = AutomationService(
+        repository,
+        handlers={
+            PLATFORM_TRADE_DAY_SETTLEMENT: create_blocker,
+            ONLINE_PULSE: lambda run, context: AutomationRunOutcome(
+                status=AutomationRunStatus.SUCCESS
+            ),
+        },
+        clock=MutableClock(now),
+    ).run_cycle()
+
+    assert cycle.completed_run_ids == (non_ui_run.run_id,)
+    assert cycle.blocked_reason == "UNKNOWN_OR_RECONCILE_ACTIVE"
+    assert repository.get_run(
+        ui_run.run_id
+    ).run_status is AutomationRunStatus.SCHEDULED
+
+
 def test_heartbeat_is_atomic_utf8_json(tmp_path: Path) -> None:
     path = tmp_path / "自动化服务" / "heartbeat.json"
     store = AutomationHeartbeatStore(path)
@@ -623,6 +1086,62 @@ def test_process_file_lock_rejects_second_instance(tmp_path: Path) -> None:
         with pytest.raises(RuntimeError, match="已有实例"):
             with ProcessFileLock(lock_path):
                 pass
+
+
+def test_lock_identity_depends_on_runtime_db_not_heartbeat(
+    tmp_path: Path,
+) -> None:
+    runtime_db = tmp_path / "runtime.sqlite3"
+    first_heartbeat = tmp_path / "first" / "heartbeat.json"
+    second_heartbeat = tmp_path / "second" / "heartbeat.json"
+
+    first_lock = automation_service_lock_path(runtime_db)
+    second_lock = automation_service_lock_path(runtime_db)
+
+    assert first_heartbeat != second_heartbeat
+    assert first_lock == second_lock
+    with ProcessFileLock(first_lock):
+        with pytest.raises(RuntimeError, match="已有实例"):
+            with ProcessFileLock(second_lock):
+                pass
+
+
+def test_lock_conflict_does_not_overwrite_active_heartbeat(
+    tmp_path: Path,
+) -> None:
+    runtime_db = tmp_path / "runtime.sqlite3"
+    heartbeat = tmp_path / "heartbeat.json"
+    active_payload = {"status": "RUNNING", "marker": "active-owner"}
+    heartbeat.write_text(
+        json.dumps(active_payload, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    environment = dict(os.environ)
+    environment["PYTHONIOENCODING"] = "utf-8"
+
+    with ProcessFileLock(automation_service_lock_path(runtime_db)):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "scripts/run_automation_service.py",
+                "--runtime-db",
+                str(runtime_db),
+                "--heartbeat",
+                str(heartbeat),
+                "--once",
+            ],
+            cwd=Path(__file__).resolve().parents[1],
+            env=environment,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+            timeout=60,
+        )
+
+    assert completed.returncode == 2
+    assert json.loads(heartbeat.read_text(encoding="utf-8")) == active_payload
 
 
 def test_once_cli_writes_stopped_heartbeat_and_default_jobs(
@@ -663,6 +1182,43 @@ def test_once_cli_writes_stopped_heartbeat_and_default_jobs(
     assert stored_jobs[0].display_name
 
 
+def test_cli_failure_after_lock_writes_redacted_failed_heartbeat(
+    tmp_path: Path,
+) -> None:
+    runtime_db = tmp_path / "runtime.sqlite3"
+    heartbeat = tmp_path / "heartbeat.json"
+    environment = dict(os.environ)
+    environment["PYTHONIOENCODING"] = "utf-8"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/run_automation_service.py",
+            "--runtime-db",
+            str(runtime_db),
+            "--heartbeat",
+            str(heartbeat),
+            "--platform-name",
+            "",
+            "--once",
+        ],
+        cwd=Path(__file__).resolve().parents[1],
+        env=environment,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+
+    assert completed.returncode == 2
+    payload = json.loads(heartbeat.read_text(encoding="utf-8"))
+    assert payload["status"] == "FAILED"
+    assert payload["reason"] == "AUTOMATION_SERVICE_FAILED"
+    assert str(tmp_path) not in payload["error_message"]
+
+
 def test_job_static_identity_is_immutable_for_existing_job_id(
     repository: AutomationRepository,
 ) -> None:
@@ -686,3 +1242,70 @@ def test_job_static_identity_is_immutable_for_existing_job_id(
             ),
             now=now,
         )
+
+
+def test_default_job_bootstrap_rejects_existing_static_drift(
+    repository: AutomationRepository,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    ensure_default_automation_jobs(
+        repository,
+        platform_name=PLATFORM,
+        now=now,
+    )
+    with repository.runtime_repository.connect_write() as connection:
+        connection.execute(
+            """
+            UPDATE automation_jobs
+            SET schedule_expression = '30'
+            WHERE job_id = 'AUTOMATION-ONLINE-PULSE-10M'
+            """
+        )
+        connection.commit()
+
+    with pytest.raises(ValueError, match="unexpected schedule"):
+        ensure_default_automation_jobs(
+            repository,
+            platform_name=PLATFORM,
+            now=now,
+        )
+
+
+def test_service_hot_reloads_operational_time_policy_chain(
+    repository: AutomationRepository,
+    runtime_repository: SQLiteRuntimeRepository,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    job = _store_job(
+        repository,
+        _job(job_id="PULSE", job_type=ONLINE_PULSE),
+        now=now,
+    )
+    effective_from = now + timedelta(minutes=5)
+    runtime_repository.replace_current_operational_time_policy(
+        expected_current_policy_version=(
+            DEFAULT_OPERATIONAL_TIME_POLICY_VERSION
+        ),
+        successor_policy_version="CN_SINGLE_PLATFORM_2026_V2",
+        effective_from=effective_from,
+        platform_cutoff_local_time="19:00",
+        seller_cutoff_local_time="21:00",
+        peak_start_local_time="17:00",
+        created_by="pytest",
+    )
+    clock = MutableClock(now)
+    service = AutomationService(
+        repository,
+        handlers={},
+        clock=clock,
+    )
+
+    service.run_cycle()
+    clock.value = now + timedelta(minutes=10)
+    service.run_cycle()
+
+    runs = repository.list_runs(job_id=job.job_id)
+    assert [run.time_policy_version for run in runs] == [
+        "CN_SINGLE_PLATFORM_2026_V2",
+        DEFAULT_OPERATIONAL_TIME_POLICY_VERSION,
+    ]

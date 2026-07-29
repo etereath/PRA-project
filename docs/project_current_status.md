@@ -504,7 +504,10 @@ Code Review 后的高中低风险问题已完成修复，系统冒烟测试、�
     16/16、编译、打包、包边界、敏感信息扫描、仓库外 wheel 安装和 Windows
     ShadowBot 夹具门禁均通过。13.5-3 已建立独立 Automation Service 本地实现：
     默认计划、逻辑 run 幂等、租约 fencing、错过/补跑/合并、父子 run、UI 写侧
-    阻断、单实例锁与 UTF-8 原子心跳均已有专项测试。真实扫描 handler、Runtime DB
+    阻断、单实例锁与 UTF-8 原子心跳均已有专项测试。PR 评审后进一步补齐了旧
+    `SCHEDULED` 每轮清理、崩溃后合并恢复、逐次领取原子 UI gate、受父租约
+    fencing 的原子子 run、禁用/子任务领取门禁、Runtime 时间策略热加载，以及按
+    Runtime DB 唯一化的进程锁和失败心跳。真实扫描 handler、Runtime DB
     迁移和生产部署仍未执行。本批专项 `15 passed`，完整回归为
     `805 passed, 3 skipped, 97 subtests passed`；系统冒烟、构建、包边界、
     secret scan、仓库外 wheel 安装和 Windows ShadowBot 静态夹具门禁均通过。

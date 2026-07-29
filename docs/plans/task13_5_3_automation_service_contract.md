@@ -58,6 +58,8 @@ job_id + scheduled_for(UTC)
 
 已存在的 `job_id` 不允许原地改变 `job_type`、计划类型、计划表达式或平台；调整这些
 静态身份时必须创建新 job。运营仍可修改启停、优先级和非身份配置。
+服务启动时必须复核所有默认 job 的静态身份；已存在不代表合法，发现漂移必须失败，
+不得静默沿用错误计划。
 
 所有计划时间先归一化为 UTC，再由统一 `OperationalTimeService` 写入：
 
@@ -68,6 +70,9 @@ job_id + scheduled_for(UTC)
 
 10 分钟与整点窗口按 `Asia/Shanghai` 对齐。每日作业使用当地固定时间，不由脚本、
 Web 或 handler 重新计算业务日期。
+Automation Service 每轮从 Runtime DB 读取完整 `operational_time_policies` 生效链，
+因此跨越策略 `effective_from` 后新 run 使用新版本；既有 run 与其子 run 保留父 run
+冻结的双日期、阶段和策略版本。
 
 ## 4. 休眠、错过、补跑与风暴保护
 
@@ -82,6 +87,10 @@ Web 或 handler 重新计算业务日期。
 
 `MISSED` 保存原计划时间、实际物化时间、迟到秒数和补跑策略。不得把错过运行伪装为
 成功，也不得因重启堆积执行所有 10 分钟小扫描。
+每轮都必须统一复核全部既有 `SCHEDULED`，即使本轮没有新窗口也要应用
+`max_lateness_seconds`；`LATEST_ONLY` 仅留最新 1 个，`IDEMPOTENT` 仅留配置的最近
+N 个。进程在创建 run 后、合并前崩溃时，下一轮必须重新扫描既有候选并补建
+`MERGED_RUN`。
 
 ## 5. 合并与单 UI 通道
 
@@ -110,6 +119,8 @@ SYSTEM_EMERGENCY SET_OFFLINE（13.5-6 启用前保持禁用）
 13.5-3 默认 gate 只读取既有账本：存在 `NEEDS_RECONCILIATION`、`UNKNOWN`
 写锁或活动写锁时，不领取任何 UI 扫描 run；非 UI 的结算/计算 handler 可以独立运行。
 它不把普通 `pending` 任务解释为执行授权，也不创建、启动或重启 ShadowBot。
+阻断检查与 UI run 领取必须位于同一个 `BEGIN IMMEDIATE` 事务，并在每次领取前重查，
+避免一次 cycle 内出现检查后写锁状态变化的 TOCTOU。
 
 ## 6. 租约、心跳与重启恢复
 
@@ -142,9 +153,17 @@ handler 异常只写入受限的稳定错误码：
 错误文本限制长度并清除明显的本机绝对路径。Scheduler 不吞掉失败，也不把异常转换为
 成功。
 
+禁用的普通 job 不得领取新的 `SCHEDULED`；已经开始、后来被禁用的过期 `RUNNING`
+仍允许回收，以便确定性收敛到终态。`CHILD_ONLY` 即使默认禁用，也只在存在受支持父
+类型、关系和父状态的链接后才允许领取。父 handler 创建子 run 时，父租约校验、子
+类型/关系/平台约束、继承父 run 冻结时间上下文、幂等创建和链接写入必须在同一事务；
+任一环节失败不得留下孤儿子 run。
+
 ## 7. 进程生命周期与健康
 
 正式入口使用跨平台非阻塞文件锁保证同一主机只运行一个 Automation Service 进程。
+锁身份由规范化 Runtime DB 路径派生，不由可配置的 heartbeat 路径派生；指向同一
+Runtime DB 的两个进程即使使用不同 heartbeat，也必须互斥。
 进程心跳独立保存在：
 
 ```text
@@ -164,6 +183,8 @@ data/runtime/automation_service/heartbeat.json
 
 `--once` 用于只执行一个调度周期和健康检查。13.5-3 的 CLI 运行模式明确为
 `SCHEDULER_ONLY`：只有后续阶段注册经过验收的 handler 后才会领取对应 run。
+获取锁后的未处理异常必须原子写入 `FAILED` 心跳，错误文本执行与 handler 相同的路径
+脱敏；锁冲突发生在获得所有权前，因此不得覆盖现有实例的活动心跳。
 
 ## 8. 验收与安全结论
 
@@ -179,8 +200,13 @@ data/runtime/automation_service/heartbeat.json
 - handler 异常；
 - job 优先级；
 - 父子 run 幂等；
+- 父租约过期/被回收、子链接回滚、跨平台和策略切换；
 - UNKNOWN/RECONCILE 阻断；
+- 每次领取的原子 UI gate；
+- 禁用 job、合法 `CHILD_ONLY` 父链与默认 job 静态漂移；
+- Runtime 时间策略热加载；
 - 单实例进程锁；
+- 同 Runtime DB 不同 heartbeat 的锁冲突与心跳保护；
 - UTF-8 原子心跳；
 - `--once` 入口。
 

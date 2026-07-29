@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import closing
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Iterable
 from uuid import uuid4
 
@@ -17,12 +17,29 @@ from app.automation_models import (
 )
 from app.enums import AutomationRunStatus, SellerPhase
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.services.operational_time import OperationalTimeContext
+from app.services.operational_time import (
+    OperationalTimeContext,
+    OperationalTimePolicy,
+)
 
 
 CLAIMABLE_STATUSES = (
     AutomationRunStatus.SCHEDULED,
     AutomationRunStatus.RUNNING,
+)
+CHILD_RELATIONS = {
+    "LISTING_STATUS_SCAN": "LISTING_STATUS_CHILD",
+    "ORDER_SCAN": "ORDER_SCAN_CHILD",
+}
+CHILD_PARENT_JOB_TYPES = frozenset(
+    {"FULL_MARKET_SCAN", "PRE_CUTOFF_FULL_SCAN"}
+)
+CHILD_PARENT_CLAIM_STATUSES = frozenset(
+    {
+        AutomationRunStatus.RUNNING.value,
+        AutomationRunStatus.SUCCESS.value,
+        AutomationRunStatus.PARTIAL.value,
+    }
 )
 
 
@@ -136,6 +153,64 @@ class AutomationRepository:
                 """
             ).fetchall()
         return [_row_to_job(row) for row in rows]
+
+    def validate_job_static_identity(self, expected: AutomationJob) -> None:
+        """Reject drift in immutable identity while preserving operator fields."""
+
+        existing = self.get_job(expected.job_id)
+        if existing is None:
+            raise ValueError("Automation job does not exist")
+        if existing.job_type != expected.job_type:
+            raise ValueError(
+                "Existing default automation job has unexpected job_type"
+            )
+        if (
+            existing.schedule_kind != expected.schedule_kind
+            or existing.schedule_expression != expected.schedule_expression
+        ):
+            raise ValueError(
+                "Existing default automation job has unexpected schedule"
+            )
+        if str(existing.config.get("platform_name") or "") != str(
+            expected.config.get("platform_name") or ""
+        ):
+            raise ValueError(
+                "Existing default automation job has unexpected platform_name"
+            )
+
+    def load_operational_time_policies(
+        self,
+    ) -> tuple[OperationalTimePolicy, ...]:
+        with closing(self.runtime_repository.connect_read()) as connection:
+            rows = connection.execute(
+                """
+                SELECT policy_version, timezone_name,
+                       platform_cutoff_local_time,
+                       seller_cutoff_local_time,
+                       peak_start_local_time,
+                       effective_from, effective_to
+                FROM operational_time_policies
+                ORDER BY julianday(effective_from), policy_version
+                """
+            ).fetchall()
+        return tuple(
+            OperationalTimePolicy(
+                policy_version=str(row["policy_version"]),
+                timezone_name=str(row["timezone_name"]),
+                platform_cutoff_local_time=time.fromisoformat(
+                    str(row["platform_cutoff_local_time"])
+                ),
+                seller_cutoff_local_time=time.fromisoformat(
+                    str(row["seller_cutoff_local_time"])
+                ),
+                peak_start_local_time=time.fromisoformat(
+                    str(row["peak_start_local_time"])
+                ),
+                effective_from=_required_datetime(row["effective_from"]),
+                effective_to=_text_to_datetime(row["effective_to"]),
+            )
+            for row in rows
+        )
 
     def latest_scheduled_for(self, job_id: str) -> datetime | None:
         with closing(self.runtime_repository.connect_read()) as connection:
@@ -306,6 +381,93 @@ class AutomationRepository:
             ).fetchall()
         return [_row_to_run(row) for row in rows]
 
+    def reconcile_scheduled_runs_for_job(
+        self,
+        job: AutomationJob,
+        *,
+        now: datetime,
+    ) -> tuple[str, ...]:
+        """Expire stale queued windows using the job's frozen catch-up policy."""
+
+        current = _as_utc(now, "now")
+        policy = str(job.config.get("catchup_policy") or "LATEST_ONLY")
+        if policy == "LATEST_ONLY":
+            keep_count = 1
+        elif policy == "IDEMPOTENT":
+            keep_count = int(job.config.get("max_catchup_runs") or 1)
+            if keep_count < 1:
+                raise ValueError("max_catchup_runs must be positive")
+        else:
+            raise ValueError(f"Unsupported catchup_policy: {policy}")
+        max_lateness = job.config.get("max_lateness_seconds")
+        max_lateness_seconds = (
+            int(max_lateness) if max_lateness is not None else None
+        )
+        if max_lateness_seconds is not None and max_lateness_seconds < 0:
+            raise ValueError("max_lateness_seconds must not be negative")
+
+        missed: list[str] = []
+        with closing(self.runtime_repository.connect_write()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT run_id, scheduled_for
+                    FROM automation_runs
+                    WHERE job_id = ? AND run_status = 'SCHEDULED'
+                    ORDER BY scheduled_for DESC, run_id DESC
+                    """,
+                    (job.job_id,),
+                ).fetchall()
+                for index, row in enumerate(rows):
+                    scheduled_for = _required_datetime(row["scheduled_for"])
+                    too_old_for_policy = index >= keep_count
+                    too_late = (
+                        max_lateness_seconds is not None
+                        and (current - scheduled_for).total_seconds()
+                        > max_lateness_seconds
+                    )
+                    if not (too_old_for_policy or too_late):
+                        continue
+                    run_id = str(row["run_id"])
+                    reason = (
+                        "MAX_LATENESS_EXCEEDED"
+                        if too_late
+                        else "SUPERSEDED_SCHEDULE_WINDOW"
+                    )
+                    cursor = connection.execute(
+                        """
+                        UPDATE automation_runs
+                        SET run_status = 'MISSED', finished_at = ?,
+                            error_code = 'MISSED_SCHEDULE_WINDOW',
+                            error_message = ?, updated_at = ?
+                        WHERE run_id = ? AND run_status = 'SCHEDULED'
+                        """,
+                        (
+                            _datetime_text(current),
+                            reason,
+                            _datetime_text(current),
+                            run_id,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        continue
+                    _insert_event(
+                        connection,
+                        run_id=run_id,
+                        event_type="RUN_MISSED",
+                        from_status=AutomationRunStatus.SCHEDULED,
+                        to_status=AutomationRunStatus.MISSED,
+                        payload={"reason": reason},
+                        created_at=current,
+                    )
+                    missed.append(run_id)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return tuple(missed)
+
     def append_event(
         self,
         *,
@@ -461,6 +623,151 @@ class AutomationRepository:
             raise RuntimeError("Automation run link was not persisted")
         return _row_to_link(row)
 
+    def ensure_child_run_fenced(
+        self,
+        parent_claim: AutomationRunClaim,
+        child_job: AutomationJob,
+        *,
+        relation_type: str,
+        now: datetime,
+    ) -> tuple[AutomationRun, bool]:
+        """Create and link a child atomically under the parent's live lease."""
+
+        current = _as_utc(now, "now")
+        normalized_relation = relation_type.strip().upper()
+        expected_relation = CHILD_RELATIONS.get(child_job.job_type)
+        if child_job.schedule_kind != "CHILD_ONLY":
+            raise ValueError("Child automation job must use CHILD_ONLY")
+        if (
+            expected_relation is None
+            or normalized_relation != expected_relation
+        ):
+            raise ValueError("Child job type and relation_type are not allowed")
+        parent = parent_claim.run
+        if parent.job_type not in CHILD_PARENT_JOB_TYPES:
+            raise ValueError("Parent job type cannot create child runs")
+        if parent.platform_name != str(
+            child_job.config.get("platform_name") or ""
+        ):
+            raise ValueError("Parent and child platform_name must match")
+        logical_key = f"{parent.logical_run_key}:child:{child_job.job_id}"
+        child_run_id = _run_id(logical_key)
+
+        with closing(self.runtime_repository.connect_write()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                parent_row = connection.execute(
+                    "SELECT * FROM automation_runs WHERE run_id = ?",
+                    (parent.run_id,),
+                ).fetchone()
+                if parent_row is None:
+                    raise ValueError("Parent automation run does not exist")
+                lease_expires_at = _text_to_datetime(
+                    parent_row["lease_expires_at"]
+                )
+                if (
+                    str(parent_row["run_status"])
+                    != AutomationRunStatus.RUNNING.value
+                    or str(parent_row["lease_owner"])
+                    != parent_claim.owner_token
+                    or int(parent_row["lease_version"])
+                    != parent_claim.lease_version
+                    or lease_expires_at is None
+                    or lease_expires_at <= current
+                ):
+                    raise RuntimeError("Parent automation run lease was lost")
+
+                existing = connection.execute(
+                    """
+                    SELECT * FROM automation_runs
+                    WHERE logical_run_key = ?
+                    """,
+                    (logical_key,),
+                ).fetchone()
+                created = existing is None
+                if existing is None:
+                    connection.execute(
+                        """
+                        INSERT INTO automation_runs(
+                            run_id, job_id, job_type, logical_run_key,
+                            run_status, platform_name,
+                            platform_trade_date, seller_operation_date,
+                            seller_phase, time_policy_version,
+                            scheduled_for, started_at, finished_at,
+                            lease_owner, lease_version, lease_expires_at,
+                            input_manifest_sha256, output_manifest_sha256,
+                            error_code, error_message, created_at, updated_at
+                        ) VALUES (
+                            ?, ?, ?, ?, 'SCHEDULED', ?, ?, ?, ?, ?, ?,
+                            NULL, NULL, '', 0, NULL, '', '', '', '', ?, ?
+                        )
+                        """,
+                        (
+                            child_run_id,
+                            child_job.job_id,
+                            child_job.job_type,
+                            logical_key,
+                            str(parent_row["platform_name"]),
+                            str(parent_row["platform_trade_date"]),
+                            str(parent_row["seller_operation_date"]),
+                            str(parent_row["seller_phase"]),
+                            str(parent_row["time_policy_version"]),
+                            str(parent_row["scheduled_for"]),
+                            _datetime_text(current),
+                            _datetime_text(current),
+                        ),
+                    )
+                    _insert_event(
+                        connection,
+                        run_id=child_run_id,
+                        event_type="CHILD_RUN_SCHEDULED",
+                        from_status=None,
+                        to_status=AutomationRunStatus.SCHEDULED,
+                        payload={"parent_run_id": parent.run_id},
+                        created_at=current,
+                    )
+                else:
+                    expected = {
+                        "job_id": child_job.job_id,
+                        "job_type": child_job.job_type,
+                        "platform_name": str(parent_row["platform_name"]),
+                        "platform_trade_date": str(
+                            parent_row["platform_trade_date"]
+                        ),
+                        "seller_operation_date": str(
+                            parent_row["seller_operation_date"]
+                        ),
+                        "seller_phase": str(parent_row["seller_phase"]),
+                        "time_policy_version": str(
+                            parent_row["time_policy_version"]
+                        ),
+                        "scheduled_for": str(parent_row["scheduled_for"]),
+                    }
+                    for field_name, expected_value in expected.items():
+                        if str(existing[field_name]) != expected_value:
+                            raise ValueError(
+                                "Existing child run has different "
+                                f"{field_name}"
+                            )
+                _insert_link(
+                    connection,
+                    parent_run_id=parent.run_id,
+                    child_run_id=child_run_id,
+                    relation_type=normalized_relation,
+                    created_at=current,
+                )
+                child_row = connection.execute(
+                    "SELECT * FROM automation_runs WHERE run_id = ?",
+                    (child_run_id,),
+                ).fetchone()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        if child_row is None:
+            raise RuntimeError("Child automation run was not persisted")
+        return _row_to_run(child_row), created
+
     def list_events(self, run_id: str) -> list[AutomationRunEvent]:
         with closing(self.runtime_repository.connect_read()) as connection:
             rows = connection.execute(
@@ -525,56 +832,67 @@ class AutomationRepository:
             raise ValueError("lease_seconds must be positive")
         if not allowed:
             return None
-        placeholders = ",".join("?" for _ in allowed)
         with closing(self.runtime_repository.connect_write()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                row = connection.execute(
-                    f"""
-                    SELECT runs.run_id
-                    FROM automation_runs AS runs
-                    INNER JOIN automation_jobs AS jobs
-                        ON jobs.job_id = runs.job_id
-                    WHERE runs.job_type IN ({placeholders})
-                      AND (
-                          (
-                              runs.run_status = 'SCHEDULED'
-                              AND julianday(runs.scheduled_for)
-                                  <= julianday(?)
-                          )
-                          OR (
-                              runs.run_status = 'RUNNING'
-                              AND (
-                                  runs.lease_expires_at IS NULL
-                                  OR julianday(runs.lease_expires_at)
-                                      <= julianday(?)
-                              )
-                          )
-                      )
-                    ORDER BY
-                        CASE
-                            WHEN runs.run_status = 'RUNNING' THEN 0
-                            ELSE 1
-                        END ASC,
-                        jobs.priority ASC,
-                        runs.scheduled_for ASC,
-                        runs.run_id ASC
-                    LIMIT 1
-                    """,
-                    (*allowed, _datetime_text(current), _datetime_text(current)),
-                ).fetchone()
-                if row is None:
-                    connection.commit()
-                    return None
-                claim = _claim_run(
+                claim = _claim_next_connection(
                     connection,
-                    run_id=str(row["run_id"]),
                     owner_token=owner,
                     now=current,
                     lease_seconds=lease_seconds,
+                    allowed_job_types=allowed,
                 )
                 connection.commit()
                 return claim
+            except Exception:
+                connection.rollback()
+                raise
+
+    def claim_next_with_ui_gate(
+        self,
+        *,
+        owner_token: str,
+        now: datetime,
+        lease_seconds: int,
+        allowed_job_types: Iterable[str],
+        ui_job_types: Iterable[str],
+    ) -> tuple[AutomationRunClaim | None, str]:
+        """Check write blockers and claim under one SQLite write lock."""
+
+        current = _as_utc(now, "now")
+        owner = owner_token.strip()
+        allowed = tuple(
+            dict.fromkeys(
+                job_type.strip()
+                for job_type in allowed_job_types
+                if job_type.strip()
+            )
+        )
+        ui_types = frozenset(ui_job_types)
+        if not owner:
+            raise ValueError("owner_token must not be blank")
+        if lease_seconds < 1:
+            raise ValueError("lease_seconds must be positive")
+        if not allowed:
+            return None, ""
+        with closing(self.runtime_repository.connect_write()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                blocker = _active_ui_blocker_connection(connection)
+                claimable_types = tuple(
+                    job_type
+                    for job_type in allowed
+                    if not blocker or job_type not in ui_types
+                )
+                claim = _claim_next_connection(
+                    connection,
+                    owner_token=owner,
+                    now=current,
+                    lease_seconds=lease_seconds,
+                    allowed_job_types=claimable_types,
+                )
+                connection.commit()
+                return claim, blocker
             except Exception:
                 connection.rollback()
                 raise
@@ -724,30 +1042,7 @@ class AutomationRepository:
         """Return the highest existing write-side blocker for read scans."""
 
         with closing(self.runtime_repository.connect_read()) as connection:
-            unknown = connection.execute(
-                """
-                SELECT 1
-                FROM shadowbot_operations AS operations
-                LEFT JOIN shadowbot_write_locks AS locks
-                    ON locks.operation_id = operations.operation_id
-                WHERE operations.status = 'NEEDS_RECONCILIATION'
-                   OR locks.status = 'UNKNOWN'
-                LIMIT 1
-                """
-            ).fetchone()
-            if unknown is not None:
-                return "UNKNOWN_OR_RECONCILE_ACTIVE"
-            active_write = connection.execute(
-                """
-                SELECT 1
-                FROM shadowbot_write_locks
-                WHERE status = 'ACTIVE'
-                LIMIT 1
-                """
-            ).fetchone()
-            if active_write is not None:
-                return "AUTHORIZED_WRITE_ACTIVE"
-        return ""
+            return _active_ui_blocker_connection(connection)
 
     def health_snapshot(self, *, now: datetime) -> dict[str, object]:
         current = _as_utc(now, "now")
@@ -780,6 +1075,115 @@ class AutomationRepository:
             "expired_running_count": expired,
             "observed_at": _datetime_text(current),
         }
+
+
+def _claim_next_connection(
+    connection,
+    *,
+    owner_token: str,
+    now: datetime,
+    lease_seconds: int,
+    allowed_job_types: tuple[str, ...],
+) -> AutomationRunClaim | None:
+    if not allowed_job_types:
+        return None
+    placeholders = ",".join("?" for _ in allowed_job_types)
+    child_relations = tuple(CHILD_RELATIONS.values())
+    relation_placeholders = ",".join("?" for _ in child_relations)
+    parent_statuses = tuple(CHILD_PARENT_CLAIM_STATUSES)
+    parent_status_placeholders = ",".join("?" for _ in parent_statuses)
+    row = connection.execute(
+        f"""
+        SELECT runs.run_id
+        FROM automation_runs AS runs
+        INNER JOIN automation_jobs AS jobs ON jobs.job_id = runs.job_id
+        WHERE runs.job_type IN ({placeholders})
+          AND (
+              (
+                  runs.run_status = 'SCHEDULED'
+                  AND julianday(runs.scheduled_for) <= julianday(?)
+                  AND (
+                      (
+                          jobs.enabled = 1
+                          AND jobs.schedule_kind <> 'CHILD_ONLY'
+                      )
+                      OR (
+                          jobs.schedule_kind = 'CHILD_ONLY'
+                          AND EXISTS (
+                              SELECT 1
+                              FROM automation_run_links AS links
+                              INNER JOIN automation_runs AS parents
+                                  ON parents.run_id = links.parent_run_id
+                              WHERE links.child_run_id = runs.run_id
+                                AND links.relation_type IN (
+                                    {relation_placeholders}
+                                )
+                                AND parents.run_status IN (
+                                    {parent_status_placeholders}
+                                )
+                          )
+                      )
+                  )
+              )
+              OR (
+                  runs.run_status = 'RUNNING'
+                  AND (
+                      runs.lease_expires_at IS NULL
+                      OR julianday(runs.lease_expires_at) <= julianday(?)
+                  )
+              )
+          )
+        ORDER BY
+            CASE WHEN runs.run_status = 'RUNNING' THEN 0 ELSE 1 END,
+            jobs.priority ASC,
+            runs.scheduled_for ASC,
+            runs.run_id ASC
+        LIMIT 1
+        """,
+        (
+            *allowed_job_types,
+            _datetime_text(now),
+            *child_relations,
+            *parent_statuses,
+            _datetime_text(now),
+        ),
+    ).fetchone()
+    if row is None:
+        return None
+    return _claim_run(
+        connection,
+        run_id=str(row["run_id"]),
+        owner_token=owner_token,
+        now=now,
+        lease_seconds=lease_seconds,
+    )
+
+
+def _active_ui_blocker_connection(connection) -> str:
+    unknown = connection.execute(
+        """
+        SELECT 1
+        FROM shadowbot_operations AS operations
+        LEFT JOIN shadowbot_write_locks AS locks
+            ON locks.operation_id = operations.operation_id
+        WHERE operations.status = 'NEEDS_RECONCILIATION'
+           OR locks.status = 'UNKNOWN'
+        LIMIT 1
+        """
+    ).fetchone()
+    if unknown is not None:
+        return "UNKNOWN_OR_RECONCILE_ACTIVE"
+    active_write = connection.execute(
+        """
+        SELECT 1
+        FROM shadowbot_write_locks
+        WHERE status = 'ACTIVE'
+        LIMIT 1
+        """
+    ).fetchone()
+    if active_write is not None:
+        return "AUTHORIZED_WRITE_ACTIVE"
+    return ""
 
 
 def _claim_run(

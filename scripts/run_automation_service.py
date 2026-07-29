@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -25,6 +26,7 @@ from app.services.automation import (  # noqa: E402
     AutomationHeartbeatStore,
     AutomationService,
     ensure_default_automation_jobs,
+    safe_automation_error_message,
 )
 from app.services.runtime import DEFAULT_RUNTIME_DB  # noqa: E402
 
@@ -121,6 +123,15 @@ class ProcessFileLock:
             self._stream = None
 
 
+def automation_service_lock_path(runtime_db: Path) -> Path:
+    """Derive one lock identity from the normalized Runtime database path."""
+
+    resolved = Path(runtime_db).resolve()
+    normalized = os.path.normcase(str(resolved))
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+    return resolved.parent / f".automation-service-{digest}.lock"
+
+
 def main() -> int:
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -134,10 +145,12 @@ def main() -> int:
         raise ValueError("--lease-seconds 必须为正整数。")
 
     heartbeat = AutomationHeartbeatStore(args.heartbeat)
-    lock_path = args.heartbeat.with_suffix(".lock")
+    lock_path = automation_service_lock_path(args.runtime_db)
     service_instance_id = f"automation-service-{uuid4().hex}"
+    lock_acquired = False
     try:
         with ProcessFileLock(lock_path):
+            lock_acquired = True
             runtime_repository = SQLiteRuntimeRepository(
                 args.runtime_db,
                 connection_config=SQLiteConnectionConfig.from_environment(
@@ -223,28 +236,36 @@ def main() -> int:
                     return 0
                 time.sleep(args.poll_seconds)
     except KeyboardInterrupt:
-        heartbeat.write(
-            {
-                "schema_version": "automation-heartbeat-1.0",
-                "status": "STOPPED",
-                "service_instance_id": service_instance_id,
-                "stopped_at": datetime.now(timezone.utc).isoformat(),
-                "reason": "KEYBOARD_INTERRUPT",
-            }
-        )
+        if lock_acquired:
+            heartbeat.write(
+                {
+                    "schema_version": "automation-heartbeat-1.0",
+                    "status": "STOPPED",
+                    "service_instance_id": service_instance_id,
+                    "stopped_at": datetime.now(timezone.utc).isoformat(),
+                    "reason": "KEYBOARD_INTERRUPT",
+                }
+            )
         return 0
     except Exception as exc:
+        safe_message = safe_automation_error_message(exc)
+        failure_payload = {
+            "schema_version": "automation-heartbeat-1.0",
+            "status": "FAILED",
+            "service_instance_id": service_instance_id,
+            "stopped_at": datetime.now(timezone.utc).isoformat(),
+            "reason": "AUTOMATION_SERVICE_FAILED",
+            "error_code": "AUTOMATION_SERVICE_FAILED",
+            "error_type": type(exc).__name__,
+            "error_message": safe_message,
+        }
+        if lock_acquired:
+            try:
+                heartbeat.write(failure_payload)
+            except Exception:
+                pass
         print(
-            json.dumps(
-                {
-                    "status": "FAILED",
-                    "error_code": "AUTOMATION_SERVICE_FAILED",
-                    "error_type": type(exc).__name__,
-                    "error_message": str(exc),
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            ),
+            json.dumps(failure_payload, ensure_ascii=False, sort_keys=True),
             flush=True,
         )
         return 2

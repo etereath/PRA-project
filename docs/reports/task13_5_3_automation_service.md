@@ -18,6 +18,13 @@
 - 新增 handler 注册边界、受限失败结果和父子 run 幂等创建。
 - 新增 `scripts/run_automation_service.py`、跨平台单实例锁、UTF-8 原子进程心跳和
   `--once` 健康入口。
+- PR 评审后补齐每轮旧 `SCHEDULED` 清理、无新窗口的迟到失效和崩溃后合并恢复。
+- UI 阻断检查改为与每次领取同一写事务，消除 cycle 级 TOCTOU。
+- 子 run 改为父租约 fencing 下的一次事务，并限制父子类型、关系与平台，直接继承
+  父 run 冻结时间上下文。
+- 领取层增加启用状态与合法父链门禁；默认 job 启动时校验静态身份。
+- Runtime 时间策略改为每轮读取完整生效链；进程锁改由 Runtime DB 身份派生，锁后
+  异常写 `FAILED` 心跳且执行本机路径脱敏。
 
 ## 2. 复用与未改写
 
@@ -55,9 +62,9 @@ CLI 当前明确报告 `SCHEDULER_ONLY`。它可以安全创建到期账本、�
 验收结果：
 
 - `python -m pytest -q tests/test_automation_service.py`：
-  `15 passed`；
+  `28 passed`；
 - `python -m pytest -q`：
-  `805 passed, 3 skipped, 97 subtests passed`；
+  `818 passed, 3 skipped, 97 subtests passed`；
 - 系统冒烟：16 项通过、0 项失败；
 - 本次新增/修改 Python 文件 Ruff：PASS；
 - `compileall`：PASS；
