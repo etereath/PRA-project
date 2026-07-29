@@ -110,6 +110,13 @@ FULL_MARKET_SCAN
 商品子结果继续以完整两页 `SYNC_STATUS` 为权威；新 v14 观察是不可变审计事实，
 不得在 schema migration 中从旧快照猜测生成。
 
+自动化执行时，`LISTING_STATUS_SCAN` 子 run 必须先把任务 13 输入清单 SHA-256
+不可变绑定到自身；同一清单不得绑定多个 Automation run。权威 `SYNC_STATUS`
+Importer 必须在快照、商品投影、异常、人工复核和通知写入的同一事务内校验当前
+Automation claim、合法父子链、平台及时间策略。未绑定 Automation run 的人工任务
+13 导入继续走独立人工模块，不要求 Automation claim；完全相同的既有回执重放可在
+验证绑定信封后直接返回，但不得新增或替换事实。
+
 ## 5. 接受条件
 
 - 映射源、不可变 JSON 和 SHA-256 可重复验证。
@@ -124,6 +131,9 @@ FULL_MARKET_SCAN
 - 幂等重放必须始终校验 run 存在及其类型、平台和时间策略；run 进入终态后仍可
   返回同 batch ID 或同 run 同内容的既有事实，只有插入新事实才要求 `RUNNING`。
 - 商品子结果失败、订单能力不可用和父 run 状态彼此隔离。
+- 完整扫描对 10 分钟小扫描的最终覆盖只能由成功且已接受上述权威事实的
+  `LISTING_STATUS_SCAN` 子 run 触发；父 run 成功本身不构成覆盖，`ORDER_SCAN`
+  结果也不参与覆盖判断。
 - 临时数据库、完整 pytest、系统冒烟、wheel 和 CI 通过。
 
 本合同不授权真实 COMMIT、普通自动业务任务或 `SYSTEM_EMERGENCY`。

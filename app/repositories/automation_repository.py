@@ -45,6 +45,7 @@ CHILD_PARENT_CLAIM_STATUSES = frozenset(
     }
 )
 COVERAGE_CANDIDATE = "COVERAGE_CANDIDATE"
+LISTING_STATUS_SCAN = "LISTING_STATUS_SCAN"
 
 
 class AutomationLeaseLostError(RuntimeError):
@@ -464,7 +465,10 @@ class AutomationRepository:
                                  AND links.relation_type = ?
                                  AND targets.run_status
                                      IN ('SCHEDULED', 'RUNNING')
-                                 AND target_jobs.enabled = 1
+                                  AND (
+                                      target_jobs.enabled = 1
+                                      OR target_jobs.schedule_kind = 'CHILD_ONLY'
+                                  )
                            ) AS coverage_held
                     FROM automation_runs AS runs
                     WHERE runs.job_id = ?
@@ -603,7 +607,10 @@ class AutomationRepository:
                     and int(pulse["job_enabled"]) == 1
                     and str(target["job_type"])
                     in {"FULL_MARKET_SCAN", "PRE_CUTOFF_FULL_SCAN"}
-                    and str(target["job_type"]) in executable
+                    and _coverage_target_is_executable(
+                        str(target["job_type"]),
+                        executable,
+                    )
                     and int(target["job_enabled"]) == 1
                     and str(pulse["platform_name"])
                     == str(target["platform_name"])
@@ -660,11 +667,17 @@ class AutomationRepository:
     def reconcile_coverage_candidates(
         self,
         *,
+        executable_job_types: Iterable[str],
         now: datetime,
     ) -> tuple[str, ...]:
         """Release candidates whose target is no longer executable."""
 
         current = _as_utc(now, "now")
+        executable = frozenset(
+            value.strip()
+            for value in executable_job_types
+            if value.strip()
+        )
         released: list[str] = []
         with closing(self.runtime_repository.connect_write()) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -673,7 +686,7 @@ class AutomationRepository:
                     """
                     SELECT links.parent_run_id, links.child_run_id,
                            targets.run_status, targets.job_type,
-                           jobs.enabled
+                           jobs.enabled, jobs.schedule_kind
                     FROM automation_run_links AS links
                     INNER JOIN automation_runs AS targets
                         ON targets.run_id = links.parent_run_id
@@ -688,7 +701,14 @@ class AutomationRepository:
                     valid = (
                         str(row["run_status"])
                         in {"SCHEDULED", "RUNNING"}
-                        and int(row["enabled"]) == 1
+                        and (
+                            int(row["enabled"]) == 1
+                            or str(row["schedule_kind"]) == "CHILD_ONLY"
+                        )
+                        and _coverage_target_is_executable(
+                            str(row["job_type"]),
+                            executable,
+                        )
                     )
                     if valid:
                         continue
@@ -735,6 +755,97 @@ class AutomationRepository:
                 connection.rollback()
                 raise
         return tuple(released)
+
+    def bind_run_input_manifest(
+        self,
+        claim: AutomationRunClaim,
+        *,
+        manifest_sha256: str,
+        now: datetime,
+    ) -> AutomationRun:
+        """Bind one immutable external input to a live Automation child run."""
+
+        current = _as_utc(now, "now")
+        manifest = manifest_sha256.strip().lower()
+        if not (
+            manifest.startswith("sha256:")
+            and len(manifest) == 71
+            and all(character in "0123456789abcdef" for character in manifest[7:])
+        ):
+            raise ValueError("manifest_sha256 must be a prefixed SHA-256")
+        with closing(self.runtime_repository.connect_write()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                validate_live_automation_claim_in_transaction(
+                    connection,
+                    claim,
+                    now=current,
+                )
+                row = connection.execute(
+                    """
+                    SELECT *
+                    FROM automation_runs
+                    WHERE run_id = ?
+                    """,
+                    (claim.run.run_id,),
+                ).fetchone()
+                if row is None or str(row["job_type"]) != LISTING_STATUS_SCAN:
+                    raise ValueError(
+                        "Only LISTING_STATUS_SCAN can bind a listing manifest"
+                    )
+                existing_manifest = str(
+                    row["input_manifest_sha256"] or ""
+                ).strip()
+                if existing_manifest and existing_manifest != manifest:
+                    raise ValueError(
+                        "Automation run already has a different input manifest"
+                    )
+                duplicate = connection.execute(
+                    """
+                    SELECT run_id
+                    FROM automation_runs
+                    WHERE input_manifest_sha256 = ? AND run_id <> ?
+                    LIMIT 1
+                    """,
+                    (manifest, claim.run.run_id),
+                ).fetchone()
+                if duplicate is not None:
+                    raise ValueError(
+                        "Listing manifest is already bound to another run"
+                    )
+                if not existing_manifest:
+                    connection.execute(
+                        """
+                        UPDATE automation_runs
+                        SET input_manifest_sha256 = ?, updated_at = ?
+                        WHERE run_id = ?
+                        """,
+                        (
+                            manifest,
+                            _datetime_text(current),
+                            claim.run.run_id,
+                        ),
+                    )
+                    _insert_event(
+                        connection,
+                        run_id=claim.run.run_id,
+                        event_type="INPUT_MANIFEST_BOUND",
+                        from_status=AutomationRunStatus.RUNNING,
+                        to_status=AutomationRunStatus.RUNNING,
+                        payload={"manifest_sha256": manifest},
+                        created_at=current,
+                    )
+                bound = connection.execute(
+                    "SELECT * FROM automation_runs WHERE run_id = ?",
+                    (claim.run.run_id,),
+                ).fetchone()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        if bound is None:
+            raise RuntimeError("Automation run input manifest was not bound")
+        return _row_to_run(bound)
 
     def ensure_link(
         self,
@@ -1226,6 +1337,21 @@ class AutomationRepository:
         }
 
 
+def _coverage_target_is_executable(
+    job_type: str,
+    executable_job_types: frozenset[str],
+) -> bool:
+    if job_type in CHILD_PARENT_JOB_TYPES:
+        return (
+            job_type in executable_job_types
+            and LISTING_STATUS_SCAN in executable_job_types
+        )
+    return (
+        job_type == LISTING_STATUS_SCAN
+        and LISTING_STATUS_SCAN in executable_job_types
+    )
+
+
 def _settle_linked_runs(
     connection,
     *,
@@ -1237,6 +1363,11 @@ def _settle_linked_runs(
         AutomationRunStatus.SUCCESS,
         AutomationRunStatus.PARTIAL,
     }
+    run_row = connection.execute(
+        "SELECT job_type FROM automation_runs WHERE run_id = ?",
+        (parent_run_id,),
+    ).fetchone()
+    run_job_type = str(run_row["job_type"]) if run_row is not None else ""
     coverage_rows = connection.execute(
         """
         SELECT child_run_id
@@ -1246,86 +1377,106 @@ def _settle_linked_runs(
         """,
         (parent_run_id, COVERAGE_CANDIDATE),
     ).fetchall()
-    if parent_status is AutomationRunStatus.SUCCESS:
-        for row in coverage_rows:
-            pulse_run_id = str(row["child_run_id"])
-            cursor = connection.execute(
+
+    if coverage_rows and run_job_type in CHILD_PARENT_JOB_TYPES:
+        listing_child = None
+        if allows_children:
+            listing_child = connection.execute(
                 """
-                UPDATE automation_runs
-                SET run_status = 'MERGED', finished_at = ?,
-                    error_code = 'MERGED_INTO_SUCCESSFUL_RUN',
-                    error_message = ?,
-                    updated_at = ?
-                WHERE run_id = ? AND run_status = 'SCHEDULED'
+                SELECT children.run_id
+                FROM automation_run_links AS links
+                INNER JOIN automation_runs AS children
+                    ON children.run_id = links.child_run_id
+                WHERE links.parent_run_id = ?
+                  AND links.relation_type = 'LISTING_STATUS_CHILD'
+                  AND children.job_type = 'LISTING_STATUS_SCAN'
+                  AND children.run_status = 'SCHEDULED'
+                ORDER BY children.run_id
+                LIMIT 1
                 """,
-                (
-                    _datetime_text(now),
-                    f"Covered by successful run {parent_run_id}",
-                    _datetime_text(now),
-                    pulse_run_id,
+                (parent_run_id,),
+            ).fetchone()
+        if listing_child is None:
+            _release_coverage_candidates(
+                connection,
+                target_run_id=parent_run_id,
+                coverage_rows=coverage_rows,
+                reason=(
+                    "LISTING_STATUS_CHILD_NOT_AVAILABLE"
+                    if allows_children
+                    else f"TARGET_{parent_status.value}"
                 ),
+                now=now,
             )
-            if cursor.rowcount == 1:
+        else:
+            listing_child_run_id = str(listing_child["run_id"])
+            for row in coverage_rows:
+                pulse_run_id = str(row["child_run_id"])
+                connection.execute(
+                    """
+                    DELETE FROM automation_run_links
+                    WHERE parent_run_id = ? AND child_run_id = ?
+                      AND relation_type = ?
+                    """,
+                    (
+                        parent_run_id,
+                        pulse_run_id,
+                        COVERAGE_CANDIDATE,
+                    ),
+                )
                 _insert_link(
                     connection,
-                    parent_run_id=parent_run_id,
+                    parent_run_id=listing_child_run_id,
                     child_run_id=pulse_run_id,
-                    relation_type="MERGED_RUN",
+                    relation_type=COVERAGE_CANDIDATE,
                     created_at=now,
                 )
                 _insert_event(
                     connection,
                     run_id=pulse_run_id,
-                    event_type="RUN_MERGED",
-                    from_status=AutomationRunStatus.SCHEDULED,
-                    to_status=AutomationRunStatus.MERGED,
-                    payload={"target_run_id": parent_run_id},
-                    created_at=now,
-                )
-            connection.execute(
-                """
-                DELETE FROM automation_run_links
-                WHERE parent_run_id = ? AND child_run_id = ?
-                  AND relation_type = ?
-                """,
-                (parent_run_id, pulse_run_id, COVERAGE_CANDIDATE),
-            )
-    else:
-        for row in coverage_rows:
-            pulse_run_id = str(row["child_run_id"])
-            connection.execute(
-                """
-                DELETE FROM automation_run_links
-                WHERE parent_run_id = ? AND child_run_id = ?
-                  AND relation_type = ?
-                """,
-                (parent_run_id, pulse_run_id, COVERAGE_CANDIDATE),
-            )
-            pulse = connection.execute(
-                """
-                SELECT run_status
-                FROM automation_runs
-                WHERE run_id = ?
-                """,
-                (pulse_run_id,),
-            ).fetchone()
-            if (
-                pulse is not None
-                and str(pulse["run_status"])
-                == AutomationRunStatus.SCHEDULED.value
-            ):
-                _insert_event(
-                    connection,
-                    run_id=pulse_run_id,
-                    event_type="COVERAGE_CANDIDATE_RELEASED",
+                    event_type="COVERAGE_CANDIDATE_RETARGETED",
                     from_status=AutomationRunStatus.SCHEDULED,
                     to_status=AutomationRunStatus.SCHEDULED,
                     payload={
-                        "target_run_id": parent_run_id,
-                        "target_status": parent_status.value,
+                        "orchestration_run_id": parent_run_id,
+                        "listing_status_run_id": listing_child_run_id,
                     },
                     created_at=now,
                 )
+    elif coverage_rows and run_job_type == LISTING_STATUS_SCAN:
+        if (
+            parent_status is AutomationRunStatus.SUCCESS
+            and _listing_coverage_facts_accepted(
+                connection,
+                listing_run_id=parent_run_id,
+            )
+        ):
+            _finalize_coverage_candidates(
+                connection,
+                target_run_id=parent_run_id,
+                coverage_rows=coverage_rows,
+                now=now,
+            )
+        else:
+            _release_coverage_candidates(
+                connection,
+                target_run_id=parent_run_id,
+                coverage_rows=coverage_rows,
+                reason=(
+                    "LISTING_FACTS_NOT_ACCEPTED"
+                    if parent_status is AutomationRunStatus.SUCCESS
+                    else f"TARGET_{parent_status.value}"
+                ),
+                now=now,
+            )
+    elif coverage_rows:
+        _release_coverage_candidates(
+            connection,
+            target_run_id=parent_run_id,
+            coverage_rows=coverage_rows,
+            reason="UNSUPPORTED_COVERAGE_TARGET",
+            now=now,
+        )
 
     if allows_children:
         return
@@ -1373,6 +1524,139 @@ def _settle_linked_runs(
             )
 
 
+def _finalize_coverage_candidates(
+    connection,
+    *,
+    target_run_id: str,
+    coverage_rows,
+    now: datetime,
+) -> None:
+    for row in coverage_rows:
+        pulse_run_id = str(row["child_run_id"])
+        cursor = connection.execute(
+            """
+            UPDATE automation_runs
+            SET run_status = 'MERGED', finished_at = ?,
+                error_code = 'MERGED_INTO_SUCCESSFUL_RUN',
+                error_message = ?,
+                updated_at = ?
+            WHERE run_id = ? AND run_status = 'SCHEDULED'
+            """,
+            (
+                _datetime_text(now),
+                f"Covered by accepted listing run {target_run_id}",
+                _datetime_text(now),
+                pulse_run_id,
+            ),
+        )
+        if cursor.rowcount == 1:
+            _insert_link(
+                connection,
+                parent_run_id=target_run_id,
+                child_run_id=pulse_run_id,
+                relation_type="MERGED_RUN",
+                created_at=now,
+            )
+            _insert_event(
+                connection,
+                run_id=pulse_run_id,
+                event_type="RUN_MERGED",
+                from_status=AutomationRunStatus.SCHEDULED,
+                to_status=AutomationRunStatus.MERGED,
+                payload={"target_run_id": target_run_id},
+                created_at=now,
+            )
+        connection.execute(
+            """
+            DELETE FROM automation_run_links
+            WHERE parent_run_id = ? AND child_run_id = ?
+              AND relation_type = ?
+            """,
+            (target_run_id, pulse_run_id, COVERAGE_CANDIDATE),
+        )
+
+
+def _release_coverage_candidates(
+    connection,
+    *,
+    target_run_id: str,
+    coverage_rows,
+    reason: str,
+    now: datetime,
+) -> None:
+    for row in coverage_rows:
+        pulse_run_id = str(row["child_run_id"])
+        connection.execute(
+            """
+            DELETE FROM automation_run_links
+            WHERE parent_run_id = ? AND child_run_id = ?
+              AND relation_type = ?
+            """,
+            (target_run_id, pulse_run_id, COVERAGE_CANDIDATE),
+        )
+        pulse = connection.execute(
+            "SELECT run_status FROM automation_runs WHERE run_id = ?",
+            (pulse_run_id,),
+        ).fetchone()
+        if (
+            pulse is not None
+            and str(pulse["run_status"])
+            == AutomationRunStatus.SCHEDULED.value
+        ):
+            _insert_event(
+                connection,
+                run_id=pulse_run_id,
+                event_type="COVERAGE_CANDIDATE_RELEASED",
+                from_status=AutomationRunStatus.SCHEDULED,
+                to_status=AutomationRunStatus.SCHEDULED,
+                payload={
+                    "target_run_id": target_run_id,
+                    "reason": reason,
+                },
+                created_at=now,
+            )
+
+
+def _listing_coverage_facts_accepted(
+    connection,
+    *,
+    listing_run_id: str,
+) -> bool:
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM automation_runs AS runs
+        INNER JOIN shadowbot_listing_action_batches AS batches
+            ON batches.manifest_sha256 = runs.input_manifest_sha256
+           AND batches.platform_name = runs.platform_name
+        INNER JOIN listing_sync_snapshots AS snapshots
+            ON snapshots.batch_id = batches.batch_id
+           AND snapshots.platform_name = runs.platform_name
+        INNER JOIN product_observation_batches AS observations
+            ON observations.automation_run_id = runs.run_id
+           AND observations.observation_batch_id =
+               'product-observation-' || snapshots.snapshot_id
+           AND observations.platform_name = runs.platform_name
+           AND observations.time_policy_version =
+               runs.time_policy_version
+        WHERE runs.run_id = ?
+          AND runs.job_type = 'LISTING_STATUS_SCAN'
+          AND runs.input_manifest_sha256 <> ''
+          AND batches.action_type = 'sync_status'
+          AND batches.status = 'VERIFIED'
+          AND snapshots.status = 'VERIFIED'
+          AND snapshots.snapshot_complete = 1
+          AND observations.scan_type = 'LISTING_STATUS_SCAN'
+          AND observations.batch_status = 'ACCEPTED'
+          AND observations.scope_complete = 1
+          AND observations.end_marker_verified = 1
+        LIMIT 1
+        """,
+        (listing_run_id,),
+    ).fetchone()
+    return row is not None
+
+
 def _claim_next_connection(
     connection,
     *,
@@ -1388,6 +1672,18 @@ def _claim_next_connection(
     relation_placeholders = ",".join("?" for _ in child_relations)
     parent_statuses = tuple(CHILD_PARENT_CLAIM_STATUSES)
     parent_status_placeholders = ",".join("?" for _ in parent_statuses)
+    executable = frozenset(allowed_job_types)
+    coverage_target_types = tuple(
+        job_type
+        for job_type in (
+            *sorted(CHILD_PARENT_JOB_TYPES),
+            LISTING_STATUS_SCAN,
+        )
+        if _coverage_target_is_executable(job_type, executable)
+    )
+    coverage_placeholders = ",".join(
+        "?" for _ in coverage_target_types
+    ) or "NULL"
     row = connection.execute(
         f"""
         SELECT runs.run_id
@@ -1427,11 +1723,15 @@ def _claim_next_connection(
                           ON targets.run_id = coverage.parent_run_id
                       INNER JOIN automation_jobs AS target_jobs
                           ON target_jobs.job_id = targets.job_id
-                      WHERE coverage.child_run_id = runs.run_id
-                        AND coverage.relation_type = 'COVERAGE_CANDIDATE'
-                        AND targets.run_status IN ('SCHEDULED', 'RUNNING')
-                        AND target_jobs.enabled = 1
-                  )
+                        WHERE coverage.child_run_id = runs.run_id
+                         AND coverage.relation_type = 'COVERAGE_CANDIDATE'
+                         AND targets.run_status IN ('SCHEDULED', 'RUNNING')
+                         AND (
+                             target_jobs.enabled = 1
+                             OR target_jobs.schedule_kind = 'CHILD_ONLY'
+                         )
+                         AND targets.job_type IN ({coverage_placeholders})
+                   )
               )
               OR (
                   runs.run_status = 'RUNNING'
@@ -1453,6 +1753,7 @@ def _claim_next_connection(
             _datetime_text(now),
             *child_relations,
             *parent_statuses,
+            *coverage_target_types,
             _datetime_text(now),
         ),
     ).fetchone()
@@ -1523,7 +1824,10 @@ def _claim_specific_run_connection(
             WHERE links.child_run_id = ?
               AND links.relation_type = 'COVERAGE_CANDIDATE'
               AND targets.run_status IN ('SCHEDULED', 'RUNNING')
-              AND jobs.enabled = 1
+              AND (
+                  jobs.enabled = 1
+                  OR jobs.schedule_kind = 'CHILD_ONLY'
+              )
             LIMIT 1
             """,
             (run_id,),

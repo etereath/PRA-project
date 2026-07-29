@@ -96,6 +96,13 @@ class AutomationExecutionContext:
         self.claim = renewed
         return True
 
+    def bind_input_manifest(self, manifest_sha256: str) -> AutomationRun:
+        return self.repository.bind_run_input_manifest(
+            self.claim,
+            manifest_sha256=manifest_sha256,
+            now=self.clock(),
+        )
+
     def ensure_child_run(
         self,
         *,
@@ -138,6 +145,7 @@ class AutomationSchedulePlanner:
         current = _as_utc(now, "now")
         executable = frozenset(executable_job_types or ())
         self.repository.reconcile_coverage_candidates(
+            executable_job_types=executable,
             now=current,
         )
         created_ids: list[str] = []

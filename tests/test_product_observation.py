@@ -131,7 +131,6 @@ class _ClaimingProductObservationImporter(ProductObservationImporter):
         batch: ProductObservationBatchInput,
         *,
         claim: AutomationRunClaim | None = None,
-        now: datetime = TEST_NOW,
     ):
         if claim is None:
             run = AutomationRepository(self.repository).get_run(
@@ -146,7 +145,7 @@ class _ClaimingProductObservationImporter(ProductObservationImporter):
                 lease_expires_at=run.lease_expires_at,
                 reclaimed=False,
             )
-        return super().import_batch(batch, claim=claim, now=now)
+        return super().import_batch(batch, claim=claim)
 
 
 def _importer(tmp_path) -> tuple[
@@ -169,6 +168,7 @@ def _importer(tmp_path) -> tuple[
     return repository, _ClaimingProductObservationImporter(
         repository,
         mappings=mappings,
+        clock=lambda: TEST_NOW,
     )
 
 
@@ -433,7 +433,7 @@ def test_live_claim_can_write_observation_and_complete_run(tmp_path) -> None:
     )
     claim = _stored_claim(repository, batch.automation_run_id)
 
-    result = importer.import_batch(batch, claim=claim, now=TEST_NOW)
+    result = importer.import_batch(batch, claim=claim)
 
     assert result.already_imported is False
     assert AutomationRepository(repository).finish_run(
@@ -461,13 +461,10 @@ def test_expired_unreclaimed_claim_cannot_write_observation(tmp_path) -> None:
         ),
     )
     claim = _stored_claim(repository, batch.automation_run_id)
+    importer.clock = lambda: claim.lease_expires_at
 
     with pytest.raises(ProductObservationError, match="lease is not live"):
-        importer.import_batch(
-            batch,
-            claim=claim,
-            now=claim.lease_expires_at,
-        )
+        importer.import_batch(batch, claim=claim)
 
     with closing(repository.connect_read()) as connection:
         assert (
@@ -496,7 +493,7 @@ def test_reclaimed_old_owner_cannot_write_second_fact_batch(tmp_path) -> None:
         ),
     )
     old_claim = _stored_claim(repository, first.automation_run_id)
-    importer.import_batch(first, claim=old_claim, now=TEST_NOW)
+    importer.import_batch(first, claim=old_claim)
     with closing(repository.connect_write()) as connection:
         connection.execute(
             """
@@ -524,13 +521,13 @@ def test_reclaimed_old_owner_cannot_write_second_fact_batch(tmp_path) -> None:
     )
 
     with pytest.raises(ProductObservationError, match="lease is not live"):
-        importer.import_batch(late, claim=old_claim, now=TEST_NOW)
+        importer.import_batch(late, claim=old_claim)
     new_claim = _stored_claim(repository, first.automation_run_id)
     with pytest.raises(
         ProductObservationError,
         match="already has different observation content",
     ):
-        importer.import_batch(late, claim=new_claim, now=TEST_NOW)
+        importer.import_batch(late, claim=new_claim)
 
     with closing(repository.connect_read()) as connection:
         assert (
@@ -1202,6 +1199,7 @@ def test_run_status_and_time_policy_are_strongly_bound(tmp_path) -> None:
                 policy_version="TEST_POLICY_V2"
             )
         ),
+        clock=lambda: TEST_NOW,
     )
     with pytest.raises(ProductObservationError, match="time policy"):
         mismatched_time_importer.import_batch(

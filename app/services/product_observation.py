@@ -7,7 +7,7 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Iterable
+from typing import Callable, Iterable
 
 from app.automation_models import AutomationRunClaim
 from app.repositories.automation_repository import (
@@ -84,20 +84,21 @@ class ProductObservationImporter:
         *,
         mappings: CompiledProductMappings,
         operational_time: OperationalTimeService | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.repository = repository
         self.mappings = mappings
         self.operational_time = operational_time or OperationalTimeService()
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     def import_batch(
         self,
         batch: ProductObservationBatchInput,
         *,
         claim: AutomationRunClaim,
-        now: datetime,
     ) -> ProductObservationImportResult:
         normalized = self._normalize_and_validate(batch)
-        current = _as_utc(now, "now")
+        current = _as_utc(self.clock(), "clock")
         if claim.run.run_id != normalized.automation_run_id:
             raise ProductObservationError(
                 "Automation Run claim does not match observation batch"

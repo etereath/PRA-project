@@ -20,11 +20,13 @@
 - 可注入的应用服务 handler 边界。
 
 本阶段不建设订单页面 Adapter、销售估算、日结算法、S4 自动紧急下架或 Web
-运营页面，也不修改 ShadowBot Worker、队列合同、Importer、Watchdog 或唯一
-RECONCILE。为形成单 UI 通道，只在既有 v4/v5 写任务取得 Runtime 写锁的事务入口增加
-活动 Automation UI 租约检查，不改变任务、队列、Worker 或动作状态机合同。真实平台
-扫描 handler 必须在对应应用服务具备完整合同和验收后显式注册；不存在 handler 时，
-调度器只创建 `SCHEDULED` 账本，不伪造成功，也不产生平台副作用。
+运营页面，也不修改 ShadowBot Worker、队列合同、Watchdog 或唯一 RECONCILE。
+为形成单 UI 通道，只在既有 v4/v5 写任务取得 Runtime 写锁的事务入口增加活动
+Automation UI 租约检查；为封闭自动扫描的事实提交边界，在任务 13 权威
+`SYNC_STATUS` Importer 增加不可变输入清单绑定和 Automation claim fencing，
+但不改变任务、队列、Worker 或动作状态机合同。真实平台扫描 handler 必须在对应
+应用服务具备完整合同和验收后显式注册；不存在 handler 时，调度器只创建
+`SCHEDULED` 账本，不伪造成功，也不产生平台副作用。
 
 ## 2. 默认作业
 
@@ -103,17 +105,27 @@ N 个。进程在创建 run 后、合并前崩溃时，下一轮必须重新扫�
 - 当前 Automation Service 已注册目标扫描 handler；
 - 平台、交易日和五分钟时间窗口一致。
 
-候选期只建立 `COVERAGE_CANDIDATE` 链接，小扫描仍为 `SCHEDULED`，但暂不领取，也不因
-迟到被标成 `MISSED`。只有目标扫描以 `SUCCESS` 完成后，才把小扫描原子推进为
-`MERGED`，并建立最终关系：
+候选期只建立从完整扫描父 run 指向小扫描的 `COVERAGE_CANDIDATE` 链接，小扫描仍为
+`SCHEDULED`，但暂不领取，也不因迟到被标成 `MISSED`。候选不仅要求父扫描 handler，
+还要求当前服务已经注册 `LISTING_STATUS_SCAN` handler；任一能力在重启后丢失时，
+既有候选必须释放，即使目标父 run 已处于租约过期的 `RUNNING`。
+
+完整扫描父 run 以 `SUCCESS/PARTIAL` 完成并创建合法 `LISTING_STATUS_CHILD` 后，候选
+原子改指向该商品子 run。父 run 完成但没有商品子 run、父 run 失败/取消/错过，或
+商品子 run 部分成功/失败/取消时，均释放候选，让小扫描回退执行。`ORDER_SCAN`
+子 run 的成功或失败不参与商品覆盖判断。
+
+只有 `LISTING_STATUS_SCAN` 子 run 以 `SUCCESS` 完成，并且同一输入清单已经形成任务
+13 的 `VERIFIED` 双页权威快照及与该快照绑定的 v14 `ACCEPTED` 完整商品观察事实后，
+才把小扫描原子推进为 `MERGED`，并建立最终关系：
 
 ```text
-完整扫描父 run --MERGED_RUN--> 小扫描 run
+LISTING_STATUS_SCAN 子 run --MERGED_RUN--> 小扫描 run
 ```
 
-目标扫描为 `PARTIAL`、`FAILED`、`CANCELLED`、`MISSED`，或候选期间被禁用时，必须
-释放候选，让小扫描按原计划回退执行。无 handler、禁用或失败的目标绝不能让小扫描
-提前进入终态。
+父/子 handler 缺失、父 job 禁用或未接受权威业务事实时，绝不能让小扫描提前进入
+终态。领取入口还必须使用当前可执行 handler 集合重复验证候选，不能依赖上次进程
+留下的候选状态。
 
 因此 17:55 截单前扫描绝不能覆盖 18:00 后已属于下一平台交易日的脉冲。
 
@@ -171,8 +183,8 @@ lease_expires_at > 写回时间
 `LEASE_RECLAIMED`。旧实例的晚到结果必须被拒绝；当前周期一旦发现租约丢失，立即停止
 继续领取，避免同一故障 handler 在一个周期内反复抢占。
 
-任何 handler 或 Importer 新增、替换商品、订单、结算等业务事实时，必须携带当前
-`AutomationRunClaim`，并在写入事实的同一个 `BEGIN IMMEDIATE` 事务内验证：
+任何自动化 handler 或 Importer 新增、替换商品、订单、结算等业务事实时，必须携带
+当前 `AutomationRunClaim`，并在写入事实的同一个 `BEGIN IMMEDIATE` 事务内验证：
 
 ```text
 run_status = RUNNING
@@ -181,9 +193,19 @@ lease_version = 当前 version
 lease_expires_at > 当前写入时间
 ```
 
-当前商品观察导入已落实这一合同；后续订单和结算事实入口必须复用同一事务校验函数。
-完全相同且不会新增或替换事实的幂等重放可以直接返回既有结果；任何不同内容仍必须
-持有有效 claim，且同一 Automation run 不得用另一批内容替换已接收的规范事实。
+当前商品观察导入和自动化绑定的任务 13 权威 `SYNC_STATUS` 导入均已落实这一合同；
+后续订单和结算事实入口必须复用同一事务校验函数。Automation
+`LISTING_STATUS_SCAN` 子 run 必须先把规范输入清单 SHA-256 不可变绑定到 run；
+同一清单只能绑定一个 run。Importer 在权威快照、投影、异常、人工复核和通知写入的
+同一事务内校验绑定、合法父子链、平台、时间策略和活动 claim。未绑定 Automation
+run 的人工任务 13 导入路径继续独立存在，不强制伪造自动化 claim。
+
+完全相同且不会新增或替换事实的幂等重放可以在复核绑定信封后直接返回既有结果；
+任何不同内容仍必须持有有效 claim，且同一 Automation run 不得用另一批内容替换
+已接收的规范事实。
+
+涉及租约有效期、事实接收时刻等安全判定的当前时间必须来自应用服务注入的可信时钟；
+生产调用方不能通过导入参数指定 `now` 来延长或回拨 claim。
 
 handler 异常只写入受限的稳定错误码：
 
@@ -236,7 +258,7 @@ data/runtime/automation_service/heartbeat.json
 专项测试必须覆盖：
 
 - 重复轮询幂等；
-- 小时扫描覆盖小扫描；
+- 完整扫描候选经商品子任务权威事实覆盖小扫描，订单子任务不影响结果；
 - 休眠与 `MISSED`；
 - 长时间停机风暴上限；
 - 单 owner 领取；
@@ -251,7 +273,10 @@ data/runtime/automation_service/heartbeat.json
 - 首个 UI handler 整个执行期间第二实例无法领取另一 UI run；
 - v4/v5 写任务在取得写锁前反向检查活动 Automation UI 租约；
 - 业务事实与 Automation claim 的同事务 fencing、过期 owner 与被回收 owner；
-- 覆盖候选仅在目标成功后转为 `MERGED`，禁用、无 handler、部分成功和失败均回退；
+- 覆盖候选从父 run 转交商品子 run，只有权威双页快照和对应观察事实均接受后转为
+  `MERGED`；无 handler、重启能力丢失、无商品子任务、无事实、部分成功和失败均回退；
+- 自动化 `SYNC_STATUS` 清单不可变绑定、同事务 claim fencing、人工导入隔离及
+  可信时钟；
 - 禁用 job、合法 `CHILD_ONLY` 父链与默认 job 静态漂移；
 - 子 run 在父 run 完成前不可领取，父失败时自动取消；
 - Runtime 时间策略热加载；

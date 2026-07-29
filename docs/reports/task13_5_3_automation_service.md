@@ -11,7 +11,7 @@
 - 新增稳定逻辑 run key、同窗口并发幂等和 job 类型不可变门禁。
 - 新增 10 分钟、每小时、17:55、18:05、20:00、20:05 默认计划。
 - 新增休眠错过、最近窗口补跑、日结幂等补跑和每 job 物化上限。
-- 新增邻近完整扫描覆盖小扫描的 `MERGED_RUN` 链接。
+- 新增邻近完整扫描覆盖小扫描的候选与 `MERGED_RUN` 链接。
 - 新增按 job priority 领取和 UNKNOWN/RECONCILE、活动写锁的 UI gate。
 - 新增 `lease_owner + lease_version + lease_expires_at` 原子领取、续租、超时回收和
   晚到写回 fencing。
@@ -35,6 +35,19 @@
 - 公开 `claim_run(...)` 与常规领取统一启用状态、父链、覆盖候选和 UI 门禁。
 - 子 run 仅在父 run `SUCCESS/PARTIAL` 后可领取；父 run 失败、取消或错过会取消尚未
   开始的子 run。
+- 第三轮评审后把覆盖完成条件从“完整扫描父 run 成功”收紧为“商品状态子 run 成功且
+  权威业务事实已接受”：候选先绑定父 run，父完成后转交 `LISTING_STATUS_SCAN`
+  子 run；只有同一清单的任务 13 `VERIFIED` 双页快照和 v14 `ACCEPTED` 完整观察
+  同时存在时才最终 `MERGED`。父任务无商品子任务、商品子任务无事实/失败/部分成功
+  均释放小扫描，`ORDER_SCAN` 不影响商品覆盖。
+- 覆盖候选和领取防御均使用当前已注册 handler 集合；服务重启后父 handler 或商品
+  handler 丢失，会释放旧候选，包括目标仍为租约过期 `RUNNING` 的恢复场景。
+- Automation 商品子 run 增加不可变输入清单 SHA-256 绑定。绑定后的任务 13
+  `SYNC_STATUS` 导入必须在同一事务内校验合法父子链、平台、时间策略和活动 claim，
+  旧 owner 在租约回收后不能写入快照、投影、异常、复核或通知；未绑定清单的人工
+  导入继续保持独立。
+- 商品观察接收时间改由应用服务注入的可信时钟产生，生产调用方不再能够通过 `now`
+  参数影响租约判定。
 
 ## 2. 复用与未改写
 
@@ -68,8 +81,11 @@ CLI 当前明确报告 `SCHEDULER_ONLY`。它可以安全创建到期账本、�
 - 计划幂等、合并、休眠、错过和任务风暴保护；
 - 优先级、单 owner、租约心跳、超时、重启恢复和 fencing；
 - handler 异常、父子 run、UNKNOWN 阻断；
-- 两阶段覆盖候选、目标失败回退、无 handler/禁用目标不合并；
+- 父候选转交商品子任务、权威快照与观察事实双重接受后合并、订单子任务隔离；
+- 重启后 handler 能力丢失、租约过期运行目标和无商品事实的候选回退；
 - 事实写入同事务租约 fencing、旧 owner 拒绝和同 run 规范事实保护；
+- 自动化输入清单不可变绑定、权威 `SYNC_STATUS` 同事务 fencing 与人工导入隔离；
+- 应用服务可信时钟，生产调用方不可指定安全判定时间；
 - Automation UI handler 执行期的跨实例互斥及 v4/v5 写锁反向门禁；
 - 公开领取入口门禁与父 run 终态驱动的子 run 领取/取消；
 - 单实例锁、UTF-8 原子心跳和正式 CLI。
@@ -77,9 +93,9 @@ CLI 当前明确报告 `SCHEDULER_ONLY`。它可以安全创建到期账本、�
 验收结果：
 
 - `python -m pytest -q tests/test_automation_service.py`：
-  `35 passed`；
+  `43 passed`；
 - `python -m pytest -q`：
-  `830 passed, 3 skipped, 97 subtests passed`；
+  `840 passed, 3 skipped, 97 subtests passed`；
 - 系统冒烟：16 项通过、0 项失败；
 - 本次新增/修改 Python 文件 Ruff：PASS；
 - `compileall`：PASS；

@@ -36,6 +36,7 @@ from app.services.automation import (
     INTERVAL_MINUTES,
     LISTING_STATUS_SCAN,
     ONLINE_PULSE,
+    ORDER_SCAN,
     PLATFORM_TRADE_DAY_SETTLEMENT,
     ensure_default_automation_jobs,
 )
@@ -124,6 +125,123 @@ def _ensure_run(
     )[0]
 
 
+def _seed_accepted_listing_coverage_facts(
+    repository: AutomationRepository,
+    *,
+    listing_run_id: str,
+    manifest_sha256: str,
+    now: datetime,
+) -> None:
+    run = repository.get_run(listing_run_id)
+    assert run is not None
+    suffix = listing_run_id[-12:]
+    batch_id = f"BATCH-COVER-{suffix}"
+    result_id = f"RESULT-COVER-{suffix}"
+    snapshot_id = f"SNAPSHOT-COVER-{suffix}"
+    timestamp = now.isoformat()
+    with repository.runtime_repository.connect_write() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            INSERT INTO shadowbot_batch_registry(
+                batch_id, batch_type, contract_version,
+                platform_name, created_at
+            ) VALUES (?, 'sync_status', 5, ?, ?)
+            """,
+            (batch_id, run.platform_name, timestamp),
+        )
+        connection.execute(
+            """
+            INSERT INTO shadowbot_listing_action_batches(
+                batch_id, contract_version, execution_profile,
+                action_type, platform_name, manifest_sha256,
+                status, batch_target_count, created_at, updated_at
+            ) VALUES (?, 5, 'production', 'sync_status', ?, ?,
+                      'VERIFIED', 0, ?, ?)
+            """,
+            (
+                batch_id,
+                run.platform_name,
+                manifest_sha256,
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO shadowbot_listing_result_receipts(
+                result_id, batch_id, execution_attempt_id,
+                instruction_hash, manifest_sha256, result_sha256,
+                source_result_path, accepted_at, ack_state
+            ) VALUES (?, ?, ?, 'instruction', ?, ?, '', ?, 'PENDING')
+            """,
+            (
+                result_id,
+                batch_id,
+                f"ATTEMPT-{suffix}",
+                manifest_sha256,
+                "a" * 64,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO listing_sync_snapshots(
+                snapshot_id, batch_id, platform_name,
+                execution_attempt_id, scan_started_at,
+                scan_completed_at, online_scan_started_at,
+                online_scan_completed_at, waiting_scan_started_at,
+                waiting_scan_completed_at, online_scan_complete,
+                waiting_scan_complete, snapshot_complete,
+                online_end_marker_verified,
+                waiting_end_marker_verified, instruction_hash,
+                result_id, status, error_code,
+                evidence_manifest_sha256
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, 1,
+                      1, 1, 'instruction', ?, 'VERIFIED', '', ?)
+            """,
+            (
+                snapshot_id,
+                batch_id,
+                run.platform_name,
+                f"ATTEMPT-{suffix}",
+                timestamp,
+                timestamp,
+                timestamp,
+                timestamp,
+                timestamp,
+                timestamp,
+                result_id,
+                "sha256:" + "b" * 64,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO product_observation_batches(
+                observation_batch_id, automation_run_id,
+                platform_name, scan_type, batch_status,
+                scan_started_at, scan_completed_at,
+                requested_scope_json, scope_complete,
+                end_marker_verified, content_sha256,
+                time_policy_version, error_code, error_message,
+                created_at
+            ) VALUES (?, ?, ?, 'LISTING_STATUS_SCAN', 'ACCEPTED',
+                      ?, ?, '{}', 1, 1, ?, ?, '', '', ?)
+            """,
+            (
+                f"product-observation-{snapshot_id}",
+                listing_run_id,
+                run.platform_name,
+                timestamp,
+                timestamp,
+                "sha256:" + "c" * 64,
+                run.time_policy_version,
+                timestamp,
+            ),
+        )
+        connection.commit()
+
+
 def test_scheduler_only_does_not_terminally_merge_hourly_pulse(
     repository: AutomationRepository,
 ) -> None:
@@ -171,15 +289,43 @@ def test_successful_full_handler_finalizes_pulse_coverage(
         ),
         now=now,
     )
+    listing_job = _store_job(
+        repository,
+        _job(
+            job_id="LISTING",
+            job_type=LISTING_STATUS_SCAN,
+            enabled=False,
+            schedule_kind=CHILD_ONLY,
+            priority=50,
+        ),
+        now=now,
+    )
     pulse = _ensure_run(repository, pulse_job, scheduled_for=now)
     full = _ensure_run(repository, full_job, scheduled_for=now)
+    manifest_sha256 = "sha256:" + "d" * 64
+
+    def full_handler(run, context):
+        context.ensure_child_run(
+            child_job_id=listing_job.job_id,
+            relation_type="LISTING_STATUS_CHILD",
+        )
+        return AutomationRunOutcome(status=AutomationRunStatus.SUCCESS)
+
+    def listing_handler(run, context):
+        context.bind_input_manifest(manifest_sha256)
+        _seed_accepted_listing_coverage_facts(
+            repository,
+            listing_run_id=run.run_id,
+            manifest_sha256=manifest_sha256,
+            now=now,
+        )
+        return AutomationRunOutcome(status=AutomationRunStatus.SUCCESS)
 
     cycle = AutomationService(
         repository,
         handlers={
-            FULL_MARKET_SCAN: lambda run, context: AutomationRunOutcome(
-                status=AutomationRunStatus.SUCCESS
-            ),
+            FULL_MARKET_SCAN: full_handler,
+            LISTING_STATUS_SCAN: listing_handler,
             ONLINE_PULSE: lambda run, context: AutomationRunOutcome(
                 status=AutomationRunStatus.SUCCESS
             ),
@@ -187,11 +333,19 @@ def test_successful_full_handler_finalizes_pulse_coverage(
         clock=MutableClock(now),
     ).run_cycle()
 
-    assert cycle.completed_run_ids == (full.run_id,)
+    listing_child = repository.list_links(parent_run_id=full.run_id)[0]
+    assert cycle.completed_run_ids == (
+        full.run_id,
+        listing_child.child_run_id,
+    )
     assert cycle.scheduled.merged_run_ids == (pulse.run_id,)
     assert repository.get_run(
         pulse.run_id
     ).run_status is AutomationRunStatus.MERGED
+    assert [
+        (link.parent_run_id, link.relation_type)
+        for link in repository.list_links(child_run_id=pulse.run_id)
+    ] == [(listing_child.child_run_id, "MERGED_RUN")]
 
 
 def test_sleep_records_missed_pulses_and_only_catches_latest_window(
@@ -359,12 +513,22 @@ def test_restart_reconciles_preexisting_scheduled_merge_candidates(
         ),
         now=now,
     )
+    listing_job = _store_job(
+        repository,
+        _job(
+            job_id="LISTING",
+            job_type=LISTING_STATUS_SCAN,
+            enabled=False,
+            schedule_kind=CHILD_ONLY,
+        ),
+        now=now,
+    )
     pulse = _ensure_run(repository, pulse_job, scheduled_for=now)
     full = _ensure_run(repository, full_job, scheduled_for=now)
 
     result = AutomationSchedulePlanner(repository).materialize(
         now=now,
-        executable_job_types=[FULL_MARKET_SCAN],
+        executable_job_types=[FULL_MARKET_SCAN, LISTING_STATUS_SCAN],
     )
 
     assert result.created_run_ids == ()
@@ -384,6 +548,13 @@ def test_restart_reconciles_preexisting_scheduled_merge_candidates(
         lease_seconds=60,
     )
     assert claim is not None
+    listing_child, created = repository.ensure_child_run_fenced(
+        claim,
+        listing_job,
+        relation_type="LISTING_STATUS_CHILD",
+        now=now,
+    )
+    assert created
     assert repository.finish_run(
         claim,
         AutomationRunOutcome(status=AutomationRunStatus.SUCCESS),
@@ -391,11 +562,330 @@ def test_restart_reconciles_preexisting_scheduled_merge_candidates(
     )
     assert repository.get_run(
         pulse.run_id
-    ).run_status is AutomationRunStatus.MERGED
+    ).run_status is AutomationRunStatus.SCHEDULED
     assert [
-        item.relation_type
+        (item.parent_run_id, item.relation_type)
         for item in repository.list_links(child_run_id=pulse.run_id)
-    ] == ["MERGED_RUN"]
+    ] == [(listing_child.run_id, "COVERAGE_CANDIDATE")]
+    listing_claim = repository.claim_run(
+        run_id=listing_child.run_id,
+        owner_token="listing-owner",
+        now=now + timedelta(seconds=1),
+        lease_seconds=60,
+    )
+    assert listing_claim is not None
+    manifest_sha256 = "sha256:" + "e" * 64
+    repository.bind_run_input_manifest(
+        listing_claim,
+        manifest_sha256=manifest_sha256,
+        now=now + timedelta(seconds=1),
+    )
+    _seed_accepted_listing_coverage_facts(
+        repository,
+        listing_run_id=listing_child.run_id,
+        manifest_sha256=manifest_sha256,
+        now=now + timedelta(seconds=1),
+    )
+    assert repository.finish_run(
+        listing_claim,
+        AutomationRunOutcome(status=AutomationRunStatus.SUCCESS),
+        now=now + timedelta(seconds=2),
+    )
+    assert repository.get_run(
+        pulse.run_id
+    ).run_status is AutomationRunStatus.MERGED
+
+
+def test_successful_parent_without_listing_child_releases_pulse(
+    repository: AutomationRepository,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    pulse_job = _store_job(
+        repository,
+        _job(job_id="PULSE", job_type=ONLINE_PULSE, priority=60),
+        now=now,
+    )
+    full_job = _store_job(
+        repository,
+        _job(
+            job_id="FULL",
+            job_type=FULL_MARKET_SCAN,
+            minutes=60,
+            priority=50,
+        ),
+        now=now,
+    )
+    pulse = _ensure_run(repository, pulse_job, scheduled_for=now)
+    full = _ensure_run(repository, full_job, scheduled_for=now)
+    AutomationSchedulePlanner(repository).materialize(
+        now=now,
+        executable_job_types=[FULL_MARKET_SCAN, LISTING_STATUS_SCAN],
+    )
+    claim = repository.claim_run(
+        run_id=full.run_id,
+        owner_token="full-owner",
+        now=now,
+        lease_seconds=60,
+    )
+    assert claim is not None
+
+    assert repository.finish_run(
+        claim,
+        AutomationRunOutcome(status=AutomationRunStatus.SUCCESS),
+        now=now + timedelta(seconds=1),
+    )
+
+    assert repository.get_run(
+        pulse.run_id
+    ).run_status is AutomationRunStatus.SCHEDULED
+    assert repository.list_links(child_run_id=pulse.run_id) == []
+
+
+@pytest.mark.parametrize(
+    "child_status",
+    [
+        AutomationRunStatus.SUCCESS,
+        AutomationRunStatus.PARTIAL,
+        AutomationRunStatus.FAILED,
+        AutomationRunStatus.CANCELLED,
+    ],
+)
+def test_incomplete_listing_child_releases_pulse(
+    repository: AutomationRepository,
+    child_status: AutomationRunStatus,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    pulse_job = _store_job(
+        repository,
+        _job(job_id="PULSE", job_type=ONLINE_PULSE, priority=60),
+        now=now,
+    )
+    full_job = _store_job(
+        repository,
+        _job(
+            job_id="FULL",
+            job_type=FULL_MARKET_SCAN,
+            minutes=60,
+            priority=50,
+        ),
+        now=now,
+    )
+    listing_job = _store_job(
+        repository,
+        _job(
+            job_id="LISTING",
+            job_type=LISTING_STATUS_SCAN,
+            enabled=False,
+            schedule_kind=CHILD_ONLY,
+        ),
+        now=now,
+    )
+    pulse = _ensure_run(repository, pulse_job, scheduled_for=now)
+    full = _ensure_run(repository, full_job, scheduled_for=now)
+    AutomationSchedulePlanner(repository).materialize(
+        now=now,
+        executable_job_types=[FULL_MARKET_SCAN, LISTING_STATUS_SCAN],
+    )
+    parent_claim = repository.claim_run(
+        run_id=full.run_id,
+        owner_token="full-owner",
+        now=now,
+        lease_seconds=60,
+    )
+    assert parent_claim is not None
+    listing_child, _ = repository.ensure_child_run_fenced(
+        parent_claim,
+        listing_job,
+        relation_type="LISTING_STATUS_CHILD",
+        now=now,
+    )
+    assert repository.finish_run(
+        parent_claim,
+        AutomationRunOutcome(status=AutomationRunStatus.SUCCESS),
+        now=now + timedelta(seconds=1),
+    )
+    listing_claim = repository.claim_run(
+        run_id=listing_child.run_id,
+        owner_token="listing-owner",
+        now=now + timedelta(seconds=1),
+        lease_seconds=60,
+    )
+    assert listing_claim is not None
+
+    assert repository.finish_run(
+        listing_claim,
+        AutomationRunOutcome(status=child_status),
+        now=now + timedelta(seconds=2),
+    )
+
+    assert repository.get_run(
+        pulse.run_id
+    ).run_status is AutomationRunStatus.SCHEDULED
+    assert repository.list_links(child_run_id=pulse.run_id) == []
+
+
+@pytest.mark.parametrize("target_running", [False, True])
+def test_restart_without_required_handlers_releases_coverage_candidate(
+    repository: AutomationRepository,
+    target_running: bool,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    pulse_job = _store_job(
+        repository,
+        _job(job_id="PULSE", job_type=ONLINE_PULSE, priority=60),
+        now=now,
+    )
+    full_job = _store_job(
+        repository,
+        _job(
+            job_id="FULL",
+            job_type=FULL_MARKET_SCAN,
+            minutes=60,
+            priority=50,
+        ),
+        now=now,
+    )
+    pulse = _ensure_run(repository, pulse_job, scheduled_for=now)
+    full = _ensure_run(repository, full_job, scheduled_for=now)
+    planner = AutomationSchedulePlanner(repository)
+    planner.materialize(
+        now=now,
+        executable_job_types=[FULL_MARKET_SCAN, LISTING_STATUS_SCAN],
+    )
+    if target_running:
+        claim = repository.claim_run(
+            run_id=full.run_id,
+            owner_token="full-owner",
+            now=now,
+            lease_seconds=1,
+        )
+        assert claim is not None
+
+    planner.materialize(
+        now=now + timedelta(seconds=2),
+        executable_job_types=[],
+    )
+
+    assert repository.list_links(child_run_id=pulse.run_id) == []
+    fallback = repository.claim_next(
+        owner_token="pulse-owner",
+        now=now + timedelta(seconds=2),
+        lease_seconds=60,
+        allowed_job_types=[ONLINE_PULSE],
+    )
+    assert fallback is not None
+    assert fallback.run.run_id == pulse.run_id
+
+
+def test_order_child_failure_does_not_undo_accepted_listing_coverage(
+    repository: AutomationRepository,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    pulse_job = _store_job(
+        repository,
+        _job(job_id="PULSE", job_type=ONLINE_PULSE, priority=60),
+        now=now,
+    )
+    full_job = _store_job(
+        repository,
+        _job(
+            job_id="FULL",
+            job_type=FULL_MARKET_SCAN,
+            minutes=60,
+            priority=50,
+        ),
+        now=now,
+    )
+    listing_job = _store_job(
+        repository,
+        _job(
+            job_id="LISTING",
+            job_type=LISTING_STATUS_SCAN,
+            enabled=False,
+            schedule_kind=CHILD_ONLY,
+        ),
+        now=now,
+    )
+    order_job = _store_job(
+        repository,
+        _job(
+            job_id="ORDER",
+            job_type=ORDER_SCAN,
+            enabled=False,
+            schedule_kind=CHILD_ONLY,
+        ),
+        now=now,
+    )
+    pulse = _ensure_run(repository, pulse_job, scheduled_for=now)
+    full = _ensure_run(repository, full_job, scheduled_for=now)
+    AutomationSchedulePlanner(repository).materialize(
+        now=now,
+        executable_job_types=[FULL_MARKET_SCAN, LISTING_STATUS_SCAN],
+    )
+    parent_claim = repository.claim_run(
+        run_id=full.run_id,
+        owner_token="full-owner",
+        now=now,
+        lease_seconds=60,
+    )
+    assert parent_claim is not None
+    listing_child, _ = repository.ensure_child_run_fenced(
+        parent_claim,
+        listing_job,
+        relation_type="LISTING_STATUS_CHILD",
+        now=now,
+    )
+    order_child, _ = repository.ensure_child_run_fenced(
+        parent_claim,
+        order_job,
+        relation_type="ORDER_SCAN_CHILD",
+        now=now,
+    )
+    assert repository.finish_run(
+        parent_claim,
+        AutomationRunOutcome(status=AutomationRunStatus.SUCCESS),
+        now=now + timedelta(seconds=1),
+    )
+    listing_claim = repository.claim_run(
+        run_id=listing_child.run_id,
+        owner_token="listing-owner",
+        now=now + timedelta(seconds=1),
+        lease_seconds=60,
+    )
+    assert listing_claim is not None
+    manifest_sha256 = "sha256:" + "f" * 64
+    repository.bind_run_input_manifest(
+        listing_claim,
+        manifest_sha256=manifest_sha256,
+        now=now + timedelta(seconds=1),
+    )
+    _seed_accepted_listing_coverage_facts(
+        repository,
+        listing_run_id=listing_child.run_id,
+        manifest_sha256=manifest_sha256,
+        now=now + timedelta(seconds=1),
+    )
+    assert repository.finish_run(
+        listing_claim,
+        AutomationRunOutcome(status=AutomationRunStatus.SUCCESS),
+        now=now + timedelta(seconds=2),
+    )
+    order_claim = repository.claim_run(
+        run_id=order_child.run_id,
+        owner_token="order-owner",
+        now=now + timedelta(seconds=2),
+        lease_seconds=60,
+    )
+    assert order_claim is not None
+    assert repository.finish_run(
+        order_claim,
+        AutomationRunOutcome(status=AutomationRunStatus.FAILED),
+        now=now + timedelta(seconds=3),
+    )
+
+    assert repository.get_run(
+        pulse.run_id
+    ).run_status is AutomationRunStatus.MERGED
 
 
 @pytest.mark.parametrize(
@@ -426,7 +916,7 @@ def test_incomplete_coverage_target_releases_pulse_for_fallback(
     full = _ensure_run(repository, full_job, scheduled_for=now)
     AutomationSchedulePlanner(repository).materialize(
         now=now,
-        executable_job_types=[FULL_MARKET_SCAN],
+        executable_job_types=[FULL_MARKET_SCAN, LISTING_STATUS_SCAN],
     )
     claim = repository.claim_run(
         run_id=full.run_id,
@@ -483,7 +973,7 @@ def test_disabled_target_never_creates_coverage_candidate(
 
     AutomationSchedulePlanner(repository).materialize(
         now=now,
-        executable_job_types=[FULL_MARKET_SCAN],
+        executable_job_types=[FULL_MARKET_SCAN, LISTING_STATUS_SCAN],
     )
 
     assert repository.list_links(child_run_id=pulse.run_id) == []
