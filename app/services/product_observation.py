@@ -191,11 +191,12 @@ class ProductObservationImporter:
                     """
                     SELECT observation_batch_id
                     FROM product_observation_batches
-                    WHERE content_sha256 = ?
+                    WHERE automation_run_id = ?
+                      AND content_sha256 = ?
                     ORDER BY created_at, observation_batch_id
                     LIMIT 1
                     """,
-                    (content_sha256,),
+                    (normalized.automation_run_id, content_sha256),
                 ).fetchone()
                 if duplicate is not None:
                     canonical_batch_id = str(
@@ -337,17 +338,20 @@ class ProductObservationImporter:
             raise ProductObservationError(
                 "scan_completed_at must not be earlier than scan_started_at"
             )
-        if batch_status in {"FAILED", "UNAVAILABLE"} and batch.items:
-            raise ProductObservationError(
-                f"{batch_status} batches must not contain observations"
-            )
-        if batch_status == "ACCEPTED" and (
-            not batch.scope_complete or not batch.end_marker_verified
-        ):
-            raise ProductObservationError(
-                "ACCEPTED batches must prove scope completeness and end marker"
-            )
-        _validate_requested_scope(scan_type, batch.requested_scope)
+        error_code = batch.error_code.strip()
+        error_message = batch.error_message.strip()
+        _validate_batch_status(
+            batch_status,
+            scope_complete=bool(batch.scope_complete),
+            end_marker_verified=bool(batch.end_marker_verified),
+            has_items=bool(batch.items),
+            error_code=error_code,
+            error_message=error_message,
+        )
+        requested_scope = _normalize_requested_scope(
+            scan_type,
+            batch.requested_scope,
+        )
         if scan_type == ONLINE_PULSE:
             if any(not item.observed_online for item in batch.items):
                 raise ProductObservationError(
@@ -377,12 +381,12 @@ class ProductObservationImporter:
             batch_status=batch_status,
             scan_started_at=started_at,
             scan_completed_at=completed_at,
-            requested_scope=dict(batch.requested_scope),
+            requested_scope=requested_scope,
             scope_complete=bool(batch.scope_complete),
             end_marker_verified=bool(batch.end_marker_verified),
             items=normalized_items,
-            error_code=batch.error_code.strip(),
-            error_message=batch.error_message.strip(),
+            error_code=error_code,
+            error_message=error_message,
         )
 
     def _normalize_item(
@@ -686,10 +690,49 @@ def _result_content_sha256(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _validate_requested_scope(
+def _validate_batch_status(
+    batch_status: str,
+    *,
+    scope_complete: bool,
+    end_marker_verified: bool,
+    has_items: bool,
+    error_code: str,
+    error_message: str,
+) -> None:
+    if batch_status == "ACCEPTED":
+        if not scope_complete or not end_marker_verified:
+            raise ProductObservationError(
+                "ACCEPTED batches must prove scope completeness and end marker"
+            )
+        if error_code or error_message:
+            raise ProductObservationError(
+                "ACCEPTED batches must not contain error fields"
+            )
+        return
+    if batch_status == "PARTIAL":
+        if not error_code:
+            raise ProductObservationError(
+                "PARTIAL batches must provide error_code"
+            )
+        return
+    if has_items:
+        raise ProductObservationError(
+            f"{batch_status} batches must not contain observations"
+        )
+    if scope_complete:
+        raise ProductObservationError(
+            f"{batch_status} batches must not mark scope_complete"
+        )
+    if not error_code:
+        raise ProductObservationError(
+            f"{batch_status} batches must provide error_code"
+        )
+
+
+def _normalize_requested_scope(
     scan_type: str,
     requested_scope: dict[str, object],
-) -> None:
+) -> dict[str, object]:
     pages = requested_scope.get("pages")
     if not isinstance(pages, list) or any(
         not isinstance(page, str) for page in pages
@@ -707,6 +750,13 @@ def _validate_requested_scope(
         raise ProductObservationError(
             "LISTING_STATUS_SCAN must cover online and waiting exactly once"
         )
+    normalized_scope = dict(requested_scope)
+    normalized_scope["pages"] = (
+        ["online"]
+        if scan_type == ONLINE_PULSE
+        else ["online", "waiting"]
+    )
+    return normalized_scope
 
 
 def _observation_item_id(

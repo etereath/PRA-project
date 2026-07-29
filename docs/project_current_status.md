@@ -487,12 +487,14 @@ Code Review 后的高中低风险问题已完成修复，系统冒烟测试、�
     引用门禁也已落地。最终复审新增的时间策略原子替换、并发单一成功、任务来源
     创建后不可变和粗粒度枚举/引用前缀映射也已完成，本地完整回归为
     `744 passed, 3 skipped, 97 subtests passed`。13.5-2 商品映射与扫描输入已进入
-    Draft PR #23：评审要求的 run 类型/状态/平台/时间策略绑定、精确页面范围、
-    时间/价格/证据校验、跨批内容幂等、WEB 平台登记隔离均已修复；12 条迁入映射
-    仅保留为 `candidate_internal_sku` 且全部 `DISABLED`，等待运营逐条复核。
-    修复后本地完整回归为 `770 passed, 3 skipped, 97 subtests passed`，系统冒烟
+    PR #23：评审要求的 run 类型/状态/平台/时间策略绑定、精确页面范围、
+    时间/价格/证据校验、同 run 内容幂等、跨 run 接收审计、批次状态矩阵、页面
+    顺序规范化和 WEB 平台登记隔离均已修复；显式停用的内置平台不会被默认值补回。
+    12 条迁入映射仅保留为 `candidate_internal_sku` 且全部 `DISABLED`，等待运营
+    逐条复核。
+    修复后本地完整回归为 `786 passed, 3 skipped, 97 subtests passed`，系统冒烟
     16/16、编译、打包、包边界、敏感信息扫描、仓库外 wheel 安装和 Windows
-    ShadowBot 夹具门禁均通过。下一步是同步 PR #23 并等待双平台 CI/复审。
+    ShadowBot 夹具门禁均通过。下一步是同步 PR #23 并等待双平台 CI 与最终复审。
 4. 任务13.5通过验收后，任务14只进行多品种、多动作、异常恢复、正式授权和观察版本冻结的综合验收。普通写动作保持明确任务与授权；唯一自动写特例是验收后的版本化 `SYSTEM_EMERGENCY` 紧急下架。
 5. 任务12 PR #18 已合并；任务13也已完成 T13-0 页面探索、T13-1 合同、T13-2 Runtime Schema v13、独立两页 SYNC_STATUS、单商品状态往返、正常多商品严格串行上下架、整批预检异常零写、严格串行 UNKNOWN、最终确认点击后的 `UNKNOWN → 唯一自动 RECONCILE → VERIFIED` 和 `UNKNOWN → 唯一自动 RECONCILE → NOT_APPLIED`、`ALREADY_APPLIED` 0 写点击、跨动作共享写锁、phase/result 恢复、Web 运营投影、最终回归、PR #19 COMMENT Review 修复和双平台 CI。仓库内已保存脱敏证据、自然语言报告、数据库回读及 CI 复算入口；本轮文档整理不执行合并或任务状态变更。
 6. 继续运行系统冒烟、完整单元测试和 ShadowBot 成功基线测试，任务13.5不得重写已验证 COMMIT 动作链路。

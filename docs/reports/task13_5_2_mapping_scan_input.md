@@ -62,8 +62,12 @@ mapping_version =
 - 每项观察独立调用 `OperationalTimeService`，不以批次时间代替逐项归属。
 - 每项时间必须位于批次区间，价格必须为有限、规范化正数，已接受或部分接受项
   的证据必须符合 `sha256:<64 位小写十六进制>`。
-- 内容哈希排除传输批次/run ID、包含映射版本并稳定排序商品项；跨批次 ID 的
-  同内容重试返回最早的规范批次，不重复落库。
+- 内容哈希排除传输批次/run ID、包含映射版本、稳定排序商品项并规范化页面顺序；
+  同一 run 内跨批次 ID 的同内容重试返回该 run 最早的规范批次，不重复落库。
+- 不同 run 的相同业务内容分别落批次，使调度和运营查询可以区分“未产生结果”和
+  “已接收结果”，不修改已冻结的 Runtime Schema v14。
+- `ACCEPTED / PARTIAL / UNAVAILABLE / FAILED` 的完整性、结束标记和错误字段执行
+  明确状态矩阵；显式停用的内置平台不会被默认列表重新补回。
 - 单事务追加 `product_observation_batches/items`。
 
 导入器不调用任务 13 的 `listing_status` 投影，也不根据脉冲扫描中缺失的商品生成
@@ -87,7 +91,9 @@ mapping_version =
 - 重叠生效区间冲突。
 - 不可变 JSON 与稳定哈希。
 - ONLINE_PULSE 缺席不产生负观察。
-- 同批同内容幂等、同批不同内容拒绝、跨批同内容不重复累加。
+- 同批同内容幂等、同批不同内容拒绝、同一 run 跨批同内容不重复累加。
+- 跨 run 相同内容分别保留可查询批次；同 run 并发重试只生成一份事实 items。
+- 四种批次状态的合法/非法组合和页面顺序规范化。
 - run 类型/状态/平台/时间策略和精确页面范围绑定。
 - 批次时间区间、有限规范化正价格和证据哈希格式校验。
 - 18:00 和 20:00 逐项双日期边界。
@@ -97,7 +103,7 @@ mapping_version =
 本地结果：
 
 ```text
-pytest: 770 passed, 3 skipped, 97 subtests passed
+pytest: 786 passed, 3 skipped, 97 subtests passed
 system smoke: 16 passed, 0 failed
 compileall: PASS
 wheel/sdist build: PASS
@@ -109,6 +115,6 @@ Windows ShadowBot fixture/hash gates: PASS
 
 ## 4. 后续
 
-本分支后续只继续完成质量门禁和 PR 收口。`ONLINE_PULSE` 的 ShadowBot 页面采集
+本分支已完成本轮复审修复，后续只继续等待最终复审和 PR 收口。`ONLINE_PULSE` 的 ShadowBot 页面采集
 需要在独立批次中先确认 Worker 停止和宿主 hash，再按本报告冻结的 JSON 边界接入；
 调度频率、租约和补跑由 13.5-3 实现。

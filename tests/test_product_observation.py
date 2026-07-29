@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
+from threading import Barrier
 
 import pytest
 
@@ -421,7 +423,7 @@ def test_same_batch_id_with_different_content_is_rejected(tmp_path) -> None:
         importer.import_batch(changed)
 
 
-def test_same_result_content_across_batch_ids_is_not_accumulated(
+def test_same_result_content_within_one_run_is_not_accumulated(
     tmp_path,
 ) -> None:
     repository, importer = _importer(tmp_path)
@@ -463,8 +465,6 @@ def test_same_result_content_across_batch_ids_is_not_accumulated(
         batch_id="batch-content-retry",
         items=(second_item, first_item),
     )
-    retry = replace(retry, automation_run_id="run-pulse-scan-2")
-
     first_result = importer.import_batch(first)
     retry_result = importer.import_batch(retry)
 
@@ -484,6 +484,271 @@ def test_same_result_content_across_batch_ids_is_not_accumulated(
             ).fetchone()[0]
             == 2
         )
+
+
+def test_same_result_content_across_runs_preserves_each_run_audit(
+    tmp_path,
+) -> None:
+    repository, importer = _importer(tmp_path)
+    item = ProductObservationInput(
+        platform_product_name="艾莎",
+        grade="A",
+        observed_at=datetime(
+            2026,
+            7,
+            29,
+            9,
+            30,
+            tzinfo=timezone.utc,
+        ),
+        observed_online=True,
+        page_identity_key="online:艾莎:A",
+        evidence_sha256=_evidence("a"),
+    )
+    first = _batch(batch_id="batch-run-1", items=(item,))
+    second = replace(
+        _batch(batch_id="batch-run-2", items=(item,)),
+        automation_run_id="run-pulse-scan-2",
+    )
+
+    first_result = importer.import_batch(first)
+    second_result = importer.import_batch(second)
+
+    assert not first_result.already_imported
+    assert not second_result.already_imported
+    assert first_result.content_sha256 == second_result.content_sha256
+    with closing(repository.connect_read()) as connection:
+        rows = connection.execute(
+            """
+            SELECT automation_run_id, observation_batch_id
+            FROM product_observation_batches
+            ORDER BY automation_run_id
+            """
+        ).fetchall()
+        item_count = connection.execute(
+            "SELECT COUNT(*) FROM product_observation_items"
+        ).fetchone()[0]
+    assert [tuple(row) for row in rows] == [
+        ("run-pulse-scan-1", "batch-run-1"),
+        ("run-pulse-scan-2", "batch-run-2"),
+    ]
+    assert item_count == 2
+
+
+def test_concurrent_same_run_content_retry_writes_one_fact_set(
+    tmp_path,
+) -> None:
+    repository, importer = _importer(tmp_path)
+    item = ProductObservationInput(
+        platform_product_name="艾莎",
+        grade="A",
+        observed_at=datetime(
+            2026,
+            7,
+            29,
+            9,
+            30,
+            tzinfo=timezone.utc,
+        ),
+        observed_online=True,
+        page_identity_key="online:艾莎:A",
+        evidence_sha256=_evidence("b"),
+    )
+    batches = (
+        _batch(batch_id="batch-concurrent-1", items=(item,)),
+        _batch(batch_id="batch-concurrent-2", items=(item,)),
+    )
+    start = Barrier(2)
+
+    def import_after_barrier(
+        batch: ProductObservationBatchInput,
+    ):
+        start.wait()
+        return importer.import_batch(batch)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(import_after_barrier, batches))
+
+    assert {result.already_imported for result in results} == {False, True}
+    assert len({result.observation_batch_id for result in results}) == 1
+    with closing(repository.connect_read()) as connection:
+        batch_count = connection.execute(
+            "SELECT COUNT(*) FROM product_observation_batches"
+        ).fetchone()[0]
+        item_count = connection.execute(
+            "SELECT COUNT(*) FROM product_observation_items"
+        ).fetchone()[0]
+    assert batch_count == 1
+    assert item_count == 1
+
+
+def test_listing_scope_page_order_is_normalized_before_hashing(
+    tmp_path,
+) -> None:
+    repository, importer = _importer(tmp_path)
+    item = ProductObservationInput(
+        platform_product_name="艾莎",
+        grade="A",
+        observed_at=datetime(
+            2026,
+            7,
+            29,
+            9,
+            30,
+            tzinfo=timezone.utc,
+        ),
+        observed_online=True,
+        page_identity_key="online:艾莎:A",
+        evidence_sha256=_evidence("c"),
+    )
+    first = _batch(
+        batch_id="batch-pages-normal",
+        scan_type=LISTING_STATUS_SCAN,
+        items=(item,),
+    )
+    retry = replace(
+        first,
+        observation_batch_id="batch-pages-reversed",
+        requested_scope={"pages": ["waiting", "online"]},
+    )
+
+    first_result = importer.import_batch(first)
+    retry_result = importer.import_batch(retry)
+
+    assert retry_result.already_imported
+    assert retry_result.observation_batch_id == first_result.observation_batch_id
+    assert retry_result.content_sha256 == first_result.content_sha256
+    with closing(repository.connect_read()) as connection:
+        row = connection.execute(
+            """
+            SELECT requested_scope_json
+            FROM product_observation_batches
+            WHERE observation_batch_id = ?
+            """,
+            (first_result.observation_batch_id,),
+        ).fetchone()
+    assert row["requested_scope_json"] == '{"pages":["online","waiting"]}'
+
+
+@pytest.mark.parametrize(
+    (
+        "batch_status",
+        "scope_complete",
+        "end_marker_verified",
+        "with_items",
+        "error_code",
+        "error_message",
+    ),
+    [
+        ("ACCEPTED", True, True, True, "", ""),
+        ("PARTIAL", False, False, True, "PAGE_PARTIAL", "部分页面失败"),
+        ("UNAVAILABLE", False, False, False, "PLATFORM_UNAVAILABLE", ""),
+        ("FAILED", False, False, False, "SCAN_FAILED", "扫描失败"),
+    ],
+)
+def test_batch_status_matrix_accepts_legal_combinations(
+    tmp_path,
+    batch_status: str,
+    scope_complete: bool,
+    end_marker_verified: bool,
+    with_items: bool,
+    error_code: str,
+    error_message: str,
+) -> None:
+    _, importer = _importer(tmp_path)
+    item = ProductObservationInput(
+        platform_product_name="艾莎",
+        grade="A",
+        observed_at=datetime(
+            2026,
+            7,
+            29,
+            9,
+            30,
+            tzinfo=timezone.utc,
+        ),
+        observed_online=True,
+        page_identity_key="online:艾莎:A",
+        evidence_sha256=_evidence("d"),
+    )
+    batch = replace(
+        _batch(
+            batch_id=f"batch-legal-{batch_status.lower()}",
+            items=(item,) if with_items else (),
+        ),
+        batch_status=batch_status,
+        scope_complete=scope_complete,
+        end_marker_verified=end_marker_verified,
+        error_code=error_code,
+        error_message=error_message,
+    )
+
+    result = importer.import_batch(batch)
+
+    assert result.item_count == int(with_items)
+
+
+@pytest.mark.parametrize(
+    (
+        "batch_status",
+        "scope_complete",
+        "end_marker_verified",
+        "with_items",
+        "error_code",
+        "error_message",
+        "message",
+    ),
+    [
+        ("ACCEPTED", True, True, True, "UNEXPECTED", "", "error fields"),
+        ("ACCEPTED", True, True, True, "", "unexpected", "error fields"),
+        ("PARTIAL", False, False, True, "", "partial", "error_code"),
+        ("UNAVAILABLE", True, False, False, "UNAVAILABLE", "", "scope_complete"),
+        ("UNAVAILABLE", False, False, False, "", "", "error_code"),
+        ("FAILED", True, False, False, "FAILED", "", "scope_complete"),
+        ("FAILED", False, False, False, "", "", "error_code"),
+        ("FAILED", False, False, True, "FAILED", "", "observations"),
+    ],
+)
+def test_batch_status_matrix_rejects_contradictory_combinations(
+    tmp_path,
+    batch_status: str,
+    scope_complete: bool,
+    end_marker_verified: bool,
+    with_items: bool,
+    error_code: str,
+    error_message: str,
+    message: str,
+) -> None:
+    _, importer = _importer(tmp_path)
+    item = ProductObservationInput(
+        platform_product_name="艾莎",
+        grade="A",
+        observed_at=datetime(
+            2026,
+            7,
+            29,
+            9,
+            30,
+            tzinfo=timezone.utc,
+        ),
+        observed_online=True,
+        page_identity_key="online:艾莎:A",
+        evidence_sha256=_evidence("e"),
+    )
+    batch = replace(
+        _batch(
+            batch_id=f"batch-invalid-{batch_status.lower()}-{message}",
+            items=(item,) if with_items else (),
+        ),
+        batch_status=batch_status,
+        scope_complete=scope_complete,
+        end_marker_verified=end_marker_verified,
+        error_code=error_code,
+        error_message=error_message,
+    )
+
+    with pytest.raises(ProductObservationError, match=message):
+        importer.import_batch(batch)
 
 
 def test_scan_type_scope_and_run_job_type_are_strongly_bound(

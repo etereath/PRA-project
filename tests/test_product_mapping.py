@@ -156,6 +156,19 @@ def test_disabled_platform_is_not_reenabled_by_verified_product_row() -> None:
     assert "测试平台" not in platform_options_from_rows(rows)
 
 
+def test_explicitly_disabled_builtin_platform_is_not_restored() -> None:
+    rows = [
+        {
+            "mapping_id": "PLATFORM-05",
+            "mapping_kind": "PLATFORM",
+            "platform_name": "蚂蚁",
+            "mapping_status": "disabled",
+        }
+    ]
+
+    assert "蚂蚁" not in platform_options_from_rows(rows)
+
+
 def test_active_platform_appears_once_and_product_rows_are_preserved() -> None:
     product_row = {
         "mapping_id": "PRODUCT-01",

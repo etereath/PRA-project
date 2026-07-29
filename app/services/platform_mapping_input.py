@@ -49,20 +49,33 @@ def persist_platform_mapping_rows(path: Path, rows: list[dict[str, object]]) -> 
 
 
 def platform_options_from_rows(rows: list[dict[str, object]]) -> list[str]:
-    options: list[str] = []
-    seen: set[str] = set()
+    enabled_order: list[str] = []
+    enabled: set[str] = set()
+    disabled: set[str] = set()
+    registered: set[str] = set()
     for row in rows:
         if not _is_platform_registry_row(row):
             continue
         status = str(row.get("mapping_status") or "").strip().lower()
         platform_name = normalize_platform_name(row.get("platform_name"))
-        if not platform_name or status in {"disabled", "inactive", "停用"}:
+        if not platform_name:
             continue
-        if platform_name not in seen:
-            seen.add(platform_name)
-            options.append(platform_name)
+        registered.add(platform_name)
+        if status in {"disabled", "inactive", "停用"}:
+            disabled.add(platform_name)
+            continue
+        if platform_name not in enabled:
+            enabled.add(platform_name)
+            enabled_order.append(platform_name)
+
+    options = [
+        platform_name
+        for platform_name in enabled_order
+        if platform_name not in disabled
+    ]
+    seen = set(options)
     for platform_name in PLATFORM_OPTIONS:
-        if platform_name not in seen:
+        if platform_name not in registered and platform_name not in seen:
             seen.add(platform_name)
             options.append(platform_name)
     return options
