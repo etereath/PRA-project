@@ -3,12 +3,15 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from threading import Barrier
 
 import pytest
 
+from app.automation_models import AutomationRunClaim, AutomationRunOutcome
+from app.enums import AutomationRunStatus
+from app.repositories.automation_repository import AutomationRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.product_mapping import compile_product_mapping_rows
 from app.services.product_observation import (
@@ -29,6 +32,8 @@ from app.services.operational_time import (
 
 
 PLATFORM = "蚂蚁花团供应商"
+TEST_OWNER = "product-observation-test-owner"
+TEST_NOW = datetime(2026, 7, 29, 12, 2, tzinfo=timezone.utc)
 
 
 def _evidence(seed: str) -> str:
@@ -88,8 +93,11 @@ def _repository_with_run(tmp_path) -> SQLiteRuntimeRepository:
                         run_status, platform_name, platform_trade_date,
                         seller_operation_date, seller_phase,
                         time_policy_version, scheduled_for, started_at,
+                        lease_owner, lease_version, lease_expires_at,
                         created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                    )
                     """,
                     (
                         f"run-{suffix}-scan-{run_number}",
@@ -104,12 +112,41 @@ def _repository_with_run(tmp_path) -> SQLiteRuntimeRepository:
                         "CN_SINGLE_PLATFORM_2026_V1",
                         now,
                         now,
+                        TEST_OWNER,
+                        1,
+                        (TEST_NOW + timedelta(hours=1)).isoformat(),
                         now,
                         now,
                     ),
                 )
         connection.commit()
     return repository
+
+
+class _ClaimingProductObservationImporter(ProductObservationImporter):
+    """Keep legacy contract tests concise while exercising fenced writes."""
+
+    def import_batch(
+        self,
+        batch: ProductObservationBatchInput,
+        *,
+        claim: AutomationRunClaim | None = None,
+        now: datetime = TEST_NOW,
+    ):
+        if claim is None:
+            run = AutomationRepository(self.repository).get_run(
+                batch.automation_run_id
+            )
+            if run is None or run.lease_expires_at is None:
+                raise AssertionError("test Automation Run lease is missing")
+            claim = AutomationRunClaim(
+                run=run,
+                owner_token=run.lease_owner,
+                lease_version=run.lease_version,
+                lease_expires_at=run.lease_expires_at,
+                reclaimed=False,
+            )
+        return super().import_batch(batch, claim=claim, now=now)
 
 
 def _importer(tmp_path) -> tuple[
@@ -129,7 +166,7 @@ def _importer(tmp_path) -> tuple[
         ],
         source_workbook_sha256="a" * 64,
     )
-    return repository, ProductObservationImporter(
+    return repository, _ClaimingProductObservationImporter(
         repository,
         mappings=mappings,
     )
@@ -147,6 +184,22 @@ def _set_run_status(
             (run_status, run_id),
         )
         connection.commit()
+
+
+def _stored_claim(
+    repository: SQLiteRuntimeRepository,
+    run_id: str,
+) -> AutomationRunClaim:
+    run = AutomationRepository(repository).get_run(run_id)
+    if run is None or run.lease_expires_at is None:
+        raise AssertionError("test Automation Run lease is missing")
+    return AutomationRunClaim(
+        run=run,
+        owner_token=run.lease_owner,
+        lease_version=run.lease_version,
+        lease_expires_at=run.lease_expires_at,
+        reclaimed=False,
+    )
 
 
 def _batch(
@@ -359,6 +412,133 @@ def test_terminal_idempotent_replay_still_validates_run_identity(
 
     with pytest.raises(ProductObservationError, match="platform"):
         importer.import_batch(batch)
+
+
+def test_live_claim_can_write_observation_and_complete_run(tmp_path) -> None:
+    repository, importer = _importer(tmp_path)
+    batch = _batch(
+        batch_id="batch-live-claim",
+        items=(
+            ProductObservationInput(
+                platform_product_name="艾莎",
+                grade="A",
+                observed_at=datetime(
+                    2026, 7, 29, 9, 30, tzinfo=timezone.utc
+                ),
+                observed_online=True,
+                page_identity_key="online:艾莎:A",
+                evidence_sha256=_evidence("7"),
+            ),
+        ),
+    )
+    claim = _stored_claim(repository, batch.automation_run_id)
+
+    result = importer.import_batch(batch, claim=claim, now=TEST_NOW)
+
+    assert result.already_imported is False
+    assert AutomationRepository(repository).finish_run(
+        claim,
+        AutomationRunOutcome(status=AutomationRunStatus.SUCCESS),
+        now=TEST_NOW + timedelta(seconds=1),
+    )
+
+
+def test_expired_unreclaimed_claim_cannot_write_observation(tmp_path) -> None:
+    repository, importer = _importer(tmp_path)
+    batch = _batch(
+        batch_id="batch-expired-claim",
+        items=(
+            ProductObservationInput(
+                platform_product_name="艾莎",
+                grade="A",
+                observed_at=datetime(
+                    2026, 7, 29, 9, 30, tzinfo=timezone.utc
+                ),
+                observed_online=True,
+                page_identity_key="online:艾莎:A",
+                evidence_sha256=_evidence("8"),
+            ),
+        ),
+    )
+    claim = _stored_claim(repository, batch.automation_run_id)
+
+    with pytest.raises(ProductObservationError, match="lease is not live"):
+        importer.import_batch(
+            batch,
+            claim=claim,
+            now=claim.lease_expires_at,
+        )
+
+    with closing(repository.connect_read()) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM product_observation_batches"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_reclaimed_old_owner_cannot_write_second_fact_batch(tmp_path) -> None:
+    repository, importer = _importer(tmp_path)
+    first = _batch(
+        batch_id="batch-before-reclaim",
+        items=(
+            ProductObservationInput(
+                platform_product_name="艾莎",
+                grade="A",
+                observed_at=datetime(
+                    2026, 7, 29, 9, 30, tzinfo=timezone.utc
+                ),
+                observed_online=True,
+                page_identity_key="online:艾莎:A",
+                evidence_sha256=_evidence("9"),
+            ),
+        ),
+    )
+    old_claim = _stored_claim(repository, first.automation_run_id)
+    importer.import_batch(first, claim=old_claim, now=TEST_NOW)
+    with closing(repository.connect_write()) as connection:
+        connection.execute(
+            """
+            UPDATE automation_runs
+            SET lease_owner = 'new-owner',
+                lease_version = lease_version + 1,
+                lease_expires_at = ?
+            WHERE run_id = ?
+            """,
+            (
+                (TEST_NOW + timedelta(hours=2)).isoformat(),
+                first.automation_run_id,
+            ),
+        )
+        connection.commit()
+    late = replace(
+        first,
+        observation_batch_id="batch-late-old-owner",
+        items=(
+            replace(
+                first.items[0],
+                evidence_sha256=_evidence("a"),
+            ),
+        ),
+    )
+
+    with pytest.raises(ProductObservationError, match="lease is not live"):
+        importer.import_batch(late, claim=old_claim, now=TEST_NOW)
+    new_claim = _stored_claim(repository, first.automation_run_id)
+    with pytest.raises(
+        ProductObservationError,
+        match="already has different observation content",
+    ):
+        importer.import_batch(late, claim=new_claim, now=TEST_NOW)
+
+    with closing(repository.connect_read()) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM product_observation_batches"
+            ).fetchone()[0]
+            == 1
+        )
 
 
 def test_online_pulse_writes_positive_observations_only_and_is_idempotent(
@@ -1014,7 +1194,7 @@ def test_run_status_and_time_policy_are_strongly_bound(tmp_path) -> None:
         )
         connection.commit()
 
-    mismatched_time_importer = ProductObservationImporter(
+    mismatched_time_importer = _ClaimingProductObservationImporter(
         repository,
         mappings=importer.mappings,
         operational_time=OperationalTimeService(

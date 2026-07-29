@@ -42,6 +42,51 @@ MAPPING_PATH = "shadowbot/test2/product_identity_mapping.json"
 OBSERVED_AT = "2026-07-22T04:59:00+00:00"
 
 
+def _insert_active_automation_ui_run(
+    repository: SQLiteRuntimeRepository,
+) -> None:
+    now = datetime.now(timezone.utc)
+    with closing(repository.connect_write()) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO automation_jobs(
+                job_id, job_type, display_name, enabled,
+                schedule_kind, schedule_expression, priority,
+                config_json, created_at, updated_at
+            ) VALUES (
+                'UI-JOB', 'ONLINE_PULSE', 'UI scan', 1,
+                'INTERVAL_MINUTES', '10', 10, '{}', ?, ?
+            )
+            """,
+            (now.isoformat(), now.isoformat()),
+        )
+        connection.execute(
+            """
+            INSERT INTO automation_runs(
+                run_id, job_id, job_type, logical_run_key,
+                run_status, platform_name, platform_trade_date,
+                seller_operation_date, seller_phase,
+                time_policy_version, scheduled_for, started_at,
+                lease_owner, lease_version, lease_expires_at,
+                created_at, updated_at
+            ) VALUES (
+                'UI-RUN', 'UI-JOB', 'ONLINE_PULSE', 'ui-run',
+                'RUNNING', '蚂蚁花团供应商', '2026-07-29',
+                '2026-07-29', 'NORMAL_SALES',
+                'CN_SINGLE_PLATFORM_2026_V1', ?, ?,
+                'ui-owner', 1, ?, ?, ?
+            )
+            """,
+            (
+                now.isoformat(),
+                now.isoformat(),
+                (now + timedelta(hours=1)).isoformat(),
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
+
+
 def _complete_result_item(item):
     completed = {
         **item,
@@ -1370,6 +1415,47 @@ def test_publish_rechecks_task_expiry_after_prepare(tmp_path):
         )
     assert runner.requests == []
     assert repository.get_task("e237dc29a715").task_status is TaskStatus.PENDING
+
+
+def test_active_automation_ui_run_blocks_v4_write_lock_publication(
+    tmp_path,
+) -> None:
+    repository = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
+    repository.init_schema()
+    repository.insert_task(
+        _task("TASK-UI-BLOCK", "CAPPUCCINO-B-60-Z", "46.30", "46.40")
+    )
+    _seed_listing_status(repository)
+    manifest = prepare_task_commit_batch(
+        repository,
+        task_ids=["TASK-UI-BLOCK"],
+        mapping_path=Path(MAPPING_PATH),
+        batch_id="BATCH-UI-BLOCK",
+        execution_profile="production",
+    )
+    _insert_active_automation_ui_run(repository)
+    runner = CapturingRunner()
+
+    with pytest.raises(ValidationError, match="UI 扫描正在运行"):
+        publish_task_commit_batch(
+            repository,
+            runner,
+            manifest=manifest,
+            execution_profile="production",
+            applet_uri="weixin://dl/business/?t=test",
+        )
+
+    assert runner.requests == []
+    with closing(repository.connect_read()) as connection:
+        assert (
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM shadowbot_write_locks
+                WHERE status = 'ACTIVE'
+                """
+            ).fetchone()[0]
+            == 0
+        )
 
 
 @pytest.mark.parametrize(

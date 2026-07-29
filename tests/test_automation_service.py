@@ -4,9 +4,11 @@ import json
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from threading import Event
 
 import pytest
 
@@ -122,7 +124,7 @@ def _ensure_run(
     )[0]
 
 
-def test_default_jobs_materialize_idempotently_and_merge_hourly_pulse(
+def test_scheduler_only_does_not_terminally_merge_hourly_pulse(
     repository: AutomationRepository,
 ) -> None:
     now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
@@ -137,7 +139,7 @@ def test_default_jobs_materialize_idempotently_and_merge_hourly_pulse(
 
     assert len(jobs) == 8
     assert first.created_run_ids
-    assert len(first.merged_run_ids) == 1
+    assert first.merged_run_ids == ()
     assert second.created_run_ids == ()
     pulse = repository.list_runs(
         job_id="AUTOMATION-ONLINE-PULSE-10M"
@@ -145,12 +147,51 @@ def test_default_jobs_materialize_idempotently_and_merge_hourly_pulse(
     full = repository.list_runs(
         job_id="AUTOMATION-FULL-MARKET-SCAN-HOURLY"
     )[0]
-    assert pulse.run_status is AutomationRunStatus.MERGED
+    assert pulse.run_status is AutomationRunStatus.SCHEDULED
     assert full.run_status is AutomationRunStatus.SCHEDULED
-    links = repository.list_links(child_run_id=pulse.run_id)
-    assert [(item.parent_run_id, item.relation_type) for item in links] == [
-        (full.run_id, "MERGED_RUN")
-    ]
+    assert repository.list_links(child_run_id=pulse.run_id) == []
+
+
+def test_successful_full_handler_finalizes_pulse_coverage(
+    repository: AutomationRepository,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    pulse_job = _store_job(
+        repository,
+        _job(job_id="PULSE", job_type=ONLINE_PULSE, priority=60),
+        now=now,
+    )
+    full_job = _store_job(
+        repository,
+        _job(
+            job_id="FULL",
+            job_type=FULL_MARKET_SCAN,
+            minutes=60,
+            priority=50,
+        ),
+        now=now,
+    )
+    pulse = _ensure_run(repository, pulse_job, scheduled_for=now)
+    full = _ensure_run(repository, full_job, scheduled_for=now)
+
+    cycle = AutomationService(
+        repository,
+        handlers={
+            FULL_MARKET_SCAN: lambda run, context: AutomationRunOutcome(
+                status=AutomationRunStatus.SUCCESS
+            ),
+            ONLINE_PULSE: lambda run, context: AutomationRunOutcome(
+                status=AutomationRunStatus.SUCCESS
+            ),
+        },
+        clock=MutableClock(now),
+    ).run_cycle()
+
+    assert cycle.completed_run_ids == (full.run_id,)
+    assert cycle.scheduled.merged_run_ids == (pulse.run_id,)
+    assert repository.get_run(
+        pulse.run_id
+    ).run_status is AutomationRunStatus.MERGED
 
 
 def test_sleep_records_missed_pulses_and_only_catches_latest_window(
@@ -185,15 +226,15 @@ def test_sleep_records_missed_pulses_and_only_catches_latest_window(
 
     pulse_runs = repository.list_runs(job_id=pulse.job_id)
     full_runs = repository.list_runs(job_id=full.job_id)
-    assert len(result.missed_run_ids) == 6
+    assert len(result.missed_run_ids) == 7
     assert sum(
         run.run_status is AutomationRunStatus.MISSED
         for run in pulse_runs
-    ) == 5
+    ) == 6
     assert sum(
         run.run_status is AutomationRunStatus.MERGED
         for run in pulse_runs
-    ) == 2
+    ) == 0
     assert len(full_runs) == 2
     assert [run.run_status for run in full_runs] == [
         AutomationRunStatus.SCHEDULED,
@@ -321,16 +362,131 @@ def test_restart_reconciles_preexisting_scheduled_merge_candidates(
     pulse = _ensure_run(repository, pulse_job, scheduled_for=now)
     full = _ensure_run(repository, full_job, scheduled_for=now)
 
-    result = AutomationSchedulePlanner(repository).materialize(now=now)
+    result = AutomationSchedulePlanner(repository).materialize(
+        now=now,
+        executable_job_types=[FULL_MARKET_SCAN],
+    )
 
     assert result.created_run_ids == ()
-    assert result.merged_run_ids == (pulse.run_id,)
+    assert result.merged_run_ids == ()
+    assert repository.get_run(
+        pulse.run_id
+    ).run_status is AutomationRunStatus.SCHEDULED
+    links = repository.list_links(child_run_id=pulse.run_id)
+    assert [(item.parent_run_id, item.relation_type) for item in links] == [
+        (full.run_id, "COVERAGE_CANDIDATE")
+    ]
+
+    claim = repository.claim_run(
+        run_id=full.run_id,
+        owner_token="full-owner",
+        now=now,
+        lease_seconds=60,
+    )
+    assert claim is not None
+    assert repository.finish_run(
+        claim,
+        AutomationRunOutcome(status=AutomationRunStatus.SUCCESS),
+        now=now + timedelta(seconds=1),
+    )
     assert repository.get_run(
         pulse.run_id
     ).run_status is AutomationRunStatus.MERGED
-    assert repository.list_links(child_run_id=pulse.run_id)[
-        0
-    ].parent_run_id == full.run_id
+    assert [
+        item.relation_type
+        for item in repository.list_links(child_run_id=pulse.run_id)
+    ] == ["MERGED_RUN"]
+
+
+@pytest.mark.parametrize(
+    "target_status",
+    [AutomationRunStatus.FAILED, AutomationRunStatus.PARTIAL],
+)
+def test_incomplete_coverage_target_releases_pulse_for_fallback(
+    repository: AutomationRepository,
+    target_status: AutomationRunStatus,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    pulse_job = _store_job(
+        repository,
+        _job(job_id="PULSE", job_type=ONLINE_PULSE, priority=60),
+        now=now,
+    )
+    full_job = _store_job(
+        repository,
+        _job(
+            job_id="FULL",
+            job_type=FULL_MARKET_SCAN,
+            minutes=60,
+            priority=50,
+        ),
+        now=now,
+    )
+    pulse = _ensure_run(repository, pulse_job, scheduled_for=now)
+    full = _ensure_run(repository, full_job, scheduled_for=now)
+    AutomationSchedulePlanner(repository).materialize(
+        now=now,
+        executable_job_types=[FULL_MARKET_SCAN],
+    )
+    claim = repository.claim_run(
+        run_id=full.run_id,
+        owner_token="full-owner",
+        now=now,
+        lease_seconds=60,
+    )
+    assert claim is not None
+
+    assert repository.finish_run(
+        claim,
+        AutomationRunOutcome(
+            status=target_status,
+            error_code="TEST_FAILURE",
+        ),
+        now=now + timedelta(seconds=1),
+    )
+
+    assert repository.get_run(
+        pulse.run_id
+    ).run_status is AutomationRunStatus.SCHEDULED
+    assert repository.list_links(child_run_id=pulse.run_id) == []
+    fallback = repository.claim_next(
+        owner_token="pulse-owner",
+        now=now + timedelta(seconds=1),
+        lease_seconds=60,
+        allowed_job_types=[ONLINE_PULSE],
+    )
+    assert fallback is not None
+    assert fallback.run.run_id == pulse.run_id
+
+
+def test_disabled_target_never_creates_coverage_candidate(
+    repository: AutomationRepository,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    pulse_job = _store_job(
+        repository,
+        _job(job_id="PULSE", job_type=ONLINE_PULSE),
+        now=now,
+    )
+    full_job = _store_job(
+        repository,
+        _job(
+            job_id="FULL",
+            job_type=FULL_MARKET_SCAN,
+            minutes=60,
+            enabled=False,
+        ),
+        now=now,
+    )
+    pulse = _ensure_run(repository, pulse_job, scheduled_for=now)
+    _ensure_run(repository, full_job, scheduled_for=now)
+
+    AutomationSchedulePlanner(repository).materialize(
+        now=now,
+        executable_job_types=[FULL_MARKET_SCAN],
+    )
+
+    assert repository.list_links(child_run_id=pulse.run_id) == []
 
 
 def test_disabled_regular_job_is_not_claimed_but_expired_run_is_recovered(
@@ -361,6 +517,12 @@ def test_disabled_regular_job_is_not_claimed_but_expired_run_is_recovered(
         now=now,
         lease_seconds=10,
         allowed_job_types=[ONLINE_PULSE],
+    ) is None
+    assert repository.claim_run(
+        run_id=scheduled.run_id,
+        owner_token="owner",
+        now=now,
+        lease_seconds=10,
     ) is None
 
     repository.upsert_job(job, now=now)
@@ -450,6 +612,135 @@ def test_run_claim_is_single_owner_until_lease_expires(
         "LEASE_RECLAIMED",
         "RUN_FINISHED",
     ]
+
+
+def test_live_ui_run_blocks_second_ui_but_not_non_ui_handler(
+    repository: AutomationRepository,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    full_job = _store_job(
+        repository,
+        _job(
+            job_id="FULL",
+            job_type=FULL_MARKET_SCAN,
+            minutes=60,
+            priority=10,
+        ),
+        now=now,
+    )
+    pulse_job = _store_job(
+        repository,
+        _job(
+            job_id="PULSE",
+            job_type=ONLINE_PULSE,
+            priority=20,
+        ),
+        now=now,
+    )
+    settlement_job = _store_job(
+        repository,
+        _job(
+            job_id="SETTLEMENT",
+            job_type=PLATFORM_TRADE_DAY_SETTLEMENT,
+            priority=30,
+        ),
+        now=now,
+    )
+    full = _ensure_run(repository, full_job, scheduled_for=now)
+    pulse = _ensure_run(repository, pulse_job, scheduled_for=now)
+    settlement = _ensure_run(
+        repository,
+        settlement_job,
+        scheduled_for=now,
+    )
+    full_claim = repository.claim_run(
+        run_id=full.run_id,
+        owner_token="full-owner",
+        now=now,
+        lease_seconds=10,
+    )
+    assert full_claim is not None
+
+    assert repository.claim_run(
+        run_id=pulse.run_id,
+        owner_token="pulse-owner",
+        now=now,
+        lease_seconds=10,
+    ) is None
+    non_ui_claim = repository.claim_next(
+        owner_token="settlement-owner",
+        now=now,
+        lease_seconds=10,
+        allowed_job_types=[ONLINE_PULSE, PLATFORM_TRADE_DAY_SETTLEMENT],
+    )
+    assert non_ui_claim is not None
+    assert non_ui_claim.run.run_id == settlement.run_id
+
+    reclaimed = repository.claim_next(
+        owner_token="recovery-owner",
+        now=now + timedelta(seconds=11),
+        lease_seconds=10,
+        allowed_job_types=[FULL_MARKET_SCAN, ONLINE_PULSE],
+    )
+    assert reclaimed is not None
+    assert reclaimed.run.run_id == full.run_id
+    assert reclaimed.reclaimed is True
+
+
+def test_second_instance_cannot_claim_ui_while_handler_is_active(
+    repository: AutomationRepository,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    first_job = _store_job(
+        repository,
+        _job(
+            job_id="PULSE-A",
+            job_type=ONLINE_PULSE,
+            priority=10,
+        ),
+        now=now,
+    )
+    second_job = _store_job(
+        repository,
+        _job(
+            job_id="PULSE-B",
+            job_type=ONLINE_PULSE,
+            priority=20,
+        ),
+        now=now,
+    )
+    _ensure_run(repository, first_job, scheduled_for=now)
+    second = _ensure_run(repository, second_job, scheduled_for=now)
+    entered = Event()
+    release = Event()
+
+    def blocking_handler(run, context):
+        entered.set()
+        assert release.wait(timeout=10)
+        return AutomationRunOutcome(status=AutomationRunStatus.SUCCESS)
+
+    service = AutomationService(
+        repository,
+        handlers={ONLINE_PULSE: blocking_handler},
+        clock=MutableClock(now),
+        max_runs_per_cycle=1,
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(service.run_cycle)
+        assert entered.wait(timeout=10)
+        assert repository.claim_run(
+            run_id=second.run_id,
+            owner_token="second-instance",
+            now=now,
+            lease_seconds=60,
+        ) is None
+        release.set()
+        cycle = future.result(timeout=10)
+
+    assert len(cycle.completed_run_ids) == 1
+    assert repository.get_run(
+        second.run_id
+    ).run_status is AutomationRunStatus.SCHEDULED
 
 
 def test_expired_handler_writeback_stops_cycle_and_restart_recovers_run(
@@ -900,6 +1191,12 @@ def test_child_only_run_requires_valid_parent_link_before_claim(
         lease_seconds=60,
         allowed_job_types=[LISTING_STATUS_SCAN],
     ) is None
+    assert repository.claim_run(
+        run_id=orphan.run_id,
+        owner_token="owner",
+        now=now,
+        lease_seconds=60,
+    ) is None
 
     parent = _ensure_run(repository, parent_job, scheduled_for=now)
     parent_claim = repository.claim_run(
@@ -916,15 +1213,79 @@ def test_child_only_run_requires_valid_parent_link_before_claim(
         now=now,
     )
 
+    assert repository.claim_next(
+        owner_token="early-child-owner",
+        now=now,
+        lease_seconds=60,
+        allowed_job_types=[LISTING_STATUS_SCAN],
+    ) is None
+    assert repository.finish_run(
+        parent_claim,
+        AutomationRunOutcome(status=AutomationRunStatus.SUCCESS),
+        now=now + timedelta(seconds=1),
+    )
     claimed = repository.claim_next(
         owner_token="child-owner",
-        now=now,
+        now=now + timedelta(seconds=1),
         lease_seconds=60,
         allowed_job_types=[LISTING_STATUS_SCAN],
     )
     assert claimed is not None
     assert claimed.run.run_id == child.run_id
     assert claimed.run.run_id != orphan.run_id
+
+
+def test_parent_failure_cancels_unstarted_child_run(
+    repository: AutomationRepository,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    parent_job = _store_job(
+        repository,
+        _job(
+            job_id="FULL",
+            job_type=FULL_MARKET_SCAN,
+            minutes=60,
+        ),
+        now=now,
+    )
+    child_job = _store_job(
+        repository,
+        _job(
+            job_id="CHILD",
+            job_type=LISTING_STATUS_SCAN,
+            enabled=False,
+            schedule_kind=CHILD_ONLY,
+        ),
+        now=now,
+    )
+    parent = _ensure_run(repository, parent_job, scheduled_for=now)
+    parent_claim = repository.claim_run(
+        run_id=parent.run_id,
+        owner_token="parent-owner",
+        now=now,
+        lease_seconds=60,
+    )
+    assert parent_claim is not None
+    child, _ = repository.ensure_child_run_fenced(
+        parent_claim,
+        child_job,
+        relation_type="LISTING_STATUS_CHILD",
+        now=now,
+    )
+
+    assert repository.finish_run(
+        parent_claim,
+        AutomationRunOutcome(
+            status=AutomationRunStatus.FAILED,
+            error_code="PARENT_HANDLER_FAILED",
+        ),
+        now=now + timedelta(seconds=1),
+    )
+
+    stored_child = repository.get_run(child.run_id)
+    assert stored_child is not None
+    assert stored_child.run_status is AutomationRunStatus.CANCELLED
+    assert stored_child.error_code == "PARENT_RUN_NOT_SUCCESSFUL"
 
 
 def test_unknown_reconcile_blocks_scan_dispatch_but_not_scheduling(

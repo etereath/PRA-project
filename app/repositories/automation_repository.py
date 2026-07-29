@@ -7,6 +7,10 @@ from datetime import datetime, time, timedelta, timezone
 from typing import Iterable
 from uuid import uuid4
 
+from app.automation_ui_channel import (
+    UI_AUTOMATION_JOB_TYPES,
+    has_active_automation_ui_run,
+)
 from app.automation_models import (
     AutomationJob,
     AutomationRun,
@@ -36,11 +40,47 @@ CHILD_PARENT_JOB_TYPES = frozenset(
 )
 CHILD_PARENT_CLAIM_STATUSES = frozenset(
     {
-        AutomationRunStatus.RUNNING.value,
         AutomationRunStatus.SUCCESS.value,
         AutomationRunStatus.PARTIAL.value,
     }
 )
+COVERAGE_CANDIDATE = "COVERAGE_CANDIDATE"
+
+
+class AutomationLeaseLostError(RuntimeError):
+    """Raised when a business write no longer owns its Automation Run."""
+
+
+def validate_live_automation_claim_in_transaction(
+    connection,
+    claim: AutomationRunClaim,
+    *,
+    now: datetime,
+) -> None:
+    """Fence a business write using the transaction's current DB state."""
+
+    current = _as_utc(now, "now")
+    row = connection.execute(
+        """
+        SELECT 1
+        FROM automation_runs
+        WHERE run_id = ?
+          AND run_status = 'RUNNING'
+          AND lease_owner = ?
+          AND lease_version = ?
+          AND julianday(lease_expires_at) > julianday(?)
+        """,
+        (
+            claim.run.run_id,
+            claim.owner_token,
+            claim.lease_version,
+            _datetime_text(current),
+        ),
+    ).fetchone()
+    if row is None:
+        raise AutomationLeaseLostError(
+            "Automation Run lease is no longer owned by this handler"
+        )
 
 
 class AutomationRepository:
@@ -412,14 +452,30 @@ class AutomationRepository:
             try:
                 rows = connection.execute(
                     """
-                    SELECT run_id, scheduled_for
-                    FROM automation_runs
-                    WHERE job_id = ? AND run_status = 'SCHEDULED'
-                    ORDER BY scheduled_for DESC, run_id DESC
+                    SELECT runs.run_id, runs.scheduled_for,
+                           EXISTS (
+                               SELECT 1
+                               FROM automation_run_links AS links
+                               INNER JOIN automation_runs AS targets
+                                   ON targets.run_id = links.parent_run_id
+                               INNER JOIN automation_jobs AS target_jobs
+                                   ON target_jobs.job_id = targets.job_id
+                               WHERE links.child_run_id = runs.run_id
+                                 AND links.relation_type = ?
+                                 AND targets.run_status
+                                     IN ('SCHEDULED', 'RUNNING')
+                                 AND target_jobs.enabled = 1
+                           ) AS coverage_held
+                    FROM automation_runs AS runs
+                    WHERE runs.job_id = ?
+                      AND runs.run_status = 'SCHEDULED'
+                    ORDER BY runs.scheduled_for DESC, runs.run_id DESC
                     """,
-                    (job.job_id,),
+                    (COVERAGE_CANDIDATE, job.job_id),
                 ).fetchall()
                 for index, row in enumerate(rows):
+                    if bool(row["coverage_held"]):
+                        continue
                     scheduled_for = _required_datetime(row["scheduled_for"])
                     too_old_for_policy = index >= keep_count
                     too_late = (
@@ -497,93 +553,188 @@ class AutomationRepository:
                 created_at=current,
             )
 
-    def mark_merged(
+    def ensure_coverage_candidate(
         self,
         *,
-        run_id: str,
+        pulse_run_id: str,
         target_run_id: str,
+        executable_target_job_types: Iterable[str],
         now: datetime,
-        reason: str,
     ) -> bool:
+        """Record a non-terminal coverage candidate after atomic revalidation."""
+
         current = _as_utc(now, "now")
-        if run_id == target_run_id:
-            raise ValueError("A run cannot merge into itself")
+        executable = frozenset(
+            value.strip()
+            for value in executable_target_job_types
+            if value.strip()
+        )
+        if pulse_run_id == target_run_id:
+            raise ValueError("A run cannot cover itself")
         with closing(self.runtime_repository.connect_write()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                source = connection.execute(
-                    "SELECT run_status FROM automation_runs WHERE run_id = ?",
-                    (run_id,),
+                pulse = connection.execute(
+                    """
+                    SELECT runs.*, jobs.enabled AS job_enabled
+                    FROM automation_runs AS runs
+                    INNER JOIN automation_jobs AS jobs
+                        ON jobs.job_id = runs.job_id
+                    WHERE runs.run_id = ?
+                    """,
+                    (pulse_run_id,),
                 ).fetchone()
                 target = connection.execute(
-                    "SELECT run_status FROM automation_runs WHERE run_id = ?",
+                    """
+                    SELECT runs.*, jobs.enabled AS job_enabled
+                    FROM automation_runs AS runs
+                    INNER JOIN automation_jobs AS jobs
+                        ON jobs.job_id = runs.job_id
+                    WHERE runs.run_id = ?
+                    """,
                     (target_run_id,),
                 ).fetchone()
-                if source is None or target is None:
+                if pulse is None or target is None:
                     raise ValueError("Both automation runs must exist")
-                source_status = AutomationRunStatus(
-                    str(source["run_status"])
+                valid = (
+                    str(pulse["run_status"]) == "SCHEDULED"
+                    and str(target["run_status"]) == "SCHEDULED"
+                    and str(pulse["job_type"]) == "ONLINE_PULSE"
+                    and int(pulse["job_enabled"]) == 1
+                    and str(target["job_type"])
+                    in {"FULL_MARKET_SCAN", "PRE_CUTOFF_FULL_SCAN"}
+                    and str(target["job_type"]) in executable
+                    and int(target["job_enabled"]) == 1
+                    and str(pulse["platform_name"])
+                    == str(target["platform_name"])
+                    and str(pulse["platform_trade_date"])
+                    == str(target["platform_trade_date"])
+                    and abs(
+                        (
+                            _required_datetime(pulse["scheduled_for"])
+                            - _required_datetime(target["scheduled_for"])
+                        ).total_seconds()
+                    )
+                    <= 300
                 )
-                if source_status is AutomationRunStatus.MERGED:
-                    existing_link = connection.execute(
-                        """
-                        SELECT 1
-                        FROM automation_run_links
-                        WHERE parent_run_id = ?
-                          AND child_run_id = ?
-                          AND relation_type = 'MERGED_RUN'
-                        """,
-                        (target_run_id, run_id),
-                    ).fetchone()
+                if not valid:
                     connection.commit()
-                    return existing_link is not None
-                if source_status is not AutomationRunStatus.SCHEDULED:
-                    connection.rollback()
                     return False
-                cursor = connection.execute(
+                existing = connection.execute(
                     """
-                    UPDATE automation_runs
-                    SET run_status = 'MERGED',
-                        finished_at = ?,
-                        error_code = 'MERGED_INTO_HIGHER_PRIORITY_RUN',
-                        error_message = ?,
-                        updated_at = ?
-                    WHERE run_id = ? AND run_status = 'SCHEDULED'
+                    SELECT 1
+                    FROM automation_run_links
+                    WHERE parent_run_id = ?
+                      AND child_run_id = ?
+                      AND relation_type = ?
                     """,
                     (
-                        _datetime_text(current),
-                        reason,
-                        _datetime_text(current),
-                        run_id,
+                        target_run_id,
+                        pulse_run_id,
+                        COVERAGE_CANDIDATE,
                     ),
-                )
-                if cursor.rowcount != 1:
-                    connection.rollback()
-                    return False
-                _insert_link(
-                    connection,
-                    parent_run_id=target_run_id,
-                    child_run_id=run_id,
-                    relation_type="MERGED_RUN",
-                    created_at=current,
-                )
-                _insert_event(
-                    connection,
-                    run_id=run_id,
-                    event_type="RUN_MERGED",
-                    from_status=AutomationRunStatus.SCHEDULED,
-                    to_status=AutomationRunStatus.MERGED,
-                    payload={
-                        "target_run_id": target_run_id,
-                        "reason": reason,
-                    },
-                    created_at=current,
-                )
+                ).fetchone()
+                if existing is None:
+                    _insert_link(
+                        connection,
+                        parent_run_id=target_run_id,
+                        child_run_id=pulse_run_id,
+                        relation_type=COVERAGE_CANDIDATE,
+                        created_at=current,
+                    )
+                    _insert_event(
+                        connection,
+                        run_id=pulse_run_id,
+                        event_type="COVERAGE_CANDIDATE_CREATED",
+                        from_status=AutomationRunStatus.SCHEDULED,
+                        to_status=AutomationRunStatus.SCHEDULED,
+                        payload={"target_run_id": target_run_id},
+                        created_at=current,
+                    )
                 connection.commit()
                 return True
             except Exception:
                 connection.rollback()
                 raise
+
+    def reconcile_coverage_candidates(
+        self,
+        *,
+        now: datetime,
+    ) -> tuple[str, ...]:
+        """Release candidates whose target is no longer executable."""
+
+        current = _as_utc(now, "now")
+        released: list[str] = []
+        with closing(self.runtime_repository.connect_write()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT links.parent_run_id, links.child_run_id,
+                           targets.run_status, targets.job_type,
+                           jobs.enabled
+                    FROM automation_run_links AS links
+                    INNER JOIN automation_runs AS targets
+                        ON targets.run_id = links.parent_run_id
+                    INNER JOIN automation_jobs AS jobs
+                        ON jobs.job_id = targets.job_id
+                    WHERE links.relation_type = ?
+                    ORDER BY links.parent_run_id, links.child_run_id
+                    """,
+                    (COVERAGE_CANDIDATE,),
+                ).fetchall()
+                for row in rows:
+                    valid = (
+                        str(row["run_status"])
+                        in {"SCHEDULED", "RUNNING"}
+                        and int(row["enabled"]) == 1
+                    )
+                    if valid:
+                        continue
+                    target_run_id = str(row["parent_run_id"])
+                    pulse_run_id = str(row["child_run_id"])
+                    connection.execute(
+                        """
+                        DELETE FROM automation_run_links
+                        WHERE parent_run_id = ? AND child_run_id = ?
+                          AND relation_type = ?
+                        """,
+                        (
+                            target_run_id,
+                            pulse_run_id,
+                            COVERAGE_CANDIDATE,
+                        ),
+                    )
+                    pulse = connection.execute(
+                        """
+                        SELECT run_status FROM automation_runs
+                        WHERE run_id = ?
+                        """,
+                        (pulse_run_id,),
+                    ).fetchone()
+                    if (
+                        pulse is not None
+                        and str(pulse["run_status"]) == "SCHEDULED"
+                    ):
+                        _insert_event(
+                            connection,
+                            run_id=pulse_run_id,
+                            event_type="COVERAGE_CANDIDATE_RELEASED",
+                            from_status=AutomationRunStatus.SCHEDULED,
+                            to_status=AutomationRunStatus.SCHEDULED,
+                            payload={
+                                "target_run_id": target_run_id,
+                                "reason": "TARGET_NOT_EXECUTABLE",
+                            },
+                            created_at=current,
+                        )
+                        released.append(pulse_run_id)
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return tuple(released)
 
     def ensure_link(
         self,
@@ -817,36 +968,14 @@ class AutomationRepository:
         lease_seconds: int,
         allowed_job_types: Iterable[str],
     ) -> AutomationRunClaim | None:
-        current = _as_utc(now, "now")
-        owner = owner_token.strip()
-        allowed = tuple(
-            dict.fromkeys(
-                job_type.strip()
-                for job_type in allowed_job_types
-                if job_type.strip()
-            )
+        claim, _ = self.claim_next_with_ui_gate(
+            owner_token=owner_token,
+            now=now,
+            lease_seconds=lease_seconds,
+            allowed_job_types=allowed_job_types,
+            ui_job_types=UI_AUTOMATION_JOB_TYPES,
         )
-        if not owner:
-            raise ValueError("owner_token must not be blank")
-        if lease_seconds < 1:
-            raise ValueError("lease_seconds must be positive")
-        if not allowed:
-            return None
-        with closing(self.runtime_repository.connect_write()) as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            try:
-                claim = _claim_next_connection(
-                    connection,
-                    owner_token=owner,
-                    now=current,
-                    lease_seconds=lease_seconds,
-                    allowed_job_types=allowed,
-                )
-                connection.commit()
-                return claim
-            except Exception:
-                connection.rollback()
-                raise
+        return claim
 
     def claim_next_with_ui_gate(
         self,
@@ -879,6 +1008,11 @@ class AutomationRepository:
             connection.execute("BEGIN IMMEDIATE")
             try:
                 blocker = _active_ui_blocker_connection(connection)
+                if not blocker and has_active_automation_ui_run(
+                    connection,
+                    now=current,
+                ):
+                    blocker = "AUTOMATION_UI_ACTIVE"
                 claimable_types = tuple(
                     job_type
                     for job_type in allowed
@@ -914,12 +1048,13 @@ class AutomationRepository:
         with closing(self.runtime_repository.connect_write()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                claim = _claim_run(
+                claim = _claim_specific_run_connection(
                     connection,
                     run_id=run_id,
                     owner_token=owner,
                     now=current,
                     lease_seconds=lease_seconds,
+                    ui_job_types=UI_AUTOMATION_JOB_TYPES,
                 )
                 connection.commit()
                 return claim
@@ -1032,6 +1167,12 @@ class AutomationRepository:
                     },
                     created_at=current,
                 )
+                _settle_linked_runs(
+                    connection,
+                    parent_run_id=claim.run.run_id,
+                    parent_status=outcome.status,
+                    now=current,
+                )
                 connection.commit()
                 return True
             except Exception:
@@ -1042,7 +1183,15 @@ class AutomationRepository:
         """Return the highest existing write-side blocker for read scans."""
 
         with closing(self.runtime_repository.connect_read()) as connection:
-            return _active_ui_blocker_connection(connection)
+            blocker = _active_ui_blocker_connection(connection)
+            if blocker:
+                return blocker
+            if has_active_automation_ui_run(
+                connection,
+                now=datetime.now(timezone.utc),
+            ):
+                return "AUTOMATION_UI_ACTIVE"
+            return ""
 
     def health_snapshot(self, *, now: datetime) -> dict[str, object]:
         current = _as_utc(now, "now")
@@ -1075,6 +1224,153 @@ class AutomationRepository:
             "expired_running_count": expired,
             "observed_at": _datetime_text(current),
         }
+
+
+def _settle_linked_runs(
+    connection,
+    *,
+    parent_run_id: str,
+    parent_status: AutomationRunStatus,
+    now: datetime,
+) -> None:
+    allows_children = parent_status in {
+        AutomationRunStatus.SUCCESS,
+        AutomationRunStatus.PARTIAL,
+    }
+    coverage_rows = connection.execute(
+        """
+        SELECT child_run_id
+        FROM automation_run_links
+        WHERE parent_run_id = ? AND relation_type = ?
+        ORDER BY child_run_id
+        """,
+        (parent_run_id, COVERAGE_CANDIDATE),
+    ).fetchall()
+    if parent_status is AutomationRunStatus.SUCCESS:
+        for row in coverage_rows:
+            pulse_run_id = str(row["child_run_id"])
+            cursor = connection.execute(
+                """
+                UPDATE automation_runs
+                SET run_status = 'MERGED', finished_at = ?,
+                    error_code = 'MERGED_INTO_SUCCESSFUL_RUN',
+                    error_message = ?,
+                    updated_at = ?
+                WHERE run_id = ? AND run_status = 'SCHEDULED'
+                """,
+                (
+                    _datetime_text(now),
+                    f"Covered by successful run {parent_run_id}",
+                    _datetime_text(now),
+                    pulse_run_id,
+                ),
+            )
+            if cursor.rowcount == 1:
+                _insert_link(
+                    connection,
+                    parent_run_id=parent_run_id,
+                    child_run_id=pulse_run_id,
+                    relation_type="MERGED_RUN",
+                    created_at=now,
+                )
+                _insert_event(
+                    connection,
+                    run_id=pulse_run_id,
+                    event_type="RUN_MERGED",
+                    from_status=AutomationRunStatus.SCHEDULED,
+                    to_status=AutomationRunStatus.MERGED,
+                    payload={"target_run_id": parent_run_id},
+                    created_at=now,
+                )
+            connection.execute(
+                """
+                DELETE FROM automation_run_links
+                WHERE parent_run_id = ? AND child_run_id = ?
+                  AND relation_type = ?
+                """,
+                (parent_run_id, pulse_run_id, COVERAGE_CANDIDATE),
+            )
+    else:
+        for row in coverage_rows:
+            pulse_run_id = str(row["child_run_id"])
+            connection.execute(
+                """
+                DELETE FROM automation_run_links
+                WHERE parent_run_id = ? AND child_run_id = ?
+                  AND relation_type = ?
+                """,
+                (parent_run_id, pulse_run_id, COVERAGE_CANDIDATE),
+            )
+            pulse = connection.execute(
+                """
+                SELECT run_status
+                FROM automation_runs
+                WHERE run_id = ?
+                """,
+                (pulse_run_id,),
+            ).fetchone()
+            if (
+                pulse is not None
+                and str(pulse["run_status"])
+                == AutomationRunStatus.SCHEDULED.value
+            ):
+                _insert_event(
+                    connection,
+                    run_id=pulse_run_id,
+                    event_type="COVERAGE_CANDIDATE_RELEASED",
+                    from_status=AutomationRunStatus.SCHEDULED,
+                    to_status=AutomationRunStatus.SCHEDULED,
+                    payload={
+                        "target_run_id": parent_run_id,
+                        "target_status": parent_status.value,
+                    },
+                    created_at=now,
+                )
+
+    if allows_children:
+        return
+    child_relations = tuple(CHILD_RELATIONS.values())
+    relation_placeholders = ",".join("?" for _ in child_relations)
+    child_rows = connection.execute(
+        f"""
+        SELECT DISTINCT child_run_id
+        FROM automation_run_links
+        WHERE parent_run_id = ?
+          AND relation_type IN ({relation_placeholders})
+        ORDER BY child_run_id
+        """,
+        (parent_run_id, *child_relations),
+    ).fetchall()
+    for row in child_rows:
+        child_run_id = str(row["child_run_id"])
+        cursor = connection.execute(
+            """
+            UPDATE automation_runs
+            SET run_status = 'CANCELLED', finished_at = ?,
+                error_code = 'PARENT_RUN_NOT_SUCCESSFUL',
+                error_message = ?, updated_at = ?
+            WHERE run_id = ? AND run_status = 'SCHEDULED'
+            """,
+            (
+                _datetime_text(now),
+                f"Parent run ended as {parent_status.value}",
+                _datetime_text(now),
+                child_run_id,
+            ),
+        )
+        if cursor.rowcount == 1:
+            _insert_event(
+                connection,
+                run_id=child_run_id,
+                event_type="RUN_CANCELLED_BY_PARENT",
+                from_status=AutomationRunStatus.SCHEDULED,
+                to_status=AutomationRunStatus.CANCELLED,
+                payload={
+                    "parent_run_id": parent_run_id,
+                    "parent_status": parent_status.value,
+                },
+                created_at=now,
+            )
 
 
 def _claim_next_connection(
@@ -1124,6 +1420,18 @@ def _claim_next_connection(
                           )
                       )
                   )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM automation_run_links AS coverage
+                      INNER JOIN automation_runs AS targets
+                          ON targets.run_id = coverage.parent_run_id
+                      INNER JOIN automation_jobs AS target_jobs
+                          ON target_jobs.job_id = targets.job_id
+                      WHERE coverage.child_run_id = runs.run_id
+                        AND coverage.relation_type = 'COVERAGE_CANDIDATE'
+                        AND targets.run_status IN ('SCHEDULED', 'RUNNING')
+                        AND target_jobs.enabled = 1
+                  )
               )
               OR (
                   runs.run_status = 'RUNNING'
@@ -1153,6 +1461,90 @@ def _claim_next_connection(
     return _claim_run(
         connection,
         run_id=str(row["run_id"]),
+        owner_token=owner_token,
+        now=now,
+        lease_seconds=lease_seconds,
+    )
+
+
+def _claim_specific_run_connection(
+    connection,
+    *,
+    run_id: str,
+    owner_token: str,
+    now: datetime,
+    lease_seconds: int,
+    ui_job_types: Iterable[str],
+) -> AutomationRunClaim | None:
+    row = connection.execute(
+        """
+        SELECT runs.run_status, runs.job_type, jobs.enabled,
+               jobs.schedule_kind
+        FROM automation_runs AS runs
+        INNER JOIN automation_jobs AS jobs ON jobs.job_id = runs.job_id
+        WHERE runs.run_id = ?
+        """,
+        (run_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    status = AutomationRunStatus(str(row["run_status"]))
+    if status is AutomationRunStatus.SCHEDULED:
+        if str(row["schedule_kind"]) == "CHILD_ONLY":
+            relations = tuple(CHILD_RELATIONS.values())
+            relation_placeholders = ",".join("?" for _ in relations)
+            parent_statuses = tuple(CHILD_PARENT_CLAIM_STATUSES)
+            status_placeholders = ",".join("?" for _ in parent_statuses)
+            parent = connection.execute(
+                f"""
+                SELECT 1
+                FROM automation_run_links AS links
+                INNER JOIN automation_runs AS parents
+                    ON parents.run_id = links.parent_run_id
+                WHERE links.child_run_id = ?
+                  AND links.relation_type IN ({relation_placeholders})
+                  AND parents.run_status IN ({status_placeholders})
+                LIMIT 1
+                """,
+                (run_id, *relations, *parent_statuses),
+            ).fetchone()
+            if parent is None:
+                return None
+        elif int(row["enabled"]) != 1:
+            return None
+        coverage = connection.execute(
+            """
+            SELECT 1
+            FROM automation_run_links AS links
+            INNER JOIN automation_runs AS targets
+                ON targets.run_id = links.parent_run_id
+            INNER JOIN automation_jobs AS jobs
+                ON jobs.job_id = targets.job_id
+            WHERE links.child_run_id = ?
+              AND links.relation_type = 'COVERAGE_CANDIDATE'
+              AND targets.run_status IN ('SCHEDULED', 'RUNNING')
+              AND jobs.enabled = 1
+            LIMIT 1
+            """,
+            (run_id,),
+        ).fetchone()
+        if coverage is not None:
+            return None
+    elif status is not AutomationRunStatus.RUNNING:
+        return None
+
+    if str(row["job_type"]) in frozenset(ui_job_types):
+        if _active_ui_blocker_connection(connection):
+            return None
+        if has_active_automation_ui_run(
+            connection,
+            now=now,
+            exclude_run_id=run_id,
+        ):
+            return None
+    return _claim_run(
+        connection,
+        run_id=run_id,
         owner_token=owner_token,
         now=now,
         lease_seconds=lease_seconds,

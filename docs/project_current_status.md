@@ -507,9 +507,14 @@ Code Review 后的高中低风险问题已完成修复，系统冒烟测试、�
     阻断、单实例锁与 UTF-8 原子心跳均已有专项测试。PR 评审后进一步补齐了旧
     `SCHEDULED` 每轮清理、崩溃后合并恢复、逐次领取原子 UI gate、受父租约
     fencing 的原子子 run、禁用/子任务领取门禁、Runtime 时间策略热加载，以及按
-    Runtime DB 唯一化的进程锁和失败心跳。真实扫描 handler、Runtime DB
-    迁移和生产部署仍未执行。本批专项 `15 passed`，完整回归为
-    `805 passed, 3 skipped, 97 subtests passed`；系统冒烟、构建、包边界、
+    Runtime DB 唯一化的进程锁和失败心跳。第二轮评审进一步把扫描合并收紧为
+    “覆盖候选→目标 `SUCCESS` 后最终合并”，无 handler、禁用、部分成功或失败目标
+    都会让小扫描回退；业务事实写入必须在同一事务校验 Automation claim，活动
+    Automation UI 租约与 v4/v5 写锁形成双向门禁，公开 `claim_run` 不再绕过策略，
+    子 run 只在父 run `SUCCESS/PARTIAL` 后可领取且父失败会取消未开始子 run。
+    真实扫描 handler、Runtime DB
+    迁移和生产部署仍未执行。第二轮修复后 Automation 专项 `35 passed`，完整回归为
+    `830 passed, 3 skipped, 97 subtests passed`；系统冒烟、构建、包边界、
     secret scan、仓库外 wheel 安装和 Windows ShadowBot 静态夹具门禁均通过。
     下一阶段边界见
     [13.5-3 实施报告](reports/task13_5_3_automation_service.md)。

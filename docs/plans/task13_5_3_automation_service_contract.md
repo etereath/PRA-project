@@ -20,9 +20,11 @@
 - 可注入的应用服务 handler 边界。
 
 本阶段不建设订单页面 Adapter、销售估算、日结算法、S4 自动紧急下架或 Web
-运营页面，也不修改 ShadowBot Worker、队列合同、Importer、Watchdog、写锁或唯一
-RECONCILE。真实平台扫描 handler 必须在对应应用服务具备完整合同和验收后显式注册；
-不存在 handler 时，调度器只创建 `SCHEDULED` 账本，不伪造成功，也不产生平台副作用。
+运营页面，也不修改 ShadowBot Worker、队列合同、Importer、Watchdog 或唯一
+RECONCILE。为形成单 UI 通道，只在既有 v4/v5 写任务取得 Runtime 写锁的事务入口增加
+活动 Automation UI 租约检查，不改变任务、队列、Worker 或动作状态机合同。真实平台
+扫描 handler 必须在对应应用服务具备完整合同和验收后显式注册；不存在 handler 时，
+调度器只创建 `SCHEDULED` 账本，不伪造成功，也不产生平台副作用。
 
 ## 2. 默认作业
 
@@ -95,12 +97,23 @@ N 个。进程在创建 run 后、合并前崩溃时，下一轮必须重新扫�
 ## 5. 合并与单 UI 通道
 
 同一平台、同一 `platform_trade_date`、计划时间相差不超过 5 分钟的 `ONLINE_PULSE` 与
-`FULL_MARKET_SCAN/PRE_CUTOFF_FULL_SCAN` 可以合并。被覆盖的小扫描进入
-`MERGED`，并建立：
+`FULL_MARKET_SCAN/PRE_CUTOFF_FULL_SCAN` 可以形成覆盖候选。候选成立必须同时满足：
+
+- 小扫描与目标扫描均启用且仍为 `SCHEDULED`；
+- 当前 Automation Service 已注册目标扫描 handler；
+- 平台、交易日和五分钟时间窗口一致。
+
+候选期只建立 `COVERAGE_CANDIDATE` 链接，小扫描仍为 `SCHEDULED`，但暂不领取，也不因
+迟到被标成 `MISSED`。只有目标扫描以 `SUCCESS` 完成后，才把小扫描原子推进为
+`MERGED`，并建立最终关系：
 
 ```text
 完整扫描父 run --MERGED_RUN--> 小扫描 run
 ```
+
+目标扫描为 `PARTIAL`、`FAILED`、`CANCELLED`、`MISSED`，或候选期间被禁用时，必须
+释放候选，让小扫描按原计划回退执行。无 handler、禁用或失败的目标绝不能让小扫描
+提前进入终态。
 
 因此 17:55 截单前扫描绝不能覆盖 18:00 后已属于下一平台交易日的脉冲。
 
@@ -121,6 +134,19 @@ SYSTEM_EMERGENCY SET_OFFLINE（13.5-6 启用前保持禁用）
 它不把普通 `pending` 任务解释为执行授权，也不创建、启动或重启 ShadowBot。
 阻断检查与 UI run 领取必须位于同一个 `BEGIN IMMEDIATE` 事务，并在每次领取前重查，
 避免一次 cycle 内出现检查后写锁状态变化的 TOCTOU。
+
+单 UI 通道是双向门禁，而不是只阻止 Automation 一侧：
+
+- Automation UI run 从领取到 handler 完成期间保持 `RUNNING` 且持有有效租约；
+- v4/v5 人工写任务在同一个 `BEGIN IMMEDIATE` 写锁事务内检查活动 Automation UI
+  租约，存在活动租约时不得发布写任务或取得活动写锁；
+- Automation 领取 UI run 时，在同一事务内反查既有写锁与 UNKNOWN/RECONCILE；
+- 另一 Automation 实例也不得在首个 UI handler 持有有效租约时领取第二个 UI run；
+- 非 UI 的结算和纯计算 run 不占用 UI 通道。
+
+handler 执行时间可能超过初始租约时，必须通过执行上下文心跳续租；租约过期后才允许
+另一实例回收。数据库门禁不能强制终止已经失去租约的外部 UI 动作，因此真实 UI
+handler 还必须在关键步骤前续租并在失去租约时协作停止。
 
 ## 6. 租约、心跳与重启恢复
 
@@ -145,6 +171,20 @@ lease_expires_at > 写回时间
 `LEASE_RECLAIMED`。旧实例的晚到结果必须被拒绝；当前周期一旦发现租约丢失，立即停止
 继续领取，避免同一故障 handler 在一个周期内反复抢占。
 
+任何 handler 或 Importer 新增、替换商品、订单、结算等业务事实时，必须携带当前
+`AutomationRunClaim`，并在写入事实的同一个 `BEGIN IMMEDIATE` 事务内验证：
+
+```text
+run_status = RUNNING
+lease_owner = 当前 owner
+lease_version = 当前 version
+lease_expires_at > 当前写入时间
+```
+
+当前商品观察导入已落实这一合同；后续订单和结算事实入口必须复用同一事务校验函数。
+完全相同且不会新增或替换事实的幂等重放可以直接返回既有结果；任何不同内容仍必须
+持有有效 claim，且同一 Automation run 不得用另一批内容替换已接收的规范事实。
+
 handler 异常只写入受限的稳定错误码：
 
 - `AUTOMATION_HANDLER_TIMEOUT`
@@ -155,9 +195,14 @@ handler 异常只写入受限的稳定错误码：
 
 禁用的普通 job 不得领取新的 `SCHEDULED`；已经开始、后来被禁用的过期 `RUNNING`
 仍允许回收，以便确定性收敛到终态。`CHILD_ONLY` 即使默认禁用，也只在存在受支持父
-类型、关系和父状态的链接后才允许领取。父 handler 创建子 run 时，父租约校验、子
+类型、关系且父 run 已为 `SUCCESS/PARTIAL` 后才允许领取；父 run 仍为 `RUNNING`
+时子 run 只能保持 `SCHEDULED`，父 run 失败、取消或错过后，仍处于 `SCHEDULED`
+的子 run 必须原子取消。父 handler 创建子 run 时，父租约校验、子
 类型/关系/平台约束、继承父 run 冻结时间上下文、幂等创建和链接写入必须在同一事务；
 任一环节失败不得留下孤儿子 run。
+
+公开的 `claim_run(...)` 与按优先级领取必须经过同一套启用状态、父链、
+`COVERAGE_CANDIDATE` 和单 UI 通道门禁；不得保留可绕过策略的直接领取入口。
 
 ## 7. 进程生命周期与健康
 
@@ -203,7 +248,12 @@ data/runtime/automation_service/heartbeat.json
 - 父租约过期/被回收、子链接回滚、跨平台和策略切换；
 - UNKNOWN/RECONCILE 阻断；
 - 每次领取的原子 UI gate；
+- 首个 UI handler 整个执行期间第二实例无法领取另一 UI run；
+- v4/v5 写任务在取得写锁前反向检查活动 Automation UI 租约；
+- 业务事实与 Automation claim 的同事务 fencing、过期 owner 与被回收 owner；
+- 覆盖候选仅在目标成功后转为 `MERGED`，禁用、无 handler、部分成功和失败均回退；
 - 禁用 job、合法 `CHILD_ONLY` 父链与默认 job 静态漂移；
+- 子 run 在父 run 完成前不可领取，父失败时自动取消；
 - Runtime 时间策略热加载；
 - 单实例进程锁；
 - 同 Runtime DB 不同 heartbeat 的锁冲突与心跳保护；

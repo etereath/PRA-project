@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
+from app.automation_ui_channel import UI_AUTOMATION_JOB_TYPES
 from app.automation_models import (
     AutomationCycleResult,
     AutomationJob,
@@ -39,16 +40,7 @@ POST_CUTOFF_PULSE = "POST_CUTOFF_PULSE"
 PLATFORM_TRADE_DAY_SETTLEMENT = "PLATFORM_TRADE_DAY_SETTLEMENT"
 SALES_PLAN_INPUT_BUILD = "SALES_PLAN_INPUT_BUILD"
 
-UI_JOB_TYPES = frozenset(
-    {
-        ONLINE_PULSE,
-        FULL_MARKET_SCAN,
-        LISTING_STATUS_SCAN,
-        ORDER_SCAN,
-        PRE_CUTOFF_FULL_SCAN,
-        POST_CUTOFF_PULSE,
-    }
-)
+UI_JOB_TYPES = UI_AUTOMATION_JOB_TYPES
 
 # Lower values have higher priority.  The first three classes are enforced by
 # the existing operation/write-lock ledger before any scan is dispatched.
@@ -137,8 +129,17 @@ class AutomationSchedulePlanner:
         self.operational_time = operational_time or OperationalTimeService()
         self.max_windows_per_job = max_windows_per_job
 
-    def materialize(self, *, now: datetime) -> AutomationScheduleResult:
+    def materialize(
+        self,
+        *,
+        now: datetime,
+        executable_job_types: Iterable[str] | None = None,
+    ) -> AutomationScheduleResult:
         current = _as_utc(now, "now")
+        executable = frozenset(executable_job_types or ())
+        self.repository.reconcile_coverage_candidates(
+            now=current,
+        )
         created_ids: list[str] = []
         missed_ids: list[str] = []
         merged_ids: list[str] = []
@@ -282,7 +283,7 @@ class AutomationSchedulePlanner:
                 ]
                 if not candidates:
                     continue
-                target = min(
+                ordered_candidates = sorted(
                     candidates,
                     key=lambda run: (
                         abs(
@@ -292,16 +293,14 @@ class AutomationSchedulePlanner:
                         run.scheduled_for,
                     ),
                 )
-                if self.repository.mark_merged(
-                    run_id=pulse.run_id,
-                    target_run_id=target.run_id,
-                    now=current,
-                    reason=(
-                        "邻近完整扫描覆盖 10 分钟上架中脉冲，"
-                        "避免重复占用单 UI 通道。"
-                    ),
-                ):
-                    merged_ids.append(pulse.run_id)
+                for target in ordered_candidates:
+                    if self.repository.ensure_coverage_candidate(
+                        pulse_run_id=pulse.run_id,
+                        target_run_id=target.run_id,
+                        executable_target_job_types=executable,
+                        now=current,
+                    ):
+                        break
 
         return AutomationScheduleResult(
             created_run_ids=tuple(created_ids),
@@ -355,11 +354,15 @@ class AutomationService:
                 policies=self.repository.load_operational_time_policies()
             )
             self.planner.operational_time = self.operational_time
-        scheduled = self.planner.materialize(now=self.clock())
+        scheduled = self.planner.materialize(
+            now=self.clock(),
+            executable_job_types=self.handlers,
+        )
         allowed_job_types = set(self.handlers)
 
         claimed_ids: list[str] = []
         completed_ids: list[str] = []
+        merged_ids = list(scheduled.merged_run_ids)
         errors: list[str] = []
         blocker = ""
         for _ in range(self.max_runs_per_cycle):
@@ -410,6 +413,14 @@ class AutomationService:
             )
             if completed:
                 completed_ids.append(claim.run.run_id)
+                merged_ids.extend(
+                    link.child_run_id
+                    for link in self.repository.list_links(
+                        parent_run_id=claim.run.run_id
+                    )
+                    if link.relation_type == "MERGED_RUN"
+                    and link.child_run_id not in merged_ids
+                )
             else:
                 errors.append(
                     f"LEASE_LOST:{claim.run.run_id}"
@@ -417,7 +428,12 @@ class AutomationService:
                 break
 
         return AutomationCycleResult(
-            scheduled=scheduled,
+            scheduled=AutomationScheduleResult(
+                created_run_ids=scheduled.created_run_ids,
+                missed_run_ids=scheduled.missed_run_ids,
+                merged_run_ids=tuple(merged_ids),
+                truncated_window_count=scheduled.truncated_window_count,
+            ),
             claimed_run_ids=tuple(claimed_ids),
             completed_run_ids=tuple(completed_ids),
             blocked_reason=blocker,

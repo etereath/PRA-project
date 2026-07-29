@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import closing
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
 import json
@@ -12,6 +12,7 @@ from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from app.automation_ui_channel import has_active_automation_ui_run
 from app.enums import TaskActionType, TaskStatus
 from app.exceptions import ValidationError
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
@@ -1194,6 +1195,10 @@ def _persist_prepared_write_batch(
     connection = repository.connect_write()
     try:
         connection.execute("BEGIN IMMEDIATE")
+        if has_active_automation_ui_run(connection, now=now_value):
+            raise ValidationError(
+                "Automation UI 扫描正在运行，当前不能获取平台写锁。"
+            )
         validated_corrective = _corrective_retry_authorizations(
             connection,
             platform_name=request["platform_name"],

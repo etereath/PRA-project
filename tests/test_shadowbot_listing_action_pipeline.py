@@ -22,6 +22,7 @@ from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.shadowbot_executor import (
     ShadowBotFileQueueRunner,
     ShadowBotStartBoundaryError,
+    ShadowBotStartResult,
 )
 from app.services.shadowbot_listing_action_contract import (
     compute_listing_result_hash,
@@ -53,6 +54,51 @@ from tests.test_shadowbot_listing_sync import (
     _request,
     _result,
 )
+
+
+def _insert_active_automation_ui_run(
+    repository: SQLiteRuntimeRepository,
+) -> None:
+    now = datetime.now(UTC)
+    with repository.connect_write() as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO automation_jobs(
+                job_id, job_type, display_name, enabled,
+                schedule_kind, schedule_expression, priority,
+                config_json, created_at, updated_at
+            ) VALUES (
+                'UI-JOB', 'ONLINE_PULSE', 'UI scan', 1,
+                'INTERVAL_MINUTES', '10', 10, '{}', ?, ?
+            )
+            """,
+            (now.isoformat(), now.isoformat()),
+        )
+        connection.execute(
+            """
+            INSERT INTO automation_runs(
+                run_id, job_id, job_type, logical_run_key,
+                run_status, platform_name, platform_trade_date,
+                seller_operation_date, seller_phase,
+                time_policy_version, scheduled_for, started_at,
+                lease_owner, lease_version, lease_expires_at,
+                created_at, updated_at
+            ) VALUES (
+                'UI-RUN', 'UI-JOB', 'ONLINE_PULSE', 'ui-run',
+                'RUNNING', ?, '2026-07-29', '2026-07-29',
+                'NORMAL_SALES', 'CN_SINGLE_PLATFORM_2026_V1',
+                ?, ?, 'ui-owner', 1, ?, ?, ?
+            )
+            """,
+            (
+                PLATFORM,
+                now.isoformat(),
+                now.isoformat(),
+                (now + timedelta(hours=1)).isoformat(),
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
 
 
 def _seed_waiting_snapshot(
@@ -403,6 +449,42 @@ def test_review_created_after_proposal_is_rechecked_inside_publish_transaction(
             "WHERE batch_id = ?",
             (proposal["manifest"]["batch_id"],),
         ).fetchone()[0] == 0
+
+
+def test_active_automation_ui_run_blocks_v5_write_lock_publication(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    _seed_waiting_snapshot(repository, tmp_path)
+    _insert_set_online_task(repository)
+    proposal = propose_listing_action_batch(
+        repository,
+        batch_id="BATCH-SET-ONLINE-UI-BLOCK-0001",
+        task_ids=["TASK-SET-ONLINE-0001"],
+        mapping_path=_mapping_file(tmp_path / "mapping-ui-block.json"),
+    )
+    _insert_active_automation_ui_run(repository)
+
+    with pytest.raises(ValidationError, match="UI 扫描正在运行"):
+        publish_listing_action_batch(
+            repository,
+            ShadowBotFileQueueRunner(tmp_path / "queue-ui-block"),
+            proposal=proposal,
+            applet_uri="weixin://launchapplet/test",
+            confirmation_text=proposal["required_confirmation"],
+            confirmed_by="tester",
+        )
+
+    with repository.connect_read() as connection:
+        assert (
+            connection.execute(
+                """
+                SELECT COUNT(*) FROM shadowbot_write_locks
+                WHERE status = 'ACTIVE'
+                """
+            ).fetchone()[0]
+            == 0
+        )
 
 
 @pytest.mark.parametrize(

@@ -9,6 +9,11 @@ from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Iterable
 
+from app.automation_models import AutomationRunClaim
+from app.repositories.automation_repository import (
+    AutomationLeaseLostError,
+    validate_live_automation_claim_in_transaction,
+)
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.shadowbot_contract_primitives import canonical_positive_price
 from app.services.operational_time import OperationalTimeService
@@ -87,8 +92,16 @@ class ProductObservationImporter:
     def import_batch(
         self,
         batch: ProductObservationBatchInput,
+        *,
+        claim: AutomationRunClaim,
+        now: datetime,
     ) -> ProductObservationImportResult:
         normalized = self._normalize_and_validate(batch)
+        current = _as_utc(now, "now")
+        if claim.run.run_id != normalized.automation_run_id:
+            raise ProductObservationError(
+                "Automation Run claim does not match observation batch"
+            )
         content_sha256 = _result_content_sha256(
             normalized,
             mapping_version=self.mappings.mapping_version,
@@ -215,10 +228,34 @@ class ProductObservationImporter:
                         item_count=item_count,
                         already_imported=True,
                     )
-
                 if str(run["run_status"]) not in ACCEPTING_RUN_STATUSES:
                     raise ProductObservationError(
                         "automation run is not accepting scan results"
+                    )
+                try:
+                    validate_live_automation_claim_in_transaction(
+                        connection,
+                        claim,
+                        now=current,
+                    )
+                except AutomationLeaseLostError as exc:
+                    raise ProductObservationError(
+                        "automation run lease is not live"
+                    ) from exc
+                conflicting_run_batch = connection.execute(
+                    """
+                    SELECT observation_batch_id
+                    FROM product_observation_batches
+                    WHERE automation_run_id = ?
+                    ORDER BY created_at, observation_batch_id
+                    LIMIT 1
+                    """,
+                    (normalized.automation_run_id,),
+                ).fetchone()
+                if conflicting_run_batch is not None:
+                    raise ProductObservationError(
+                        "automation run already has different observation "
+                        "content"
                     )
 
                 connection.execute(
@@ -253,7 +290,7 @@ class ProductObservationImporter:
                         batch_context.time_policy_version,
                         normalized.error_code,
                         normalized.error_message,
-                        _datetime_text(datetime.now(timezone.utc)),
+                        _datetime_text(current),
                     ),
                 )
                 for index, item in enumerate(resolved_items):
