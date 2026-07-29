@@ -135,12 +135,17 @@ COLD_STORAGE_STATUS_HEADERS = [
 
 PLATFORM_MAPPING_HEADERS = [
     "mapping_id",
+    "mapping_kind",
     "internal_sku",
     "platform_name",
     "platform_product_id",
     "platform_product_name",
+    "normalized_platform_product_name",
+    "grade",
     "search_keyword",
     "mapping_status",
+    "effective_from",
+    "effective_to",
     "last_verified_at",
     "remark",
 ]

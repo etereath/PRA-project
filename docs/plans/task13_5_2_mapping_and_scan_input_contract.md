@@ -3,7 +3,7 @@
 - 形成日期：2026-07-29
 - 上游：
   [任务 13.5-1 冻结合同](task13_5_1_quality_and_settlement_contract_review.md)
-- 当前状态：`READY_FOR_IMPLEMENTATION`
+- 当前状态：`CORE_INPUT_IMPLEMENTED_LOCAL`
 - 范围：商品映射、`ONLINE_PULSE`、`FULL_MARKET_SCAN` 的商品状态子结果和
   v14 不可变商品观察
 
@@ -109,3 +109,23 @@ FULL_MARKET_SCAN
 - 临时数据库、完整 pytest、系统冒烟、wheel 和 CI 通过。
 
 本合同不授权真实 COMMIT、普通自动业务任务或 `SYSTEM_EMERGENCY`。
+
+## 6. 首批本地实现（2026-07-29）
+
+本批已经完成扫描输入与持久化核心，不包含 ShadowBot 宿主部署和真实平台运行：
+
+- `platform_mappings.xlsx` 已扩展为同一工作簿内的 `PLATFORM` 平台登记记录与
+  `PRODUCT` 商品映射记录，原 WEB 平台选项行为继续兼容。
+- 商品映射编译器严格实现四种映射状态、身份规范化、生效区间冲突检查和不可变
+  UTF-8 JSON 输出。
+- `ONLINE_PULSE` JSON 输入边界只接受在线正观察；未出现商品不会生成负观察，
+  导入器也不会写 `listing_status`。
+- `LISTING_STATUS_SCAN` 可以把任务 13 的已验证双页快照转换为在线页和待上架页
+  两类 v14 观察事实。
+- 批次按“规范化输入 + 映射版本”计算内容 SHA-256；同 ID 同内容幂等，同 ID
+  不同内容拒绝。
+- 每个商品观察均独立调用 `OperationalTimeService` 计算平台交易日、卖家作业日和
+  卖家阶段。
+
+实现与验证证据见
+[任务 13.5-2 首批实施报告](../reports/task13_5_2_mapping_scan_input.md)。

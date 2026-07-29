@@ -88,12 +88,17 @@ def normalize_platform_name(value: object) -> str:
 def _platform_row(platform_name: str) -> dict[str, object]:
     return {
         "mapping_id": f"PLATFORM-{_platform_code(platform_name)}",
+        "mapping_kind": "PLATFORM",
         "internal_sku": "",
         "platform_name": platform_name,
         "platform_product_id": "",
         "platform_product_name": "",
+        "normalized_platform_product_name": "",
+        "grade": "",
         "search_keyword": platform_name,
         "mapping_status": "active",
+        "effective_from": "",
+        "effective_to": "",
         "last_verified_at": "",
         "remark": "平台占位记录；初始库存不绑定平台。",
     }
@@ -109,12 +114,20 @@ def _platform_code(platform_name: str) -> str:
 def _ensure_platform_mapping_defaults(row: dict[str, object]) -> dict[str, object]:
     return {
         "mapping_id": row.get("mapping_id", ""),
+        "mapping_kind": row.get("mapping_kind", "PLATFORM"),
         "internal_sku": row.get("internal_sku", ""),
         "platform_name": row.get("platform_name", ""),
         "platform_product_id": row.get("platform_product_id", ""),
         "platform_product_name": row.get("platform_product_name", ""),
+        "normalized_platform_product_name": row.get(
+            "normalized_platform_product_name",
+            "",
+        ),
+        "grade": row.get("grade", ""),
         "search_keyword": row.get("search_keyword", ""),
         "mapping_status": row.get("mapping_status", "active"),
+        "effective_from": row.get("effective_from", ""),
+        "effective_to": row.get("effective_to", ""),
         "last_verified_at": row.get("last_verified_at", ""),
         "remark": row.get("remark", ""),
     }
