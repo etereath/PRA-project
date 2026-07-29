@@ -56,14 +56,16 @@ mapping_version =
 - 严格的 `product-observation-input-1.0` JSON 输入边界。
 - `ONLINE_PULSE` 只接受 `observed_online=true` 的正观察。
 - `LISTING_STATUS_SCAN` 接受在线与待上架两类页面观察。
-- `scan_type` 与页面范围精确绑定；商品结果只接受类型一致、`RUNNING`、同平台、
-  同时间策略版本的子 run。
+- `scan_type` 与页面范围精确绑定；商品结果只接受类型、平台和时间策略一致的子
+  run，新事实插入要求 `RUNNING`，终态仅允许返回已经存在的幂等事实。
 - 任务 13 v5 完整双页快照到 v14 商品观察的适配器。
 - 每项观察独立调用 `OperationalTimeService`，不以批次时间代替逐项归属。
 - 每项时间必须位于批次区间，价格必须为有限、规范化正数，已接受或部分接受项
   的证据必须符合 `sha256:<64 位小写十六进制>`。
 - 内容哈希排除传输批次/run ID、包含映射版本、稳定排序商品项并规范化页面顺序；
   同一 run 内跨批次 ID 的同内容重试返回该 run 最早的规范批次，不重复落库。
+- 导入事务先校验 run 的类型、平台和时间策略，再查询同 ID 或同 run 同内容事实；
+  终态 run 可幂等返回既有事实，只有准备插入新内容时才要求 `RUNNING`。
 - 不同 run 的相同业务内容分别落批次，使调度和运营查询可以区分“未产生结果”和
   “已接收结果”，不修改已冻结的 Runtime Schema v14。
 - `ACCEPTED / PARTIAL / UNAVAILABLE / FAILED` 的完整性、结束标记和错误字段执行
@@ -93,6 +95,8 @@ mapping_version =
 - ONLINE_PULSE 缺席不产生负观察。
 - 同批同内容幂等、同批不同内容拒绝、同一 run 跨批同内容不重复累加。
 - 跨 run 相同内容分别保留可查询批次；同 run 并发重试只生成一份事实 items。
+- 终态 run 的原 batch ID 和新 batch ID 同内容重放均幂等成功；不同内容被拒绝，
+  且幂等重放仍校验 run 静态身份。
 - 四种批次状态的合法/非法组合和页面顺序规范化。
 - run 类型/状态/平台/时间策略和精确页面范围绑定。
 - 批次时间区间、有限规范化正价格和证据哈希格式校验。
@@ -103,7 +107,7 @@ mapping_version =
 本地结果：
 
 ```text
-pytest: 786 passed, 3 skipped, 97 subtests passed
+pytest: 790 passed, 3 skipped, 97 subtests passed
 system smoke: 16 passed, 0 failed
 compileall: PASS
 wheel/sdist build: PASS

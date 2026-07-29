@@ -112,6 +112,35 @@ class ProductObservationImporter:
         with closing(self.repository.connect_write()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                run = connection.execute(
+                    """
+                    SELECT job_type, run_status, platform_name,
+                           time_policy_version
+                    FROM automation_runs
+                    WHERE run_id = ?
+                    """,
+                    (normalized.automation_run_id,),
+                ).fetchone()
+                if run is None:
+                    raise ProductObservationError(
+                        "automation_run_id does not exist"
+                    )
+                if str(run["platform_name"]) != normalized.platform_name:
+                    raise ProductObservationError(
+                        "observation platform does not match automation run"
+                    )
+                if str(run["job_type"]) != normalized.scan_type:
+                    raise ProductObservationError(
+                        "scan_type does not match automation run job_type"
+                    )
+                if (
+                    str(run["time_policy_version"])
+                    != batch_context.time_policy_version
+                ):
+                    raise ProductObservationError(
+                        "observation time policy does not match automation run"
+                    )
+
                 existing = connection.execute(
                     """
                     SELECT automation_run_id, platform_name, scan_type,
@@ -154,39 +183,6 @@ class ProductObservationImporter:
                         already_imported=True,
                     )
 
-                run = connection.execute(
-                    """
-                    SELECT job_type, run_status, platform_name,
-                           time_policy_version
-                    FROM automation_runs
-                    WHERE run_id = ?
-                    """,
-                    (normalized.automation_run_id,),
-                ).fetchone()
-                if run is None:
-                    raise ProductObservationError(
-                        "automation_run_id does not exist"
-                    )
-                if str(run["platform_name"]) != normalized.platform_name:
-                    raise ProductObservationError(
-                        "observation platform does not match automation run"
-                    )
-                if str(run["job_type"]) != normalized.scan_type:
-                    raise ProductObservationError(
-                        "scan_type does not match automation run job_type"
-                    )
-                if str(run["run_status"]) not in ACCEPTING_RUN_STATUSES:
-                    raise ProductObservationError(
-                        "automation run is not accepting scan results"
-                    )
-                if (
-                    str(run["time_policy_version"])
-                    != batch_context.time_policy_version
-                ):
-                    raise ProductObservationError(
-                        "observation time policy does not match automation run"
-                    )
-
                 duplicate = connection.execute(
                     """
                     SELECT observation_batch_id
@@ -218,6 +214,11 @@ class ProductObservationImporter:
                         content_sha256=content_sha256,
                         item_count=item_count,
                         already_imported=True,
+                    )
+
+                if str(run["run_status"]) not in ACCEPTING_RUN_STATUSES:
+                    raise ProductObservationError(
+                        "automation run is not accepting scan results"
                     )
 
                 connection.execute(

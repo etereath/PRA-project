@@ -135,6 +135,20 @@ def _importer(tmp_path) -> tuple[
     )
 
 
+def _set_run_status(
+    repository: SQLiteRuntimeRepository,
+    *,
+    run_id: str,
+    run_status: str,
+) -> None:
+    with closing(repository.connect_write()) as connection:
+        connection.execute(
+            "UPDATE automation_runs SET run_status = ? WHERE run_id = ?",
+            (run_status, run_id),
+        )
+        connection.commit()
+
+
 def _batch(
     *,
     batch_id: str = "batch-1",
@@ -173,6 +187,178 @@ def _batch(
         end_marker_verified=True,
         items=items,
     )
+
+
+def test_terminal_run_allows_exact_batch_idempotent_replay(tmp_path) -> None:
+    repository, importer = _importer(tmp_path)
+    batch = _batch(
+        batch_id="batch-terminal-exact",
+        items=(
+            ProductObservationInput(
+                platform_product_name="艾莎",
+                grade="A",
+                observed_at=datetime(
+                    2026,
+                    7,
+                    29,
+                    9,
+                    30,
+                    tzinfo=timezone.utc,
+                ),
+                observed_online=True,
+                page_identity_key="online:艾莎:A",
+                evidence_sha256=_evidence("1"),
+            ),
+        ),
+    )
+    first = importer.import_batch(batch)
+    _set_run_status(
+        repository,
+        run_id="run-pulse-scan-1",
+        run_status="SUCCESS",
+    )
+
+    replay = importer.import_batch(batch)
+
+    assert replay.already_imported
+    assert replay.observation_batch_id == first.observation_batch_id
+    assert replay.content_sha256 == first.content_sha256
+
+
+def test_terminal_run_allows_new_batch_id_same_content_replay(
+    tmp_path,
+) -> None:
+    repository, importer = _importer(tmp_path)
+    batch = _batch(
+        batch_id="batch-terminal-content",
+        items=(
+            ProductObservationInput(
+                platform_product_name="艾莎",
+                grade="A",
+                observed_at=datetime(
+                    2026,
+                    7,
+                    29,
+                    9,
+                    30,
+                    tzinfo=timezone.utc,
+                ),
+                observed_online=True,
+                page_identity_key="online:艾莎:A",
+                evidence_sha256=_evidence("2"),
+            ),
+        ),
+    )
+    first = importer.import_batch(batch)
+    _set_run_status(
+        repository,
+        run_id="run-pulse-scan-1",
+        run_status="SUCCESS",
+    )
+
+    replay = importer.import_batch(
+        replace(
+            batch,
+            observation_batch_id="batch-terminal-content-retry",
+        )
+    )
+
+    assert replay.already_imported
+    assert replay.observation_batch_id == first.observation_batch_id
+    assert replay.content_sha256 == first.content_sha256
+    with closing(repository.connect_read()) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM product_observation_batches"
+            ).fetchone()[0]
+            == 1
+        )
+
+
+def test_terminal_run_rejects_new_batch_id_with_different_content(
+    tmp_path,
+) -> None:
+    repository, importer = _importer(tmp_path)
+    batch = _batch(
+        batch_id="batch-terminal-new-content",
+        items=(
+            ProductObservationInput(
+                platform_product_name="艾莎",
+                grade="A",
+                observed_at=datetime(
+                    2026,
+                    7,
+                    29,
+                    9,
+                    30,
+                    tzinfo=timezone.utc,
+                ),
+                observed_online=True,
+                page_identity_key="online:艾莎:A",
+                observed_inventory=10,
+                evidence_sha256=_evidence("3"),
+            ),
+        ),
+    )
+    importer.import_batch(batch)
+    _set_run_status(
+        repository,
+        run_id="run-pulse-scan-1",
+        run_status="SUCCESS",
+    )
+    changed = replace(
+        batch,
+        observation_batch_id="batch-terminal-new-content-retry",
+        items=(
+            replace(
+                batch.items[0],
+                observed_inventory=9,
+            ),
+        ),
+    )
+
+    with pytest.raises(ProductObservationError, match="not accepting"):
+        importer.import_batch(changed)
+
+
+def test_terminal_idempotent_replay_still_validates_run_identity(
+    tmp_path,
+) -> None:
+    repository, importer = _importer(tmp_path)
+    batch = _batch(
+        batch_id="batch-terminal-run-identity",
+        items=(
+            ProductObservationInput(
+                platform_product_name="艾莎",
+                grade="A",
+                observed_at=datetime(
+                    2026,
+                    7,
+                    29,
+                    9,
+                    30,
+                    tzinfo=timezone.utc,
+                ),
+                observed_online=True,
+                page_identity_key="online:艾莎:A",
+                evidence_sha256=_evidence("4"),
+            ),
+        ),
+    )
+    importer.import_batch(batch)
+    with closing(repository.connect_write()) as connection:
+        connection.execute(
+            """
+            UPDATE automation_runs
+            SET run_status = 'SUCCESS', platform_name = '其他平台'
+            WHERE run_id = ?
+            """,
+            ("run-pulse-scan-1",),
+        )
+        connection.commit()
+
+    with pytest.raises(ProductObservationError, match="platform"):
+        importer.import_batch(batch)
 
 
 def test_online_pulse_writes_positive_observations_only_and_is_idempotent(
