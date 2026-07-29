@@ -137,6 +137,7 @@ PLATFORM_MAPPING_HEADERS = [
     "mapping_id",
     "mapping_kind",
     "internal_sku",
+    "candidate_internal_sku",
     "platform_name",
     "platform_product_id",
     "platform_product_name",

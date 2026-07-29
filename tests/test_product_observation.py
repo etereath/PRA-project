@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import closing
+from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal
 
@@ -19,9 +20,17 @@ from app.services.product_observation import (
     listing_snapshot_to_observation_batch,
     product_observation_batch_from_payload,
 )
+from app.services.operational_time import (
+    OperationalTimePolicy,
+    OperationalTimeService,
+)
 
 
 PLATFORM = "蚂蚁花团供应商"
+
+
+def _evidence(seed: str) -> str:
+    return "sha256:" + seed[0].lower() * 64
 
 
 def _mapping_row(
@@ -37,6 +46,7 @@ def _mapping_row(
         "platform_product_name": product_name,
         "grade": grade,
         "internal_sku": sku,
+        "candidate_internal_sku": "",
         "mapping_status": "VERIFIED",
     }
 
@@ -46,51 +56,56 @@ def _repository_with_run(tmp_path) -> SQLiteRuntimeRepository:
     repository.init_schema()
     now = "2026-07-29T08:00:00+00:00"
     with closing(repository.connect_write()) as connection:
-        connection.execute(
-            """
-            INSERT INTO automation_jobs(
-                job_id, job_type, display_name, enabled,
-                schedule_kind, schedule_expression, priority,
-                config_json, created_at, updated_at
-            ) VALUES (?, ?, ?, 1, ?, ?, 100, '{}', ?, ?)
-            """,
-            (
-                "job-listing-scan",
-                "LISTING_STATUS_SCAN",
-                "商品扫描",
-                "INTERVAL",
-                "10m",
-                now,
-                now,
-            ),
-        )
-        connection.execute(
-            """
-            INSERT INTO automation_runs(
-                run_id, job_id, job_type, logical_run_key,
-                run_status, platform_name, platform_trade_date,
-                seller_operation_date, seller_phase,
-                time_policy_version, scheduled_for, started_at,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                "run-listing-scan-1",
-                "job-listing-scan",
-                "LISTING_STATUS_SCAN",
-                "listing-scan-20260729-1",
-                "RUNNING",
-                PLATFORM,
-                "2026-07-29",
-                "2026-07-29",
-                "NORMAL_SALES",
-                "CN_SINGLE_PLATFORM_2026_V1",
-                now,
-                now,
-                now,
-                now,
-            ),
-        )
+        for job_type, suffix in (
+            (ONLINE_PULSE, "pulse"),
+            (LISTING_STATUS_SCAN, "listing"),
+        ):
+            connection.execute(
+                """
+                INSERT INTO automation_jobs(
+                    job_id, job_type, display_name, enabled,
+                    schedule_kind, schedule_expression, priority,
+                    config_json, created_at, updated_at
+                ) VALUES (?, ?, ?, 1, ?, ?, 100, '{}', ?, ?)
+                """,
+                (
+                    f"job-{suffix}-scan",
+                    job_type,
+                    f"{job_type} test job",
+                    "INTERVAL",
+                    "10m",
+                    now,
+                    now,
+                ),
+            )
+            for run_number in (1, 2):
+                connection.execute(
+                    """
+                    INSERT INTO automation_runs(
+                        run_id, job_id, job_type, logical_run_key,
+                        run_status, platform_name, platform_trade_date,
+                        seller_operation_date, seller_phase,
+                        time_policy_version, scheduled_for, started_at,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"run-{suffix}-scan-{run_number}",
+                        f"job-{suffix}-scan",
+                        job_type,
+                        f"{suffix}-scan-20260729-{run_number}",
+                        "RUNNING",
+                        PLATFORM,
+                        "2026-07-29",
+                        "2026-07-29",
+                        "NORMAL_SALES",
+                        "CN_SINGLE_PLATFORM_2026_V1",
+                        now,
+                        now,
+                        now,
+                        now,
+                    ),
+                )
         connection.commit()
     return repository
 
@@ -124,9 +139,12 @@ def _batch(
     scan_type: str = ONLINE_PULSE,
     items: tuple[ProductObservationInput, ...],
 ) -> ProductObservationBatchInput:
+    is_pulse = scan_type == ONLINE_PULSE
     return ProductObservationBatchInput(
         observation_batch_id=batch_id,
-        automation_run_id="run-listing-scan-1",
+        automation_run_id=(
+            "run-pulse-scan-1" if is_pulse else "run-listing-scan-1"
+        ),
         platform_name=PLATFORM,
         scan_type=scan_type,
         batch_status="ACCEPTED",
@@ -146,7 +164,9 @@ def _batch(
             1,
             tzinfo=timezone.utc,
         ),
-        requested_scope={"pages": ["online"]},
+        requested_scope={
+            "pages": ["online"] if is_pulse else ["online", "waiting"]
+        },
         scope_complete=True,
         end_marker_verified=True,
         items=items,
@@ -174,7 +194,7 @@ def test_online_pulse_writes_positive_observations_only_and_is_idempotent(
                 page_identity_key="online:艾莎:A",
                 observed_price=Decimal("12.50"),
                 observed_inventory=18,
-                evidence_sha256="evidence-1",
+                evidence_sha256=_evidence("a"),
             ),
         )
     )
@@ -222,6 +242,7 @@ def test_online_pulse_rejects_negative_observation(tmp_path) -> None:
                 ),
                 observed_online=False,
                 page_identity_key="online:艾莎:A",
+                evidence_sha256=_evidence("b"),
             ),
         )
     )
@@ -238,7 +259,7 @@ def test_online_pulse_json_boundary_parses_exact_values(tmp_path) -> None:
     payload = {
         "schema_version": PRODUCT_OBSERVATION_INPUT_SCHEMA_VERSION,
         "observation_batch_id": "batch-json-pulse",
-        "automation_run_id": "run-listing-scan-1",
+        "automation_run_id": "run-pulse-scan-1",
         "platform_name": PLATFORM,
         "scan_type": ONLINE_PULSE,
         "batch_status": "ACCEPTED",
@@ -256,7 +277,7 @@ def test_online_pulse_json_boundary_parses_exact_values(tmp_path) -> None:
                 "page_identity_key": "online:艾莎:A",
                 "observed_price": "12.50",
                 "observed_inventory": 18,
-                "evidence_sha256": "evidence-json-1",
+                "evidence_sha256": _evidence("c"),
             }
         ],
     }
@@ -298,6 +319,7 @@ def test_listing_scan_calculates_each_items_18_and_20_boundaries(
                 ),
                 observed_online=True,
                 page_identity_key="online:艾莎:A",
+                evidence_sha256=_evidence("d"),
             ),
             ProductObservationInput(
                 platform_product_name="卡布奇诺",
@@ -312,6 +334,7 @@ def test_listing_scan_calculates_each_items_18_and_20_boundaries(
                 ),
                 observed_online=False,
                 page_identity_key="waiting:卡布奇诺:B",
+                evidence_sha256=_evidence("e"),
             ),
         ),
     )
@@ -365,6 +388,7 @@ def test_same_batch_id_with_different_content_is_rejected(tmp_path) -> None:
                 ),
                 observed_online=True,
                 page_identity_key="online:艾莎:A",
+                evidence_sha256=_evidence("f"),
             ),
         )
     )
@@ -384,6 +408,7 @@ def test_same_batch_id_with_different_content_is_rejected(tmp_path) -> None:
                 observed_online=True,
                 page_identity_key="online:艾莎:A",
                 observed_inventory=99,
+                evidence_sha256=_evidence("f"),
             ),
         )
     )
@@ -391,9 +416,261 @@ def test_same_batch_id_with_different_content_is_rejected(tmp_path) -> None:
     importer.import_batch(first)
     with pytest.raises(
         ProductObservationError,
-        match="different content",
+        match="different envelope or content",
     ):
         importer.import_batch(changed)
+
+
+def test_same_result_content_across_batch_ids_is_not_accumulated(
+    tmp_path,
+) -> None:
+    repository, importer = _importer(tmp_path)
+    first_item = ProductObservationInput(
+        platform_product_name="艾莎",
+        grade="A",
+        observed_at=datetime(
+            2026,
+            7,
+            29,
+            9,
+            30,
+            tzinfo=timezone.utc,
+        ),
+        observed_online=True,
+        page_identity_key="online:艾莎:A",
+        evidence_sha256=_evidence("1"),
+    )
+    second_item = ProductObservationInput(
+        platform_product_name="卡布奇诺",
+        grade="B",
+        observed_at=datetime(
+            2026,
+            7,
+            29,
+            9,
+            31,
+            tzinfo=timezone.utc,
+        ),
+        observed_online=True,
+        page_identity_key="online:卡布奇诺:B",
+        evidence_sha256=_evidence("2"),
+    )
+    first = _batch(
+        batch_id="batch-content-first",
+        items=(first_item, second_item),
+    )
+    retry = _batch(
+        batch_id="batch-content-retry",
+        items=(second_item, first_item),
+    )
+    retry = replace(retry, automation_run_id="run-pulse-scan-2")
+
+    first_result = importer.import_batch(first)
+    retry_result = importer.import_batch(retry)
+
+    assert retry_result.already_imported
+    assert retry_result.observation_batch_id == first_result.observation_batch_id
+    assert retry_result.content_sha256 == first_result.content_sha256
+    with closing(repository.connect_read()) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM product_observation_batches"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM product_observation_items"
+            ).fetchone()[0]
+            == 2
+        )
+
+
+def test_scan_type_scope_and_run_job_type_are_strongly_bound(
+    tmp_path,
+) -> None:
+    _, importer = _importer(tmp_path)
+    item = ProductObservationInput(
+        platform_product_name="艾莎",
+        grade="A",
+        observed_at=datetime(
+            2026,
+            7,
+            29,
+            9,
+            30,
+            tzinfo=timezone.utc,
+        ),
+        observed_online=True,
+        page_identity_key="online:艾莎:A",
+        evidence_sha256=_evidence("3"),
+    )
+    wrong_run = _batch(batch_id="batch-wrong-run", items=(item,))
+    wrong_run = replace(
+        wrong_run,
+        automation_run_id="run-listing-scan-1",
+    )
+
+    with pytest.raises(ProductObservationError, match="job_type"):
+        importer.import_batch(wrong_run)
+
+    wrong_scope = _batch(
+        batch_id="batch-wrong-scope",
+        scan_type=LISTING_STATUS_SCAN,
+        items=(item,),
+    )
+    wrong_scope = replace(
+        wrong_scope,
+        requested_scope={"pages": ["online"]},
+    )
+    with pytest.raises(ProductObservationError, match="online and waiting"):
+        importer.import_batch(wrong_scope)
+
+
+def test_run_status_and_time_policy_are_strongly_bound(tmp_path) -> None:
+    repository, importer = _importer(tmp_path)
+    item = ProductObservationInput(
+        platform_product_name="艾莎",
+        grade="A",
+        observed_at=datetime(
+            2026,
+            7,
+            29,
+            9,
+            30,
+            tzinfo=timezone.utc,
+        ),
+        observed_online=True,
+        page_identity_key="online:艾莎:A",
+        evidence_sha256=_evidence("8"),
+    )
+    with closing(repository.connect_write()) as connection:
+        connection.execute(
+            "UPDATE automation_runs SET run_status = 'SUCCESS' WHERE run_id = ?",
+            ("run-pulse-scan-1",),
+        )
+        connection.commit()
+
+    with pytest.raises(ProductObservationError, match="not accepting"):
+        importer.import_batch(
+            _batch(batch_id="batch-finished-run", items=(item,))
+        )
+
+    with closing(repository.connect_write()) as connection:
+        connection.execute(
+            "UPDATE automation_runs SET run_status = 'RUNNING' WHERE run_id = ?",
+            ("run-pulse-scan-1",),
+        )
+        connection.commit()
+
+    mismatched_time_importer = ProductObservationImporter(
+        repository,
+        mappings=importer.mappings,
+        operational_time=OperationalTimeService(
+            policy=OperationalTimePolicy(
+                policy_version="TEST_POLICY_V2"
+            )
+        ),
+    )
+    with pytest.raises(ProductObservationError, match="time policy"):
+        mismatched_time_importer.import_batch(
+            _batch(batch_id="batch-wrong-time-policy", items=(item,))
+        )
+
+
+def test_run_platform_is_strongly_bound(tmp_path) -> None:
+    _, importer = _importer(tmp_path)
+    item = ProductObservationInput(
+        platform_product_name="艾莎",
+        grade="A",
+        observed_at=datetime(
+            2026,
+            7,
+            29,
+            9,
+            30,
+            tzinfo=timezone.utc,
+        ),
+        observed_online=True,
+        page_identity_key="online:艾莎:A",
+        evidence_sha256=_evidence("9"),
+    )
+
+    with pytest.raises(ProductObservationError, match="platform"):
+        importer.import_batch(
+            replace(
+                _batch(batch_id="batch-wrong-platform", items=(item,)),
+                platform_name="其他平台",
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("observed_at", "price", "evidence", "message"),
+    [
+        (
+            datetime(2026, 7, 29, 8, 59, tzinfo=timezone.utc),
+            None,
+            _evidence("4"),
+            "scan interval",
+        ),
+        (
+            datetime(2026, 7, 29, 9, 30, tzinfo=timezone.utc),
+            Decimal("-1.00"),
+            _evidence("5"),
+            "canonical positive",
+        ),
+        (
+            datetime(2026, 7, 29, 9, 30, tzinfo=timezone.utc),
+            Decimal("NaN"),
+            _evidence("6"),
+            "canonical positive",
+        ),
+        (
+            datetime(2026, 7, 29, 9, 30, tzinfo=timezone.utc),
+            Decimal("Infinity"),
+            _evidence("7"),
+            "canonical positive",
+        ),
+        (
+            datetime(2026, 7, 29, 9, 30, tzinfo=timezone.utc),
+            Decimal("12.5"),
+            _evidence("8"),
+            "canonical positive",
+        ),
+        (
+            datetime(2026, 7, 29, 9, 30, tzinfo=timezone.utc),
+            Decimal("12.50"),
+            "not-a-sha",
+            "evidence_sha256",
+        ),
+    ],
+)
+def test_observation_rejects_invalid_time_price_and_evidence(
+    tmp_path,
+    observed_at: datetime,
+    price: Decimal | None,
+    evidence: str,
+    message: str,
+) -> None:
+    _, importer = _importer(tmp_path)
+    batch = _batch(
+        batch_id=f"invalid-{message}-{evidence[:4]}",
+        items=(
+            ProductObservationInput(
+                platform_product_name="艾莎",
+                grade="A",
+                observed_at=observed_at,
+                observed_online=True,
+                page_identity_key="online:艾莎:A",
+                observed_price=price,
+                evidence_sha256=evidence,
+            ),
+        ),
+    )
+
+    with pytest.raises(ProductObservationError, match=message):
+        importer.import_batch(batch)
 
 
 def test_task13_complete_snapshot_adapts_both_pages_to_v14_items(

@@ -16,16 +16,18 @@
 - `PRODUCT`：按“平台 + 规范化商品名 + 等级”解析内部 SKU。
 
 商品记录严格使用 `VERIFIED / UNMAPPED / AMBIGUOUS / DISABLED`。当前样例包含
-8 条平台登记和 12 条从任务 13 只读基线迁入的蚂蚁平台商品映射。
+8 条平台登记和 12 条从任务 13 只读基线迁入的蚂蚁平台候选映射。12 条候选记录
+均把候选值写入 `candidate_internal_sku` 并保持 `DISABLED`；只有运营逐条复核后
+才能把确认值迁入 `internal_sku` 并改为 `VERIFIED`。
 
 编译结果：
 
 ```text
 source_workbook_sha256 =
-d66b4c1ed13fbca72e1476ccf0d452f4f93b5d425a538b09a6a40e7e9b85e3ac
+a47b7c298ad93a6e999694a02ec14d9a5636f982bd6f3198bdcfefd0cf3bc41e
 
 mapping_version =
-f4e2cc039bc4ab09722e472d3c181b03dee04c760afa611169288dfb5e7e03d5
+64aaf787eace33d959823c0e91c4037da47a960ddd666e72ca918723fc92567d
 ```
 
 `scripts/compile_product_mappings.py` 可重复生成
@@ -41,6 +43,7 @@ f4e2cc039bc4ab09722e472d3c181b03dee04c760afa611169288dfb5e7e03d5
 - 同一身份、重叠区间映射到不同 SKU 时拒绝加载。
 - 四种冻结映射状态的解析和决议。
 - 平台登记行与商品映射行隔离。
+- 候选 SKU 与已验证内部 SKU 隔离；`DISABLED` 候选绝不参与解析。
 - 原子写入不可变 JSON。
 
 只有唯一有效的 `VERIFIED` 记录会返回 `internal_sku`。状态冲突或多个有效 SKU
@@ -53,9 +56,14 @@ f4e2cc039bc4ab09722e472d3c181b03dee04c760afa611169288dfb5e7e03d5
 - 严格的 `product-observation-input-1.0` JSON 输入边界。
 - `ONLINE_PULSE` 只接受 `observed_online=true` 的正观察。
 - `LISTING_STATUS_SCAN` 接受在线与待上架两类页面观察。
+- `scan_type` 与页面范围精确绑定；商品结果只接受类型一致、`RUNNING`、同平台、
+  同时间策略版本的子 run。
 - 任务 13 v5 完整双页快照到 v14 商品观察的适配器。
 - 每项观察独立调用 `OperationalTimeService`，不以批次时间代替逐项归属。
-- 内容哈希幂等；哈希包含映射版本。
+- 每项时间必须位于批次区间，价格必须为有限、规范化正数，已接受或部分接受项
+  的证据必须符合 `sha256:<64 位小写十六进制>`。
+- 内容哈希排除传输批次/run ID、包含映射版本并稳定排序商品项；跨批次 ID 的
+  同内容重试返回最早的规范批次，不重复落库。
 - 单事务追加 `product_observation_batches/items`。
 
 导入器不调用任务 13 的 `listing_status` 投影，也不根据脉冲扫描中缺失的商品生成
@@ -75,10 +83,13 @@ f4e2cc039bc4ab09722e472d3c181b03dee04c760afa611169288dfb5e7e03d5
 本批覆盖：
 
 - 四种映射状态。
+- `DISABLED` 候选 SKU 与 WEB 平台登记/商品行隔离。
 - 重叠生效区间冲突。
 - 不可变 JSON 与稳定哈希。
 - ONLINE_PULSE 缺席不产生负观察。
-- 同批同内容幂等、同批不同内容拒绝。
+- 同批同内容幂等、同批不同内容拒绝、跨批同内容不重复累加。
+- run 类型/状态/平台/时间策略和精确页面范围绑定。
+- 批次时间区间、有限规范化正价格和证据哈希格式校验。
 - 18:00 和 20:00 逐项双日期边界。
 - 任务 13 双页快照生成两类 v14 观察。
 - 中文 XLSX/JSON 显式回读与内容抽查。
@@ -86,13 +97,14 @@ f4e2cc039bc4ab09722e472d3c181b03dee04c760afa611169288dfb5e7e03d5
 本地结果：
 
 ```text
-pytest: 757 passed, 3 skipped, 97 subtests passed
+pytest: 770 passed, 3 skipped, 97 subtests passed
 system smoke: 16 passed, 0 failed
 compileall: PASS
 wheel/sdist build: PASS
 package allowlist: PASS
 secret scan: PASS
 repository-external wheel install: PASS
+Windows ShadowBot fixture/hash gates: PASS
 ```
 
 ## 4. 后续

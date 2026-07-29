@@ -13,6 +13,10 @@ from app.services.product_mapping import (
     normalize_mapping_text,
     write_immutable_product_mapping,
 )
+from app.services.platform_mapping_input import (
+    apply_platform_input,
+    platform_options_from_rows,
+)
 
 
 OBSERVED_AT = datetime(2026, 7, 29, 8, 0, tzinfo=timezone.utc)
@@ -25,6 +29,7 @@ def _row(
     grade: str,
     status: str,
     sku: str = "",
+    candidate_sku: str = "",
     effective_from: str = "",
     effective_to: str = "",
 ) -> dict[str, object]:
@@ -36,6 +41,7 @@ def _row(
         "normalized_platform_product_name": "",
         "grade": grade,
         "internal_sku": sku,
+        "candidate_internal_sku": candidate_sku,
         "mapping_status": status,
         "effective_from": effective_from,
         "effective_to": effective_to,
@@ -95,6 +101,90 @@ def test_platform_registry_rows_are_not_compiled_as_product_mappings() -> None:
     )
 
     assert compiled.records == ()
+
+
+def test_disabled_mapping_preserves_candidate_without_resolving_sku() -> None:
+    compiled = compile_product_mapping_rows(
+        [
+            _row(
+                "MAP-CANDIDATE",
+                product_name="艾莎",
+                grade="A级",
+                status="DISABLED",
+                candidate_sku="AISHA-A-70-Z",
+            )
+        ],
+        source_workbook_sha256="e" * 64,
+    )
+
+    resolution = compiled.resolve(
+        platform_name="蚂蚁花团供应商",
+        platform_product_name="艾莎",
+        grade="A级",
+        observed_at=OBSERVED_AT,
+    )
+    payload = json.loads(compiled.immutable_json.decode("utf-8"))
+
+    assert resolution.mapping_status is ProductMappingStatus.DISABLED
+    assert resolution.internal_sku is None
+    assert payload["records"][0]["internal_sku"] is None
+    assert (
+        payload["records"][0]["candidate_internal_sku"]
+        == "AISHA-A-70-Z"
+    )
+
+
+def test_disabled_platform_is_not_reenabled_by_verified_product_row() -> None:
+    rows = [
+        {
+            "mapping_id": "PLATFORM-01",
+            "mapping_kind": "PLATFORM",
+            "platform_name": "测试平台",
+            "mapping_status": "disabled",
+        },
+        {
+            "mapping_id": "PRODUCT-01",
+            "mapping_kind": "PRODUCT",
+            "platform_name": "测试平台",
+            "platform_product_name": "艾莎",
+            "grade": "A级",
+            "internal_sku": "AISHA-A",
+            "mapping_status": "VERIFIED",
+        },
+    ]
+
+    assert "测试平台" not in platform_options_from_rows(rows)
+
+
+def test_active_platform_appears_once_and_product_rows_are_preserved() -> None:
+    product_row = {
+        "mapping_id": "PRODUCT-01",
+        "mapping_kind": "PRODUCT",
+        "platform_name": "测试平台",
+        "platform_product_name": "艾莎",
+        "grade": "A级",
+        "internal_sku": "AISHA-A",
+        "mapping_status": "VERIFIED",
+        "remark": "保留商品映射",
+    }
+    rows = [
+        {
+            "mapping_id": "PLATFORM-01",
+            "mapping_kind": "PLATFORM",
+            "platform_name": "测试平台",
+            "mapping_status": "active",
+        },
+        product_row,
+    ]
+
+    options = platform_options_from_rows(rows)
+    result = apply_platform_input(rows, {"platform_name": "新增平台"})
+
+    assert options.count("测试平台") == 1
+    assert result.rows[1]["mapping_kind"] == "PRODUCT"
+    assert result.rows[1]["internal_sku"] == "AISHA-A"
+    assert result.rows[1]["remark"] == "保留商品映射"
+    assert result.rows[-1]["mapping_kind"] == "PLATFORM"
 
 
 def test_overlapping_effective_ranges_cannot_target_multiple_skus() -> None:

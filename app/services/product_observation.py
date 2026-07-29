@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import sqlite3
+import re
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -10,6 +10,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Iterable
 
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.shadowbot_contract_primitives import canonical_positive_price
 from app.services.operational_time import OperationalTimeService
 from app.services.product_mapping import CompiledProductMappings
 from app.services.shadowbot_listing_action_contract import (
@@ -24,6 +25,8 @@ ALLOWED_SCAN_TYPES = frozenset({ONLINE_PULSE, LISTING_STATUS_SCAN})
 ALLOWED_BATCH_STATUSES = frozenset(
     {"ACCEPTED", "PARTIAL", "UNAVAILABLE", "FAILED"}
 )
+ACCEPTING_RUN_STATUSES = frozenset({"RUNNING"})
+EVIDENCE_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
 class ProductObservationError(ValueError):
@@ -86,7 +89,7 @@ class ProductObservationImporter:
         batch: ProductObservationBatchInput,
     ) -> ProductObservationImportResult:
         normalized = self._normalize_and_validate(batch)
-        content_sha256 = _content_sha256(
+        content_sha256 = _result_content_sha256(
             normalized,
             mapping_version=self.mappings.mapping_version,
         )
@@ -111,17 +114,27 @@ class ProductObservationImporter:
             try:
                 existing = connection.execute(
                     """
-                    SELECT content_sha256
+                    SELECT automation_run_id, platform_name, scan_type,
+                           content_sha256
                     FROM product_observation_batches
                     WHERE observation_batch_id = ?
                     """,
                     (normalized.observation_batch_id,),
                 ).fetchone()
                 if existing is not None:
-                    if str(existing["content_sha256"]) != content_sha256:
+                    if (
+                        str(existing["automation_run_id"])
+                        != normalized.automation_run_id
+                        or str(existing["platform_name"])
+                        != normalized.platform_name
+                        or str(existing["scan_type"])
+                        != normalized.scan_type
+                        or str(existing["content_sha256"])
+                        != content_sha256
+                    ):
                         raise ProductObservationError(
                             "observation_batch_id already exists with "
-                            "different content"
+                            "different envelope or content"
                         )
                     item_count = int(
                         connection.execute(
@@ -143,7 +156,8 @@ class ProductObservationImporter:
 
                 run = connection.execute(
                     """
-                    SELECT platform_name
+                    SELECT job_type, run_status, platform_name,
+                           time_policy_version
                     FROM automation_runs
                     WHERE run_id = ?
                     """,
@@ -156,6 +170,53 @@ class ProductObservationImporter:
                 if str(run["platform_name"]) != normalized.platform_name:
                     raise ProductObservationError(
                         "observation platform does not match automation run"
+                    )
+                if str(run["job_type"]) != normalized.scan_type:
+                    raise ProductObservationError(
+                        "scan_type does not match automation run job_type"
+                    )
+                if str(run["run_status"]) not in ACCEPTING_RUN_STATUSES:
+                    raise ProductObservationError(
+                        "automation run is not accepting scan results"
+                    )
+                if (
+                    str(run["time_policy_version"])
+                    != batch_context.time_policy_version
+                ):
+                    raise ProductObservationError(
+                        "observation time policy does not match automation run"
+                    )
+
+                duplicate = connection.execute(
+                    """
+                    SELECT observation_batch_id
+                    FROM product_observation_batches
+                    WHERE content_sha256 = ?
+                    ORDER BY created_at, observation_batch_id
+                    LIMIT 1
+                    """,
+                    (content_sha256,),
+                ).fetchone()
+                if duplicate is not None:
+                    canonical_batch_id = str(
+                        duplicate["observation_batch_id"]
+                    )
+                    item_count = int(
+                        connection.execute(
+                            """
+                            SELECT COUNT(*)
+                            FROM product_observation_items
+                            WHERE observation_batch_id = ?
+                            """,
+                            (canonical_batch_id,),
+                        ).fetchone()[0]
+                    )
+                    connection.commit()
+                    return ProductObservationImportResult(
+                        observation_batch_id=canonical_batch_id,
+                        content_sha256=content_sha256,
+                        item_count=item_count,
+                        already_imported=True,
                     )
 
                 connection.execute(
@@ -286,6 +347,7 @@ class ProductObservationImporter:
             raise ProductObservationError(
                 "ACCEPTED batches must prove scope completeness and end marker"
             )
+        _validate_requested_scope(scan_type, batch.requested_scope)
         if scan_type == ONLINE_PULSE:
             if any(not item.observed_online for item in batch.items):
                 raise ProductObservationError(
@@ -295,6 +357,18 @@ class ProductObservationImporter:
             self._normalize_item(item)
             for item in batch.items
         )
+        for item in normalized_items:
+            if not started_at <= item.observed_at <= completed_at:
+                raise ProductObservationError(
+                    "item observed_at must fall within the scan interval"
+                )
+            if batch_status in {"ACCEPTED", "PARTIAL"} and (
+                not EVIDENCE_SHA256_RE.fullmatch(item.evidence_sha256)
+            ):
+                raise ProductObservationError(
+                    "accepted observations require evidence_sha256 in "
+                    "sha256:<64 lowercase hex> format"
+                )
         return ProductObservationBatchInput(
             observation_batch_id=batch.observation_batch_id.strip(),
             automation_run_id=batch.automation_run_id.strip(),
@@ -326,13 +400,27 @@ class ProductObservationImporter:
             raise ProductObservationError(
                 "observed_inventory must not be negative"
             )
+        observed_price = None
+        if item.observed_price is not None:
+            try:
+                observed_price = Decimal(
+                    canonical_positive_price(
+                        item.observed_price,
+                        require_canonical=True,
+                        reject_float=True,
+                    )
+                )
+            except (InvalidOperation, ValueError) as exc:
+                raise ProductObservationError(
+                    "observed_price must be a canonical positive decimal"
+                ) from exc
         return ProductObservationInput(
             platform_product_name=name,
             grade=grade,
             observed_at=_as_utc(item.observed_at, "observed_at"),
             observed_online=bool(item.observed_online),
             page_identity_key=page_identity_key,
-            observed_price=item.observed_price,
+            observed_price=observed_price,
             observed_inventory=item.observed_inventory,
             evidence_sha256=item.evidence_sha256.strip(),
         )
@@ -480,7 +568,7 @@ def listing_snapshot_to_observation_batch(
                     "evidence_manifest_sha256"
                 ],
             }
-            evidence_sha256 = hashlib.sha256(
+            evidence_sha256 = "sha256:" + hashlib.sha256(
                 json.dumps(
                     evidence_payload,
                     ensure_ascii=False,
@@ -545,14 +633,37 @@ def listing_snapshot_to_observation_batch(
     )
 
 
-def _content_sha256(
+def _result_content_sha256(
     batch: ProductObservationBatchInput,
     *,
     mapping_version: str,
 ) -> str:
+    items = [
+        {
+            "platform_product_name": item.platform_product_name,
+            "grade": item.grade,
+            "observed_at": _datetime_text(item.observed_at),
+            "observed_online": item.observed_online,
+            "page_identity_key": item.page_identity_key,
+            "observed_price": (
+                str(item.observed_price)
+                if item.observed_price is not None
+                else None
+            ),
+            "observed_inventory": item.observed_inventory,
+            "evidence_sha256": item.evidence_sha256,
+        }
+        for item in batch.items
+    ]
+    items.sort(
+        key=lambda item: json.dumps(
+            item,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
     payload = {
-        "observation_batch_id": batch.observation_batch_id,
-        "automation_run_id": batch.automation_run_id,
         "platform_name": batch.platform_name,
         "mapping_version": mapping_version,
         "scan_type": batch.scan_type,
@@ -564,23 +675,7 @@ def _content_sha256(
         "end_marker_verified": batch.end_marker_verified,
         "error_code": batch.error_code,
         "error_message": batch.error_message,
-        "items": [
-            {
-                "platform_product_name": item.platform_product_name,
-                "grade": item.grade,
-                "observed_at": _datetime_text(item.observed_at),
-                "observed_online": item.observed_online,
-                "page_identity_key": item.page_identity_key,
-                "observed_price": (
-                    str(item.observed_price)
-                    if item.observed_price is not None
-                    else None
-                ),
-                "observed_inventory": item.observed_inventory,
-                "evidence_sha256": item.evidence_sha256,
-            }
-            for item in batch.items
-        ],
+        "items": items,
     }
     encoded = json.dumps(
         payload,
@@ -589,6 +684,29 @@ def _content_sha256(
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_requested_scope(
+    scan_type: str,
+    requested_scope: dict[str, object],
+) -> None:
+    pages = requested_scope.get("pages")
+    if not isinstance(pages, list) or any(
+        not isinstance(page, str) for page in pages
+    ):
+        raise ProductObservationError(
+            "requested_scope.pages must be an array of page names"
+        )
+    if scan_type == ONLINE_PULSE and pages != ["online"]:
+        raise ProductObservationError(
+            "ONLINE_PULSE requested_scope.pages must be exactly [online]"
+        )
+    if scan_type == LISTING_STATUS_SCAN and (
+        len(pages) != 2 or set(pages) != {"online", "waiting"}
+    ):
+        raise ProductObservationError(
+            "LISTING_STATUS_SCAN must cover online and waiting exactly once"
+        )
 
 
 def _observation_item_id(

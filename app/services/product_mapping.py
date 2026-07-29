@@ -31,6 +31,7 @@ class ProductMappingRecord:
     normalized_platform_product_name: str
     grade: str
     internal_sku: str | None
+    candidate_internal_sku: str | None
     mapping_status: ProductMappingStatus
     effective_from: datetime | None = None
     effective_to: datetime | None = None
@@ -166,7 +167,12 @@ def compile_product_mapping_rows(
         mapping_kind = str(row.get("mapping_kind") or "").strip().upper()
         has_product_identity = any(
             str(row.get(field) or "").strip()
-            for field in ("platform_product_name", "grade", "internal_sku")
+            for field in (
+                "platform_product_name",
+                "grade",
+                "internal_sku",
+                "candidate_internal_sku",
+            )
         )
         if mapping_kind == "PLATFORM" or (
             not mapping_kind and not has_product_identity
@@ -260,6 +266,9 @@ def _record_from_row(
             "VERIFIED, UNMAPPED, AMBIGUOUS or DISABLED"
         ) from exc
     internal_sku = str(row.get("internal_sku") or "").strip() or None
+    candidate_internal_sku = (
+        str(row.get("candidate_internal_sku") or "").strip() or None
+    )
     if status is ProductMappingStatus.VERIFIED and internal_sku is None:
         raise ProductMappingError(
             f"platform_mappings row {row_number}: "
@@ -269,6 +278,14 @@ def _record_from_row(
         raise ProductMappingError(
             f"platform_mappings row {row_number}: "
             f"{status.value} must not set internal_sku"
+        )
+    if (
+        status is ProductMappingStatus.VERIFIED
+        and candidate_internal_sku is not None
+    ):
+        raise ProductMappingError(
+            f"platform_mappings row {row_number}: "
+            "VERIFIED must not set candidate_internal_sku"
         )
     effective_from = _optional_datetime(
         row.get("effective_from"),
@@ -296,6 +313,7 @@ def _record_from_row(
         normalized_platform_product_name=normalized_name,
         grade=grade,
         internal_sku=internal_sku,
+        candidate_internal_sku=candidate_internal_sku,
         mapping_status=status,
         effective_from=effective_from,
         effective_to=effective_to,
@@ -356,6 +374,7 @@ def _record_payload(record: ProductMappingRecord) -> dict[str, object]:
         ),
         "grade": record.grade,
         "internal_sku": record.internal_sku,
+        "candidate_internal_sku": record.candidate_internal_sku,
         "mapping_status": record.mapping_status.value,
         "effective_from": _datetime_text(record.effective_from),
         "effective_to": _datetime_text(record.effective_to),

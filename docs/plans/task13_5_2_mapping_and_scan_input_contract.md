@@ -26,6 +26,7 @@ platform_product_name
 normalized_platform_product_name
 grade
 internal_sku
+candidate_internal_sku
 mapping_status
 effective_from
 effective_to
@@ -48,6 +49,10 @@ DISABLED
 - 生成不可变 JSON，并保存源文件与 JSON 的 SHA-256。
 - 不把平台名称或页面行号当作内部 SKU。
 - 只有 `VERIFIED` 可以进入精确 SKU 观察和后续自动动作候选。
+- 未经运营逐条复核的迁入记录必须保持 `DISABLED`，候选值只能写入
+  `candidate_internal_sku`，不得提前写入 `internal_sku`。
+- `PLATFORM` 登记行和 `PRODUCT` 商品行必须隔离；WEB 平台选项不得把商品行当作
+  平台，也不得因同平台存在商品行而重新启用已停用的平台登记。
 
 CSV/TSV 导入如后续增加，必须使用 UTF-8-SIG；XLSX 写入继续使用现有原子保存流程。
 
@@ -77,6 +82,7 @@ evidence_sha256
 
 批次保存开始/结束时间、页面范围、结束标记、完整性、内容 hash 和
 `automation_run_id`。逐项双日期只能由 `OperationalTimeService` 计算。
+`ONLINE_PULSE` 的页面范围必须精确为 `["online"]`。
 
 ## 4. `FULL_MARKET_SCAN`
 
@@ -94,6 +100,12 @@ FULL_MARKET_SCAN
 13.5-4。父子 run 使用 `automation_run_links` 关联，一个子结果失败不能撤销其他
 已接受事实。
 
+本阶段只接受对应子任务自身的 `automation_run_id`：run 的 `job_type` 必须与
+`scan_type` 完全一致，状态必须为 `RUNNING`，平台与时间策略版本也必须一致。
+因此不能把 `FULL_MARKET_SCAN` 父 run 直接作为商品子结果的 run；父子关系仍由
+13.5-3 的 `automation_run_links` 编排负责。`LISTING_STATUS_SCAN` 的页面范围必须
+精确覆盖 `online` 与 `waiting` 两页。
+
 商品子结果继续以完整两页 `SYNC_STATUS` 为权威；新 v14 观察是不可变审计事实，
 不得在 schema migration 中从旧快照猜测生成。
 
@@ -104,6 +116,8 @@ FULL_MARKET_SCAN
 - 小扫描缺席不产生离线推断。
 - 大扫描两页完整性继续满足任务 13 合同。
 - 跨 18:00/20:00 的逐项观察归属正确。
+- 每项 `observed_at` 必须落在批次起止区间内；价格必须为有限、规范化的正数；
+  已接受或部分接受的商品项必须提供 `sha256:<64 位小写十六进制>` 证据。
 - 重复结果按内容 hash 幂等，不跨批次累加。
 - 商品子结果失败、订单能力不可用和父 run 状态彼此隔离。
 - 临时数据库、完整 pytest、系统冒烟、wheel 和 CI 通过。
@@ -122,8 +136,11 @@ FULL_MARKET_SCAN
   导入器也不会写 `listing_status`。
 - `LISTING_STATUS_SCAN` 可以把任务 13 的已验证双页快照转换为在线页和待上架页
   两类 v14 观察事实。
-- 批次按“规范化输入 + 映射版本”计算内容 SHA-256；同 ID 同内容幂等，同 ID
-  不同内容拒绝。
+- 批次按“业务内容 + 映射版本”计算内容 SHA-256；传输批次 ID 和 run ID 不参与
+  内容哈希，商品项在计算前稳定排序。同 ID 同内容幂等，同 ID 不同内容拒绝；
+  不同批次 ID 的同内容重试返回最早已接受的规范批次，不重复累加。
+- 扫描类型、精确页面范围、run 类型/状态/平台/时间策略均已绑定校验；父 run
+  不能替代 `LISTING_STATUS_SCAN` 子 run。
 - 每个商品观察均独立调用 `OperationalTimeService` 计算平台交易日、卖家作业日和
   卖家阶段。
 
