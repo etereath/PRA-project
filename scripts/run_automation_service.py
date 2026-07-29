@@ -1,0 +1,254 @@
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from types import TracebackType
+from uuid import uuid4
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from app.repositories.automation_repository import AutomationRepository  # noqa: E402
+from app.repositories.sqlite_connection import (  # noqa: E402
+    SQLiteConnectionConfig,
+)
+from app.repositories.sqlite_runtime_repository import (  # noqa: E402
+    SQLiteRuntimeRepository,
+)
+from app.services.automation import (  # noqa: E402
+    AutomationHeartbeatStore,
+    AutomationService,
+    ensure_default_automation_jobs,
+)
+from app.services.runtime import DEFAULT_RUNTIME_DB  # noqa: E402
+
+
+DEFAULT_HEARTBEAT_PATH = Path(
+    "data/runtime/automation_service/heartbeat.json"
+)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Run the independent PRA Automation scheduler and leased "
+            "application-service dispatcher."
+        )
+    )
+    parser.add_argument(
+        "--runtime-db",
+        type=Path,
+        default=DEFAULT_RUNTIME_DB,
+    )
+    parser.add_argument(
+        "--platform-name",
+        default="蚂蚁花团供应商",
+    )
+    parser.add_argument(
+        "--heartbeat",
+        type=Path,
+        default=DEFAULT_HEARTBEAT_PATH,
+    )
+    parser.add_argument("--poll-seconds", type=float, default=5.0)
+    parser.add_argument("--lease-seconds", type=int, default=60)
+    parser.add_argument("--max-runs-per-cycle", type=int, default=8)
+    parser.add_argument("--max-windows-per-job", type=int, default=16)
+    parser.add_argument("--once", action="store_true")
+    return parser
+
+
+class ProcessFileLock:
+    """Cross-platform non-blocking single-process lock for one service."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self._stream = None
+
+    def __enter__(self) -> "ProcessFileLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._stream = self.path.open("a+b")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                self._stream.seek(0)
+                if self._stream.read(1) == b"":
+                    self._stream.write(b"0")
+                    self._stream.flush()
+                self._stream.seek(0)
+                msvcrt.locking(self._stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(
+                    self._stream.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+        except OSError:
+            self._stream.close()
+            self._stream = None
+            raise RuntimeError(
+                "Automation Service 已有实例持有单实例锁。"
+            ) from None
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        if self._stream is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                self._stream.seek(0)
+                msvcrt.locking(self._stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(self._stream.fileno(), fcntl.LOCK_UN)
+        finally:
+            self._stream.close()
+            self._stream = None
+
+
+def main() -> int:
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+    args = build_parser().parse_args()
+    if args.poll_seconds < 0.2:
+        raise ValueError("--poll-seconds 必须不小于 0.2。")
+    if args.lease_seconds < 1:
+        raise ValueError("--lease-seconds 必须为正整数。")
+
+    heartbeat = AutomationHeartbeatStore(args.heartbeat)
+    lock_path = args.heartbeat.with_suffix(".lock")
+    service_instance_id = f"automation-service-{uuid4().hex}"
+    try:
+        with ProcessFileLock(lock_path):
+            runtime_repository = SQLiteRuntimeRepository(
+                args.runtime_db,
+                connection_config=SQLiteConnectionConfig.from_environment(
+                    purpose="background"
+                ),
+            )
+            runtime_repository.init_schema()
+            schema_health = runtime_repository.check_schema_health()
+            if not schema_health.ok or schema_health.actual_version != 14:
+                raise RuntimeError(
+                    "Automation Service 要求健康的 Runtime Schema v14。"
+                )
+            repository = AutomationRepository(runtime_repository)
+            ensure_default_automation_jobs(
+                repository,
+                platform_name=args.platform_name,
+                now=datetime.now(timezone.utc),
+            )
+            # 13.5-3 only owns the control plane.  Scanner/order/settlement
+            # handlers are registered by their application-service stages;
+            # an empty registry schedules jobs without inventing side effects.
+            service = AutomationService(
+                repository,
+                handlers={},
+                owner_token=service_instance_id,
+                lease_seconds=args.lease_seconds,
+                max_runs_per_cycle=args.max_runs_per_cycle,
+                max_windows_per_job=args.max_windows_per_job,
+            )
+            while True:
+                cycle_started_at = datetime.now(timezone.utc)
+                cycle = service.run_cycle()
+                health = repository.health_snapshot(
+                    now=datetime.now(timezone.utc)
+                )
+                payload = {
+                    "schema_version": "automation-heartbeat-1.0",
+                    "status": "RUNNING",
+                    "mode": "SCHEDULER_ONLY",
+                    "service_instance_id": service_instance_id,
+                    "cycle_started_at": cycle_started_at.isoformat(),
+                    "last_cycle_at": datetime.now(
+                        timezone.utc
+                    ).isoformat(),
+                    "scheduled_run_count": len(
+                        cycle.scheduled.created_run_ids
+                    ),
+                    "missed_run_count": len(
+                        cycle.scheduled.missed_run_ids
+                    ),
+                    "merged_run_count": len(
+                        cycle.scheduled.merged_run_ids
+                    ),
+                    "truncated_window_count": (
+                        cycle.scheduled.truncated_window_count
+                    ),
+                    "claimed_run_count": len(cycle.claimed_run_ids),
+                    "completed_run_count": len(cycle.completed_run_ids),
+                    "blocked_reason": cycle.blocked_reason,
+                    "errors": list(cycle.errors),
+                    "runtime_health": health,
+                }
+                heartbeat.write(payload)
+                print(
+                    json.dumps(
+                        payload,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
+                if args.once:
+                    heartbeat.write(
+                        {
+                            **payload,
+                            "status": "STOPPED",
+                            "stopped_at": datetime.now(
+                                timezone.utc
+                            ).isoformat(),
+                            "reason": "ONCE_COMPLETED",
+                        }
+                    )
+                    return 0
+                time.sleep(args.poll_seconds)
+    except KeyboardInterrupt:
+        heartbeat.write(
+            {
+                "schema_version": "automation-heartbeat-1.0",
+                "status": "STOPPED",
+                "service_instance_id": service_instance_id,
+                "stopped_at": datetime.now(timezone.utc).isoformat(),
+                "reason": "KEYBOARD_INTERRUPT",
+            }
+        )
+        return 0
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "status": "FAILED",
+                    "error_code": "AUTOMATION_SERVICE_FAILED",
+                    "error_type": type(exc).__name__,
+                    "error_message": str(exc),
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
