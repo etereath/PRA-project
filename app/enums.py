@@ -130,6 +130,15 @@ class SellerPhase(str, Enum):
     DELIVERY_OVERLAP = "DELIVERY_OVERLAP"
 
 
+class ProductMappingStatus(str, Enum):
+    """Frozen product-identity mapping states used by scan observations."""
+
+    VERIFIED = "VERIFIED"
+    UNMAPPED = "UNMAPPED"
+    AMBIGUOUS = "AMBIGUOUS"
+    DISABLED = "DISABLED"
+
+
 class FactSource(str, Enum):
     """How an accepted sales fact was obtained."""
 

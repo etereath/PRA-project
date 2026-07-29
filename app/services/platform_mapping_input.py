@@ -49,18 +49,33 @@ def persist_platform_mapping_rows(path: Path, rows: list[dict[str, object]]) -> 
 
 
 def platform_options_from_rows(rows: list[dict[str, object]]) -> list[str]:
-    options: list[str] = []
-    seen: set[str] = set()
+    enabled_order: list[str] = []
+    enabled: set[str] = set()
+    disabled: set[str] = set()
+    registered: set[str] = set()
     for row in rows:
+        if not _is_platform_registry_row(row):
+            continue
         status = str(row.get("mapping_status") or "").strip().lower()
         platform_name = normalize_platform_name(row.get("platform_name"))
-        if not platform_name or status in {"disabled", "inactive", "停用"}:
+        if not platform_name:
             continue
-        if platform_name not in seen:
-            seen.add(platform_name)
-            options.append(platform_name)
+        registered.add(platform_name)
+        if status in {"disabled", "inactive", "停用"}:
+            disabled.add(platform_name)
+            continue
+        if platform_name not in enabled:
+            enabled.add(platform_name)
+            enabled_order.append(platform_name)
+
+    options = [
+        platform_name
+        for platform_name in enabled_order
+        if platform_name not in disabled
+    ]
+    seen = set(options)
     for platform_name in PLATFORM_OPTIONS:
-        if platform_name not in seen:
+        if platform_name not in registered and platform_name not in seen:
             seen.add(platform_name)
             options.append(platform_name)
     return options
@@ -70,7 +85,11 @@ def apply_platform_input(rows: list[dict[str, object]], values: dict[str, str]) 
     platform_name = normalize_platform_name(values.get("platform_name"))
     if not platform_name:
         raise PlatformMappingInputError("请输入平台名称。")
-    existing_names = {normalize_platform_name(row.get("platform_name")) for row in rows}
+    existing_names = {
+        normalize_platform_name(row.get("platform_name"))
+        for row in rows
+        if _is_platform_registry_row(row)
+    }
     if platform_name in existing_names:
         raise PlatformMappingInputError("该平台已存在，请勿重复新增。")
     rows = [_ensure_platform_mapping_defaults(row) for row in rows]
@@ -88,12 +107,18 @@ def normalize_platform_name(value: object) -> str:
 def _platform_row(platform_name: str) -> dict[str, object]:
     return {
         "mapping_id": f"PLATFORM-{_platform_code(platform_name)}",
+        "mapping_kind": "PLATFORM",
         "internal_sku": "",
+        "candidate_internal_sku": "",
         "platform_name": platform_name,
         "platform_product_id": "",
         "platform_product_name": "",
+        "normalized_platform_product_name": "",
+        "grade": "",
         "search_keyword": platform_name,
         "mapping_status": "active",
+        "effective_from": "",
+        "effective_to": "",
         "last_verified_at": "",
         "remark": "平台占位记录；初始库存不绑定平台。",
     }
@@ -109,12 +134,47 @@ def _platform_code(platform_name: str) -> str:
 def _ensure_platform_mapping_defaults(row: dict[str, object]) -> dict[str, object]:
     return {
         "mapping_id": row.get("mapping_id", ""),
+        "mapping_kind": _normalized_mapping_kind(row),
         "internal_sku": row.get("internal_sku", ""),
+        "candidate_internal_sku": row.get("candidate_internal_sku", ""),
         "platform_name": row.get("platform_name", ""),
         "platform_product_id": row.get("platform_product_id", ""),
         "platform_product_name": row.get("platform_product_name", ""),
+        "normalized_platform_product_name": row.get(
+            "normalized_platform_product_name",
+            "",
+        ),
+        "grade": row.get("grade", ""),
         "search_keyword": row.get("search_keyword", ""),
         "mapping_status": row.get("mapping_status", "active"),
+        "effective_from": row.get("effective_from", ""),
+        "effective_to": row.get("effective_to", ""),
         "last_verified_at": row.get("last_verified_at", ""),
         "remark": row.get("remark", ""),
     }
+
+
+def _normalized_mapping_kind(row: dict[str, object]) -> str:
+    mapping_kind = str(row.get("mapping_kind") or "").strip().upper()
+    if mapping_kind:
+        return mapping_kind
+    return "PRODUCT" if _has_product_identity(row) else "PLATFORM"
+
+
+def _is_platform_registry_row(row: dict[str, object]) -> bool:
+    mapping_kind = str(row.get("mapping_kind") or "").strip().upper()
+    if mapping_kind:
+        return mapping_kind == "PLATFORM"
+    return not _has_product_identity(row)
+
+
+def _has_product_identity(row: dict[str, object]) -> bool:
+    return any(
+        str(row.get(field_name) or "").strip()
+        for field_name in (
+            "platform_product_name",
+            "grade",
+            "internal_sku",
+            "candidate_internal_sku",
+        )
+    )

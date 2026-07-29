@@ -8,7 +8,7 @@ PRA 当前定位为：
 
 鲜切花预测性销售决策系统 + 运行态任务运营后台。
 
-PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、多商品、受控 RPA 改价与上下架闭环；任务 13.5 已插入任务 13 与任务 14 之间，用于补齐 18:00 平台交易日/20:00 卖家作业日双时间轴、持续只读扫描、历史订单观察、销售日结、S0–S4 异常治理、任务来源对齐、受控紧急保护和运营 Web 重写。当前 13.5-1 已在独立分支完成双时间轴、Runtime Schema v14、六级质量约束和日结状态机的本地实现与验收；真实 Runtime DB 尚未迁移，13.5-2 扫描闭环也尚未开始，因此仍不承诺生产级无人值守写操作，也未扩展到第二平台。系统核心职责是：
+PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、多商品、受控 RPA 改价与上下架闭环；任务 13.5 已插入任务 13 与任务 14 之间，用于补齐 18:00 平台交易日/20:00 卖家作业日双时间轴、持续只读扫描、历史订单观察、销售日结、S0–S4 异常治理、任务来源对齐、受控紧急保护和运营 Web 重写。当前 13.5-1 已完成双时间轴、Runtime Schema v14、六级质量约束和日结状态机；13.5-2 已进入实施并完成商品映射编译、扫描 JSON 输入、任务 13 双页快照适配和 v14 商品观察导入的首批本地实现。真实 Runtime DB 尚未迁移，`ONLINE_PULSE` 的 ShadowBot 宿主采集与 Automation 调度也尚未部署，因此仍不承诺生产级无人值守写操作，也未扩展到第二平台。系统核心职责是：
 
 - 从 Excel 读取业务输入。
 - 根据规则和预测输入生成运行态任务。
@@ -43,6 +43,8 @@ PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、�
 - 冷库状态已提供日常表单：按业务日期维护冷库总容量、当前占用、预计入库、预计出库、预计占用、剩余容量、预警阈值和启用状态，并保存回 `cold_storage_status.xlsx`。
 - `cold_storage_status.xlsx` 中的 `projected_occupied_qty` 和 `remaining_capacity_qty` 是 ColdStorageEvaluator 的判断口径；页面会按“当前占用 + 预计入库 - 预计出库”和“总容量 - 预计占用”默认计算，也允许运营人员人工确认。
 - 旧 `/tables` 仍保留为高级兼容入口，适合批量维护和排障。
+- `platform_mappings.xlsx` 现可同时保存 WEB 平台登记记录和严格的商品身份映射；
+  商品映射可编译为带源工作簿 SHA-256 的不可变 JSON。
 - 当前不迁移 Excel 主数据到 SQLite。
 
 ### 2.2 SQLite 运行态事实来源
@@ -75,8 +77,14 @@ SQLite 当前保存以下运行态表：
 - `listing_sync_snapshots`
 - `listing_sync_snapshot_items`
 - `listing_anomaly_cases`
+- `product_observation_batches`
+- `product_observation_items`
 
 SQLite 只承接运行态任务系统，不替代 Excel 主数据。
+
+13.5-2 的商品观察导入器只向 v14 不可变观察表追加事实。`ONLINE_PULSE`
+缺席不推断下架，也不改写 `listing_status`；任务 13 的完整双页快照可以适配为
+`LISTING_STATUS_SCAN` 商品子结果。
 
 当前代码中的 runtime schema 最新版本为 v14。v3 新增自动规则评估运行记录，v4 新增 ShadowBot Executor 账本，v5 新增队列审计字段和 `retry_authorizations`，v6 新增事务型通知 Outbox，v7-v9 建立 `listing_status` 并将业务身份统一为“平台 + 品种 + 等级”，v10 将 `tasks.expected_old_price` 结构化，v11 新增单次请求的 `shadowbot_commit_batches` 和 `shadowbot_commit_batch_items`，v12 新增逐商品操作/尝试身份、活动写锁、观察时间和持久化结果回执，v13 新增公共批次注册表、通用上下架 operation、共享写锁、v5 动作账本、两页快照和页面异常事实表，v14 新增双时间轴、Automation、不可变观察、日结、Incident 和任务来源结构。真实 Runtime DB 是否已升级必须单独核实；`app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION` 是代码版本唯一权威来源。
 
@@ -478,8 +486,17 @@ Code Review 后的高中低风险问题已完成修复，系统冒烟测试、�
     修订合同；复审新增的时间策略版本不可变、观察/审计 append-only 和人工任务来源
     引用门禁也已落地。最终复审新增的时间策略原子替换、并发单一成功、任务来源
     创建后不可变和粗粒度枚举/引用前缀映射也已完成，本地完整回归为
-    `744 passed, 3 skipped, 97 subtests passed`。下一步是推送修复、等待双平台 CI
-    并完成 PR 最终复审。
+    `744 passed, 3 skipped, 97 subtests passed`。13.5-2 商品映射与扫描输入已进入
+    PR #23：评审要求的 run 类型/状态/平台/时间策略绑定、精确页面范围、
+    时间/价格/证据校验、同 run 内容幂等、跨 run 接收审计、批次状态矩阵、页面
+    顺序规范化和 WEB 平台登记隔离均已修复；显式停用的内置平台不会被默认值补回。
+    终态 run 对同 ID 和跨 ID 同内容重放保持一致幂等，只有新内容插入要求
+    `RUNNING`，同时仍校验 run 类型、平台和时间策略。
+    12 条迁入映射仅保留为 `candidate_internal_sku` 且全部 `DISABLED`，等待运营
+    逐条复核。
+    修复后本地完整回归为 `790 passed, 3 skipped, 97 subtests passed`，系统冒烟
+    16/16、编译、打包、包边界、敏感信息扫描、仓库外 wheel 安装和 Windows
+    ShadowBot 夹具门禁均通过。下一步是同步 PR #23 并等待双平台 CI 与最终复审。
 4. 任务13.5通过验收后，任务14只进行多品种、多动作、异常恢复、正式授权和观察版本冻结的综合验收。普通写动作保持明确任务与授权；唯一自动写特例是验收后的版本化 `SYSTEM_EMERGENCY` 紧急下架。
 5. 任务12 PR #18 已合并；任务13也已完成 T13-0 页面探索、T13-1 合同、T13-2 Runtime Schema v13、独立两页 SYNC_STATUS、单商品状态往返、正常多商品严格串行上下架、整批预检异常零写、严格串行 UNKNOWN、最终确认点击后的 `UNKNOWN → 唯一自动 RECONCILE → VERIFIED` 和 `UNKNOWN → 唯一自动 RECONCILE → NOT_APPLIED`、`ALREADY_APPLIED` 0 写点击、跨动作共享写锁、phase/result 恢复、Web 运营投影、最终回归、PR #19 COMMENT Review 修复和双平台 CI。仓库内已保存脱敏证据、自然语言报告、数据库回读及 CI 复算入口；本轮文档整理不执行合并或任务状态变更。
 6. 继续运行系统冒烟、完整单元测试和 ShadowBot 成功基线测试，任务13.5不得重写已验证 COMMIT 动作链路。
