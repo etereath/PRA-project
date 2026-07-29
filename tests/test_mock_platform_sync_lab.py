@@ -222,6 +222,7 @@ class MockPlatformSyncLabTests(unittest.TestCase):
             task_status=TaskStatus.PENDING,
             created_at=utc_now(),
             origin_type=TaskOriginType.MANUAL,
+            origin_ref_id="test-harness:mock-platform-sync",
             target_price=target_price,
             target_status=action_type.value if action_type in {TaskActionType.SET_ONLINE, TaskActionType.SET_OFFLINE} else None,
             trade_date=self.trade_date,

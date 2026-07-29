@@ -361,7 +361,8 @@ is_current
   `RECONCILED → FINAL`。
 - 当前版本输入 hash 不变时直接幂等返回，不增加版本或重复事件。
 - `PROVISIONAL` 阶段的实质输入变化允许在同一事务中原子修订当前版本；必须整体替换
-  当前输入 manifest、写入完整状态事件，不能只改汇总数字。
+  当前输入 manifest、写入完整状态事件，不能只改汇总数字。旧 manifest 的输入行必须
+  继续保留；输入关联以 `summary_id + input_manifest_sha256` 区分每次修订。
 - `OBSERVED / RECONCILED / FINAL` 的实质输入、映射、算法、金额或数量变化必须撤销
   旧 current 并创建同系列新 `OBSERVED` 版本；旧版本和输入保持可审计。
 
@@ -410,6 +411,10 @@ supersedes_policy_version
 必须创建新版本，不能原地覆盖。`effective_from/effective_to` 使用左闭右开的 UTC
 技术时间区间；Service 必须按观察时刻选择唯一策略并把 `observed_at` 归一化为 UTC。
 Schema 和 Service 都必须拒绝策略区间重叠，业务日期仍统一按 `Asia/Shanghai` 计算。
+策略记录禁止删除；创建后唯一允许的 UPDATE 是把当前版本的 `effective_to` 从 NULL
+关闭为合法 UTC 时间。已关闭版本不得重新打开或二次修改；后继版本必须通过
+`supersedes_policy_version` 指向旧版本，并以旧版本 `effective_to` 作为相邻
+`effective_from`。
 
 ### 8.2 Automation 核心
 
@@ -449,6 +454,9 @@ CANCELLED
 批次保存请求范围、能力结果、完整性、hash、时间策略和 Importer 状态；item 使用代理
 主键并保存逐条双日期。13.5-1 不建立会把订单指纹当绝对身份的唯一索引；13.5-4 再
 冻结 `source_row_fingerprint / occurrence_no / occurrence_count` 的最终约束。
+上述四张观察表和 `sales_estimate_segments` 均为 append-only：数据库拒绝 UPDATE
+和 DELETE。重复身份的精确相同输入由 Importer 幂等返回；相同身份但内容或 hash
+不同必须报冲突，不得覆盖或使用 `INSERT OR IGNORE` 静默吞掉差异。
 
 ### 8.4 销售和日结
 
@@ -466,6 +474,9 @@ CANCELLED
 然后完成 summary UPDATE、输入和事件写入。FINAL 后唯一允许的 UPDATE 是新版本建立
 事务内的 `is_current: 1 → 0`；系列、版本、平台、双日期、阶段、范围、事实、指标和
 全部审计字段都不可变。
+`platform_trade_day_summary_events` 和 `platform_trade_day_summary_inputs` 同样为
+append-only。输入表必须保存 `input_manifest_sha256`，使 PROVISIONAL 同版本修订
+能够追加新 manifest 输入并保留旧输入；当前输入通过 summary 当前 manifest 选择。
 
 ### 8.5 Incident 核心
 
@@ -524,8 +535,9 @@ LEGACY
 
 新建 `Task` 必须显式给出 `origin_type`，不提供 `MANUAL` 默认值。规则、预测和
 proposal 路径使用 `AUTOMATION` 并绑定生成运行或规则引用；Workbook/Web/CLI
-人工入口使用 `MANUAL` 并保存可追溯入口引用。Repository 继续拒绝缺少
-`origin_ref_id` 的自动任务。
+人工入口使用 `MANUAL` 并保存可追溯入口引用。模型、Workbook、Repository 和数据库
+触发器统一拒绝缺少 `origin_ref_id` 的 `MANUAL` 或 `AUTOMATION` 新任务；历史数据
+继续使用 `LEGACY`，不得伪造来源。
 
 ## 9. 决策 D7：迁移与回滚
 

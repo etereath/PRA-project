@@ -32,6 +32,7 @@ def _runtime_task(task_id: str, *, status: TaskStatus = TaskStatus.MANUAL_REVIEW
         task_status=status,
         created_at=datetime(2026, 5, 4, 9, 0),
         origin_type=TaskOriginType.MANUAL,
+        origin_ref_id=f"test-harness:test-cli:{task_id}",
         trade_date=datetime(2026, 5, 4).date(),
         scope_type="global",
         scope_key="2026-05-04",

@@ -74,7 +74,8 @@ time_policy_version
 - 初版只能从 `PROVISIONAL` 开始；FINAL 后迟到数据创建从
   `OBSERVED` 开始的新版本。
 - PROVISIONAL 实质变化在单事务内原子修订并整体替换输入 manifest；
-  OBSERVED/RECONCILED/FINAL 实质变化创建新的 OBSERVED 版本。
+  OBSERVED/RECONCILED/FINAL 实质变化创建新的 OBSERVED 版本。每个 manifest 的
+  输入行按 `summary_id + input_manifest_sha256` 追加保存，旧 manifest 不删除。
 - 一个系列最多一个 `is_current=1`。
 - FINAL 的业务身份、版本、指标和审计字段全部不可修改；只允许在新版本建立事务中
   执行 `is_current: 1 → 0`。
@@ -83,6 +84,8 @@ time_policy_version
 - FINAL 门禁查询、summary UPDATE、输入与事件写入位于同一个
   `BEGIN IMMEDIATE` 事务。
 - 所有转换写入不可变事件，实际输入写入输入关联表。
+- 商品/订单观察批次与明细、销售估算片段、日结事件和日结输入均由数据库触发器
+  拒绝 UPDATE/DELETE；精确重复可幂等返回，身份相同但内容不同必须报冲突。
 
 ### 1.4 任务来源安全边界
 
@@ -96,13 +99,17 @@ LEGACY
 ```
 
 通用任务 Repository 当前拒绝新建 `LEGACY` 和
-`SYSTEM_EMERGENCY`；自动任务必须提供 `origin_ref_id`。
+`SYSTEM_EMERGENCY`；`MANUAL` 与 `AUTOMATION` 都必须提供 `origin_ref_id`。
 `Task` 模型不再提供隐式 `MANUAL` 默认值；规则、预测和 proposal 生成路径显式使用
 `AUTOMATION` 并绑定来源运行，人工 Workbook 导入显式使用 `MANUAL`。当前 Web/CLI
 没有独立的 Task 构造旁路，后续入口也必须通过模型的必填来源门禁。
 任务 Workbook 导出/导入保留来源和授权字段；缺少这些列的旧 Workbook 只标记为
 `LEGACY`，不猜测为人工任务。
 `SYSTEM_EMERGENCY` 仍等待 13.5-6 的专用策略、授权与实机门禁。
+
+时间策略版本创建后不可改写或删除；唯一允许的 UPDATE 是把当前版本的
+`effective_to` 从 NULL 关闭为合法 UTC 时间。后继版本必须指向被替代版本并从同一
+边界相邻开始，已关闭版本不得重新打开。
 
 ### 1.5 Automation 与 Incident 冻结集合
 
@@ -144,7 +151,7 @@ RESOLVED / CLOSED`；`resolved_at` 与 `RESOLVED/CLOSED` 双向一致。
 
 ```text
 完整 pytest：
-733 passed, 3 skipped, 97 subtests passed
+739 passed, 3 skipped, 97 subtests passed
 
 系统冒烟：
 16 passed, 0 failed

@@ -49,6 +49,7 @@ def _runtime_task(
         task_status=status,
         created_at=datetime(2026, 5, 4, 9, 0),
         origin_type=TaskOriginType.MANUAL,
+        origin_ref_id=f"test-harness:runtime-persistence:{task_id}",
         trade_date=date(2026, 5, 4),
         scope_type="global",
         scope_key="2026-05-04",

@@ -354,6 +354,18 @@ class Task:
     expires_at: datetime | None = None
     updated_at: datetime | None = None
 
+    def __post_init__(self) -> None:
+        if self.origin_type in {
+            TaskOriginType.MANUAL,
+            TaskOriginType.AUTOMATION,
+        }:
+            normalized_origin_ref = str(self.origin_ref_id or "").strip()
+            if not normalized_origin_ref:
+                raise ValueError(
+                    f"{self.origin_type.value} tasks require an origin_ref_id"
+                )
+            self.origin_ref_id = normalized_origin_ref
+
     def to_record(self) -> dict[str, Any]:
         data = asdict(self)
         data["action_type"] = self.action_type.value

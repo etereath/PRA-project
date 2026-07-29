@@ -118,6 +118,7 @@ def _task(task_id, sku, old_price, target_price):
         task_status=TaskStatus.PENDING,
         created_at=now,
         origin_type=TaskOriginType.MANUAL,
+        origin_ref_id=f"test-harness:shadowbot-commit:{task_id}",
         expected_old_price=Decimal(old_price),
         target_price=Decimal(target_price),
         expires_at=now + timedelta(hours=1),

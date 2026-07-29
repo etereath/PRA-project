@@ -85,6 +85,7 @@ def _task(task_id: str = "TASK-SB-1") -> Task:
         task_status=TaskStatus.PENDING,
         created_at=datetime(2026, 6, 23, 9, 0),
         origin_type=TaskOriginType.MANUAL,
+        origin_ref_id="test-harness:shadowbot-executor:TASK-001",
         target_price=Decimal("19.50"),
         trade_date=date(2026, 6, 23),
         scope_type="sku",

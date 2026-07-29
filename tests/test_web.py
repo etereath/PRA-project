@@ -119,6 +119,7 @@ def _runtime_task(
         task_status=status,
         created_at=datetime(2026, 5, 4, 9, 0),
         origin_type=TaskOriginType.MANUAL,
+        origin_ref_id=f"test-harness:web:{task_id}",
         trade_date=trade_date,
         scope_type="global",
         scope_key=trade_date.isoformat(),

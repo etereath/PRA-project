@@ -603,11 +603,13 @@ def load_tasks(path: Path) -> list[Task]:
             else None
         )
         if (
-            origin_type is TaskOriginType.AUTOMATION
+            origin_type
+            in {TaskOriginType.MANUAL, TaskOriginType.AUTOMATION}
             and origin_ref_id is None
         ):
             raise ValidationError(
-                f"row {row_number}: AUTOMATION requires origin_ref_id"
+                f"row {row_number}: {origin_type.value} requires "
+                "origin_ref_id"
             )
         tasks.append(
             Task(

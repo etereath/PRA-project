@@ -73,10 +73,16 @@ class OperationalSummaryRepository:
         with closing(self.runtime_repository.connect_read()) as connection:
             rows = connection.execute(
                 """
-                SELECT input_type, input_ref_id, input_sha256
-                FROM platform_trade_day_summary_inputs
-                WHERE summary_id = ?
-                ORDER BY input_type ASC, input_ref_id ASC
+                SELECT inputs.input_type,
+                       inputs.input_ref_id,
+                       inputs.input_sha256
+                FROM platform_trade_day_summary_inputs AS inputs
+                INNER JOIN platform_trade_day_summaries AS summary
+                    ON summary.summary_id = inputs.summary_id
+                   AND summary.input_manifest_sha256
+                       = inputs.input_manifest_sha256
+                WHERE inputs.summary_id = ?
+                ORDER BY inputs.input_type ASC, inputs.input_ref_id ASC
                 """,
                 (summary_id,),
             ).fetchall()
@@ -112,7 +118,12 @@ class OperationalSummaryRepository:
                     "A current summary already exists for the series"
                 )
             _insert_summary(connection, summary)
-            _insert_summary_inputs(connection, summary.summary_id, input_rows)
+            _insert_summary_inputs(
+                connection,
+                summary.summary_id,
+                summary.input_manifest_sha256,
+                input_rows,
+            )
             _insert_event(connection, event)
 
     def transition(
@@ -195,21 +206,10 @@ class OperationalSummaryRepository:
                 if cursor.rowcount != 1:
                     connection.rollback()
                     return False
-                if (
-                    before.summary_status is after.summary_status
-                    and before.input_manifest_sha256
-                    != after.input_manifest_sha256
-                ):
-                    connection.execute(
-                        """
-                        DELETE FROM platform_trade_day_summary_inputs
-                        WHERE summary_id = ?
-                        """,
-                        (after.summary_id,),
-                    )
                 _insert_summary_inputs(
                     connection,
                     after.summary_id,
+                    after.input_manifest_sha256,
                     input_rows,
                 )
                 _insert_event(connection, event)
@@ -256,6 +256,7 @@ class OperationalSummaryRepository:
                 _insert_summary_inputs(
                     connection,
                     revision.summary_id,
+                    revision.input_manifest_sha256,
                     input_rows,
                 )
                 _insert_event(connection, event)
@@ -340,26 +341,50 @@ def _summary_values(summary: PlatformTradeDaySummary) -> tuple[object, ...]:
 def _insert_summary_inputs(
     connection,
     summary_id: str,
+    input_manifest_sha256: str,
     inputs: Iterable[TradeDaySummaryInput],
 ) -> None:
     created_at = _datetime_to_text(datetime.now().astimezone())
-    connection.executemany(
-        """
-        INSERT OR IGNORE INTO platform_trade_day_summary_inputs(
-            summary_id, input_type, input_ref_id, input_sha256, created_at
-        ) VALUES (?, ?, ?, ?, ?)
-        """,
-        [
+    for item in inputs:
+        existing = connection.execute(
+            """
+            SELECT input_sha256
+            FROM platform_trade_day_summary_inputs
+            WHERE summary_id = ?
+              AND input_manifest_sha256 = ?
+              AND input_type = ?
+              AND input_ref_id = ?
+            """,
             (
                 summary_id,
+                input_manifest_sha256,
+                item.input_type,
+                item.input_ref_id,
+            ),
+        ).fetchone()
+        if existing is not None:
+            if str(existing["input_sha256"]) != item.input_sha256:
+                raise ValueError(
+                    "A summary input identity was reused with different "
+                    "content"
+                )
+            continue
+        connection.execute(
+            """
+            INSERT INTO platform_trade_day_summary_inputs(
+                summary_id, input_manifest_sha256,
+                input_type, input_ref_id, input_sha256, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                summary_id,
+                input_manifest_sha256,
                 item.input_type,
                 item.input_ref_id,
                 item.input_sha256,
                 created_at,
-            )
-            for item in inputs
-        ],
-    )
+            ),
+        )
 
 
 def _insert_event(connection, event: TradeDaySummaryEvent) -> None:

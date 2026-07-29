@@ -397,6 +397,7 @@ def runtime_task(
         task_status=status,
         created_at=datetime(2026, 5, 7, 9, 0),
         origin_type=TaskOriginType.MANUAL,
+        origin_ref_id=f"test-harness:system-smoke:{task_id}",
         trade_date=date(2026, 5, 7),
         scope_type="global",
         scope_key="smoke",

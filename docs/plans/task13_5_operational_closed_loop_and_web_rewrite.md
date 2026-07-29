@@ -378,6 +378,10 @@ supporting_observation_ids
 - `approval_policy`
 - `policy_version`
 
+`MANUAL` 和 `AUTOMATION` 类新任务都必须提供非空、稳定的 `origin_ref_id`；人工
+入口使用 `web:`、`cli:`、`workbook:`、`acceptance:` 等可追溯前缀，测试工具使用
+`test-harness:`。历史记录缺少结构化来源时只标记 `LEGACY`，不得猜测。
+
 `origin_type` 只能取：
 
 - `MANUAL_WEB`

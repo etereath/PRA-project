@@ -373,6 +373,23 @@ def test_provisional_material_change_is_atomically_audited(
         item.input_ref_id
         for item in repository.list_inputs(original.summary_id)
     } == {"scan-2"}
+    with closing(repository.runtime_repository.connect_read()) as connection:
+        manifest_rows = connection.execute(
+            """
+            SELECT input_manifest_sha256, input_ref_id
+            FROM platform_trade_day_summary_inputs
+            WHERE summary_id = ?
+            ORDER BY input_manifest_sha256, input_ref_id
+            """,
+            (original.summary_id,),
+        ).fetchall()
+    assert {
+        (str(row["input_manifest_sha256"]), str(row["input_ref_id"]))
+        for row in manifest_rows
+    } == {
+        ("sha256:provisional", "scan-1"),
+        ("sha256:provisional-revised", "scan-2"),
+    }
 
     repeated = service.transition(
         revision.summary.summary_id,

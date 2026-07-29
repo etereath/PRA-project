@@ -128,6 +128,7 @@ def prepare_shadowbot_chain_from_args(args: argparse.Namespace) -> PreparedShado
                 task_status=TaskStatus.PENDING,
                 created_at=created_at,
                 origin_type=TaskOriginType.MANUAL,
+                origin_ref_id=f"acceptance:{operation_id}",
                 target_price=payload.target_price,
                 trade_date=trade_date,
                 scope_type="sku",

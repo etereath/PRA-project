@@ -92,6 +92,7 @@ def _task() -> Task:
         task_status=TaskStatus.PENDING,
         created_at=datetime(2026, 7, 15, 8, 0),
         origin_type=TaskOriginType.MANUAL,
+        origin_ref_id="test-harness:shadowbot-recovery:TASK-RECOVERY",
         target_price=Decimal("19.50"),
         trade_date=date(2026, 7, 15),
         scope_type="sku",

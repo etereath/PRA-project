@@ -64,6 +64,7 @@ from app.repositories.sqlite_connection import (
 from app.runtime_schema import (
     LATEST_RUNTIME_SCHEMA_VERSION,
     RuntimeSchemaHealth,
+    V14_APPEND_ONLY_TABLES,
     inspect_runtime_schema,
 )
 from app.utils import serialize_decimal
@@ -1069,6 +1070,67 @@ SCHEMA_V14_SQL = [
     END
     """,
     """
+    CREATE TRIGGER IF NOT EXISTS trg_operational_time_policy_immutable_update
+    BEFORE UPDATE ON operational_time_policies
+    FOR EACH ROW
+    WHEN NOT (
+        OLD.effective_to IS NULL
+        AND NEW.effective_to IS NOT NULL
+        AND NEW.policy_version IS OLD.policy_version
+        AND NEW.timezone_name IS OLD.timezone_name
+        AND NEW.platform_cutoff_local_time
+            IS OLD.platform_cutoff_local_time
+        AND NEW.seller_cutoff_local_time
+            IS OLD.seller_cutoff_local_time
+        AND NEW.peak_start_local_time IS OLD.peak_start_local_time
+        AND NEW.effective_from IS OLD.effective_from
+        AND NEW.created_at IS OLD.created_at
+        AND NEW.created_by IS OLD.created_by
+        AND NEW.supersedes_policy_version
+            IS OLD.supersedes_policy_version
+    )
+    BEGIN
+        SELECT RAISE(
+            ABORT,
+            'operational time policy versions are immutable after creation'
+        );
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_operational_time_policy_no_delete
+    BEFORE DELETE ON operational_time_policies
+    FOR EACH ROW
+    BEGIN
+        SELECT RAISE(
+            ABORT,
+            'operational time policy versions cannot be deleted'
+        );
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_operational_time_policy_successor_adjacent
+    BEFORE INSERT ON operational_time_policies
+    FOR EACH ROW
+    WHEN EXISTS (
+        SELECT 1 FROM operational_time_policies
+    )
+    AND NOT EXISTS (
+        SELECT 1
+        FROM operational_time_policies AS previous
+        WHERE previous.policy_version = NEW.supersedes_policy_version
+          AND previous.timezone_name = NEW.timezone_name
+          AND previous.effective_to IS NOT NULL
+          AND julianday(previous.effective_to)
+              = julianday(NEW.effective_from)
+    )
+    BEGIN
+        SELECT RAISE(
+            ABORT,
+            'operational time policy successor must be adjacent to its superseded version'
+        );
+    END
+    """,
+    """
     CREATE TABLE IF NOT EXISTS automation_jobs (
         job_id TEXT PRIMARY KEY,
         job_type TEXT NOT NULL,
@@ -1578,11 +1640,14 @@ SCHEMA_V14_SQL = [
     """
     CREATE TABLE IF NOT EXISTS platform_trade_day_summary_inputs (
         summary_id TEXT NOT NULL,
+        input_manifest_sha256 TEXT NOT NULL,
         input_type TEXT NOT NULL,
         input_ref_id TEXT NOT NULL,
         input_sha256 TEXT NOT NULL,
         created_at TEXT NOT NULL,
-        PRIMARY KEY(summary_id, input_type, input_ref_id),
+        PRIMARY KEY(
+            summary_id, input_manifest_sha256, input_type, input_ref_id
+        ),
         FOREIGN KEY(summary_id)
             REFERENCES platform_trade_day_summaries(summary_id)
     )
@@ -1669,7 +1734,63 @@ SCHEMA_V14_SQL = [
     CREATE INDEX IF NOT EXISTS ix_incident_notification_state_due
     ON incident_notification_state(next_notification_at)
     """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_tasks_traceable_origin_insert
+    BEFORE INSERT ON tasks
+    FOR EACH ROW
+    WHEN NEW.origin_type IN ('MANUAL', 'AUTOMATION')
+      AND trim(COALESCE(NEW.origin_ref_id, '')) = ''
+    BEGIN
+        SELECT RAISE(
+            ABORT,
+            'MANUAL and AUTOMATION tasks require an origin_ref_id'
+        );
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_tasks_traceable_origin_update
+    BEFORE UPDATE OF origin_type, origin_ref_id ON tasks
+    FOR EACH ROW
+    WHEN NEW.origin_type IN ('MANUAL', 'AUTOMATION')
+      AND trim(COALESCE(NEW.origin_ref_id, '')) = ''
+    BEGIN
+        SELECT RAISE(
+            ABORT,
+            'MANUAL and AUTOMATION tasks require an origin_ref_id'
+        );
+    END
+    """,
 ]
+
+for _append_only_table in V14_APPEND_ONLY_TABLES:
+    SCHEMA_V14_SQL.extend(
+        (
+            f"""
+            CREATE TRIGGER IF NOT EXISTS
+                trg_{_append_only_table}_append_only_update
+            BEFORE UPDATE ON {_append_only_table}
+            FOR EACH ROW
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    '{_append_only_table} is append-only'
+                );
+            END
+            """,
+            f"""
+            CREATE TRIGGER IF NOT EXISTS
+                trg_{_append_only_table}_append_only_delete
+            BEFORE DELETE ON {_append_only_table}
+            FOR EACH ROW
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    '{_append_only_table} is append-only'
+                );
+            END
+            """,
+        )
+    )
 
 
 def _backfill_shadowbot_batch_registry(
@@ -2264,7 +2385,7 @@ def _requires_runtime_schema_v14_migration(
         str(row[1])
         for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
     }
-    return not {
+    if not {
         "origin_type",
         "origin_ref_id",
         "approval_policy",
@@ -2273,7 +2394,85 @@ def _requires_runtime_schema_v14_migration(
         "seller_operation_date",
         "seller_phase",
         "time_policy_version",
-    }.issubset(task_columns)
+    }.issubset(task_columns):
+        return True
+    summary_input_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(platform_trade_day_summary_inputs)"
+        ).fetchall()
+    }
+    return "input_manifest_sha256" not in summary_input_columns
+
+
+def _migrate_trade_day_summary_inputs_manifest_dimension(
+    connection: sqlite3.Connection,
+) -> None:
+    table_row = connection.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name = 'platform_trade_day_summary_inputs'
+        """
+    ).fetchone()
+    if table_row is None:
+        return
+    columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(platform_trade_day_summary_inputs)"
+        ).fetchall()
+    }
+    if "input_manifest_sha256" in columns:
+        return
+    connection.execute(
+        """
+        ALTER TABLE platform_trade_day_summary_inputs
+        RENAME TO platform_trade_day_summary_inputs_v14_legacy
+        """
+    )
+    connection.execute(
+        "DROP INDEX IF EXISTS ix_trade_day_summary_inputs_ref"
+    )
+    connection.execute(
+        """
+        CREATE TABLE platform_trade_day_summary_inputs (
+            summary_id TEXT NOT NULL,
+            input_manifest_sha256 TEXT NOT NULL,
+            input_type TEXT NOT NULL,
+            input_ref_id TEXT NOT NULL,
+            input_sha256 TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(
+                summary_id, input_manifest_sha256,
+                input_type, input_ref_id
+            ),
+            FOREIGN KEY(summary_id)
+                REFERENCES platform_trade_day_summaries(summary_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO platform_trade_day_summary_inputs(
+            summary_id, input_manifest_sha256,
+            input_type, input_ref_id, input_sha256, created_at
+        )
+        SELECT legacy.summary_id,
+               summary.input_manifest_sha256,
+               legacy.input_type,
+               legacy.input_ref_id,
+               legacy.input_sha256,
+               legacy.created_at
+        FROM platform_trade_day_summary_inputs_v14_legacy AS legacy
+        INNER JOIN platform_trade_day_summaries AS summary
+            ON summary.summary_id = legacy.summary_id
+        """
+    )
+    connection.execute(
+        "DROP TABLE platform_trade_day_summary_inputs_v14_legacy"
+    )
 
 
 def _ensure_open_task_dedupe_index(connection: sqlite3.Connection) -> None:
@@ -2526,6 +2725,9 @@ class SQLiteRuntimeRepository:
                 for statement in SCHEMA_V13_SQL:
                     connection.execute(statement)
                 _backfill_listing_status_latest_scan_observations(connection)
+                _migrate_trade_day_summary_inputs_manifest_dimension(
+                    connection
+                )
                 for statement in SCHEMA_V14_SQL:
                     connection.execute(statement)
                 connection.execute(
@@ -2960,11 +3162,12 @@ class SQLiteRuntimeRepository:
                     "the dedicated 13.5-6 authorization service"
                 )
             if (
-                task.origin_type is TaskOriginType.AUTOMATION
+                task.origin_type
+                in {TaskOriginType.MANUAL, TaskOriginType.AUTOMATION}
                 and not str(task.origin_ref_id or "").strip()
             ):
                 raise ValueError(
-                    "AUTOMATION tasks require an origin_ref_id"
+                    "MANUAL and AUTOMATION tasks require an origin_ref_id"
                 )
         rows = [_task_to_row(task) for task in task_rows]
         if not rows:

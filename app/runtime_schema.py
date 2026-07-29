@@ -64,6 +64,16 @@ REQUIRED_RUNTIME_TABLES = frozenset(
     }
 )
 
+V14_APPEND_ONLY_TABLES = (
+    "product_observation_batches",
+    "product_observation_items",
+    "order_observation_batches",
+    "order_observation_items",
+    "sales_estimate_segments",
+    "platform_trade_day_summary_events",
+    "platform_trade_day_summary_inputs",
+)
+
 V7_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "listing_status": (
         "listing_status_id",
@@ -576,6 +586,7 @@ V14_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
     ),
     "platform_trade_day_summary_inputs": (
         "summary_id",
+        "input_manifest_sha256",
         "input_type",
         "input_ref_id",
         "input_sha256",
@@ -1321,6 +1332,20 @@ def _check_v14_constraints(
         label="tasks.origin_type",
         errors=errors,
     )
+    untraceable_task_count = int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM tasks
+            WHERE origin_type IN ('MANUAL', 'AUTOMATION')
+              AND trim(COALESCE(origin_ref_id, '')) = ''
+            """
+        ).fetchone()[0]
+    )
+    if untraceable_task_count:
+        errors.append(
+            "MANUAL and AUTOMATION tasks must have a traceable origin_ref_id"
+        )
 
     automation_run_sql = _table_sql(connection, "automation_runs")
     _check_exact_status_values(
@@ -1427,7 +1452,36 @@ def _check_v14_constraints(
             "effective_to",
             "overlap",
         ),
+        "trg_operational_time_policy_immutable_update": (
+            "effective_to",
+            "immutable",
+            "supersedes_policy_version",
+        ),
+        "trg_operational_time_policy_no_delete": (
+            "cannot be deleted",
+        ),
+        "trg_operational_time_policy_successor_adjacent": (
+            "supersedes_policy_version",
+            "adjacent",
+        ),
+        "trg_tasks_traceable_origin_insert": (
+            "MANUAL",
+            "AUTOMATION",
+            "origin_ref_id",
+        ),
+        "trg_tasks_traceable_origin_update": (
+            "MANUAL",
+            "AUTOMATION",
+            "origin_ref_id",
+        ),
     }
+    for table_name in V14_APPEND_ONLY_TABLES:
+        required_triggers[
+            f"trg_{table_name}_append_only_update"
+        ] = ("append-only",)
+        required_triggers[
+            f"trg_{table_name}_append_only_delete"
+        ] = ("append-only",)
     for trigger_name, required_terms in required_triggers.items():
         trigger_row = connection.execute(
             """
@@ -1462,6 +1516,19 @@ def _check_v14_constraints(
             errors.append(
                 f"operational_time_policies.{column} must require UTC storage"
             )
+    current_policy_count = int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM operational_time_policies
+            WHERE effective_to IS NULL
+            """
+        ).fetchone()[0]
+    )
+    if current_policy_count != 1:
+        errors.append(
+            "operational_time_policies must have exactly one current policy"
+        )
 
     incident_sql = _table_sql(connection, "operational_incidents")
     _check_exact_status_values(

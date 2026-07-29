@@ -496,6 +496,7 @@ class WorkflowTests(unittest.TestCase):
             task_status=TaskStatus.PENDING,
             created_at=datetime(2026, 7, 26, 14, 34, tzinfo=timezone.utc),
             origin_type=TaskOriginType.MANUAL,
+            origin_ref_id="test-harness:workflow:old-task",
             target_status="offline",
             required_by=datetime(2026, 7, 26, 23, 4),
         )
@@ -509,6 +510,7 @@ class WorkflowTests(unittest.TestCase):
             task_status=TaskStatus.PENDING,
             created_at=datetime(2026, 7, 26, 15, 33, tzinfo=timezone.utc),
             origin_type=TaskOriginType.MANUAL,
+            origin_ref_id="test-harness:workflow:new-task",
             target_status="offline",
             required_by=datetime(2026, 7, 27, 0, 3),
         )

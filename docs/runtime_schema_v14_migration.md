@@ -60,6 +60,8 @@ PRAGMA integrity_check = ok
 
 - `CN_SINGLE_PLATFORM_2026_V1` 为唯一当前时间策略。
 - 时间策略 `effective_from/effective_to` 使用 UTC，区间无重叠。
+- 时间策略禁止删除或原地改写；只允许关闭当前 `effective_to`，随后新增
+  `effective_from` 相邻且显式 supersedes 的后继版本。
 - Automation 状态包含 `SUCCESS/MERGED/SKIPPED` 且不接受 `SUCCEEDED`。
 - Incident `category`、状态和 `resolved_at` 一致性 CHECK 生效。
 - 历史任务 `origin_type=LEGACY`。
@@ -68,6 +70,10 @@ PRAGMA integrity_check = ok
 - 没有 `emergency_action_policies`，也没有新建
   `SYSTEM_EMERGENCY` 任务。
 - FINAL 触发器只允许受控 `is_current: 1 → 0`，其他业务身份与审计字段不可变。
+- v14 观察事实、销售估算、日结事件和带 manifest 维度的日结输入均为
+  append-only，数据库拒绝 UPDATE/DELETE。
+- 新建 `MANUAL/AUTOMATION` 任务必须具有非空 `origin_ref_id`；旧任务仍按
+  `LEGACY` 无猜测迁移。
 
 ### 3.4 切换
 

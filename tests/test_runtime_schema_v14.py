@@ -120,6 +120,7 @@ def test_v14_new_database_has_frozen_tables_policy_and_task_origin(
         task_status=TaskStatus.PENDING,
         created_at=datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc),
         origin_type=TaskOriginType.MANUAL,
+        origin_ref_id="test-harness:runtime-schema-v14:TASK-V14-MANUAL",
     )
     assert repository.insert_task(task) == 1
     loaded = repository.get_task(task.task_id)
@@ -147,6 +148,27 @@ def test_task_model_requires_explicit_origin() -> None:
         )
 
 
+def test_task_model_requires_traceable_manual_origin() -> None:
+    with pytest.raises(ValueError, match="origin_ref_id"):
+        Task(
+            task_id="TASK-MANUAL-MISSING-REF",
+            internal_sku="SKU-1",
+            platform_name="platform",
+            action_type=TaskActionType.MANUAL_REVIEW,
+            priority=10,
+            task_status=TaskStatus.PENDING,
+            created_at=datetime(
+                2026,
+                7,
+                29,
+                12,
+                0,
+                tzinfo=timezone.utc,
+            ),
+            origin_type=TaskOriginType.MANUAL,
+        )
+
+
 def test_v14_database_rejects_invalid_task_origin(
     tmp_path: Path,
 ) -> None:
@@ -168,6 +190,26 @@ def test_v14_database_rejects_invalid_task_origin(
                 """,
                 (now, now),
             )
+        for origin_type in ("MANUAL", "AUTOMATION"):
+            with pytest.raises(sqlite3.IntegrityError, match="origin_ref_id"):
+                connection.execute(
+                    """
+                    INSERT INTO tasks(
+                        task_id, scope_type, scope_key, action_type,
+                        priority, task_status, created_at, updated_at,
+                        origin_type, origin_ref_id
+                    ) VALUES (
+                        ?, 'sku', 'SKU-1', 'manual_review',
+                        10, 'pending', ?, ?, ?, NULL
+                    )
+                    """,
+                    (
+                        f"TASK-{origin_type}-NO-REF",
+                        now,
+                        now,
+                        origin_type,
+                    ),
+                )
 
 
 @pytest.mark.parametrize(
@@ -207,7 +249,9 @@ def test_v14_automation_task_requires_origin_reference(
         task_status=TaskStatus.PENDING,
         created_at=datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc),
         origin_type=TaskOriginType.AUTOMATION,
+        origin_ref_id="automation-run:test",
     )
+    task.origin_ref_id = None
 
     with pytest.raises(ValueError, match="origin_ref_id"):
         repository.insert_task(task)
@@ -322,7 +366,85 @@ def test_v14_incident_category_status_and_resolution_are_frozen(
                 )
 
 
-def test_v14_time_policy_rejects_overlap_and_non_utc_storage(
+def test_v14_time_policy_is_immutable_and_successors_are_adjacent(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    now = "2026-07-29T12:00:00+00:00"
+    with closing(repository.connect_write()) as connection, connection:
+        for statement in (
+            """
+            UPDATE operational_time_policies
+            SET platform_cutoff_local_time = '17:00:00'
+            WHERE policy_version = 'CN_SINGLE_PLATFORM_2026_V1'
+            """,
+            """
+            UPDATE operational_time_policies
+            SET effective_from = '2025-12-31T17:00:00+00:00'
+            WHERE policy_version = 'CN_SINGLE_PLATFORM_2026_V1'
+            """,
+        ):
+            with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+                connection.execute(statement)
+        with pytest.raises(sqlite3.IntegrityError, match="cannot be deleted"):
+            connection.execute(
+                """
+                DELETE FROM operational_time_policies
+                WHERE policy_version = 'CN_SINGLE_PLATFORM_2026_V1'
+                """
+            )
+        connection.execute(
+            """
+            UPDATE operational_time_policies
+            SET effective_to = '2026-07-29T10:00:00+00:00'
+            WHERE policy_version = 'CN_SINGLE_PLATFORM_2026_V1'
+            """
+        )
+        _insert_time_policy(
+            connection,
+            version="V2",
+            effective_from="2026-07-29T10:00:00+00:00",
+            effective_to=None,
+            created_at=now,
+            supersedes="CN_SINGLE_PLATFORM_2026_V1",
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                """
+                UPDATE operational_time_policies
+                SET effective_to = NULL
+                WHERE policy_version = 'CN_SINGLE_PLATFORM_2026_V1'
+                """
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute(
+                """
+                UPDATE operational_time_policies
+                SET effective_to = '2026-07-29T11:00:00+00:00'
+                WHERE policy_version = 'CN_SINGLE_PLATFORM_2026_V1'
+                """
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="adjacent"):
+            _insert_time_policy(
+                connection,
+                version="GAP",
+                effective_from="2026-07-29T11:00:00+00:00",
+                effective_to=None,
+                created_at=now,
+                supersedes="CN_SINGLE_PLATFORM_2026_V1",
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            _insert_time_policy(
+                connection,
+                version="NON-UTC",
+                effective_from="2026-07-30T00:00:00+08:00",
+                effective_to="2026-07-31T00:00:00+08:00",
+                created_at=now,
+                supersedes="CN_SINGLE_PLATFORM_2026_V1",
+            )
+
+
+def test_v14_time_policy_rejects_overlap_after_adjacent_chain(
     tmp_path: Path,
 ) -> None:
     repository = _repository(tmp_path)
@@ -339,25 +461,90 @@ def test_v14_time_policy_rejects_overlap_and_non_utc_storage(
             connection,
             version="V2",
             effective_from="2026-07-29T10:00:00+00:00",
+            effective_to="2026-07-29T20:00:00+00:00",
+            created_at=now,
+            supersedes="CN_SINGLE_PLATFORM_2026_V1",
+        )
+        _insert_time_policy(
+            connection,
+            version="V3",
+            effective_from="2026-07-29T20:00:00+00:00",
             effective_to=None,
             created_at=now,
+            supersedes="V2",
         )
         with pytest.raises(sqlite3.IntegrityError, match="must not overlap"):
             _insert_time_policy(
                 connection,
                 version="OVERLAP",
-                effective_from="2026-07-29T09:00:00+00:00",
+                effective_from="2026-07-29T10:00:00+00:00",
                 effective_to="2026-07-29T11:00:00+00:00",
                 created_at=now,
+                supersedes="CN_SINGLE_PLATFORM_2026_V1",
             )
-        with pytest.raises(sqlite3.IntegrityError):
-            _insert_time_policy(
-                connection,
-                version="NON-UTC",
-                effective_from="2026-07-30T00:00:00+08:00",
-                effective_to="2026-07-31T00:00:00+08:00",
-                created_at=now,
-            )
+
+
+def test_v14_observation_and_summary_fact_tables_are_append_only(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    with closing(repository.connect_write()) as connection, connection:
+        _insert_append_only_fixture(connection)
+        identities = (
+            (
+                "product_observation_batches",
+                "observation_batch_id",
+                "PRODUCT-BATCH-1",
+            ),
+            (
+                "product_observation_items",
+                "observation_item_id",
+                "PRODUCT-ITEM-1",
+            ),
+            (
+                "order_observation_batches",
+                "observation_batch_id",
+                "ORDER-BATCH-1",
+            ),
+            (
+                "order_observation_items",
+                "observation_item_id",
+                "ORDER-ITEM-1",
+            ),
+            (
+                "sales_estimate_segments",
+                "estimate_segment_id",
+                "ESTIMATE-1",
+            ),
+            (
+                "platform_trade_day_summary_events",
+                "event_id",
+                "SUMMARY-EVENT-1",
+            ),
+            (
+                "platform_trade_day_summary_inputs",
+                "summary_id",
+                "SUMMARY-APPEND-ONLY",
+            ),
+        )
+        for table_name, identity_column, identity_value in identities:
+            with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+                connection.execute(
+                    f"""
+                    UPDATE {table_name}
+                    SET {identity_column} = {identity_column}
+                    WHERE {identity_column} = ?
+                    """,
+                    (identity_value,),
+                )
+            with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+                connection.execute(
+                    f"""
+                    DELETE FROM {table_name}
+                    WHERE {identity_column} = ?
+                    """,
+                    (identity_value,),
+                )
 
 
 @pytest.mark.parametrize(
@@ -537,6 +724,24 @@ def test_v14_health_detects_missing_required_index(
     assert "ux_trade_day_summaries_current" in health.missing_indexes
 
 
+def test_v14_health_detects_missing_append_only_trigger(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    trigger_name = (
+        "trg_order_observation_items_append_only_update"
+    )
+    with closing(repository.connect_write()) as connection, connection:
+        connection.execute(f"DROP TRIGGER {trigger_name}")
+
+    health = repository.check_schema_health()
+
+    assert not health.ok
+    assert any(
+        trigger_name in error for error in health.constraint_errors
+    )
+
+
 def test_v13_to_v14_migration_backfills_legacy_without_guessing_dates(
     tmp_path: Path,
 ) -> None:
@@ -549,14 +754,15 @@ def test_v13_to_v14_migration_backfills_legacy_without_guessing_dates(
             """
             INSERT INTO tasks(
                 task_id, trade_date, scope_type, scope_key,
-                action_type, priority, task_status,
-                created_at, updated_at, origin_type,
-                platform_trade_date, seller_operation_date
-            ) VALUES (
-                'TASK-HISTORICAL', '2026-07-28', 'sku', 'SKU-1',
-                'manual_review', 10, 'pending',
-                ?, ?, 'MANUAL', '2099-01-01', '2099-01-02'
-            )
+                    action_type, priority, task_status,
+                    created_at, updated_at, origin_type, origin_ref_id,
+                    platform_trade_date, seller_operation_date
+                ) VALUES (
+                    'TASK-HISTORICAL', '2026-07-28', 'sku', 'SKU-1',
+                    'manual_review', 10, 'pending',
+                    ?, ?, 'MANUAL', 'test-harness:v13-migration',
+                    '2099-01-01', '2099-01-02'
+                )
             """,
             (now, now),
         )
@@ -587,6 +793,90 @@ def test_v13_to_v14_migration_backfills_legacy_without_guessing_dates(
         assert connection.execute(
             "PRAGMA foreign_key_check"
         ).fetchall() == []
+
+
+def test_existing_v14_summary_inputs_gain_manifest_dimension(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    now = "2026-07-29T12:00:00+00:00"
+    with closing(repository.connect_write()) as connection, connection:
+        connection.execute(
+            """
+            DROP TRIGGER
+            trg_platform_trade_day_summary_inputs_append_only_update
+            """
+        )
+        connection.execute(
+            """
+            DROP TRIGGER
+            trg_platform_trade_day_summary_inputs_append_only_delete
+            """
+        )
+        connection.execute(
+            "DROP INDEX ix_trade_day_summary_inputs_ref"
+        )
+        connection.execute(
+            "DROP TABLE platform_trade_day_summary_inputs"
+        )
+        connection.execute(
+            """
+            CREATE TABLE platform_trade_day_summary_inputs (
+                summary_id TEXT NOT NULL,
+                input_type TEXT NOT NULL,
+                input_ref_id TEXT NOT NULL,
+                input_sha256 TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(summary_id, input_type, input_ref_id),
+                FOREIGN KEY(summary_id)
+                    REFERENCES platform_trade_day_summaries(summary_id)
+            )
+            """
+        )
+        _insert_summary(
+            connection,
+            summary_id="SUMMARY-OLD-V14",
+            series_id="SERIES-OLD-V14",
+            fact_source=None,
+            quality_level="UNAVAILABLE",
+            summary_status="PROVISIONAL",
+            sold_qty=None,
+            order_count=None,
+            amount=None,
+            finalized_at=None,
+        )
+        connection.execute(
+            """
+            INSERT INTO platform_trade_day_summary_inputs(
+                summary_id, input_type, input_ref_id,
+                input_sha256, created_at
+            ) VALUES (
+                'SUMMARY-OLD-V14', 'PRODUCT_BATCH',
+                'PRODUCT-BATCH-OLD', 'sha256:old', ?
+            )
+            """,
+            (now,),
+        )
+
+    repository.init_schema()
+
+    assert repository.check_schema_health().ok
+    with closing(repository.connect_read()) as connection:
+        columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(platform_trade_day_summary_inputs)"
+            )
+        }
+        row = connection.execute(
+            """
+            SELECT input_manifest_sha256, input_ref_id
+            FROM platform_trade_day_summary_inputs
+            WHERE summary_id = 'SUMMARY-OLD-V14'
+            """
+        ).fetchone()
+    assert "input_manifest_sha256" in columns
+    assert tuple(row) == ("sha256:input", "PRODUCT-BATCH-OLD")
 
 
 def test_v13_to_v14_failure_rolls_back_all_schema_changes(
@@ -642,6 +932,12 @@ def _downgrade_fixture_to_v13(
         try:
             for table in V14_DROP_ORDER:
                 connection.execute(f"DROP TABLE {table}")
+            connection.execute(
+                "DROP TRIGGER IF EXISTS trg_tasks_traceable_origin_insert"
+            )
+            connection.execute(
+                "DROP TRIGGER IF EXISTS trg_tasks_traceable_origin_update"
+            )
             for column in V14_TASK_COLUMNS:
                 connection.execute(
                     f"ALTER TABLE tasks DROP COLUMN {column}"
@@ -769,6 +1065,7 @@ def _insert_time_policy(
     effective_from: str,
     effective_to: str | None,
     created_at: str,
+    supersedes: str,
 ) -> None:
     connection.execute(
         """
@@ -778,12 +1075,163 @@ def _insert_time_policy(
             seller_cutoff_local_time,
             peak_start_local_time,
             effective_from, effective_to,
-            created_at, created_by
+            created_at, created_by,
+            supersedes_policy_version
         ) VALUES (
             ?, 'Asia/Shanghai',
             '18:00:00', '20:00:00', '16:00:00',
-            ?, ?, ?, 'test'
+            ?, ?, ?, 'test', ?
         )
         """,
-        (version, effective_from, effective_to, created_at),
+        (
+            version,
+            effective_from,
+            effective_to,
+            created_at,
+            supersedes,
+        ),
+    )
+
+
+def _insert_append_only_fixture(connection) -> None:
+    now = "2026-07-29T12:00:00+00:00"
+    _insert_automation_job(connection)
+    _insert_automation_run(connection, run_status="RUNNING")
+    connection.execute(
+        """
+        INSERT INTO product_observation_batches(
+            observation_batch_id, automation_run_id,
+            platform_name, scan_type, batch_status,
+            scan_started_at, scan_completed_at,
+            requested_scope_json, scope_complete,
+            end_marker_verified, content_sha256,
+            time_policy_version, created_at
+        ) VALUES (
+            'PRODUCT-BATCH-1', 'RUN-RUNNING',
+            'platform', 'ONLINE_PULSE', 'ACCEPTED',
+            ?, ?, '{}', 1, 1, 'sha256:product-batch',
+            'CN_SINGLE_PLATFORM_2026_V1', ?
+        )
+        """,
+        (now, now, now),
+    )
+    connection.execute(
+        """
+        INSERT INTO product_observation_items(
+            observation_item_id, observation_batch_id,
+            internal_sku, platform_product_name, grade,
+            observed_online, observed_at,
+            platform_trade_date, seller_operation_date,
+            seller_phase, page_identity_key, mapping_status
+        ) VALUES (
+            'PRODUCT-ITEM-1', 'PRODUCT-BATCH-1',
+            'SKU-1', 'Rose', 'A',
+            1, ?, '2026-07-29', '2026-07-29',
+            'NORMAL_SALES', 'page:rose:a', 'VERIFIED'
+        )
+        """,
+        (now,),
+    )
+    connection.execute(
+        """
+        INSERT INTO order_observation_batches(
+            observation_batch_id, automation_run_id,
+            platform_name, requested_platform_trade_date,
+            capability_result, batch_status,
+            scan_started_at, scan_completed_at,
+            requested_range_json, scope_complete,
+            end_marker_verified, content_sha256,
+            time_policy_version, created_at
+        ) VALUES (
+            'ORDER-BATCH-1', 'RUN-RUNNING',
+            'platform', '2026-07-29',
+            'SUCCEEDED', 'ACCEPTED',
+            ?, ?, '{}', 1, 1, 'sha256:order-batch',
+            'CN_SINGLE_PLATFORM_2026_V1', ?
+        )
+        """,
+        (now, now, now),
+    )
+    connection.execute(
+        """
+        INSERT INTO order_observation_items(
+            observation_item_id, observation_batch_id,
+            platform_trade_date, platform_product_name,
+            grade, internal_sku, mapping_status,
+            order_created_at, ordered_qty,
+            observed_at, seller_operation_date, seller_phase,
+            source_row_fingerprint, occurrence_no,
+            raw_observation_sha256
+        ) VALUES (
+            'ORDER-ITEM-1', 'ORDER-BATCH-1',
+            '2026-07-29', 'Rose',
+            'A', 'SKU-1', 'VERIFIED',
+            ?, 1, ?, '2026-07-29', 'NORMAL_SALES',
+            'row:fingerprint', 1, 'sha256:order-item'
+        )
+        """,
+        (now, now),
+    )
+    connection.execute(
+        """
+        INSERT INTO sales_estimate_segments(
+            estimate_segment_id, platform_name,
+            internal_sku, platform_trade_date,
+            interval_started_at, interval_ended_at,
+            inventory_before, inventory_after,
+            estimated_sold_qty, estimation_eligible,
+            estimation_reason, quality_level,
+            mapping_version, supporting_observation_ids_json,
+            algorithm_version, created_at
+        ) VALUES (
+            'ESTIMATE-1', 'platform',
+            'SKU-1', '2026-07-29',
+            '2026-07-29T11:00:00+00:00',
+            '2026-07-29T12:00:00+00:00',
+            10, 9, 1, 1,
+            'complete interval', 'SCAN_ESTIMATED_HIGH',
+            'mapping-v1', '["PRODUCT-ITEM-1"]',
+            'estimate-v1', ?
+        )
+        """,
+        (now,),
+    )
+    _insert_summary(
+        connection,
+        summary_id="SUMMARY-APPEND-ONLY",
+        series_id="SERIES-APPEND-ONLY",
+        fact_source=None,
+        quality_level="UNAVAILABLE",
+        summary_status="PROVISIONAL",
+        sold_qty=None,
+        order_count=None,
+        amount=None,
+        finalized_at=None,
+    )
+    connection.execute(
+        """
+        INSERT INTO platform_trade_day_summary_events(
+            event_id, summary_id, to_status,
+            trigger_type, quality_level_after,
+            input_manifest_sha256, changed_at, changed_by
+        ) VALUES (
+            'SUMMARY-EVENT-1', 'SUMMARY-APPEND-ONLY', 'PROVISIONAL',
+            'TEST', 'UNAVAILABLE',
+            'sha256:input', ?, 'test'
+        )
+        """,
+        (now,),
+    )
+    connection.execute(
+        """
+        INSERT INTO platform_trade_day_summary_inputs(
+            summary_id, input_manifest_sha256,
+            input_type, input_ref_id, input_sha256, created_at
+        ) VALUES (
+            'SUMMARY-APPEND-ONLY', 'sha256:input',
+            'PRODUCT_BATCH', 'PRODUCT-BATCH-1',
+            'sha256:product-batch', ?
+        )
+        """,
+        (now,),
     )
