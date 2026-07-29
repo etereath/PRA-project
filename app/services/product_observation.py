@@ -32,6 +32,7 @@ ALLOWED_BATCH_STATUSES = frozenset(
 )
 ACCEPTING_RUN_STATUSES = frozenset({"RUNNING"})
 EVIDENCE_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+RAW_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class ProductObservationError(ValueError):
@@ -98,7 +99,6 @@ class ProductObservationImporter:
         claim: AutomationRunClaim,
     ) -> ProductObservationImportResult:
         normalized = self._normalize_and_validate(batch)
-        current = _as_utc(self.clock(), "clock")
         if claim.run.run_id != normalized.automation_run_id:
             raise ProductObservationError(
                 "Automation Run claim does not match observation batch"
@@ -109,6 +109,9 @@ class ProductObservationImporter:
         )
         batch_context = self.operational_time.classify(
             normalized.scan_completed_at
+        )
+        batch_start_context = self.operational_time.classify(
+            normalized.scan_started_at
         )
         resolved_items = tuple(
             self._resolve_items(
@@ -126,10 +129,12 @@ class ProductObservationImporter:
         with closing(self.repository.connect_write()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                current = _as_utc(self.clock(), "clock")
                 run = connection.execute(
                     """
                     SELECT job_type, run_status, platform_name,
-                           time_policy_version
+                           platform_trade_date, time_policy_version,
+                           input_manifest_sha256
                     FROM automation_runs
                     WHERE run_id = ?
                     """,
@@ -150,9 +155,32 @@ class ProductObservationImporter:
                 if (
                     str(run["time_policy_version"])
                     != batch_context.time_policy_version
+                    or str(run["time_policy_version"])
+                    != batch_start_context.time_policy_version
                 ):
                     raise ProductObservationError(
                         "observation time policy does not match automation run"
+                    )
+                run_trade_date = str(run["platform_trade_date"])
+                if (
+                    batch_start_context.platform_trade_date.isoformat()
+                    != run_trade_date
+                    or batch_context.platform_trade_date.isoformat()
+                    != run_trade_date
+                    or any(
+                        str(item["platform_trade_date"]) != run_trade_date
+                        for item in resolved_items
+                    )
+                ):
+                    raise ProductObservationError(
+                        "observation platform_trade_date does not match "
+                        "automation run"
+                    )
+                if normalized.scan_type == LISTING_STATUS_SCAN:
+                    _validate_listing_snapshot_source(
+                        connection,
+                        normalized,
+                        run=run,
                     )
 
                 existing = connection.execute(
@@ -589,13 +617,212 @@ def listing_snapshot_to_observation_batch(
     snapshot: dict[str, object],
     *,
     automation_run_id: str,
+    source_manifest_sha256: str,
+    source_result_sha256: str,
+    operational_time: OperationalTimeService | None = None,
 ) -> ProductObservationBatchInput:
     """Adapt one validated Task 13 two-page snapshot to the v14 input."""
 
     validate_listing_sync_snapshot(snapshot)
+    manifest_sha256 = source_manifest_sha256.strip().lower()
+    result_sha256 = source_result_sha256.strip().lower()
+    if not EVIDENCE_SHA256_RE.fullmatch(manifest_sha256):
+        raise ProductObservationError(
+            "source_manifest_sha256 must be a prefixed SHA-256"
+        )
+    if not RAW_SHA256_RE.fullmatch(result_sha256):
+        raise ProductObservationError(
+            "source_result_sha256 must be an unprefixed SHA-256"
+        )
+    items = _listing_snapshot_observation_items(
+        snapshot_id=str(snapshot["snapshot_id"]),
+        evidence_manifest_sha256=str(
+            snapshot["evidence_manifest_sha256"]
+        ),
+        snapshot_items=tuple(dict(item) for item in snapshot["items"]),
+    )
+    time_service = operational_time or OperationalTimeService()
+    source_trade_date = time_service.classify(
+        _parse_datetime(
+            snapshot["scan_completed_at"],
+            "scan_completed_at",
+        )
+    ).platform_trade_date.isoformat()
+    source_conversion_sha256 = _listing_source_conversion_sha256(
+        snapshot_id=str(snapshot["snapshot_id"]),
+        manifest_sha256=manifest_sha256,
+        result_sha256=result_sha256,
+        scan_started_at=_parse_datetime(
+            snapshot["scan_started_at"],
+            "scan_started_at",
+        ),
+        scan_completed_at=_parse_datetime(
+            snapshot["scan_completed_at"],
+            "scan_completed_at",
+        ),
+        items=items,
+    )
+
+    snapshot_complete = bool(snapshot["snapshot_complete"])
+    return ProductObservationBatchInput(
+        observation_batch_id=(
+            f"product-observation-{snapshot['snapshot_id']}"
+        ),
+        automation_run_id=automation_run_id,
+        platform_name=str(snapshot["platform_name"]),
+        scan_type=LISTING_STATUS_SCAN,
+        batch_status="ACCEPTED" if snapshot_complete else "FAILED",
+        scan_started_at=_parse_datetime(
+            snapshot["scan_started_at"],
+            "scan_started_at",
+        ),
+        scan_completed_at=_parse_datetime(
+            snapshot["scan_completed_at"],
+            "scan_completed_at",
+        ),
+        requested_scope={
+            "child_type": LISTING_STATUS_SCAN,
+            "pages": ["online", "waiting"],
+            "source_snapshot_id": snapshot["snapshot_id"],
+            "source_manifest_sha256": manifest_sha256,
+            "source_result_sha256": result_sha256,
+            "source_platform_trade_date": source_trade_date,
+            "source_conversion_sha256": source_conversion_sha256,
+        },
+        scope_complete=snapshot_complete,
+        end_marker_verified=bool(
+            snapshot["online_end_marker_verified"]
+            and snapshot["waiting_end_marker_verified"]
+        ),
+        items=items,
+        error_code=str(snapshot.get("error_code") or ""),
+        error_message=(
+            ""
+            if snapshot_complete
+            else "Task 13 listing snapshot was incomplete"
+        ),
+    )
+
+
+def _validate_listing_snapshot_source(
+    connection,
+    batch: ProductObservationBatchInput,
+    *,
+    run,
+) -> None:
+    scope = batch.requested_scope
+    snapshot_id = str(scope.get("source_snapshot_id") or "").strip()
+    manifest_sha256 = str(
+        scope.get("source_manifest_sha256") or ""
+    ).strip().lower()
+    result_sha256 = str(
+        scope.get("source_result_sha256") or ""
+    ).strip().lower()
+    source_trade_date = str(
+        scope.get("source_platform_trade_date") or ""
+    ).strip()
+    conversion_sha256 = str(
+        scope.get("source_conversion_sha256") or ""
+    ).strip().lower()
+    if (
+        not snapshot_id
+        or not EVIDENCE_SHA256_RE.fullmatch(manifest_sha256)
+        or not RAW_SHA256_RE.fullmatch(result_sha256)
+        or not EVIDENCE_SHA256_RE.fullmatch(conversion_sha256)
+    ):
+        raise ProductObservationError(
+            "LISTING_STATUS_SCAN requires immutable snapshot source binding"
+        )
+    source = connection.execute(
+        """
+        SELECT snapshots.*, batches.manifest_sha256,
+               receipts.result_sha256
+        FROM listing_sync_snapshots AS snapshots
+        INNER JOIN shadowbot_listing_action_batches AS batches
+            ON batches.batch_id = snapshots.batch_id
+        INNER JOIN shadowbot_listing_result_receipts AS receipts
+            ON receipts.result_id = snapshots.result_id
+           AND receipts.batch_id = snapshots.batch_id
+        WHERE snapshots.snapshot_id = ?
+        """,
+        (snapshot_id,),
+    ).fetchone()
+    if source is None:
+        raise ProductObservationError(
+            "LISTING_STATUS_SCAN source snapshot does not exist"
+        )
+    run_manifest = str(run["input_manifest_sha256"] or "").strip().lower()
+    if (
+        str(source["platform_name"]) != batch.platform_name
+        or str(source["status"]) != "VERIFIED"
+        or int(source["snapshot_complete"]) != 1
+        or manifest_sha256 != str(source["manifest_sha256"]).lower()
+        or manifest_sha256 != run_manifest
+        or result_sha256 != str(source["result_sha256"]).lower()
+        or source_trade_date != str(run["platform_trade_date"])
+        or batch.scan_started_at
+        != _parse_datetime(source["scan_started_at"], "scan_started_at")
+        or batch.scan_completed_at
+        != _parse_datetime(source["scan_completed_at"], "scan_completed_at")
+    ):
+        raise ProductObservationError(
+            "LISTING_STATUS_SCAN source snapshot envelope does not match run"
+        )
+    source_item_rows = connection.execute(
+        """
+        SELECT *
+        FROM listing_sync_snapshot_items
+        WHERE snapshot_id = ?
+        ORDER BY snapshot_item_id
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    source_items = tuple(
+        {
+            **dict(row),
+            "online_row_identities": json.loads(
+                str(row["online_row_identities_json"])
+            ),
+            "waiting_row_identities": json.loads(
+                str(row["waiting_row_identities_json"])
+            ),
+        }
+        for row in source_item_rows
+    )
+    expected_items = _listing_snapshot_observation_items(
+        snapshot_id=snapshot_id,
+        evidence_manifest_sha256=str(
+            source["evidence_manifest_sha256"]
+        ),
+        snapshot_items=source_items,
+    )
+    expected_conversion_sha256 = _listing_source_conversion_sha256(
+        snapshot_id=snapshot_id,
+        manifest_sha256=manifest_sha256,
+        result_sha256=result_sha256,
+        scan_started_at=batch.scan_started_at,
+        scan_completed_at=batch.scan_completed_at,
+        items=expected_items,
+    )
+    if (
+        conversion_sha256 != expected_conversion_sha256
+        or _observation_inputs_payload(batch.items)
+        != _observation_inputs_payload(expected_items)
+    ):
+        raise ProductObservationError(
+            "LISTING_STATUS_SCAN observations are not the canonical "
+            "snapshot conversion"
+        )
+
+
+def _listing_snapshot_observation_items(
+    *,
+    snapshot_id: str,
+    evidence_manifest_sha256: str,
+    snapshot_items: Iterable[dict[str, object]],
+) -> tuple[ProductObservationInput, ...]:
     items: list[ProductObservationInput] = []
-    for raw_item in snapshot["items"]:
-        item = dict(raw_item)
+    for item in snapshot_items:
         for page, observed_online in (
             ("online", True),
             ("waiting", False),
@@ -603,13 +830,11 @@ def listing_snapshot_to_observation_batch(
             if int(item[f"{page}_occurrences"]) == 0:
                 continue
             evidence_payload = {
-                "snapshot_id": snapshot["snapshot_id"],
+                "snapshot_id": snapshot_id,
                 "snapshot_item_id": item["snapshot_item_id"],
                 "page": page,
                 "row_identities": item[f"{page}_row_identities"],
-                "evidence_manifest_sha256": snapshot[
-                    "evidence_manifest_sha256"
-                ],
+                "evidence_manifest_sha256": evidence_manifest_sha256,
             }
             evidence_sha256 = "sha256:" + hashlib.sha256(
                 json.dumps(
@@ -638,42 +863,65 @@ def listing_snapshot_to_observation_batch(
                     evidence_sha256=evidence_sha256,
                 )
             )
+    return tuple(items)
 
-    snapshot_complete = bool(snapshot["snapshot_complete"])
-    return ProductObservationBatchInput(
-        observation_batch_id=(
-            f"product-observation-{snapshot['snapshot_id']}"
-        ),
-        automation_run_id=automation_run_id,
-        platform_name=str(snapshot["platform_name"]),
-        scan_type=LISTING_STATUS_SCAN,
-        batch_status="ACCEPTED" if snapshot_complete else "FAILED",
-        scan_started_at=_parse_datetime(
-            snapshot["scan_started_at"],
-            "scan_started_at",
-        ),
-        scan_completed_at=_parse_datetime(
-            snapshot["scan_completed_at"],
-            "scan_completed_at",
-        ),
-        requested_scope={
-            "child_type": LISTING_STATUS_SCAN,
-            "pages": ["online", "waiting"],
-            "source_snapshot_id": snapshot["snapshot_id"],
-        },
-        scope_complete=snapshot_complete,
-        end_marker_verified=bool(
-            snapshot["online_end_marker_verified"]
-            and snapshot["waiting_end_marker_verified"]
-        ),
-        items=tuple(items),
-        error_code=str(snapshot.get("error_code") or ""),
-        error_message=(
-            ""
-            if snapshot_complete
-            else "Task 13 listing snapshot was incomplete"
-        ),
+
+def _listing_source_conversion_sha256(
+    *,
+    snapshot_id: str,
+    manifest_sha256: str,
+    result_sha256: str,
+    scan_started_at: datetime,
+    scan_completed_at: datetime,
+    items: Iterable[ProductObservationInput],
+) -> str:
+    payload = {
+        "snapshot_id": snapshot_id,
+        "manifest_sha256": manifest_sha256,
+        "result_sha256": result_sha256,
+        "scan_started_at": _datetime_text(scan_started_at),
+        "scan_completed_at": _datetime_text(scan_completed_at),
+        "items": _observation_inputs_payload(items),
+    }
+    return "sha256:" + hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _observation_inputs_payload(
+    items: Iterable[ProductObservationInput],
+) -> list[dict[str, object]]:
+    payload = [
+        {
+            "platform_product_name": item.platform_product_name,
+            "grade": item.grade,
+            "observed_at": _datetime_text(item.observed_at),
+            "observed_online": item.observed_online,
+            "page_identity_key": item.page_identity_key,
+            "observed_price": (
+                str(item.observed_price)
+                if item.observed_price is not None
+                else None
+            ),
+            "observed_inventory": item.observed_inventory,
+            "evidence_sha256": item.evidence_sha256,
+        }
+        for item in items
+    ]
+    payload.sort(
+        key=lambda item: json.dumps(
+            item,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
     )
+    return payload
 
 
 def _result_content_sha256(

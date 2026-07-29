@@ -88,7 +88,7 @@ class AutomationExecutionContext:
     def heartbeat(self) -> bool:
         renewed = self.repository.renew_lease(
             self.claim,
-            now=self.clock(),
+            clock=self.clock,
             lease_seconds=self.lease_seconds,
         )
         if renewed is None:
@@ -100,7 +100,7 @@ class AutomationExecutionContext:
         return self.repository.bind_run_input_manifest(
             self.claim,
             manifest_sha256=manifest_sha256,
-            now=self.clock(),
+            clock=self.clock,
         )
 
     def ensure_child_run(
@@ -116,7 +116,7 @@ class AutomationExecutionContext:
             self.claim,
             child_job,
             relation_type=relation_type,
-            now=self.clock(),
+            clock=self.clock,
         )
 
 
@@ -377,7 +377,7 @@ class AutomationService:
             claim, observed_blocker = (
                 self.repository.claim_next_with_ui_gate(
                     owner_token=self.owner_token,
-                    now=self.clock(),
+                    clock=self.clock,
                     lease_seconds=self.lease_seconds,
                     allowed_job_types=allowed_job_types,
                     ui_job_types=UI_JOB_TYPES,
@@ -417,7 +417,7 @@ class AutomationService:
             completed = self.repository.finish_run(
                 context.claim,
                 outcome,
-                now=self.clock(),
+                clock=self.clock,
             )
             if completed:
                 completed_ids.append(claim.run.run_id)

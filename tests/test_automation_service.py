@@ -131,6 +131,7 @@ def _seed_accepted_listing_coverage_facts(
     listing_run_id: str,
     manifest_sha256: str,
     now: datetime,
+    observation_trade_date: str | None = None,
 ) -> None:
     run = repository.get_run(listing_run_id)
     assert run is not None
@@ -143,28 +144,15 @@ def _seed_accepted_listing_coverage_facts(
         connection.execute("BEGIN IMMEDIATE")
         connection.execute(
             """
-            INSERT INTO shadowbot_batch_registry(
-                batch_id, batch_type, contract_version,
-                platform_name, created_at
-            ) VALUES (?, 'sync_status', 5, ?, ?)
-            """,
-            (batch_id, run.platform_name, timestamp),
-        )
-        connection.execute(
-            """
-            INSERT INTO shadowbot_listing_action_batches(
-                batch_id, contract_version, execution_profile,
-                action_type, platform_name, manifest_sha256,
-                status, batch_target_count, created_at, updated_at
-            ) VALUES (?, 5, 'production', 'sync_status', ?, ?,
-                      'VERIFIED', 0, ?, ?)
+            UPDATE shadowbot_listing_action_batches
+            SET status = 'VERIFIED', result_id = ?, updated_at = ?
+            WHERE batch_id = ? AND manifest_sha256 = ?
             """,
             (
+                result_id,
+                timestamp,
                 batch_id,
-                run.platform_name,
                 manifest_sha256,
-                timestamp,
-                timestamp,
             ),
         )
         connection.execute(
@@ -226,16 +214,100 @@ def _seed_accepted_listing_coverage_facts(
                 time_policy_version, error_code, error_message,
                 created_at
             ) VALUES (?, ?, ?, 'LISTING_STATUS_SCAN', 'ACCEPTED',
-                      ?, ?, '{}', 1, 1, ?, ?, '', '', ?)
+                      ?, ?, ?, 1, 1, ?, ?, '', '', ?)
             """,
             (
-                f"product-observation-{snapshot_id}",
+                f"OBSERVATION-{suffix}",
                 listing_run_id,
                 run.platform_name,
                 timestamp,
                 timestamp,
+                json.dumps(
+                    {
+                        "pages": ["online", "waiting"],
+                        "source_snapshot_id": snapshot_id,
+                        "source_manifest_sha256": manifest_sha256,
+                        "source_result_sha256": "a" * 64,
+                        "source_platform_trade_date": (
+                            run.platform_trade_date.isoformat()
+                        ),
+                        "source_conversion_sha256": (
+                            "sha256:" + "c" * 64
+                        ),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
                 "sha256:" + "c" * 64,
                 run.time_policy_version,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO product_observation_items(
+                observation_item_id, observation_batch_id,
+                internal_sku, platform_product_name, grade,
+                observed_price, observed_inventory, observed_online,
+                observed_at, platform_trade_date,
+                seller_operation_date, seller_phase,
+                page_identity_key, mapping_status, mapping_version,
+                evidence_sha256
+            ) VALUES (?, ?, NULL, '测试商品', 'A', '10.00', 1, 1,
+                      ?, ?, ?, ?, 'online:test', 'UNMAPPED', '', ?)
+            """,
+            (
+                f"OBSERVATION-ITEM-{suffix}",
+                f"OBSERVATION-{suffix}",
+                timestamp,
+                observation_trade_date
+                or run.platform_trade_date.isoformat(),
+                run.seller_operation_date.isoformat(),
+                run.seller_phase.value,
+                "sha256:" + "d" * 64,
+            ),
+        )
+        connection.commit()
+
+
+def _prepare_listing_coverage_batch(
+    repository: AutomationRepository,
+    *,
+    listing_run_id: str,
+    manifest_sha256: str,
+    now: datetime,
+) -> None:
+    run = repository.get_run(listing_run_id)
+    assert run is not None
+    suffix = listing_run_id[-12:]
+    batch_id = f"BATCH-COVER-{suffix}"
+    timestamp = now.isoformat()
+    with repository.runtime_repository.connect_write() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        connection.execute(
+            """
+            INSERT INTO shadowbot_batch_registry(
+                batch_id, batch_type, contract_version,
+                platform_name, created_at
+            ) VALUES (?, 'sync_status', 5, ?, ?)
+            """,
+            (batch_id, run.platform_name, timestamp),
+        )
+        connection.execute(
+            """
+            INSERT INTO shadowbot_listing_action_batches(
+                batch_id, contract_version, execution_profile,
+                action_type, platform_name, manifest_sha256,
+                status, batch_target_count, created_at, updated_at
+            ) VALUES (?, 5, 'production', 'sync_status', ?, ?,
+                      'PREPARED', 0, ?, ?)
+            """,
+            (
+                batch_id,
+                run.platform_name,
+                manifest_sha256,
+                timestamp,
                 timestamp,
             ),
         )
@@ -312,6 +384,12 @@ def test_successful_full_handler_finalizes_pulse_coverage(
         return AutomationRunOutcome(status=AutomationRunStatus.SUCCESS)
 
     def listing_handler(run, context):
+        _prepare_listing_coverage_batch(
+            repository,
+            listing_run_id=run.run_id,
+            manifest_sha256=manifest_sha256,
+            now=now,
+        )
         context.bind_input_manifest(manifest_sha256)
         _seed_accepted_listing_coverage_facts(
             repository,
@@ -346,6 +424,87 @@ def test_successful_full_handler_finalizes_pulse_coverage(
         (link.parent_run_id, link.relation_type)
         for link in repository.list_links(child_run_id=pulse.run_id)
     ] == [(listing_child.child_run_id, "MERGED_RUN")]
+
+
+def test_listing_facts_from_other_trade_date_cannot_merge_pulse(
+    repository: AutomationRepository,
+) -> None:
+    now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
+    pulse_job = _store_job(
+        repository,
+        _job(job_id="PULSE", job_type=ONLINE_PULSE, priority=60),
+        now=now,
+    )
+    full_job = _store_job(
+        repository,
+        _job(
+            job_id="FULL",
+            job_type=FULL_MARKET_SCAN,
+            minutes=60,
+            priority=50,
+        ),
+        now=now,
+    )
+    listing_job = _store_job(
+        repository,
+        _job(
+            job_id="LISTING",
+            job_type=LISTING_STATUS_SCAN,
+            enabled=False,
+            schedule_kind=CHILD_ONLY,
+        ),
+        now=now,
+    )
+    pulse = _ensure_run(repository, pulse_job, scheduled_for=now)
+    _ensure_run(repository, full_job, scheduled_for=now)
+    manifest_sha256 = "sha256:" + "9" * 64
+
+    def full_handler(run, context):
+        context.ensure_child_run(
+            child_job_id=listing_job.job_id,
+            relation_type="LISTING_STATUS_CHILD",
+        )
+        return AutomationRunOutcome(status=AutomationRunStatus.SUCCESS)
+
+    def listing_handler(run, context):
+        _prepare_listing_coverage_batch(
+            repository,
+            listing_run_id=run.run_id,
+            manifest_sha256=manifest_sha256,
+            now=now,
+        )
+        context.bind_input_manifest(manifest_sha256)
+        _seed_accepted_listing_coverage_facts(
+            repository,
+            listing_run_id=run.run_id,
+            manifest_sha256=manifest_sha256,
+            now=now,
+            observation_trade_date=(
+                run.platform_trade_date + timedelta(days=1)
+            ).isoformat(),
+        )
+        return AutomationRunOutcome(status=AutomationRunStatus.SUCCESS)
+
+    cycle = AutomationService(
+        repository,
+        handlers={
+            FULL_MARKET_SCAN: full_handler,
+            LISTING_STATUS_SCAN: listing_handler,
+            ONLINE_PULSE: lambda run, context: AutomationRunOutcome(
+                status=AutomationRunStatus.SUCCESS
+            ),
+        },
+        clock=MutableClock(now),
+    ).run_cycle()
+
+    assert pulse.run_id in cycle.completed_run_ids
+    assert repository.get_run(
+        pulse.run_id
+    ).run_status is AutomationRunStatus.SUCCESS
+    assert not any(
+        link.relation_type == "MERGED_RUN"
+        for link in repository.list_links(child_run_id=pulse.run_id)
+    )
 
 
 def test_sleep_records_missed_pulses_and_only_catches_latest_window(
@@ -575,6 +734,12 @@ def test_restart_reconciles_preexisting_scheduled_merge_candidates(
     )
     assert listing_claim is not None
     manifest_sha256 = "sha256:" + "e" * 64
+    _prepare_listing_coverage_batch(
+        repository,
+        listing_run_id=listing_child.run_id,
+        manifest_sha256=manifest_sha256,
+        now=now,
+    )
     repository.bind_run_input_manifest(
         listing_claim,
         manifest_sha256=manifest_sha256,
@@ -854,6 +1019,12 @@ def test_order_child_failure_does_not_undo_accepted_listing_coverage(
     )
     assert listing_claim is not None
     manifest_sha256 = "sha256:" + "f" * 64
+    _prepare_listing_coverage_batch(
+        repository,
+        listing_run_id=listing_child.run_id,
+        manifest_sha256=manifest_sha256,
+        now=now,
+    )
     repository.bind_run_input_manifest(
         listing_claim,
         manifest_sha256=manifest_sha256,

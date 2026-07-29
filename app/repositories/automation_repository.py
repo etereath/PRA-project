@@ -4,7 +4,7 @@ import hashlib
 import json
 from contextlib import closing
 from datetime import datetime, time, timedelta, timezone
-from typing import Iterable
+from typing import Callable, Iterable
 from uuid import uuid4
 
 from app.automation_ui_channel import (
@@ -761,21 +761,18 @@ class AutomationRepository:
         claim: AutomationRunClaim,
         *,
         manifest_sha256: str,
-        now: datetime,
+        now: datetime | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> AutomationRun:
         """Bind one immutable external input to a live Automation child run."""
 
-        current = _as_utc(now, "now")
         manifest = manifest_sha256.strip().lower()
-        if not (
-            manifest.startswith("sha256:")
-            and len(manifest) == 71
-            and all(character in "0123456789abcdef" for character in manifest[7:])
-        ):
+        if not _is_prefixed_sha256(manifest):
             raise ValueError("manifest_sha256 must be a prefixed SHA-256")
         with closing(self.runtime_repository.connect_write()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                current = _transaction_time(now=now, clock=clock)
                 validate_live_automation_claim_in_transaction(
                     connection,
                     claim,
@@ -800,6 +797,68 @@ class AutomationRepository:
                     raise ValueError(
                         "Automation run already has a different input manifest"
                     )
+                if not existing_manifest:
+                    batches = connection.execute(
+                        """
+                        SELECT batch_id, action_type, platform_name,
+                               status, result_id
+                        FROM shadowbot_listing_action_batches
+                        WHERE manifest_sha256 = ?
+                        ORDER BY batch_id
+                        """,
+                        (manifest,),
+                    ).fetchall()
+                    if len(batches) != 1:
+                        raise ValueError(
+                            "Listing manifest must identify exactly one "
+                            "prepared SYNC_STATUS batch"
+                        )
+                    batch = batches[0]
+                    if str(batch["action_type"]) != "sync_status":
+                        raise ValueError(
+                            "Listing manifest batch must use sync_status"
+                        )
+                    if str(batch["platform_name"]) != str(
+                        row["platform_name"]
+                    ):
+                        raise ValueError(
+                            "Listing manifest platform does not match run"
+                        )
+                    if (
+                        str(batch["status"]) != "PREPARED"
+                        or str(batch["result_id"] or "")
+                    ):
+                        raise ValueError(
+                            "Listing manifest must be bound before publication "
+                            "or result acceptance"
+                        )
+                    result_facts = connection.execute(
+                        """
+                        SELECT
+                            EXISTS(
+                                SELECT 1
+                                FROM shadowbot_listing_result_receipts
+                                WHERE batch_id = ?
+                            ) AS has_receipt,
+                            EXISTS(
+                                SELECT 1
+                                FROM listing_sync_snapshots
+                                WHERE batch_id = ?
+                            ) AS has_snapshot
+                        """,
+                        (batch["batch_id"], batch["batch_id"]),
+                    ).fetchone()
+                    if (
+                        result_facts is not None
+                        and (
+                            int(result_facts["has_receipt"]) == 1
+                            or int(result_facts["has_snapshot"]) == 1
+                        )
+                    ):
+                        raise ValueError(
+                            "Completed listing facts cannot be bound to a new "
+                            "Automation run"
+                        )
                 duplicate = connection.execute(
                     """
                     SELECT run_id
@@ -891,11 +950,11 @@ class AutomationRepository:
         child_job: AutomationJob,
         *,
         relation_type: str,
-        now: datetime,
+        now: datetime | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> tuple[AutomationRun, bool]:
         """Create and link a child atomically under the parent's live lease."""
 
-        current = _as_utc(now, "now")
         normalized_relation = relation_type.strip().upper()
         expected_relation = CHILD_RELATIONS.get(child_job.job_type)
         if child_job.schedule_kind != "CHILD_ONLY":
@@ -918,6 +977,7 @@ class AutomationRepository:
         with closing(self.runtime_repository.connect_write()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                current = _transaction_time(now=now, clock=clock)
                 parent_row = connection.execute(
                     "SELECT * FROM automation_runs WHERE run_id = ?",
                     (parent.run_id,),
@@ -1075,13 +1135,15 @@ class AutomationRepository:
         self,
         *,
         owner_token: str,
-        now: datetime,
+        now: datetime | None = None,
+        clock: Callable[[], datetime] | None = None,
         lease_seconds: int,
         allowed_job_types: Iterable[str],
     ) -> AutomationRunClaim | None:
         claim, _ = self.claim_next_with_ui_gate(
             owner_token=owner_token,
             now=now,
+            clock=clock,
             lease_seconds=lease_seconds,
             allowed_job_types=allowed_job_types,
             ui_job_types=UI_AUTOMATION_JOB_TYPES,
@@ -1092,14 +1154,14 @@ class AutomationRepository:
         self,
         *,
         owner_token: str,
-        now: datetime,
+        now: datetime | None = None,
+        clock: Callable[[], datetime] | None = None,
         lease_seconds: int,
         allowed_job_types: Iterable[str],
         ui_job_types: Iterable[str],
     ) -> tuple[AutomationRunClaim | None, str]:
         """Check write blockers and claim under one SQLite write lock."""
 
-        current = _as_utc(now, "now")
         owner = owner_token.strip()
         allowed = tuple(
             dict.fromkeys(
@@ -1118,6 +1180,7 @@ class AutomationRepository:
         with closing(self.runtime_repository.connect_write()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                current = _transaction_time(now=now, clock=clock)
                 blocker = _active_ui_blocker_connection(connection)
                 if not blocker and has_active_automation_ui_run(
                     connection,
@@ -1147,10 +1210,10 @@ class AutomationRepository:
         *,
         run_id: str,
         owner_token: str,
-        now: datetime,
+        now: datetime | None = None,
+        clock: Callable[[], datetime] | None = None,
         lease_seconds: int,
     ) -> AutomationRunClaim | None:
-        current = _as_utc(now, "now")
         owner = owner_token.strip()
         if not owner:
             raise ValueError("owner_token must not be blank")
@@ -1159,6 +1222,7 @@ class AutomationRepository:
         with closing(self.runtime_repository.connect_write()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                current = _transaction_time(now=now, clock=clock)
                 claim = _claim_specific_run_connection(
                     connection,
                     run_id=run_id,
@@ -1177,41 +1241,47 @@ class AutomationRepository:
         self,
         claim: AutomationRunClaim,
         *,
-        now: datetime,
+        now: datetime | None = None,
+        clock: Callable[[], datetime] | None = None,
         lease_seconds: int,
     ) -> AutomationRunClaim | None:
-        current = _as_utc(now, "now")
         if lease_seconds < 1:
             raise ValueError("lease_seconds must be positive")
-        expires_at = current + timedelta(seconds=lease_seconds)
-        with closing(
-            self.runtime_repository.connect_write()
-        ) as connection, connection:
-            cursor = connection.execute(
-                """
-                UPDATE automation_runs
-                SET lease_expires_at = ?, updated_at = ?
-                WHERE run_id = ?
-                  AND run_status = 'RUNNING'
-                  AND lease_owner = ?
-                  AND lease_version = ?
-                  AND julianday(lease_expires_at) > julianday(?)
-                """,
-                (
-                    _datetime_text(expires_at),
-                    _datetime_text(current),
-                    claim.run.run_id,
-                    claim.owner_token,
-                    claim.lease_version,
-                    _datetime_text(current),
-                ),
-            )
-            if cursor.rowcount != 1:
-                return None
-            row = connection.execute(
-                "SELECT * FROM automation_runs WHERE run_id = ?",
-                (claim.run.run_id,),
-            ).fetchone()
+        with closing(self.runtime_repository.connect_write()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                current = _transaction_time(now=now, clock=clock)
+                expires_at = current + timedelta(seconds=lease_seconds)
+                cursor = connection.execute(
+                    """
+                    UPDATE automation_runs
+                    SET lease_expires_at = ?, updated_at = ?
+                    WHERE run_id = ?
+                      AND run_status = 'RUNNING'
+                      AND lease_owner = ?
+                      AND lease_version = ?
+                      AND julianday(lease_expires_at) > julianday(?)
+                    """,
+                    (
+                        _datetime_text(expires_at),
+                        _datetime_text(current),
+                        claim.run.run_id,
+                        claim.owner_token,
+                        claim.lease_version,
+                        _datetime_text(current),
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    connection.rollback()
+                    return None
+                row = connection.execute(
+                    "SELECT * FROM automation_runs WHERE run_id = ?",
+                    (claim.run.run_id,),
+                ).fetchone()
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
         if row is None:
             return None
         return AutomationRunClaim(
@@ -1227,12 +1297,13 @@ class AutomationRepository:
         claim: AutomationRunClaim,
         outcome: AutomationRunOutcome,
         *,
-        now: datetime,
+        now: datetime | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> bool:
-        current = _as_utc(now, "now")
         with closing(self.runtime_repository.connect_write()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                current = _transaction_time(now=now, clock=clock)
                 cursor = connection.execute(
                     """
                     UPDATE automation_runs
@@ -1622,9 +1693,13 @@ def _listing_coverage_facts_accepted(
     *,
     listing_run_id: str,
 ) -> bool:
-    row = connection.execute(
+    rows = connection.execute(
         """
-        SELECT 1
+        SELECT runs.platform_trade_date, runs.input_manifest_sha256,
+               batches.manifest_sha256, snapshots.snapshot_id,
+               receipts.result_sha256,
+               observations.observation_batch_id,
+               observations.requested_scope_json
         FROM automation_runs AS runs
         INNER JOIN shadowbot_listing_action_batches AS batches
             ON batches.manifest_sha256 = runs.input_manifest_sha256
@@ -1632,10 +1707,11 @@ def _listing_coverage_facts_accepted(
         INNER JOIN listing_sync_snapshots AS snapshots
             ON snapshots.batch_id = batches.batch_id
            AND snapshots.platform_name = runs.platform_name
+        INNER JOIN shadowbot_listing_result_receipts AS receipts
+            ON receipts.result_id = snapshots.result_id
+           AND receipts.batch_id = batches.batch_id
         INNER JOIN product_observation_batches AS observations
             ON observations.automation_run_id = runs.run_id
-           AND observations.observation_batch_id =
-               'product-observation-' || snapshots.snapshot_id
            AND observations.platform_name = runs.platform_name
            AND observations.time_policy_version =
                runs.time_policy_version
@@ -1650,11 +1726,47 @@ def _listing_coverage_facts_accepted(
           AND observations.batch_status = 'ACCEPTED'
           AND observations.scope_complete = 1
           AND observations.end_marker_verified = 1
-        LIMIT 1
         """,
         (listing_run_id,),
-    ).fetchone()
-    return row is not None
+    ).fetchall()
+    for row in rows:
+        try:
+            scope = json.loads(str(row["requested_scope_json"]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(scope, dict):
+            continue
+        run_trade_date = str(row["platform_trade_date"])
+        run_manifest = str(row["input_manifest_sha256"])
+        conversion_sha256 = str(
+            scope.get("source_conversion_sha256") or ""
+        )
+        if (
+            str(scope.get("source_snapshot_id") or "")
+            != str(row["snapshot_id"])
+            or str(scope.get("source_manifest_sha256") or "")
+            != run_manifest
+            or run_manifest != str(row["manifest_sha256"])
+            or str(scope.get("source_result_sha256") or "")
+            != str(row["result_sha256"])
+            or str(scope.get("source_platform_trade_date") or "")
+            != run_trade_date
+            or not _is_prefixed_sha256(conversion_sha256)
+        ):
+            continue
+        mismatched_item = connection.execute(
+            """
+            SELECT 1
+            FROM product_observation_items
+            WHERE observation_batch_id = ?
+              AND platform_trade_date <> ?
+            LIMIT 1
+            """,
+            (row["observation_batch_id"], run_trade_date),
+        ).fetchone()
+        if mismatched_item is None:
+            return True
+    return False
 
 
 def _claim_next_connection(
@@ -2205,3 +2317,25 @@ def _as_utc(value: datetime, field_name: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(f"{field_name} must be timezone-aware")
     return value.astimezone(timezone.utc)
+
+
+def _transaction_time(
+    *,
+    now: datetime | None,
+    clock: Callable[[], datetime] | None,
+) -> datetime:
+    if (now is None) == (clock is None):
+        raise ValueError("Provide exactly one of now or clock")
+    if clock is not None:
+        return _as_utc(clock(), "clock")
+    if now is None:
+        raise ValueError("now is required when clock is not provided")
+    return _as_utc(now, "now")
+
+
+def _is_prefixed_sha256(value: str) -> bool:
+    return (
+        value.startswith("sha256:")
+        and len(value) == 71
+        and all(character in "0123456789abcdef" for character in value[7:])
+    )

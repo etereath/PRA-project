@@ -219,13 +219,22 @@ def import_listing_sync_result(
         raise ValidationError("result_file_sha256 无效。")
     snapshot = dict(result["snapshot"])
     _validate_snapshot_result_binding(request, result, snapshot)
-    now = datetime.now(UTC)
-    now_text = now.isoformat()
-    snapshot_time_context = OperationalTimeService(
+    time_service = OperationalTimeService(
         policies=AutomationRepository(
             repository
         ).load_operational_time_policies()
-    ).classify(_parse_aware(snapshot["scan_completed_at"]))
+    )
+    snapshot_time_contexts = _snapshot_operational_contexts(
+        snapshot,
+        operational_time=time_service,
+    )
+    snapshot_policy_versions = frozenset(
+        context.time_policy_version for context in snapshot_time_contexts
+    )
+    snapshot_trade_dates = frozenset(
+        context.platform_trade_date.isoformat()
+        for context in snapshot_time_contexts
+    )
     batch_id = str(request["batch_id"])
     result_id = str(result.get("result_id") or "").strip()
     if not result_id:
@@ -234,6 +243,8 @@ def import_listing_sync_result(
     connection = repository.connect_write()
     try:
         connection.execute("BEGIN IMMEDIATE")
+        now = datetime.now(UTC)
+        now_text = now.isoformat()
         batch = connection.execute(
             """
             SELECT * FROM shadowbot_listing_action_batches
@@ -267,7 +278,8 @@ def import_listing_sync_result(
                 automation_binding,
                 automation_claim=automation_claim,
                 platform_name=str(request["platform_name"]),
-                time_policy_version=snapshot_time_context.time_policy_version,
+                time_policy_versions=snapshot_policy_versions,
+                platform_trade_dates=snapshot_trade_dates,
             )
             connection.rollback()
             return _existing_import_summary(repository, batch_id, result_id)
@@ -278,7 +290,8 @@ def import_listing_sync_result(
             binding=automation_binding,
             automation_claim=automation_claim,
             platform_name=str(request["platform_name"]),
-            time_policy_version=snapshot_time_context.time_policy_version,
+            time_policy_versions=snapshot_policy_versions,
+            platform_trade_dates=snapshot_trade_dates,
             now=now,
         )
         _assert_no_unimported_listing_write(connection, batch_id)
@@ -410,14 +423,16 @@ def _validate_automation_replay_binding(
     *,
     automation_claim: AutomationRunClaim | None,
     platform_name: str,
-    time_policy_version: str,
+    time_policy_versions: frozenset[str],
+    platform_trade_dates: frozenset[str],
 ) -> None:
     _validate_automation_listing_sync_envelope(
         connection,
         binding=binding,
         automation_claim=automation_claim,
         platform_name=platform_name,
-        time_policy_version=time_policy_version,
+        time_policy_versions=time_policy_versions,
+        platform_trade_dates=platform_trade_dates,
         require_live_claim=False,
     )
 
@@ -428,7 +443,8 @@ def _validate_automation_listing_sync_import(
     binding,
     automation_claim: AutomationRunClaim | None,
     platform_name: str,
-    time_policy_version: str,
+    time_policy_versions: frozenset[str],
+    platform_trade_dates: frozenset[str],
     now: datetime,
 ) -> None:
     _validate_automation_listing_sync_envelope(
@@ -436,7 +452,8 @@ def _validate_automation_listing_sync_import(
         binding=binding,
         automation_claim=automation_claim,
         platform_name=platform_name,
-        time_policy_version=time_policy_version,
+        time_policy_versions=time_policy_versions,
+        platform_trade_dates=platform_trade_dates,
         require_live_claim=True,
     )
     if binding is None or automation_claim is None:
@@ -459,7 +476,8 @@ def _validate_automation_listing_sync_envelope(
     binding,
     automation_claim: AutomationRunClaim | None,
     platform_name: str,
-    time_policy_version: str,
+    time_policy_versions: frozenset[str],
+    platform_trade_dates: frozenset[str],
     require_live_claim: bool,
 ) -> None:
     if binding is None:
@@ -488,9 +506,15 @@ def _validate_automation_listing_sync_envelope(
         raise ValidationError(
             "Automation Run 与 SYNC_STATUS 平台不一致。"
         )
-    if str(binding["time_policy_version"]) != time_policy_version:
+    run_policy_version = str(binding["time_policy_version"])
+    run_trade_date = str(binding["platform_trade_date"])
+    if time_policy_versions != frozenset({run_policy_version}):
         raise ValidationError(
             "Automation Run 与 SYNC_STATUS 时间策略不一致。"
+        )
+    if platform_trade_dates != frozenset({run_trade_date}):
+        raise ValidationError(
+            "Automation Run 与 SYNC_STATUS 平台交易日不一致。"
         )
     parent = connection.execute(
         """
@@ -506,14 +530,42 @@ def _validate_automation_listing_sync_envelope(
           )
           AND parents.platform_name = ?
           AND parents.time_policy_version = ?
+          AND parents.platform_trade_date = ?
         LIMIT 1
         """,
-        (run_id, platform_name, time_policy_version),
+        (run_id, platform_name, run_policy_version, run_trade_date),
     ).fetchone()
     if parent is None:
         raise ValidationError(
             "Automation SYNC_STATUS 缺少合法完整扫描父子关系。"
         )
+
+
+def _snapshot_operational_contexts(
+    snapshot: dict[str, Any],
+    *,
+    operational_time: OperationalTimeService,
+):
+    timestamp_values: list[object] = [
+        snapshot["scan_started_at"],
+        snapshot["scan_completed_at"],
+        snapshot["online_scan_started_at"],
+        snapshot["online_scan_completed_at"],
+        snapshot["waiting_scan_started_at"],
+        snapshot["waiting_scan_completed_at"],
+    ]
+    for raw_item in snapshot["items"]:
+        item = dict(raw_item)
+        for field_name in (
+            "online_observed_at",
+            "waiting_observed_at",
+        ):
+            if item.get(field_name):
+                timestamp_values.append(item[field_name])
+    return tuple(
+        operational_time.classify(_parse_aware(value))
+        for value in timestamp_values
+    )
 
 
 def mark_listing_sync_ack(

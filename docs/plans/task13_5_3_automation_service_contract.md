@@ -116,8 +116,11 @@ N 个。进程在创建 run 后、合并前崩溃时，下一轮必须重新扫�
 子 run 的成功或失败不参与商品覆盖判断。
 
 只有 `LISTING_STATUS_SCAN` 子 run 以 `SUCCESS` 完成，并且同一输入清单已经形成任务
-13 的 `VERIFIED` 双页权威快照及与该快照绑定的 v14 `ACCEPTED` 完整商品观察事实后，
-才把小扫描原子推进为 `MERGED`，并建立最终关系：
+13 的 `VERIFIED` 双页权威快照及与该快照显式绑定的 v14 `ACCEPTED` 完整商品观察事实
+后，才把小扫描原子推进为 `MERGED`。显式来源至少包含 snapshot ID、输入 manifest、
+result SHA、来源平台交易日和标准转换摘要；不得依赖
+`product-observation-{snapshot_id}` 等主键命名约定。最终判定还必须复核所有观察项
+的 `platform_trade_date` 与 run 冻结交易日一致，并建立最终关系：
 
 ```text
 LISTING_STATUS_SCAN 子 run --MERGED_RUN--> 小扫描 run
@@ -196,16 +199,26 @@ lease_expires_at > 当前写入时间
 当前商品观察导入和自动化绑定的任务 13 权威 `SYNC_STATUS` 导入均已落实这一合同；
 后续订单和结算事实入口必须复用同一事务校验函数。Automation
 `LISTING_STATUS_SCAN` 子 run 必须先把规范输入清单 SHA-256 不可变绑定到 run；
-同一清单只能绑定一个 run。Importer 在权威快照、投影、异常、人工复核和通知写入的
-同一事务内校验绑定、合法父子链、平台、时间策略和活动 claim。未绑定 Automation
-run 的人工任务 13 导入路径继续独立存在，不强制伪造自动化 claim。
+同一清单只能绑定一个 run。首次绑定必须在对应任务 13 `sync_status` 批次仍精确为
+`PREPARED`、平台一致、尚未发布且不存在 result ID、结果回执或快照时，在同一事务内
+完成；已经完成的人工历史清单不得事后绑定到新 Automation run。同一 run 的既有相同
+绑定可以幂等返回。
+
+Importer 在权威快照、投影、异常、人工复核和通知写入的同一事务内校验绑定、合法
+父子链、平台、时间策略、冻结 `platform_trade_date` 和活动 claim。扫描开始、完成、
+分页面及逐项观察任一时间跨越 18:00 并落入另一平台交易日时，不得作为该 run 的完整
+事实，也不得触发脉冲覆盖。未绑定 Automation run 的人工任务 13 导入路径继续独立
+存在，不强制伪造自动化 claim。
 
 完全相同且不会新增或替换事实的幂等重放可以在复核绑定信封后直接返回既有结果；
 任何不同内容仍必须持有有效 claim，且同一 Automation run 不得用另一批内容替换
 已接收的规范事实。
 
 涉及租约有效期、事实接收时刻等安全判定的当前时间必须来自应用服务注入的可信时钟；
-生产调用方不能通过导入参数指定 `now` 来延长或回拨 claim。
+生产调用方不能通过导入参数指定 `now` 来延长或回拨 claim。可信时钟只能在成功取得
+`BEGIN IMMEDIATE` 后采样，避免等待 SQLite 写锁期间租约已到期却继续使用锁前旧时间。
+领取、续租、完成、父子创建、输入清单绑定及事实导入均遵循这一原则；计划窗口的逻辑
+时间仍与安全租约时间分离。
 
 handler 异常只写入受限的稳定错误码：
 
@@ -277,6 +290,10 @@ data/runtime/automation_service/heartbeat.json
   `MERGED`；无 handler、重启能力丢失、无商品子任务、无事实、部分成功和失败均回退；
 - 自动化 `SYNC_STATUS` 清单不可变绑定、同事务 claim fencing、人工导入隔离及
   可信时钟；
+- 历史人工清单事后绑定拒绝、`17:55→18:05` 和逐项跨 18:00 拒绝；
+- snapshot ID、manifest、result SHA、交易日和标准转换摘要的显式不可变来源链，
+  且合法 observation ID 不受命名约定限制；
+- 安全时钟在取得 `BEGIN IMMEDIATE` 后采样；
 - 禁用 job、合法 `CHILD_ONLY` 父链与默认 job 静态漂移；
 - 子 run 在父 run 完成前不可领取，父失败时自动取消；
 - Runtime 时间策略热加载；

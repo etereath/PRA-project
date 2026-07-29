@@ -99,6 +99,7 @@ def _request(
     *,
     batch_id: str,
     attempt_id: str,
+    queued: bool = True,
 ) -> dict:
     manifest = prepare_listing_sync_batch(
         repository,
@@ -113,16 +114,17 @@ def _request(
         applet_uri="weixin://launchapplet/test",
         window_title=PLATFORM,
     )
-    with repository.connect_write() as connection, connection:
-        connection.execute(
-            """
-            UPDATE shadowbot_listing_action_batches
-            SET instruction_hash = ?, execution_attempt_id = ?,
-                status = 'QUEUED'
-            WHERE batch_id = ?
-            """,
-            (request["instruction_hash"], attempt_id, batch_id),
-        )
+    if queued:
+        with repository.connect_write() as connection, connection:
+            connection.execute(
+                """
+                UPDATE shadowbot_listing_action_batches
+                SET instruction_hash = ?, execution_attempt_id = ?,
+                    status = 'QUEUED'
+                WHERE batch_id = ?
+                """,
+                (request["instruction_hash"], attempt_id, batch_id),
+            )
     return request
 
 
@@ -264,10 +266,13 @@ def _result(
 def _bind_automation_listing_run(
     repository: SQLiteRuntimeRepository,
     request: dict,
+    *,
+    bind_manifest: bool = True,
+    scheduled_for: datetime | None = None,
 ) -> tuple[AutomationRepository, AutomationRunClaim]:
     automation = AutomationRepository(repository)
     now = datetime.now(UTC)
-    scheduled_for = datetime(2026, 7, 25, 3, 0, tzinfo=UTC)
+    scheduled = scheduled_for or datetime(2026, 7, 25, 3, 0, tzinfo=UTC)
     suffix = str(request["batch_id"])[-8:]
     parent_job = AutomationJob(
         job_id=f"FULL-{suffix}",
@@ -299,8 +304,8 @@ def _bind_automation_listing_run(
     automation.upsert_job(child_job, now=now)
     parent_run = automation.ensure_run(
         job=parent_job,
-        scheduled_for=scheduled_for,
-        time_context=OperationalTimeService().classify(scheduled_for),
+        scheduled_for=scheduled,
+        time_context=OperationalTimeService().classify(scheduled),
         initial_status=AutomationRunStatus.SCHEDULED,
         now=now,
     )[0]
@@ -329,11 +334,26 @@ def _bind_automation_listing_run(
         lease_seconds=3600,
     )
     assert child_claim is not None
-    automation.bind_run_input_manifest(
-        child_claim,
-        manifest_sha256=str(request["manifest_sha256"]),
-        now=now,
-    )
+    if bind_manifest:
+        automation.bind_run_input_manifest(
+            child_claim,
+            manifest_sha256=str(request["manifest_sha256"]),
+            now=now,
+        )
+        with repository.connect_write() as connection, connection:
+            connection.execute(
+                """
+                UPDATE shadowbot_listing_action_batches
+                SET instruction_hash = ?, execution_attempt_id = ?,
+                    status = 'QUEUED'
+                WHERE batch_id = ? AND status = 'PREPARED'
+                """,
+                (
+                    request["instruction_hash"],
+                    request["execution_attempt_id"],
+                    request["batch_id"],
+                ),
+            )
     return automation, child_claim
 
 
@@ -416,9 +436,16 @@ def test_automation_sync_requires_bound_live_claim_and_allows_noop_replay(
         tmp_path,
         batch_id="BATCH-AUTO-0001",
         attempt_id="ATTEMPT-AUTO-0001",
+        queued=False,
     )
     result = _result(request)
-    _, claim = _bind_automation_listing_run(repository, request)
+    automation, claim = _bind_automation_listing_run(repository, request)
+    rebound = automation.bind_run_input_manifest(
+        claim,
+        manifest_sha256=str(request["manifest_sha256"]),
+        now=datetime.now(UTC),
+    )
+    assert rebound.input_manifest_sha256 == request["manifest_sha256"]
 
     with pytest.raises(
         ValidationError,
@@ -461,6 +488,7 @@ def test_reclaimed_automation_owner_cannot_project_authoritative_status(
         tmp_path,
         batch_id="BATCH-AUTO-0002",
         attempt_id="ATTEMPT-AUTO-0002",
+        queued=False,
     )
     result = _result(request)
     _, old_claim = _bind_automation_listing_run(repository, request)
@@ -510,6 +538,97 @@ def test_reclaimed_automation_owner_cannot_project_authoritative_status(
             assert connection.execute(
                 f"SELECT COUNT(*) FROM {table_name}"
             ).fetchone()[0] == 0
+
+
+def test_completed_manual_manifest_cannot_be_bound_to_new_automation_run(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    request = _request(
+        repository,
+        tmp_path,
+        batch_id="BATCH-HISTORY-0001",
+        attempt_id="ATTEMPT-HISTORY-0001",
+    )
+    result = _result(request)
+    summary = import_listing_sync_result(
+        repository,
+        request=request,
+        result=result,
+        result_file_sha256="6" * 64,
+        source_result_path="manual-result.json",
+    )
+    automation, claim = _bind_automation_listing_run(
+        repository,
+        request,
+        bind_manifest=False,
+    )
+
+    assert summary["status"] == "VERIFIED"
+    with pytest.raises(
+        ValueError,
+        match="before publication or result acceptance",
+    ):
+        automation.bind_run_input_manifest(
+            claim,
+            manifest_sha256=str(request["manifest_sha256"]),
+            now=datetime.now(UTC),
+        )
+
+
+def test_pre_cutoff_automation_run_rejects_post_cutoff_snapshot(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    request = _request(
+        repository,
+        tmp_path,
+        batch_id="BATCH-CUTOFF-0001",
+        attempt_id="ATTEMPT-CUTOFF-0001",
+        queued=False,
+    )
+    result = _result(request)
+    snapshot = result["snapshot"]
+    snapshot.update(
+        {
+            "scan_started_at": "2026-07-25T09:55:00+00:00",
+            "scan_completed_at": "2026-07-25T10:05:00+00:00",
+            "online_scan_started_at": "2026-07-25T09:55:00+00:00",
+            "online_scan_completed_at": "2026-07-25T09:59:00+00:00",
+            "waiting_scan_started_at": "2026-07-25T10:00:00+00:00",
+            "waiting_scan_completed_at": "2026-07-25T10:05:00+00:00",
+        }
+    )
+    for item in snapshot["items"]:
+        if item["online_observed_at"]:
+            item["online_observed_at"] = "2026-07-25T09:58:00+00:00"
+        if item["waiting_observed_at"]:
+            item["waiting_observed_at"] = "2026-07-25T10:02:00+00:00"
+    result["started_at"] = snapshot["scan_started_at"]
+    result["ended_at"] = snapshot["scan_completed_at"]
+    result["result_payload_sha256"] = compute_listing_result_hash(result)
+    _, claim = _bind_automation_listing_run(
+        repository,
+        request,
+        scheduled_for=datetime(2026, 7, 25, 9, 55, tzinfo=UTC),
+    )
+
+    with pytest.raises(ValidationError, match="平台交易日不一致"):
+        import_listing_sync_result(
+            repository,
+            request=request,
+            result=result,
+            result_file_sha256="7" * 64,
+            source_result_path="cross-cutoff-result.json",
+            automation_claim=claim,
+        )
+    with repository.connect_read() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM shadowbot_listing_result_receipts"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT COUNT(*) FROM listing_sync_snapshots"
+        ).fetchone()[0] == 0
 
 
 def test_failed_snapshot_is_recorded_without_projection(tmp_path: Path) -> None:

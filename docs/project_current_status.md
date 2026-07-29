@@ -519,9 +519,15 @@ Code Review 后的高中低风险问题已完成修复，系统冒烟测试、�
     绑定，权威 `SYNC_STATUS` 在写快照、投影、异常、复核和通知的同一事务内执行
     claim fencing，同时保留未绑定批次的人工导入路径；事实接收时间改用应用服务
     可信时钟。
-    真实扫描 handler、Runtime DB 迁移和生产部署仍未执行。第三轮修复后 Automation
-    专项 `43 passed`，完整回归为
-    `840 passed, 3 skipped, 97 subtests passed`；系统冒烟、构建、包边界、
+    第四轮评审进一步封闭跨交易日和来源替换：自动化快照、页面及逐项观察必须全部
+    匹配 run 冻结的 `platform_trade_date`，跨 18:00 完整扫描在权威写入前拒绝；
+    manifest 首次绑定只允许尚未发布、无任何结果事实的 `PREPARED sync_status`
+    批次，历史人工完成批次不能事后绑定。v14 观察通过 append-only 来源字段显式绑定
+    snapshot、manifest、result SHA、交易日和标准转换摘要，最终覆盖不再依赖批次 ID
+    命名；所有租约安全时钟均在取得 `BEGIN IMMEDIATE` 后采样。
+    真实扫描 handler、Runtime DB 迁移和生产部署仍未执行。第四轮修复后 Automation
+    专项 `44 passed`，第四轮涉及模块 `174 passed`，完整回归为
+    `844 passed, 3 skipped, 97 subtests passed`；系统冒烟、构建、包边界、
     secret scan、仓库外 wheel 安装和 Windows ShadowBot 静态夹具门禁均通过。
     下一阶段边界见
     [13.5-3 实施报告](reports/task13_5_3_automation_service.md)。

@@ -111,11 +111,20 @@ FULL_MARKET_SCAN
 不得在 schema migration 中从旧快照猜测生成。
 
 自动化执行时，`LISTING_STATUS_SCAN` 子 run 必须先把任务 13 输入清单 SHA-256
-不可变绑定到自身；同一清单不得绑定多个 Automation run。权威 `SYNC_STATUS`
-Importer 必须在快照、商品投影、异常、人工复核和通知写入的同一事务内校验当前
-Automation claim、合法父子链、平台及时间策略。未绑定 Automation run 的人工任务
-13 导入继续走独立人工模块，不要求 Automation claim；完全相同的既有回执重放可在
-验证绑定信封后直接返回，但不得新增或替换事实。
+不可变绑定到自身；同一清单不得绑定多个 Automation run。首次绑定只允许对应
+`sync_status` 批次仍为 `PREPARED`、平台一致且不存在 result ID、结果回执或快照；
+已完成的人工历史批次不得事后绑定。权威 `SYNC_STATUS` Importer 必须在快照、商品
+投影、异常、人工复核和通知写入的同一事务内校验当前 Automation claim、合法父子链、
+平台、时间策略及冻结平台交易日。未绑定 Automation run 的人工任务 13 导入继续走
+独立人工模块，不要求 Automation claim；完全相同的既有回执重放可在验证绑定信封后
+直接返回，但不得新增或替换事实。
+
+任务 13 快照转换为 v14 观察时，append-only `requested_scope_json` 必须显式保存
+`source_snapshot_id`、`source_manifest_sha256`、`source_result_sha256`、
+`source_platform_trade_date` 和 `source_conversion_sha256`。Importer 必须从 Runtime
+重新读取源 snapshot 及逐项事实，重算标准转换并比较内容；最终覆盖不得依赖 observation
+batch ID 的字符串命名。扫描批次或任一商品观察跨越 18:00 落入另一平台交易日时，
+自动化事实必须拒绝，不得覆盖旧交易日脉冲。
 
 ## 5. 接受条件
 
@@ -123,7 +132,8 @@ Automation claim、合法父子链、平台及时间策略。未绑定 Automatio
 - VERIFIED、UNMAPPED、AMBIGUOUS、DISABLED 均有测试。
 - 小扫描缺席不产生离线推断。
 - 大扫描两页完整性继续满足任务 13 合同。
-- 跨 18:00/20:00 的逐项观察归属正确。
+- 跨 20:00 的卖家作业阶段归属正确；自动化完整扫描跨 18:00 时明确拒绝，不把下一
+  平台交易日事实归入旧 run。
 - 每项 `observed_at` 必须落在批次起止区间内；价格必须为有限、规范化的正数；
   已接受或部分接受的商品项必须提供 `sha256:<64 位小写十六进制>` 证据。
 - 同一 `automation_run_id` 内的重复结果按内容 hash 幂等，不跨批次累加；不同
@@ -134,6 +144,8 @@ Automation claim、合法父子链、平台及时间策略。未绑定 Automatio
 - 完整扫描对 10 分钟小扫描的最终覆盖只能由成功且已接受上述权威事实的
   `LISTING_STATUS_SCAN` 子 run 触发；父 run 成功本身不构成覆盖，`ORDER_SCAN`
   结果也不参与覆盖判断。
+- 已完成人工 manifest 不可事后绑定；显式来源字段及标准转换摘要不可伪造，合法
+  observation batch ID 无需遵守特定命名。
 - 临时数据库、完整 pytest、系统冒烟、wheel 和 CI 通过。
 
 本合同不授权真实 COMMIT、普通自动业务任务或 `SYSTEM_EMERGENCY`。

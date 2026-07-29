@@ -48,6 +48,17 @@
   导入继续保持独立。
 - 商品观察接收时间改由应用服务注入的可信时钟产生，生产调用方不再能够通过 `now`
   参数影响租约判定。
+- 第四轮评审后把事实交易日提升为强门禁：任务 13 快照的扫描、分页面和逐项时间，
+  以及 v14 批次与逐项观察，必须全部属于 run 冻结的 `platform_trade_date`；
+  `17:55→18:05` 等跨 18:00 扫描在任何权威写入前拒绝，最终覆盖再次复核逐项交易日。
+- 输入清单首次绑定只允许真实、平台一致且仍为 `PREPARED` 的 `sync_status` 批次，
+  并要求尚无 result ID、结果回执或快照；已完成的人工历史清单不能事后绑定到新 run。
+- snapshot 与 v14 观察改用 append-only `requested_scope_json` 中的 snapshot ID、
+  manifest、result SHA、来源交易日和标准转换摘要显式关联。Importer 从 Runtime
+  重读源快照并重算逐项标准转换，最终覆盖不再依赖 observation batch ID 命名。
+- 安全时钟在取得 `BEGIN IMMEDIATE` 后才采样；Automation 领取、续租、完成、父子
+  创建、清单绑定以及两个事实 Importer 使用同一原则，等待写锁期间到期的 owner
+  不能凭锁前旧时间继续写入。
 
 ## 2. 复用与未改写
 
@@ -86,6 +97,11 @@ CLI 当前明确报告 `SCHEDULER_ONLY`。它可以安全创建到期账本、�
 - 事实写入同事务租约 fencing、旧 owner 拒绝和同 run 规范事实保护；
 - 自动化输入清单不可变绑定、权威 `SYNC_STATUS` 同事务 fencing 与人工导入隔离；
 - 应用服务可信时钟，生产调用方不可指定安全判定时间；
+- 跨 18:00 批次与逐项交易日拒绝、最终覆盖交易日纵深复核；
+- 已完成人工清单事后绑定拒绝及 PREPARED 首绑原子门禁；
+- 任意 observation ID 下的显式 snapshot/manifest/result/交易日/转换摘要来源链，
+  以及篡改标准转换拒绝；
+- `BEGIN IMMEDIATE` 后安全时钟采样；
 - Automation UI handler 执行期的跨实例互斥及 v4/v5 写锁反向门禁；
 - 公开领取入口门禁与父 run 终态驱动的子 run 领取/取消；
 - 单实例锁、UTF-8 原子心跳和正式 CLI。
@@ -93,9 +109,11 @@ CLI 当前明确报告 `SCHEDULER_ONLY`。它可以安全创建到期账本、�
 验收结果：
 
 - `python -m pytest -q tests/test_automation_service.py`：
-  `43 passed`；
+  `44 passed`；
+- 第四轮涉及模块：
+  `174 passed`；
 - `python -m pytest -q`：
-  `840 passed, 3 skipped, 97 subtests passed`；
+  `844 passed, 3 skipped, 97 subtests passed`；
 - 系统冒烟：16 项通过、0 项失败；
 - 本次新增/修改 Python 文件 Ruff：PASS；
 - `compileall`：PASS；
