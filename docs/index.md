@@ -2,7 +2,7 @@
 
 本文档是当前项目文档入口。项目说明文本以中文为主，英文键名和代码标识保持原样。
 
-运行态业务数据以 SQLite 为中心，当前结构版本为 v13。v9 使用“平台 + 品种 + 等级”作为 `listing_status` 业务身份，v10 将任务旧价结构化，v11 增加单次请求的 ShadowBot 多商品 COMMIT 批次账本，v12 增加逐商品操作/尝试身份、活动写锁、观察时间和技术回执，v13 增加公共批次注册表、通用上下架 operation、两页快照、页面异常和 v5 动作账本。Excel 继续承担商品、规则等主数据输入，不是运行态任务数据库。
+运行态业务数据以 SQLite 为中心，当前代码结构版本为 v14。v9 使用“平台 + 品种 + 等级”作为 `listing_status` 业务身份，v10 将任务旧价结构化，v11 增加单次请求的 ShadowBot 多商品 COMMIT 批次账本，v12 增加逐商品操作/尝试身份、活动写锁、观察时间和技术回执，v13 增加公共批次注册表、通用上下架 operation、两页快照、页面异常和 v5 动作账本；v14 增加双时间轴、Automation 账本、不可变观察、销售日结、Incident 和任务来源字段。真实 Runtime DB 需按迁移手册另行升级。Excel 继续承担商品、规则等主数据输入，不是运行态任务数据库。
 
 ## 当前状态与入口
 
@@ -11,6 +11,10 @@
 - [reports/task13_final_handoff_20260727.md](reports/task13_final_handoff_20260727.md)：任务13当前实现、四维状态模型、v5上下架合同、实机证据、运行边界和审查步骤的最终交接入口。
 - [plans/task13_5_issue20_alignment_review.md](plans/task13_5_issue20_alignment_review.md)：GitHub Issue #20 与本地任务13.5计划的权威层级、差异裁决、Web实测补充和任务14新边界。
 - [plans/task13_5_0_kickoff_baseline.md](plans/task13_5_0_kickoff_baseline.md)：任务13.5-0 的 main/Schema/Worker/证据黄金基线、部署后完整 READ_ONLY、全脚本分类、禁止重写资产、合同草案、子PR顺序、验收清单和回滚点。
+- [plans/task13_5_1_quality_and_settlement_contract_review.md](plans/task13_5_1_quality_and_settlement_contract_review.md)：任务13.5-1 已冻结合同；覆盖双时间轴、三个正交维度、六级数据质量、唯一 FINAL 日结状态机、v14 最小结构及迁移回滚，并授权在该边界内开始编码。
+- [reports/task13_5_1_runtime_schema_v14.md](reports/task13_5_1_runtime_schema_v14.md)：任务13.5-1 双时间轴、Runtime Schema v14、迁移兼容、质量约束、日结版本状态机和本地验收结果。
+- [runtime_schema_v14_migration.md](runtime_schema_v14_migration.md)：真实 Runtime DB 的备份、副本迁移、健康检查、切换和回滚门禁。
+- [plans/task13_5_2_mapping_and_scan_input_contract.md](plans/task13_5_2_mapping_and_scan_input_contract.md)：任务13.5-2 商品映射、ONLINE_PULSE、FULL_MARKET_SCAN 商品子结果和 v14 不可变观察输入合同。
 - [plans/task13_5_operational_closed_loop_and_web_rewrite.md](plans/task13_5_operational_closed_loop_and_web_rewrite.md)：任务13.5双时间轴、自动扫描、历史订单观察、销售日结、S0–S4、受控紧急保护、任务来源对齐和Web主控重写实施计划。
 - [plans/task13_5_web_current_state_audit_20260729.md](plans/task13_5_web_current_state_audit_20260729.md)：带精确时间、main SHA、Runtime DB脱敏快照、浏览器/视口/角色、路由、页面规模和DOM hash的独立Web现状审计。
 - [reports/task12_review_remediation_20260723.md](reports/task12_review_remediation_20260723.md)：针对任务12审查问题的接续修复记录；以该文档说明 v12 合同、原子导入和待补实机证据，不覆盖原交接报告。

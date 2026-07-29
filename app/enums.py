@@ -122,6 +122,95 @@ class TradePhase(str, Enum):
     CLOSED = "closed"
 
 
+class SellerPhase(str, Enum):
+    """Operational phase on the seller's 20:00-to-20:00 work day."""
+
+    NORMAL_SALES = "NORMAL_SALES"
+    PEAK_SALES = "PEAK_SALES"
+    DELIVERY_OVERLAP = "DELIVERY_OVERLAP"
+
+
+class FactSource(str, Enum):
+    """How an accepted sales fact was obtained."""
+
+    ORDER_OBSERVED = "ORDER_OBSERVED"
+    SCAN_ESTIMATED = "SCAN_ESTIMATED"
+
+
+class DataQualityLevel(str, Enum):
+    """Frozen six-level sales data quality vocabulary."""
+
+    ORDER_COMPLETE = "ORDER_COMPLETE"
+    ORDER_PARTIAL = "ORDER_PARTIAL"
+    SCAN_ESTIMATED_HIGH = "SCAN_ESTIMATED_HIGH"
+    SCAN_ESTIMATED_MEDIUM = "SCAN_ESTIMATED_MEDIUM"
+    SCAN_ESTIMATED_LOW = "SCAN_ESTIMATED_LOW"
+    UNAVAILABLE = "UNAVAILABLE"
+
+
+class SummaryStatus(str, Enum):
+    """Single forward-only platform trade-day summary lifecycle."""
+
+    PROVISIONAL = "PROVISIONAL"
+    OBSERVED = "OBSERVED"
+    RECONCILED = "RECONCILED"
+    FINAL = "FINAL"
+
+
+class TaskOriginType(str, Enum):
+    """Origin boundary for manual, automation, and future emergency tasks."""
+
+    MANUAL = "MANUAL"
+    AUTOMATION = "AUTOMATION"
+    SYSTEM_EMERGENCY = "SYSTEM_EMERGENCY"
+    LEGACY = "LEGACY"
+
+
+class AutomationRunStatus(str, Enum):
+    """Canonical automation run states shared by storage and operations UI."""
+
+    SCHEDULED = "SCHEDULED"
+    RUNNING = "RUNNING"
+    SUCCESS = "SUCCESS"
+    PARTIAL = "PARTIAL"
+    FAILED = "FAILED"
+    MISSED = "MISSED"
+    MERGED = "MERGED"
+    SKIPPED = "SKIPPED"
+    CANCELLED = "CANCELLED"
+
+
+class IncidentCategory(str, Enum):
+    """Stable operational incident categories frozen by task 13.5."""
+
+    PLATFORM_LOGIN = "PLATFORM_LOGIN"
+    PLATFORM_NETWORK = "PLATFORM_NETWORK"
+    PAGE_STRUCTURE = "PAGE_STRUCTURE"
+    SCAN_INCOMPLETE = "SCAN_INCOMPLETE"
+    WORKER_UNAVAILABLE = "WORKER_UNAVAILABLE"
+    QUEUE_BACKLOG = "QUEUE_BACKLOG"
+    PRODUCT_MAPPING = "PRODUCT_MAPPING"
+    PRICE_ANOMALY = "PRICE_ANOMALY"
+    INVENTORY_ANOMALY = "INVENTORY_ANOMALY"
+    ORDER_PAGE_UNAVAILABLE = "ORDER_PAGE_UNAVAILABLE"
+    ORDER_DATA_INCONSISTENT = "ORDER_DATA_INCONSISTENT"
+    SALES_ESTIMATE_LOW_CONFIDENCE = "SALES_ESTIMATE_LOW_CONFIDENCE"
+    NOTIFICATION_FAILURE = "NOTIFICATION_FAILURE"
+    WRITE_UNKNOWN = "WRITE_UNKNOWN"
+
+
+class IncidentStatus(str, Enum):
+    """Frozen lifecycle for operational incident handling."""
+
+    OPEN = "OPEN"
+    RETRYING = "RETRYING"
+    WAITING_HUMAN = "WAITING_HUMAN"
+    ACKNOWLEDGED = "ACKNOWLEDGED"
+    AUTO_PROTECTING = "AUTO_PROTECTING"
+    RESOLVED = "RESOLVED"
+    CLOSED = "CLOSED"
+
+
 class ShortageRisk(str, Enum):
     LOW = "low"
     MANAGEABLE = "manageable"

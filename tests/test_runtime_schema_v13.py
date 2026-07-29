@@ -623,7 +623,7 @@ def test_v13_new_database_has_exact_schema_and_nullable_action_prices(
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 
-def test_v12_to_v13_migration_preserves_v4_ledgers_and_unknown_lock(
+def test_v12_to_latest_migration_preserves_v4_ledgers_and_unknown_lock(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "runtime-v12.sqlite3"
@@ -633,7 +633,9 @@ def test_v12_to_v13_migration_preserves_v4_ledgers_and_unknown_lock(
     repository = SQLiteRuntimeRepository(path)
     repository.init_schema()
 
-    assert repository.schema_versions() == list(range(1, 14))
+    assert repository.schema_versions() == list(
+        range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1)
+    )
     health = repository.check_schema_health()
     assert health.ok, health.summary
     after = _old_digests(path)
@@ -659,6 +661,24 @@ def test_v12_to_v13_migration_preserves_v4_ledgers_and_unknown_lock(
             "sha256:approved-unknown",
             "sha256:approved-verified",
         }
+        migrated_tasks = connection.execute(
+            """
+            SELECT origin_type, platform_trade_date,
+                   seller_operation_date, seller_phase,
+                   time_policy_version
+            FROM tasks ORDER BY task_id
+            """
+        ).fetchall()
+        assert {
+            str(row["origin_type"]) for row in migrated_tasks
+        } == {"LEGACY"}
+        assert all(
+            row["platform_trade_date"] is None
+            and row["seller_operation_date"] is None
+            and row["seller_phase"] is None
+            and row["time_policy_version"] is None
+            for row in migrated_tasks
+        )
         registry = connection.execute(
             """
             SELECT batch_id, batch_type, contract_version, platform_name

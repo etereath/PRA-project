@@ -6,10 +6,16 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from app.enums import TaskActionType, TaskStatus
+from openpyxl import load_workbook
+
+from app.enums import TaskActionType, TaskOriginType, TaskStatus
 from app.exceptions import ValidationError
 from app.models import Task
-from app.repositories.workbook_repository import export_tasks
+from app.repositories.workbook_repository import (
+    TASK_HEADERS,
+    export_tasks,
+    load_tasks,
+)
 from app.services.inventory_planning import InventoryPlanningService
 from app.services.manual_intervention import ManualInterventionService
 from app.services.workflow import ManualInterventionInputs, list_manual_intervention_tasks, resolve_manual_intervention_task
@@ -24,12 +30,47 @@ def _manual_task(task_id: str = "TASK-001") -> Task:
         priority=3,
         task_status=TaskStatus.MANUAL_REVIEW,
         created_at=datetime(2026, 5, 3, 12, 0, tzinfo=timezone.utc),
+        origin_type=TaskOriginType.MANUAL,
+        origin_ref_id=f"test-harness:manual-strategy:{task_id}",
         target_price=Decimal("12.00"),
         result_message="needs review",
     )
 
 
 class ManualAndStrategyTests(unittest.TestCase):
+    def test_legacy_task_workbook_does_not_guess_manual_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "legacy_tasks.xlsx"
+            export_tasks(path, [_manual_task("TASK-LEGACY")])
+            workbook = load_workbook(path)
+            sheet = workbook.active
+            origin_column = TASK_HEADERS.index("origin_type") + 1
+            for _ in range(4):
+                sheet.delete_cols(origin_column)
+            workbook.save(path)
+
+            loaded = load_tasks(path)
+
+            self.assertEqual(len(loaded), 1)
+            self.assertIs(loaded[0].origin_type, TaskOriginType.LEGACY)
+            self.assertIsNone(loaded[0].origin_ref_id)
+
+    def test_current_manual_task_workbook_requires_origin_reference(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "manual_tasks.xlsx"
+            export_tasks(path, [_manual_task("TASK-MISSING-REF")])
+            workbook = load_workbook(path)
+            sheet = workbook.active
+            origin_ref_column = TASK_HEADERS.index("origin_ref_id") + 1
+            sheet.cell(row=2, column=origin_ref_column).value = None
+            workbook.save(path)
+
+            with self.assertRaisesRegex(
+                ValidationError,
+                "MANUAL requires origin_ref_id",
+            ):
+                load_tasks(path)
+
     def test_inventory_strategy_can_switch(self) -> None:
         conservative = InventoryPlanningService(strategy_name="conservative_v1").build_inventory_plan(
             product=type("ProductLike", (), {"product_name": "rose", "grade": "A", "current_stock": 20})(),
@@ -66,6 +107,8 @@ class ManualAndStrategyTests(unittest.TestCase):
                 priority=1,
                 task_status=TaskStatus.PENDING,
                 created_at=datetime(2026, 5, 3, 12, 0, tzinfo=timezone.utc),
+                origin_type=TaskOriginType.MANUAL,
+                origin_ref_id="test-harness:manual-strategy:TASK-002",
             ),
         ]
         open_tasks = service.list_open_tasks(tasks)
@@ -89,6 +132,11 @@ class ManualAndStrategyTests(unittest.TestCase):
             source = Path(tmpdir) / "tasks.xlsx"
             output = Path(tmpdir) / "resolved_tasks.xlsx"
             export_tasks(source, [_manual_task("TASK-100")])
+            round_tripped = load_tasks(source)
+            self.assertEqual(
+                round_tripped[0].origin_type,
+                TaskOriginType.MANUAL,
+            )
 
             open_tasks = list_manual_intervention_tasks(source)
             self.assertEqual(len(open_tasks), 1)

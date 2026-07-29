@@ -17,6 +17,7 @@ from app.enums import (
     NotificationOutboxStatus,
     ReviewTaskStatus,
     TaskActionType,
+    TaskOriginType,
     TaskStatus,
 )
 from app.exceptions import (
@@ -90,6 +91,8 @@ def _source_task(task_id: str) -> Task:
         priority=2,
         task_status=TaskStatus.MANUAL_REVIEW,
         created_at=datetime(2026, 7, 17, 9, 0),
+        origin_type=TaskOriginType.MANUAL,
+        origin_ref_id=f"test-harness:notification-outbox:{task_id}",
         trade_date=datetime(2026, 7, 17).date(),
         scope_type="global",
         scope_key="2026-07-17",

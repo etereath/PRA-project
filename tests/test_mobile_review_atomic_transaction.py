@@ -13,7 +13,12 @@ from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
-from app.enums import ReviewTaskStatus, TaskActionType, TaskStatus
+from app.enums import (
+    ReviewTaskStatus,
+    TaskActionType,
+    TaskOriginType,
+    TaskStatus,
+)
 from app.exceptions import MobileReviewErrorCode, MobileReviewTransactionError
 from app.models import Task
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository, _is_sqlite_concurrency_error
@@ -36,6 +41,8 @@ def _task(
         priority=1,
         task_status=status,
         created_at=datetime(2026, 7, 15, 9, 0),
+        origin_type=TaskOriginType.MANUAL,
+        origin_ref_id=f"test-harness:mobile-review:{task_id}",
         result_message="needs review",
         trade_date=date(2026, 7, 15),
         scope_type="task",

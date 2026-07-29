@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from uuid import uuid4
 
-from app.enums import TaskActionType, TaskStatus, TradePhase
+from app.enums import TaskActionType, TaskOriginType, TaskStatus, TradePhase
 from app.listing_identity import listing_identity_key
 from app.models import (
     ColdStorageStatus,
@@ -70,7 +70,15 @@ class TaskGenerationService:
         | None = None,
         platform_listing_states: dict[tuple[str, str, str], str] | None = None,
         ignored_candidates: list[IgnoredTaskCandidate] | None = None,
+        origin_ref_id: str | None = None,
     ) -> list[Task]:
+        source_run_id = (
+            str(origin_ref_id).strip()
+            if origin_ref_id is not None
+            else f"task-generation:{uuid4()}"
+        )
+        if not source_run_id:
+            raise ValueError("origin_ref_id must not be blank")
         if harvest_forecasts or price_forecasts or capacity_plan or cold_storage_status or trade_date:
             return self._generate_predictive_tasks(
                 products=list(products),
@@ -85,6 +93,7 @@ class TaskGenerationService:
                 platform_observations=platform_observations,
                 platform_listing_states=platform_listing_states,
                 ignored_candidates=ignored_candidates,
+                source_run_id=source_run_id,
             )
 
         tasks: list[Task] = []
@@ -151,7 +160,12 @@ class TaskGenerationService:
                     update_key = (product.internal_sku, TaskActionType.UPDATE_PRICE.value, platform_name)
                     if update_key not in dedupe:
                         dedupe.add(update_key)
-                        tasks.append(self._price_task(pricing_decision))
+                        tasks.append(
+                            self._price_task(
+                                pricing_decision,
+                                source_run_id=source_run_id,
+                            )
+                        )
 
             if listing_action:
                 action_type = TaskActionType(listing_action)
@@ -186,6 +200,8 @@ class TaskGenerationService:
                             priority=1 if action_type == TaskActionType.SET_OFFLINE else 5,
                             task_status=TaskStatus.PENDING,
                             created_at=utc_now(),
+                            origin_type=TaskOriginType.AUTOMATION,
+                            origin_ref_id=source_run_id,
                             target_price=(
                                 observed_listing[0]
                                 if action_type is TaskActionType.SET_ONLINE
@@ -261,6 +277,7 @@ class TaskGenerationService:
         | None,
         platform_listing_states: dict[tuple[str, str, str], str] | None,
         ignored_candidates: list[IgnoredTaskCandidate] | None,
+        source_run_id: str,
     ) -> list[Task]:
         self.inventory_planning_service = InventoryPlanningService(strategy_name=inventory_strategy)
         resolved_trade_date = self._resolve_trade_date(trade_date, harvest_forecasts, price_forecasts, capacity_plan)
@@ -276,7 +293,13 @@ class TaskGenerationService:
         dedupe: set[tuple[str, str, str]] = set()
 
         for review in self.capacity_planning_service.build_capacity_reviews(harvest_forecasts, capacity_plan):
-            self._append_review_task(tasks, dedupe, review, platform_name)
+            self._append_review_task(
+                tasks,
+                dedupe,
+                review,
+                platform_name,
+                source_run_id=source_run_id,
+            )
 
         forecast_total_qty = self.capacity_planning_service.predicted_total_harvest_qty(harvest_forecasts)
         committable_total_qty = 0
@@ -334,6 +357,8 @@ class TaskGenerationService:
                         priority=2,
                         task_status=TaskStatus.PENDING,
                         created_at=utc_now(),
+                        origin_type=TaskOriginType.AUTOMATION,
+                        origin_ref_id=source_run_id,
                         decision_trace=listing_decision.decision_trace | inventory_plan.decision_trace,
                         result_message=listing_decision.reason,
                     ),
@@ -356,6 +381,8 @@ class TaskGenerationService:
                         priority=3,
                         task_status=TaskStatus.MANUAL_REVIEW,
                         created_at=utc_now(),
+                        origin_type=TaskOriginType.AUTOMATION,
+                        origin_ref_id=source_run_id,
                         target_price=pricing_decision.target_price,
                         pricing_source=pricing_decision.pricing_source,
                         decision_trace=pricing_decision.decision_trace,
@@ -399,6 +426,8 @@ class TaskGenerationService:
                         priority=1,
                         task_status=TaskStatus.PENDING,
                         created_at=utc_now(),
+                        origin_type=TaskOriginType.AUTOMATION,
+                        origin_ref_id=source_run_id,
                         target_status="offline",
                         decision_trace=listing_decision.decision_trace,
                         result_message=listing_decision.reason,
@@ -444,6 +473,8 @@ class TaskGenerationService:
                         priority=5,
                         task_status=TaskStatus.PENDING,
                         created_at=utc_now(),
+                        origin_type=TaskOriginType.AUTOMATION,
+                        origin_ref_id=source_run_id,
                         expected_old_price=(
                             observed_listing[0]
                             if observed_listing is not None
@@ -499,6 +530,8 @@ class TaskGenerationService:
                         priority=10,
                         task_status=TaskStatus.PENDING,
                         created_at=utc_now(),
+                        origin_type=TaskOriginType.AUTOMATION,
+                        origin_ref_id=source_run_id,
                         target_price=pricing_decision.target_price,
                         pricing_source=pricing_decision.pricing_source,
                         decision_trace=pricing_decision.decision_trace,
@@ -523,12 +556,23 @@ class TaskGenerationService:
                 committable_total_qty=committable_total_qty,
                 cold_storage_status=cold_storage_status,
             ):
-                self._append_review_task(tasks, dedupe, review, platform_name)
+                self._append_review_task(
+                    tasks,
+                    dedupe,
+                    review,
+                    platform_name,
+                    source_run_id=source_run_id,
+                )
 
         tasks.sort(key=lambda item: (item.priority, item.internal_sku, item.action_type.value))
         return tasks
 
-    def _price_task(self, pricing_decision: FinalPricingDecision) -> Task:
+    def _price_task(
+        self,
+        pricing_decision: FinalPricingDecision,
+        *,
+        source_run_id: str,
+    ) -> Task:
         return Task(
             task_id=self._task_id(),
             internal_sku=pricing_decision.internal_sku,
@@ -537,6 +581,8 @@ class TaskGenerationService:
             priority=10,
             task_status=TaskStatus.PENDING,
             created_at=utc_now(),
+            origin_type=TaskOriginType.AUTOMATION,
+            origin_ref_id=source_run_id,
             expected_old_price=pricing_decision.expected_old_price,
             target_price=pricing_decision.final_price,
             pricing_source=pricing_decision.pricing_source,
@@ -627,6 +673,8 @@ class TaskGenerationService:
         dedupe: set[tuple[str, str, str]],
         review: ReviewRequirement,
         platform_name: str,
+        *,
+        source_run_id: str,
     ) -> None:
         self._append_task(
             tasks,
@@ -639,6 +687,8 @@ class TaskGenerationService:
                 priority=2,
                 task_status=TaskStatus.PENDING,
                 created_at=utc_now(),
+                origin_type=TaskOriginType.AUTOMATION,
+                origin_ref_id=source_run_id,
                 decision_trace=review.details,
                 result_message=review.reason,
                 required_by=review.required_by,

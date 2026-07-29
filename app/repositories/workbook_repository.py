@@ -9,7 +9,15 @@ from uuid import uuid4
 
 from openpyxl import Workbook, load_workbook
 
-from app.enums import ListingStrategy, PricingMethod, PricingSource, RoundingRule, TaskActionType, TaskStatus
+from app.enums import (
+    ListingStrategy,
+    PricingMethod,
+    PricingSource,
+    RoundingRule,
+    TaskActionType,
+    TaskOriginType,
+    TaskStatus,
+)
 from app.exceptions import TableValidationError, TableValidationIssue, ValidationError
 from app.models import (
     ColdStorageStatus,
@@ -145,6 +153,10 @@ TASK_HEADERS = [
     "priority",
     "task_status",
     "created_at",
+    "origin_type",
+    "origin_ref_id",
+    "approval_policy",
+    "policy_version",
     "expected_old_price",
     "target_price",
     "target_inventory",
@@ -549,6 +561,10 @@ def export_tasks(path: Path, tasks: Iterable[Task]) -> Path:
                 record["priority"],
                 record["task_status"],
                 record["created_at"],
+                record["origin_type"],
+                record["origin_ref_id"],
+                record["approval_policy"],
+                record["policy_version"],
                 serialize_decimal(task.expected_old_price),
                 serialize_decimal(task.target_price),
                 task.target_inventory,
@@ -574,6 +590,27 @@ def load_tasks(path: Path) -> list[Task]:
             parsed_trace = ast.literal_eval(str(raw_trace))
             if isinstance(parsed_trace, dict):
                 decision_trace = parsed_trace
+        origin_type = TaskOriginType(
+            _required_text(
+                row["origin_type"],
+                "origin_type",
+                row_number,
+            )
+        )
+        origin_ref_id = (
+            str(row["origin_ref_id"]).strip()
+            if row.get("origin_ref_id") not in ("", None)
+            else None
+        )
+        if (
+            origin_type
+            in {TaskOriginType.MANUAL, TaskOriginType.AUTOMATION}
+            and origin_ref_id is None
+        ):
+            raise ValidationError(
+                f"row {row_number}: {origin_type.value} requires "
+                "origin_ref_id"
+            )
         tasks.append(
             Task(
                 task_id=_required_text(row["task_id"], "task_id", row_number),
@@ -583,6 +620,16 @@ def load_tasks(path: Path) -> list[Task]:
                 priority=parse_int(row["priority"], f"tasks row {row_number} priority"),
                 task_status=TaskStatus(_required_text(row["task_status"], "task_status", row_number)),
                 created_at=datetime.fromisoformat(_required_text(row["created_at"], "created_at", row_number)),
+                origin_type=origin_type,
+                origin_ref_id=origin_ref_id,
+                approval_policy=str(
+                    row.get("approval_policy") or "UNSPECIFIED"
+                ),
+                policy_version=(
+                    str(row["policy_version"]).strip()
+                    if row.get("policy_version") not in ("", None)
+                    else None
+                ),
                 expected_old_price=parse_decimal(
                     row["expected_old_price"], f"tasks row {row_number} expected_old_price"
                 )
@@ -1242,10 +1289,26 @@ def _read_task_rows(path: Path) -> list[dict[str, object]]:
         ("expected_old_price", "required_by"),
         ("target_inventory", "expected_old_price", "required_by"),
     )
+    legacy_origin_headers = (
+        "origin_type",
+        "origin_ref_id",
+        "approval_policy",
+        "policy_version",
+    )
     legacy_header_variants = [
         [header for header in TASK_HEADERS if header not in omitted]
         for omitted in legacy_optional_headers
     ]
+    legacy_header_variants.extend(
+        [
+            [
+                header
+                for header in TASK_HEADERS
+                if header not in set(omitted) | set(legacy_origin_headers)
+            ]
+            for omitted in ((), *legacy_optional_headers)
+        ]
+    )
     if header_row in legacy_header_variants:
         accepted_headers = header_row
     elif header_row != TASK_HEADERS:
@@ -1259,6 +1322,10 @@ def _read_task_rows(path: Path) -> list[dict[str, object]]:
         row.setdefault("expected_old_price", None)
         row.setdefault("target_inventory", None)
         row.setdefault("required_by", None)
+        row.setdefault("origin_type", TaskOriginType.LEGACY.value)
+        row.setdefault("origin_ref_id", None)
+        row.setdefault("approval_policy", "UNSPECIFIED")
+        row.setdefault("policy_version", None)
         rows.append(row)
     return rows
 

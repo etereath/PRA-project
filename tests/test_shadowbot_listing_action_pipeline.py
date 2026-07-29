@@ -9,7 +9,12 @@ import sqlite3
 
 import pytest
 
-from app.enums import ReviewTaskStatus, TaskActionType, TaskStatus
+from app.enums import (
+    ReviewTaskStatus,
+    TaskActionType,
+    TaskOriginType,
+    TaskStatus,
+)
 from app.exceptions import ValidationError
 from app.listing_identity import listing_identity_key
 from app.models import ReviewTask, Task
@@ -106,6 +111,8 @@ def _insert_set_online_task(
         priority=5,
         task_status=TaskStatus.PENDING,
         created_at=now,
+        origin_type=TaskOriginType.MANUAL,
+        origin_ref_id=f"test-harness:listing-action:{task_id}",
         expected_old_price=Decimal("21.00"),
         target_price=Decimal("22.00"),
         target_inventory=8,
@@ -136,6 +143,8 @@ def _insert_set_offline_task(
         priority=5,
         task_status=TaskStatus.PENDING,
         created_at=now,
+        origin_type=TaskOriginType.MANUAL,
+        origin_ref_id=f"test-harness:listing-action:{task_id}",
         expected_old_price=Decimal("21.00"),
         target_price=None,
         target_inventory=None,

@@ -4,7 +4,14 @@ import unittest
 from datetime import datetime
 from decimal import Decimal
 
-from app.enums import ListingAction, ListingStrategy, PricingMethod, RoundingRule, TaskActionType
+from app.enums import (
+    ListingAction,
+    ListingStrategy,
+    PricingMethod,
+    RoundingRule,
+    TaskActionType,
+    TaskOriginType,
+)
 from app.exceptions import ValidationError
 from app.listing_identity import listing_identity_key
 from app.models import ListingRule, PriceRule, Product
@@ -99,13 +106,25 @@ class ListingAndTaskTests(unittest.TestCase):
             pricing_service=PricingService(ai_provider=NullAISuggestionProvider()),
             listing_service=ListingService(),
         )
-        tasks = generator.generate(self.products, self.price_rules, self.listing_rules)
+        tasks = generator.generate(
+            self.products,
+            self.price_rules,
+            self.listing_rules,
+            origin_ref_id="automation-run:rules-1",
+        )
         actions = {(task.internal_sku, task.action_type) for task in tasks}
         self.assertIn(("SKU-ONLINE", TaskActionType.UPDATE_PRICE), actions)
         self.assertIn(("SKU-ONLINE", TaskActionType.SET_ONLINE), actions)
         self.assertIn(("SKU-OFFLINE", TaskActionType.SET_OFFLINE), actions)
         self.assertIn(("SKU-DISABLED", TaskActionType.SET_OFFLINE), actions)
         self.assertNotIn(("SKU-DISABLED", TaskActionType.UPDATE_PRICE), actions)
+        self.assertTrue(
+            all(
+                task.origin_type is TaskOriginType.AUTOMATION
+                and task.origin_ref_id == "automation-run:rules-1"
+                for task in tasks
+            )
+        )
 
     def test_task_generation_filters_actions_by_current_platform_state(self) -> None:
         generator = TaskGenerationService(

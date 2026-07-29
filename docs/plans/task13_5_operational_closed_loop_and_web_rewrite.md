@@ -2,8 +2,10 @@
 
 - 计划日期：2026-07-28；按父 Issue 合并正文修订于 2026-07-29
 - 插入位置：任务 13 完成后、任务 14 开始前
-- 当前状态：13.5-0 独立分支已建立，黄金基线、部署 hash 和部署后 READ_ONLY 已收敛；
-  正式实现前等待文档 PR 与 13.5-1 合同评审
+- 当前状态：13.5-0 已通过 PR #21 合并；13.5-1
+  [双时间轴、质量与日结合同](task13_5_1_quality_and_settlement_contract_review.md)
+  已冻结并完成本地 v14 实现与验收；真实 Runtime DB 尚未迁移，下一阶段输入见
+  [13.5-2 商品映射与扫描合同](task13_5_2_mapping_and_scan_input_contract.md)
 - 适用对象：PRA Web 主控端、SQLite 运行态、自动化服务、ShadowBot 单平台执行端
 - 宏观权威：[GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20)
 - 对齐评估：[Issue #20 与本地实施计划对齐评估](task13_5_issue20_alignment_review.md)
@@ -376,15 +378,32 @@ supporting_observation_ids
 - `approval_policy`
 - `policy_version`
 
-`origin_type` 只能取：
+`MANUAL` 和 `AUTOMATION` 类新任务都必须提供非空、稳定的 `origin_ref_id`；人工
+入口使用 `web:`、`cli:`、`workbook:`、`acceptance:` 等可追溯前缀，测试工具使用
+`test-harness:`。历史记录缺少结构化来源时只标记 `LEGACY`，不得猜测。
 
-- `MANUAL_WEB`
-- `MANUAL_CLI`
-- `AUTOMATION_RULE`
-- `AUTOMATION_SCAN`
+核心 `origin_type` 只能取：
+
+- `MANUAL`
+- `AUTOMATION`
 - `SYSTEM_EMERGENCY`
-- `SYSTEM_RECONCILE`
 - `LEGACY`
+
+Issue #20 中的细分来源名称是运营语义，不扩张为第二套数据库枚举，固定映射为：
+
+| 运营语义 | 核心来源 |
+| --- | --- |
+| `MANUAL_WEB` | `MANUAL + web:<request-or-form-id>` |
+| `MANUAL_CLI` | `MANUAL + cli:<command-run-id>` |
+| `AUTOMATION_RULE` | `AUTOMATION + rule:<rule-or-run-id>` |
+| `AUTOMATION_SCAN` | `AUTOMATION + scan:<automation-run-id>` |
+| `SYSTEM_RECONCILE` | `AUTOMATION + reconcile:<execution-attempt-id>` |
+| `SYSTEM_EMERGENCY` | `SYSTEM_EMERGENCY + emergency:<authorized-run-id>` |
+| `LEGACY` | `LEGACY + NULL` |
+
+`origin_type` 与 `origin_ref_id` 创建后均不可修改。通用 Repository 不得新建
+`LEGACY` 或 `SYSTEM_EMERGENCY`；数据库不可通过 UPDATE 把既有任务改成这两种来源。
+`SYSTEM_EMERGENCY` 仍只能由 13.5-6 的专用授权入口创建。
 
 自动化运行使用 `automation_jobs`、`automation_runs`、`automation_run_events` 和
 `automation_run_links` 独立建模。扫描不是普通任务；只有扫描或规则产生的业务处置才
@@ -526,7 +545,8 @@ Web 主控端以运营人员的工作问题组织页面：
    - 展示日结版本、质量等级、峰值份额、18:00–20:00 早期销售和预测输入。
 4. **自动化**
    - 调度计划、最近运行、下一次运行、暂停/恢复、手工补跑。
-   - 运行状态使用 `RUNNING / SUCCESS / FAILED / MISSED / MERGED / SKIPPED`。
+   - 运行状态使用 `SCHEDULED / RUNNING / SUCCESS / PARTIAL / FAILED / MISSED /
+     MERGED / SKIPPED / CANCELLED`。
 5. **待处理**
    - 集中 Review、登录、映射、页面、HIGH/CRITICAL、UNKNOWN、通知失败和低置信估算。
    - 确认不等于解决；支持指派、安全重试、处置时间线和恢复证据。
@@ -609,8 +629,8 @@ Web 主控端以运营人员的工作问题组织页面：
 - 同一 schedule 在同一计划时间只允许生成一个逻辑运行。
 - 使用数据库租约或等效单实例机制，不能仅依赖进程内锁。
 - 每次运行记录 `scheduled_for / started_at / heartbeat_at / finished_at`。
-- 自动化运行对外状态使用 `RUNNING / SUCCESS / FAILED / MISSED / MERGED / SKIPPED`；
-  详细步骤结果保存在事件中。
+- 自动化运行对外状态使用 `SCHEDULED / RUNNING / SUCCESS / PARTIAL / FAILED /
+  MISSED / MERGED / SKIPPED / CANCELLED`；详细步骤结果保存在事件中。
 - 重试必须复用逻辑运行身份并增加 attempt，不得产生无法关联的重复运行。
 - 错过小扫描时只补最近一次；完整扫描和日结按交易日策略补跑，避免启动后形成任务风暴。
 - 运行超时后先判断是否进入平台副作用区；只读扫描可以安全终止，写操作沿用现有恢复状态机。

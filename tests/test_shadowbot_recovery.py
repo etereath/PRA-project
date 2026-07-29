@@ -12,7 +12,12 @@ from unittest.mock import patch
 
 import pytest
 
-from app.enums import ReviewTaskStatus, TaskActionType, TaskStatus
+from app.enums import (
+    ReviewTaskStatus,
+    TaskActionType,
+    TaskOriginType,
+    TaskStatus,
+)
 from app.exceptions import ValidationError
 from app.models import ReviewTask, ShadowBotExecutionAttempt, ShadowBotOperationLedger, Task
 from app.repositories.sqlite_connection import SQLiteConnectionConfig
@@ -86,6 +91,8 @@ def _task() -> Task:
         priority=1,
         task_status=TaskStatus.PENDING,
         created_at=datetime(2026, 7, 15, 8, 0),
+        origin_type=TaskOriginType.MANUAL,
+        origin_ref_id="test-harness:shadowbot-recovery:TASK-RECOVERY",
         target_price=Decimal("19.50"),
         trade_date=date(2026, 7, 15),
         scope_type="sku",

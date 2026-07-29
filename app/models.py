@@ -11,8 +11,10 @@ from app.enums import (
     PricingSource,
     ReviewTaskStatus,
     RoundingRule,
+    SellerPhase,
     ShortageRisk,
     TaskActionType,
+    TaskOriginType,
     TaskStatus,
     TradePhase,
 )
@@ -337,12 +339,32 @@ class Task:
     result_message: str = ""
     required_by: datetime | None = None
     trade_date: date | None = None
+    origin_type: TaskOriginType = field(kw_only=True)
+    origin_ref_id: str | None = None
+    approval_policy: str = "UNSPECIFIED"
+    policy_version: str | None = None
+    platform_trade_date: date | None = None
+    seller_operation_date: date | None = None
+    seller_phase: SellerPhase | None = None
+    time_policy_version: str | None = None
     scope_type: str = "sku"
     scope_key: str = ""
     dedupe_key: str = ""
     scheduled_at: datetime | None = None
     expires_at: datetime | None = None
     updated_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        if self.origin_type in {
+            TaskOriginType.MANUAL,
+            TaskOriginType.AUTOMATION,
+        }:
+            normalized_origin_ref = str(self.origin_ref_id or "").strip()
+            if not normalized_origin_ref:
+                raise ValueError(
+                    f"{self.origin_type.value} tasks require an origin_ref_id"
+                )
+            self.origin_ref_id = normalized_origin_ref
 
     def to_record(self) -> dict[str, Any]:
         data = asdict(self)
@@ -352,6 +374,20 @@ class Task:
         data["created_at"] = self.created_at.isoformat()
         data["required_by"] = self.required_by.isoformat() if self.required_by else None
         data["trade_date"] = self.trade_date.isoformat() if self.trade_date else None
+        data["origin_type"] = self.origin_type.value
+        data["platform_trade_date"] = (
+            self.platform_trade_date.isoformat()
+            if self.platform_trade_date
+            else None
+        )
+        data["seller_operation_date"] = (
+            self.seller_operation_date.isoformat()
+            if self.seller_operation_date
+            else None
+        )
+        data["seller_phase"] = (
+            self.seller_phase.value if self.seller_phase else None
+        )
         data["scheduled_at"] = self.scheduled_at.isoformat() if self.scheduled_at else None
         data["expires_at"] = self.expires_at.isoformat() if self.expires_at else None
         data["updated_at"] = self.updated_at.isoformat() if self.updated_at else None
