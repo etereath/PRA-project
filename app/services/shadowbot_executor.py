@@ -49,6 +49,11 @@ from app.services.shadowbot_listing_action_contract import (
     compute_listing_instruction_hash,
     validate_listing_action_request,
 )
+from app.shadowbot_contract_primitives import (
+    ORDER_SCAN_CONTRACT_VERSION,
+    normalize_order_scan_request,
+    order_scan_instruction_hash,
+)
 from app.utils import serialize_decimal, utc_now
 
 
@@ -229,12 +234,15 @@ class ShadowBotFileQueueRunner:
             is_multi_product = contract_version == 2
             is_commit_batch = contract_version == COMMIT_BATCH_CONTRACT_VERSION
             is_listing_action = contract_version == 5
+            is_order_scan = contract_version == ORDER_SCAN_CONTRACT_VERSION
             if is_multi_product:
                 _validate_multi_product_queue_request(payload)
             elif is_commit_batch:
                 validate_commit_batch_request(payload)
             elif is_listing_action:
                 validate_listing_action_request(payload)
+            elif is_order_scan:
+                normalize_order_scan_request(payload)
             else:
                 _validate_queue_request(payload)
             execution_attempt_id = str(payload["execution_attempt_id"])
@@ -245,6 +253,8 @@ class ShadowBotFileQueueRunner:
                 if is_commit_batch
                 else compute_listing_instruction_hash(payload)
                 if is_listing_action
+                else order_scan_instruction_hash(payload)
+                if is_order_scan
                 else compute_instruction_hash(payload)
             )
             supplied_instruction_hash = str(payload.get("instruction_hash") or "")

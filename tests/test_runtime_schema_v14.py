@@ -920,7 +920,7 @@ def test_v14_database_trigger_rejects_initial_final_and_status_skip(
                     quality_level = 'ORDER_COMPLETE',
                     summary_status = 'RECONCILED',
                     order_count = 1,
-                    seller_received_amount = '10.00'
+                    transaction_amount_total = '10.00'
                 WHERE summary_id = 'SUMMARY-SKIP'
                 """
             )
@@ -957,6 +957,68 @@ def test_v14_health_detects_missing_append_only_trigger(
     assert any(
         trigger_name in error for error in health.constraint_errors
     )
+
+
+def test_v14_replaces_empty_provisional_order_shape_in_place(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    with closing(repository.connect_write()) as connection, connection:
+        connection.execute(
+            """
+            ALTER TABLE order_observation_items
+            ADD COLUMN seller_received_amount TEXT
+            """
+        )
+
+    repository.init_schema()
+
+    with closing(repository.connect_read()) as connection:
+        item_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(order_observation_items)"
+            )
+        }
+        summary_columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(platform_trade_day_summaries)"
+            )
+        }
+    assert "order_transaction_amount" in item_columns
+    assert "seller_received_amount" not in item_columns
+    assert "transaction_amount_total" in summary_columns
+    assert repository.check_schema_health().ok
+
+
+def test_v14_refuses_to_guess_nonempty_provisional_order_facts(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    with closing(repository.connect_write()) as connection, connection:
+        _insert_append_only_fixture(connection)
+        connection.execute(
+            """
+            ALTER TABLE order_observation_items
+            ADD COLUMN seller_received_amount TEXT
+            """
+        )
+
+    with pytest.raises(RuntimeError, match="cannot be guessed"):
+        repository.init_schema()
+
+    with closing(repository.connect_read()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM order_observation_batches"
+        ).fetchone()[0] == 1
+        columns = {
+            str(row["name"])
+            for row in connection.execute(
+                "PRAGMA table_info(order_observation_items)"
+            )
+        }
+    assert "seller_received_amount" in columns
 
 
 def test_v14_health_detects_missing_task_origin_immutable_trigger(
@@ -1213,7 +1275,7 @@ def _insert_summary(
             seller_operation_date, seller_phase,
             scope_type, scope_key,
             fact_source, quality_level, summary_status,
-            sold_qty, order_count, seller_received_amount,
+            sold_qty, order_count, transaction_amount_total,
             quality_reason, source_proportions_json,
             input_manifest_sha256, mapping_version,
             algorithm_version, time_policy_version,
@@ -1373,14 +1435,14 @@ def _insert_append_only_fixture(connection) -> None:
         INSERT INTO order_observation_batches(
             observation_batch_id, automation_run_id,
             platform_name, requested_platform_trade_date,
-            capability_result, batch_status,
+            trade_day_status, capability_result, batch_status,
             scan_started_at, scan_completed_at,
             requested_range_json, scope_complete,
             end_marker_verified, content_sha256,
             time_policy_version, created_at
         ) VALUES (
             'ORDER-BATCH-1', 'RUN-RUNNING',
-            'platform', '2026-07-29',
+            'platform', '2026-07-29', 'CLOSED',
             'SUCCEEDED', 'ACCEPTED',
             ?, ?, '{}', 1, 1, 'sha256:order-batch',
             'CN_SINGLE_PLATFORM_2026_V1', ?
@@ -1392,18 +1454,20 @@ def _insert_append_only_fixture(connection) -> None:
         """
         INSERT INTO order_observation_items(
             observation_item_id, observation_batch_id,
-            platform_trade_date, platform_product_name,
+            platform_name, platform_trade_date, trade_day_status,
+            order_identity_fingerprint, occurrence_no,
+            order_created_at, platform_product_name,
             grade, internal_sku, mapping_status,
-            order_created_at, ordered_qty,
+            order_qty, order_transaction_amount,
             observed_at, seller_operation_date, seller_phase,
-            source_row_fingerprint, occurrence_no,
             raw_observation_sha256
         ) VALUES (
             'ORDER-ITEM-1', 'ORDER-BATCH-1',
-            '2026-07-29', 'Rose',
-            'A', 'SKU-1', 'VERIFIED',
-            ?, 1, ?, '2026-07-29', 'NORMAL_SALES',
-            'row:fingerprint', 1, 'sha256:order-item'
+            'platform', '2026-07-29', 'CLOSED',
+            'sha256:order-fingerprint', 1,
+            ?, 'Rose', 'A', 'SKU-1', 'VERIFIED',
+            1, '10', ?, '2026-07-29', 'NORMAL_SALES',
+            'sha256:order-item'
         )
         """,
         (now, now),

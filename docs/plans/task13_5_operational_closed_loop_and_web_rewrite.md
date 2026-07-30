@@ -708,12 +708,25 @@ Web 主控端以运营人员的工作问题组织页面：
 
 ### T13.5-4：订单页探索与历史观察
 
-- 无副作用探索页面，冻结能力标志、字段白名单、分页和可访问历史范围。
-- 在编码前冻结不可变订单批次、行指纹、`occurrence_no / occurrence_count`、
-  跨批次多重集合和完整批次接受规则。
-- 当前开放交易日只形成截至 `observed_at` 的快照，不伪造闭市完整订单或稳定订单 ID。
+- 已完成无副作用探索并冻结
+  `supports_order_scan / supports_current_trade_day /
+  supports_historical_trade_day=true`、字段白名单、日期选择、滚动和结束标记。
+- 实现不可变订单批次、无平台订单 ID 的
+  `order_identity_fingerprint + occurrence_no` 多重集合、逐项 `observed_at`、
+  商品映射和完整批次接受规则。
+- 当前交易日只形成截至 `observed_at` 的 `OPEN` 快照；历史交易日为 `CLOSED`。
+  `OPEN` 不进入 `FINAL`。
+- 页面数量固定为 `order_qty`，页面成交金额固定为
+  `order_transaction_amount`，汇总为 `transaction_amount_total`；不得解释为卖家
+  实收、扣佣收入、退款净额或财务到账。
+- 复用 Automation 父子 run、单 Worker 文件队列、租约、checksum、phase 和归档，
+  不建立新的 R4 控制面；v6 订单请求严格为零平台写副作用。
+- 13.5-4 不伪造取消行；13.5-5 才能在同平台同交易日的相邻完整快照之间按多重集合
+  减少推导取消。
 
-验收：历史日、重复行、多批次、空页、分页、部分失败和取消推导均有证据。
+验收：`OPEN/CLOSED`、重复行、精确重放、冲突、可信空页、滚动/尾标失败、日期错位、
+映射异常、错绑、事务回滚、PII 拒绝和零平台写副作用均有自动测试；Ready for review
+前另做受控真实页面 READ_ONLY。
 
 ### T13.5-5：销售估算、日结和计划输入
 

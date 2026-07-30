@@ -484,6 +484,7 @@ V14_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
         "automation_run_id",
         "platform_name",
         "requested_platform_trade_date",
+        "trade_day_status",
         "capability_result",
         "batch_status",
         "scan_started_at",
@@ -500,24 +501,22 @@ V14_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "order_observation_items": (
         "observation_item_id",
         "observation_batch_id",
+        "platform_name",
         "platform_trade_date",
+        "trade_day_status",
+        "order_identity_fingerprint",
+        "occurrence_no",
+        "order_created_at",
         "platform_product_name",
         "grade",
         "internal_sku",
         "mapping_status",
         "mapping_version",
-        "order_created_at",
-        "ordered_qty",
-        "effective_qty",
-        "cancelled_qty",
-        "cancellation_derivation_method",
-        "seller_received_amount",
-        "purchase_sequence",
+        "order_qty",
+        "order_transaction_amount",
         "observed_at",
         "seller_operation_date",
         "seller_phase",
-        "source_row_fingerprint",
-        "occurrence_no",
         "raw_observation_sha256",
     ),
     "sales_estimate_segments": (
@@ -557,7 +556,7 @@ V14_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
         "summary_status",
         "sold_qty",
         "order_count",
-        "seller_received_amount",
+        "transaction_amount_total",
         "quality_reason",
         "source_proportions_json",
         "input_manifest_sha256",
@@ -1356,7 +1355,99 @@ def _check_v14_constraints(
         errors=errors,
     )
 
+    order_batch_sql = _table_sql(
+        connection,
+        "order_observation_batches",
+    )
+    _check_exact_status_values(
+        order_batch_sql,
+        column="trade_day_status",
+        expected=frozenset({"OPEN", "CLOSED"}),
+        label="order_observation_batches.trade_day_status",
+        errors=errors,
+    )
+    order_item_sql = _table_sql(
+        connection,
+        "order_observation_items",
+    )
+    _check_exact_status_values(
+        order_item_sql,
+        column="trade_day_status",
+        expected=frozenset({"OPEN", "CLOSED"}),
+        label="order_observation_items.trade_day_status",
+        errors=errors,
+    )
+    order_item_info = {
+        str(row[1]): row
+        for row in connection.execute(
+            "PRAGMA table_info(order_observation_items)"
+        ).fetchall()
+    }
+    retired_order_columns = {
+        "ordered_qty",
+        "effective_qty",
+        "cancelled_qty",
+        "cancellation_derivation_method",
+        "seller_received_amount",
+        "purchase_sequence",
+        "source_row_fingerprint",
+    }
+    retained_retired_columns = retired_order_columns.intersection(
+        order_item_info
+    )
+    if retained_retired_columns:
+        errors.append(
+            "order_observation_items retains retired provisional columns: "
+            + ", ".join(sorted(retained_retired_columns))
+        )
+    for required_not_null in (
+        "platform_name",
+        "trade_day_status",
+        "order_identity_fingerprint",
+        "order_qty",
+        "order_transaction_amount",
+    ):
+        row = order_item_info.get(required_not_null)
+        if row is None or int(row[3]) != 1:
+            errors.append(
+                "order_observation_items."
+                f"{required_not_null} must be NOT NULL"
+            )
+    order_unique_identities = {
+        tuple(
+            str(index_row[2])
+            for index_row in connection.execute(
+                f"PRAGMA index_info('{str(index[1])}')"
+            ).fetchall()
+        )
+        for index in connection.execute(
+            "PRAGMA index_list('order_observation_items')"
+        ).fetchall()
+        if int(index[2]) == 1
+    }
+    required_order_identity = (
+        "observation_batch_id",
+        "order_identity_fingerprint",
+        "occurrence_no",
+    )
+    if required_order_identity not in order_unique_identities:
+        errors.append(
+            "order_observation_items must uniquely preserve "
+            "batch, identity fingerprint and occurrence_no"
+        )
+
     summary_sql = _table_sql(connection, "platform_trade_day_summaries")
+    summary_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(platform_trade_day_summaries)"
+        ).fetchall()
+    }
+    if "seller_received_amount" in summary_columns:
+        errors.append(
+            "platform_trade_day_summaries retains retired "
+            "seller_received_amount"
+        )
     _check_exact_status_values(
         summary_sql,
         column="quality_level",
@@ -1404,7 +1495,7 @@ def _check_v14_constraints(
         r"quality_level\s*=\s*'UNAVAILABLE'.*?"
         r"sold_qty\s+IS\s+NULL.*?"
         r"order_count\s+IS\s+NULL.*?"
-        r"seller_received_amount\s+IS\s+NULL",
+        r"transaction_amount_total\s+IS\s+NULL",
         summary_sql,
         re.IGNORECASE | re.DOTALL,
     ):

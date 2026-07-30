@@ -20,12 +20,15 @@ try:
         contract_identity_key,
         derive_v4_batch_semantics,
         derive_v5_batch_semantics,
+        normalize_order_scan_request,
         normalize_contract_grade,
         normalize_contract_sku,
         normalize_contract_text,
         set_offline_confirmation_matches,
         set_online_confirmation_matches,
         sha256_json,
+        ORDER_SCAN_CONTRACT_VERSION,
+        ORDER_SCAN_RESULT_SCHEMA_VERSION,
         v4_result_counts,
         v5_result_counts,
     )
@@ -35,12 +38,15 @@ except ImportError:
             contract_identity_key,
             derive_v4_batch_semantics,
             derive_v5_batch_semantics,
+            normalize_order_scan_request,
             normalize_contract_grade,
             normalize_contract_sku,
             normalize_contract_text,
             set_offline_confirmation_matches,
             set_online_confirmation_matches,
             sha256_json,
+            ORDER_SCAN_CONTRACT_VERSION,
+            ORDER_SCAN_RESULT_SCHEMA_VERSION,
             v4_result_counts,
             v5_result_counts,
         )
@@ -49,12 +55,15 @@ except ImportError:
             contract_identity_key,
             derive_v4_batch_semantics,
             derive_v5_batch_semantics,
+            normalize_order_scan_request,
             normalize_contract_grade,
             normalize_contract_sku,
             normalize_contract_text,
             set_offline_confirmation_matches,
             set_online_confirmation_matches,
             sha256_json,
+            ORDER_SCAN_CONTRACT_VERSION,
+            ORDER_SCAN_RESULT_SCHEMA_VERSION,
             v4_result_counts,
             v5_result_counts,
         )
@@ -138,6 +147,26 @@ WAITING_SET_ONLINE_INDEX_OFFSET = 13
 ONLINE_SET_OFFLINE_INDEX_OFFSET = 14
 PRODUCT_LIST_END_LABEL = "没有更多了"
 PRODUCT_LIST_EMPTY_LABEL = "暂无商品"
+ORDER_MANAGEMENT_ENTRY_SELECTOR = "蚂蚁_订单管理_入口"
+ORDER_LIST_CONTAINER_SELECTOR = "商品管理_订单_容器"
+ORDER_ROW_SELECTOR_TEMPLATES = {
+    "grade": "订单管理_订单1_等级",
+    "platform_product_name": "订单管理_订单1_品种",
+    "order_qty": "订单管理_订单1_数量",
+    "unit_price": "订单管理_订单1_单价",
+    "order_created_at": "订单管理_订单1_下单时间",
+}
+ORDER_DATE_PICKER_SELECTORS = {
+    "year": "订单管理_订单日期选择_选择框年",
+    "month": "订单管理_订单日期选择_选择框_月",
+    "day": "订单管理_订单日期选择_选择框_日",
+    "confirm": "订单管理_订单日期选择_选择框确认按钮",
+    "cancel": "订单管理_订单日期选择_选择框取消按钮",
+}
+ORDER_ROW_INDEX_STEP = 9
+ORDER_TRANSACTION_AMOUNT_INDEX = 8
+ORDER_LIST_END_LABEL = "没有更多了"
+ORDER_LIST_EMPTY_LABEL = "暂无订单"
 V5_KEYBOARD_LOAD_WAIT_SECONDS = 0.1
 V5_KEYBOARD_END_LOAD_WAIT_SECONDS = 0.8
 
@@ -6507,6 +6536,751 @@ def _run_set_offline_v5(args, request, result):
     return _set_result(args, result)
 
 
+def _clone_order_row_selector(base_name, inferred_name, target_index):
+    """Clone one captured order field without retaining captured business text."""
+
+    base = package.selector(base_name)
+    value = copy.deepcopy(base.__dict__["value"])
+    _remove_dynamic_page_id_constraints(value)
+    value["id"] = str(uuid.uuid4())
+    value["name"] = inferred_name
+    value["screenshot"] = ""
+    selected_nodes = [
+        node for node in value["path"] if node.get("selected") is True
+    ]
+    indexed_views = [
+        node
+        for node in selected_nodes
+        if node.get("name") == "wx-view"
+        and any(
+            attribute.get("name") == "index"
+            for attribute in node.get("attributes", [])
+        )
+    ]
+    if not indexed_views:
+        raise SliceError(
+            "ORDER_SELECTOR_BUILD_FAILED",
+            "订单字段模板缺少可替换的卡片索引",
+            retryable=False,
+        )
+    _set_path_attribute(indexed_views[-1], "index", int(target_index))
+    static_nodes = [
+        node for node in value["path"] if node.get("name") == "StaticText"
+    ]
+    if not static_nodes:
+        raise SliceError(
+            "ORDER_SELECTOR_BUILD_FAILED",
+            "订单字段模板缺少 StaticText",
+            retryable=False,
+        )
+    target_node = static_nodes[-1]
+    target_node["selected"] = True
+    target_node["attributes"] = [
+        attribute
+        for attribute in target_node.get("attributes", [])
+        if attribute.get("name")
+        not in {"acc-name", "explicit-name", "name-from", "value"}
+    ]
+    _set_path_attribute(target_node, "role", "StaticText")
+    return Selector(value)
+
+
+def _order_row_field_selector(row_ordinal, field):
+    base_index = {
+        "grade": 2,
+        "platform_product_name": 3,
+        "order_qty": 5,
+        "unit_price": 6,
+        "order_created_at": 7,
+        "order_transaction_amount": ORDER_TRANSACTION_AMOUNT_INDEX,
+    }.get(field)
+    if base_index is None:
+        raise SliceError(
+            "ORDER_SELECTOR_BUILD_FAILED",
+            "不支持的订单字段",
+            retryable=False,
+        )
+    template_field = (
+        "unit_price" if field == "order_transaction_amount" else field
+    )
+    return _clone_order_row_selector(
+        ORDER_ROW_SELECTOR_TEMPLATES[template_field],
+        "动态_订单_%d_%s" % (int(row_ordinal), field),
+        base_index + ORDER_ROW_INDEX_STEP * (int(row_ordinal) - 1),
+    )
+
+
+def _order_picker_value_selector(column_name, expected_text):
+    base = package.selector(ORDER_DATE_PICKER_SELECTORS[column_name])
+    value = copy.deepcopy(base.__dict__["value"])
+    _remove_dynamic_page_id_constraints(value)
+    value["id"] = str(uuid.uuid4())
+    value["name"] = "动态_订单日期_%s_%s" % (
+        column_name,
+        str(expected_text),
+    )
+    value["screenshot"] = ""
+    grade_template = package.selector(
+        ORDER_ROW_SELECTOR_TEMPLATES["grade"]
+    ).__dict__["value"]
+    static_nodes = [
+        node
+        for node in grade_template["path"]
+        if node.get("name") == "StaticText"
+    ]
+    if not static_nodes:
+        raise SliceError(
+            "ORDER_SELECTOR_BUILD_FAILED",
+            "日期选择器缺少 StaticText 模板",
+            retryable=False,
+        )
+    target = copy.deepcopy(static_nodes[-1])
+    target["selected"] = True
+    target["attributes"] = [
+        attribute
+        for attribute in target.get("attributes", [])
+        if attribute.get("name")
+        not in {"acc-name", "explicit-name", "index", "name-from", "value"}
+    ]
+    _set_path_attribute(target, "role", "StaticText")
+    _set_path_attribute(target, "acc-name", str(expected_text))
+    value["path"].append(target)
+    return Selector(value)
+
+
+def _order_click_element(element):
+    try:
+        element.click()
+    except Exception:
+        element.parent().click()
+
+
+def _order_selected_date_from_labels(window):
+    for label in _collect_ui_state_labels(window):
+        match = re.fullmatch(
+            r"\s*(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?\s*",
+            str(label or ""),
+        )
+        if not match:
+            continue
+        try:
+            return "%04d-%02d-%02d" % tuple(
+                int(part) for part in match.groups()
+            )
+        except ValueError:
+            continue
+    return ""
+
+
+def _order_click_visible_date(window, selected_date, timeout_seconds):
+    candidates = (
+        selected_date,
+        selected_date.replace("-", "/"),
+        "%s年%d月%d日"
+        % (
+            selected_date[:4],
+            int(selected_date[5:7]),
+            int(selected_date[8:10]),
+        ),
+    )
+    for candidate in candidates:
+        try:
+            target = _find_element(
+                window,
+                _exact_acc_label_selector(
+                    candidate,
+                    "dynamic_order_current_date",
+                ),
+                min(float(timeout_seconds), 2.0),
+            )
+            _order_click_element(target)
+            sleep(0.5)
+            return
+        except SliceError:
+            continue
+    raise SliceError(
+        "ORDER_DATE_SELECTOR_NOT_FOUND",
+        "未找到订单日期入口",
+        retryable=True,
+    )
+
+
+def _order_select_picker_value(
+    window,
+    column_name,
+    candidates,
+    timeout_seconds,
+    max_scrolls,
+):
+    container = _find_element(
+        window,
+        ORDER_DATE_PICKER_SELECTORS[column_name],
+        timeout_seconds,
+    )
+    directions = ("up", "down")
+    for direction in directions:
+        for _ in range(max(1, int(max_scrolls))):
+            for candidate in candidates:
+                try:
+                    target = _find_element(
+                        window,
+                        _order_picker_value_selector(
+                            column_name,
+                            candidate,
+                        ),
+                        0.4,
+                    )
+                    _order_click_element(target)
+                    sleep(0.3)
+                    return
+                except SliceError:
+                    continue
+            try:
+                bounding = _bounding_dict(container)
+                win32.mouse_move(
+                    int(bounding["x"] + bounding["width"] / 2.0),
+                    int(bounding["y"] + bounding["height"] / 2.0),
+                    "screen",
+                    "instant",
+                    0.1,
+                )
+                win32.mouse_wheel(direction, 1, "none", 0.1)
+                sleep(0.15)
+            except Exception:
+                break
+    raise SliceError(
+        "ORDER_DATE_VALUE_NOT_FOUND",
+        "目标订单日期不在有界日期选择范围内",
+        retryable=False,
+    )
+
+
+def _order_select_trade_date(
+    window,
+    requested_date,
+    timeout_seconds,
+    max_scrolls,
+):
+    selected_date = _order_selected_date_from_labels(window)
+    if selected_date == requested_date:
+        return selected_date
+    if not selected_date:
+        raise SliceError(
+            "ORDER_DATE_NOT_READABLE",
+            "订单页面未显示可验证的当前选择日期",
+            retryable=True,
+        )
+    _order_click_visible_date(window, selected_date, timeout_seconds)
+    year = int(requested_date[:4])
+    month = int(requested_date[5:7])
+    day = int(requested_date[8:10])
+    try:
+        _order_select_picker_value(
+            window,
+            "year",
+            ("%d年" % year, str(year)),
+            timeout_seconds,
+            max_scrolls,
+        )
+        _order_select_picker_value(
+            window,
+            "month",
+            ("%d月" % month, "%02d月" % month, str(month), "%02d" % month),
+            timeout_seconds,
+            max_scrolls,
+        )
+        _order_select_picker_value(
+            window,
+            "day",
+            ("%d日" % day, "%02d日" % day, str(day), "%02d" % day),
+            timeout_seconds,
+            max_scrolls,
+        )
+        confirm = _find_element(
+            window,
+            ORDER_DATE_PICKER_SELECTORS["confirm"],
+            timeout_seconds,
+        )
+        _order_click_element(confirm)
+        sleep(1)
+    except Exception:
+        try:
+            cancel = _find_element(
+                window,
+                ORDER_DATE_PICKER_SELECTORS["cancel"],
+                1,
+            )
+            _order_click_element(cancel)
+        except Exception:
+            pass
+        raise
+    verified = _order_selected_date_from_labels(window)
+    if verified != requested_date:
+        raise SliceError(
+            "ORDER_DATE_MISMATCH",
+            "订单页面选择日期与请求日期不一致",
+            retryable=False,
+        )
+    return verified
+
+
+def _order_marker_visible(window, label, timeout_seconds):
+    try:
+        _find_element(
+            window,
+            _exact_acc_label_selector(
+                label,
+                "dynamic_order_marker",
+            ),
+            min(float(timeout_seconds), 1.0),
+        )
+        return True
+    except SliceError:
+        return False
+
+
+def _find_order_scroll_container(window, timeout_seconds):
+    base = package.selector(ORDER_LIST_CONTAINER_SELECTOR)
+    value = copy.deepcopy(base.__dict__["value"])
+    _remove_dynamic_page_id_constraints(value)
+    value["id"] = str(uuid.uuid4())
+    value["name"] = "动态_订单列表容器"
+    value["screenshot"] = ""
+    return _find_element(window, Selector(value), timeout_seconds)
+
+
+def _order_scroll_to_end(
+    window,
+    timeout_seconds,
+    max_scrolls,
+    max_seconds,
+    stop_signal_path,
+):
+    started = time.time()
+    scrolls = 0
+    if _order_marker_visible(window, ORDER_LIST_EMPTY_LABEL, timeout_seconds):
+        return scrolls, True, False
+    container = _find_order_scroll_container(window, timeout_seconds)
+    while (
+        scrolls <= int(max_scrolls)
+        and time.time() - started <= float(max_seconds)
+    ):
+        if stop_signal_path and os.path.exists(stop_signal_path):
+            raise SliceError(
+                "ORDER_SCAN_STOPPED",
+                "Worker 在订单只读扫描期间收到停止请求",
+                retryable=True,
+            )
+        if _order_marker_visible(
+            window,
+            ORDER_LIST_END_LABEL,
+            timeout_seconds,
+        ):
+            return scrolls, False, True
+        try:
+            window.activate()
+            window.wait_active(timeout=min(float(timeout_seconds), 3.0))
+            if scrolls == 0:
+                win32.send_keys("{END}", 50, False, 0.3, True, False)
+            else:
+                bounding = _bounding_dict(container)
+                win32.mouse_move(
+                    int(bounding["x"] + bounding["width"] / 2.0),
+                    int(
+                        bounding["y"]
+                        + min(
+                            bounding["height"] * 0.7,
+                            bounding["height"] - 40,
+                        )
+                    ),
+                    "screen",
+                    "instant",
+                    0.1,
+                )
+                win32.mouse_wheel("down", 3, "none", 0.2)
+            scrolls += 1
+            sleep(0.6)
+        except Exception as exc:
+            raise SliceError(
+                "ORDER_SCROLL_FAILED",
+                "订单列表滚动失败: " + type(exc).__name__,
+                retryable=True,
+            )
+    return scrolls, False, False
+
+
+def _order_normalize_qty(value):
+    match = re.search(r"(?<!\d)(\d+)(?:\s*扎)?", str(value or ""))
+    if not match or int(match.group(1)) <= 0:
+        raise SliceError(
+            "ORDER_QTY_PARSE_FAILED",
+            "订单数量字段无法解析",
+            retryable=False,
+        )
+    return str(int(match.group(1)))
+
+
+def _order_normalize_amount(value):
+    numbers = re.findall(r"\d+(?:\.\d{1,2})?", str(value or "").replace(",", ""))
+    if not numbers:
+        raise SliceError(
+            "ORDER_AMOUNT_PARSE_FAILED",
+            "订单成交金额字段无法解析",
+            retryable=False,
+        )
+    try:
+        amount = Decimal(numbers[-1])
+    except InvalidOperation:
+        raise SliceError(
+            "ORDER_AMOUNT_PARSE_FAILED",
+            "订单成交金额字段无法解析",
+            retryable=False,
+        )
+    if amount < 0:
+        raise SliceError(
+            "ORDER_AMOUNT_PARSE_FAILED",
+            "订单成交金额不能为负数",
+            retryable=False,
+        )
+    return format(amount, "f")
+
+
+def _order_normalize_created_at(value):
+    match = re.search(
+        r"(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})",
+        str(value or ""),
+    )
+    if not match:
+        raise SliceError(
+            "ORDER_CREATED_AT_PARSE_FAILED",
+            "订单下单时间必须精确到秒",
+            retryable=False,
+        )
+    try:
+        datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        raise SliceError(
+            "ORDER_CREATED_AT_PARSE_FAILED",
+            "订单下单时间无效",
+            retryable=False,
+        )
+    return match.group(1)
+
+
+def _order_read_rows(window, timeout_seconds, max_rows):
+    rows = []
+    for ordinal in range(1, int(max_rows) + 1):
+        try:
+            grade = _read_text(
+                window,
+                _order_row_field_selector(ordinal, "grade"),
+                min(float(timeout_seconds), 2.0),
+            )
+        except SliceError:
+            break
+        try:
+            product_name = _read_text(
+                window,
+                _order_row_field_selector(
+                    ordinal,
+                    "platform_product_name",
+                ),
+                timeout_seconds,
+            )
+            qty = _order_normalize_qty(
+                _read_text(
+                    window,
+                    _order_row_field_selector(ordinal, "order_qty"),
+                    timeout_seconds,
+                )
+            )
+            amount = _order_normalize_amount(
+                _read_text(
+                    window,
+                    _order_row_field_selector(
+                        ordinal,
+                        "order_transaction_amount",
+                    ),
+                    timeout_seconds,
+                )
+            )
+            created_at = _order_normalize_created_at(
+                _read_text(
+                    window,
+                    _order_row_field_selector(
+                        ordinal,
+                        "order_created_at",
+                    ),
+                    timeout_seconds,
+                )
+            )
+        except SliceError as exc:
+            raise SliceError(
+                exc.code,
+                "订单卡片字段关联校验失败",
+                retryable=exc.retryable,
+            )
+        grade = str(grade or "").strip()
+        product_name = str(product_name or "").strip()
+        if not grade or not product_name:
+            raise SliceError(
+                "ORDER_IDENTITY_PARSE_FAILED",
+                "订单卡片缺少品种或等级",
+                retryable=False,
+            )
+        if len(grade) > 200 or len(product_name) > 200:
+            raise SliceError(
+                "ORDER_IDENTITY_PARSE_FAILED",
+                "订单卡片品种或等级超过长度限制",
+                retryable=False,
+            )
+        rows.append(
+            {
+                "order_created_at": created_at,
+                "platform_product_name": product_name,
+                "grade": grade,
+                "order_qty": qty,
+                "order_transaction_amount": amount,
+                "observed_at": _now_iso(),
+            }
+        )
+    return rows
+
+
+def _order_failed_capture(
+    scan_started_at,
+    selected_date,
+    rows,
+    page_count,
+    error_code,
+    error_message,
+):
+    return {
+        "selected_platform_trade_date": selected_date or None,
+        "scan_started_at": scan_started_at,
+        "scan_completed_at": _now_iso(),
+        "loading_completed": bool(
+            selected_date and (rows or int(page_count) > 0)
+        ),
+        "scroll_completed": False,
+        "no_more_marker_visible": False,
+        "trusted_empty_marker_visible": False,
+        "page_count": max(0, int(page_count)),
+        "rows": list(rows),
+        "unavailable_code": "",
+        "failure_code": str(error_code or "ORDER_SCAN_FAILED"),
+        "failure_message": str(error_message or "订单只读扫描失败")[:512],
+    }
+
+
+def _run_order_scan_v6(args, request, result):
+    scan_started_at = _now_iso()
+    selected_date = ""
+    rows = []
+    page_count = 0
+    result.update(
+        {
+            "schema_version": ORDER_SCAN_RESULT_SCHEMA_VERSION,
+            "contract_version": ORDER_SCAN_CONTRACT_VERSION,
+            "execution_attempt_id": str(
+                request.get("execution_attempt_id") or ""
+            ),
+            "execution_mode": "READ_ONLY",
+            "automation_run_id": str(
+                request.get("automation_run_id") or ""
+            ),
+            "observation_batch_id": str(
+                request.get("observation_batch_id") or ""
+            ),
+            "platform_name": str(request.get("platform_name") or ""),
+            "requested_platform_trade_date": str(
+                request.get("requested_platform_trade_date") or ""
+            ),
+            "instruction_hash": str(
+                request.get("instruction_hash") or ""
+            ),
+            "status": "FAILED",
+            "run_success_flag": False,
+            "business_operation_completed": False,
+            "side_effect_state": "NOT_STARTED",
+            "current_step": "VALIDATE_ORDER_SCAN",
+            "capture": _order_failed_capture(
+                scan_started_at,
+                "",
+                (),
+                0,
+                "ORDER_SCAN_NOT_STARTED",
+                "订单只读扫描尚未开始",
+            ),
+            "error_code": "",
+            "error_message": "",
+            "retryable": False,
+            "started_at": scan_started_at,
+            "ended_at": "",
+        }
+    )
+    try:
+        normalized = normalize_order_scan_request(request)
+        timeout_seconds = int(
+            normalized["element_timeout_seconds"]
+        )
+        max_rows = int(normalized["limits"]["max_rows"])
+        max_scrolls = int(normalized["limits"]["max_scrolls"])
+        max_seconds = int(normalized["limits"]["max_seconds"])
+        requested_date = normalized["requested_platform_trade_date"]
+        _write_phase(request, result, "UI_STARTED")
+        result["current_step"] = "OPEN_ORDER_MANAGEMENT"
+        window, launch = _get_or_open_and_prepare_window(
+            normalized["window_title"],
+            _as_int(request, "window_x", WINDOW_X_DEFAULT),
+            _as_int(request, "window_y", WINDOW_Y_DEFAULT),
+            _as_int(
+                request,
+                "window_width",
+                WINDOW_WIDTH_DEFAULT,
+                minimum=100,
+            ),
+            _as_int(
+                request,
+                "window_height",
+                WINDOW_HEIGHT_DEFAULT,
+                minimum=100,
+            ),
+            normalized["applet_uri"],
+            int(normalized["applet_launch_timeout_seconds"]),
+        )
+        result["applet_launch"] = launch
+        sleep(0.5)
+        _recover_login_if_needed(
+            window,
+            request,
+            result,
+            timeout_seconds,
+            _get_arg(args, "_login_config", {}),
+            _get_arg(args, "_credential_provider", None),
+        )
+        entry = _find_element(
+            window,
+            ORDER_MANAGEMENT_ENTRY_SELECTOR,
+            timeout_seconds,
+        )
+        _order_click_element(entry)
+        sleep(1)
+        result["current_step"] = "SELECT_ORDER_DATE"
+        selected_date = _order_select_trade_date(
+            window,
+            requested_date,
+            timeout_seconds,
+            min(max_scrolls, 40),
+        )
+        result["current_step"] = "READ_ORDER_LIST"
+        scrolls, trusted_empty, no_more = _order_scroll_to_end(
+            window,
+            timeout_seconds,
+            max_scrolls,
+            max_seconds,
+            str(request.get("_stop_signal_path") or ""),
+        )
+        page_count = scrolls + 1
+        if not trusted_empty:
+            try:
+                win32.send_keys("{HOME}", 50, False, 0.3, True, False)
+                sleep(0.5)
+            except Exception as exc:
+                raise SliceError(
+                    "ORDER_SCROLL_HOME_FAILED",
+                    "订单列表无法返回首项: " + type(exc).__name__,
+                    retryable=True,
+                )
+            rows = _order_read_rows(
+                window,
+                timeout_seconds,
+                max_rows,
+            )
+        if trusted_empty and rows:
+            raise SliceError(
+                "ORDER_EMPTY_MARKER_CONFLICT",
+                "可信空页标记与订单卡片同时出现",
+                retryable=False,
+            )
+        if not trusted_empty and not rows:
+            raise SliceError(
+                "ORDER_ROWS_NOT_FOUND",
+                "订单页面既非可信空页也没有可解析卡片",
+                retryable=True,
+            )
+        capture = {
+            "selected_platform_trade_date": selected_date,
+            "scan_started_at": scan_started_at,
+            "scan_completed_at": _now_iso(),
+            "loading_completed": True,
+            "scroll_completed": bool(trusted_empty or no_more),
+            "no_more_marker_visible": bool(no_more),
+            "trusted_empty_marker_visible": bool(trusted_empty),
+            "page_count": page_count,
+            "rows": rows,
+            "unavailable_code": "",
+            "failure_code": (
+                "" if trusted_empty or no_more else "ORDER_SCROLL_INCOMPLETE"
+            ),
+            "failure_message": (
+                ""
+                if trusted_empty or no_more
+                else "未在有界滚动内验证订单列表结束标记"
+            ),
+        }
+        completed = bool(trusted_empty or no_more)
+        result.update(
+            {
+                "status": "SUCCESS" if completed else "PARTIAL",
+                "run_success_flag": completed,
+                "capture": capture,
+                "current_step": "ORDER_SCAN_COMPLETED",
+                "error_code": (
+                    "" if completed else "ORDER_SCROLL_INCOMPLETE"
+                ),
+                "error_message": capture["failure_message"],
+                "retryable": not completed,
+            }
+        )
+        _write_phase(request, result, "UI_READ_COMPLETED")
+    except SliceError as exc:
+        result.update(
+            {
+                "capture": _order_failed_capture(
+                    scan_started_at,
+                    selected_date,
+                    rows,
+                    page_count,
+                    exc.code,
+                    exc.message,
+                ),
+                "error_code": exc.code,
+                "error_message": exc.message,
+                "retryable": bool(exc.retryable),
+            }
+        )
+    except Exception as exc:
+        result.update(
+            {
+                "capture": _order_failed_capture(
+                    scan_started_at,
+                    selected_date,
+                    rows,
+                    page_count,
+                    "ORDER_SCAN_FAILED",
+                    "订单只读扫描失败: " + type(exc).__name__,
+                ),
+                "error_code": "ORDER_SCAN_FAILED",
+                "error_message": "订单只读扫描失败: "
+                + type(exc).__name__,
+                "retryable": True,
+            }
+        )
+    result["ended_at"] = _now_iso()
+    return _set_result(args, result)
+
+
 def _run_single_product_flow(args, allow_contract_dispatch=False):
     started_at = _now_iso()
     current_step = "VALIDATE_INPUT"
@@ -6554,6 +7328,12 @@ def _run_single_product_flow(args, allow_contract_dispatch=False):
 
     try:
         request = _request_payload(args)
+        if (
+            allow_contract_dispatch
+            and request.get("contract_version")
+            == ORDER_SCAN_CONTRACT_VERSION
+        ):
+            return _run_order_scan_v6(args, request, result)
         if allow_contract_dispatch and request.get("contract_version") == 5:
             action_type = str(request.get("action_type") or "").strip().lower()
             if (

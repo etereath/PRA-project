@@ -167,7 +167,7 @@ class OperationalSummaryRepository:
                         summary_status = ?,
                         sold_qty = ?,
                         order_count = ?,
-                        seller_received_amount = ?,
+                        transaction_amount_total = ?,
                         quality_reason = ?,
                         source_proportions_json = ?,
                         input_manifest_sha256 = ?,
@@ -190,7 +190,7 @@ class OperationalSummaryRepository:
                         after.summary_status.value,
                         after.sold_qty,
                         after.order_count,
-                        _decimal_to_text(after.seller_received_amount),
+                        _decimal_to_text(after.transaction_amount_total),
                         after.quality_reason,
                         _json_dump(after.source_proportions),
                         after.input_manifest_sha256,
@@ -293,7 +293,7 @@ def _insert_summary(connection, summary: PlatformTradeDaySummary) -> None:
             seller_operation_date, seller_phase,
             scope_type, scope_key,
             fact_source, quality_level, summary_status,
-            sold_qty, order_count, seller_received_amount,
+            sold_qty, order_count, transaction_amount_total,
             quality_reason, source_proportions_json,
             input_manifest_sha256, mapping_version,
             algorithm_version, time_policy_version,
@@ -325,7 +325,7 @@ def _summary_values(summary: PlatformTradeDaySummary) -> tuple[object, ...]:
         summary.summary_status.value,
         summary.sold_qty,
         summary.order_count,
-        _decimal_to_text(summary.seller_received_amount),
+        _decimal_to_text(summary.transaction_amount_total),
         summary.quality_reason,
         _json_dump(summary.source_proportions),
         summary.input_manifest_sha256,
@@ -431,7 +431,7 @@ def _insert_event(connection, event: TradeDaySummaryEvent) -> None:
 
 def _row_to_summary(row) -> PlatformTradeDaySummary:
     fact_source = row["fact_source"]
-    amount = row["seller_received_amount"]
+    amount = row["transaction_amount_total"]
     return PlatformTradeDaySummary(
         summary_id=str(row["summary_id"]),
         summary_series_id=str(row["summary_series_id"]),
@@ -459,7 +459,7 @@ def _row_to_summary(row) -> PlatformTradeDaySummary:
             if row["order_count"] is not None
             else None
         ),
-        seller_received_amount=(
+        transaction_amount_total=(
             Decimal(str(amount)) if amount is not None else None
         ),
         quality_reason=str(row["quality_reason"] or ""),

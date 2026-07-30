@@ -74,6 +74,15 @@ PRAGMA integrity_check = ok
 - FINAL 触发器只允许受控 `is_current: 1 → 0`，其他业务身份与审计字段不可变。
 - v14 观察事实、销售估算、日结事件和带 manifest 维度的日结输入均为
   append-only，数据库拒绝 UPDATE/DELETE。
+- `order_observation_items` 只使用 `order_qty` 和
+  `order_transaction_amount`；`trade_day_summaries` 只使用
+  `transaction_amount_total`。旧预留字段 `seller_received_amount` 以及
+  `effective_qty/refund_qty/invalid_qty` 不得保留。
+- 若旧 v14 订单预留表为空，迁移器可按正式合同重建；若旧结构已写入订单事实，迁移
+  必须失败关闭并要求人工处理，不能猜测金额、有效量或取消语义。
+- 订单项唯一约束为
+  `(observation_batch_id, order_identity_fingerprint, occurrence_no)`，相同指纹的
+  真实重复订单不得被吞掉。
 - 新建 `MANUAL/AUTOMATION` 任务必须具有非空 `origin_ref_id`；旧任务仍按
   `LEGACY` 无猜测迁移。任务创建后 `origin_type/origin_ref_id` 均不可修改，不能
   通过 UPDATE 获得 `LEGACY` 或 `SYSTEM_EMERGENCY`。

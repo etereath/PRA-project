@@ -70,7 +70,7 @@ class TradeDaySummaryService:
         quality_level: DataQualityLevel,
         sold_qty: int | None,
         order_count: int | None,
-        seller_received_amount: Decimal | None,
+        transaction_amount_total: Decimal | None,
         quality_reason: str,
         source_proportions: dict,
         input_manifest_sha256: str,
@@ -119,7 +119,7 @@ class TradeDaySummaryService:
             summary_status=SummaryStatus.PROVISIONAL,
             sold_qty=sold_qty,
             order_count=order_count,
-            seller_received_amount=seller_received_amount,
+            transaction_amount_total=transaction_amount_total,
             quality_reason=quality_reason,
             source_proportions=dict(source_proportions),
             input_manifest_sha256=_require_text(
@@ -167,7 +167,7 @@ class TradeDaySummaryService:
         quality_level: DataQualityLevel,
         sold_qty: int | None,
         order_count: int | None,
-        seller_received_amount: Decimal | None,
+        transaction_amount_total: Decimal | None,
         quality_reason: str,
         source_proportions: dict,
         input_manifest_sha256: str,
@@ -195,7 +195,7 @@ class TradeDaySummaryService:
                 quality_level=quality_level,
                 sold_qty=sold_qty,
                 order_count=order_count,
-                seller_received_amount=seller_received_amount,
+                transaction_amount_total=transaction_amount_total,
                 quality_reason=quality_reason,
                 source_proportions=source_proportions,
                 input_manifest_sha256=input_manifest_sha256,
@@ -224,7 +224,7 @@ class TradeDaySummaryService:
             summary_status=to_status,
             sold_qty=sold_qty,
             order_count=order_count,
-            seller_received_amount=seller_received_amount,
+            transaction_amount_total=transaction_amount_total,
             quality_reason=quality_reason,
             source_proportions=dict(source_proportions),
             input_manifest_sha256=_require_text(
@@ -276,7 +276,7 @@ class TradeDaySummaryService:
         quality_level: DataQualityLevel,
         sold_qty: int | None,
         order_count: int | None,
-        seller_received_amount: Decimal | None,
+        transaction_amount_total: Decimal | None,
         quality_reason: str,
         source_proportions: dict,
         input_manifest_sha256: str,
@@ -298,7 +298,7 @@ class TradeDaySummaryService:
                 quality_level=quality_level,
                 sold_qty=sold_qty,
                 order_count=order_count,
-                seller_received_amount=seller_received_amount,
+                transaction_amount_total=transaction_amount_total,
                 quality_reason=quality_reason,
                 source_proportions=source_proportions,
                 input_manifest_sha256=input_manifest_sha256,
@@ -315,7 +315,7 @@ class TradeDaySummaryService:
             quality_level=quality_level,
             sold_qty=sold_qty,
             order_count=order_count,
-            seller_received_amount=seller_received_amount,
+            transaction_amount_total=transaction_amount_total,
             quality_reason=quality_reason,
             source_proportions=source_proportions,
             input_manifest_sha256=input_manifest_sha256,
@@ -335,7 +335,7 @@ class TradeDaySummaryService:
         quality_level: DataQualityLevel,
         sold_qty: int,
         order_count: int,
-        seller_received_amount: Decimal,
+        transaction_amount_total: Decimal,
         quality_reason: str,
         source_proportions: dict,
         input_manifest_sha256: str,
@@ -354,7 +354,7 @@ class TradeDaySummaryService:
             quality_level=quality_level,
             sold_qty=sold_qty,
             order_count=order_count,
-            seller_received_amount=seller_received_amount,
+            transaction_amount_total=transaction_amount_total,
             quality_reason=quality_reason,
             source_proportions=source_proportions,
             input_manifest_sha256=input_manifest_sha256,
@@ -374,7 +374,7 @@ class TradeDaySummaryService:
         quality_level: DataQualityLevel,
         sold_qty: int | None,
         order_count: int | None,
-        seller_received_amount: Decimal | None,
+        transaction_amount_total: Decimal | None,
         quality_reason: str,
         source_proportions: dict,
         input_manifest_sha256: str,
@@ -399,7 +399,7 @@ class TradeDaySummaryService:
             summary_status=SummaryStatus.OBSERVED,
             sold_qty=sold_qty,
             order_count=order_count,
-            seller_received_amount=seller_received_amount,
+            transaction_amount_total=transaction_amount_total,
             quality_reason=quality_reason,
             source_proportions=dict(source_proportions),
             input_manifest_sha256=_require_text(
@@ -482,10 +482,10 @@ def _validate_summary(summary: PlatformTradeDaySummary) -> None:
     if summary.order_count is not None and summary.order_count < 0:
         raise ValueError("order_count must not be negative")
     if (
-        summary.seller_received_amount is not None
-        and summary.seller_received_amount < 0
+        summary.transaction_amount_total is not None
+        and summary.transaction_amount_total < 0
     ):
-        raise ValueError("seller_received_amount must not be negative")
+        raise ValueError("transaction_amount_total must not be negative")
 
     if summary.quality_level is DataQualityLevel.UNAVAILABLE:
         if summary.fact_source is not None:
@@ -495,7 +495,7 @@ def _validate_summary(summary: PlatformTradeDaySummary) -> None:
             for value in (
                 summary.sold_qty,
                 summary.order_count,
-                summary.seller_received_amount,
+                summary.transaction_amount_total,
             )
         ):
             raise ValueError("UNAVAILABLE facts must keep metrics NULL")

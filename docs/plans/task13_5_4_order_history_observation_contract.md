@@ -1,60 +1,30 @@
-# 任务 13.5-4：订单历史只读观察开工合同
+# 任务 13.5-4：订单只读观察合同
 
-- 状态：首轮无副作用探索与父 Issue Capability 同步完成，等待字段口径复核
-- 基线：`origin/main@4aa4c73`
-- 准备提交：`16f60b8`
-- 权威范围：GitHub Issue #20 正文与
-  `task13_5_operational_closed_loop_and_web_rewrite.md`
+- Review Profile：`R3`
 - 当前平台：蚂蚁花团供应商微信小程序
+- 权威：GitHub Issue #20 最新正文及评论 `5136623832`
+- 基线：`origin/main@4aa4c73`
+- 范围：只读经营事实链；不得扩张为新的 R4 控制面
 
-## 1. 阶段目标
+## 1. 目标和边界
 
-13.5-4 只建设订单管理页面的历史只读观察链路：
+本任务复用 13.5-3 已有 Automation Run、父子关系、租约、完成接口和 Runtime
+Schema v14，在以下既有拓扑中补齐订单事实：
 
 ```text
-ORDER_SCAN Automation 子 run
-→ 平台订单页只读 Adapter
-→ 结构化只读结果
-→ ORDER_HISTORY_IMPORT
-→ v14 append-only 订单观察
+FULL_MARKET_SCAN
+└─ ORDER_SCAN
+   └─ ORDER_HISTORY_IMPORT
 ```
 
-本阶段必须交付：
+平台 Adapter 只读取订单管理页，不修改订单、发货、退款、支付、资金或销售平台状态。
+ShadowBot v6 合同固定为 `execution_mode=READ_ONLY`、
+`business_operation_completed=false`、`side_effect_state=NOT_STARTED`。订单结果不得包含
+平台订单 ID、买家姓名、电话、地址、聊天内容、原始页面正文或截图。
 
-- 订单页无副作用探索证据；
-- 平台能力、字段、分页、日期范围和结束标记合同；
-- 无稳定订单 ID 时的批次内多重集合语义；
-- 平台无关输入合同、Importer、Repository 和测试；
-- 当前平台只读 Adapter 及脱敏证据；
-- `ORDER_SCAN` Automation handler 接入。
+## 2. 平台能力和交易日终态
 
-本阶段不实现销售估算、日结、Incident 自动处置、Web 重写或任何订单写操作。
-
-## 2. 已有资产与实际缺口
-
-继续复用：
-
-- v14 `order_observation_batches / order_observation_items`；
-- `OperationalTimeService` 的平台交易日、卖家作业日和阶段；
-- 13.5-3 Automation run、父子 link、租约 fencing 和单 UI 通道；
-- 任务 12/13 文件队列、Worker 生命周期、登录介入、结果归档和证据规范；
-- `CompiledProductMappings` 的 `VERIFIED / UNMAPPED / AMBIGUOUS / DISABLED`；
-- 商品观察 Importer 的“既有事实读取”和“新事实写入”分路原则。
-
-当前尚未实现：
-
-- 订单页 Adapter capability；
-- 订单扫描 JSON 输入/结果 schema；
-- 订单观察 Importer 和查询 Repository；
-- 行指纹、多重集合比较和完整批次选择；
-- `ORDER_SCAN` 正式 handler；
-- 历史日、空页、分页、重复行、部分失败和取消量语义的实机证据。
-
-真实 Runtime DB 尚未迁移到 v14；本阶段开发继续只使用临时数据库。
-
-## 3. 平台能力合同
-
-GitHub Issue #20 已依据 2026-07-31 首轮实测更新为：
+当前能力冻结为：
 
 ```text
 supports_order_scan = true
@@ -62,279 +32,148 @@ supports_current_trade_day = true
 supports_historical_trade_day = true
 ```
 
-结果语义：
+当前平台交易日是截至 `observed_at` 的开放快照，标记 `OPEN`；已经截单的历史平台
+交易日标记 `CLOSED`。`OPEN` 不代表完整闭市事实，不得进入 `FINAL` 日结。
 
-- `UNSUPPORTED`：平台根本没有订单扫描能力；
-- `UNAVAILABLE`：平台支持，但目标交易日或范围当前不可访问；
-- `FAILED`：能力应可用，但本次登录、网络、页面、解析或执行失败；
-- `SUCCEEDED`：目标范围已完成只读访问；是否可接受仍由批次完整性决定。
+Adapter 只能报告已验证的页面能力，不得声称平台内部修复了错误。未来日期、不可访问
+日期和页面能力故障必须明确表示为 `UNAVAILABLE` 或 `FAILED`，不得伪造成空订单。
 
-`supports_current_trade_day=true` 只表示能够读取截至 `observed_at` 的开放交易日快照，
-不表示交易日已经关闭或可以最终结算。当前日期返回零汇总和“暂无订单”时属于可信
-可用空页，可以形成 `SUCCEEDED` 零行结果；只有请求日期确实不可访问时才返回
-`UNAVAILABLE`。详见
-[首轮无副作用探索报告](../reports/task13_5_4_order_page_exploration_20260731.md)。
+## 3. 原始订单观察字段
 
-Adapter 和 Importer 必须同时保存 `OPEN / CLOSED` 或等价的交易日终态事实；18:00
-截单前的当前交易日快照不得进入 `FINAL`，也不得用后续缺失数据覆盖已经接受的历史
-快照。
-
-## 4. 无副作用探索门禁
-
-编码平台 Adapter 前，先完成一次独立的订单页无副作用探索：
-
-1. 只进入订单管理页和历史日期筛选，不点击发货、退款、确认、支付、联系买家或其他
-   写操作；
-2. 记录可访问的最早/最晚平台交易日、默认日期、切换日期后的实际返回范围；
-3. 确认列表、分页或滚动加载机制，以及可验证的结束标记；
-4. 确认可信空页、加载失败、权限不足和请求日期不可访问的页面差异；
-5. 对每个候选字段确认页面标签、格式、空值、单位和业务含义；
-6. 验证相同内容的真实重复行是否可能出现，以及页面顺序是否稳定；
-7. 只在页面事实足以证明时冻结 `effective_qty` 和取消量推导公式；
-8. 证据必须脱敏，不保存或提交买家姓名、电话、地址、聊天内容、账号或订单 ID。
-
-探索阶段不得写真实 Runtime DB，不得把页面截图或控制台文本直接当作结构化数据真值。
-
-## 5. 数据最小化白名单
-
-允许进入公共订单观察合同的字段：
-
-- `platform_name`
-- `platform_trade_date`
-- `platform_product_name`
-- `grade`
-- `internal_sku`（内部映射结果，可空）
-- `mapping_status`
-- `mapping_version`
-- `order_created_at`
-- `ordered_qty`
-- `effective_qty`
-- `cancelled_qty`
-- `cancellation_derivation_method`
-- `seller_received_amount`
-- `purchase_sequence`
-- `observed_at`
-- `seller_operation_date`
-- `seller_phase`
-- `source_row_fingerprint`
-- `occurrence_no`
-- `raw_observation_sha256`
-
-明确禁止持久化：
-
-- 平台订单 ID、订单行 ID或把页面行号伪装成长期 ID；
-- 买家姓名、电话、地址、聊天内容、账号等个人信息；
-- 退款数量、付款状态、支付时间、完成时间等尚未证明可得的字段；
-- 独立规格、商品历史累计销量；
-- 买家支付金额、标价、优惠后成交价等页面未提供的金额口径。
-
-公共订单事实的金额字段只允许 `seller_received_amount`。页面“单价 / 合计 / 金额”
-口径经业务证据确认为卖家实收前，该字段保持 `NULL`；Adapter 局部
-`displayed_order_total_amount` 不得直接写入 v14。确认后若派生单位金额，名称必须是
-`seller_received_unit_amount`，且来源为卖家实收金额除以有效数量。
-
-## 6. 不可变批次合同
-
-订单观察批次继续使用 v14 现有字段，不新增 schema：
+`order_observation_items` 仅保存以下不可变原始事实和映射结果：
 
 ```text
-observation_batch_id
-automation_run_id
 platform_name
-requested_platform_trade_date
-capability_result
-batch_status
-scan_started_at / scan_completed_at
-requested_range_json
-scope_complete
-end_marker_verified
-content_sha256
-time_policy_version
-error_code / error_message
-created_at
+platform_trade_date
+trade_day_status
+order_identity_fingerprint
+occurrence_no
+order_created_at
+platform_product_name
+grade
+internal_sku
+mapping_status
+mapping_version
+order_qty
+order_transaction_amount
+observed_at
+seller_operation_date
+seller_phase
+raw_observation_sha256
 ```
 
-`requested_range_json` 除用户请求范围外，必须保存可复核的内部来源绑定：
+业务口径：
+
+- `order_qty`：页面展示的订单数量；
+- `order_transaction_amount`：页面展示的成交金额；
+- `transaction_amount_total`：批次或日结中的成交金额合计。
+
+成交金额不代表卖家实收、扣佣收入、退款净额或财务到账。当前范围不使用
+`effective_qty / refund_qty / invalid_qty / seller_received_amount`，也不保留两套等价
+金额字段。
+
+## 4. 身份、多重集合和哈希
+
+平台订单 ID 禁止采集。`order_identity_fingerprint` 由以下规范化可观察字段生成：
 
 ```text
-contract_version
-requested_platform_trade_date
-requested_range
-actual_range
-adapter_capabilities
-source_request_id
-source_manifest_sha256
-source_result_sha256
-page_count
-source_row_count
-end_marker_kind
-accepted_mapping_version（有商品项时）
+platform_name
+platform_trade_date
+order_created_at
+platform_product_name
+grade
 ```
 
-这些内部字段由 Importer 写入或验证，外部调用方不得伪造。来源 manifest/result
-摘要必须绑定脱敏结构化结果，不得绑定含个人信息的原始页面正文。
-`UNSUPPORTED / UNAVAILABLE / FAILED` 等无商品项结果不得为了生成该字段而解析当前
-映射；其幂等身份必须独立于映射工作簿。
+数量和成交金额不进入身份指纹，因此跨快照内容变化仍可比较同一可观察身份；它们连同
+`trade_day_status` 和 `observed_at` 进入 `raw_observation_sha256`。
 
-## 7. 行指纹与多重集合冻结
+同一快照内相同指纹的真实重复订单必须全部保存，并按确定性顺序写入
+`occurrence_no=1..N`。唯一约束只允许
+`(observation_batch_id, order_identity_fingerprint, occurrence_no)`，不得用单指纹唯一
+约束吞掉重复订单。
 
-### 7.1 行指纹
+13.5-4 不写取消行、不写负数量。13.5-5 只有在以下条件全部满足时，才能通过相邻快照
+多重集合减少推导取消：
 
-`source_row_fingerprint` 只表示规范业务字段相同的候选分组，不是订单身份：
+1. 同一平台、同一平台交易日；
+2. 两份快照都完整；
+3. 比较不是 18:00 换日造成；
+4. 前一快照的某身份出现次数大于后一快照；
+5. 减少不是滚动、解析、范围或能力失败造成。
 
-```text
-sha256(
-  canonical_json(
-    fingerprint_version,
-    platform_name,
-    platform_trade_date,
-    normalized_platform_product_name,
-    normalized_grade,
-    order_created_at,
-    ordered_qty,
-    effective_qty,
-    seller_received_amount,
-    purchase_sequence
-  )
-)
-```
+## 5. 页面完成矩阵
 
-规则：
+订单页结果必须落入以下互斥状态：
 
-- 版本固定为 `order-row-fingerprint-1.0`；
-- JSON 使用 UTF-8、稳定键顺序和无多余空白；
-- 时间转换为带时区的规范 ISO-8601；
-- 金额由精确 Decimal 规范化，禁止 float；
-- `NULL` 与 0、空字符串必须保持不同；
-- 指纹格式为 `sha256:<64 位小写十六进制>`。
-
-`cancelled_qty` 不进入 v1 指纹；它是可撤销的推导结果，其输入和方法进入
-`raw_observation_sha256`。若探索证明页面直接给出稳定取消事实，必须先更新合同版本，
-不能静默改变 v1 指纹。
-
-### 7.2 批次内重复实例
-
-相同指纹可能真实出现多次：
-
-- `occurrence_no` 在单一批次、单一指纹组内从 1 连续编号；
-- 编号只用于保存每个真实实例，不承担跨批次身份；
-- `observation_item_id` 由 batch ID、指纹和 `occurrence_no` 稳定生成；
-- 不得对 `source_row_fingerprint` 建立唯一索引；
-- 重复行必须逐条写入，禁止 `INSERT OR IGNORE` 或集合去重。
-
-v14 没有 `occurrence_count` 列；13.5-4 将其冻结为查询时派生值：
-
-```sql
-COUNT(*) GROUP BY observation_batch_id, source_row_fingerprint
-```
-
-派生计数必须等于该组最大 `occurrence_no`，并且编号连续无缺口。
-
-### 7.3 跨批次比较
-
-跨批次比较使用：
-
-```text
-source_row_fingerprint → occurrence_count
-```
-
-形成的多重集合。不同批次不得相加为销量，也不得按 `occurrence_no` 逐条配对为同一
-订单。13.5-5 只能选择目标交易日最新的、已接受且完整的批次作为正式订单输入；旧批次
-保留用于审计、差异和修订证据。
-
-## 8. 批次状态矩阵
-
-| capability_result | batch_status | items | 约束 |
+| 页面事实 | capability_result | batch_status | 可作为完整事实 |
 | --- | --- | --- | --- |
-| `SUCCEEDED` | `ACCEPTED` | 可空 | 范围完整、结束标记验证、字段满足合同；空页必须有可信空页结束证据 |
-| `SUCCEEDED` | `PARTIAL` | 可有 | 读取到真实行，但分页、字段、映射或范围不完整；不得进入正式结算 |
-| `UNSUPPORTED` | `UNAVAILABLE` | 必须空 | 平台能力明确不存在 |
-| `UNAVAILABLE` | `UNAVAILABLE` | 必须空 | 目标日期或范围当前不可访问，不表示 0 |
-| `FAILED` | `FAILED` | 必须空 | 未形成可接受观察 |
-| `FAILED` | `PARTIAL` | 可有 | 失败前已有可验证行；仅作部分事实和诊断，不进入正式结算 |
+| 有数据且日期、滚动和“没有更多了”均验证 | `SUCCEEDED` | `ACCEPTED` | 是 |
+| 无数据且“暂无订单”可信空页验证 | `SUCCEEDED` | `ACCEPTED` | 是 |
+| 已读部分行但滚动、字段关联或结束标记失败 | `FAILED` | `PARTIAL` | 否 |
+| 页面加载、日期或解析失败且无可信行 | `FAILED` | `FAILED` | 否 |
+| 日期或能力确实不可用 | `UNAVAILABLE` | `UNAVAILABLE` | 否 |
+| Adapter 明确不支持订单扫描 | `UNSUPPORTED` | `UNAVAILABLE` | 否 |
 
-所有 item 的 `platform_trade_date` 必须等于请求交易日；`observed_at` 必须位于批次
-区间内。`order_created_at` 必须是页面提供的准确时间；若只有无法消除歧义的局部时间，
-批次不得标为 `ACCEPTED`。
+日期选择后必须回读并精确等于请求日期；历史列表必须有界滚动并验证“没有更多了”；
+空页必须验证“暂无订单”。每一项独立记录读取完成时的 `observed_at`。下一条元素定位
+失败本身不是完成证据。
 
-## 9. 映射、时间与取消量
+订单卡片采用平台专属候选步长 `9`，但运行时仍逐卡片读取品种、等级、数量、成交金额
+和下单时间，并以日期、字段解析和尾部标记共同验收；结构漂移必须失败关闭。
 
-- 商品映射以扫描验收时的 `CompiledProductMappings` 为准并冻结版本；
-- `VERIFIED` 保存明确 SKU；其他状态保存空 SKU，不进入自动业务规则；
-- 批次内映射版本必须一致；
-- `seller_operation_date / seller_phase` 由每条 `observed_at` 经
-  `OperationalTimeService` 计算；
-- `platform_trade_date` 以订单事实所属交易日为准，不使用扫描发生日替代；
-- 在无副作用探索冻结公式前，`cancelled_qty=NULL` 且
-  `cancellation_derivation_method=''`；
-- 后续推导必须保存版本化方法及可复核输入，且满足
-  `0 <= effective_qty <= ordered_qty` 和
-  `cancelled_qty = ordered_qty - effective_qty` 才可接受。
+## 6. Adapter、Importer 和映射
 
-## 10. Importer 与 Automation fencing
+蚂蚁花团 Adapter 只把页面捕获转换为平台无关
+`OrderObservationBatchInput / OrderObservationInput`。平台专属选择器、日期控件和滚动
+逻辑不得进入公共服务。
 
-Importer 分为两条路径：
+Importer 在单一 `BEGIN IMMEDIATE` 事务中：
 
-1. 先在事务内校验 run、平台、时间策略、交易日、来源信封和规范原始内容；
-2. 同 batch ID 或同 run 同规范内容已存在时，返回数据库原批次和原 hash；
-3. 只有新增事实才要求 `ORDER_SCAN` run 为 `RUNNING`、claim 实时有效，并解析当前
-   映射后插入；
-4. 同 run 的不同内容不得形成第二套权威事实；
-5. append-only 表禁止 UPDATE、DELETE 和静默覆盖。
+1. 校验 Automation claim、`ORDER_SCAN` 类型、平台、交易日和
+   `ORDER_SCAN_CHILD` 父子绑定；
+2. 验证批次状态、完成标记、逐项时间和内容摘要；
+3. 用当前不可变 Mapping 版本解析 `VERIFIED / UNMAPPED / AMBIGUOUS / DISABLED`；
+4. 追加批次和全部订单项；
+5. 任一数据库错误整体回滚。
 
-`ORDER_SCAN` 必须是 `FULL_MARKET_SCAN / PRE_CUTOFF_FULL_SCAN` 的合法 `CHILD_ONLY`
-子 run，并继承父 run 冻结的双日期、阶段和时间策略。订单子结果成功、失败或不可用均
-不得撤销已接受的商品子结果，也不得参与 `ONLINE_PULSE` 覆盖判定。
+未映射或歧义商品仍保留原始订单事实，但完整页面的批次状态降为 `PARTIAL`，不得编造
+`internal_sku`。映射版本必须随每一行持久化。
 
-## 11. 实施切分
+同一 `observation_batch_id`、同一规范内容精确重放返回原结果，即使 run 已终态；同 ID
+异内容冲突。终态精确重放不依赖当前映射漂移，新事实仍要求有效实时 claim。
 
-按以下顺序实施，不把实机探索和全部业务代码压成一次不可审查变更：
+## 7. ShadowBot 文件队列
 
-1. **13.5-4A 合同与探索**：只读探索、脱敏 fixture、字段和分页语义冻结；
-2. **13.5-4B 公共核心**：JSON 边界、指纹、多重集合、Importer、Repository；
-3. **13.5-4C 平台 Adapter**：当前平台历史日只读解析及来源 hash；
-4. **13.5-4D Automation 接入**：注册 `ORDER_SCAN` handler、父子隔离和运行证据；
-5. **13.5-4E 回归与交接**：全量测试、打包、双平台 CI 和实施报告。
+订单读取使用 v6 请求/结果合同，复用既有文件队列、单 Worker、checksum、phase、心跳
+和归档目录，不建立第二队列或新的写锁状态机。
 
-## 12. 验收矩阵
+提交请求前要求新鲜 `RUNNING` heartbeat；等待结果期间续租 Automation claim。结果
+必须先通过 schema、请求绑定、checksum、PII 黑名单和零副作用校验，再进入 Importer。
+数据库导入成功后才归档队列结果；数据库失败时保留结果用于精确重放。
 
-至少覆盖：
+## 8. Runtime Schema v14 最小纠正
 
-- 支持历史日、当前日 `UNAVAILABLE`、平台 `UNSUPPORTED`；
-- 单页、多页/滚动、可信空页和结束标记缺失；
-- 同指纹 1 条、2 条和多组重复行，编号连续且不丢实例；
-- 新 batch ID 的相同多重集合幂等返回原规范批次；
-- 相同 batch ID 不同内容拒绝；
-- 跨批次多重集合差异不累加；
-- `ACCEPTED / PARTIAL / UNAVAILABLE / FAILED` 状态矩阵；
-- 映射四状态、映射漂移、时间策略和交易日不匹配；
-- 终态 run 的既有事实重放、新事实的 claim fencing；
-- 订单子结果失败不影响商品子结果；
-- PII、订单 ID 和敏感本机路径不进入 JSON、SQLite、日志或证据；
-- Linux/Windows pytest、系统冒烟、wheel、包边界和 UTF-8 门禁。
+真实 Runtime DB 尚未写入订单事实。v14 的预留字段
+`seller_received_amount` 最小纠正为 `order_transaction_amount`，日结同义字段纠正为
+`transaction_amount_total`。
 
-## 13. 开工判定
+若旧预留订单表为空，迁移器可以重建为正式合同；若已经存在旧结构订单事实，必须失败
+关闭并要求人工迁移，不能猜测转换。健康检查必须拒绝退休字段、缺失 NOT NULL、错误
+`OPEN/CLOSED` 约束或会吞掉重复订单的唯一索引。
 
-已满足：
+## 9. 验收矩阵
 
-- [x] 本地 `main` 与 `origin/main@4aa4c73` 对齐；
-- [x] v14 订单观察表和 append-only 约束已存在；
-- [x] 多重集合核心语义已在父 Issue 和本合同中冻结；
-- [x] 实现切分、安全边界和验收矩阵已明确。
-- [x] 已完成首轮订单页无副作用探索并形成脱敏报告；
-- [x] 已确认纵向滚动、“没有更多了”、可信空页和精确到秒的下单时间；
-- [x] 已记录用户初测的订单元素候选步长 `9`，但尚未冻结为正式选择器常量。
+开发专项必须覆盖：
 
-开始公共核心编码前仍必须满足：
+- `OPEN` 当前交易日和 `CLOSED` 历史交易日；
+- 有数据完整页、可信空页、滚动/结束标记失败、日期错位；
+- 相同指纹重复订单及 `occurrence_no`；
+- 精确重放、同 ID 异内容冲突；
+- 未映射、歧义商品；
+- 平台或 Run 错绑；
+- 数据库失败整体回滚；
+- v6 checksum、请求/结果绑定、PII 拒绝和零平台写副作用。
 
-- [x] Issue #20 已更新为 `true / true / true`，并区分开放交易日快照与闭市终态；
-- [ ] 冻结页面字段标签、可访问日期范围、滚动和结束标记；
-- [ ] 确认准确 `order_created_at` 的格式和时区语义；
-- [ ] 确认 `ordered_qty / effective_qty / seller_received_amount /
-  purchase_sequence` 的页面含义和空值；
-- [ ] 决定取消量保持未知或采用有证据的版本化推导方法；
-- [ ] 跨三张卡片、滚动和另一个历史日期验证候选步长 `9`；
-- [ ] 形成不含 PII 和订单 ID 的脱敏结构化 fixture。
-
-在这些门禁完成前，不实现真实订单页解析，不注册生产 `ORDER_SCAN` handler，也不宣称
-当前交易日订单可用。
+Ready for review 前统一运行订单专项、受影响集成测试、完整 pytest、系统冒烟、
+Windows/Linux CI 和受控真实页面 READ_ONLY 验收。真实值、截图、平台订单号和买家
+PII 不进入仓库；仓库只保留合成 fixture、结构化测试和脱敏验收摘要。
