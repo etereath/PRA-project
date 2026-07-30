@@ -58,6 +58,7 @@ class ProductMappingResolution:
     mapping_status: ProductMappingStatus
     internal_sku: str | None
     mapping_ids: tuple[str, ...] = ()
+    candidate_internal_skus: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,11 +97,38 @@ class CompiledProductMappings:
             if record.mapping_status is not ProductMappingStatus.DISABLED
         )
         if not enabled:
+            candidate_skus = tuple(
+                sorted(
+                    {
+                        sku
+                        for record in matches
+                        for sku in (
+                            record.internal_sku,
+                            record.candidate_internal_sku,
+                        )
+                        if sku
+                    }
+                )
+            )
             return ProductMappingResolution(
                 ProductMappingStatus.DISABLED,
                 None,
                 ids,
+                candidate_skus,
             )
+        candidate_skus = tuple(
+            sorted(
+                {
+                    sku
+                    for record in enabled
+                    for sku in (
+                        record.internal_sku,
+                        record.candidate_internal_sku,
+                    )
+                    if sku
+                }
+            )
+        )
         if any(
             record.mapping_status is ProductMappingStatus.AMBIGUOUS
             for record in enabled
@@ -109,6 +137,7 @@ class CompiledProductMappings:
                 ProductMappingStatus.AMBIGUOUS,
                 None,
                 ids,
+                candidate_skus,
             )
 
         verified_skus = {
@@ -125,6 +154,7 @@ class CompiledProductMappings:
                 ProductMappingStatus.VERIFIED,
                 next(iter(verified_skus)),
                 ids,
+                tuple(sorted(verified_skus)),
             )
         if len(verified_skus) > 1 or any(
             record.mapping_status is ProductMappingStatus.VERIFIED
@@ -134,11 +164,13 @@ class CompiledProductMappings:
                 ProductMappingStatus.AMBIGUOUS,
                 None,
                 ids,
+                candidate_skus,
             )
         return ProductMappingResolution(
             ProductMappingStatus.UNMAPPED,
             None,
             ids,
+            candidate_skus,
         )
 
 

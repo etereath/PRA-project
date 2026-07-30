@@ -20,6 +20,11 @@ from app.automation_models import (
     AutomationRunOutcome,
 )
 from app.enums import AutomationRunStatus, SellerPhase
+from app.listing_observation_identity import (
+    ListingObservationSourceIdentity,
+    listing_observation_source_identities,
+    listing_observation_source_identity_sha256,
+)
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.operational_time import (
     OperationalTimeContext,
@@ -1696,10 +1701,11 @@ def _listing_coverage_facts_accepted(
     rows = connection.execute(
         """
         SELECT runs.platform_trade_date, runs.input_manifest_sha256,
-               batches.manifest_sha256, snapshots.snapshot_id,
-               receipts.result_sha256,
-               observations.observation_batch_id,
-               observations.requested_scope_json
+                batches.manifest_sha256, snapshots.snapshot_id,
+                snapshots.evidence_manifest_sha256,
+                receipts.result_sha256,
+                observations.observation_batch_id,
+                observations.requested_scope_json
         FROM automation_runs AS runs
         INNER JOIN shadowbot_listing_action_batches AS batches
             ON batches.manifest_sha256 = runs.input_manifest_sha256
@@ -1741,6 +1747,12 @@ def _listing_coverage_facts_accepted(
         conversion_sha256 = str(
             scope.get("source_conversion_sha256") or ""
         )
+        mapping_identity_sha256 = str(
+            scope.get("source_mapping_identity_sha256") or ""
+        )
+        validated_mapping_identity_sha256 = str(
+            scope.get("validated_mapping_identity_sha256") or ""
+        )
         if (
             str(scope.get("source_snapshot_id") or "")
             != str(row["snapshot_id"])
@@ -1752,6 +1764,57 @@ def _listing_coverage_facts_accepted(
             or str(scope.get("source_platform_trade_date") or "")
             != run_trade_date
             or not _is_prefixed_sha256(conversion_sha256)
+            or not _is_prefixed_sha256(mapping_identity_sha256)
+            or (
+                validated_mapping_identity_sha256
+                != mapping_identity_sha256
+            )
+        ):
+            continue
+        source_item_rows = connection.execute(
+            """
+            SELECT *
+            FROM listing_sync_snapshot_items
+            WHERE snapshot_id = ?
+            ORDER BY snapshot_item_id
+            """,
+            (row["snapshot_id"],),
+        ).fetchall()
+        try:
+            source_items = tuple(
+                {
+                    **dict(source_item),
+                    "affected_internal_skus": json.loads(
+                        str(source_item["affected_internal_skus_json"])
+                    ),
+                    "online_row_identities": json.loads(
+                        str(source_item["online_row_identities_json"])
+                    ),
+                    "waiting_row_identities": json.loads(
+                        str(source_item["waiting_row_identities_json"])
+                    ),
+                }
+                for source_item in source_item_rows
+            )
+            source_identities = listing_observation_source_identities(
+                snapshot_id=str(row["snapshot_id"]),
+                evidence_manifest_sha256=str(
+                    row["evidence_manifest_sha256"]
+                ),
+                snapshot_items=source_items,
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            mapping_identity_sha256
+            != listing_observation_source_identity_sha256(
+                source_identities
+            )
+            or not _persisted_observations_match_source_identities(
+                connection,
+                observation_batch_id=str(row["observation_batch_id"]),
+                source_identities=source_identities,
+            )
         ):
             continue
         mismatched_item = connection.execute(
@@ -1767,6 +1830,45 @@ def _listing_coverage_facts_accepted(
         if mismatched_item is None:
             return True
     return False
+
+
+def _persisted_observations_match_source_identities(
+    connection,
+    *,
+    observation_batch_id: str,
+    source_identities: Iterable[ListingObservationSourceIdentity],
+) -> bool:
+    expected = {
+        identity.evidence_sha256: identity
+        for identity in source_identities
+    }
+    rows = connection.execute(
+        """
+        SELECT evidence_sha256, internal_sku, mapping_status
+        FROM product_observation_items
+        WHERE observation_batch_id = ?
+        """,
+        (observation_batch_id,),
+    ).fetchall()
+    if len(rows) != len(expected):
+        return False
+    actual: dict[str, object] = {}
+    for row in rows:
+        evidence_sha256 = str(row["evidence_sha256"])
+        if evidence_sha256 in actual:
+            return False
+        actual[evidence_sha256] = row
+    if set(actual) != set(expected):
+        return False
+    for evidence_sha256, identity in expected.items():
+        row = actual[evidence_sha256]
+        internal_sku = str(row["internal_sku"] or "").strip() or None
+        if (
+            str(row["mapping_status"]) != identity.mapping_status.value
+            or internal_sku != identity.internal_sku
+        ):
+            return False
+    return True
 
 
 def _claim_next_connection(

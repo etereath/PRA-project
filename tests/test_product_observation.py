@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import replace
@@ -287,6 +288,93 @@ def _seed_listing_snapshot_source(
                 ),
             )
         connection.commit()
+
+
+def _listing_snapshot(
+    *,
+    snapshot_id: str,
+    product_name: str = "艾莎",
+    internal_sku: str | None = "AISHA-A",
+    affected_internal_skus: tuple[str, ...] = ("AISHA-A",),
+) -> dict[str, object]:
+    mapping_ambiguous = internal_sku is None
+    diagnostic_code = ""
+    if mapping_ambiguous:
+        diagnostic_code = (
+            "IDENTITY_MAPPING_CONFLICT"
+            if affected_internal_skus
+            else "UNMAPPED_PRODUCT"
+        )
+    return {
+        "schema_version": "shadowbot-listing-sync-snapshot-1.0",
+        "snapshot_id": snapshot_id,
+        "platform_name": PLATFORM,
+        "execution_attempt_id": f"ATTEMPT-{snapshot_id}",
+        "mapping_source_version": "sha256:" + "a" * 64,
+        "result_id": f"RESULT-{snapshot_id}",
+        "scan_started_at": "2026-07-29T09:00:00+00:00",
+        "scan_completed_at": "2026-07-29T09:00:03+00:00",
+        "online_scan_started_at": "2026-07-29T09:00:00+00:00",
+        "online_scan_completed_at": "2026-07-29T09:00:01+00:00",
+        "waiting_scan_started_at": "2026-07-29T09:00:01+00:00",
+        "waiting_scan_completed_at": "2026-07-29T09:00:03+00:00",
+        "online_scan_complete": True,
+        "waiting_scan_complete": True,
+        "online_end_marker_verified": True,
+        "waiting_end_marker_verified": True,
+        "snapshot_complete": True,
+        "instruction_hash": "sha256:" + "b" * 64,
+        "status": "VERIFIED",
+        "error_code": "",
+        "evidence_manifest_sha256": "sha256:" + "c" * 64,
+        "items": [
+            {
+                "snapshot_item_id": f"{snapshot_id}-ITEM-1",
+                "internal_sku": internal_sku,
+                "product_name": product_name,
+                "grade": "A",
+                "page_identity_key": (
+                    f"platform|name:{product_name}|grade:A"
+                ),
+                "affected_internal_skus": list(
+                    affected_internal_skus
+                ),
+                "online_occurrences": 1,
+                "waiting_occurrences": 0,
+                "mapping_ambiguous": mapping_ambiguous,
+                "listing_location": (
+                    "ambiguous" if mapping_ambiguous else "online_only"
+                ),
+                "online_row_identities": ["online:row:1"],
+                "waiting_row_identities": [],
+                "online_observed_price": "21.00",
+                "waiting_observed_price": None,
+                "online_observed_inventory": 9,
+                "waiting_observed_inventory": None,
+                "diagnostic_code": diagnostic_code,
+                "online_observed_at": "2026-07-29T09:00:01+00:00",
+                "waiting_observed_at": None,
+            }
+        ],
+    }
+
+
+def _candidate_mapping_row(
+    mapping_id: str,
+    *,
+    product_name: str,
+    candidate_sku: str,
+) -> dict[str, object]:
+    return {
+        "mapping_id": mapping_id,
+        "mapping_kind": "PRODUCT",
+        "platform_name": PLATFORM,
+        "platform_product_name": product_name,
+        "grade": "A",
+        "internal_sku": "",
+        "candidate_internal_sku": candidate_sku,
+        "mapping_status": "AMBIGUOUS",
+    }
 
 
 class _ClaimingProductObservationImporter(ProductObservationImporter):
@@ -1580,6 +1668,9 @@ def test_task13_complete_snapshot_adapts_both_pages_to_v14_items(
     assert batch.requested_scope["source_result_sha256"] == (
         source_result_sha256
     )
+    assert str(
+        batch.requested_scope["source_mapping_identity_sha256"]
+    ).startswith("sha256:")
     assert result.item_count == 2
     with closing(repository.connect_read()) as connection:
         rows = connection.execute(
@@ -1592,10 +1683,25 @@ def test_task13_complete_snapshot_adapts_both_pages_to_v14_items(
             """,
             (batch.observation_batch_id,),
         ).fetchall()
+        stored_scope = json.loads(
+            str(
+                connection.execute(
+                    """
+                    SELECT requested_scope_json
+                    FROM product_observation_batches
+                    WHERE observation_batch_id = ?
+                    """,
+                    (batch.observation_batch_id,),
+                ).fetchone()["requested_scope_json"]
+            )
+        )
     assert [tuple(row) for row in rows] == [
         (1, "21.00", 9, "VERIFIED"),
         (0, "20.00", 8, "VERIFIED"),
     ]
+    assert stored_scope["validated_mapping_identity_sha256"] == (
+        stored_scope["source_mapping_identity_sha256"]
+    )
 
     with closing(repository.connect_write()) as connection:
         connection.execute(
@@ -1621,3 +1727,215 @@ def test_task13_complete_snapshot_adapts_both_pages_to_v14_items(
         match="canonical snapshot conversion",
     ):
         importer.import_batch(tampered)
+
+
+def test_listing_snapshot_rejects_verified_sku_mapping_drift(
+    tmp_path,
+) -> None:
+    repository = _repository_with_run(tmp_path)
+    importer = _ClaimingProductObservationImporter(
+        repository,
+        mappings=compile_product_mapping_rows(
+            [_mapping_row("MAP-AISHA-B", "艾莎", "A", "AISHA-B")],
+            source_workbook_sha256="5" * 64,
+        ),
+        clock=lambda: TEST_NOW,
+    )
+    snapshot = _listing_snapshot(snapshot_id="SNAPSHOT-SKU-DRIFT")
+    manifest_sha256 = "sha256:" + "d" * 64
+    result_sha256 = "e" * 64
+    _seed_listing_snapshot_source(
+        repository,
+        snapshot=snapshot,
+        manifest_sha256=manifest_sha256,
+        result_sha256=result_sha256,
+    )
+    batch = listing_snapshot_to_observation_batch(
+        snapshot,
+        automation_run_id="run-listing-scan-1",
+        source_manifest_sha256=manifest_sha256,
+        source_result_sha256=result_sha256,
+    )
+
+    with pytest.raises(
+        ProductObservationError,
+        match="mapping identity drifted",
+    ):
+        importer.import_batch(batch)
+
+    with closing(repository.connect_read()) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM product_observation_batches"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM product_observation_items"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_listing_source_conversion_digest_includes_frozen_sku_identity() -> None:
+    first_snapshot = _listing_snapshot(
+        snapshot_id="SNAPSHOT-SOURCE-IDENTITY-HASH"
+    )
+    second_snapshot = deepcopy(first_snapshot)
+    second_item = second_snapshot["items"][0]
+    second_item["internal_sku"] = "AISHA-B"
+    second_item["affected_internal_skus"] = ["AISHA-B"]
+    manifest_sha256 = "sha256:" + "8" * 64
+    result_sha256 = "9" * 64
+
+    first = listing_snapshot_to_observation_batch(
+        first_snapshot,
+        automation_run_id="run-listing-scan-1",
+        source_manifest_sha256=manifest_sha256,
+        source_result_sha256=result_sha256,
+    )
+    second = listing_snapshot_to_observation_batch(
+        second_snapshot,
+        automation_run_id="run-listing-scan-1",
+        source_manifest_sha256=manifest_sha256,
+        source_result_sha256=result_sha256,
+    )
+
+    assert first.items == second.items
+    assert (
+        first.requested_scope["source_mapping_identity_sha256"]
+        != second.requested_scope["source_mapping_identity_sha256"]
+    )
+    assert (
+        first.requested_scope["source_conversion_sha256"]
+        != second.requested_scope["source_conversion_sha256"]
+    )
+
+
+def test_listing_snapshot_rejects_unmapped_to_verified_drift(
+    tmp_path,
+) -> None:
+    repository = _repository_with_run(tmp_path)
+    importer = _ClaimingProductObservationImporter(
+        repository,
+        mappings=compile_product_mapping_rows(
+            [_mapping_row("MAP-NEW", "未映射商品", "A", "NEW-SKU")],
+            source_workbook_sha256="6" * 64,
+        ),
+        clock=lambda: TEST_NOW,
+    )
+    snapshot = _listing_snapshot(
+        snapshot_id="SNAPSHOT-UNMAPPED-DRIFT",
+        product_name="未映射商品",
+        internal_sku=None,
+        affected_internal_skus=(),
+    )
+    manifest_sha256 = "sha256:" + "1" * 64
+    result_sha256 = "2" * 64
+    _seed_listing_snapshot_source(
+        repository,
+        snapshot=snapshot,
+        manifest_sha256=manifest_sha256,
+        result_sha256=result_sha256,
+    )
+    batch = listing_snapshot_to_observation_batch(
+        snapshot,
+        automation_run_id="run-listing-scan-1",
+        source_manifest_sha256=manifest_sha256,
+        source_result_sha256=result_sha256,
+    )
+
+    with pytest.raises(
+        ProductObservationError,
+        match="mapping identity drifted",
+    ):
+        importer.import_batch(batch)
+
+    with closing(repository.connect_read()) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM product_observation_batches"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+@pytest.mark.parametrize(
+    ("current_candidates", "accepted"),
+    [
+        (("AISHA-A", "AISHA-B"), True),
+        (("AISHA-A", "AISHA-C"), False),
+    ],
+)
+def test_listing_snapshot_freezes_ambiguous_candidate_identity(
+    tmp_path,
+    current_candidates: tuple[str, ...],
+    accepted: bool,
+) -> None:
+    repository = _repository_with_run(tmp_path)
+    importer = _ClaimingProductObservationImporter(
+        repository,
+        mappings=compile_product_mapping_rows(
+            [
+                _candidate_mapping_row(
+                    f"MAP-CANDIDATE-{index}",
+                    product_name="候选商品",
+                    candidate_sku=candidate,
+                )
+                for index, candidate in enumerate(
+                    current_candidates,
+                    start=1,
+                )
+            ],
+                source_workbook_sha256="7" * 64,
+            ),
+        clock=lambda: TEST_NOW,
+    )
+    snapshot = _listing_snapshot(
+        snapshot_id="SNAPSHOT-AMBIGUOUS",
+        product_name="候选商品",
+        internal_sku=None,
+        affected_internal_skus=("AISHA-A", "AISHA-B"),
+    )
+    manifest_sha256 = "sha256:" + "3" * 64
+    result_sha256 = "4" * 64
+    _seed_listing_snapshot_source(
+        repository,
+        snapshot=snapshot,
+        manifest_sha256=manifest_sha256,
+        result_sha256=result_sha256,
+    )
+    batch = listing_snapshot_to_observation_batch(
+        snapshot,
+        automation_run_id="run-listing-scan-1",
+        source_manifest_sha256=manifest_sha256,
+        source_result_sha256=result_sha256,
+    )
+
+    if accepted:
+        result = importer.import_batch(batch)
+        assert result.item_count == 1
+        with closing(repository.connect_read()) as connection:
+            row = connection.execute(
+                """
+                SELECT internal_sku, mapping_status
+                FROM product_observation_items
+                WHERE observation_batch_id = ?
+                """,
+                (batch.observation_batch_id,),
+            ).fetchone()
+        assert tuple(row) == (None, "AMBIGUOUS")
+    else:
+        with pytest.raises(
+            ProductObservationError,
+            match="mapping identity drifted",
+        ):
+            importer.import_batch(batch)
+        with closing(repository.connect_read()) as connection:
+            assert (
+                connection.execute(
+                    "SELECT COUNT(*) FROM product_observation_batches"
+                ).fetchone()[0]
+                == 0
+            )

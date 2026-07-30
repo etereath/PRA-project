@@ -22,6 +22,10 @@ from app.enums import (
     TaskOriginType,
     TaskStatus,
 )
+from app.listing_observation_identity import (
+    listing_observation_source_identities,
+    listing_observation_source_identity_sha256,
+)
 from app.models import ShadowBotOperationLedger, Task
 from app.repositories.automation_repository import AutomationRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
@@ -132,6 +136,8 @@ def _seed_accepted_listing_coverage_facts(
     manifest_sha256: str,
     now: datetime,
     observation_trade_date: str | None = None,
+    observation_internal_sku: str | None = None,
+    observation_mapping_status: str = "UNMAPPED",
 ) -> None:
     run = repository.get_run(listing_run_id)
     assert run is not None
@@ -140,6 +146,28 @@ def _seed_accepted_listing_coverage_facts(
     result_id = f"RESULT-COVER-{suffix}"
     snapshot_id = f"SNAPSHOT-COVER-{suffix}"
     timestamp = now.isoformat()
+    evidence_manifest_sha256 = "sha256:" + "b" * 64
+    source_item = {
+        "snapshot_item_id": f"SNAPSHOT-ITEM-COVER-{suffix}",
+        "internal_sku": None,
+        "product_name": "测试商品",
+        "grade": "A",
+        "page_identity_key": "online:test",
+        "affected_internal_skus": [],
+        "online_occurrences": 1,
+        "waiting_occurrences": 0,
+        "online_row_identities": ["online:test-row"],
+        "waiting_row_identities": [],
+    }
+    source_identities = listing_observation_source_identities(
+        snapshot_id=snapshot_id,
+        evidence_manifest_sha256=evidence_manifest_sha256,
+        snapshot_items=(source_item,),
+    )
+    source_identity = source_identities[0]
+    source_mapping_identity_sha256 = (
+        listing_observation_source_identity_sha256(source_identities)
+    )
     with repository.runtime_repository.connect_write() as connection:
         connection.execute("BEGIN IMMEDIATE")
         connection.execute(
@@ -200,7 +228,36 @@ def _seed_accepted_listing_coverage_facts(
                 timestamp,
                 timestamp,
                 result_id,
-                "sha256:" + "b" * 64,
+                evidence_manifest_sha256,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO listing_sync_snapshot_items(
+                snapshot_item_id, snapshot_id, internal_sku,
+                product_name, grade, page_identity_key,
+                affected_internal_skus_json, online_occurrences,
+                waiting_occurrences, listing_location,
+                online_row_identities_json,
+                waiting_row_identities_json,
+                online_observed_price, waiting_observed_price,
+                online_observed_inventory,
+                waiting_observed_inventory, diagnostic_code,
+                online_observed_at, waiting_observed_at
+            ) VALUES (?, ?, NULL, '测试商品', 'A', 'online:test',
+                      '[]', 1, 0, 'ambiguous', ?, '[]',
+                      '10.00', NULL, 1, NULL, 'UNMAPPED_PRODUCT',
+                      ?, NULL)
+            """,
+            (
+                source_item["snapshot_item_id"],
+                snapshot_id,
+                json.dumps(
+                    source_item["online_row_identities"],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                timestamp,
             ),
         )
         connection.execute(
@@ -234,6 +291,12 @@ def _seed_accepted_listing_coverage_facts(
                         "source_conversion_sha256": (
                             "sha256:" + "c" * 64
                         ),
+                        "source_mapping_identity_sha256": (
+                            source_mapping_identity_sha256
+                        ),
+                        "validated_mapping_identity_sha256": (
+                            source_mapping_identity_sha256
+                        ),
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -254,18 +317,20 @@ def _seed_accepted_listing_coverage_facts(
                 seller_operation_date, seller_phase,
                 page_identity_key, mapping_status, mapping_version,
                 evidence_sha256
-            ) VALUES (?, ?, NULL, '测试商品', 'A', '10.00', 1, 1,
-                      ?, ?, ?, ?, 'online:test', 'UNMAPPED', '', ?)
+            ) VALUES (?, ?, ?, '测试商品', 'A', '10.00', 1, 1,
+                      ?, ?, ?, ?, 'online:test', ?, '', ?)
             """,
             (
                 f"OBSERVATION-ITEM-{suffix}",
                 f"OBSERVATION-{suffix}",
+                observation_internal_sku,
                 timestamp,
                 observation_trade_date
                 or run.platform_trade_date.isoformat(),
                 run.seller_operation_date.isoformat(),
                 run.seller_phase.value,
-                "sha256:" + "d" * 64,
+                observation_mapping_status,
+                source_identity.evidence_sha256,
             ),
         )
         connection.commit()
@@ -426,8 +491,13 @@ def test_successful_full_handler_finalizes_pulse_coverage(
     ] == [(listing_child.child_run_id, "MERGED_RUN")]
 
 
-def test_listing_facts_from_other_trade_date_cannot_merge_pulse(
+@pytest.mark.parametrize(
+    "mismatch_kind",
+    ["trade-date", "mapping-identity"],
+)
+def test_incompatible_listing_facts_cannot_merge_pulse(
     repository: AutomationRepository,
+    mismatch_kind: str,
 ) -> None:
     now = datetime(2026, 7, 29, 2, 0, tzinfo=timezone.utc)
     pulse_job = _store_job(
@@ -474,14 +544,24 @@ def test_listing_facts_from_other_trade_date_cannot_merge_pulse(
             now=now,
         )
         context.bind_input_manifest(manifest_sha256)
+        fact_overrides: dict[str, object]
+        if mismatch_kind == "trade-date":
+            fact_overrides = {
+                "observation_trade_date": (
+                    run.platform_trade_date + timedelta(days=1)
+                ).isoformat()
+            }
+        else:
+            fact_overrides = {
+                "observation_internal_sku": "AISHA-B",
+                "observation_mapping_status": "VERIFIED",
+            }
         _seed_accepted_listing_coverage_facts(
             repository,
             listing_run_id=run.run_id,
             manifest_sha256=manifest_sha256,
             now=now,
-            observation_trade_date=(
-                run.platform_trade_date + timedelta(days=1)
-            ).isoformat(),
+            **fact_overrides,
         )
         return AutomationRunOutcome(status=AutomationRunStatus.SUCCESS)
 

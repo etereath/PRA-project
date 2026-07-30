@@ -121,10 +121,16 @@ FULL_MARKET_SCAN
 
 任务 13 快照转换为 v14 观察时，append-only `requested_scope_json` 必须显式保存
 `source_snapshot_id`、`source_manifest_sha256`、`source_result_sha256`、
-`source_platform_trade_date` 和 `source_conversion_sha256`。Importer 必须从 Runtime
-重新读取源 snapshot 及逐项事实，重算标准转换并比较内容；最终覆盖不得依赖 observation
-batch ID 的字符串命名。扫描批次或任一商品观察跨越 18:00 落入另一平台交易日时，
-自动化事实必须拒绝，不得覆盖旧交易日脉冲。
+`source_platform_trade_date`、`source_conversion_sha256` 和
+`source_mapping_identity_sha256`。来源映射身份按 snapshot item/page 冻结明确 SKU，
+或冻结 `UNMAPPED/AMBIGUOUS` 状态及规范排序的候选 SKU 集合，并纳入标准转换摘要。
+Importer 必须从 Runtime 重新读取源 snapshot 及逐项事实，重算标准转换和来源映射身份，
+再把当前 `CompiledProductMappings` 的逐项解析结果与来源完全比较；任何 SKU、映射状态
+或候选集合漂移都必须在观察写入前拒绝。最终覆盖不得依赖 observation batch ID 的
+字符串命名；Importer 接受后必须在持久化 scope 写入与来源身份摘要相等的
+`validated_mapping_identity_sha256`，最终覆盖要求该验证标记存在且仍与重算来源身份
+一致，并复核已落库观察的 SKU/映射状态。扫描批次或任一商品观察跨越 18:00 落入
+另一平台交易日时，自动化事实必须拒绝，不得覆盖旧交易日脉冲。
 
 ## 5. 接受条件
 
@@ -146,6 +152,8 @@ batch ID 的字符串命名。扫描批次或任一商品观察跨越 18:00 落�
   结果也不参与覆盖判断。
 - 已完成人工 manifest 不可事后绑定；显式来源字段及标准转换摘要不可伪造，合法
   observation batch ID 无需遵守特定命名。
+- 同一 Task 13 snapshot 与 v14 观察不得解析为不同 SKU；`UNMAPPED/AMBIGUOUS`
+  状态及候选 SKU 集合必须兼容，映射漂移时整批零写且不得覆盖脉冲。
 - 临时数据库、完整 pytest、系统冒烟、wheel 和 CI 通过。
 
 本合同不授权真实 COMMIT、普通自动业务任务或 `SYSTEM_EMERGENCY`。
@@ -161,7 +169,8 @@ batch ID 的字符串命名。扫描批次或任一商品观察跨越 18:00 落�
 - `ONLINE_PULSE` JSON 输入边界只接受在线正观察；未出现商品不会生成负观察，
   导入器也不会写 `listing_status`。
 - `LISTING_STATUS_SCAN` 可以把任务 13 的已验证双页快照转换为在线页和待上架页
-  两类 v14 观察事实。
+  两类 v14 观察事实；转换同时冻结来源 SKU、映射状态和候选身份，当前映射版本
+  重新解析不一致时拒绝整批。
 - 批次按“业务内容 + 映射版本”计算内容 SHA-256；传输批次 ID 和 run ID 不参与
   内容哈希，商品项在计算前稳定排序，页面范围先规范化为固定顺序。同 ID 同内容
   幂等，同 ID 不同内容拒绝；同一 run 内不同批次 ID 的同内容重试返回该 run 最早

@@ -525,9 +525,13 @@ Code Review 后的高中低风险问题已完成修复，系统冒烟测试、�
     批次，历史人工完成批次不能事后绑定。v14 观察通过 append-only 来源字段显式绑定
     snapshot、manifest、result SHA、交易日和标准转换摘要，最终覆盖不再依赖批次 ID
     命名；所有租约安全时钟均在取得 `BEGIN IMMEDIATE` 后采样。
-    真实扫描 handler、Runtime DB 迁移和生产部署仍未执行。第四轮修复后 Automation
-    专项 `44 passed`，第四轮涉及模块 `174 passed`，完整回归为
-    `844 passed, 3 skipped, 97 subtests passed`；系统冒烟、构建、包边界、
+    第五轮评审继续封闭 Task 13 与 v14 的 SKU 分裂：明确 SKU，或
+    `UNMAPPED/AMBIGUOUS` 状态及候选 SKU 集合，均按 snapshot item/page 冻结并
+    纳入来源/转换摘要；当前映射解析发生漂移时观察整批零写，最终覆盖还会复核
+    持久化观察 SKU/映射状态与 snapshot 身份。
+    真实扫描 handler、Runtime DB 迁移和生产部署仍未执行。第五轮修复后 Automation
+    专项 `45 passed`，第五轮涉及模块 `191 passed`，完整回归为
+    `850 passed, 3 skipped, 97 subtests passed`；系统冒烟、构建、包边界、
     secret scan、仓库外 wheel 安装和 Windows ShadowBot 静态夹具门禁均通过。
     下一阶段边界见
     [13.5-3 实施报告](reports/task13_5_3_automation_service.md)。

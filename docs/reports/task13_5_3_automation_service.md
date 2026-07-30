@@ -59,6 +59,12 @@
 - 安全时钟在取得 `BEGIN IMMEDIATE` 后才采样；Automation 领取、续租、完成、父子
   创建、清单绑定以及两个事实 Importer 使用同一原则，等待写锁期间到期的 owner
   不能凭锁前旧时间继续写入。
+- 第五轮评审后补齐跨事实 SKU 身份门禁：Task 13 snapshot 的明确 SKU，或
+  `UNMAPPED/AMBIGUOUS` 状态及候选 SKU 集合，按 item/page 形成不可变来源摘要并
+  纳入标准转换摘要。ProductObservation 在事务内把当前映射解析与来源逐项比较，
+  SKU、状态或候选集合漂移时整批零写；通过后持久化与来源摘要相等的验证标记。
+  最终覆盖要求验证标记匹配，并再次比较持久化观察与 snapshot 身份，不接受仅有
+  来源信封但 SKU 已分裂的事实。
 
 ## 2. 复用与未改写
 
@@ -101,6 +107,8 @@ CLI 当前明确报告 `SCHEDULER_ONLY`。它可以安全创建到期账本、�
 - 已完成人工清单事后绑定拒绝及 PREPARED 首绑原子门禁；
 - 任意 observation ID 下的显式 snapshot/manifest/result/交易日/转换摘要来源链，
   以及篡改标准转换拒绝；
+- 明确 SKU 漂移、`UNMAPPED→VERIFIED` 和 `AMBIGUOUS` 候选集合漂移零写拒绝，
+  来源身份一致时接受，持久化 SKU/映射状态不一致时脉冲不合并；
 - `BEGIN IMMEDIATE` 后安全时钟采样；
 - Automation UI handler 执行期的跨实例互斥及 v4/v5 写锁反向门禁；
 - 公开领取入口门禁与父 run 终态驱动的子 run 领取/取消；
@@ -109,11 +117,11 @@ CLI 当前明确报告 `SCHEDULER_ONLY`。它可以安全创建到期账本、�
 验收结果：
 
 - `python -m pytest -q tests/test_automation_service.py`：
-  `44 passed`；
-- 第四轮涉及模块：
-  `174 passed`；
+  `45 passed`；
+- 第五轮涉及模块：
+  `191 passed`；
 - `python -m pytest -q`：
-  `844 passed, 3 skipped, 97 subtests passed`；
+  `850 passed, 3 skipped, 97 subtests passed`；
 - 系统冒烟：16 项通过、0 项失败；
 - 本次新增/修改 Python 文件 Ruff：PASS；
 - `compileall`：PASS；

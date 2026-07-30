@@ -118,9 +118,13 @@ N 个。进程在创建 run 后、合并前崩溃时，下一轮必须重新扫�
 只有 `LISTING_STATUS_SCAN` 子 run 以 `SUCCESS` 完成，并且同一输入清单已经形成任务
 13 的 `VERIFIED` 双页权威快照及与该快照显式绑定的 v14 `ACCEPTED` 完整商品观察事实
 后，才把小扫描原子推进为 `MERGED`。显式来源至少包含 snapshot ID、输入 manifest、
-result SHA、来源平台交易日和标准转换摘要；不得依赖
+result SHA、来源平台交易日、来源映射身份摘要和标准转换摘要；不得依赖
 `product-observation-{snapshot_id}` 等主键命名约定。最终判定还必须复核所有观察项
-的 `platform_trade_date` 与 run 冻结交易日一致，并建立最终关系：
+的 `platform_trade_date` 与 run 冻结交易日一致，并复核持久化观察 SKU/映射状态
+与 snapshot 冻结身份一致。明确 SKU 必须逐项相等；`UNMAPPED/AMBIGUOUS` 必须冻结
+并校验状态和候选 SKU 集合。Importer 只有在跨事实校验通过后才写入
+`validated_mapping_identity_sha256`，最终覆盖要求该标记等于重算的来源身份摘要。
+任一映射漂移都释放候选，不得覆盖脉冲。通过后建立最终关系：
 
 ```text
 LISTING_STATUS_SCAN 子 run --MERGED_RUN--> 小扫描 run
@@ -293,6 +297,8 @@ data/runtime/automation_service/heartbeat.json
 - 历史人工清单事后绑定拒绝、`17:55→18:05` 和逐项跨 18:00 拒绝；
 - snapshot ID、manifest、result SHA、交易日和标准转换摘要的显式不可变来源链，
   且合法 observation ID 不受命名约定限制；
+- snapshot 明确 SKU、`UNMAPPED/AMBIGUOUS` 状态和候选集合的来源冻结；当前
+  v14 映射漂移时零写观察事实且最终覆盖回退；
 - 安全时钟在取得 `BEGIN IMMEDIATE` 后采样；
 - 禁用 job、合法 `CHILD_ONLY` 父链与默认 job 静态漂移；
 - 子 run 在父 run 完成前不可领取，父失败时自动取消；

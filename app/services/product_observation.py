@@ -4,12 +4,18 @@ import hashlib
 import json
 import re
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Callable, Iterable
 
 from app.automation_models import AutomationRunClaim
+from app.listing_observation_identity import (
+    ListingObservationSourceIdentity,
+    listing_observation_source_identities,
+    listing_observation_source_identity_payload,
+    listing_observation_source_identity_sha256,
+)
 from app.repositories.automation_repository import (
     AutomationLeaseLostError,
     validate_live_automation_claim_in_transaction,
@@ -103,10 +109,6 @@ class ProductObservationImporter:
             raise ProductObservationError(
                 "Automation Run claim does not match observation batch"
             )
-        content_sha256 = _result_content_sha256(
-            normalized,
-            mapping_version=self.mappings.mapping_version,
-        )
         batch_context = self.operational_time.classify(
             normalized.scan_completed_at
         )
@@ -177,11 +179,27 @@ class ProductObservationImporter:
                         "automation run"
                     )
                 if normalized.scan_type == LISTING_STATUS_SCAN:
-                    _validate_listing_snapshot_source(
-                        connection,
-                        normalized,
-                        run=run,
+                    validated_mapping_identity_sha256 = (
+                        _validate_listing_snapshot_source(
+                            connection,
+                            normalized,
+                            run=run,
+                            resolved_items=resolved_items,
+                        )
                     )
+                    normalized = replace(
+                        normalized,
+                        requested_scope={
+                            **normalized.requested_scope,
+                            "validated_mapping_identity_sha256": (
+                                validated_mapping_identity_sha256
+                            ),
+                        },
+                    )
+                content_sha256 = _result_content_sha256(
+                    normalized,
+                    mapping_version=self.mappings.mapping_version,
+                )
 
                 existing = connection.execute(
                     """
@@ -529,6 +547,9 @@ class ProductObservationImporter:
                 "time_policy_version": context.time_policy_version,
                 "page_identity_key": item.page_identity_key,
                 "mapping_status": resolution.mapping_status.value,
+                "candidate_internal_skus": (
+                    resolution.candidate_internal_skus
+                ),
                 "evidence_sha256": item.evidence_sha256,
             }
 
@@ -634,7 +655,7 @@ def listing_snapshot_to_observation_batch(
         raise ProductObservationError(
             "source_result_sha256 must be an unprefixed SHA-256"
         )
-    items = _listing_snapshot_observation_items(
+    items, source_identities = _listing_snapshot_observation_bundle(
         snapshot_id=str(snapshot["snapshot_id"]),
         evidence_manifest_sha256=str(
             snapshot["evidence_manifest_sha256"]
@@ -661,6 +682,10 @@ def listing_snapshot_to_observation_batch(
             "scan_completed_at",
         ),
         items=items,
+        source_identities=source_identities,
+    )
+    source_mapping_identity_sha256 = (
+        listing_observation_source_identity_sha256(source_identities)
     )
 
     snapshot_complete = bool(snapshot["snapshot_complete"])
@@ -688,6 +713,9 @@ def listing_snapshot_to_observation_batch(
             "source_result_sha256": result_sha256,
             "source_platform_trade_date": source_trade_date,
             "source_conversion_sha256": source_conversion_sha256,
+            "source_mapping_identity_sha256": (
+                source_mapping_identity_sha256
+            ),
         },
         scope_complete=snapshot_complete,
         end_marker_verified=bool(
@@ -709,7 +737,8 @@ def _validate_listing_snapshot_source(
     batch: ProductObservationBatchInput,
     *,
     run,
-) -> None:
+    resolved_items: tuple[dict[str, object], ...],
+) -> str:
     scope = batch.requested_scope
     snapshot_id = str(scope.get("source_snapshot_id") or "").strip()
     manifest_sha256 = str(
@@ -724,11 +753,15 @@ def _validate_listing_snapshot_source(
     conversion_sha256 = str(
         scope.get("source_conversion_sha256") or ""
     ).strip().lower()
+    mapping_identity_sha256 = str(
+        scope.get("source_mapping_identity_sha256") or ""
+    ).strip().lower()
     if (
         not snapshot_id
         or not EVIDENCE_SHA256_RE.fullmatch(manifest_sha256)
         or not RAW_SHA256_RE.fullmatch(result_sha256)
         or not EVIDENCE_SHA256_RE.fullmatch(conversion_sha256)
+        or not EVIDENCE_SHA256_RE.fullmatch(mapping_identity_sha256)
     ):
         raise ProductObservationError(
             "LISTING_STATUS_SCAN requires immutable snapshot source binding"
@@ -780,6 +813,9 @@ def _validate_listing_snapshot_source(
     source_items = tuple(
         {
             **dict(row),
+            "affected_internal_skus": json.loads(
+                str(row["affected_internal_skus_json"])
+            ),
             "online_row_identities": json.loads(
                 str(row["online_row_identities_json"])
             ),
@@ -789,7 +825,7 @@ def _validate_listing_snapshot_source(
         }
         for row in source_item_rows
     )
-    expected_items = _listing_snapshot_observation_items(
+    expected_items, source_identities = _listing_snapshot_observation_bundle(
         snapshot_id=snapshot_id,
         evidence_manifest_sha256=str(
             source["evidence_manifest_sha256"]
@@ -803,9 +839,14 @@ def _validate_listing_snapshot_source(
         scan_started_at=batch.scan_started_at,
         scan_completed_at=batch.scan_completed_at,
         items=expected_items,
+        source_identities=source_identities,
+    )
+    expected_mapping_identity_sha256 = (
+        listing_observation_source_identity_sha256(source_identities)
     )
     if (
         conversion_sha256 != expected_conversion_sha256
+        or mapping_identity_sha256 != expected_mapping_identity_sha256
         or _observation_inputs_payload(batch.items)
         != _observation_inputs_payload(expected_items)
     ):
@@ -813,37 +854,43 @@ def _validate_listing_snapshot_source(
             "LISTING_STATUS_SCAN observations are not the canonical "
             "snapshot conversion"
         )
+    _validate_resolved_listing_identities(
+        source_identities=source_identities,
+        resolved_items=resolved_items,
+    )
+    return expected_mapping_identity_sha256
 
 
-def _listing_snapshot_observation_items(
+def _listing_snapshot_observation_bundle(
     *,
     snapshot_id: str,
     evidence_manifest_sha256: str,
     snapshot_items: Iterable[dict[str, object]],
-) -> tuple[ProductObservationInput, ...]:
+) -> tuple[
+    tuple[ProductObservationInput, ...],
+    tuple[ListingObservationSourceIdentity, ...],
+]:
+    source_items = tuple(snapshot_items)
+    source_identities = listing_observation_source_identities(
+        snapshot_id=snapshot_id,
+        evidence_manifest_sha256=evidence_manifest_sha256,
+        snapshot_items=source_items,
+    )
+    identity_by_item_and_page = {
+        (identity.snapshot_item_id, identity.page): identity
+        for identity in source_identities
+    }
     items: list[ProductObservationInput] = []
-    for item in snapshot_items:
+    for item in source_items:
         for page, observed_online in (
             ("online", True),
             ("waiting", False),
         ):
             if int(item[f"{page}_occurrences"]) == 0:
                 continue
-            evidence_payload = {
-                "snapshot_id": snapshot_id,
-                "snapshot_item_id": item["snapshot_item_id"],
-                "page": page,
-                "row_identities": item[f"{page}_row_identities"],
-                "evidence_manifest_sha256": evidence_manifest_sha256,
-            }
-            evidence_sha256 = "sha256:" + hashlib.sha256(
-                json.dumps(
-                    evidence_payload,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest()
+            identity = identity_by_item_and_page[
+                (str(item["snapshot_item_id"]), page)
+            ]
             items.append(
                 ProductObservationInput(
                     platform_product_name=str(item["product_name"]),
@@ -860,10 +907,10 @@ def _listing_snapshot_observation_items(
                     observed_inventory=int(
                         item[f"{page}_observed_inventory"]
                     ),
-                    evidence_sha256=evidence_sha256,
+                    evidence_sha256=identity.evidence_sha256,
                 )
             )
-    return tuple(items)
+    return tuple(items), source_identities
 
 
 def _listing_source_conversion_sha256(
@@ -874,6 +921,7 @@ def _listing_source_conversion_sha256(
     scan_started_at: datetime,
     scan_completed_at: datetime,
     items: Iterable[ProductObservationInput],
+    source_identities: Iterable[ListingObservationSourceIdentity],
 ) -> str:
     payload = {
         "snapshot_id": snapshot_id,
@@ -882,6 +930,9 @@ def _listing_source_conversion_sha256(
         "scan_started_at": _datetime_text(scan_started_at),
         "scan_completed_at": _datetime_text(scan_completed_at),
         "items": _observation_inputs_payload(items),
+        "source_mapping_identities": (
+            listing_observation_source_identity_payload(source_identities)
+        ),
     }
     return "sha256:" + hashlib.sha256(
         json.dumps(
@@ -891,6 +942,55 @@ def _listing_source_conversion_sha256(
             separators=(",", ":"),
         ).encode("utf-8")
     ).hexdigest()
+
+
+def _validate_resolved_listing_identities(
+    *,
+    source_identities: Iterable[ListingObservationSourceIdentity],
+    resolved_items: Iterable[dict[str, object]],
+) -> None:
+    expected = {
+        identity.evidence_sha256: identity for identity in source_identities
+    }
+    resolved_by_evidence: dict[str, dict[str, object]] = {}
+    for item in resolved_items:
+        evidence_sha256 = str(item["evidence_sha256"])
+        if evidence_sha256 in resolved_by_evidence:
+            raise ProductObservationError(
+                "LISTING_STATUS_SCAN resolved evidence identity is duplicated"
+            )
+        resolved_by_evidence[evidence_sha256] = item
+    if set(resolved_by_evidence) != set(expected):
+        raise ProductObservationError(
+            "LISTING_STATUS_SCAN resolved mapping identities do not match "
+            "source snapshot"
+        )
+    for evidence_sha256, identity in expected.items():
+        resolved = resolved_by_evidence[evidence_sha256]
+        resolved_sku = (
+            str(resolved.get("internal_sku") or "").strip() or None
+        )
+        resolved_candidates = tuple(
+            sorted(
+                {
+                    str(candidate or "").strip()
+                    for candidate in (
+                        resolved.get("candidate_internal_skus") or ()
+                    )
+                    if str(candidate or "").strip()
+                }
+            )
+        )
+        if (
+            str(resolved["mapping_status"])
+            != identity.mapping_status.value
+            or resolved_sku != identity.internal_sku
+            or resolved_candidates != identity.candidate_internal_skus
+        ):
+            raise ProductObservationError(
+                "LISTING_STATUS_SCAN mapping identity drifted from source "
+                f"snapshot item {identity.snapshot_item_id}"
+            )
 
 
 def _observation_inputs_payload(
