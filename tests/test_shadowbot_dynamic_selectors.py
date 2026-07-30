@@ -61,6 +61,21 @@ def test_product_list_container_uses_dynamic_page_id_fallback():
     assert "_find_product_list_container(window, timeout_seconds)" in source
 
 
+def test_order_date_values_use_global_exact_accessibility_labels():
+    source = FLOW_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_order_picker_value_selector"
+    )
+    helper_source = ast.get_source_segment(source, helper)
+
+    assert "_exact_acc_label_selector(" in helper_source
+    assert "value[\"path\"].append" not in helper_source
+
+
 def test_v5_waiting_row_scroll_probes_before_adaptive_keyboard_navigation():
     source = FLOW_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)

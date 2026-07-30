@@ -205,28 +205,6 @@ class MayiHuatuanOrderReadOnlyAdapter:
                 error_code=_error_code(capture.unavailable_code),
                 error_message=capture.failure_message,
             )
-        if (
-            capture.selected_platform_trade_date
-            != requested_platform_trade_date
-        ):
-            return self._batch(
-                observation_batch_id=observation_batch_id,
-                automation_run_id=automation_run_id,
-                platform_name=platform_name,
-                requested_platform_trade_date=(
-                    requested_platform_trade_date
-                ),
-                trade_day_status=trade_day_status,
-                capture=capture,
-                capability_result="FAILED",
-                batch_status="FAILED",
-                scope_complete=False,
-                end_marker_verified=False,
-                end_marker_kind="",
-                items=(),
-                error_code="ORDER_DATE_MISMATCH",
-                error_message="selected order date differs from requested date",
-            )
         if not capture.loading_completed:
             return self._batch(
                 observation_batch_id=observation_batch_id,
@@ -248,6 +226,28 @@ class MayiHuatuanOrderReadOnlyAdapter:
                     or "ORDER_PAGE_NOT_LOADED"
                 ),
                 error_message=capture.failure_message,
+            )
+        if (
+            capture.selected_platform_trade_date
+            != requested_platform_trade_date
+        ):
+            return self._batch(
+                observation_batch_id=observation_batch_id,
+                automation_run_id=automation_run_id,
+                platform_name=platform_name,
+                requested_platform_trade_date=(
+                    requested_platform_trade_date
+                ),
+                trade_day_status=trade_day_status,
+                capture=capture,
+                capability_result="FAILED",
+                batch_status="FAILED",
+                scope_complete=False,
+                end_marker_verified=False,
+                end_marker_kind="",
+                items=(),
+                error_code="ORDER_DATE_MISMATCH",
+                error_message="selected order date differs from requested date",
             )
 
         parsed: list[OrderObservationInput] = []

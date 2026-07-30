@@ -230,6 +230,63 @@ def order_scan_instruction_hash(request):
     return sha256_json(normalize_order_scan_request(request))
 
 
+def build_order_scan_failure_result(
+    request,
+    request_file_sha256,
+    *,
+    worker_id,
+    error_code,
+    error_message,
+    observed_at,
+):
+    """Build the shared v6 failure/recovery result without page facts."""
+
+    normalized = normalize_order_scan_request(request)
+    request_digest = str(request_file_sha256 or "").removeprefix("sha256:")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", request_digest):
+        raise ValueError("ORDER_SCAN_REQUEST_INVALID")
+    failure_code = str(error_code or "WORKER_EXECUTION_FAILED")[:64]
+    failure_message = str(error_message or "")[:512]
+    return {
+        "schema_version": ORDER_SCAN_RESULT_SCHEMA_VERSION,
+        "contract_version": ORDER_SCAN_CONTRACT_VERSION,
+        "execution_attempt_id": normalized["execution_attempt_id"],
+        "automation_run_id": normalized["automation_run_id"],
+        "observation_batch_id": normalized["observation_batch_id"],
+        "execution_mode": "READ_ONLY",
+        "platform_name": normalized["platform_name"],
+        "requested_platform_trade_date": normalized[
+            "requested_platform_trade_date"
+        ],
+        "instruction_hash": request.get("instruction_hash", ""),
+        "request_file_sha256": "sha256:" + request_digest.lower(),
+        "worker_id": str(worker_id or ""),
+        "queue_phase": "RESULT_WRITTEN",
+        "worker_heartbeat_at": str(observed_at),
+        "status": "FAILED",
+        "run_success_flag": False,
+        "business_operation_completed": False,
+        "side_effect_state": "NOT_STARTED",
+        "error_code": failure_code,
+        "error_message": failure_message,
+        "retryable": False,
+        "capture": {
+            "selected_platform_trade_date": None,
+            "scan_started_at": str(observed_at),
+            "scan_completed_at": str(observed_at),
+            "loading_completed": False,
+            "scroll_completed": False,
+            "no_more_marker_visible": False,
+            "trusted_empty_marker_visible": False,
+            "page_count": 0,
+            "rows": [],
+            "unavailable_code": "",
+            "failure_code": failure_code,
+            "failure_message": failure_message,
+        },
+    }
+
+
 def _bounded_contract_integer(value, minimum, maximum):
     if isinstance(value, bool) or (
         isinstance(value, float) and not value.is_integer()

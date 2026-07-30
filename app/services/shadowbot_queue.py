@@ -46,7 +46,10 @@ from app.services.shadowbot_listing_action_contract import (
     validate_listing_action_result,
 )
 from app.shadowbot_contract_primitives import (
+    ORDER_SCAN_CONTRACT_VERSION,
+    build_order_scan_failure_result,
     build_v4_recovery_result,
+    normalize_order_scan_request,
     sha256_json,
 )
 
@@ -194,6 +197,13 @@ class ShadowBotResultImporter:
                 data=data,
                 result_bytes=result_bytes,
             )
+        if data.get("contract_version") == ORDER_SCAN_CONTRACT_VERSION:
+            return {
+                "status": "DEFERRED",
+                "error_code": "ORDER_RESULT_REQUIRES_AUTOMATION_IMPORTER",
+                "execution_attempt_id": execution_attempt_id,
+                "path": str(result_path),
+            }
         attempt = self.repository.get_shadowbot_execution_attempt(execution_attempt_id)
         if attempt is None:
             raise ValidationError("RESULT_CONTRACT_INVALID: execution_attempt_id does not exist.")
@@ -1172,7 +1182,8 @@ class ShadowBotQueueWatchdog:
             phase_data = {
                 "request_file_sha256": (
                     "sha256:" + request_digest
-                    if request_data.get("contract_version") == 5
+                    if request_data.get("contract_version")
+                    in {5, ORDER_SCAN_CONTRACT_VERSION}
                     else request_digest
                 ),
                 "side_effect_state": SIDE_EFFECT_NOT_STARTED,
@@ -1211,6 +1222,57 @@ class ShadowBotQueueWatchdog:
                 if duplicate:
                     reason = "DUPLICATE_READY_REQUEST"
                     target_root = self.paths.quarantine
+                elif (
+                    request.get("contract_version")
+                    == ORDER_SCAN_CONTRACT_VERSION
+                ):
+                    normalize_order_scan_request(request)
+                    with self.repository.connect_read() as connection:
+                        run = connection.execute(
+                            """
+                            SELECT job_type, run_status, platform_name,
+                                   platform_trade_date
+                            FROM automation_runs
+                            WHERE run_id = ?
+                            """,
+                            (
+                                str(
+                                    request.get("automation_run_id")
+                                    or ""
+                                ),
+                            ),
+                        ).fetchone()
+                    bound = (
+                        run is not None
+                        and str(run["job_type"]) == "ORDER_SCAN"
+                        and str(run["platform_name"])
+                        == str(request.get("platform_name") or "")
+                        and str(run["platform_trade_date"])
+                        == str(
+                            request.get(
+                                "requested_platform_trade_date"
+                            )
+                            or ""
+                        )
+                    )
+                    if not bound:
+                        reason = "ORPHAN_READY_REQUEST"
+                        target_root = self.paths.quarantine
+                    elif str(run["run_status"]) == "RUNNING":
+                        continue
+                    elif str(run["run_status"]) in {
+                        "SUCCESS",
+                        "PARTIAL",
+                        "FAILED",
+                        "SKIPPED",
+                        "CANCELLED",
+                    }:
+                        reason = "STALE_TERMINAL_READY_REQUEST"
+                        target_root = self.paths.archive / attempt_id
+                        target_root.mkdir(parents=True, exist_ok=True)
+                    else:
+                        reason = "FROZEN_READY_REQUEST"
+                        target_root = self.paths.quarantine
                 elif request.get("contract_version") == 5:
                     validate_listing_action_request(request, check_expiry=False)
                     if (
@@ -1435,7 +1497,10 @@ class ShadowBotQueueWatchdog:
         request_path = self.paths.working / f"{execution_attempt_id}.request.json"
         request_data = _read_json_object(request_path)
         request_digest = hashlib.sha256(request_path.read_bytes()).hexdigest()
-        if request_data.get("contract_version") == 5:
+        if request_data.get("contract_version") in {
+            5,
+            ORDER_SCAN_CONTRACT_VERSION,
+        }:
             phase_data.setdefault("request_file_sha256", "sha256:" + request_digest)
         else:
             phase_data.setdefault("request_file_sha256", request_digest)
@@ -1462,6 +1527,15 @@ class ShadowBotQueueWatchdog:
             return None
         if request_data.get("contract_version") == 5:
             return self._write_v5_recovery_result(
+                request_data,
+                phase_data,
+                phase=phase,
+            )
+        if (
+            request_data.get("contract_version")
+            == ORDER_SCAN_CONTRACT_VERSION
+        ):
+            return self._write_v6_recovery_result(
                 request_data,
                 phase_data,
                 phase=phase,
@@ -1496,6 +1570,12 @@ class ShadowBotQueueWatchdog:
                 request,
                 synthetic_phase,
                 phase="CLAIMED",
+            )
+        if request.get("contract_version") == ORDER_SCAN_CONTRACT_VERSION:
+            return self._write_v6_recovery_result(
+                request,
+                phase_data,
+                phase=phase,
             )
         execution_mode = str(request.get("execution_mode") or "")
         has_submit_risk = phase in SUBMIT_PHASES or phase == "VERIFIED" or (
@@ -1539,6 +1619,31 @@ class ShadowBotQueueWatchdog:
             "ended_at": datetime.now(UTC).isoformat(),
         }
         return self._write_result(result, str(request.get("execution_attempt_id") or ""))
+
+    def _write_v6_recovery_result(
+        self,
+        request: dict[str, Any],
+        phase_data: dict[str, Any],
+        *,
+        phase: str,
+    ) -> dict[str, Any]:
+        result = build_order_scan_failure_result(
+            request,
+            str(phase_data.get("request_file_sha256") or ""),
+            worker_id=str(
+                phase_data.get("worker_id") or "watchdog:recovery"
+            ),
+            error_code="WORKER_INTERRUPTED",
+            error_message=(
+                "stale ShadowBot v6 order scan recovered at phase "
+                f"{phase}"
+            ),
+            observed_at=datetime.now(UTC).isoformat(),
+        )
+        return self._write_result(
+            result,
+            str(request.get("execution_attempt_id") or ""),
+        )
 
     def _write_v4_recovery_result(
         self,

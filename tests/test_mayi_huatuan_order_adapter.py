@@ -184,6 +184,24 @@ def test_unavailable_is_distinct_from_empty_and_failed() -> None:
     assert batch.items == ()
 
 
+def test_page_failure_precedes_date_mismatch_classification() -> None:
+    failed = replace(
+        _capture(),
+        selected_platform_trade_date=None,
+        loading_completed=False,
+        rows=(),
+        failure_code="ORDER_DATE_VALUE_NOT_FOUND",
+        failure_message="synthetic date selection failure",
+    )
+    adapter, _ = _adapter(failed)
+
+    batch = _scan(adapter)
+
+    assert batch.capability_result == "FAILED"
+    assert batch.batch_status == "FAILED"
+    assert batch.error_code == "ORDER_DATE_VALUE_NOT_FOUND"
+
+
 def test_fixture_loader_rejects_order_ids_and_pii_fields() -> None:
     payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
     payload["rows"][0]["platform_order_id"] = "forbidden"

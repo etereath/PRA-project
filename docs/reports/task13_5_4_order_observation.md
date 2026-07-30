@@ -26,6 +26,9 @@ FULL_MARKET_SCAN
   买家 PII、请求错绑、checksum 错误和任何平台写副作用声明；
 - `ShadowBotFileQueueOrderTransport`：复用既有单 Worker 文件队列、heartbeat、phase、
   checksum 和归档；事实导入成功后才归档结果；
+- 通用队列 Watchdog：识别 v6 `ORDER_SCAN` 绑定，避免把合法订单请求隔离为孤儿；
+  通用 Result Importer 对 v6 让路给订单 Importer，超时恢复生成零写的 v6
+  `FAILED` 结果；
 - `FullMarketScanOrderCoordinator / OrderScanHandler`：复用 13.5-3 的父子 run、租约、
   完成接口和 `ORDER_SCAN_CHILD` 关系。
 
@@ -66,27 +69,47 @@ FULL_MARKET_SCAN
 - 平台或 Run 错绑；
 - 数据库失败整体回滚；
 - v6 请求/结果绑定、checksum、PII 拒绝、零平台写副作用；
+- v6 Watchdog Run 绑定、通用 Importer 分流和超时恢复；
 - `FULL_MARKET_SCAN → ORDER_SCAN` 父子集成。
 
 本地统一回归：
 
 ```text
-pytest: 881 passed, 3 skipped, 97 subtests passed
+pytest: 886 passed, 3 skipped, 97 subtests passed
+system smoke: 16 passed, 0 failed
 ```
 
 ## 5. 受控实机 READ_ONLY
 
-截至本报告首次写入时，生命周期记录是过期的 `RUNNING`，磁盘 heartbeat 为旧
-`STOPPED`，队列为空且 `stop.signal` 不存在；影刀窗口仍处于应用设计器。
+2026-07-31 已完成受控真实页面 READ_ONLY 验收。验收使用一次性 v14 Runtime DB，
+避免绕过真实 Runtime DB 中既有的 `NEEDS_RECONCILIATION` 写安全门禁；真实 Runtime
+DB 未写入订单事实。
 
-仓库与部署目录的 `shadowbot_contract_primitives.py`、
-`vertical_slice_read_price.py`、`shadowbot_queue_worker.py` 哈希不一致。按项目门禁，
-在编辑器关闭并回到应用列表前不得外部同步。因此本项尚未宣称通过，也没有向真实页面
-投递请求。
+脱敏验收摘要：
 
-完成实机验收后，本节必须补充脱敏 attempt ID、请求/结果 SHA-256、状态、交易日终态、
-行数/合计的非敏感计数摘要、归档状态、队列清空和生命周期/heartbeat 一致性；不得
-写入真实订单值、截图、平台订单号或买家 PII。
+```text
+execution_attempt_id: ORDER-READ-T1354-20260730T233128Z
+execution_mode: READ_ONLY
+trade_day_status: OPEN
+capability_result: SUCCEEDED
+batch_status: ACCEPTED
+scope_complete: true
+end_marker_verified: true
+item_count: 0
+content_sha256: sha256:16cffc1f68d198424df7e851dd4e9d23068c2e852187ed2101c09b95b488f987
+result_imported: true
+result_archived: true
+queue_counts: inbox=0, working=0, results=0
+platform_write_operations: 0
+```
+
+该结果表示当前交易日页面已验证为可信空页，不表示 `OPEN` 是完整闭市事实。验收结束
+后 `test2` Worker 保持新鲜 `RUNNING`，`stop.signal` 不存在，通用队列服务已恢复。
+仓库未保存真实订单值、截图、平台订单号或买家 PII。
+
+真实 Runtime DB 的尝试在父 run claim 前被既有
+`READ-READ-BATCH-T11-20260719-082740` 的 `NEEDS_RECONCILIATION` 正确阻断；没有绕过、
+修改或清理该账本，只精确回滚了本次验收临时创建的父 run/job。
 
 ## 6. 当前限制
 

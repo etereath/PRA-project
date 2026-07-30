@@ -14,6 +14,7 @@ from pathlib import Path
 
 try:
     from app.shadowbot_contract_primitives import (
+        build_order_scan_failure_result,
         build_v4_recovery_result,
         canonical_positive_price,
         derive_v4_batch_semantics,
@@ -33,6 +34,7 @@ try:
 except ImportError:
     try:
         from .shadowbot_contract_primitives import (
+            build_order_scan_failure_result,
             build_v4_recovery_result,
             canonical_positive_price,
             derive_v4_batch_semantics,
@@ -51,6 +53,7 @@ except ImportError:
         )
     except ImportError:
         from shadowbot_contract_primitives import (
+            build_order_scan_failure_result,
             build_v4_recovery_result,
             canonical_positive_price,
             derive_v4_batch_semantics,
@@ -143,48 +146,14 @@ def _v6_failed_result(
     error_code,
     error_message,
 ):
-    observed_at = _now_iso()
-    return {
-        "schema_version": ORDER_SCAN_RESULT_SCHEMA_VERSION,
-        "contract_version": ORDER_SCAN_CONTRACT_VERSION,
-        "execution_attempt_id": request.get("execution_attempt_id", ""),
-        "automation_run_id": request.get("automation_run_id", ""),
-        "observation_batch_id": request.get("observation_batch_id", ""),
-        "execution_mode": "READ_ONLY",
-        "platform_name": request.get("platform_name", ""),
-        "requested_platform_trade_date": request.get(
-            "requested_platform_trade_date",
-            "",
-        ),
-        "instruction_hash": request.get("instruction_hash", ""),
-        "request_file_sha256": "sha256:" + request_sha256,
-        "worker_id": worker_id,
-        "queue_phase": "RESULT_WRITTEN",
-        "worker_heartbeat_at": observed_at,
-        "status": "FAILED",
-        "run_success_flag": False,
-        "business_operation_completed": False,
-        "side_effect_state": "NOT_STARTED",
-        "error_code": str(error_code or "WORKER_EXECUTION_FAILED"),
-        "error_message": str(error_message or "")[:512],
-        "retryable": False,
-        "capture": {
-            "selected_platform_trade_date": None,
-            "scan_started_at": observed_at,
-            "scan_completed_at": observed_at,
-            "loading_completed": False,
-            "scroll_completed": False,
-            "no_more_marker_visible": False,
-            "trusted_empty_marker_visible": False,
-            "page_count": 0,
-            "rows": [],
-            "unavailable_code": "",
-            "failure_code": str(
-                error_code or "WORKER_EXECUTION_FAILED"
-            ),
-            "failure_message": str(error_message or "")[:512],
-        },
-    }
+    return build_order_scan_failure_result(
+        request,
+        request_sha256,
+        worker_id=worker_id,
+        error_code=error_code,
+        error_message=error_message,
+        observed_at=_now_iso(),
+    )
 
 
 def _v2_normalize_text(value):

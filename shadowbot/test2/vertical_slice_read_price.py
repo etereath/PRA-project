@@ -6611,41 +6611,13 @@ def _order_row_field_selector(row_ordinal, field):
 
 
 def _order_picker_value_selector(column_name, expected_text):
-    base = package.selector(ORDER_DATE_PICKER_SELECTORS[column_name])
-    value = copy.deepcopy(base.__dict__["value"])
-    _remove_dynamic_page_id_constraints(value)
-    value["id"] = str(uuid.uuid4())
-    value["name"] = "动态_订单日期_%s_%s" % (
-        column_name,
+    return _exact_acc_label_selector(
         str(expected_text),
+        "动态_订单日期_%s_%s" % (
+            column_name,
+            str(expected_text),
+        ),
     )
-    value["screenshot"] = ""
-    grade_template = package.selector(
-        ORDER_ROW_SELECTOR_TEMPLATES["grade"]
-    ).__dict__["value"]
-    static_nodes = [
-        node
-        for node in grade_template["path"]
-        if node.get("name") == "StaticText"
-    ]
-    if not static_nodes:
-        raise SliceError(
-            "ORDER_SELECTOR_BUILD_FAILED",
-            "日期选择器缺少 StaticText 模板",
-            retryable=False,
-        )
-    target = copy.deepcopy(static_nodes[-1])
-    target["selected"] = True
-    target["attributes"] = [
-        attribute
-        for attribute in target.get("attributes", [])
-        if attribute.get("name")
-        not in {"acc-name", "explicit-name", "index", "name-from", "value"}
-    ]
-    _set_path_attribute(target, "role", "StaticText")
-    _set_path_attribute(target, "acc-name", str(expected_text))
-    value["path"].append(target)
-    return Selector(value)
 
 
 def _order_click_element(element):

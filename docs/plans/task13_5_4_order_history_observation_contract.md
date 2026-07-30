@@ -151,6 +151,11 @@ Importer 在单一 `BEGIN IMMEDIATE` 事务中：
 必须先通过 schema、请求绑定、checksum、PII 黑名单和零副作用校验，再进入 Importer。
 数据库导入成功后才归档队列结果；数据库失败时保留结果用于精确重放。
 
+既有通用队列服务不得把 v6 结果作为旧版结果导入，也不得把合法 v6 请求误判为孤儿。
+v6 请求进入 `working` 前，Watchdog 必须确认其绑定到同平台、同交易日且处于
+`RUNNING` 的 `ORDER_SCAN`；超时恢复只能生成 `FAILED`、零写副作用的 v6 结果，后续仍
+由订单 Importer 完成业务导入和归档。
+
 ## 8. Runtime Schema v14 最小纠正
 
 真实 Runtime DB 尚未写入订单事实。v14 的预留字段
