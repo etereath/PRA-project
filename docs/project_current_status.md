@@ -8,7 +8,7 @@ PRA 当前定位为：
 
 鲜切花预测性销售决策系统 + 运行态任务运营后台。
 
-PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、多商品、受控 RPA 改价与上下架闭环；任务 13.5 已插入任务 13 与任务 14 之间，用于补齐 18:00 平台交易日/20:00 卖家作业日双时间轴、持续只读扫描、历史订单观察、销售日结、S0–S4 异常治理、任务来源对齐、受控紧急保护和运营 Web 重写。当前 13.5-1 已完成双时间轴、Runtime Schema v14、六级质量约束和日结状态机；13.5-2 已通过 PR #23 合并商品映射编译、扫描 JSON 输入、任务 13 双页快照适配和 v14 商品观察导入；13.5-3 已通过 PR #24 合并独立 Automation Service 的计划窗口、租约、合并、补跑、父子 run、心跳和健康控制面。13.5-4 已进入订单历史只读观察准备阶段，必须先完成订单页无副作用探索并冻结字段、分页、日期范围和取消量语义，之后才实现 Adapter、Importer、Repository 和 `ORDER_SCAN` handler。真实 Runtime DB 尚未迁移，`ONLINE_PULSE` 与 `ORDER_SCAN` 的 ShadowBot 宿主采集 handler 尚未部署，因此仍不承诺生产级无人值守写操作，也未扩展到第二平台。系统核心职责是：
+PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、多商品、受控 RPA 改价与上下架闭环；任务 13.5 已插入任务 13 与任务 14 之间，用于补齐 18:00 平台交易日/20:00 卖家作业日双时间轴、持续只读扫描、历史订单观察、销售日结、S0–S4 异常治理、任务来源对齐、受控紧急保护和运营 Web 重写。当前 13.5-1 已完成双时间轴、Runtime Schema v14、六级质量约束和日结状态机；13.5-2 已通过 PR #23 合并商品映射编译、扫描 JSON 输入、任务 13 双页快照适配和 v14 商品观察导入；13.5-3 已通过 PR #24 合并独立 Automation Service 的计划窗口、租约、合并、补跑、父子 run、心跳和健康控制面。13.5-4 已完成订单页首轮无副作用探索，确认纵向滚动、可信空页、显式结束标记和准确下单时间，同时发现当前交易日可读，与 Issue #20 的旧 Capability 声明冲突；在父 Issue 校正、金额/数量口径和候选步长 `9` 完成复核前，不进入公共 Adapter、Importer、Repository 和 `ORDER_SCAN` handler 实现。真实 Runtime DB 尚未迁移，`ONLINE_PULSE` 与 `ORDER_SCAN` 的 ShadowBot 宿主采集 handler 尚未部署，因此仍不承诺生产级无人值守写操作，也未扩展到第二平台。系统核心职责是：
 
 - 从 Excel 读取业务输入。
 - 根据规则和预测输入生成运行态任务。
@@ -28,6 +28,8 @@ PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、�
 验收结果，[迁移手册](runtime_schema_v14_migration.md)负责后续真实库升级。
 [13.5-4 订单历史只读观察合同](plans/task13_5_4_order_history_observation_contract.md)
 冻结无稳定订单 ID 时的批次内多重集合语义、数据最小化、能力降级和开工门禁。
+[订单页首轮无副作用探索报告](reports/task13_5_4_order_page_exploration_20260731.md)
+记录 2026-07-31 的页面事实、字段边界、候选步长和父 Issue 冲突。
 
 ## 2. 当前已完成能力
 
@@ -96,11 +98,13 @@ lease_expires_at` fencing、邻近扫描合并和有界补跑。独立 CLI 当�
 平台请求，也不伪造扫描成功。合同见
 [13.5-3 Automation Service 合同](plans/task13_5_3_automation_service_contract.md)。
 
-13.5-4 当前只完成开工准备：v14 已预留 append-only 订单观察表，但订单页 Adapter、
-订单观察 Importer/Repository 和正式 `ORDER_SCAN` handler 尚未实现。当前平台能力
-预期为“支持历史日、不支持当前日”；当前交易日不可访问必须表示为 `UNAVAILABLE`，
-不能伪造为空订单或 0。公共核心编码前必须先形成不含个人信息和订单 ID 的脱敏探索
-fixture，并冻结分页/滚动、结束标记、字段口径和取消量推导边界。
+13.5-4 已完成首轮无副作用探索：v14 已预留 append-only 订单观察表，但订单页
+Adapter、订单观察 Importer/Repository 和正式 `ORDER_SCAN` handler 尚未实现。
+实测当前日期可查询，并能以零汇总和“暂无订单”表示可用空页；这与 Issue #20 当前的
+`supports_current_trade_day=false` 冻结声明冲突。公共核心编码前必须先更新父 Issue，
+把“可读进行中快照”和“交易日已关闭可结算”拆开，并形成不含个人信息和订单 ID 的
+脱敏 fixture，冻结可访问日期范围、滚动/结束标记、候选步长 `9`、金额/数量口径和
+取消量推导边界。
 
 当前代码中的 runtime schema 最新版本为 v14。v3 新增自动规则评估运行记录，v4 新增 ShadowBot Executor 账本，v5 新增队列审计字段和 `retry_authorizations`，v6 新增事务型通知 Outbox，v7-v9 建立 `listing_status` 并将业务身份统一为“平台 + 品种 + 等级”，v10 将 `tasks.expected_old_price` 结构化，v11 新增单次请求的 `shadowbot_commit_batches` 和 `shadowbot_commit_batch_items`，v12 新增逐商品操作/尝试身份、活动写锁、观察时间和持久化结果回执，v13 新增公共批次注册表、通用上下架 operation、共享写锁、v5 动作账本、两页快照和页面异常事实表，v14 新增双时间轴、Automation、不可变观察、日结、Incident 和任务来源结构。真实 Runtime DB 是否已升级必须单独核实；`app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION` 是代码版本唯一权威来源。
 

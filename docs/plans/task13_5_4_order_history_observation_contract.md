@@ -1,7 +1,8 @@
 # 任务 13.5-4：订单历史只读观察开工合同
 
-- 状态：准备完成，等待订单页无副作用探索
-- 基线：`main` 合并 PR #24 后的 `6d46e3f`
+- 状态：首轮无副作用探索完成，等待父 Issue Capability 校正和字段口径复核
+- 基线：`origin/main@4aa4c73`
+- 准备提交：`16f60b8`
 - 权威范围：GitHub Issue #20 正文与
   `task13_5_operational_closed_loop_and_web_rewrite.md`
 - 当前平台：蚂蚁花团供应商微信小程序
@@ -53,7 +54,7 @@ ORDER_SCAN Automation 子 run
 
 ## 3. 平台能力合同
 
-当前平台能力固定声明为：
+GitHub Issue #20 当前固定声明为：
 
 ```text
 supports_order_scan = true
@@ -70,6 +71,16 @@ supports_historical_trade_day = true
 
 当前交易日不可读必须返回 `UNAVAILABLE`，数量、金额和订单观察数保持未知，不能用
 空数组或 0 表示“无订单”。
+
+2026-07-31 首轮实测发现当前日期可以选择，并能返回零汇总和“暂无订单”可信空页，
+与上述父 Issue 声明冲突。实测候选能力为
+`true / true / true`，但“可读当前进行中快照”不等于“交易日已经关闭并可最终结算”。
+详见
+[首轮无副作用探索报告](../reports/task13_5_4_order_page_exploration_20260731.md)。
+
+Adapter Capability 属于父 Issue 冻结边界。在 Issue #20 正文完成校正前，公共实现仍
+不得静默改成 `supports_current_trade_day=true`，也不得继续把当前日期可信空页写成
+`UNAVAILABLE`。该冲突是 13.5-4B/4C 的显式开工阻塞项。
 
 ## 4. 无副作用探索门禁
 
@@ -307,20 +318,23 @@ Importer 分为两条路径：
 
 已满足：
 
-- [x] PR #24 已合并，本地 `main` 与 `origin/main` 对齐；
+- [x] 本地 `main` 与 `origin/main@4aa4c73` 对齐；
 - [x] v14 订单观察表和 append-only 约束已存在；
 - [x] 多重集合核心语义已在父 Issue 和本合同中冻结；
-- [x] 当前平台能力的预期值已明确；
 - [x] 实现切分、安全边界和验收矩阵已明确。
+- [x] 已完成首轮订单页无副作用探索并形成脱敏报告；
+- [x] 已确认纵向滚动、“没有更多了”、可信空页和精确到秒的下单时间；
+- [x] 已记录用户初测的订单元素候选步长 `9`，但尚未冻结为正式选择器常量。
 
 开始公共核心编码前仍必须满足：
 
-- [ ] 完成一次订单页无副作用探索；
-- [ ] 冻结页面字段标签、日期范围、分页/滚动和结束标记；
+- [ ] 更新 Issue #20，解决当前交易日 Capability 与实测冲突；
+- [ ] 冻结页面字段标签、可访问日期范围、滚动和结束标记；
 - [ ] 确认准确 `order_created_at` 的格式和时区语义；
 - [ ] 确认 `ordered_qty / effective_qty / seller_received_amount /
   purchase_sequence` 的页面含义和空值；
 - [ ] 决定取消量保持未知或采用有证据的版本化推导方法；
+- [ ] 跨三张卡片、滚动和另一个历史日期验证候选步长 `9`；
 - [ ] 形成不含 PII 和订单 ID 的脱敏结构化 fixture。
 
 在这些门禁完成前，不实现真实订单页解析，不注册生产 `ORDER_SCAN` handler，也不宣称
