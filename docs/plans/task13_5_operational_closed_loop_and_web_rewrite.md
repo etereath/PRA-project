@@ -254,17 +254,18 @@ supports_historical_trade_day
 
 ### 6.1 数据最小化
 
-订单管理页当前只能可靠读取前几个历史交易日，不能可靠读取当前交易日。能力合同必须
-明确记录：
+2026-07-31 首轮无副作用实测确认订单管理页可以读取当前交易日截至 `observed_at`
+的开放快照，也可以读取相邻历史交易日。能力合同必须明确记录：
 
 - `supports_order_scan=true`
-- `supports_current_trade_day=false`
+- `supports_current_trade_day=true`
 - `supports_historical_trade_day=true`
 
-系统只读取页面可访问的历史日，并明确显示当前日不可用，不能伪装成实时订单。每次读取
-写入不可变的 `order_observation_batches` 和 `order_observation_items`。页面没有稳定订单
-ID 或订单行 ID 时，使用规范化行指纹、`occurrence_no` 和 `occurrence_count` 表示
-重复行多重集：
+系统必须把 `supports_current_trade_day` 与 `OPEN / CLOSED` 或等价终态分开：
+当前开放交易日结果只是截至观察时刻的快照，不能伪装成闭市完整订单或提前进入
+`FINAL`；可信“暂无订单”空页不得写成 `UNAVAILABLE`。每次读取写入不可变的
+`order_observation_batches` 和 `order_observation_items`。页面没有稳定订单 ID 或订单行
+ID 时，使用规范化行指纹、`occurrence_no` 和 `occurrence_count` 表示重复行多重集：
 
 - `source_row_fingerprint` 只用于候选分组和完整性校验，不是 canonical ID。
 - `occurrence_no` 表示同一批次中每条相同指纹记录的实例序号。
@@ -710,7 +711,7 @@ Web 主控端以运营人员的工作问题组织页面：
 - 无副作用探索页面，冻结能力标志、字段白名单、分页和可访问历史范围。
 - 在编码前冻结不可变订单批次、行指纹、`occurrence_no / occurrence_count`、
   跨批次多重集合和完整批次接受规则。
-- 当前交易日不可读时明确降级，不伪造实时订单或稳定订单 ID。
+- 当前开放交易日只形成截至 `observed_at` 的快照，不伪造闭市完整订单或稳定订单 ID。
 
 验收：历史日、重复行、多批次、空页、分页、部分失败和取消推导均有证据。
 
@@ -786,7 +787,7 @@ Web 主控端以运营人员的工作问题组织页面：
 
 - 相同订单观察行以指纹和 `occurrence_no` 保留真实实例，`occurrence_count` 可复算，
   跨批次按多重集合比较而不累加销售。
-- 当前订单页不可用时能力标志、质量和页面实际范围一致。
+- 当前开放交易日快照或请求日期真实不可用时，能力标志、终态、质量和页面实际范围一致。
 - `ORDER_OBSERVED` 与 `SCAN_ESTIMATED` 不混算。
 - `fact_source / quality_level / summary_status` 独立保存。
 - 后续历史订单按 `OBSERVED → RECONCILED → FINAL` 推进，而不是静默覆盖

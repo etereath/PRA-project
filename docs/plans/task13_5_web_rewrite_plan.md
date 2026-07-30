@@ -448,7 +448,7 @@ Schema v13、测试角色 `admin`、桌面 1440×900 和移动端 390×844。精
 
 ```text
 supports_order_scan = true
-supports_current_trade_day = false
+supports_current_trade_day = true
 supports_historical_trade_day = true
 ```
 
@@ -488,7 +488,8 @@ ACKNOWLEDGED / AUTO_PROTECTING / RESOLVED / CLOSED`；确认不等于解决。
 第一版不追求复杂 BI，优先提供：
 
 - `ORDER_OBSERVED` 与 `SCAN_ESTIMATED` 分栏或显式切换。
-- 卖家实收金额、有效数量和卖家实收单价；不可得订单数不展示为 0。
+- 已确认口径的卖家实收金额、有效数量和卖家实收单价；口径未确认时显示“待确认”，
+  不把页面“合计”直接命名为卖家实收，不可得订单数也不展示为 0。
 - 品种 × 等级矩阵。
 - 10/30/60 分钟时段曲线、16:00–18:00 高峰份额和 18:00–20:00 早期销售。
 - 上架时长、销售速度、缺货时长和库存消耗。
@@ -497,8 +498,9 @@ ACKNOWLEDGED / AUTO_PROTECTING / RESOLVED / CLOSED`；确认不等于解决。
 - `PROVISIONAL → OBSERVED → RECONCILED → FINAL` 日结状态和 supersedes 关系；
   只有 `FINAL` 是正式终态。
 
-当前交易日订单不可读时显示 `supports_current_trade_day=false` 的运营文案和估算质量，
-不能展示 0 冒充真实结果。
+当前交易日显示“截至最近观察时刻”的 `OPEN` 快照和新鲜度；可信“暂无订单”空页可以
+显示 0，但必须同时显示观察时间且不得冒充闭市完整结果。请求日期真实不可用时显示
+`UNAVAILABLE`，不能展示 0 冒充真实结果。
 
 ### 6.8 系统维护中的执行与审计
 

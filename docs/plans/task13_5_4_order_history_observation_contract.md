@@ -1,6 +1,6 @@
 # 任务 13.5-4：订单历史只读观察开工合同
 
-- 状态：首轮无副作用探索完成，等待父 Issue Capability 校正和字段口径复核
+- 状态：首轮无副作用探索与父 Issue Capability 同步完成，等待字段口径复核
 - 基线：`origin/main@4aa4c73`
 - 准备提交：`16f60b8`
 - 权威范围：GitHub Issue #20 正文与
@@ -54,11 +54,11 @@ ORDER_SCAN Automation 子 run
 
 ## 3. 平台能力合同
 
-GitHub Issue #20 当前固定声明为：
+GitHub Issue #20 已依据 2026-07-31 首轮实测更新为：
 
 ```text
 supports_order_scan = true
-supports_current_trade_day = false
+supports_current_trade_day = true
 supports_historical_trade_day = true
 ```
 
@@ -69,18 +69,15 @@ supports_historical_trade_day = true
 - `FAILED`：能力应可用，但本次登录、网络、页面、解析或执行失败；
 - `SUCCEEDED`：目标范围已完成只读访问；是否可接受仍由批次完整性决定。
 
-当前交易日不可读必须返回 `UNAVAILABLE`，数量、金额和订单观察数保持未知，不能用
-空数组或 0 表示“无订单”。
-
-2026-07-31 首轮实测发现当前日期可以选择，并能返回零汇总和“暂无订单”可信空页，
-与上述父 Issue 声明冲突。实测候选能力为
-`true / true / true`，但“可读当前进行中快照”不等于“交易日已经关闭并可最终结算”。
-详见
+`supports_current_trade_day=true` 只表示能够读取截至 `observed_at` 的开放交易日快照，
+不表示交易日已经关闭或可以最终结算。当前日期返回零汇总和“暂无订单”时属于可信
+可用空页，可以形成 `SUCCEEDED` 零行结果；只有请求日期确实不可访问时才返回
+`UNAVAILABLE`。详见
 [首轮无副作用探索报告](../reports/task13_5_4_order_page_exploration_20260731.md)。
 
-Adapter Capability 属于父 Issue 冻结边界。在 Issue #20 正文完成校正前，公共实现仍
-不得静默改成 `supports_current_trade_day=true`，也不得继续把当前日期可信空页写成
-`UNAVAILABLE`。该冲突是 13.5-4B/4C 的显式开工阻塞项。
+Adapter 和 Importer 必须同时保存 `OPEN / CLOSED` 或等价的交易日终态事实；18:00
+截单前的当前交易日快照不得进入 `FINAL`，也不得用后续缺失数据覆盖已经接受的历史
+快照。
 
 ## 4. 无副作用探索门禁
 
@@ -90,7 +87,7 @@ Adapter Capability 属于父 Issue 冻结边界。在 Issue #20 正文完成校�
    写操作；
 2. 记录可访问的最早/最晚平台交易日、默认日期、切换日期后的实际返回范围；
 3. 确认列表、分页或滚动加载机制，以及可验证的结束标记；
-4. 确认空页、加载失败、权限不足和当前交易日不可访问的页面差异；
+4. 确认可信空页、加载失败、权限不足和请求日期不可访问的页面差异；
 5. 对每个候选字段确认页面标签、格式、空值、单位和业务含义；
 6. 验证相同内容的真实重复行是否可能出现，以及页面顺序是否稳定；
 7. 只在页面事实足以证明时冻结 `effective_qty` 和取消量推导公式；
@@ -131,7 +128,9 @@ Adapter Capability 属于父 Issue 冻结边界。在 Issue #20 正文完成校�
 - 独立规格、商品历史累计销量；
 - 买家支付金额、标价、优惠后成交价等页面未提供的金额口径。
 
-只保存 `seller_received_amount`。若后续派生单位金额，名称必须是
+公共订单事实的金额字段只允许 `seller_received_amount`。页面“单价 / 合计 / 金额”
+口径经业务证据确认为卖家实收前，该字段保持 `NULL`；Adapter 局部
+`displayed_order_total_amount` 不得直接写入 v14。确认后若派生单位金额，名称必须是
 `seller_received_unit_amount`，且来源为卖家实收金额除以有效数量。
 
 ## 6. 不可变批次合同
@@ -328,7 +327,7 @@ Importer 分为两条路径：
 
 开始公共核心编码前仍必须满足：
 
-- [ ] 更新 Issue #20，解决当前交易日 Capability 与实测冲突；
+- [x] Issue #20 已更新为 `true / true / true`，并区分开放交易日快照与闭市终态；
 - [ ] 冻结页面字段标签、可访问日期范围、滚动和结束标记；
 - [ ] 确认准确 `order_created_at` 的格式和时区语义；
 - [ ] 确认 `ordered_qty / effective_qty / seller_received_amount /

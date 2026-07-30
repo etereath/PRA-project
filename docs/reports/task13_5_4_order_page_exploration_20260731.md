@@ -5,7 +5,7 @@
 - 探索分支：`codex/task13-5-4-order-history-observation`
 - 准备提交：`16f60b8`
 - 平台：蚂蚁花团供应商微信小程序
-- 结论：首轮探索完成，但 Capability、金额口径和行定位稳定性仍需冻结
+- 结论：首轮探索和 Capability 同步完成，金额口径和行定位稳定性仍需冻结
 
 ## 1. 安全边界与证据处理
 
@@ -67,9 +67,9 @@ trade_day_finality = OPEN | CLOSED
 当前交易日在 18:00 截单前只能形成带 `observed_at` 的进行中快照；不得把空结果解释为
 完整交易日最终销量，也不得在 18:00 前进入 `FINAL` 日结。
 
-GitHub Issue #20 正文目前仍声明
-`supports_current_trade_day=false`。该 Capability 属于父 Issue 冻结边界，必须先更新
-父 Issue，再修改公共实现和验收矩阵；本报告只记录实测冲突，不静默改写权威范围。
+GitHub Issue #20 已于 2026-07-31 同步更新为
+`supports_current_trade_day=true`，并明确“可读开放交易日快照”与“交易日已经关闭”
+是两个维度。公共实现和验收矩阵必须遵守更新后的父 Issue。
 
 ### 2.2 历史日期可查询
 
@@ -227,7 +227,6 @@ confidence = PROVISIONAL
 
 ### 6.2 仍阻塞公共核心或平台 Adapter 的事项
 
-- 父 Issue 中 `supports_current_trade_day=false` 与实测冲突；
 - 页面“合计”是否等于卖家实收；
 - 单一数量字段与 `ordered_qty / effective_qty` 的映射；
 - 取消量是否只能长期保持未知；
@@ -239,10 +238,8 @@ confidence = PROVISIONAL
 
 ## 7. 下一步建议
 
-1. 先在 Issue #20 更新当前交易日 Capability，明确“可读进行中快照”与“交易日已关闭”
-   是两个维度；
-2. 再补捕获“合计”“暂无订单”“没有更多了”和第二张卡片对照元素；
-3. 用只读测试流程验证步长 9 的三卡片、滚动后和跨日期矩阵；
-4. 对金额和数量口径取得平台业务证据；证据不足时公共字段保持 `NULL`；
-5. 生成完全合成、无真实订单值的脱敏 fixture；
-6. 完成上述门禁后再进入 13.5-4B 公共核心，不提前注册生产 `ORDER_SCAN` handler。
+1. 补捕获“合计”“暂无订单”“没有更多了”和第二张卡片对照元素；
+2. 用只读测试流程验证步长 9 的三卡片、滚动后和跨日期矩阵；
+3. 对金额和数量口径取得平台业务证据；证据不足时公共字段保持 `NULL`；
+4. 生成完全合成、无真实订单值的脱敏 fixture；
+5. 完成上述门禁后再进入 13.5-4B 公共核心，不提前注册生产 `ORDER_SCAN` handler。
