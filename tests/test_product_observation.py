@@ -22,6 +22,7 @@ from app.services.product_observation import (
     PRODUCT_OBSERVATION_INPUT_SCHEMA_VERSION,
     ProductObservationBatchInput,
     ProductObservationError,
+    ProductObservationImportResult,
     ProductObservationImporter,
     ProductObservationInput,
     _result_content_sha256,
@@ -1727,6 +1728,145 @@ def test_task13_complete_snapshot_adapts_both_pages_to_v14_items(
         match="canonical snapshot conversion",
     ):
         importer.import_batch(tampered)
+
+
+def _accepted_listing_batch_with_changed_unrelated_mapping(
+    tmp_path,
+    *,
+    snapshot_id: str,
+) -> tuple[
+    SQLiteRuntimeRepository,
+    ProductObservationBatchInput,
+    ProductObservationImportResult,
+    _ClaimingProductObservationImporter,
+]:
+    repository = _repository_with_run(tmp_path)
+    mappings_v1 = compile_product_mapping_rows(
+        [
+            _mapping_row("MAP-AISHA-A", "艾莎", "A", "AISHA-A"),
+            _mapping_row(
+                "MAP-OTHER-V1",
+                "无关商品",
+                "A",
+                "OTHER-A",
+            ),
+        ],
+        source_workbook_sha256="1" * 64,
+    )
+    importer_v1 = _ClaimingProductObservationImporter(
+        repository,
+        mappings=mappings_v1,
+        clock=lambda: TEST_NOW,
+    )
+    snapshot = _listing_snapshot(snapshot_id=snapshot_id)
+    manifest_sha256 = "sha256:" + "2" * 64
+    result_sha256 = "3" * 64
+    _seed_listing_snapshot_source(
+        repository,
+        snapshot=snapshot,
+        manifest_sha256=manifest_sha256,
+        result_sha256=result_sha256,
+    )
+    batch = listing_snapshot_to_observation_batch(
+        snapshot,
+        automation_run_id="run-listing-scan-1",
+        source_manifest_sha256=manifest_sha256,
+        source_result_sha256=result_sha256,
+    )
+    first = importer_v1.import_batch(batch)
+    _set_run_status(
+        repository,
+        run_id="run-listing-scan-1",
+        run_status="SUCCESS",
+    )
+
+    mappings_v2 = compile_product_mapping_rows(
+        [
+            _mapping_row("MAP-AISHA-A", "艾莎", "A", "AISHA-A"),
+            _mapping_row(
+                "MAP-OTHER-V2",
+                "无关商品",
+                "A",
+                "OTHER-B",
+            ),
+        ],
+        source_workbook_sha256="4" * 64,
+    )
+    assert mappings_v2.mapping_version != mappings_v1.mapping_version
+    importer_v2 = _ClaimingProductObservationImporter(
+        repository,
+        mappings=mappings_v2,
+        clock=lambda: TEST_NOW,
+    )
+    return repository, batch, first, importer_v2
+
+
+def test_terminal_listing_replay_uses_accepted_mapping_version(
+    tmp_path,
+) -> None:
+    repository, batch, first, importer_v2 = (
+        _accepted_listing_batch_with_changed_unrelated_mapping(
+            tmp_path,
+            snapshot_id="SNAPSHOT-IDEMPOTENT-SAME-ID",
+        )
+    )
+
+    replay = importer_v2.import_batch(batch)
+
+    assert replay.already_imported
+    assert replay.observation_batch_id == first.observation_batch_id
+    assert replay.content_sha256 == first.content_sha256
+    assert replay.mapping_version == first.mapping_version
+    assert replay.mapping_version != importer_v2.mappings.mapping_version
+    with closing(repository.connect_read()) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM product_observation_batches"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM product_observation_items"
+            ).fetchone()[0]
+            == first.item_count
+        )
+
+
+def test_terminal_listing_new_batch_id_returns_canonical_accepted_batch(
+    tmp_path,
+) -> None:
+    repository, batch, first, importer_v2 = (
+        _accepted_listing_batch_with_changed_unrelated_mapping(
+            tmp_path,
+            snapshot_id="SNAPSHOT-IDEMPOTENT-NEW-ID",
+        )
+    )
+    replay_batch = replace(
+        batch,
+        observation_batch_id="listing-replay-with-new-batch-id",
+    )
+
+    replay = importer_v2.import_batch(replay_batch)
+
+    assert replay.already_imported
+    assert replay.observation_batch_id == first.observation_batch_id
+    assert replay.content_sha256 == first.content_sha256
+    assert replay.mapping_version == first.mapping_version
+    assert replay.mapping_version != importer_v2.mappings.mapping_version
+    with closing(repository.connect_read()) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM product_observation_batches"
+            ).fetchone()[0]
+            == 1
+        )
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM product_observation_items"
+            ).fetchone()[0]
+            == first.item_count
+        )
 
 
 def test_listing_snapshot_rejects_verified_sku_mapping_drift(

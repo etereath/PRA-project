@@ -126,6 +126,13 @@ result SHA、来源平台交易日、来源映射身份摘要和标准转换摘�
 `validated_mapping_identity_sha256`，最终覆盖要求该标记等于重算的来源身份摘要。
 任一映射漂移都释放候选，不得覆盖脉冲。通过后建立最终关系：
 
+ProductObservation 的重放路径不得依赖当前全局 `mapping_version`。Importer 必须
+先校验 run、平台、冻结时间语义和来源 snapshot，再按同 batch ID 或同 run 的规范
+来源与原始观察内容读取既有不可变事实。匹配时返回数据库保存的内容摘要、规范批次
+ID、项目数和验收映射版本；终态 run 不要求实时租约。只有没有对应事实时才解析当前
+映射、做跨事实 SKU 校验并在实时 claim 下写入。验收映射版本复用 append-only
+`requested_scope_json.accepted_mapping_version` 保存，不扩展 v14 schema。
+
 ```text
 LISTING_STATUS_SCAN 子 run --MERGED_RUN--> 小扫描 run
 ```

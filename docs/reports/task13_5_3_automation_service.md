@@ -65,6 +65,11 @@
   SKU、状态或候选集合漂移时整批零写；通过后持久化与来源摘要相等的验证标记。
   最终覆盖要求验证标记匹配，并再次比较持久化观察与 snapshot 身份，不接受仅有
   来源信封但 SKU 已分裂的事实。
+- 第六轮评审后拆分 ProductObservation 的既有事实读取与新事实写入：先校验
+  run/时间/来源并比对数据库中的规范原始观察，命中后直接返回原批次、原内容摘要和
+  验收映射版本，不再用当前全局映射重新计算幂等身份，也不要求终态 run 持有实时
+  租约。仅在没有对应事实时才解析当前映射、执行 SKU 漂移校验并写入；验收映射版本
+  复用 `requested_scope_json.accepted_mapping_version` 保存，不新增 v14 字段。
 
 ## 2. 复用与未改写
 
@@ -109,6 +114,8 @@ CLI 当前明确报告 `SCHEDULER_ONLY`。它可以安全创建到期账本、�
   以及篡改标准转换拒绝；
 - 明确 SKU 漂移、`UNMAPPED→VERIFIED` 和 `AMBIGUOUS` 候选集合漂移零写拒绝，
   来源身份一致时接受，持久化 SKU/映射状态不一致时脉冲不合并；
+- 已接受后无关商品引起全局映射版本变化时，同 batch ID 及新 batch ID 的终态重放
+  均返回原规范事实、原内容摘要和原映射版本，数据库仍只保留一套观察；
 - `BEGIN IMMEDIATE` 后安全时钟采样；
 - Automation UI handler 执行期的跨实例互斥及 v4/v5 写锁反向门禁；
 - 公开领取入口门禁与父 run 终态驱动的子 run 领取/取消；
@@ -118,10 +125,10 @@ CLI 当前明确报告 `SCHEDULER_ONLY`。它可以安全创建到期账本、�
 
 - `python -m pytest -q tests/test_automation_service.py`：
   `45 passed`；
-- 第五轮涉及模块：
-  `191 passed`；
+- 第六轮商品观察专项：
+  `46 passed`；
 - `python -m pytest -q`：
-  `850 passed, 3 skipped, 97 subtests passed`；
+  `852 passed, 3 skipped, 97 subtests passed`；
 - 系统冒烟：16 项通过、0 项失败；
 - 本次新增/修改 Python 文件 Ruff：PASS；
 - `compileall`：PASS；
