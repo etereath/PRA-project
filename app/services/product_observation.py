@@ -4,11 +4,22 @@ import hashlib
 import json
 import re
 from contextlib import closing
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Iterable
+from typing import Callable, Iterable
 
+from app.automation_models import AutomationRunClaim
+from app.listing_observation_identity import (
+    ListingObservationSourceIdentity,
+    listing_observation_source_identities,
+    listing_observation_source_identity_payload,
+    listing_observation_source_identity_sha256,
+)
+from app.repositories.automation_repository import (
+    AutomationLeaseLostError,
+    validate_live_automation_claim_in_transaction,
+)
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.shadowbot_contract_primitives import canonical_positive_price
 from app.services.operational_time import OperationalTimeService
@@ -27,6 +38,7 @@ ALLOWED_BATCH_STATUSES = frozenset(
 )
 ACCEPTING_RUN_STATUSES = frozenset({"RUNNING"})
 EVIDENCE_SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+RAW_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class ProductObservationError(ValueError):
@@ -67,7 +79,14 @@ class ProductObservationImportResult:
     observation_batch_id: str
     content_sha256: str
     item_count: int
+    mapping_version: str
     already_imported: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _ListingSnapshotSourceValidation:
+    mapping_identity_sha256: str
+    source_identities: tuple[ListingObservationSourceIdentity, ...]
 
 
 class ProductObservationImporter:
@@ -79,31 +98,36 @@ class ProductObservationImporter:
         *,
         mappings: CompiledProductMappings,
         operational_time: OperationalTimeService | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.repository = repository
         self.mappings = mappings
         self.operational_time = operational_time or OperationalTimeService()
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     def import_batch(
         self,
         batch: ProductObservationBatchInput,
+        *,
+        claim: AutomationRunClaim,
     ) -> ProductObservationImportResult:
         normalized = self._normalize_and_validate(batch)
-        content_sha256 = _result_content_sha256(
-            normalized,
-            mapping_version=self.mappings.mapping_version,
-        )
+        if claim.run.run_id != normalized.automation_run_id:
+            raise ProductObservationError(
+                "Automation Run claim does not match observation batch"
+            )
         batch_context = self.operational_time.classify(
             normalized.scan_completed_at
         )
-        resolved_items = tuple(
-            self._resolve_items(
-                normalized.platform_name,
-                normalized.items,
-            )
+        batch_start_context = self.operational_time.classify(
+            normalized.scan_started_at
         )
-        for item in resolved_items:
-            if item["time_policy_version"] != batch_context.time_policy_version:
+        item_contexts = tuple(
+            self.operational_time.classify(item.observed_at)
+            for item in normalized.items
+        )
+        for context in item_contexts:
+            if context.time_policy_version != batch_context.time_policy_version:
                 raise ProductObservationError(
                     "all observations in one batch must use the same "
                     "operational time policy"
@@ -115,7 +139,8 @@ class ProductObservationImporter:
                 run = connection.execute(
                     """
                     SELECT job_type, run_status, platform_name,
-                           time_policy_version
+                           platform_trade_date, time_policy_version,
+                           input_manifest_sha256
                     FROM automation_runs
                     WHERE run_id = ?
                     """,
@@ -136,91 +161,110 @@ class ProductObservationImporter:
                 if (
                     str(run["time_policy_version"])
                     != batch_context.time_policy_version
+                    or str(run["time_policy_version"])
+                    != batch_start_context.time_policy_version
                 ):
                     raise ProductObservationError(
                         "observation time policy does not match automation run"
                     )
-
-                existing = connection.execute(
-                    """
-                    SELECT automation_run_id, platform_name, scan_type,
-                           content_sha256
-                    FROM product_observation_batches
-                    WHERE observation_batch_id = ?
-                    """,
-                    (normalized.observation_batch_id,),
-                ).fetchone()
-                if existing is not None:
-                    if (
-                        str(existing["automation_run_id"])
-                        != normalized.automation_run_id
-                        or str(existing["platform_name"])
-                        != normalized.platform_name
-                        or str(existing["scan_type"])
-                        != normalized.scan_type
-                        or str(existing["content_sha256"])
-                        != content_sha256
-                    ):
-                        raise ProductObservationError(
-                            "observation_batch_id already exists with "
-                            "different envelope or content"
-                        )
-                    item_count = int(
-                        connection.execute(
-                            """
-                            SELECT COUNT(*)
-                            FROM product_observation_items
-                            WHERE observation_batch_id = ?
-                            """,
-                            (normalized.observation_batch_id,),
-                        ).fetchone()[0]
+                run_trade_date = str(run["platform_trade_date"])
+                if (
+                    batch_start_context.platform_trade_date.isoformat()
+                    != run_trade_date
+                    or batch_context.platform_trade_date.isoformat()
+                    != run_trade_date
+                    or any(
+                        context.platform_trade_date.isoformat()
+                        != run_trade_date
+                        for context in item_contexts
                     )
+                ):
+                    raise ProductObservationError(
+                        "observation platform_trade_date does not match "
+                        "automation run"
+                    )
+                source_validation = None
+                if normalized.scan_type == LISTING_STATUS_SCAN:
+                    source_validation = _validate_listing_snapshot_source(
+                        connection,
+                        normalized,
+                        run=run,
+                    )
+                    normalized = replace(
+                        normalized,
+                        requested_scope={
+                            **normalized.requested_scope,
+                            "validated_mapping_identity_sha256": (
+                                source_validation.mapping_identity_sha256
+                            ),
+                        },
+                    )
+
+                replay = _find_existing_observation_replay(
+                    connection,
+                    normalized,
+                    operational_time=self.operational_time,
+                    source_validation=source_validation,
+                )
+                if replay is not None:
                     connection.commit()
-                    return ProductObservationImportResult(
-                        observation_batch_id=normalized.observation_batch_id,
-                        content_sha256=content_sha256,
-                        item_count=item_count,
-                        already_imported=True,
-                    )
-
-                duplicate = connection.execute(
-                    """
-                    SELECT observation_batch_id
-                    FROM product_observation_batches
-                    WHERE automation_run_id = ?
-                      AND content_sha256 = ?
-                    ORDER BY created_at, observation_batch_id
-                    LIMIT 1
-                    """,
-                    (normalized.automation_run_id, content_sha256),
-                ).fetchone()
-                if duplicate is not None:
-                    canonical_batch_id = str(
-                        duplicate["observation_batch_id"]
-                    )
-                    item_count = int(
-                        connection.execute(
-                            """
-                            SELECT COUNT(*)
-                            FROM product_observation_items
-                            WHERE observation_batch_id = ?
-                            """,
-                            (canonical_batch_id,),
-                        ).fetchone()[0]
-                    )
-                    connection.commit()
-                    return ProductObservationImportResult(
-                        observation_batch_id=canonical_batch_id,
-                        content_sha256=content_sha256,
-                        item_count=item_count,
-                        already_imported=True,
-                    )
-
+                    return replay
                 if str(run["run_status"]) not in ACCEPTING_RUN_STATUSES:
                     raise ProductObservationError(
                         "automation run is not accepting scan results"
                     )
+                current = _as_utc(self.clock(), "clock")
+                try:
+                    validate_live_automation_claim_in_transaction(
+                        connection,
+                        claim,
+                        now=current,
+                    )
+                except AutomationLeaseLostError as exc:
+                    raise ProductObservationError(
+                        "automation run lease is not live"
+                    ) from exc
+                conflicting_run_batch = connection.execute(
+                    """
+                    SELECT observation_batch_id
+                    FROM product_observation_batches
+                    WHERE automation_run_id = ?
+                    ORDER BY created_at, observation_batch_id
+                    LIMIT 1
+                    """,
+                    (normalized.automation_run_id,),
+                ).fetchone()
+                if conflicting_run_batch is not None:
+                    raise ProductObservationError(
+                        "automation run already has different observation "
+                        "content"
+                    )
 
+                resolved_items = tuple(
+                    self._resolve_items(
+                        normalized.platform_name,
+                        normalized.items,
+                    )
+                )
+                if source_validation is not None:
+                    _validate_resolved_listing_identities(
+                        source_identities=(
+                            source_validation.source_identities
+                        ),
+                        resolved_items=resolved_items,
+                    )
+                accepted_mapping_version = self.mappings.mapping_version
+                normalized = replace(
+                    normalized,
+                    requested_scope={
+                        **normalized.requested_scope,
+                        "accepted_mapping_version": accepted_mapping_version,
+                    },
+                )
+                content_sha256 = _result_content_sha256(
+                    normalized,
+                    mapping_version=accepted_mapping_version,
+                )
                 connection.execute(
                     """
                     INSERT INTO product_observation_batches(
@@ -253,7 +297,7 @@ class ProductObservationImporter:
                         batch_context.time_policy_version,
                         normalized.error_code,
                         normalized.error_message,
-                        _datetime_text(datetime.now(timezone.utc)),
+                        _datetime_text(current),
                     ),
                 )
                 for index, item in enumerate(resolved_items):
@@ -290,7 +334,7 @@ class ProductObservationImporter:
                             item["seller_phase"],
                             item["page_identity_key"],
                             item["mapping_status"],
-                            self.mappings.mapping_version,
+                            accepted_mapping_version,
                             item["evidence_sha256"],
                         ),
                     )
@@ -303,6 +347,7 @@ class ProductObservationImporter:
             observation_batch_id=normalized.observation_batch_id,
             content_sha256=content_sha256,
             item_count=len(resolved_items),
+            mapping_version=accepted_mapping_version,
             already_imported=False,
         )
 
@@ -463,6 +508,9 @@ class ProductObservationImporter:
                 "time_policy_version": context.time_policy_version,
                 "page_identity_key": item.page_identity_key,
                 "mapping_status": resolution.mapping_status.value,
+                "candidate_internal_skus": (
+                    resolution.candidate_internal_skus
+                ),
                 "evidence_sha256": item.evidence_sha256,
             }
 
@@ -551,55 +599,55 @@ def listing_snapshot_to_observation_batch(
     snapshot: dict[str, object],
     *,
     automation_run_id: str,
+    source_manifest_sha256: str,
+    source_result_sha256: str,
+    operational_time: OperationalTimeService | None = None,
 ) -> ProductObservationBatchInput:
     """Adapt one validated Task 13 two-page snapshot to the v14 input."""
 
     validate_listing_sync_snapshot(snapshot)
-    items: list[ProductObservationInput] = []
-    for raw_item in snapshot["items"]:
-        item = dict(raw_item)
-        for page, observed_online in (
-            ("online", True),
-            ("waiting", False),
-        ):
-            if int(item[f"{page}_occurrences"]) == 0:
-                continue
-            evidence_payload = {
-                "snapshot_id": snapshot["snapshot_id"],
-                "snapshot_item_id": item["snapshot_item_id"],
-                "page": page,
-                "row_identities": item[f"{page}_row_identities"],
-                "evidence_manifest_sha256": snapshot[
-                    "evidence_manifest_sha256"
-                ],
-            }
-            evidence_sha256 = "sha256:" + hashlib.sha256(
-                json.dumps(
-                    evidence_payload,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest()
-            items.append(
-                ProductObservationInput(
-                    platform_product_name=str(item["product_name"]),
-                    grade=str(item["grade"]),
-                    observed_at=_parse_datetime(
-                        item[f"{page}_observed_at"],
-                        f"{page}_observed_at",
-                    ),
-                    observed_online=observed_online,
-                    page_identity_key=str(item["page_identity_key"]),
-                    observed_price=Decimal(
-                        str(item[f"{page}_observed_price"])
-                    ),
-                    observed_inventory=int(
-                        item[f"{page}_observed_inventory"]
-                    ),
-                    evidence_sha256=evidence_sha256,
-                )
-            )
+    manifest_sha256 = source_manifest_sha256.strip().lower()
+    result_sha256 = source_result_sha256.strip().lower()
+    if not EVIDENCE_SHA256_RE.fullmatch(manifest_sha256):
+        raise ProductObservationError(
+            "source_manifest_sha256 must be a prefixed SHA-256"
+        )
+    if not RAW_SHA256_RE.fullmatch(result_sha256):
+        raise ProductObservationError(
+            "source_result_sha256 must be an unprefixed SHA-256"
+        )
+    items, source_identities = _listing_snapshot_observation_bundle(
+        snapshot_id=str(snapshot["snapshot_id"]),
+        evidence_manifest_sha256=str(
+            snapshot["evidence_manifest_sha256"]
+        ),
+        snapshot_items=tuple(dict(item) for item in snapshot["items"]),
+    )
+    time_service = operational_time or OperationalTimeService()
+    source_trade_date = time_service.classify(
+        _parse_datetime(
+            snapshot["scan_completed_at"],
+            "scan_completed_at",
+        )
+    ).platform_trade_date.isoformat()
+    source_conversion_sha256 = _listing_source_conversion_sha256(
+        snapshot_id=str(snapshot["snapshot_id"]),
+        manifest_sha256=manifest_sha256,
+        result_sha256=result_sha256,
+        scan_started_at=_parse_datetime(
+            snapshot["scan_started_at"],
+            "scan_started_at",
+        ),
+        scan_completed_at=_parse_datetime(
+            snapshot["scan_completed_at"],
+            "scan_completed_at",
+        ),
+        items=items,
+        source_identities=source_identities,
+    )
+    source_mapping_identity_sha256 = (
+        listing_observation_source_identity_sha256(source_identities)
+    )
 
     snapshot_complete = bool(snapshot["snapshot_complete"])
     return ProductObservationBatchInput(
@@ -622,13 +670,20 @@ def listing_snapshot_to_observation_batch(
             "child_type": LISTING_STATUS_SCAN,
             "pages": ["online", "waiting"],
             "source_snapshot_id": snapshot["snapshot_id"],
+            "source_manifest_sha256": manifest_sha256,
+            "source_result_sha256": result_sha256,
+            "source_platform_trade_date": source_trade_date,
+            "source_conversion_sha256": source_conversion_sha256,
+            "source_mapping_identity_sha256": (
+                source_mapping_identity_sha256
+            ),
         },
         scope_complete=snapshot_complete,
         end_marker_verified=bool(
             snapshot["online_end_marker_verified"]
             and snapshot["waiting_end_marker_verified"]
         ),
-        items=tuple(items),
+        items=items,
         error_code=str(snapshot.get("error_code") or ""),
         error_message=(
             ""
@@ -636,6 +691,549 @@ def listing_snapshot_to_observation_batch(
             else "Task 13 listing snapshot was incomplete"
         ),
     )
+
+
+def _validate_listing_snapshot_source(
+    connection,
+    batch: ProductObservationBatchInput,
+    *,
+    run,
+) -> _ListingSnapshotSourceValidation:
+    scope = batch.requested_scope
+    snapshot_id = str(scope.get("source_snapshot_id") or "").strip()
+    manifest_sha256 = str(
+        scope.get("source_manifest_sha256") or ""
+    ).strip().lower()
+    result_sha256 = str(
+        scope.get("source_result_sha256") or ""
+    ).strip().lower()
+    source_trade_date = str(
+        scope.get("source_platform_trade_date") or ""
+    ).strip()
+    conversion_sha256 = str(
+        scope.get("source_conversion_sha256") or ""
+    ).strip().lower()
+    mapping_identity_sha256 = str(
+        scope.get("source_mapping_identity_sha256") or ""
+    ).strip().lower()
+    if (
+        not snapshot_id
+        or not EVIDENCE_SHA256_RE.fullmatch(manifest_sha256)
+        or not RAW_SHA256_RE.fullmatch(result_sha256)
+        or not EVIDENCE_SHA256_RE.fullmatch(conversion_sha256)
+        or not EVIDENCE_SHA256_RE.fullmatch(mapping_identity_sha256)
+    ):
+        raise ProductObservationError(
+            "LISTING_STATUS_SCAN requires immutable snapshot source binding"
+        )
+    source = connection.execute(
+        """
+        SELECT snapshots.*, batches.manifest_sha256,
+               receipts.result_sha256
+        FROM listing_sync_snapshots AS snapshots
+        INNER JOIN shadowbot_listing_action_batches AS batches
+            ON batches.batch_id = snapshots.batch_id
+        INNER JOIN shadowbot_listing_result_receipts AS receipts
+            ON receipts.result_id = snapshots.result_id
+           AND receipts.batch_id = snapshots.batch_id
+        WHERE snapshots.snapshot_id = ?
+        """,
+        (snapshot_id,),
+    ).fetchone()
+    if source is None:
+        raise ProductObservationError(
+            "LISTING_STATUS_SCAN source snapshot does not exist"
+        )
+    run_manifest = str(run["input_manifest_sha256"] or "").strip().lower()
+    if (
+        str(source["platform_name"]) != batch.platform_name
+        or str(source["status"]) != "VERIFIED"
+        or int(source["snapshot_complete"]) != 1
+        or manifest_sha256 != str(source["manifest_sha256"]).lower()
+        or manifest_sha256 != run_manifest
+        or result_sha256 != str(source["result_sha256"]).lower()
+        or source_trade_date != str(run["platform_trade_date"])
+        or batch.scan_started_at
+        != _parse_datetime(source["scan_started_at"], "scan_started_at")
+        or batch.scan_completed_at
+        != _parse_datetime(source["scan_completed_at"], "scan_completed_at")
+    ):
+        raise ProductObservationError(
+            "LISTING_STATUS_SCAN source snapshot envelope does not match run"
+        )
+    source_item_rows = connection.execute(
+        """
+        SELECT *
+        FROM listing_sync_snapshot_items
+        WHERE snapshot_id = ?
+        ORDER BY snapshot_item_id
+        """,
+        (snapshot_id,),
+    ).fetchall()
+    source_items = tuple(
+        {
+            **dict(row),
+            "affected_internal_skus": json.loads(
+                str(row["affected_internal_skus_json"])
+            ),
+            "online_row_identities": json.loads(
+                str(row["online_row_identities_json"])
+            ),
+            "waiting_row_identities": json.loads(
+                str(row["waiting_row_identities_json"])
+            ),
+        }
+        for row in source_item_rows
+    )
+    expected_items, source_identities = _listing_snapshot_observation_bundle(
+        snapshot_id=snapshot_id,
+        evidence_manifest_sha256=str(
+            source["evidence_manifest_sha256"]
+        ),
+        snapshot_items=source_items,
+    )
+    expected_conversion_sha256 = _listing_source_conversion_sha256(
+        snapshot_id=snapshot_id,
+        manifest_sha256=manifest_sha256,
+        result_sha256=result_sha256,
+        scan_started_at=batch.scan_started_at,
+        scan_completed_at=batch.scan_completed_at,
+        items=expected_items,
+        source_identities=source_identities,
+    )
+    expected_mapping_identity_sha256 = (
+        listing_observation_source_identity_sha256(source_identities)
+    )
+    if (
+        conversion_sha256 != expected_conversion_sha256
+        or mapping_identity_sha256 != expected_mapping_identity_sha256
+        or _observation_inputs_payload(batch.items)
+        != _observation_inputs_payload(expected_items)
+    ):
+        raise ProductObservationError(
+            "LISTING_STATUS_SCAN observations are not the canonical "
+            "snapshot conversion"
+        )
+    return _ListingSnapshotSourceValidation(
+        mapping_identity_sha256=expected_mapping_identity_sha256,
+        source_identities=source_identities,
+    )
+
+
+def _find_existing_observation_replay(
+    connection,
+    batch: ProductObservationBatchInput,
+    *,
+    operational_time: OperationalTimeService,
+    source_validation: _ListingSnapshotSourceValidation | None,
+) -> ProductObservationImportResult | None:
+    same_id = connection.execute(
+        """
+        SELECT *
+        FROM product_observation_batches
+        WHERE observation_batch_id = ?
+        """,
+        (batch.observation_batch_id,),
+    ).fetchone()
+    if same_id is not None:
+        replay = _existing_observation_replay(
+            connection,
+            same_id,
+            batch,
+            operational_time=operational_time,
+            source_validation=source_validation,
+        )
+        if replay is None:
+            raise ProductObservationError(
+                "observation_batch_id already exists with different "
+                "envelope or content"
+            )
+        return replay
+
+    candidates = connection.execute(
+        """
+        SELECT *
+        FROM product_observation_batches
+        WHERE automation_run_id = ?
+        ORDER BY created_at, observation_batch_id
+        """,
+        (batch.automation_run_id,),
+    ).fetchall()
+    for candidate in candidates:
+        replay = _existing_observation_replay(
+            connection,
+            candidate,
+            batch,
+            operational_time=operational_time,
+            source_validation=source_validation,
+        )
+        if replay is not None:
+            return replay
+    return None
+
+
+def _existing_observation_replay(
+    connection,
+    stored_batch,
+    incoming: ProductObservationBatchInput,
+    *,
+    operational_time: OperationalTimeService,
+    source_validation: _ListingSnapshotSourceValidation | None,
+) -> ProductObservationImportResult | None:
+    scalar_fields = {
+        "automation_run_id": incoming.automation_run_id,
+        "platform_name": incoming.platform_name,
+        "scan_type": incoming.scan_type,
+        "batch_status": incoming.batch_status,
+        "scan_started_at": _datetime_text(incoming.scan_started_at),
+        "scan_completed_at": _datetime_text(incoming.scan_completed_at),
+        "scope_complete": int(incoming.scope_complete),
+        "end_marker_verified": int(incoming.end_marker_verified),
+        "time_policy_version": operational_time.classify(
+            incoming.scan_completed_at
+        ).time_policy_version,
+        "error_code": incoming.error_code,
+        "error_message": incoming.error_message,
+    }
+    if any(
+        str(stored_batch[field]) != str(expected)
+        for field, expected in scalar_fields.items()
+    ):
+        return None
+
+    try:
+        stored_scope = json.loads(str(stored_batch["requested_scope_json"]))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(stored_scope, dict):
+        return None
+    comparable_scope = dict(stored_scope)
+    comparable_scope.pop("accepted_mapping_version", None)
+    if comparable_scope != incoming.requested_scope:
+        return None
+
+    stored_items = connection.execute(
+        """
+        SELECT *
+        FROM product_observation_items
+        WHERE observation_batch_id = ?
+        ORDER BY observation_item_id
+        """,
+        (stored_batch["observation_batch_id"],),
+    ).fetchall()
+    if _stored_observation_fact_payload(stored_items) != (
+        _expected_observation_fact_payload(
+            incoming.items,
+            operational_time=operational_time,
+        )
+    ):
+        return None
+    stored_item_mapping_versions = {
+        str(row["mapping_version"]) for row in stored_items
+    }
+    mapping_version = str(
+        stored_scope.get("accepted_mapping_version") or ""
+    ).strip()
+    if not mapping_version and len(stored_item_mapping_versions) == 1:
+        mapping_version = next(iter(stored_item_mapping_versions))
+    if not mapping_version:
+        return None
+    if stored_item_mapping_versions and (
+        stored_item_mapping_versions != {mapping_version}
+    ):
+        return None
+    if source_validation is not None and not (
+        _stored_listing_identities_match_source(
+            stored_items,
+            source_validation.source_identities,
+        )
+    ):
+        return None
+
+    stored_content_sha256 = str(stored_batch["content_sha256"])
+    canonical_stored_batch = replace(
+        incoming,
+        observation_batch_id=str(stored_batch["observation_batch_id"]),
+        requested_scope=stored_scope,
+    )
+    if (
+        _result_content_sha256(
+            canonical_stored_batch,
+            mapping_version=mapping_version,
+        )
+        != stored_content_sha256
+    ):
+        return None
+    return ProductObservationImportResult(
+        observation_batch_id=str(stored_batch["observation_batch_id"]),
+        content_sha256=stored_content_sha256,
+        item_count=len(stored_items),
+        mapping_version=mapping_version,
+        already_imported=True,
+    )
+
+
+def _expected_observation_fact_payload(
+    items: Iterable[ProductObservationInput],
+    *,
+    operational_time: OperationalTimeService,
+) -> list[dict[str, object]]:
+    payload = []
+    for item in items:
+        context = operational_time.classify(item.observed_at)
+        payload.append(
+            {
+                "platform_product_name": item.platform_product_name,
+                "grade": item.grade,
+                "observed_at": _datetime_text(context.observed_at),
+                "observed_online": item.observed_online,
+                "page_identity_key": item.page_identity_key,
+                "observed_price": (
+                    str(item.observed_price)
+                    if item.observed_price is not None
+                    else None
+                ),
+                "observed_inventory": item.observed_inventory,
+                "platform_trade_date": (
+                    context.platform_trade_date.isoformat()
+                ),
+                "seller_operation_date": (
+                    context.seller_operation_date.isoformat()
+                ),
+                "seller_phase": context.seller_phase.value,
+                "evidence_sha256": item.evidence_sha256,
+            }
+        )
+    return _sort_json_payload(payload)
+
+
+def _stored_observation_fact_payload(
+    rows: Iterable[object],
+) -> list[dict[str, object]]:
+    payload = [
+        {
+            "platform_product_name": str(row["platform_product_name"]),
+            "grade": str(row["grade"]),
+            "observed_at": str(row["observed_at"]),
+            "observed_online": bool(row["observed_online"]),
+            "page_identity_key": str(row["page_identity_key"]),
+            "observed_price": (
+                str(row["observed_price"])
+                if row["observed_price"] is not None
+                else None
+            ),
+            "observed_inventory": row["observed_inventory"],
+            "platform_trade_date": str(row["platform_trade_date"]),
+            "seller_operation_date": str(row["seller_operation_date"]),
+            "seller_phase": str(row["seller_phase"]),
+            "evidence_sha256": str(row["evidence_sha256"]),
+        }
+        for row in rows
+    ]
+    return _sort_json_payload(payload)
+
+
+def _sort_json_payload(
+    payload: Iterable[dict[str, object]],
+) -> list[dict[str, object]]:
+    return sorted(
+        payload,
+        key=lambda item: json.dumps(
+            item,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+
+
+def _stored_listing_identities_match_source(
+    stored_items: Iterable[object],
+    source_identities: Iterable[ListingObservationSourceIdentity],
+) -> bool:
+    stored_items = tuple(stored_items)
+    expected = {
+        identity.evidence_sha256: identity for identity in source_identities
+    }
+    stored_by_evidence = {
+        str(item["evidence_sha256"]): item for item in stored_items
+    }
+    if len(stored_by_evidence) != len(stored_items):
+        return False
+    if set(stored_by_evidence) != set(expected):
+        return False
+    for evidence_sha256, identity in expected.items():
+        item = stored_by_evidence[evidence_sha256]
+        stored_sku = str(item["internal_sku"] or "").strip() or None
+        if (
+            stored_sku != identity.internal_sku
+            or str(item["mapping_status"]) != identity.mapping_status.value
+        ):
+            return False
+    return True
+
+
+def _listing_snapshot_observation_bundle(
+    *,
+    snapshot_id: str,
+    evidence_manifest_sha256: str,
+    snapshot_items: Iterable[dict[str, object]],
+) -> tuple[
+    tuple[ProductObservationInput, ...],
+    tuple[ListingObservationSourceIdentity, ...],
+]:
+    source_items = tuple(snapshot_items)
+    source_identities = listing_observation_source_identities(
+        snapshot_id=snapshot_id,
+        evidence_manifest_sha256=evidence_manifest_sha256,
+        snapshot_items=source_items,
+    )
+    identity_by_item_and_page = {
+        (identity.snapshot_item_id, identity.page): identity
+        for identity in source_identities
+    }
+    items: list[ProductObservationInput] = []
+    for item in source_items:
+        for page, observed_online in (
+            ("online", True),
+            ("waiting", False),
+        ):
+            if int(item[f"{page}_occurrences"]) == 0:
+                continue
+            identity = identity_by_item_and_page[
+                (str(item["snapshot_item_id"]), page)
+            ]
+            items.append(
+                ProductObservationInput(
+                    platform_product_name=str(item["product_name"]),
+                    grade=str(item["grade"]),
+                    observed_at=_parse_datetime(
+                        item[f"{page}_observed_at"],
+                        f"{page}_observed_at",
+                    ),
+                    observed_online=observed_online,
+                    page_identity_key=str(item["page_identity_key"]),
+                    observed_price=Decimal(
+                        str(item[f"{page}_observed_price"])
+                    ),
+                    observed_inventory=int(
+                        item[f"{page}_observed_inventory"]
+                    ),
+                    evidence_sha256=identity.evidence_sha256,
+                )
+            )
+    return tuple(items), source_identities
+
+
+def _listing_source_conversion_sha256(
+    *,
+    snapshot_id: str,
+    manifest_sha256: str,
+    result_sha256: str,
+    scan_started_at: datetime,
+    scan_completed_at: datetime,
+    items: Iterable[ProductObservationInput],
+    source_identities: Iterable[ListingObservationSourceIdentity],
+) -> str:
+    payload = {
+        "snapshot_id": snapshot_id,
+        "manifest_sha256": manifest_sha256,
+        "result_sha256": result_sha256,
+        "scan_started_at": _datetime_text(scan_started_at),
+        "scan_completed_at": _datetime_text(scan_completed_at),
+        "items": _observation_inputs_payload(items),
+        "source_mapping_identities": (
+            listing_observation_source_identity_payload(source_identities)
+        ),
+    }
+    return "sha256:" + hashlib.sha256(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _validate_resolved_listing_identities(
+    *,
+    source_identities: Iterable[ListingObservationSourceIdentity],
+    resolved_items: Iterable[dict[str, object]],
+) -> None:
+    expected = {
+        identity.evidence_sha256: identity for identity in source_identities
+    }
+    resolved_by_evidence: dict[str, dict[str, object]] = {}
+    for item in resolved_items:
+        evidence_sha256 = str(item["evidence_sha256"])
+        if evidence_sha256 in resolved_by_evidence:
+            raise ProductObservationError(
+                "LISTING_STATUS_SCAN resolved evidence identity is duplicated"
+            )
+        resolved_by_evidence[evidence_sha256] = item
+    if set(resolved_by_evidence) != set(expected):
+        raise ProductObservationError(
+            "LISTING_STATUS_SCAN resolved mapping identities do not match "
+            "source snapshot"
+        )
+    for evidence_sha256, identity in expected.items():
+        resolved = resolved_by_evidence[evidence_sha256]
+        resolved_sku = (
+            str(resolved.get("internal_sku") or "").strip() or None
+        )
+        resolved_candidates = tuple(
+            sorted(
+                {
+                    str(candidate or "").strip()
+                    for candidate in (
+                        resolved.get("candidate_internal_skus") or ()
+                    )
+                    if str(candidate or "").strip()
+                }
+            )
+        )
+        if (
+            str(resolved["mapping_status"])
+            != identity.mapping_status.value
+            or resolved_sku != identity.internal_sku
+            or resolved_candidates != identity.candidate_internal_skus
+        ):
+            raise ProductObservationError(
+                "LISTING_STATUS_SCAN mapping identity drifted from source "
+                f"snapshot item {identity.snapshot_item_id}"
+            )
+
+
+def _observation_inputs_payload(
+    items: Iterable[ProductObservationInput],
+) -> list[dict[str, object]]:
+    payload = [
+        {
+            "platform_product_name": item.platform_product_name,
+            "grade": item.grade,
+            "observed_at": _datetime_text(item.observed_at),
+            "observed_online": item.observed_online,
+            "page_identity_key": item.page_identity_key,
+            "observed_price": (
+                str(item.observed_price)
+                if item.observed_price is not None
+                else None
+            ),
+            "observed_inventory": item.observed_inventory,
+            "evidence_sha256": item.evidence_sha256,
+        }
+        for item in items
+    ]
+    payload.sort(
+        key=lambda item: json.dumps(
+            item,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    return payload
 
 
 def _result_content_sha256(
@@ -734,6 +1332,16 @@ def _normalize_requested_scope(
     scan_type: str,
     requested_scope: dict[str, object],
 ) -> dict[str, object]:
+    reserved_fields = {
+        "accepted_mapping_version",
+        "validated_mapping_identity_sha256",
+    }
+    supplied_reserved_fields = sorted(reserved_fields & set(requested_scope))
+    if supplied_reserved_fields:
+        raise ProductObservationError(
+            "requested_scope contains importer-reserved fields: "
+            + ", ".join(supplied_reserved_fields)
+        )
     pages = requested_scope.get("pages")
     if not isinstance(pages, list) or any(
         not isinstance(page, str) for page in pages

@@ -11,6 +11,7 @@ from typing import Any, Iterable
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from app.automation_ui_channel import has_active_automation_ui_run
 from app.enums import TaskActionType, TaskStatus
 from app.exceptions import ValidationError
 from app.listing_identity import listing_identity_key
@@ -27,17 +28,17 @@ from app.services.shadowbot_executor import (
     ShadowBotStartBoundaryError,
     ShadowBotStartResult,
 )
+from app.shadowbot_contract_primitives import (
+    canonical_positive_price,
+    derive_v4_batch_semantics,
+    sha256_json,
+)
 
 
 RESULT_SCHEMA_VERSION = "shadowbot-commit-batch-result-1.1"
 FINAL_BATCH_STATUSES = frozenset({"VERIFIED", "PARTIAL", "FAILED", "UNKNOWN"})
 ITEM_STATUSES = frozenset(
     {"NOT_ATTEMPTED", "VERIFIED", "NOT_APPLIED", "FAILED", "UNKNOWN"}
-)
-from app.shadowbot_contract_primitives import (
-    canonical_positive_price,
-    derive_v4_batch_semantics,
-    sha256_json,
 )
 ITEM_SIDE_EFFECT_STATES = frozenset(
     {"NOT_STARTED", "SUBMIT_INTENT_RECORDED", "SUBMIT_CLICKED", "UNKNOWN", "VERIFIED", "NOT_APPLIED"}
@@ -163,7 +164,13 @@ def publish_task_commit_batch(
     )
     validate_request(request)
     now = _now_text()
+    now_value = datetime.fromisoformat(now)
     with closing(repository.connect_write()) as connection, connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if has_active_automation_ui_run(connection, now=now_value):
+            raise ValidationError(
+                "Automation UI 扫描正在运行，当前不能获取平台写锁。"
+            )
         cursor = connection.execute(
             """
             UPDATE shadowbot_commit_batches

@@ -4,8 +4,10 @@
 - 插入位置：任务 13 完成后、任务 14 开始前
 - 当前状态：13.5-0 已通过 PR #21 合并；13.5-1
   [双时间轴、质量与日结合同](task13_5_1_quality_and_settlement_contract_review.md)
-  已冻结并完成本地 v14 实现与验收；真实 Runtime DB 尚未迁移，下一阶段输入见
-  [13.5-2 商品映射与扫描合同](task13_5_2_mapping_and_scan_input_contract.md)
+  已冻结并完成本地 v14 实现与验收；13.5-2 已通过 PR #23 合并；13.5-3 独立
+  调度控制面见
+  [Automation Service 合同](task13_5_3_automation_service_contract.md)。
+  真实 Runtime DB 尚未迁移，真实扫描 handler 尚未部署
 - 适用对象：PRA Web 主控端、SQLite 运行态、自动化服务、ShadowBot 单平台执行端
 - 宏观权威：[GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20)
 - 对齐评估：[Issue #20 与本地实施计划对齐评估](task13_5_issue20_alignment_review.md)

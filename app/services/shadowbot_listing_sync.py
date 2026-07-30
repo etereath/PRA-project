@@ -11,9 +11,16 @@ from pathlib import Path
 from typing import Any, Callable
 from uuid import uuid4
 
+from app.automation_models import AutomationRunClaim
 from app.enums import ReviewTaskStatus
 from app.exceptions import ValidationError
+from app.repositories.automation_repository import (
+    AutomationLeaseLostError,
+    AutomationRepository,
+    validate_live_automation_claim_in_transaction,
+)
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.services.operational_time import OperationalTimeService
 from app.services.shadowbot_executor import (
     ShadowBotFileQueueRunner,
     ShadowBotStartBoundaryError,
@@ -195,6 +202,7 @@ def import_listing_sync_result(
     result: dict[str, Any],
     result_file_sha256: str,
     source_result_path: str,
+    automation_claim: AutomationRunClaim | None = None,
     failure_injector: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     """Atomically accept a v5 snapshot and project all derived runtime facts."""
@@ -211,8 +219,22 @@ def import_listing_sync_result(
         raise ValidationError("result_file_sha256 无效。")
     snapshot = dict(result["snapshot"])
     _validate_snapshot_result_binding(request, result, snapshot)
-    now = datetime.now(UTC)
-    now_text = now.isoformat()
+    time_service = OperationalTimeService(
+        policies=AutomationRepository(
+            repository
+        ).load_operational_time_policies()
+    )
+    snapshot_time_contexts = _snapshot_operational_contexts(
+        snapshot,
+        operational_time=time_service,
+    )
+    snapshot_policy_versions = frozenset(
+        context.time_policy_version for context in snapshot_time_contexts
+    )
+    snapshot_trade_dates = frozenset(
+        context.platform_trade_date.isoformat()
+        for context in snapshot_time_contexts
+    )
     batch_id = str(request["batch_id"])
     result_id = str(result.get("result_id") or "").strip()
     if not result_id:
@@ -221,6 +243,8 @@ def import_listing_sync_result(
     connection = repository.connect_write()
     try:
         connection.execute("BEGIN IMMEDIATE")
+        now = datetime.now(UTC)
+        now_text = now.isoformat()
         batch = connection.execute(
             """
             SELECT * FROM shadowbot_listing_action_batches
@@ -230,6 +254,10 @@ def import_listing_sync_result(
         ).fetchone()
         if batch is None or str(batch["action_type"]) != "sync_status":
             raise ValidationError("SYNC_STATUS 批次不存在或类型不匹配。")
+        automation_binding = _automation_listing_sync_binding(
+            connection,
+            manifest_sha256=str(batch["manifest_sha256"]),
+        )
         existing_receipt = connection.execute(
             """
             SELECT batch_id, result_sha256
@@ -245,10 +273,27 @@ def import_listing_sync_result(
                 != result_file_sha256
             ):
                 raise ValidationError("同一 result_id 对应了不同结果文件。")
+            _validate_automation_replay_binding(
+                connection,
+                automation_binding,
+                automation_claim=automation_claim,
+                platform_name=str(request["platform_name"]),
+                time_policy_versions=snapshot_policy_versions,
+                platform_trade_dates=snapshot_trade_dates,
+            )
             connection.rollback()
             return _existing_import_summary(repository, batch_id, result_id)
         if str(batch["result_id"] or ""):
             raise ValidationError("SYNC_STATUS 批次已经绑定其他 result_id。")
+        _validate_automation_listing_sync_import(
+            connection,
+            binding=automation_binding,
+            automation_claim=automation_claim,
+            platform_name=str(request["platform_name"]),
+            time_policy_versions=snapshot_policy_versions,
+            platform_trade_dates=snapshot_trade_dates,
+            now=now,
+        )
         _assert_no_unimported_listing_write(connection, batch_id)
 
         connection.execute(
@@ -349,6 +394,178 @@ def import_listing_sync_result(
         raise
     finally:
         connection.close()
+
+
+def _automation_listing_sync_binding(
+    connection,
+    *,
+    manifest_sha256: str,
+):
+    rows = connection.execute(
+        """
+        SELECT runs.*
+        FROM automation_runs AS runs
+        WHERE runs.input_manifest_sha256 = ?
+        ORDER BY runs.run_id
+        """,
+        (manifest_sha256,),
+    ).fetchall()
+    if len(rows) > 1:
+        raise ValidationError(
+            "同一 SYNC_STATUS manifest 绑定了多个 Automation Run。"
+        )
+    return rows[0] if rows else None
+
+
+def _validate_automation_replay_binding(
+    connection,
+    binding,
+    *,
+    automation_claim: AutomationRunClaim | None,
+    platform_name: str,
+    time_policy_versions: frozenset[str],
+    platform_trade_dates: frozenset[str],
+) -> None:
+    _validate_automation_listing_sync_envelope(
+        connection,
+        binding=binding,
+        automation_claim=automation_claim,
+        platform_name=platform_name,
+        time_policy_versions=time_policy_versions,
+        platform_trade_dates=platform_trade_dates,
+        require_live_claim=False,
+    )
+
+
+def _validate_automation_listing_sync_import(
+    connection,
+    *,
+    binding,
+    automation_claim: AutomationRunClaim | None,
+    platform_name: str,
+    time_policy_versions: frozenset[str],
+    platform_trade_dates: frozenset[str],
+    now: datetime,
+) -> None:
+    _validate_automation_listing_sync_envelope(
+        connection,
+        binding=binding,
+        automation_claim=automation_claim,
+        platform_name=platform_name,
+        time_policy_versions=time_policy_versions,
+        platform_trade_dates=platform_trade_dates,
+        require_live_claim=True,
+    )
+    if binding is None or automation_claim is None:
+        return
+    try:
+        validate_live_automation_claim_in_transaction(
+            connection,
+            automation_claim,
+            now=now,
+        )
+    except AutomationLeaseLostError as exc:
+        raise ValidationError(
+            "Automation Run claim 已过期或被其他实例回收。"
+        ) from exc
+
+
+def _validate_automation_listing_sync_envelope(
+    connection,
+    *,
+    binding,
+    automation_claim: AutomationRunClaim | None,
+    platform_name: str,
+    time_policy_versions: frozenset[str],
+    platform_trade_dates: frozenset[str],
+    require_live_claim: bool,
+) -> None:
+    if binding is None:
+        if automation_claim is not None:
+            raise ValidationError(
+                "Automation claim 未绑定到当前 SYNC_STATUS manifest。"
+            )
+        return
+    if require_live_claim and automation_claim is None:
+        raise ValidationError(
+            "Automation 来源的 SYNC_STATUS 结果必须携带当前 Run claim。"
+        )
+    run_id = str(binding["run_id"])
+    if (
+        automation_claim is not None
+        and automation_claim.run.run_id != run_id
+    ):
+        raise ValidationError(
+            "Automation claim 与 SYNC_STATUS manifest 绑定不一致。"
+        )
+    if str(binding["job_type"]) != "LISTING_STATUS_SCAN":
+        raise ValidationError(
+            "Automation SYNC_STATUS 只能绑定 LISTING_STATUS_SCAN。"
+        )
+    if str(binding["platform_name"]) != platform_name:
+        raise ValidationError(
+            "Automation Run 与 SYNC_STATUS 平台不一致。"
+        )
+    run_policy_version = str(binding["time_policy_version"])
+    run_trade_date = str(binding["platform_trade_date"])
+    if time_policy_versions != frozenset({run_policy_version}):
+        raise ValidationError(
+            "Automation Run 与 SYNC_STATUS 时间策略不一致。"
+        )
+    if platform_trade_dates != frozenset({run_trade_date}):
+        raise ValidationError(
+            "Automation Run 与 SYNC_STATUS 平台交易日不一致。"
+        )
+    parent = connection.execute(
+        """
+        SELECT 1
+        FROM automation_run_links AS links
+        INNER JOIN automation_runs AS parents
+            ON parents.run_id = links.parent_run_id
+        WHERE links.child_run_id = ?
+          AND links.relation_type = 'LISTING_STATUS_CHILD'
+          AND parents.job_type IN (
+              'FULL_MARKET_SCAN',
+              'PRE_CUTOFF_FULL_SCAN'
+          )
+          AND parents.platform_name = ?
+          AND parents.time_policy_version = ?
+          AND parents.platform_trade_date = ?
+        LIMIT 1
+        """,
+        (run_id, platform_name, run_policy_version, run_trade_date),
+    ).fetchone()
+    if parent is None:
+        raise ValidationError(
+            "Automation SYNC_STATUS 缺少合法完整扫描父子关系。"
+        )
+
+
+def _snapshot_operational_contexts(
+    snapshot: dict[str, Any],
+    *,
+    operational_time: OperationalTimeService,
+):
+    timestamp_values: list[object] = [
+        snapshot["scan_started_at"],
+        snapshot["scan_completed_at"],
+        snapshot["online_scan_started_at"],
+        snapshot["online_scan_completed_at"],
+        snapshot["waiting_scan_started_at"],
+        snapshot["waiting_scan_completed_at"],
+    ]
+    for raw_item in snapshot["items"]:
+        item = dict(raw_item)
+        for field_name in (
+            "online_observed_at",
+            "waiting_observed_at",
+        ):
+            if item.get(field_name):
+                timestamp_values.append(item[field_name])
+    return tuple(
+        operational_time.classify(_parse_aware(value))
+        for value in timestamp_values
+    )
 
 
 def mark_listing_sync_ack(
