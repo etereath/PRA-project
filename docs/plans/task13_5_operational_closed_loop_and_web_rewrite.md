@@ -201,7 +201,8 @@ Web 请求线程不得承担长期调度、循环扫描或 ShadowBot Worker 生�
 
 ### 5.3 完整扫描
 
-`FULL_MARKET_SCAN` 是通用平台父作业，默认每小时执行一次：
+`FULL_MARKET_SCAN` 是通用平台父作业，默认每小时 `HH:10` 执行一次；`18:10`
+是 18:00 换日后的关键完整扫描：
 
 ```text
 FULL_MARKET_SCAN
@@ -220,7 +221,7 @@ supports_current_trade_day
 supports_historical_trade_day
 ```
 
-当前蚂蚁花团平台为 `true / false / true`。
+当前蚂蚁花团平台为 `true / true / true`。
 
 完整扫描要求：
 
@@ -238,8 +239,11 @@ supports_historical_trade_day
 
 ### 5.4 边界扫描与日结
 
-- 18:00 前执行 `PRE_CUTOFF_FULL_SCAN`，18:00 后执行 `POST_CUTOFF_PULSE`；
-  用相邻观察证明交易日边界，跨界记录按 `observed_at` 单条归属。
+- 18:00 前执行 `PRE_CUTOFF_FULL_SCAN` 商品边界扫描，18:00 后执行
+  `POST_CUTOFF_PULSE`，并在 18:10 执行关键 `FULL_MARKET_SCAN`；截单前父任务不派生
+  订单扫描。
+- 订单批次的起止时间若跨越 18:00，必须整批失败关闭；不得按逐项
+  `observed_at` 拆分后接受为完整订单事实。
 - 20:00 执行结算作业，生成 `PROVISIONAL` 平台交易日汇总和下一销售计划输入。
 - 历史订单观察到达后按
   `PROVISIONAL → OBSERVED → RECONCILED → FINAL` 单向推进；只有 `FINAL` 是正式

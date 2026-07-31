@@ -22,8 +22,12 @@ from app.services.automation import (
     ORDER_SCAN,
 )
 from app.services.operational_time import OperationalTimeService
+from app.services.order_automation_runtime import (
+    build_order_read_only_handlers,
+)
 from app.services.order_observation import OrderObservationImporter
 from app.services.order_scan_automation import (
+    FullMarketScanOrderDispatchHandler,
     FullMarketScanOrderCoordinator,
     OrderScanHandler,
 )
@@ -198,3 +202,85 @@ def test_full_market_scan_creates_order_child_and_imports_observations(
         and link.relation_type == "ORDER_SCAN_CHILD"
         for link in links
     )
+    target_events = [
+        event
+        for event in repository.list_events(child_id)
+        if event.event_type == "ORDER_SCAN_TARGET_SELECTED"
+    ]
+    assert len(target_events) == 1
+    assert target_events[0].payload == {
+        "requested_platform_trade_date": "2026-07-31"
+    }
+
+
+def test_formal_full_market_dispatch_schedules_order_child_without_scan_fact(
+    tmp_path,
+) -> None:
+    runtime = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
+    runtime.init_schema()
+    repository = AutomationRepository(runtime)
+    parent_job = repository.upsert_job(
+        _job("FULL", FULL_MARKET_SCAN, INTERVAL_MINUTES, True),
+        now=NOW,
+    )
+    repository.upsert_job(
+        _job(
+            "AUTOMATION-ORDER-SCAN-CHILD",
+            ORDER_SCAN,
+            CHILD_ONLY,
+            False,
+        ),
+        now=NOW,
+    )
+    parent = repository.ensure_run(
+        job=parent_job,
+        scheduled_for=NOW,
+        time_context=OperationalTimeService().classify(NOW),
+        initial_status=AutomationRunStatus.SCHEDULED,
+        now=NOW,
+    )[0]
+    claim = repository.claim_run(
+        run_id=parent.run_id,
+        owner_token="dispatch-owner",
+        now=NOW,
+        lease_seconds=600,
+    )
+    assert claim is not None
+    context = AutomationExecutionContext(
+        claim=claim,
+        repository=repository,
+        operational_time=OperationalTimeService(),
+        clock=lambda: NOW,
+        lease_seconds=600,
+    )
+
+    outcome = FullMarketScanOrderDispatchHandler()(claim.run, context)
+
+    assert outcome.status is AutomationRunStatus.SUCCESS
+    assert outcome.event_payload["coordination_only"] is True
+    assert "output_manifest_sha256" not in outcome.event_payload
+    child = repository.get_run(
+        str(outcome.event_payload["order_scan_child_run_id"])
+    )
+    assert child is not None
+    assert child.job_type == ORDER_SCAN
+
+
+def test_formal_runtime_composition_registers_only_read_only_order_chain(
+    tmp_path,
+) -> None:
+    runtime = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
+    runtime.init_schema()
+
+    handlers = build_order_read_only_handlers(
+        runtime_repository=runtime,
+        queue_dir=tmp_path / "queue",
+        mapping_workbook=tmp_path / "platform_mappings.xlsx",
+    )
+
+    assert set(handlers) == {FULL_MARKET_SCAN, ORDER_SCAN}
+    assert isinstance(
+        handlers[FULL_MARKET_SCAN],
+        FullMarketScanOrderDispatchHandler,
+    )
+    assert isinstance(handlers[ORDER_SCAN], OrderScanHandler)

@@ -407,6 +407,28 @@ def test_scheduler_only_does_not_terminally_merge_hourly_pulse(
     assert repository.list_links(child_run_id=pulse.run_id) == []
 
 
+def test_default_full_market_scan_is_aligned_to_local_hour_plus_ten(
+    repository: AutomationRepository,
+) -> None:
+    now = datetime(2026, 7, 31, 10, 12, tzinfo=timezone.utc)
+    ensure_default_automation_jobs(
+        repository,
+        platform_name=PLATFORM,
+        now=now,
+    )
+
+    AutomationSchedulePlanner(repository).materialize(now=now)
+
+    full = repository.list_runs(
+        job_id="AUTOMATION-FULL-MARKET-SCAN-HOURLY"
+    )
+    assert len(full) == 1
+    assert (
+        full[0].scheduled_for.hour,
+        full[0].scheduled_for.minute,
+    ) == (10, 10)
+
+
 def test_successful_full_handler_finalizes_pulse_coverage(
     repository: AutomationRepository,
 ) -> None:

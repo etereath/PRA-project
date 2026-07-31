@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import closing
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Callable, Iterable
 from uuid import uuid4
 
@@ -51,6 +51,8 @@ CHILD_PARENT_CLAIM_STATUSES = frozenset(
 )
 COVERAGE_CANDIDATE = "COVERAGE_CANDIDATE"
 LISTING_STATUS_SCAN = "LISTING_STATUS_SCAN"
+ORDER_SCAN = "ORDER_SCAN"
+ORDER_SCAN_TARGET_SELECTED = "ORDER_SCAN_TARGET_SELECTED"
 
 
 class AutomationLeaseLostError(RuntimeError):
@@ -911,6 +913,80 @@ class AutomationRepository:
             raise RuntimeError("Automation run input manifest was not bound")
         return _row_to_run(bound)
 
+    def bind_order_scan_target_trade_date(
+        self,
+        claim: AutomationRunClaim,
+        *,
+        target_trade_date: date,
+        now: datetime | None = None,
+        clock: Callable[[], datetime] | None = None,
+    ) -> date:
+        """Freeze the exact current or historical date queried by ORDER_SCAN."""
+
+        if not isinstance(target_trade_date, date):
+            raise ValueError("target_trade_date must be a date")
+        with closing(self.runtime_repository.connect_write()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                current = _transaction_time(now=now, clock=clock)
+                validate_live_automation_claim_in_transaction(
+                    connection,
+                    claim,
+                    now=current,
+                )
+                row = connection.execute(
+                    """
+                    SELECT job_type, platform_trade_date
+                    FROM automation_runs
+                    WHERE run_id = ?
+                    """,
+                    (claim.run.run_id,),
+                ).fetchone()
+                if row is None or str(row["job_type"]) != ORDER_SCAN:
+                    raise ValueError(
+                        "Only ORDER_SCAN can bind an order target trade date"
+                    )
+                run_trade_date = date.fromisoformat(
+                    str(row["platform_trade_date"])
+                )
+                if target_trade_date > run_trade_date:
+                    raise ValueError(
+                        "ORDER_SCAN target trade date cannot be in the future"
+                    )
+                existing = _order_scan_target_rows(
+                    connection,
+                    claim.run.run_id,
+                )
+                if len(existing) > 1:
+                    raise ValueError(
+                        "ORDER_SCAN has multiple frozen target trade dates"
+                    )
+                if existing:
+                    selected = _order_scan_target_from_event(existing[0])
+                    if selected != target_trade_date:
+                        raise ValueError(
+                            "ORDER_SCAN target trade date is already frozen"
+                        )
+                else:
+                    _insert_event(
+                        connection,
+                        run_id=claim.run.run_id,
+                        event_type=ORDER_SCAN_TARGET_SELECTED,
+                        from_status=AutomationRunStatus.RUNNING,
+                        to_status=AutomationRunStatus.RUNNING,
+                        payload={
+                            "requested_platform_trade_date": (
+                                target_trade_date.isoformat()
+                            )
+                        },
+                        created_at=current,
+                    )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        return target_trade_date
+
     def ensure_link(
         self,
         *,
@@ -972,6 +1048,13 @@ class AutomationRepository:
         parent = parent_claim.run
         if parent.job_type not in CHILD_PARENT_JOB_TYPES:
             raise ValueError("Parent job type cannot create child runs")
+        if (
+            child_job.job_type == ORDER_SCAN
+            and parent.job_type != "FULL_MARKET_SCAN"
+        ):
+            raise ValueError(
+                "ORDER_SCAN cannot be created by a near-cutoff parent"
+            )
         if parent.platform_name != str(
             child_job.config.get("platform_name") or ""
         ):
@@ -2389,6 +2472,42 @@ def _json_load(value: object) -> dict[str, object]:
     if not isinstance(parsed, dict):
         raise ValueError("Stored automation JSON must be an object")
     return parsed
+
+
+def _order_scan_target_rows(connection, run_id: str):
+    return connection.execute(
+        """
+        SELECT payload_json
+        FROM automation_run_events
+        WHERE run_id = ?
+          AND event_type = ?
+        ORDER BY created_at ASC, event_id ASC
+        """,
+        (run_id, ORDER_SCAN_TARGET_SELECTED),
+    ).fetchall()
+
+
+def _order_scan_target_from_event(row) -> date:
+    payload = _json_load(row["payload_json"])
+    value = str(
+        payload.get("requested_platform_trade_date") or ""
+    ).strip()
+    if not value:
+        raise ValueError(
+            "ORDER_SCAN target event has no requested trade date"
+        )
+    return date.fromisoformat(value)
+
+
+def read_order_scan_target_trade_date(connection, run_id: str) -> date:
+    """Read the one immutable ORDER_SCAN target date from its run events."""
+
+    rows = _order_scan_target_rows(connection, run_id)
+    if len(rows) != 1:
+        raise ValueError(
+            "ORDER_SCAN must have exactly one frozen target trade date"
+        )
+    return _order_scan_target_from_event(rows[0])
 
 
 def _datetime_text(value: datetime) -> str:

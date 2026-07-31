@@ -159,6 +159,9 @@ class MayiHuatuanOrderReadOnlyAdapter:
             raise OrderObservationError(
                 "order-page capture completed before it started"
             )
+        started_trade_date = self.operational_time.classify(
+            started
+        ).platform_trade_date
         current_trade_date = self.operational_time.classify(
             completed
         ).platform_trade_date
@@ -186,6 +189,27 @@ class MayiHuatuanOrderReadOnlyAdapter:
             if requested_platform_trade_date == current_trade_date
             else "CLOSED"
         )
+        if started_trade_date != current_trade_date:
+            return self._batch(
+                observation_batch_id=observation_batch_id,
+                automation_run_id=automation_run_id,
+                platform_name=platform_name,
+                requested_platform_trade_date=(
+                    requested_platform_trade_date
+                ),
+                trade_day_status=trade_day_status,
+                capture=capture,
+                capability_result="FAILED",
+                batch_status="FAILED",
+                scope_complete=False,
+                end_marker_verified=False,
+                end_marker_kind="",
+                items=(),
+                error_code="ORDER_SCAN_CROSSED_TRADE_DAY_CUTOFF",
+                error_message=(
+                    "order scan crossed the platform trade-day cutoff"
+                ),
+            )
         if capture.unavailable_code:
             return self._batch(
                 observation_batch_id=observation_batch_id,

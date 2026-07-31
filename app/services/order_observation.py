@@ -14,6 +14,7 @@ from typing import Any, Callable, Iterable, Mapping
 from app.automation_models import AutomationRunClaim
 from app.enums import ProductMappingStatus, SellerPhase
 from app.repositories.automation_repository import (
+    read_order_scan_target_trade_date,
     validate_live_automation_claim_in_transaction,
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
@@ -35,9 +36,7 @@ BATCH_STATUSES = frozenset(
     {"ACCEPTED", "PARTIAL", "UNAVAILABLE", "FAILED"}
 )
 TRADE_DAY_STATUSES = frozenset({"OPEN", "CLOSED"})
-ALLOWED_ORDER_PARENT_TYPES = frozenset(
-    {"FULL_MARKET_SCAN", "PRE_CUTOFF_FULL_SCAN"}
-)
+ALLOWED_ORDER_PARENT_TYPES = frozenset({"FULL_MARKET_SCAN"})
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
@@ -426,13 +425,24 @@ class OrderObservationImporter:
                 "order observation platform does not match its run"
             )
         run_trade_date = date.fromisoformat(str(row["platform_trade_date"]))
-        if batch.requested_platform_trade_date > run_trade_date:
+        try:
+            selected_trade_date = read_order_scan_target_trade_date(
+                connection,
+                batch.automation_run_id,
+            )
+        except (TypeError, ValueError) as exc:
+            raise OrderObservationError(str(exc)) from exc
+        if batch.requested_platform_trade_date != selected_trade_date:
+            raise OrderObservationError(
+                "order observation target does not match its frozen run input"
+            )
+        if selected_trade_date > run_trade_date:
             raise OrderObservationError(
                 "order observation cannot query a future platform trade date"
             )
         expected_status = (
             "OPEN"
-            if batch.requested_platform_trade_date == run_trade_date
+            if selected_trade_date == run_trade_date
             else "CLOSED"
         )
         if batch.trade_day_status != expected_status:

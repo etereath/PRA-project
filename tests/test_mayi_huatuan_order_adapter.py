@@ -115,6 +115,39 @@ def test_historical_trade_day_is_closed() -> None:
     assert batch.batch_status == "ACCEPTED"
 
 
+def test_scan_crossing_1800_cutoff_fails_closed_as_one_batch() -> None:
+    crossed = replace(
+        _capture(),
+        scan_started_at=datetime(
+            2026,
+            7,
+            31,
+            9,
+            59,
+            tzinfo=timezone.utc,
+        ),
+        scan_completed_at=datetime(
+            2026,
+            7,
+            31,
+            10,
+            1,
+            tzinfo=timezone.utc,
+        ),
+    )
+    adapter, _ = _adapter(crossed)
+
+    batch = _scan(adapter)
+
+    assert batch.trade_day_status == "CLOSED"
+    assert batch.capability_result == "FAILED"
+    assert batch.batch_status == "FAILED"
+    assert batch.scope_complete is False
+    assert batch.end_marker_verified is False
+    assert batch.items == ()
+    assert batch.error_code == "ORDER_SCAN_CROSSED_TRADE_DAY_CUTOFF"
+
+
 def test_trusted_empty_page_is_success_not_unavailable() -> None:
     empty = replace(
         _capture(),

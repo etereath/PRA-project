@@ -14,6 +14,9 @@ from typing import Any
 from app.exceptions import ValidationError
 from app.listing_identity import listing_identity_key
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.repositories.automation_repository import (
+    read_order_scan_target_trade_date,
+)
 from app.repositories.workbook_repository import load_products
 from app.services.shadowbot_executor import (
     EXECUTION_MODE_COMMIT,
@@ -1242,12 +1245,24 @@ class ShadowBotQueueWatchdog:
                                 ),
                             ),
                         ).fetchone()
+                        try:
+                            target_trade_date = (
+                                read_order_scan_target_trade_date(
+                                    connection,
+                                    str(
+                                        request.get("automation_run_id")
+                                        or ""
+                                    ),
+                                ).isoformat()
+                            )
+                        except (TypeError, ValueError):
+                            target_trade_date = ""
                     bound = (
                         run is not None
                         and str(run["job_type"]) == "ORDER_SCAN"
                         and str(run["platform_name"])
                         == str(request.get("platform_name") or "")
-                        and str(run["platform_trade_date"])
+                        and target_trade_date
                         == str(
                             request.get(
                                 "requested_platform_trade_date"

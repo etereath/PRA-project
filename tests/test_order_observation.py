@@ -120,7 +120,11 @@ def _job(
     )
 
 
-def _runtime_with_order_claim(tmp_path):
+def _runtime_with_order_claim(
+    tmp_path,
+    *,
+    target_trade_date: date = date(2026, 7, 31),
+):
     runtime = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
     runtime.init_schema()
     repository = AutomationRepository(runtime)
@@ -174,6 +178,11 @@ def _runtime_with_order_claim(tmp_path):
         lease_seconds=600,
     )
     assert claim is not None
+    repository.bind_order_scan_target_trade_date(
+        claim,
+        target_trade_date=target_trade_date,
+        now=SCHEDULED_FOR + timedelta(seconds=3),
+    )
     return runtime, repository, claim
 
 
@@ -247,6 +256,44 @@ def test_import_preserves_duplicate_identity_multiset_and_mapping_states(
     assert len(rows) == 3
     assert all(str(row["platform_name"]) == MAYI_HUATUAN_PLATFORM for row in rows)
     assert all(str(row["trade_day_status"]) == "OPEN" for row in rows)
+
+
+def test_historical_target_is_frozen_and_imported_as_closed(tmp_path) -> None:
+    target = date(2026, 7, 30)
+    runtime, _, claim = _runtime_with_order_claim(
+        tmp_path,
+        target_trade_date=target,
+    )
+    capture = page_capture_from_json(
+        json.loads(FIXTURE.read_text(encoding="utf-8"))
+    )
+    historical_capture = replace(
+        capture,
+        selected_platform_trade_date=target,
+        rows=tuple(
+            replace(row, order_created_at="2026-07-30 17:01:02")
+            for row in capture.rows
+        ),
+    )
+    batch = MayiHuatuanOrderReadOnlyAdapter(
+        FixtureReader(historical_capture),
+        operational_time=OperationalTimeService(),
+    ).scan(
+        observation_batch_id="ORDER-BATCH-HISTORICAL",
+        automation_run_id=claim.run.run_id,
+        platform_name=MAYI_HUATUAN_PLATFORM,
+        requested_platform_trade_date=target,
+    )
+
+    result = _importer(runtime).import_batch(
+        batch,
+        mappings=_mappings(),
+        claim=claim,
+    )
+
+    assert result.requested_platform_trade_date == target
+    assert result.trade_day_status == "CLOSED"
+    assert {item.trade_day_status for item in result.items} == {"CLOSED"}
 
 
 def test_import_preserves_unmapped_order_without_inventing_sku(
@@ -395,6 +442,30 @@ def test_platform_or_run_misbinding_is_rejected(
         assert connection.execute(
             "SELECT COUNT(*) FROM order_observation_batches"
         ).fetchone()[0] == 0
+
+
+def test_import_requires_exactly_one_frozen_order_target(tmp_path) -> None:
+    runtime, _, claim = _runtime_with_order_claim(tmp_path)
+    with runtime.connect_write() as connection:
+        connection.execute(
+            """
+            DELETE FROM automation_run_events
+            WHERE run_id = ?
+              AND event_type = 'ORDER_SCAN_TARGET_SELECTED'
+            """,
+            (claim.run.run_id,),
+        )
+        connection.commit()
+
+    with pytest.raises(
+        OrderObservationError,
+        match="exactly one frozen target",
+    ):
+        _importer(runtime).import_batch(
+            _batch(claim),
+            mappings=_mappings(),
+            claim=claim,
+        )
 
 
 def test_unsupported_and_unavailable_batches_do_not_invent_zero_orders(

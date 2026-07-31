@@ -3,7 +3,7 @@
 - Review Profile：`R3`
 - 分支：`codex/task13-5-4-order-observation`
 - 基线：`origin/main@4aa4c73`
-- 权威：GitHub Issue #20 最新正文及评论 `5136623832`
+- 权威：GitHub Issue #20 最新正文及评论 `5136623832 / 5139601975`
 - 平台写操作：`0`
 
 ## 1. 实施结果
@@ -31,6 +31,13 @@ FULL_MARKET_SCAN
   `FAILED` 结果；
 - `FullMarketScanOrderCoordinator / OrderScanHandler`：复用 13.5-3 的父子 run、租约、
   完成接口和 `ORDER_SCAN_CHILD` 关系。
+- `ORDER_SCAN_TARGET_SELECTED`：在队列发布前冻结精确当前/历史目标日期；
+  Watchdog、请求和 Importer 拒绝未冻结、错日期或多重冻结；
+- 每小时 `FULL_MARKET_SCAN` 按本地 `HH:10` 对齐，关键换日扫描为 `18:10`；
+  跨 18:00 的订单批次整批失败，`PRE_CUTOFF_FULL_SCAN` 不派生订单扫描；
+- 正式 Automation Service 可通过 `--enable-order-read-only` 注册
+  `FULL_MARKET_SCAN → ORDER_SCAN`，组合根只包含只读 Handler，父 run 仅声明子 run
+  调度结果，不伪造页面事实。
 
 未新增订单控制状态机、第二队列、写锁或销售平台写动作。
 
@@ -71,12 +78,14 @@ FULL_MARKET_SCAN
 - 数据库失败整体回滚；
 - v6 请求/结果绑定、checksum、PII 拒绝、零平台写副作用；
 - v6 Watchdog Run 绑定、通用 Importer 分流和超时恢复；
+- 历史目标精确冻结、错日期拒绝和跨 18:00 失败关闭；
+- `18:10` 小时扫描对齐及正式只读服务组合；
 - `FULL_MARKET_SCAN → ORDER_SCAN` 父子集成。
 
 本地统一回归：
 
 ```text
-pytest: 888 passed, 3 skipped, 97 subtests passed
+pytest: 896 passed, 3 skipped, 97 subtests passed
 system smoke: 16 passed, 0 failed
 ```
 
@@ -133,9 +142,56 @@ platform_write_operations: 0
 `READ-READ-BATCH-T11-20260719-082740` 的 `NEEDS_RECONCILIATION` 正确阻断；没有绕过、
 修改或清理该账本，只精确回滚了本次验收临时创建的父 run/job。
 
+### 5.1 三日期真实页面矩阵
+
+2026-07-31 使用三个一次性 v14 Runtime DB 对 7 月 31 日、7 月 30 日和 7 月 22 日
+执行真实页面 READ_ONLY。脱敏结果如下：
+
+| 目标日期 | 交易日状态 | 条目数 | page_count | 页面能力 | 范围/尾部 | 导入/归档 | 平台写操作 |
+| --- | --- | ---: | ---: | --- | --- | --- | ---: |
+| 2026-07-31 | `OPEN` | 3 | 1 | `SUCCEEDED` | 完整/已验证 | 完成/完成 | 0 |
+| 2026-07-30 | `CLOSED` | 5 | 1 | `SUCCEEDED` | 完整/已验证 | 完成/完成 | 0 |
+| 2026-07-22 | `CLOSED` | 4 | 1 | `SUCCEEDED` | 完整/已验证 | 完成/完成 | 0 |
+
+对应成功尝试为：
+
+```text
+2026-07-31: ORDER-READ-T1354-20260731T083228Z
+2026-07-30: ORDER-READ-T1354-20260731T082801Z
+2026-07-22: ORDER-READ-T1354-20260731T082835Z
+```
+
+三个批次均因隔离验收继续使用空 Mapping 集合而保存为 `PARTIAL`，不是页面范围失败。
+各批次均完成 checksum 校验、Importer、归档和活动队列清空，未保存真实订单值、截图、
+平台订单号或买家 PII。
+
+本轮发现并关闭了历史日期自动选择缺陷：日期轮无障碍树会暴露当前视口外的全部日期，
+旧实现误把“树中存在”当作“当前可见”，点击隐藏的 7 月 22 日后页面仍停在 7 月 30 日，
+随后确认按钮捕获选择器返回 `ELEMENT_NOT_FOUND`。失败尝试
+`ORDER-READ-T1354-20260731T080402Z` 正确保存为 0 条、范围不完整、尾部未验证且平台
+写操作为 0。修复增加日期项相对滚轮容器的可视边界判断，并通过按钮父节点文本重新
+定位“确认”；从 7 月 30 日出发的 `ORDER-READ-T1354-20260731T082835Z` 已在无人工
+介入的情况下自动向上滚动并确认 7 月 22 日，随后完成 4 条订单观察、Importer 和归档；
+`ORDER-READ-T1354-20260731T083228Z` 又从 7 月 22 日自动向下滚动回 7 月 31 日，
+完成当前交易日 3 条订单观察。日期轮两个方向均由最终部署版本验证。
+
+仍需补验的门禁：
+
+- 三个成功批次的 `page_count` 均为 1，因此没有满足“至少一个历史日期实际发生滚动并
+  验证滚动结束”的合并门禁。7 月 30 日的 5 条记录满足连续多卡片样本，但不能替代
+  订单列表滚动批次。日期选择器滚动已通过，不等价于订单列表滚动。
+
+一次性 Runtime DB 与绑定真实 Runtime DB 的常驻 Watchdog 存在竞态：两个重试请求在
+Worker 领取前被正确隔离为 `ORPHAN_READY_REQUEST`。验收期间仅在活动队列为 0 时短暂
+暂停队列 Watchdog/Importer 服务，完成后已按原参数恢复；`test2` Worker 始终保持
+`RUNNING`。因此本轮不能宣称“历史一次性 DB 请求已通过常驻 Watchdog 绑定”。
+
 ## 6. 当前限制
 
 - 真实 Runtime DB 未迁移，也未写入订单事实；
-- 单卡片真实页面已验证当前平台专属候选步长 `9`；多卡片页面仍需继续复验；
+- 当前日和两个历史日期已完成真实页面只读读取；7 月 30 日覆盖 5 张连续卡片，
+  7 月 22 日覆盖 4 张连续卡片；
+- 较早历史日期全自动日期选择已通过；订单列表实际滚动批次和常驻 Watchdog 精确绑定
+  仍未形成合并证据；
 - 取消、退款净额、财务实收和 `FINAL` 日结属于后续阶段；
 - 当前实现不扩大到第二平台或多 Worker 并发。

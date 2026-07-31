@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import Mock
 
 from app.adapters.mayi_huatuan_order import MAYI_HUATUAN_PLATFORM
@@ -35,7 +35,11 @@ from app.shadowbot_contract_primitives import (
 NOW = datetime(2026, 7, 31, 1, 0, tzinfo=timezone.utc)
 
 
-def _request(run_id: str) -> dict[str, object]:
+def _request(
+    run_id: str,
+    *,
+    target_trade_date: str = "2026-07-31",
+) -> dict[str, object]:
     payload: dict[str, object] = {
         "schema_version": ORDER_SCAN_REQUEST_SCHEMA_VERSION,
         "contract_version": ORDER_SCAN_CONTRACT_VERSION,
@@ -44,7 +48,7 @@ def _request(run_id: str) -> dict[str, object]:
         "observation_batch_id": f"ORDER-BATCH-{run_id}",
         "execution_attempt_id": "ORDER-READ-SYNTHETIC-QUEUE",
         "platform_name": MAYI_HUATUAN_PLATFORM,
-        "requested_platform_trade_date": "2026-07-31",
+        "requested_platform_trade_date": target_trade_date,
         "window_title": MAYI_HUATUAN_PLATFORM,
         "applet_uri": "",
         "element_timeout_seconds": 15,
@@ -62,7 +66,11 @@ def _request(run_id: str) -> dict[str, object]:
     return payload
 
 
-def _running_order_scan(runtime: SQLiteRuntimeRepository) -> str:
+def _running_order_scan(
+    runtime: SQLiteRuntimeRepository,
+    *,
+    target_trade_date: date = date(2026, 7, 31),
+) -> str:
     repository = AutomationRepository(runtime)
     parent_job = repository.upsert_job(
         AutomationJob(
@@ -128,6 +136,11 @@ def _running_order_scan(runtime: SQLiteRuntimeRepository) -> str:
         lease_seconds=600,
     )
     assert child_claim is not None
+    repository.bind_order_scan_target_trade_date(
+        child_claim,
+        target_trade_date=target_trade_date,
+        now=NOW + timedelta(seconds=3),
+    )
     return child.run_id
 
 
@@ -164,6 +177,49 @@ def test_watchdog_accepts_v6_ready_request_bound_to_running_order_scan(
         / "inbox"
         / "ORDER-READ-SYNTHETIC-QUEUE.ready.json"
     ).exists()
+
+
+def test_watchdog_accepts_only_the_frozen_historical_trade_date(
+    tmp_path,
+) -> None:
+    runtime = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
+    runtime.init_schema()
+    run_id = _running_order_scan(
+        runtime,
+        target_trade_date=date(2026, 7, 30),
+    )
+    queue_dir = tmp_path / "queue"
+    queue_dir.mkdir()
+    historical = _request(run_id, target_trade_date="2026-07-30")
+    historical["execution_attempt_id"] = "ORDER-READ-HISTORICAL"
+    historical["instruction_hash"] = order_scan_instruction_hash(historical)
+    ShadowBotFileQueueRunner(queue_dir).start(historical)
+
+    events = ShadowBotQueueWatchdog(
+        queue_dir,
+        stale_seconds=30,
+        repository=runtime,
+    ).inspect(now=NOW)
+
+    assert events == []
+    assert (
+        queue_dir / "inbox" / "ORDER-READ-HISTORICAL.ready.json"
+    ).exists()
+
+    wrong = _request(run_id, target_trade_date="2026-07-31")
+    wrong["execution_attempt_id"] = "ORDER-READ-WRONG-DATE"
+    wrong["instruction_hash"] = order_scan_instruction_hash(wrong)
+    ShadowBotFileQueueRunner(queue_dir).start(wrong)
+    events = ShadowBotQueueWatchdog(
+        queue_dir,
+        stale_seconds=30,
+        repository=runtime,
+    ).inspect(now=NOW)
+
+    assert any(
+        event.get("error_code") == "ORPHAN_READY_REQUEST"
+        for event in events
+    )
 
 
 def test_generic_result_importer_defers_v6_to_order_importer(

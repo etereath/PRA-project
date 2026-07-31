@@ -2,7 +2,7 @@
 
 - Review Profile：`R3`
 - 当前平台：蚂蚁花团供应商微信小程序
-- 权威：GitHub Issue #20 最新正文及评论 `5136623832`
+- 权威：GitHub Issue #20 最新正文及评论 `5136623832 / 5139601975`
 - 基线：`origin/main@4aa4c73`
 - 范围：只读经营事实链；不得扩张为新的 R4 控制面
 
@@ -34,6 +34,12 @@ supports_historical_trade_day = true
 
 当前平台交易日是截至 `observed_at` 的开放快照，标记 `OPEN`；已经截单的历史平台
 交易日标记 `CLOSED`。`OPEN` 不代表完整闭市事实，不得进入 `FINAL` 日结。
+
+每小时 `FULL_MARKET_SCAN` 固定在本地时间 `HH:10`，因此关键换日扫描为 `18:10`：
+此时前一平台交易日为 `CLOSED`，新交易日为 `OPEN`。订单扫描的
+`scan_started_at / scan_completed_at` 必须属于同一平台交易日；跨越 18:00 的批次
+以 `ORDER_SCAN_CROSSED_TRADE_DAY_CUTOFF` 整批失败关闭，不接受为完整事实。
+`PRE_CUTOFF_FULL_SCAN` 不派生 `ORDER_SCAN`，避免在 18:00 附近启动完整订单读取。
 
 Adapter 只能报告已验证的页面能力，不得声称平台内部修复了错误。未来日期、不可访问
 日期和页面能力故障必须明确表示为 `UNAVAILABLE` 或 `FAILED`，不得伪造成空订单。
@@ -144,6 +150,12 @@ Importer 在单一 `BEGIN IMMEDIATE` 事务中：
 同一 `observation_batch_id`、同一规范内容精确重放返回原结果，即使 run 已终态；同 ID
 异内容冲突。终态精确重放不依赖当前映射漂移，新事实仍要求有效实时 claim。
 
+`ORDER_SCAN` 在发布队列请求前必须以唯一
+`ORDER_SCAN_TARGET_SELECTED` Run Event 冻结精确的
+`requested_platform_trade_date`。当前日和历史日使用同一机制；目标日期不得晚于 run
+冻结的 `platform_trade_date`，重复绑定只能使用同一日期。Watchdog、Worker 请求和
+Importer 必须共同校验该精确目标，不能用宽松的“早于或等于 run 日期”代替绑定。
+
 ## 7. ShadowBot 文件队列
 
 订单读取使用 v6 请求/结果合同，复用既有文件队列、单 Worker、checksum、phase、心跳
@@ -154,9 +166,14 @@ Importer 在单一 `BEGIN IMMEDIATE` 事务中：
 数据库导入成功后才归档队列结果；数据库失败时保留结果用于精确重放。
 
 既有通用队列服务不得把 v6 结果作为旧版结果导入，也不得把合法 v6 请求误判为孤儿。
-v6 请求进入 `working` 前，Watchdog 必须确认其绑定到同平台、同交易日且处于
-`RUNNING` 的 `ORDER_SCAN`；超时恢复只能生成 `FAILED`、零写副作用的 v6 结果，后续仍
-由订单 Importer 完成业务导入和归档。
+v6 请求进入 `working` 前，Watchdog 必须确认其绑定到同平台、唯一冻结目标日期且处于
+`RUNNING` 的 `ORDER_SCAN`；超时恢复只能生成 `FAILED`、零写副作用的 v6 结果，后续
+仍由订单 Importer 完成业务导入和归档。
+
+正式 Automation Service 通过显式 `--enable-order-read-only` 门禁注册
+`FULL_MARKET_SCAN` 只读派生 Handler 与 `ORDER_SCAN` Handler。父 run 的成功只表示
+子 run 调度完成，不声明页面扫描事实；订单事实仍只由子 run 和 Importer 接受。该组合
+不得注册 COMMIT、上下架或其他平台写 Handler。
 
 ## 8. Runtime Schema v14 最小纠正
 
@@ -178,9 +195,18 @@ v6 请求进入 `working` 前，Watchdog 必须确认其绑定到同平台、同
 - 精确重放、同 ID 异内容冲突；
 - 未映射、歧义商品；
 - 平台或 Run 错绑；
+- 未冻结目标、目标漂移和历史目标 Watchdog 绑定；
+- `18:10 FULL_MARKET_SCAN` 对齐及跨 18:00 整批失败；
+- 正式 Automation Service 只读 Handler 组合且零写 Handler；
 - 数据库失败整体回滚；
 - v6 checksum、请求/结果绑定、PII 拒绝和零平台写副作用。
 
 Ready for review 前统一运行订单专项、受影响集成测试、完整 pytest、系统冒烟、
 Windows/Linux CI 和受控真实页面 READ_ONLY 验收。真实值、截图、平台订单号和买家
 PII 不进入仓库；仓库只保留合成 fixture、结构化测试和脱敏验收摘要。
+
+合并前真实页面历史批次至少覆盖两个不同历史日期：一个日期连续读取不少于三张订单
+卡片并验证候选步长 `9` 的同卡字段关联；一个日期具备足够订单触发滚动并验证尾部
+“没有更多了”、可见数与读取数一致、任一中间失败整批失败。两项可以在同一日期合并，
+但总计仍需两个不同历史日期，并验证目标日期从 Watchdog、Worker、Importer 到归档
+保持一致。

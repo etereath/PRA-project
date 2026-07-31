@@ -269,3 +269,23 @@ def test_order_vertical_slice_has_no_order_id_selector_or_write_action() -> None
     assert "订单管理_订单1_单号" not in source
     assert "def _run_order_scan_v6" in source
     assert '"side_effect_state": "NOT_STARTED"' in source
+
+
+def test_order_date_picker_scrolls_directionally_and_rebinds_actions() -> None:
+    source = (
+        Path("shadowbot/test2/vertical_slice_read_price.py")
+        .read_text(encoding="utf-8")
+    )
+
+    assert "requested_date < selected_date" in source
+    assert (
+        "win32.mouse_wheel(scroll_direction, 1, \"none\", 0.1)"
+        in source
+    )
+    assert "sleep(0.3)" in source
+    assert "def _order_element_visible_in_container" in source
+    assert "hidden_target_found = True" in source
+    assert "def _order_find_picker_action" in source
+    assert "_find_button_by_exact_label(" in source
+    assert '"dynamic_order_picker_%s" % action' in source
+    assert 'directions = ("up", "down")' not in source

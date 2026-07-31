@@ -4,7 +4,7 @@ import json
 import os
 import re
 from collections.abc import Callable, Iterable, Mapping
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Protocol
 from uuid import uuid4
@@ -100,6 +100,16 @@ class AutomationExecutionContext:
         return self.repository.bind_run_input_manifest(
             self.claim,
             manifest_sha256=manifest_sha256,
+            clock=self.clock,
+        )
+
+    def bind_order_scan_target_trade_date(
+        self,
+        target_trade_date: date,
+    ) -> date:
+        return self.repository.bind_order_scan_target_trade_date(
+            self.claim,
+            target_trade_date=target_trade_date,
             clock=self.clock,
         )
 
@@ -549,6 +559,7 @@ def default_automation_jobs(
                 **common,
                 "catchup_policy": "LATEST_ONLY",
                 "max_lateness_seconds": 3600,
+                "interval_offset_minutes": 10,
             },
         ),
         AutomationJob(
@@ -643,7 +654,19 @@ def _due_windows(
 ) -> tuple[tuple[datetime, ...], int]:
     if job.schedule_kind == INTERVAL_MINUTES:
         minutes = _parse_interval_minutes(job.schedule_expression)
-        latest = _floor_interval(now, minutes)
+        default_offset = 10 if job.job_type == FULL_MARKET_SCAN else 0
+        offset_minutes = int(
+            job.config.get("interval_offset_minutes", default_offset)
+        )
+        if not 0 <= offset_minutes < minutes:
+            raise ValueError(
+                "interval_offset_minutes must be within the interval"
+            )
+        latest = _floor_interval(
+            now,
+            minutes,
+            offset_minutes=offset_minutes,
+        )
         if last_scheduled_for is None:
             return (latest,), 0
         previous = _as_utc(last_scheduled_for, "last_scheduled_for")
@@ -717,14 +740,20 @@ def _window_statuses(
     )
 
 
-def _floor_interval(value: datetime, minutes: int) -> datetime:
+def _floor_interval(
+    value: datetime,
+    minutes: int,
+    *,
+    offset_minutes: int = 0,
+) -> datetime:
     current = _as_utc(value, "value")
     local = current.astimezone(ZoneInfo(DEFAULT_OPERATIONAL_TIMEZONE))
-    floored = local.replace(
-        minute=local.minute - (local.minute % minutes),
+    shifted = local - timedelta(minutes=offset_minutes)
+    floored = shifted.replace(
+        minute=shifted.minute - (shifted.minute % minutes),
         second=0,
         microsecond=0,
-    )
+    ) + timedelta(minutes=offset_minutes)
     return floored.astimezone(timezone.utc)
 
 

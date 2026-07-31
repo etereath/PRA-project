@@ -28,11 +28,26 @@ from app.services.automation import (  # noqa: E402
     ensure_default_automation_jobs,
     safe_automation_error_message,
 )
+from app.services.operational_time import (  # noqa: E402
+    OperationalTimeService,
+)
+from app.services.order_automation_runtime import (  # noqa: E402
+    build_order_read_only_handlers,
+)
 from app.services.runtime import DEFAULT_RUNTIME_DB  # noqa: E402
 
 
 DEFAULT_HEARTBEAT_PATH = Path(
     "data/runtime/automation_service/heartbeat.json"
+)
+DEFAULT_SHADOWBOT_QUEUE_DIR = Path(
+    os.environ.get(
+        "SHADOWBOT_QUEUE_DIR",
+        "data/runtime/shadowbot_queue",
+    )
+)
+DEFAULT_PLATFORM_MAPPINGS = (
+    PROJECT_ROOT / "data" / "samples" / "platform_mappings.xlsx"
 )
 
 
@@ -61,6 +76,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lease-seconds", type=int, default=60)
     parser.add_argument("--max-runs-per-cycle", type=int, default=8)
     parser.add_argument("--max-windows-per-job", type=int, default=16)
+    parser.add_argument(
+        "--enable-order-read-only",
+        action="store_true",
+        help=(
+            "Register only FULL_MARKET_SCAN order dispatch and ORDER_SCAN "
+            "READ_ONLY handlers; no platform-write handler is registered."
+        ),
+    )
+    parser.add_argument(
+        "--shadowbot-queue-dir",
+        type=Path,
+        default=DEFAULT_SHADOWBOT_QUEUE_DIR,
+    )
+    parser.add_argument(
+        "--platform-mappings",
+        type=Path,
+        default=DEFAULT_PLATFORM_MAPPINGS,
+    )
+    parser.add_argument(
+        "--order-timeout-seconds",
+        type=float,
+        default=330.0,
+    )
     parser.add_argument("--once", action="store_true")
     return parser
 
@@ -143,6 +181,8 @@ def main() -> int:
         raise ValueError("--poll-seconds 必须不小于 0.2。")
     if args.lease_seconds < 1:
         raise ValueError("--lease-seconds 必须为正整数。")
+    if args.order_timeout_seconds <= 0:
+        raise ValueError("--order-timeout-seconds 必须为正数。")
 
     heartbeat = AutomationHeartbeatStore(args.heartbeat)
     lock_path = automation_service_lock_path(args.runtime_db)
@@ -169,12 +209,23 @@ def main() -> int:
                 platform_name=args.platform_name,
                 now=datetime.now(timezone.utc),
             )
-            # 13.5-3 only owns the control plane.  Scanner/order/settlement
-            # handlers are registered by their application-service stages;
-            # an empty registry schedules jobs without inventing side effects.
+            operational_time = OperationalTimeService(
+                policies=repository.load_operational_time_policies()
+            )
+            handlers = {}
+            if args.enable_order_read_only:
+                handlers = dict(
+                    build_order_read_only_handlers(
+                        runtime_repository=runtime_repository,
+                        queue_dir=args.shadowbot_queue_dir,
+                        mapping_workbook=args.platform_mappings,
+                        operational_time=operational_time,
+                        timeout_seconds=args.order_timeout_seconds,
+                    )
+                )
             service = AutomationService(
                 repository,
-                handlers={},
+                handlers=handlers,
                 owner_token=service_instance_id,
                 lease_seconds=args.lease_seconds,
                 max_runs_per_cycle=args.max_runs_per_cycle,
@@ -189,7 +240,13 @@ def main() -> int:
                 payload = {
                     "schema_version": "automation-heartbeat-1.0",
                     "status": "RUNNING",
-                    "mode": "SCHEDULER_ONLY",
+                    "mode": (
+                        "ORDER_READ_ONLY"
+                        if args.enable_order_read_only
+                        else "SCHEDULER_ONLY"
+                    ),
+                    "registered_job_types": sorted(handlers),
+                    "platform_write_handlers_registered": False,
                     "service_instance_id": service_instance_id,
                     "cycle_started_at": cycle_started_at.isoformat(),
                     "last_cycle_at": datetime.now(

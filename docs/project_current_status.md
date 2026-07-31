@@ -8,7 +8,7 @@ PRA 当前定位为：
 
 鲜切花预测性销售决策系统 + 运行态任务运营后台。
 
-PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、多商品、受控 RPA 改价与上下架闭环；任务 13.5 已插入任务 13 与任务 14 之间，用于补齐 18:00 平台交易日/20:00 卖家作业日双时间轴、持续只读扫描、历史订单观察、销售日结、S0–S4 异常治理、任务来源对齐、受控紧急保护和运营 Web 重写。当前 13.5-1 已完成双时间轴、Runtime Schema v14、六级质量约束和日结状态机；13.5-2 已通过 PR #23 合并商品映射编译、扫描 JSON 输入、任务 13 双页快照适配和 v14 商品观察导入；13.5-3 已通过 PR #24 合并独立 Automation Service 的计划窗口、租约、合并、补跑、父子 run、心跳和健康控制面。13.5-4 已实现订单只读合同、蚂蚁花团 Adapter、平台无关 Importer、v6 ShadowBot 只读队列边界和 `FULL_MARKET_SCAN → ORDER_SCAN → ORDER_HISTORY_IMPORT` 接入；当前日按 `OPEN`、历史日按 `CLOSED`，重复订单按指纹多重集合保留。受控真实页面 READ_ONLY 已使用一次性 v14 Runtime DB 验收可信空页和完整有数据页、范围与尾部标记、单价乘数量、导入归档和零平台写副作用；真实 Runtime DB 因既有 `NEEDS_RECONCILIATION` 安全门禁保持未迁移、未写入订单事实，因此仍不承诺生产级无人值守写操作，也未扩展到第二平台。系统核心职责是：
+PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、多商品、受控 RPA 改价与上下架闭环；任务 13.5 已插入任务 13 与任务 14 之间，用于补齐 18:00 平台交易日/20:00 卖家作业日双时间轴、持续只读扫描、历史订单观察、销售日结、S0–S4 异常治理、任务来源对齐、受控紧急保护和运营 Web 重写。当前 13.5-1 已完成双时间轴、Runtime Schema v14、六级质量约束和日结状态机；13.5-2 已通过 PR #23 合并商品映射编译、扫描 JSON 输入、任务 13 双页快照适配和 v14 商品观察导入；13.5-3 已通过 PR #24 合并独立 Automation Service 的计划窗口、租约、合并、补跑、父子 run、心跳和健康控制面。13.5-4 已实现订单只读合同、蚂蚁花团 Adapter、平台无关 Importer、v6 ShadowBot 只读队列边界和 `FULL_MARKET_SCAN → ORDER_SCAN → ORDER_HISTORY_IMPORT` 接入；当前日按 `OPEN`、历史日按 `CLOSED`，重复订单按指纹多重集合保留。最新审查修复已增加历史目标日期 Run Event 精确冻结、Watchdog/Importer 全链路绑定、`HH:10` 完整扫描、跨 18:00 整批失败和正式 Automation Service 只读 Handler 组合。受控真实页面 READ_ONLY 已完成 2026-07-31、2026-07-30 和 2026-07-22 三日期矩阵，分别读取 3、5、4 条并完成范围/尾部验证、导入归档和零平台写副作用；日期轮已修复“隐藏日期存在于无障碍树却不在视口”的误判，从 7 月 30 日到 7 月 22 日的向上滚动以及从 7 月 22 日回到 7 月 31 日的向下滚动、确认和精确日期回读均已通过。三个成功批次的订单列表均未触发实际分页滚动，因此该合并门禁仍未关闭。真实 Runtime DB 因既有 `NEEDS_RECONCILIATION` 安全门禁保持未迁移、未写入订单事实，因此仍不承诺生产级无人值守写操作，也未扩展到第二平台。系统核心职责是：
 
 - 从 Excel 读取业务输入。
 - 根据规则和预测输入生成运行态任务。
@@ -95,9 +95,10 @@ SQLite 只承接运行态任务系统，不替代 Excel 主数据。
 `LISTING_STATUS_SCAN` 商品子结果。
 
 13.5-3 的 Automation Service 使用稳定逻辑窗口、`lease_owner + lease_version +
-lease_expires_at` fencing、邻近扫描合并和有界补跑。独立 CLI 当前明确为
-`SCHEDULER_ONLY`：缺少已验收 handler 时只记录到期账本，不启动 ShadowBot、不投递
-平台请求，也不伪造扫描成功。合同见
+lease_expires_at` fencing、邻近扫描合并和有界补跑。独立 CLI 默认保持
+`SCHEDULER_ONLY`；13.5-4 增加显式 `--enable-order-read-only` 模式，只注册完整扫描
+订单子 run 派生与 `ORDER_SCAN` 只读 Handler，不注册平台写 Handler。默认模式只记录
+到期账本，不启动 ShadowBot、不投递平台请求，也不伪造扫描成功。合同见
 [13.5-3 Automation Service 合同](plans/task13_5_3_automation_service_contract.md)。
 
 13.5-4 已实现蚂蚁花团订单只读 Adapter、平台无关订单输入与 Importer、合成 fixture、
@@ -107,11 +108,15 @@ v6 ShadowBot 请求/结果和既有文件队列传输，并通过 Automation 父
 可信空页要求“暂无订单”。平台订单 ID 和买家 PII 被合同拒绝，相同指纹的真实重复
 订单用 `occurrence_no` 保留。页面数量固定为 `order_qty`；执行端用页面单价乘数量
 计算 `order_transaction_amount`，不单独定位合计金额元素。取消推导留到 13.5-5。
-真实 Runtime DB 仍未写入订单事实，
+目标交易日通过唯一 `ORDER_SCAN_TARGET_SELECTED` Run Event 冻结并由 Watchdog、
+Worker 请求和 Importer 精确校验；每小时完整扫描对齐 `HH:10`，跨越 18:00 的订单
+批次整批失败。真实 Runtime DB 仍未写入订单事实，
 受控实机验收已在一次性 v14 Runtime DB 上通过：当前交易日 `OPEN` 的可信空页和
 完整有数据页均已验证，最新有数据页为 `scope_complete=true`、
 `end_marker_verified=true`，结果已导入归档且平台写操作为 0；批次仅因隔离验收使用
-空 Mapping 集合而标记 `PARTIAL / UNMAPPED`。
+空 Mapping 集合而标记 `PARTIAL / UNMAPPED`。2026-07-31 进一步完成当前日及两个
+历史日期的 3/5/4 条真实页面矩阵；从 7 月 30 日到 7 月 22 日的全自动日期轮滚动已经
+通过，订单列表实际滚动批次仍待补验。
 通用队列 Watchdog 已识别 v6 `ORDER_SCAN` Run 绑定，旧版 Result Importer 不再抢占
 订单结果，超时恢复保持 v6 零写语义。
 

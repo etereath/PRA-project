@@ -50,6 +50,11 @@ class OrderScanHandler:
     ) -> AutomationRunOutcome:
         if run.job_type != "ORDER_SCAN":
             raise ValueError("OrderScanHandler only accepts ORDER_SCAN")
+        target_trade_date = context.bind_order_scan_target_trade_date(
+            self.target_trade_date(run)
+        )
+        self.adapter.operational_time = context.operational_time
+        self.importer.operational_time = context.operational_time
         reader = self.adapter.reader
         set_wait_callback = getattr(reader, "set_wait_callback", None)
         if callable(set_wait_callback):
@@ -59,7 +64,7 @@ class OrderScanHandler:
                 observation_batch_id=self.batch_id_factory(run),
                 automation_run_id=run.run_id,
                 platform_name=run.platform_name,
-                requested_platform_trade_date=self.target_trade_date(run),
+                requested_platform_trade_date=target_trade_date,
             )
             imported = self.importer.import_batch(
                 batch,
@@ -119,7 +124,6 @@ class FullMarketScanOrderCoordinator:
     ) -> AutomationRunOutcome:
         if run.job_type not in {
             "FULL_MARKET_SCAN",
-            "PRE_CUTOFF_FULL_SCAN",
         }:
             raise ValueError(
                 "order child coordination requires a full-scan parent"
@@ -147,4 +151,34 @@ class FullMarketScanOrderCoordinator:
             error_code=outcome.error_code,
             error_message=outcome.error_message,
             event_payload=payload,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class FullMarketScanOrderDispatchHandler:
+    """Schedule the read-only order child without claiming scan facts."""
+
+    child_job_id: str = ORDER_SCAN_CHILD_JOB_ID
+
+    def __call__(
+        self,
+        run: AutomationRun,
+        context: AutomationExecutionContext,
+    ) -> AutomationRunOutcome:
+        if run.job_type != "FULL_MARKET_SCAN":
+            raise ValueError(
+                "order dispatch requires a FULL_MARKET_SCAN parent"
+            )
+        child, created = context.ensure_child_run(
+            child_job_id=self.child_job_id,
+            relation_type=ORDER_SCAN_CHILD_RELATION,
+        )
+        return AutomationRunOutcome(
+            status=AutomationRunStatus.SUCCESS,
+            event_payload={
+                "coordination_only": True,
+                "order_scan_child_run_id": child.run_id,
+                "order_scan_child_created": created,
+                "order_scan_relation": ORDER_SCAN_CHILD_RELATION,
+            },
         )

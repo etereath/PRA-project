@@ -6622,6 +6622,21 @@ def _order_click_element(element):
         element.parent().click()
 
 
+def _order_element_visible_in_container(container, element):
+    container_bounds = _bounding_dict(container)
+    element_bounds = _bounding_dict(element)
+    element_center_x = element_bounds["x"] + element_bounds["width"] / 2.0
+    element_center_y = element_bounds["y"] + element_bounds["height"] / 2.0
+    return (
+        element_bounds["width"] > 0
+        and element_bounds["height"] > 0
+        and container_bounds["x"] <= element_center_x
+        <= container_bounds["x"] + container_bounds["width"]
+        and container_bounds["y"] <= element_center_y
+        <= container_bounds["y"] + container_bounds["height"]
+    )
+
+
 def _order_selected_date_from_labels(window):
     for label in _collect_ui_state_labels(window):
         match = re.fullmatch(
@@ -6678,48 +6693,100 @@ def _order_select_picker_value(
     candidates,
     timeout_seconds,
     max_scrolls,
+    scroll_direction,
 ):
     container = _find_element(
         window,
         ORDER_DATE_PICKER_SELECTORS[column_name],
         timeout_seconds,
     )
-    directions = ("up", "down")
-    for direction in directions:
-        for _ in range(max(1, int(max_scrolls))):
-            for candidate in candidates:
-                try:
-                    target = _find_element(
-                        window,
-                        _order_picker_value_selector(
-                            column_name,
-                            candidate,
-                        ),
-                        0.4,
-                    )
-                    _order_click_element(target)
-                    sleep(0.3)
-                    return
-                except SliceError:
-                    continue
+    if scroll_direction not in {"up", "down"}:
+        raise SliceError(
+            "ORDER_DATE_SCROLL_DIRECTION_INVALID",
+            "订单日期滚动方向无效",
+            retryable=False,
+        )
+    for _ in range(max(1, int(max_scrolls))):
+        hidden_target_found = False
+        for candidate in candidates:
             try:
-                bounding = _bounding_dict(container)
-                win32.mouse_move(
-                    int(bounding["x"] + bounding["width"] / 2.0),
-                    int(bounding["y"] + bounding["height"] / 2.0),
-                    "screen",
-                    "instant",
-                    0.1,
+                target = _find_element(
+                    window,
+                    _order_picker_value_selector(
+                        column_name,
+                        candidate,
+                    ),
+                    0.4,
                 )
-                win32.mouse_wheel(direction, 1, "none", 0.1)
-                sleep(0.15)
-            except Exception:
-                break
+                if not _order_element_visible_in_container(
+                    container,
+                    target,
+                ):
+                    hidden_target_found = True
+                    break
+                _order_click_element(target)
+                sleep(0.3)
+                return
+            except SliceError:
+                continue
+        if hidden_target_found:
+            sleep(0.1)
+        try:
+            bounding = _bounding_dict(container)
+            win32.mouse_move(
+                int(bounding["x"] + bounding["width"] / 2.0),
+                int(bounding["y"] + bounding["height"] / 2.0),
+                "screen",
+                "instant",
+                0.1,
+            )
+            # The platform exposes only the selected day and about two
+            # neighbours on either side. One wheel notch advances roughly
+            # two to three days, so search again after every bounded notch.
+            win32.mouse_wheel(scroll_direction, 1, "none", 0.1)
+            sleep(0.3)
+        except Exception:
+            break
     raise SliceError(
         "ORDER_DATE_VALUE_NOT_FOUND",
         "目标订单日期不在有界日期选择范围内",
         retryable=False,
     )
+
+
+def _order_find_picker_action(window, action, timeout_seconds):
+    labels = {"confirm": "确认", "cancel": "取消"}
+    label = labels.get(action)
+    if not label:
+        raise SliceError(
+            "ORDER_DATE_PICKER_ACTION_INVALID",
+            "订单日期选择器动作无效",
+            retryable=False,
+        )
+    try:
+        button, _, _ = _find_button_by_exact_label(
+            window,
+            (label,),
+            min(float(timeout_seconds), 3.0),
+        )
+        return button
+    except SliceError:
+        pass
+    try:
+        return _find_element(
+            window,
+            _exact_acc_label_selector(
+                label,
+                "dynamic_order_picker_%s" % action,
+            ),
+            timeout_seconds,
+        )
+    except SliceError:
+        return _find_element(
+            window,
+            ORDER_DATE_PICKER_SELECTORS[action],
+            timeout_seconds,
+        )
 
 
 def _order_select_trade_date(
@@ -6738,6 +6805,9 @@ def _order_select_trade_date(
             retryable=True,
         )
     _order_click_visible_date(window, selected_date, timeout_seconds)
+    scroll_direction = (
+        "up" if requested_date < selected_date else "down"
+    )
     year = int(requested_date[:4])
     month = int(requested_date[5:7])
     day = int(requested_date[8:10])
@@ -6748,6 +6818,7 @@ def _order_select_trade_date(
             ("%d年" % year, str(year)),
             timeout_seconds,
             max_scrolls,
+            scroll_direction,
         )
         _order_select_picker_value(
             window,
@@ -6755,6 +6826,7 @@ def _order_select_trade_date(
             ("%d月" % month, "%02d月" % month, str(month), "%02d" % month),
             timeout_seconds,
             max_scrolls,
+            scroll_direction,
         )
         _order_select_picker_value(
             window,
@@ -6762,19 +6834,20 @@ def _order_select_trade_date(
             ("%d日" % day, "%02d日" % day, str(day), "%02d" % day),
             timeout_seconds,
             max_scrolls,
+            scroll_direction,
         )
-        confirm = _find_element(
+        confirm = _order_find_picker_action(
             window,
-            ORDER_DATE_PICKER_SELECTORS["confirm"],
+            "confirm",
             timeout_seconds,
         )
         _order_click_element(confirm)
         sleep(1)
     except Exception:
         try:
-            cancel = _find_element(
+            cancel = _order_find_picker_action(
                 window,
-                ORDER_DATE_PICKER_SELECTORS["cancel"],
+                "cancel",
                 1,
             )
             _order_click_element(cancel)

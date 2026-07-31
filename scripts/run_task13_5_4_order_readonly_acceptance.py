@@ -12,7 +12,7 @@ import hashlib
 import json
 import sys
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -96,6 +96,7 @@ def run_acceptance(
     runtime_db: Path,
     queue_dir: Path,
     timeout_seconds: float,
+    target_trade_date: date | None = None,
 ) -> dict[str, object]:
     now = datetime.now(timezone.utc)
     operational_time = OperationalTimeService()
@@ -194,6 +195,11 @@ def run_acceptance(
         ),
         mappings_provider=lambda: mappings,
         batch_id_factory=lambda run: f"ORDER-BATCH-{run.run_id}",
+        target_trade_date=(
+            (lambda run: target_trade_date)
+            if target_trade_date is not None
+            else (lambda run: run.platform_trade_date)
+        ),
     )
     child_context = AutomationExecutionContext(
         claim=child_claim,
@@ -240,7 +246,9 @@ def run_acceptance(
         "schema_version": "task13.5-4-order-readonly-acceptance-1.0",
         "execution_mode": "READ_ONLY",
         "platform_name": MAYI_HUATUAN_PLATFORM,
-        "platform_trade_date": time_context.platform_trade_date.isoformat(),
+        "platform_trade_date": (
+            target_trade_date or time_context.platform_trade_date
+        ).isoformat(),
         "trade_day_status": str(batch["trade_day_status"]),
         "capability_result": str(batch["capability_result"]),
         "batch_status": str(batch["batch_status"]),
@@ -264,11 +272,18 @@ def main() -> int:
     parser.add_argument("--runtime-db", required=True, type=Path)
     parser.add_argument("--queue-dir", required=True, type=Path)
     parser.add_argument("--timeout-seconds", type=float, default=330.0)
+    parser.add_argument(
+        "--target-trade-date",
+        type=date.fromisoformat,
+        default=None,
+        help="Optional current or historical platform trade date (YYYY-MM-DD)",
+    )
     args = parser.parse_args()
     result = run_acceptance(
         runtime_db=args.runtime_db,
         queue_dir=args.queue_dir,
         timeout_seconds=args.timeout_seconds,
+        target_trade_date=args.target_trade_date,
     )
     print(json.dumps(result, ensure_ascii=True, sort_keys=True))
     return 0 if (
