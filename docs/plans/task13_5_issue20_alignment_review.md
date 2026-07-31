@@ -52,8 +52,8 @@ Issue #20 的优势是业务闭环更完整，尤其补齐了：
 | 时间模型 | 18:00 平台交易日、20:00 卖家作业日；固定边界样例 | 单一可配置截单时间和 15/60 分钟窗口 | 采用双时间轴；配置只能版本化覆盖，不再把核心边界当未决项 |
 | 小扫描 | `ONLINE_PULSE`，每 10 分钟，仅上架中 | `ONLINE_DELTA` | 统一改为 `ONLINE_PULSE` |
 | 完整扫描 | `FULL_MARKET_SCAN` 父作业，下含 `LISTING_STATUS_SCAN` 与 `ORDER_SCAN → ORDER_HISTORY_IMPORT` | `FULL_OPERATIONAL` | 采用父子合同；子结果独立接受和失败 |
-| Adapter Capability | `supports_order_scan / supports_current_trade_day / supports_historical_trade_day`，子结果区分 `UNSUPPORTED / UNAVAILABLE / FAILED` | 未完整建模 | 采用 Issue 合同；当前平台为 `true / false / true` |
-| 订单页能力 | 当前交易日不可可靠读取；历史日可读 | 假定可做当前日增量同步 | 明确 `supports_current_trade_day=false`，禁止伪装实时订单 |
+| Adapter Capability | `supports_order_scan / supports_current_trade_day / supports_historical_trade_day`，子结果区分 `UNSUPPORTED / UNAVAILABLE / FAILED` | 未完整建模 | 采用 Issue 合同；2026-07-31 实测后当前平台为 `true / true / true` |
+| 订单页能力 | 当前交易日可读截至 `observed_at` 的开放快照；历史日可读 | 假定可做当前日完整增量同步 | 明确 `supports_current_trade_day=true`，但 `OPEN` 快照不得伪装成闭市完整订单或进入 `FINAL` |
 | 订单标识 | 行指纹加 `occurrence_no / occurrence_count`，不制造 canonical order ID | 哈希订单 ID、订单行 ID | 删除伪造 ID 方案，采用不可变观察批次和跨批次多重集合比较 |
 | 订单字段 | 只收页面稳定可得的非 PII 字段 | 包含支付时间、取消时间、规格、运费等候选字段 | 采用 Issue 白名单；取消量仅在页面探索证明后推导 |
 | 销售事实 | `fact_source / quality_level / summary_status` 正交；六级质量；`PROVISIONAL → OBSERVED → RECONCILED → FINAL` | 以订单日结为主 | 采用完整质量矩阵和唯一 FINAL 终态 |

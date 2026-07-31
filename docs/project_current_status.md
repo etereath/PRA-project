@@ -8,7 +8,7 @@ PRA 当前定位为：
 
 鲜切花预测性销售决策系统 + 运行态任务运营后台。
 
-PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、多商品、受控 RPA 改价与上下架闭环；任务 13.5 已插入任务 13 与任务 14 之间，用于补齐 18:00 平台交易日/20:00 卖家作业日双时间轴、持续只读扫描、历史订单观察、销售日结、S0–S4 异常治理、任务来源对齐、受控紧急保护和运营 Web 重写。当前 13.5-1 已完成双时间轴、Runtime Schema v14、六级质量约束和日结状态机；13.5-2 已通过 PR #23 合并商品映射编译、扫描 JSON 输入、任务 13 双页快照适配和 v14 商品观察导入；13.5-3 已开始实现独立 Automation Service 的计划窗口、租约、合并、补跑、父子 run、心跳和健康控制面。真实 Runtime DB 尚未迁移，`ONLINE_PULSE` 的 ShadowBot 宿主采集 handler 尚未部署，因此仍不承诺生产级无人值守写操作，也未扩展到第二平台。系统核心职责是：
+PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、多商品、受控 RPA 改价与上下架闭环；任务 13.5 已插入任务 13 与任务 14 之间，用于补齐 18:00 平台交易日/20:00 卖家作业日双时间轴、持续只读扫描、历史订单观察、销售日结、S0–S4 异常治理、任务来源对齐、受控紧急保护和运营 Web 重写。当前 13.5-1 已完成双时间轴、Runtime Schema v14、六级质量约束和日结状态机；13.5-2 已通过 PR #23 合并商品映射编译、扫描 JSON 输入、任务 13 双页快照适配和 v14 商品观察导入；13.5-3 已通过 PR #24 合并独立 Automation Service 的计划窗口、租约、合并、补跑、父子 run、心跳和健康控制面。13.5-4 已实现订单只读合同、蚂蚁花团 Adapter、平台无关 Importer、v6 ShadowBot 只读队列边界和 `FULL_MARKET_SCAN → ORDER_SCAN → ORDER_HISTORY_IMPORT` 接入；当前日按 `OPEN`、历史日按 `CLOSED`，重复订单按指纹多重集合保留。最新审查修复已增加历史目标日期 Run Event 精确冻结、Watchdog/Importer 全链路绑定、`HH:10` 完整扫描、跨 18:00 整批失败和正式 Automation Service 只读 Handler 组合。受控真实页面 READ_ONLY 已完成 2026-07-31、2026-07-30 和 2026-07-22 三日期矩阵，分别读取 3、5、4 条并完成范围/尾部验证、导入归档和零平台写副作用；日期轮已修复“隐藏日期存在于无障碍树却不在视口”的误判，从 7 月 30 日到 7 月 22 日的向上滚动以及从 7 月 22 日回到 7 月 31 日的向下滚动、确认和精确日期回读均已通过。2026-07-10 又完成 20 条历史订单 READ_ONLY：订单调用方点击新捕获的 `订单管理_容器` 右边缘空白带，共享助手发送 2 次 `END` 后验证“没有更多了”，再由 `HOME` 恢复首卡；`scroll_progress_verified=true`，订单列表真实滚动门禁已关闭。复用优先整改保留商品和订单共用的参数化列表物化助手，并以 `scroll_count / scroll_progress_verified` 独立记录滚动证据。真实 Runtime DB 因既有 `NEEDS_RECONCILIATION` 安全门禁保持未迁移、未写入订单事实，因此仍不承诺生产级无人值守写操作，也未扩展到第二平台。系统核心职责是：
 
 - 从 Excel 读取业务输入。
 - 根据规则和预测输入生成运行态任务。
@@ -26,6 +26,12 @@ PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、�
 双时间轴、六级质量、唯一 FINAL 日结状态机和 v14 兼容边界；
 [v14 实施报告](reports/task13_5_1_runtime_schema_v14.md)记录本地代码与临时数据库
 验收结果，[迁移手册](runtime_schema_v14_migration.md)负责后续真实库升级。
+[13.5-4 订单历史只读观察合同](plans/task13_5_4_order_history_observation_contract.md)
+冻结无稳定订单 ID 时的批次内多重集合语义、数据最小化、能力降级和 v6 零写边界。
+[订单页首轮无副作用探索报告](reports/task13_5_4_order_page_exploration_20260731.md)
+记录 2026-07-31 的页面事实、字段边界、候选步长和后续权威裁决。
+[13.5-4 实施报告](reports/task13_5_4_order_observation.md)记录代码、测试、迁移纠正和
+受控实机验收状态。
 
 ## 2. 当前已完成能力
 
@@ -79,6 +85,8 @@ SQLite 当前保存以下运行态表：
 - `listing_anomaly_cases`
 - `product_observation_batches`
 - `product_observation_items`
+- `order_observation_batches`
+- `order_observation_items`
 
 SQLite 只承接运行态任务系统，不替代 Excel 主数据。
 
@@ -87,10 +95,38 @@ SQLite 只承接运行态任务系统，不替代 Excel 主数据。
 `LISTING_STATUS_SCAN` 商品子结果。
 
 13.5-3 的 Automation Service 使用稳定逻辑窗口、`lease_owner + lease_version +
-lease_expires_at` fencing、邻近扫描合并和有界补跑。独立 CLI 当前明确为
-`SCHEDULER_ONLY`：缺少已验收 handler 时只记录到期账本，不启动 ShadowBot、不投递
-平台请求，也不伪造扫描成功。合同见
+lease_expires_at` fencing、邻近扫描合并和有界补跑。独立 CLI 默认保持
+`SCHEDULER_ONLY`；13.5-4 增加显式 `--enable-order-read-only` 模式，只注册完整扫描
+订单子 run 派生与 `ORDER_SCAN` 只读 Handler，不注册平台写 Handler。默认模式只记录
+到期账本，不启动 ShadowBot、不投递平台请求，也不伪造扫描成功。合同见
 [13.5-3 Automation Service 合同](plans/task13_5_3_automation_service_contract.md)。
+
+13.5-4 已实现蚂蚁花团订单只读 Adapter、平台无关订单输入与 Importer、合成 fixture、
+v6 ShadowBot 请求/结果和既有文件队列传输，并通过 Automation 父子 run 接入
+`FULL_MARKET_SCAN → ORDER_SCAN → ORDER_HISTORY_IMPORT`。当前交易日保存为
+`OPEN`，历史交易日保存为 `CLOSED`；完整有数据页要求验证滚动和“没有更多了”，
+可信空页要求“暂无订单”。平台订单 ID 和买家 PII 被合同拒绝，相同指纹的真实重复
+订单用 `occurrence_no` 保留。页面数量固定为 `order_qty`；执行端用页面单价乘数量
+计算 `order_transaction_amount`，不单独定位合计金额元素。取消推导留到 13.5-5。
+目标交易日通过唯一 `ORDER_SCAN_TARGET_SELECTED` Run Event 冻结并由 Watchdog、
+Worker 请求和 Importer 精确校验；每小时完整扫描对齐 `HH:10`，跨越 18:00 的订单
+批次整批失败。真实 Runtime DB 仍未写入订单事实，
+受控实机验收已在一次性 v14 Runtime DB 上通过：当前交易日 `OPEN` 的可信空页和
+完整有数据页均已验证，最新有数据页为 `scope_complete=true`、
+`end_marker_verified=true`，结果已导入归档且平台写操作为 0；批次仅因隔离验收使用
+空 Mapping 集合而标记 `PARTIAL / UNMAPPED`。2026-07-31 进一步完成当前日及两个
+历史日期的 3/5/4 条真实页面矩阵；从 7 月 30 日到 7 月 22 日的全自动日期轮滚动已经
+通过。7 月 10 日进一步完成 20 条历史订单读取，点击 `订单管理_容器` 右边缘后以 2 次
+`END` 验证尾部并由 `HOME` 恢复首卡，订单列表实际滚动门禁已通过。随后订单字段读取
+改为一次枚举安全等级锚点，再按列表全局 index `2/3/5/6/7`、步长 `9` 只读取允许
+字段；同一 7 月 10 日的 20 条实机回归将首末 `observed_at` 跨度由约 29 秒降至 10 秒，
+范围、尾部、Importer、归档和零平台写副作用仍全部成立。
+通用队列 Watchdog 已识别 v6 `ORDER_SCAN` Run 绑定，旧版 Result Importer 不再抢占
+订单结果，超时恢复保持 v6 零写语义。最终合并门禁又让常驻 Watchdog、验收
+Automation Run、唯一目标日期事件和订单 Importer 共用同一个一次性 v14 Runtime DB；
+Watchdog 输出精确匹配的 `READY_REQUEST_VALIDATED` 后，Worker、Importer 和 Archive
+完整通过，20 条历史订单写入隔离 DB，活动队列清空且平台写操作为 0。验收后原真实 DB
+队列服务按原参数恢复，真实 Runtime DB 仍未写入订单事实。
 
 当前代码中的 runtime schema 最新版本为 v14。v3 新增自动规则评估运行记录，v4 新增 ShadowBot Executor 账本，v5 新增队列审计字段和 `retry_authorizations`，v6 新增事务型通知 Outbox，v7-v9 建立 `listing_status` 并将业务身份统一为“平台 + 品种 + 等级”，v10 将 `tasks.expected_old_price` 结构化，v11 新增单次请求的 `shadowbot_commit_batches` 和 `shadowbot_commit_batch_items`，v12 新增逐商品操作/尝试身份、活动写锁、观察时间和持久化结果回执，v13 新增公共批次注册表、通用上下架 operation、共享写锁、v5 动作账本、两页快照和页面异常事实表，v14 新增双时间轴、Automation、不可变观察、日结、Incident 和任务来源结构。真实 Runtime DB 是否已升级必须单独核实；`app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION` 是代码版本唯一权威来源。
 
@@ -529,12 +565,15 @@ Code Review 后的高中低风险问题已完成修复，系统冒烟测试、�
     `UNMAPPED/AMBIGUOUS` 状态及候选 SKU 集合，均按 snapshot item/page 冻结并
     纳入来源/转换摘要；当前映射解析发生漂移时观察整批零写，最终覆盖还会复核
     持久化观察 SKU/映射状态与 snapshot 身份。
-    真实扫描 handler、Runtime DB 迁移和生产部署仍未执行。第五轮修复后 Automation
-    专项 `45 passed`，第五轮涉及模块 `191 passed`，完整回归为
-    `850 passed, 3 skipped, 97 subtests passed`；系统冒烟、构建、包边界、
-    secret scan、仓库外 wheel 安装和 Windows ShadowBot 静态夹具门禁均通过。
-    下一阶段边界见
-    [13.5-3 实施报告](reports/task13_5_3_automation_service.md)。
+    第六轮评审进一步把 ProductObservation 的既有事实读取与新事实写入分路：
+    终态 run 的幂等重放返回数据库保存的原批次、内容摘要和验收映射版本，不再依赖
+    当前全局映射；只有新事实才解析当前映射并要求实时 claim。PR #24 已于
+    2026-07-30 合并，合并提交为 `6d46e3f`。真实扫描 handler、Runtime DB 迁移和
+    生产部署仍未执行。最终 ProductObservation 专项 `46 passed`，完整回归为
+    `852 passed, 3 skipped, 97 subtests passed`；系统冒烟、构建、包边界、
+    secret scan、仓库外 wheel 安装、Windows ShadowBot 静态夹具和双平台 CI 门禁
+    均通过。下一阶段边界见
+    [13.5-4 订单历史只读观察合同](plans/task13_5_4_order_history_observation_contract.md)。
 4. 任务13.5通过验收后，任务14只进行多品种、多动作、异常恢复、正式授权和观察版本冻结的综合验收。普通写动作保持明确任务与授权；唯一自动写特例是验收后的版本化 `SYSTEM_EMERGENCY` 紧急下架。
 5. 任务12 PR #18 已合并；任务13也已完成 T13-0 页面探索、T13-1 合同、T13-2 Runtime Schema v13、独立两页 SYNC_STATUS、单商品状态往返、正常多商品严格串行上下架、整批预检异常零写、严格串行 UNKNOWN、最终确认点击后的 `UNKNOWN → 唯一自动 RECONCILE → VERIFIED` 和 `UNKNOWN → 唯一自动 RECONCILE → NOT_APPLIED`、`ALREADY_APPLIED` 0 写点击、跨动作共享写锁、phase/result 恢复、Web 运营投影、最终回归、PR #19 COMMENT Review 修复和双平台 CI。仓库内已保存脱敏证据、自然语言报告、数据库回读及 CI 复算入口；本轮文档整理不执行合并或任务状态变更。
 6. 继续运行系统冒烟、完整单元测试和 ShadowBot 成功基线测试，任务13.5不得重写已验证 COMMIT 动作链路。

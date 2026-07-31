@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
+from decimal import Decimal
 from pathlib import Path
 
 
@@ -59,6 +60,97 @@ def test_product_list_container_uses_dynamic_page_id_fallback():
     assert "def _find_product_list_container" in source
     assert "动态_商品管理列表容器" in source
     assert "_find_product_list_container(window, timeout_seconds)" in source
+
+
+def test_order_date_values_use_global_exact_accessibility_labels():
+    source = FLOW_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_order_picker_value_selector"
+    )
+    helper_source = ast.get_source_segment(source, helper)
+
+    assert "_exact_acc_label_selector(" in helper_source
+    assert "value[\"path\"].append" not in helper_source
+
+
+def test_order_transaction_amount_is_calculated_from_displayed_price_and_qty():
+    source = FLOW_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    calculator = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_order_calculate_transaction_amount"
+    )
+    namespace = {"Decimal": Decimal}
+    module = ast.Module(body=[calculator], type_ignores=[])
+    exec(
+        compile(ast.fix_missing_locations(module), str(FLOW_PATH), "exec"),
+        namespace,
+    )
+
+    calculate = namespace["_order_calculate_transaction_amount"]
+    assert calculate("5.50", "2") == "11.00"
+    assert calculate("3.33", "3") == "9.99"
+
+
+def test_order_reader_does_not_locate_a_separate_total_amount_element():
+    source = FLOW_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    selector = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_order_row_field_selector"
+    )
+    reader = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_order_read_rows"
+    )
+    selector_source = ast.get_source_segment(source, selector)
+    reader_source = ast.get_source_segment(source, reader)
+
+    assert '"order_transaction_amount":' not in selector_source
+    assert 'read_field("unit_price", _order_normalize_amount)' in reader_source
+    assert (
+        "_order_calculate_transaction_amount(unit_price, qty)"
+        in reader_source
+    )
+    assert "window.find_all(" in reader_source
+    assert reader_source.count("window.find_all(") == 1
+    assert "_order_row_field_selector(ordinal" not in reader_source
+    assert '"grade": 2' in reader_source
+    assert '"platform_product_name": 3' in reader_source
+    assert '"order_qty": 5' in reader_source
+    assert '"unit_price": 6' in reader_source
+    assert '"order_created_at": 7' in reader_source
+    assert "_order_indexed_children_from_grade_anchor" in reader_source
+    assert "ORDER_ROW_INDEX_STEP * (ordinal - 1)" in reader_source
+    assert "expected_anchor=grade_anchor" in reader_source
+
+
+def test_order_anchor_collection_removes_only_the_repeated_grade_index():
+    source = FLOW_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_order_row_anchor_collection_selector"
+    )
+    helper_source = ast.get_source_segment(source, helper)
+
+    assert 'ORDER_ROW_SELECTOR_TEMPLATES["grade"]' in helper_source
+    assert 'not in {"index", "acc-name", "value"}' in helper_source
+    assert 'ORDER_ROW_SELECTOR_TEMPLATES["order_qty"]' not in helper_source
+    assert 'ORDER_ROW_SELECTOR_TEMPLATES["unit_price"]' not in helper_source
+    assert 'ORDER_ROW_SELECTOR_TEMPLATES["order_created_at"]' not in helper_source
 
 
 def test_v5_waiting_row_scroll_probes_before_adaptive_keyboard_navigation():

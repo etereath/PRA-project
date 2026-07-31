@@ -22,6 +22,20 @@ _SET_OFFLINE_CONFIRMATION_RE = re.compile(
     r"^\s*您确定下架[【\[]\s*(?P<grade>.+?)\s+(?P<product_name>.+?)\s*[】\]]吗[？?]\s*$"
 )
 
+ORDER_SCAN_CONTRACT_VERSION = 6
+ORDER_SCAN_REQUEST_SCHEMA_VERSION = "shadowbot-order-scan-request-1.0"
+ORDER_SCAN_RESULT_SCHEMA_VERSION = "shadowbot-order-scan-result-1.0"
+ORDER_SCAN_DEFAULT_LIMITS = {
+    "max_rows": 500,
+    "max_scrolls": 100,
+    "max_seconds": 300,
+}
+ORDER_SCAN_HARD_LIMITS = {
+    "max_rows": 2000,
+    "max_scrolls": 500,
+    "max_seconds": 900,
+}
+
 
 def normalize_contract_text(value):
     normalized = unicodedata.normalize("NFKC", str(value or ""))
@@ -140,6 +154,153 @@ def canonical_json_bytes(payload, default=None):
 def sha256_json(payload, prefixed=True, default=None):
     digest = hashlib.sha256(canonical_json_bytes(payload, default=default)).hexdigest()
     return ("sha256:" + digest) if prefixed else digest
+
+
+def normalize_order_scan_request(request):
+    """Normalize the v6 read-only order request on both trust boundaries."""
+
+    if not isinstance(request, dict):
+        raise ValueError("ORDER_SCAN_REQUEST_INVALID")
+    if (
+        request.get("contract_version") != ORDER_SCAN_CONTRACT_VERSION
+        or request.get("schema_version")
+        != ORDER_SCAN_REQUEST_SCHEMA_VERSION
+    ):
+        raise ValueError("ORDER_SCAN_REQUEST_INVALID")
+    if str(request.get("execution_mode") or "").strip().upper() != "READ_ONLY":
+        raise ValueError("ORDER_SCAN_READ_ONLY_REQUIRED")
+    required_text = (
+        "automation_run_id",
+        "observation_batch_id",
+        "execution_attempt_id",
+        "platform_name",
+        "requested_platform_trade_date",
+        "created_at",
+        "expires_at",
+    )
+    normalized = {
+        "schema_version": ORDER_SCAN_REQUEST_SCHEMA_VERSION,
+        "contract_version": ORDER_SCAN_CONTRACT_VERSION,
+        "execution_mode": "READ_ONLY",
+    }
+    for field in required_text:
+        value = str(request.get(field) or "").strip()
+        if not value:
+            raise ValueError("ORDER_SCAN_REQUEST_INVALID")
+        normalized[field] = value
+    requested_date = normalized["requested_platform_trade_date"]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", requested_date):
+        raise ValueError("ORDER_SCAN_REQUEST_INVALID")
+    limits = request.get("limits") or {}
+    if not isinstance(limits, dict):
+        raise ValueError("ORDER_SCAN_REQUEST_INVALID")
+    normalized_limits = {}
+    for name, default in ORDER_SCAN_DEFAULT_LIMITS.items():
+        raw = limits.get(name, default)
+        if isinstance(raw, bool) or (
+            isinstance(raw, float) and not raw.is_integer()
+        ):
+            raise ValueError("ORDER_SCAN_REQUEST_INVALID")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError("ORDER_SCAN_REQUEST_INVALID") from None
+        if not 1 <= value <= ORDER_SCAN_HARD_LIMITS[name]:
+            raise ValueError("ORDER_SCAN_REQUEST_INVALID")
+        normalized_limits[name] = value
+    normalized["limits"] = normalized_limits
+    normalized["window_title"] = str(
+        request.get("window_title") or "蚂蚁花团供应商"
+    ).strip()
+    normalized["applet_uri"] = str(request.get("applet_uri") or "").strip()
+    normalized["element_timeout_seconds"] = _bounded_contract_integer(
+        request.get("element_timeout_seconds", 15),
+        minimum=1,
+        maximum=120,
+    )
+    normalized["applet_launch_timeout_seconds"] = _bounded_contract_integer(
+        request.get("applet_launch_timeout_seconds", 20),
+        minimum=1,
+        maximum=120,
+    )
+    return normalized
+
+
+def order_scan_instruction_hash(request):
+    return sha256_json(normalize_order_scan_request(request))
+
+
+def build_order_scan_failure_result(
+    request,
+    request_file_sha256,
+    *,
+    worker_id,
+    error_code,
+    error_message,
+    observed_at,
+):
+    """Build the shared v6 failure/recovery result without page facts."""
+
+    normalized = normalize_order_scan_request(request)
+    request_digest = str(request_file_sha256 or "").removeprefix("sha256:")
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", request_digest):
+        raise ValueError("ORDER_SCAN_REQUEST_INVALID")
+    failure_code = str(error_code or "WORKER_EXECUTION_FAILED")[:64]
+    failure_message = str(error_message or "")[:512]
+    return {
+        "schema_version": ORDER_SCAN_RESULT_SCHEMA_VERSION,
+        "contract_version": ORDER_SCAN_CONTRACT_VERSION,
+        "execution_attempt_id": normalized["execution_attempt_id"],
+        "automation_run_id": normalized["automation_run_id"],
+        "observation_batch_id": normalized["observation_batch_id"],
+        "execution_mode": "READ_ONLY",
+        "platform_name": normalized["platform_name"],
+        "requested_platform_trade_date": normalized[
+            "requested_platform_trade_date"
+        ],
+        "instruction_hash": request.get("instruction_hash", ""),
+        "request_file_sha256": "sha256:" + request_digest.lower(),
+        "worker_id": str(worker_id or ""),
+        "queue_phase": "RESULT_WRITTEN",
+        "worker_heartbeat_at": str(observed_at),
+        "status": "FAILED",
+        "run_success_flag": False,
+        "business_operation_completed": False,
+        "side_effect_state": "NOT_STARTED",
+        "error_code": failure_code,
+        "error_message": failure_message,
+        "retryable": False,
+        "capture": {
+            "selected_platform_trade_date": None,
+            "scan_started_at": str(observed_at),
+            "scan_completed_at": str(observed_at),
+            "loading_completed": False,
+            "scroll_completed": False,
+            "no_more_marker_visible": False,
+            "trusted_empty_marker_visible": False,
+            "page_count": 0,
+            "scroll_count": 0,
+            "scroll_progress_verified": False,
+            "rows": [],
+            "unavailable_code": "",
+            "failure_code": failure_code,
+            "failure_message": failure_message,
+        },
+    }
+
+
+def _bounded_contract_integer(value, minimum, maximum):
+    if isinstance(value, bool) or (
+        isinstance(value, float) and not value.is_integer()
+    ):
+        raise ValueError("ORDER_SCAN_REQUEST_INVALID")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("ORDER_SCAN_REQUEST_INVALID") from None
+    if not minimum <= parsed <= maximum:
+        raise ValueError("ORDER_SCAN_REQUEST_INVALID")
+    return parsed
 
 
 V4_RESULT_ITEM_FIELDS = (

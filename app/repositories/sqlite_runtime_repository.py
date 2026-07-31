@@ -1308,6 +1308,9 @@ SCHEMA_V14_SQL = [
         automation_run_id TEXT NOT NULL,
         platform_name TEXT NOT NULL,
         requested_platform_trade_date TEXT NOT NULL,
+        trade_day_status TEXT NOT NULL CHECK (trade_day_status IN (
+            'OPEN', 'CLOSED'
+        )),
         capability_result TEXT NOT NULL CHECK (capability_result IN (
             'SUCCEEDED', 'UNSUPPORTED', 'UNAVAILABLE', 'FAILED'
         )),
@@ -1345,7 +1348,14 @@ SCHEMA_V14_SQL = [
     CREATE TABLE IF NOT EXISTS order_observation_items (
         observation_item_id TEXT PRIMARY KEY,
         observation_batch_id TEXT NOT NULL,
+        platform_name TEXT NOT NULL,
         platform_trade_date TEXT NOT NULL,
+        trade_day_status TEXT NOT NULL CHECK (trade_day_status IN (
+            'OPEN', 'CLOSED'
+        )),
+        order_identity_fingerprint TEXT NOT NULL,
+        occurrence_no INTEGER NOT NULL CHECK (occurrence_no > 0),
+        order_created_at TEXT NOT NULL,
         platform_product_name TEXT NOT NULL,
         grade TEXT NOT NULL,
         internal_sku TEXT,
@@ -1353,27 +1363,19 @@ SCHEMA_V14_SQL = [
             'VERIFIED', 'UNMAPPED', 'AMBIGUOUS', 'DISABLED'
         )),
         mapping_version TEXT NOT NULL DEFAULT '',
-        order_created_at TEXT NOT NULL,
-        ordered_qty INTEGER NOT NULL CHECK (ordered_qty >= 0),
-        effective_qty INTEGER CHECK (
-            effective_qty IS NULL OR effective_qty >= 0
-        ),
-        cancelled_qty INTEGER CHECK (
-            cancelled_qty IS NULL OR cancelled_qty >= 0
-        ),
-        cancellation_derivation_method TEXT NOT NULL DEFAULT '',
-        seller_received_amount TEXT,
-        purchase_sequence INTEGER CHECK (
-            purchase_sequence IS NULL OR purchase_sequence > 0
-        ),
+        order_qty INTEGER NOT NULL CHECK (order_qty > 0),
+        order_transaction_amount TEXT NOT NULL,
         observed_at TEXT NOT NULL,
         seller_operation_date TEXT NOT NULL,
         seller_phase TEXT NOT NULL CHECK (seller_phase IN (
             'NORMAL_SALES', 'PEAK_SALES', 'DELIVERY_OVERLAP'
         )),
-        source_row_fingerprint TEXT NOT NULL,
-        occurrence_no INTEGER NOT NULL CHECK (occurrence_no > 0),
         raw_observation_sha256 TEXT NOT NULL,
+        UNIQUE(
+            observation_batch_id,
+            order_identity_fingerprint,
+            occurrence_no
+        ),
         FOREIGN KEY(observation_batch_id)
             REFERENCES order_observation_batches(observation_batch_id)
     )
@@ -1456,7 +1458,7 @@ SCHEMA_V14_SQL = [
         )),
         sold_qty INTEGER CHECK (sold_qty IS NULL OR sold_qty >= 0),
         order_count INTEGER CHECK (order_count IS NULL OR order_count >= 0),
-        seller_received_amount TEXT,
+        transaction_amount_total TEXT,
         quality_reason TEXT NOT NULL DEFAULT '',
         source_proportions_json TEXT NOT NULL DEFAULT '{}',
         input_manifest_sha256 TEXT NOT NULL,
@@ -1472,7 +1474,7 @@ SCHEMA_V14_SQL = [
                 AND quality_level = 'UNAVAILABLE'
                 AND sold_qty IS NULL
                 AND order_count IS NULL
-                AND seller_received_amount IS NULL
+                AND transaction_amount_total IS NULL
             )
             OR (
                 fact_source = 'ORDER_OBSERVED'
@@ -1570,7 +1572,7 @@ SCHEMA_V14_SQL = [
           AND NEW.summary_status IS OLD.summary_status
           AND NEW.sold_qty IS OLD.sold_qty
           AND NEW.order_count IS OLD.order_count
-          AND NEW.seller_received_amount IS OLD.seller_received_amount
+          AND NEW.transaction_amount_total IS OLD.transaction_amount_total
           AND NEW.quality_reason IS OLD.quality_reason
           AND NEW.source_proportions_json IS OLD.source_proportions_json
           AND NEW.input_manifest_sha256 IS OLD.input_manifest_sha256
@@ -2418,6 +2420,64 @@ def _requires_runtime_schema_v14_migration(
         "time_policy_version",
     }.issubset(task_columns):
         return True
+    order_batch_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(order_observation_batches)"
+        ).fetchall()
+    }
+    if "trade_day_status" not in order_batch_columns:
+        return True
+    order_item_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(order_observation_items)"
+        ).fetchall()
+    }
+    required_order_item_columns = {
+        "platform_name",
+        "platform_trade_date",
+        "trade_day_status",
+        "order_identity_fingerprint",
+        "occurrence_no",
+        "order_created_at",
+        "platform_product_name",
+        "grade",
+        "internal_sku",
+        "mapping_status",
+        "mapping_version",
+        "order_qty",
+        "order_transaction_amount",
+        "observed_at",
+        "seller_operation_date",
+        "seller_phase",
+        "raw_observation_sha256",
+    }
+    retired_order_item_columns = {
+        "ordered_qty",
+        "effective_qty",
+        "cancelled_qty",
+        "cancellation_derivation_method",
+        "seller_received_amount",
+        "purchase_sequence",
+        "source_row_fingerprint",
+    }
+    if (
+        not required_order_item_columns.issubset(order_item_columns)
+        or retired_order_item_columns.intersection(order_item_columns)
+    ):
+        return True
+    summary_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(platform_trade_day_summaries)"
+        ).fetchall()
+    }
+    if (
+        "transaction_amount_total" not in summary_columns
+        or "seller_received_amount" in summary_columns
+    ):
+        return True
     summary_input_columns = {
         str(row[1])
         for row in connection.execute(
@@ -2425,6 +2485,112 @@ def _requires_runtime_schema_v14_migration(
         ).fetchall()
     }
     return "input_manifest_sha256" not in summary_input_columns
+
+
+def _migrate_order_observation_v14_contract(
+    connection: sqlite3.Connection,
+) -> None:
+    """Replace the unused provisional v14 order shape with the frozen one."""
+
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    required_tables = {
+        "order_observation_batches",
+        "order_observation_items",
+    }
+    if not required_tables.issubset(tables):
+        return
+    batch_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(order_observation_batches)"
+        ).fetchall()
+    }
+    item_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(order_observation_items)"
+        ).fetchall()
+    }
+    already_frozen = (
+        "trade_day_status" in batch_columns
+        and {
+            "platform_name",
+            "trade_day_status",
+            "order_identity_fingerprint",
+            "order_qty",
+            "order_transaction_amount",
+        }.issubset(item_columns)
+        and not {
+            "ordered_qty",
+            "effective_qty",
+            "cancelled_qty",
+            "cancellation_derivation_method",
+            "seller_received_amount",
+            "purchase_sequence",
+            "source_row_fingerprint",
+        }.intersection(item_columns)
+    )
+    if already_frozen:
+        return
+    batch_count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM order_observation_batches"
+        ).fetchone()[0]
+    )
+    item_count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM order_observation_items"
+        ).fetchone()[0]
+    )
+    if batch_count or item_count:
+        raise RuntimeError(
+            "The provisional v14 order-observation tables contain rows; "
+            "their old amount and quantity semantics cannot be guessed"
+        )
+    connection.execute("DROP TABLE order_observation_items")
+    connection.execute("DROP TABLE order_observation_batches")
+
+
+def _migrate_trade_day_summary_transaction_amount(
+    connection: sqlite3.Connection,
+) -> None:
+    table_row = connection.execute(
+        """
+        SELECT 1
+        FROM sqlite_master
+        WHERE type = 'table'
+          AND name = 'platform_trade_day_summaries'
+        """
+    ).fetchone()
+    if table_row is None:
+        return
+    columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(platform_trade_day_summaries)"
+        ).fetchall()
+    }
+    if (
+        "seller_received_amount" in columns
+        and "transaction_amount_total" in columns
+    ):
+        raise RuntimeError(
+            "Runtime v14 must not retain two equivalent transaction "
+            "amount columns"
+        )
+    if "seller_received_amount" in columns:
+        connection.execute(
+            """
+            ALTER TABLE platform_trade_day_summaries
+            RENAME COLUMN seller_received_amount
+            TO transaction_amount_total
+            """
+        )
 
 
 def _migrate_trade_day_summary_inputs_manifest_dimension(
@@ -2750,6 +2916,8 @@ class SQLiteRuntimeRepository:
                 _migrate_trade_day_summary_inputs_manifest_dimension(
                     connection
                 )
+                _migrate_order_observation_v14_contract(connection)
+                _migrate_trade_day_summary_transaction_amount(connection)
                 connection.execute(
                     """
                     UPDATE tasks

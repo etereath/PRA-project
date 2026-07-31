@@ -14,6 +14,9 @@ from typing import Any
 from app.exceptions import ValidationError
 from app.listing_identity import listing_identity_key
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.repositories.automation_repository import (
+    read_order_scan_target_trade_date,
+)
 from app.repositories.workbook_repository import load_products
 from app.services.shadowbot_executor import (
     EXECUTION_MODE_COMMIT,
@@ -46,13 +49,80 @@ from app.services.shadowbot_listing_action_contract import (
     validate_listing_action_result,
 )
 from app.shadowbot_contract_primitives import (
+    ORDER_SCAN_CONTRACT_VERSION,
+    build_order_scan_failure_result,
     build_v4_recovery_result,
+    normalize_order_scan_request,
     sha256_json,
 )
 
 
 SUBMIT_PHASES = {"SUBMIT_INTENT_RECORDED", "SUBMIT_CLICKED"}
 PRE_SUBMIT_PHASES = {"CLAIMED", "UI_STARTED", "PRICE_VERIFIED", "TARGET_FILLED"}
+
+
+def read_checked_queue_json(
+    path: Path,
+    *,
+    max_bytes: int | None = None,
+) -> tuple[dict[str, Any], bytes]:
+    """Read one checksummed queue JSON object through the shared trust boundary."""
+
+    payload_bytes = Path(path).read_bytes()
+    if max_bytes is not None and len(payload_bytes) > int(max_bytes):
+        raise ValidationError(
+            "RESULT_CONTRACT_INVALID: queue JSON exceeds the size limit."
+        )
+    _verify_checksum(Path(path), payload_bytes)
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValidationError(
+            "RESULT_CONTRACT_INVALID: queue JSON is invalid."
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ValidationError(
+            "RESULT_CONTRACT_INVALID: queue JSON must be an object."
+        )
+    return payload, payload_bytes
+
+
+def require_fresh_running_worker(
+    queue_dir: Path,
+    *,
+    now: datetime,
+    heartbeat_max_age_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Validate the shared Worker heartbeat before publishing synchronous work."""
+
+    heartbeat_path = Path(queue_dir) / "heartbeat.json"
+    if not heartbeat_path.exists():
+        raise ValidationError("ShadowBot worker heartbeat is unavailable")
+    try:
+        payload = json.loads(
+            heartbeat_path.read_bytes().decode("utf-8-sig")
+        )
+        if not isinstance(payload, dict):
+            raise ValueError("heartbeat must be an object")
+        updated_at = datetime.fromisoformat(
+            str(payload.get("updated_at") or "").replace("Z", "+00:00")
+        )
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValidationError("ShadowBot worker heartbeat is invalid") from exc
+    if (
+        str(payload.get("status") or "") != "RUNNING"
+        or updated_at.tzinfo is None
+    ):
+        raise ValidationError("ShadowBot worker is not in RUNNING state")
+    current = now
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValidationError("worker heartbeat clock must be timezone-aware")
+    age = (
+        current.astimezone(UTC) - updated_at.astimezone(UTC)
+    ).total_seconds()
+    if age < -5 or age > float(heartbeat_max_age_seconds):
+        raise ValidationError("ShadowBot worker heartbeat is stale")
+    return payload
 
 
 def _parse_shadowbot_observed_at(value: Any) -> datetime:
@@ -165,11 +235,7 @@ class ShadowBotResultImporter:
         return events
 
     def import_one(self, result_path: Path) -> dict[str, Any]:
-        result_bytes = result_path.read_bytes()
-        _verify_checksum(result_path, result_bytes)
-        data = json.loads(result_bytes.decode("utf-8-sig"))
-        if not isinstance(data, dict):
-            raise ValidationError("RESULT_CONTRACT_INVALID: result JSON must be an object.")
+        data, result_bytes = read_checked_queue_json(result_path)
         execution_attempt_id = str(data.get("execution_attempt_id") or "").strip()
         if not execution_attempt_id:
             raise ValidationError("RESULT_CONTRACT_INVALID: execution_attempt_id is required.")
@@ -194,6 +260,13 @@ class ShadowBotResultImporter:
                 data=data,
                 result_bytes=result_bytes,
             )
+        if data.get("contract_version") == ORDER_SCAN_CONTRACT_VERSION:
+            return {
+                "status": "DEFERRED",
+                "error_code": "ORDER_RESULT_REQUIRES_AUTOMATION_IMPORTER",
+                "execution_attempt_id": execution_attempt_id,
+                "path": str(result_path),
+            }
         attempt = self.repository.get_shadowbot_execution_attempt(execution_attempt_id)
         if attempt is None:
             raise ValidationError("RESULT_CONTRACT_INVALID: execution_attempt_id does not exist.")
@@ -1147,6 +1220,7 @@ class ShadowBotQueueWatchdog:
         self.stale_seconds = stale_seconds
         self.repository = repository
         self._last_heartbeat_alert_key = ""
+        self._validated_ready_attempts: set[str] = set()
 
     def inspect(self, *, now: datetime | None = None) -> list[dict[str, Any]]:
         current = now or datetime.now(UTC)
@@ -1172,7 +1246,8 @@ class ShadowBotQueueWatchdog:
             phase_data = {
                 "request_file_sha256": (
                     "sha256:" + request_digest
-                    if request_data.get("contract_version") == 5
+                    if request_data.get("contract_version")
+                    in {5, ORDER_SCAN_CONTRACT_VERSION}
                     else request_digest
                 ),
                 "side_effect_state": SIDE_EFFECT_NOT_STARTED,
@@ -1200,17 +1275,99 @@ class ShadowBotQueueWatchdog:
             return []
         events: list[dict[str, Any]] = []
         seen: set[str] = set()
+        ready_attempts: set[str] = set()
         for request_path in sorted(self.paths.inbox.glob("*.ready.json")):
             try:
                 request = _read_json_object(request_path)
                 attempt_id = str(request.get("execution_attempt_id") or "").strip()
                 if not attempt_id:
                     raise ValidationError("ready request has no execution_attempt_id")
+                ready_attempts.add(attempt_id)
                 duplicate = attempt_id in seen or (self.paths.working / f"{attempt_id}.request.json").exists()
                 seen.add(attempt_id)
                 if duplicate:
                     reason = "DUPLICATE_READY_REQUEST"
                     target_root = self.paths.quarantine
+                elif (
+                    request.get("contract_version")
+                    == ORDER_SCAN_CONTRACT_VERSION
+                ):
+                    normalize_order_scan_request(request)
+                    with self.repository.connect_read() as connection:
+                        run = connection.execute(
+                            """
+                            SELECT job_type, run_status, platform_name,
+                                   platform_trade_date
+                            FROM automation_runs
+                            WHERE run_id = ?
+                            """,
+                            (
+                                str(
+                                    request.get("automation_run_id")
+                                    or ""
+                                ),
+                            ),
+                        ).fetchone()
+                        try:
+                            target_trade_date = (
+                                read_order_scan_target_trade_date(
+                                    connection,
+                                    str(
+                                        request.get("automation_run_id")
+                                        or ""
+                                    ),
+                                ).isoformat()
+                            )
+                        except (TypeError, ValueError):
+                            target_trade_date = ""
+                    bound = (
+                        run is not None
+                        and str(run["job_type"]) == "ORDER_SCAN"
+                        and str(run["platform_name"])
+                        == str(request.get("platform_name") or "")
+                        and target_trade_date
+                        == str(
+                            request.get(
+                                "requested_platform_trade_date"
+                            )
+                            or ""
+                        )
+                    )
+                    if not bound:
+                        reason = "ORPHAN_READY_REQUEST"
+                        target_root = self.paths.quarantine
+                    elif str(run["run_status"]) == "RUNNING":
+                        if attempt_id not in self._validated_ready_attempts:
+                            events.append(
+                                {
+                                    "status": "READY_REQUEST_VALIDATED",
+                                    "contract_version": (
+                                        ORDER_SCAN_CONTRACT_VERSION
+                                    ),
+                                    "execution_attempt_id": attempt_id,
+                                    "automation_run_id": str(
+                                        request.get("automation_run_id") or ""
+                                    ),
+                                    "requested_platform_trade_date": (
+                                        target_trade_date
+                                    ),
+                                }
+                            )
+                            self._validated_ready_attempts.add(attempt_id)
+                        continue
+                    elif str(run["run_status"]) in {
+                        "SUCCESS",
+                        "PARTIAL",
+                        "FAILED",
+                        "SKIPPED",
+                        "CANCELLED",
+                    }:
+                        reason = "STALE_TERMINAL_READY_REQUEST"
+                        target_root = self.paths.archive / attempt_id
+                        target_root.mkdir(parents=True, exist_ok=True)
+                    else:
+                        reason = "FROZEN_READY_REQUEST"
+                        target_root = self.paths.quarantine
                 elif request.get("contract_version") == 5:
                     validate_listing_action_request(request, check_expiry=False)
                     if (
@@ -1417,6 +1574,7 @@ class ShadowBotQueueWatchdog:
                         "path": str(destination),
                     }
                 )
+        self._validated_ready_attempts.intersection_update(ready_attempts)
         return events
 
     def _heartbeat_stale(self, now: datetime) -> bool:
@@ -1435,7 +1593,10 @@ class ShadowBotQueueWatchdog:
         request_path = self.paths.working / f"{execution_attempt_id}.request.json"
         request_data = _read_json_object(request_path)
         request_digest = hashlib.sha256(request_path.read_bytes()).hexdigest()
-        if request_data.get("contract_version") == 5:
+        if request_data.get("contract_version") in {
+            5,
+            ORDER_SCAN_CONTRACT_VERSION,
+        }:
             phase_data.setdefault("request_file_sha256", "sha256:" + request_digest)
         else:
             phase_data.setdefault("request_file_sha256", request_digest)
@@ -1462,6 +1623,15 @@ class ShadowBotQueueWatchdog:
             return None
         if request_data.get("contract_version") == 5:
             return self._write_v5_recovery_result(
+                request_data,
+                phase_data,
+                phase=phase,
+            )
+        if (
+            request_data.get("contract_version")
+            == ORDER_SCAN_CONTRACT_VERSION
+        ):
+            return self._write_v6_recovery_result(
                 request_data,
                 phase_data,
                 phase=phase,
@@ -1496,6 +1666,12 @@ class ShadowBotQueueWatchdog:
                 request,
                 synthetic_phase,
                 phase="CLAIMED",
+            )
+        if request.get("contract_version") == ORDER_SCAN_CONTRACT_VERSION:
+            return self._write_v6_recovery_result(
+                request,
+                phase_data,
+                phase=phase,
             )
         execution_mode = str(request.get("execution_mode") or "")
         has_submit_risk = phase in SUBMIT_PHASES or phase == "VERIFIED" or (
@@ -1539,6 +1715,31 @@ class ShadowBotQueueWatchdog:
             "ended_at": datetime.now(UTC).isoformat(),
         }
         return self._write_result(result, str(request.get("execution_attempt_id") or ""))
+
+    def _write_v6_recovery_result(
+        self,
+        request: dict[str, Any],
+        phase_data: dict[str, Any],
+        *,
+        phase: str,
+    ) -> dict[str, Any]:
+        result = build_order_scan_failure_result(
+            request,
+            str(phase_data.get("request_file_sha256") or ""),
+            worker_id=str(
+                phase_data.get("worker_id") or "watchdog:recovery"
+            ),
+            error_code="WORKER_INTERRUPTED",
+            error_message=(
+                "stale ShadowBot v6 order scan recovered at phase "
+                f"{phase}"
+            ),
+            observed_at=datetime.now(UTC).isoformat(),
+        )
+        return self._write_result(
+            result,
+            str(request.get("execution_attempt_id") or ""),
+        )
 
     def _write_v4_recovery_result(
         self,

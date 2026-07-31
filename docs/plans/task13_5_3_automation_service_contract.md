@@ -33,7 +33,7 @@ Automation UI 租约检查；为封闭自动扫描的事实提交边界，在任
 | job_id | job_type | 计划 | 优先级 | 补跑 |
 | --- | --- | --- | ---: | --- |
 | `AUTOMATION-ONLINE-PULSE-10M` | `ONLINE_PULSE` | 每 10 分钟 | 60 | 只保留最新有价值窗口 |
-| `AUTOMATION-FULL-MARKET-SCAN-HOURLY` | `FULL_MARKET_SCAN` | 每小时 | 50 | 最多执行最新窗口 |
+| `AUTOMATION-FULL-MARKET-SCAN-HOURLY` | `FULL_MARKET_SCAN` | 每小时 `HH:10` | 50 | 最多执行最新窗口；18:10 为换日关键扫描 |
 | `AUTOMATION-PRE-CUTOFF-FULL-SCAN` | `PRE_CUTOFF_FULL_SCAN` | 每日 17:55 | 30 | 超过 2 小时记 `MISSED` |
 | `AUTOMATION-POST-CUTOFF-PULSE` | `POST_CUTOFF_PULSE` | 每日 18:05 | 35 | 超过 2 小时记 `MISSED` |
 | `AUTOMATION-TRADE-DAY-SETTLEMENT` | `PLATFORM_TRADE_DAY_SETTLEMENT` | 每日 20:00 | 40 | 幂等保留最近 2 个窗口 |
@@ -72,8 +72,9 @@ job_id + scheduled_for(UTC)
 - `seller_phase`
 - `time_policy_version`
 
-10 分钟与整点窗口按 `Asia/Shanghai` 对齐。每日作业使用当地固定时间，不由脚本、
-Web 或 handler 重新计算业务日期。
+10 分钟小扫描与每小时 `HH:10` 完整扫描按 `Asia/Shanghai` 对齐。每日作业使用当地
+固定时间，不由脚本、Web 或 handler 重新计算业务日期。`PRE_CUTOFF_FULL_SCAN`
+保留商品边界扫描，但不得派生可能跨越 18:00 的 `ORDER_SCAN`。
 Automation Service 每轮从 Runtime DB 读取完整 `operational_time_policies` 生效链，
 因此跨越策略 `effective_from` 后新 run 使用新版本；既有 run 与其子 run 保留父 run
 冻结的双日期、阶段和策略版本。
@@ -83,7 +84,7 @@ Automation Service 每轮从 Runtime DB 读取完整 `operational_time_policies`
 首次启动只观察每个 job 最近一个已到期窗口，不回填历史全部窗口。已有运行记录后：
 
 - 小扫描：旧窗口记 `MISSED`，只让最新有价值窗口进入 `SCHEDULED`；
-- 小时完整扫描：旧窗口记 `MISSED`，最多补跑最新窗口；
+- `HH:10` 小时完整扫描：旧窗口记 `MISSED`，最多补跑最新窗口；
 - 17:55/18:05 边界扫描：超过两小时不再执行，明确记 `MISSED`；
 - 20:00 日结与 20:05 计划输入：幂等保留最近两个到期窗口；
 - 每 job 每周期最多物化 16 个窗口；更早窗口压缩为
@@ -272,8 +273,10 @@ data/runtime/automation_service/heartbeat.json
 - UI 阻断原因；
 - Runtime run 状态计数和过期 `RUNNING` 数量。
 
-`--once` 用于只执行一个调度周期和健康检查。13.5-3 的 CLI 运行模式明确为
-`SCHEDULER_ONLY`：只有后续阶段注册经过验收的 handler 后才会领取对应 run。
+`--once` 用于只执行一个调度周期和健康检查。CLI 默认模式为
+`SCHEDULER_ONLY`；13.5-4 可通过显式 `--enable-order-read-only` 注册
+`FULL_MARKET_SCAN` 的订单子 run 派生和 `ORDER_SCAN` 只读 Handler。该模式不得注册
+平台写 Handler，父 run 成功只表示子 run 调度完成，不声明页面事实。
 获取锁后的未处理异常必须原子写入 `FAILED` 心跳，错误文本执行与 handler 相同的路径
 脱敏；锁冲突发生在获得所有权前，因此不得覆盖现有实例的活动心跳。
 

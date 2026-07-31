@@ -92,7 +92,22 @@ UNKNOWN 后唯一 RECONCILE、写锁和审计证据等核心动作闭环。但�
 - 第二套任务表、第二套执行账本或绕过现有 service/repository 的直接写库实现。
 - 完整企业级权限系统；本任务只补充满足运营和管理员分工的最小权限边界。
 
-### 3.3 与任务 14 的边界
+### 3.3 复用优先工程门禁
+
+任务 13.5 的默认开发顺序是：原样复用 → 参数化复用 → 从成功链路抽取公共能力 →
+最后才允许新增实现。每个子任务编码前必须提交复用矩阵，列明既有入口、实机证据、
+本次最小差异、禁止重写点和确需新增项。
+
+平台专属 Adapter 可以新增页面入口、选择器、字段步长和解析器，但不得因此复制登录、
+窗口准备、列表物化、队列、租约、phase、Importer、Watchdog、写锁、终态或恢复语义。
+若既有入口无法参数化，必须先用只读证据证明不兼容，并记录替代方案比较和额外验收；
+没有评审结论不得进入 Ready for review。
+
+同一小程序宿主中的列表默认共享任务 12 已验证的“聚焦首项 → `END` → 尾部验证 →
+`HOME` → 首项恢复”控制流。单页数据、默认视口、未进入滚动分支的实机运行或 CI 通过
+不能替代该分支验收。
+
+### 3.4 与任务 14 的边界
 
 任务 13.5 完成控制服务、订单与商品观察、销售估算、日结、异常分级、紧急保护、脚本
 收口、任务来源对齐和 Web 产品化。任务 14 只负责：
@@ -201,7 +216,8 @@ Web 请求线程不得承担长期调度、循环扫描或 ShadowBot Worker 生�
 
 ### 5.3 完整扫描
 
-`FULL_MARKET_SCAN` 是通用平台父作业，默认每小时执行一次：
+`FULL_MARKET_SCAN` 是通用平台父作业，默认每小时 `HH:10` 执行一次；`18:10`
+是 18:00 换日后的关键完整扫描：
 
 ```text
 FULL_MARKET_SCAN
@@ -220,7 +236,7 @@ supports_current_trade_day
 supports_historical_trade_day
 ```
 
-当前蚂蚁花团平台为 `true / false / true`。
+当前蚂蚁花团平台为 `true / true / true`。
 
 完整扫描要求：
 
@@ -238,8 +254,11 @@ supports_historical_trade_day
 
 ### 5.4 边界扫描与日结
 
-- 18:00 前执行 `PRE_CUTOFF_FULL_SCAN`，18:00 后执行 `POST_CUTOFF_PULSE`；
-  用相邻观察证明交易日边界，跨界记录按 `observed_at` 单条归属。
+- 18:00 前执行 `PRE_CUTOFF_FULL_SCAN` 商品边界扫描，18:00 后执行
+  `POST_CUTOFF_PULSE`，并在 18:10 执行关键 `FULL_MARKET_SCAN`；截单前父任务不派生
+  订单扫描。
+- 订单批次的起止时间若跨越 18:00，必须整批失败关闭；不得按逐项
+  `observed_at` 拆分后接受为完整订单事实。
 - 20:00 执行结算作业，生成 `PROVISIONAL` 平台交易日汇总和下一销售计划输入。
 - 历史订单观察到达后按
   `PROVISIONAL → OBSERVED → RECONCILED → FINAL` 单向推进；只有 `FINAL` 是正式
@@ -254,17 +273,18 @@ supports_historical_trade_day
 
 ### 6.1 数据最小化
 
-订单管理页当前只能可靠读取前几个历史交易日，不能可靠读取当前交易日。能力合同必须
-明确记录：
+2026-07-31 首轮无副作用实测确认订单管理页可以读取当前交易日截至 `observed_at`
+的开放快照，也可以读取相邻历史交易日。能力合同必须明确记录：
 
 - `supports_order_scan=true`
-- `supports_current_trade_day=false`
+- `supports_current_trade_day=true`
 - `supports_historical_trade_day=true`
 
-系统只读取页面可访问的历史日，并明确显示当前日不可用，不能伪装成实时订单。每次读取
-写入不可变的 `order_observation_batches` 和 `order_observation_items`。页面没有稳定订单
-ID 或订单行 ID 时，使用规范化行指纹、`occurrence_no` 和 `occurrence_count` 表示
-重复行多重集：
+系统必须把 `supports_current_trade_day` 与 `OPEN / CLOSED` 或等价终态分开：
+当前开放交易日结果只是截至观察时刻的快照，不能伪装成闭市完整订单或提前进入
+`FINAL`；可信“暂无订单”空页不得写成 `UNAVAILABLE`。每次读取写入不可变的
+`order_observation_batches` 和 `order_observation_items`。页面没有稳定订单 ID 或订单行
+ID 时，使用规范化行指纹、`occurrence_no` 和 `occurrence_count` 表示重复行多重集：
 
 - `source_row_fingerprint` 只用于候选分组和完整性校验，不是 canonical ID。
 - `occurrence_no` 表示同一批次中每条相同指纹记录的实例序号。
@@ -707,12 +727,30 @@ Web 主控端以运营人员的工作问题组织页面：
 
 ### T13.5-4：订单页探索与历史观察
 
-- 无副作用探索页面，冻结能力标志、字段白名单、分页和可访问历史范围。
-- 在编码前冻结不可变订单批次、行指纹、`occurrence_no / occurrence_count`、
-  跨批次多重集合和完整批次接受规则。
-- 当前交易日不可读时明确降级，不伪造实时订单或稳定订单 ID。
+- 已完成无副作用探索并冻结
+  `supports_order_scan / supports_current_trade_day /
+  supports_historical_trade_day=true`、字段白名单、日期选择、滚动和结束标记。
+- 实现不可变订单批次、无平台订单 ID 的
+  `order_identity_fingerprint + occurrence_no` 多重集合、逐项 `observed_at`、
+  商品映射和完整批次接受规则。
+- 当前交易日只形成截至 `observed_at` 的 `OPEN` 快照；历史交易日为 `CLOSED`。
+  `OPEN` 不进入 `FINAL`。
+- 页面数量固定为 `order_qty`，页面成交金额固定为
+  `order_transaction_amount`，汇总为 `transaction_amount_total`；不得解释为卖家
+  实收、扣佣收入、退款净额或财务到账。
+- 复用 Automation 父子 run、单 Worker 文件队列、租约、checksum、phase 和归档，
+  不建立新的 R4 控制面；v6 订单请求严格为零平台写副作用。
+- 订单字段和日期控件由订单 Adapter 适配；订单列表加载、焦点、`END/HOME`、尾部验证、
+  回顶和无进展停止必须复用任务 12 的列表物化体系，优先抽取为商品与订单共用助手，
+  不得保留两套同职责控制流。
+- 13.5-4 不伪造取消行；13.5-5 才能在同平台同交易日的相邻完整快照之间按多重集合
+  减少推导取消。
 
-验收：历史日、重复行、多批次、空页、分页、部分失败和取消推导均有证据。
+验收：`OPEN/CLOSED`、重复行、精确重放、冲突、可信空页、滚动/尾标失败、日期错位、
+映射异常、错绑、事务回滚、PII 拒绝和零平台写副作用均有自动测试；Ready for review
+前另做受控真实页面 READ_ONLY。至少一个真实订单日期必须实际进入共享列表物化助手的
+滚动分支并验证焦点、`END`、尾部、`HOME` 和首项恢复；`page_count=1` 或只有日期选择器
+滚动不算通过。
 
 ### T13.5-5：销售估算、日结和计划输入
 
@@ -786,7 +824,7 @@ Web 主控端以运营人员的工作问题组织页面：
 
 - 相同订单观察行以指纹和 `occurrence_no` 保留真实实例，`occurrence_count` 可复算，
   跨批次按多重集合比较而不累加销售。
-- 当前订单页不可用时能力标志、质量和页面实际范围一致。
+- 当前开放交易日快照或请求日期真实不可用时，能力标志、终态、质量和页面实际范围一致。
 - `ORDER_OBSERVED` 与 `SCAN_ESTIMATED` 不混算。
 - `fact_source / quality_level / summary_status` 独立保存。
 - 后续历史订单按 `OBSERVED → RECONCILED → FINAL` 推进，而不是静默覆盖
@@ -821,6 +859,7 @@ Web 主控端以运营人员的工作问题组织页面：
 只有满足以下条件才开始任务 14：
 
 - [ ] 任务 12/13 黄金基线和禁止重写清单已经冻结。
+- [ ] 每个 13.5 子任务均有复用矩阵；不存在未经不兼容证据和评审批准的平行实现。
 - [ ] 双时间轴、边界归属和 schema v14 迁移通过验收。
 - [ ] `ONLINE_PULSE`、`FULL_MARKET_SCAN` 和日结具备稳定运行记录及新鲜度指标。
 - [ ] 自动任务、人工任务和系统任务具备可靠来源与策略版本。

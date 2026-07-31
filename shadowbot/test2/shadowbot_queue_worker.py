@@ -14,14 +14,19 @@ from pathlib import Path
 
 try:
     from app.shadowbot_contract_primitives import (
+        build_order_scan_failure_result,
         build_v4_recovery_result,
         canonical_positive_price,
         derive_v4_batch_semantics,
         derive_v5_batch_semantics,
+        normalize_order_scan_request,
         normalize_contract_grade,
         normalize_contract_sku,
         normalize_contract_text,
         sha256_json,
+        order_scan_instruction_hash,
+        ORDER_SCAN_CONTRACT_VERSION,
+        ORDER_SCAN_RESULT_SCHEMA_VERSION,
         v4_result_counts,
         v4_result_item_skeleton,
         v5_result_counts,
@@ -29,28 +34,38 @@ try:
 except ImportError:
     try:
         from .shadowbot_contract_primitives import (
+            build_order_scan_failure_result,
             build_v4_recovery_result,
             canonical_positive_price,
             derive_v4_batch_semantics,
             derive_v5_batch_semantics,
+            normalize_order_scan_request,
             normalize_contract_grade,
             normalize_contract_sku,
             normalize_contract_text,
             sha256_json,
+            order_scan_instruction_hash,
+            ORDER_SCAN_CONTRACT_VERSION,
+            ORDER_SCAN_RESULT_SCHEMA_VERSION,
             v4_result_counts,
             v4_result_item_skeleton,
             v5_result_counts,
         )
     except ImportError:
         from shadowbot_contract_primitives import (
+            build_order_scan_failure_result,
             build_v4_recovery_result,
             canonical_positive_price,
             derive_v4_batch_semantics,
             derive_v5_batch_semantics,
+            normalize_order_scan_request,
             normalize_contract_grade,
             normalize_contract_sku,
             normalize_contract_text,
             sha256_json,
+            order_scan_instruction_hash,
+            ORDER_SCAN_CONTRACT_VERSION,
+            ORDER_SCAN_RESULT_SCHEMA_VERSION,
             v4_result_counts,
             v4_result_item_skeleton,
             v5_result_counts,
@@ -105,6 +120,42 @@ V5_PHASE_SCHEMA_VERSION = "shadowbot-listing-action-batch-phase-1.0"
 V5_DEVELOPMENT_FAULT_INJECTIONS = frozenset(
     {"AFTER_ACTION_CLICK_UNKNOWN"}
 )
+
+
+def _v6_validate_request(request):
+    normalized = normalize_order_scan_request(request)
+    if request.get("instruction_hash") != order_scan_instruction_hash(
+        request
+    ):
+        raise ValueError("ORDER_SCAN_INSTRUCTION_HASH_MISMATCH")
+    if str(request.get("platform_name") or "") != normalized["platform_name"]:
+        raise ValueError("ORDER_SCAN_REQUEST_INVALID")
+    expires_at = datetime.fromisoformat(str(request["expires_at"]))
+    if (
+        expires_at.tzinfo is None
+        or expires_at.astimezone(timezone.utc) <= datetime.now(timezone.utc)
+    ):
+        raise ValueError("request expired")
+
+
+def _v6_failed_result(
+    request,
+    request_sha256,
+    *,
+    worker_id,
+    error_code,
+    error_message,
+):
+    return build_order_scan_failure_result(
+        request,
+        request_sha256,
+        worker_id=worker_id,
+        error_code=error_code,
+        error_message=error_message,
+        observed_at=_now_iso(),
+    )
+
+
 def _v2_normalize_text(value):
     return normalize_contract_text(value)
 
@@ -1157,6 +1208,9 @@ class QueueWorker:
         if request.get("contract_version") == V5_CONTRACT_VERSION:
             _v5_validate_request(request)
             return
+        if request.get("contract_version") == ORDER_SCAN_CONTRACT_VERSION:
+            _v6_validate_request(request)
+            return
         required = (
             "task_id",
             "operation_id",
@@ -1202,6 +1256,10 @@ class QueueWorker:
         attempt_id = str(request["execution_attempt_id"])
         is_v4 = request.get("contract_version") == V4_CONTRACT_VERSION
         is_v5 = request.get("contract_version") == V5_CONTRACT_VERSION
+        is_v6 = (
+            request.get("contract_version")
+            == ORDER_SCAN_CONTRACT_VERSION
+        )
         runtime_request = dict(request)
         runtime_request.update(
             {
@@ -1273,6 +1331,15 @@ class QueueWorker:
                     + type(exc).__name__,
                     phase_data=phase_data,
                 )
+            elif is_v6:
+                result = _v6_failed_result(
+                    request,
+                    request_sha256,
+                    worker_id=self.worker_id,
+                    error_code="WORKER_EXECUTION_FAILED",
+                    error_message="worker execution failed: "
+                    + type(exc).__name__,
+                )
             else:
                 result = {
                     "status": "FAILED",
@@ -1296,7 +1363,9 @@ class QueueWorker:
         result.update(
             {
                 "schema_version": (
-                    V5_RESULT_SCHEMA_VERSION
+                    ORDER_SCAN_RESULT_SCHEMA_VERSION
+                    if is_v6
+                    else V5_RESULT_SCHEMA_VERSION
                     if is_v5
                     else V4_RESULT_SCHEMA_VERSION
                     if is_v4
@@ -1308,14 +1377,16 @@ class QueueWorker:
                 "execution_mode": request["execution_mode"],
                 "instruction_hash": request["instruction_hash"],
                 "request_file_sha256": (
-                    "sha256:" + request_sha256 if is_v5 else request_sha256
+                    "sha256:" + request_sha256
+                    if is_v5 or is_v6
+                    else request_sha256
                 ),
                 "worker_id": self.worker_id,
                 "queue_phase": "RESULT_WRITTEN",
                 "worker_heartbeat_at": _now_iso(),
             }
         )
-        if not is_v5:
+        if not is_v5 and not is_v6:
             result["task_id"] = request["task_id"]
             result["operation_id"] = request["operation_id"]
         if request.get("contract_version") == V2_CONTRACT_VERSION:
@@ -1337,6 +1408,25 @@ class QueueWorker:
                     "action_type": request.get("action_type", ""),
                     "batch_id": request.get("batch_id", ""),
                     "manifest_sha256": request.get("manifest_sha256", ""),
+                }
+            )
+        if is_v6:
+            result.update(
+                {
+                    "contract_version": ORDER_SCAN_CONTRACT_VERSION,
+                    "automation_run_id": request.get(
+                        "automation_run_id",
+                        "",
+                    ),
+                    "observation_batch_id": request.get(
+                        "observation_batch_id",
+                        "",
+                    ),
+                    "platform_name": request.get("platform_name", ""),
+                    "requested_platform_trade_date": request.get(
+                        "requested_platform_trade_date",
+                        "",
+                    ),
                 }
             )
         if not result.get("result_id"):
@@ -1453,6 +1543,19 @@ class QueueWorker:
             }
             result["result_id"] = "RESULT-" + hashlib.sha256(_json_bytes(result)).hexdigest()[:24]
             content = _json_bytes(result)
+        if is_v6 and len(content) > V2_MAX_RESULT_BYTES:
+            result = _v6_failed_result(
+                request,
+                request_sha256,
+                worker_id=self.worker_id,
+                error_code="ORDER_RESULT_TOO_LARGE",
+                error_message="order result exceeds 4 MiB contract limit",
+            )
+            result["result_id"] = (
+                "RESULT-"
+                + hashlib.sha256(_json_bytes(result)).hexdigest()[:24]
+            )
+            content = _json_bytes(result)
         _atomic_write(result_path.with_suffix(result_path.suffix + ".sha256"), (hashlib.sha256(content).hexdigest() + "\n").encode("ascii"))
         _atomic_write(result_path, content)
         self._write_phase(
@@ -1542,6 +1645,30 @@ class QueueWorker:
             )
             if isinstance(result_snapshot, dict):
                 payload["batch_result_snapshot"] = result_snapshot
+        if (
+            request.get("contract_version")
+            == ORDER_SCAN_CONTRACT_VERSION
+        ):
+            payload.update(
+                {
+                    "schema_version": (
+                        "shadowbot-order-scan-phase-1.0"
+                    ),
+                    "contract_version": ORDER_SCAN_CONTRACT_VERSION,
+                    "automation_run_id": request.get(
+                        "automation_run_id",
+                        "",
+                    ),
+                    "observation_batch_id": request.get(
+                        "observation_batch_id",
+                        "",
+                    ),
+                    "requested_platform_trade_date": request.get(
+                        "requested_platform_trade_date",
+                        "",
+                    ),
+                }
+            )
         _atomic_write(phase_path, _json_bytes(payload))
 
     def _write_rejected_request_result(
@@ -1572,6 +1699,38 @@ class QueueWorker:
             _atomic_write(
                 result_path.with_suffix(result_path.suffix + ".sha256"),
                 (hashlib.sha256(content).hexdigest() + "\n").encode("ascii"),
+            )
+            _atomic_write(result_path, content)
+            self._write_phase(
+                request,
+                phase_path,
+                "RESULT_WRITTEN",
+                "NOT_STARTED",
+                request_sha256,
+            )
+            return
+        if (
+            request.get("contract_version")
+            == ORDER_SCAN_CONTRACT_VERSION
+        ):
+            result = _v6_failed_result(
+                request,
+                request_sha256,
+                worker_id=self.worker_id,
+                error_code=error_code,
+                error_message=error_message,
+            )
+            result_path = self.results / (
+                attempt_id + ".result.json"
+            )
+            content = _json_bytes(result)
+            _atomic_write(
+                result_path.with_suffix(
+                    result_path.suffix + ".sha256"
+                ),
+                (
+                    hashlib.sha256(content).hexdigest() + "\n"
+                ).encode("ascii"),
             )
             _atomic_write(result_path, content)
             self._write_phase(

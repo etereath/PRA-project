@@ -38,7 +38,7 @@ class PlatformTradeDaySummary:
     summary_status: SummaryStatus
     sold_qty: int | None
     order_count: int | None
-    seller_received_amount: Decimal | None
+    transaction_amount_total: Decimal | None
     quality_reason: str
     source_proportions: dict[str, Any]
     input_manifest_sha256: str

@@ -15,6 +15,9 @@
 - [reports/task13_5_1_runtime_schema_v14.md](reports/task13_5_1_runtime_schema_v14.md)：任务13.5-1 双时间轴、Runtime Schema v14、迁移兼容、质量约束、日结版本状态机和本地验收结果。
 - [runtime_schema_v14_migration.md](runtime_schema_v14_migration.md)：真实 Runtime DB 的备份、副本迁移、健康检查、切换和回滚门禁。
 - [plans/task13_5_2_mapping_and_scan_input_contract.md](plans/task13_5_2_mapping_and_scan_input_contract.md)：任务13.5-2 商品映射、ONLINE_PULSE、FULL_MARKET_SCAN 商品子结果和 v14 不可变观察输入合同。
+- [plans/task13_5_4_order_history_observation_contract.md](plans/task13_5_4_order_history_observation_contract.md)：任务13.5-4 订单字段、`OPEN/CLOSED`、多重集合、完整性、Importer 和 v6 零写合同。
+- [reports/task13_5_4_order_page_exploration_20260731.md](reports/task13_5_4_order_page_exploration_20260731.md)：蚂蚁花团订单页无副作用探索、元素步长和数据最小化证据。
+- [reports/task13_5_4_order_observation.md](reports/task13_5_4_order_observation.md)：任务13.5-4 实施、测试、迁移纠正和实机验收报告。
 - [plans/task13_5_operational_closed_loop_and_web_rewrite.md](plans/task13_5_operational_closed_loop_and_web_rewrite.md)：任务13.5双时间轴、自动扫描、历史订单观察、销售日结、S0–S4、受控紧急保护、任务来源对齐和Web主控重写实施计划。
 - [plans/task13_5_web_current_state_audit_20260729.md](plans/task13_5_web_current_state_audit_20260729.md)：带精确时间、main SHA、Runtime DB脱敏快照、浏览器/视口/角色、路由、页面规模和DOM hash的独立Web现状审计。
 - [reports/task12_review_remediation_20260723.md](reports/task12_review_remediation_20260723.md)：针对任务12审查问题的接续修复记录；以该文档说明 v12 合同、原子导入和待补实机证据，不覆盖原交接报告。
