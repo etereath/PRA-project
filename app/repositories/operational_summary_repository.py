@@ -24,6 +24,7 @@ from app.sales_settlement_models import (
     InventoryObservationPoint,
     OrderSnapshot,
     OrderSnapshotItem,
+    ProductScanExecution,
     SalesEstimateSegment,
 )
 
@@ -37,31 +38,40 @@ class OperationalSummaryRepository:
     def get_summary(
         self,
         summary_id: str,
+        *,
+        connection=None,
     ) -> PlatformTradeDaySummary | None:
-        with closing(self.runtime_repository.connect_read()) as connection:
-            row = connection.execute(
-                """
-                SELECT *
-                FROM platform_trade_day_summaries
-                WHERE summary_id = ?
-                """,
-                (summary_id,),
-            ).fetchone()
+        query = """
+            SELECT *
+            FROM platform_trade_day_summaries
+            WHERE summary_id = ?
+        """
+        if connection is not None:
+            row = connection.execute(query, (summary_id,)).fetchone()
+        else:
+            with closing(self.runtime_repository.connect_read()) as read_connection:
+                row = read_connection.execute(query, (summary_id,)).fetchone()
         return _row_to_summary(row) if row is not None else None
 
     def get_current_summary(
         self,
         summary_series_id: str,
+        *,
+        connection=None,
     ) -> PlatformTradeDaySummary | None:
-        with closing(self.runtime_repository.connect_read()) as connection:
-            row = connection.execute(
-                """
-                SELECT *
-                FROM platform_trade_day_summaries
-                WHERE summary_series_id = ? AND is_current = 1
-                """,
-                (summary_series_id,),
-            ).fetchone()
+        query = """
+            SELECT *
+            FROM platform_trade_day_summaries
+            WHERE summary_series_id = ? AND is_current = 1
+        """
+        if connection is not None:
+            row = connection.execute(query, (summary_series_id,)).fetchone()
+        else:
+            with closing(self.runtime_repository.connect_read()) as read_connection:
+                row = read_connection.execute(
+                    query,
+                    (summary_series_id,),
+                ).fetchone()
         return _row_to_summary(row) if row is not None else None
 
     def list_events(self, summary_id: str) -> list[TradeDaySummaryEvent]:
@@ -131,6 +141,86 @@ class OperationalSummaryRepository:
             ).fetchall()
         return tuple(_row_to_inventory_observation(row) for row in rows)
 
+    def list_inventory_observations_for_seller_operation_date(
+        self,
+        *,
+        platform_name: str,
+        seller_operation_date: date,
+    ) -> tuple[InventoryObservationPoint, ...]:
+        with closing(self.runtime_repository.connect_read()) as connection:
+            rows = connection.execute(
+                """
+                SELECT items.*, batches.platform_name,
+                       batches.scan_type, batches.batch_status,
+                       batches.scope_complete,
+                       batches.end_marker_verified,
+                       batches.content_sha256
+                FROM product_observation_items AS items
+                INNER JOIN product_observation_batches AS batches
+                    ON batches.observation_batch_id
+                       = items.observation_batch_id
+                WHERE batches.platform_name = ?
+                  AND items.seller_operation_date = ?
+                ORDER BY items.internal_sku ASC,
+                         items.observed_at ASC,
+                         items.observation_item_id ASC
+                """,
+                (platform_name, seller_operation_date.isoformat()),
+            ).fetchall()
+        return tuple(_row_to_inventory_observation(row) for row in rows)
+
+    def list_product_scan_executions(
+        self,
+        *,
+        platform_name: str,
+        platform_trade_date: date,
+    ) -> tuple[ProductScanExecution, ...]:
+        with closing(self.runtime_repository.connect_read()) as connection:
+            rows = connection.execute(
+                """
+                SELECT runs.run_id, runs.run_status, runs.scheduled_for,
+                       batches.observation_batch_id,
+                       batches.batch_status,
+                       batches.scan_started_at,
+                       batches.scan_completed_at,
+                       batches.scope_complete,
+                       batches.end_marker_verified
+                FROM automation_runs AS runs
+                LEFT JOIN product_observation_batches AS batches
+                    ON batches.automation_run_id = runs.run_id
+                WHERE runs.platform_name = ?
+                  AND runs.platform_trade_date = ?
+                  AND runs.job_type IN ('ONLINE_PULSE', 'LISTING_STATUS_SCAN')
+                ORDER BY runs.scheduled_for, runs.run_id
+                """,
+                (platform_name, platform_trade_date.isoformat()),
+            ).fetchall()
+        return tuple(
+            ProductScanExecution(
+                automation_run_id=str(row["run_id"]),
+                observation_batch_id=(
+                    str(row["observation_batch_id"])
+                    if row["observation_batch_id"] not in (None, "")
+                    else None
+                ),
+                run_status=str(row["run_status"]),
+                batch_status=(
+                    str(row["batch_status"])
+                    if row["batch_status"] not in (None, "")
+                    else None
+                ),
+                scan_started_at=_required_datetime(
+                    row["scan_started_at"] or row["scheduled_for"]
+                ),
+                scan_completed_at=_required_datetime(
+                    row["scan_completed_at"] or row["scheduled_for"]
+                ),
+                scope_complete=bool(row["scope_complete"]),
+                end_marker_verified=bool(row["end_marker_verified"]),
+            )
+            for row in rows
+        )
+
     def list_inventory_adjustment_sources(
         self,
         *,
@@ -173,21 +263,29 @@ class OperationalSummaryRepository:
                   AND review_status IN ('approved', 'adjusted')
                   AND platform_name = ?
                   AND internal_sku = ?
-                  AND julianday(resolved_at) > julianday(?)
-                  AND julianday(resolved_at) <= julianday(?)
                 ORDER BY review_task_id
                 """,
                 (
                     platform_name,
                     internal_sku,
-                    _datetime_to_text(interval_started_at),
-                    _datetime_to_text(interval_ended_at),
                 ),
             ).fetchall()
         refs = list(_listing_adjustment_refs(action_rows))
         refs.extend(
-            _review_adjustment_ref(row)
+            ref
             for row in review_rows
+            if _review_covers_interval(
+                row,
+                interval_started_at=interval_started_at,
+                interval_ended_at=interval_ended_at,
+            )
+            for ref in (
+                _review_adjustment_ref(
+                    row,
+                    interval_started_at=interval_started_at,
+                    interval_ended_at=interval_ended_at,
+                ),
+            )
         )
         return tuple(
             sorted(
@@ -217,8 +315,11 @@ class OperationalSummaryRepository:
                     ON batches.batch_id = items.batch_id
                 WHERE batches.platform_name = ?
                   AND items.internal_sku = ?
-                  AND julianday(items.updated_at) > julianday(?)
-                  AND julianday(items.updated_at) <= julianday(?)
+                  AND julianday(COALESCE(
+                        items.detail_save_clicked_at,
+                        items.action_clicked_at,
+                        batches.created_at
+                      )) <= julianday(?)
                   AND (
                         items.operation_result IN (
                             'PARTIALLY_APPLIED', 'NEEDS_RECONCILIATION'
@@ -231,7 +332,6 @@ class OperationalSummaryRepository:
                 (
                     platform_name,
                     internal_sku,
-                    _datetime_to_text(interval_started_at),
                     _datetime_to_text(interval_ended_at),
                 ),
             ).fetchone()
@@ -298,6 +398,7 @@ class OperationalSummaryRepository:
         platform_name: str,
         platform_trade_date: date,
         internal_sku: str | None = None,
+        connection=None,
     ) -> tuple[SalesEstimateSegment, ...]:
         query = """
             SELECT *
@@ -312,8 +413,11 @@ class OperationalSummaryRepository:
             query += " AND internal_sku = ?"
             values.append(internal_sku)
         query += " ORDER BY interval_started_at, internal_sku, estimate_segment_id"
-        with closing(self.runtime_repository.connect_read()) as connection:
+        if connection is not None:
             rows = connection.execute(query, tuple(values)).fetchall()
+        else:
+            with closing(self.runtime_repository.connect_read()) as read_connection:
+                rows = read_connection.execute(query, tuple(values)).fetchall()
         return tuple(_row_to_estimate_segment(row) for row in rows)
 
     def list_order_snapshots(
@@ -321,10 +425,17 @@ class OperationalSummaryRepository:
         *,
         platform_name: str,
         platform_trade_date: date,
+        connection=None,
     ) -> tuple[OrderSnapshot, ...]:
-        with closing(self.runtime_repository.connect_read()) as connection:
+        if connection is not None:
             return _list_order_snapshots_in_connection(
                 connection,
+                platform_name=platform_name,
+                platform_trade_date=platform_trade_date,
+            )
+        with closing(self.runtime_repository.connect_read()) as read_connection:
+            return _list_order_snapshots_in_connection(
+                read_connection,
                 platform_name=platform_name,
                 platform_trade_date=platform_trade_date,
             )
@@ -370,19 +481,24 @@ class OperationalSummaryRepository:
         self,
         *,
         platform_name: str,
+        connection=None,
     ) -> dict[str, dict[str, str]]:
-        with closing(self.runtime_repository.connect_read()) as connection:
-            rows = connection.execute(
-                """
-                SELECT internal_sku, variety, grade
-                FROM listing_status
-                WHERE platform_name = ?
-                  AND internal_sku IS NOT NULL
-                  AND internal_sku <> ''
-                ORDER BY internal_sku, variety, grade
-                """,
-                (platform_name,),
-            ).fetchall()
+        query = """
+            SELECT internal_sku, variety, grade
+            FROM listing_status
+            WHERE platform_name = ?
+              AND internal_sku IS NOT NULL
+              AND internal_sku <> ''
+            ORDER BY internal_sku, variety, grade
+        """
+        if connection is not None:
+            rows = connection.execute(query, (platform_name,)).fetchall()
+        else:
+            with closing(self.runtime_repository.connect_read()) as read_connection:
+                rows = read_connection.execute(
+                    query,
+                    (platform_name,),
+                ).fetchall()
         dimensions: dict[str, dict[str, str]] = {}
         for row in rows:
             sku = str(row["internal_sku"])
@@ -402,37 +518,29 @@ class OperationalSummaryRepository:
         event: TradeDaySummaryEvent,
         inputs: Iterable[TradeDaySummaryInput],
         transaction_validator: Callable[[object], None] | None = None,
+        connection=None,
     ) -> None:
         input_rows = tuple(inputs)
-        with closing(self.runtime_repository.connect_write()) as connection:
+        if connection is not None:
+            if transaction_validator is not None:
+                transaction_validator(connection)
+            _insert_initial_rows(connection, summary, event, input_rows)
+            return
+        with closing(self.runtime_repository.connect_write()) as write_connection:
             try:
-                connection.execute("BEGIN IMMEDIATE")
+                write_connection.execute("BEGIN IMMEDIATE")
                 if transaction_validator is not None:
-                    transaction_validator(connection)
-                existing = connection.execute(
-                    """
-                    SELECT summary_id
-                    FROM platform_trade_day_summaries
-                    WHERE summary_series_id = ? AND is_current = 1
-                    """,
-                    (summary.summary_series_id,),
-                ).fetchone()
-                if existing is not None:
-                    raise ValueError(
-                        "A current summary already exists for the series"
-                    )
-                _insert_summary(connection, summary)
-                _insert_summary_inputs(
-                    connection,
-                    summary.summary_id,
-                    summary.input_manifest_sha256,
+                    transaction_validator(write_connection)
+                _insert_initial_rows(
+                    write_connection,
+                    summary,
+                    event,
                     input_rows,
                 )
-                _insert_event(connection, event)
-                connection.commit()
+                write_connection.commit()
             except Exception:
-                if connection.in_transaction:
-                    connection.rollback()
+                if write_connection.in_transaction:
+                    write_connection.rollback()
                 raise
 
     def transition(
@@ -444,98 +552,43 @@ class OperationalSummaryRepository:
         inputs: Iterable[TradeDaySummaryInput],
         finalization_validator: Callable[[object], None] | None = None,
         transaction_validator: Callable[[object], None] | None = None,
+        connection=None,
     ) -> bool:
         input_rows = tuple(inputs)
+        if connection is not None:
+            if transaction_validator is not None:
+                transaction_validator(connection)
+            return _transition_rows(
+                connection,
+                before=before,
+                after=after,
+                event=event,
+                input_rows=input_rows,
+                finalization_validator=finalization_validator,
+            )
         with closing(
             self.runtime_repository.connect_write()
-        ) as connection:
+        ) as write_connection:
             try:
-                connection.execute("BEGIN IMMEDIATE")
+                write_connection.execute("BEGIN IMMEDIATE")
                 if transaction_validator is not None:
-                    transaction_validator(connection)
-                if after.summary_status is SummaryStatus.FINAL:
-                    if finalization_validator is None:
-                        raise ValueError(
-                            "FINAL requires an atomic evidence validator"
-                        )
-                    finalization_validator(connection)
-                    blocking_count = int(
-                        connection.execute(
-                            """
-                            SELECT COUNT(*)
-                            FROM operational_incidents
-                            WHERE source_type = 'TRADE_DAY_SUMMARY'
-                              AND source_ref_id = ?
-                              AND blocks_finalization = 1
-                              AND resolved_at IS NULL
-                            """,
-                            (before.summary_id,),
-                        ).fetchone()[0]
-                    )
-                    if blocking_count:
-                        raise ValueError(
-                            "Cannot finalize while blocking S3/S4 "
-                            "incidents remain open"
-                        )
-                cursor = connection.execute(
-                    """
-                    UPDATE platform_trade_day_summaries
-                    SET fact_source = ?,
-                        quality_level = ?,
-                        summary_status = ?,
-                        sold_qty = ?,
-                        order_count = ?,
-                        transaction_amount_total = ?,
-                        quality_reason = ?,
-                        source_proportions_json = ?,
-                        input_manifest_sha256 = ?,
-                        mapping_version = ?,
-                        algorithm_version = ?,
-                        finalized_at = ?,
-                        updated_at = ?
-                    WHERE summary_id = ?
-                      AND summary_status = ?
-                      AND input_manifest_sha256 = ?
-                      AND is_current = 1
-                    """,
-                    (
-                        (
-                            after.fact_source.value
-                            if after.fact_source
-                            else None
-                        ),
-                        after.quality_level.value,
-                        after.summary_status.value,
-                        after.sold_qty,
-                        after.order_count,
-                        _decimal_to_text(after.transaction_amount_total),
-                        after.quality_reason,
-                        _json_dump(after.source_proportions),
-                        after.input_manifest_sha256,
-                        after.mapping_version,
-                        after.algorithm_version,
-                        _datetime_to_text(after.finalized_at),
-                        _datetime_to_text(after.updated_at),
-                        before.summary_id,
-                        before.summary_status.value,
-                        before.input_manifest_sha256,
-                    ),
+                    transaction_validator(write_connection)
+                changed = _transition_rows(
+                    write_connection,
+                    before=before,
+                    after=after,
+                    event=event,
+                    input_rows=input_rows,
+                    finalization_validator=finalization_validator,
                 )
-                if cursor.rowcount != 1:
-                    connection.rollback()
+                if not changed:
+                    write_connection.rollback()
                     return False
-                _insert_summary_inputs(
-                    connection,
-                    after.summary_id,
-                    after.input_manifest_sha256,
-                    input_rows,
-                )
-                _insert_event(connection, event)
-                connection.commit()
+                write_connection.commit()
                 return True
             except Exception:
-                if connection.in_transaction:
-                    connection.rollback()
+                if write_connection.in_transaction:
+                    write_connection.rollback()
                 raise
 
     def insert_revision(
@@ -613,6 +666,11 @@ def _row_to_inventory_observation(row) -> InventoryObservationPoint:
             str(row["platform_trade_date"])
         ),
         observed_at=_required_datetime(row["observed_at"]),
+        observed_price=(
+            Decimal(str(row["observed_price"]))
+            if row["observed_price"] not in (None, "")
+            else None
+        ),
         observed_inventory=(int(inventory) if inventory is not None else None),
         observed_online=bool(row["observed_online"]),
         mapping_status=ProductMappingStatus(str(row["mapping_status"])),
@@ -668,7 +726,12 @@ def _listing_adjustment_refs(rows) -> tuple[InventoryAdjustmentSourceRef, ...]:
     return tuple(refs)
 
 
-def _review_adjustment_ref(row) -> InventoryAdjustmentSourceRef:
+def _review_adjustment_ref(
+    row,
+    *,
+    interval_started_at: datetime | None = None,
+    interval_ended_at: datetime | None = None,
+) -> InventoryAdjustmentSourceRef:
     payload = json.loads(str(row["resolution_payload_json"] or "{}"))
     if (
         not isinstance(payload, dict)
@@ -700,13 +763,46 @@ def _review_adjustment_ref(row) -> InventoryAdjustmentSourceRef:
     adjustment_id = str(payload.get("adjustment_id") or "").strip()
     if not adjustment_id:
         raise ValueError("Inventory adjustment review adjustment_id is blank")
+    occurred_at = _required_datetime(payload.get("occurred_at"))
+    if (
+        interval_started_at is not None
+        and interval_ended_at is not None
+        and not interval_started_at < occurred_at <= interval_ended_at
+    ):
+        occurred_at = interval_ended_at
     return InventoryAdjustmentSourceRef(
         adjustment_id=adjustment_id,
         source_type=source_type,
         source_ref_id=str(row["review_task_id"]),
         adjustment_qty=adjustment_qty,
-        occurred_at=_required_datetime(payload.get("occurred_at")),
+        occurred_at=occurred_at,
         evidence_sha256=_prefixed_sha256(payload.get("evidence_sha256")),
+    )
+
+
+def _review_covers_interval(
+    row,
+    *,
+    interval_started_at: datetime,
+    interval_ended_at: datetime,
+) -> bool:
+    payload = json.loads(str(row["resolution_payload_json"] or "{}"))
+    if not isinstance(payload, dict):
+        return False
+    occurred_at = _required_datetime(payload.get("occurred_at"))
+    if interval_started_at < occurred_at <= interval_ended_at:
+        return True
+    coverage_started = payload.get("coverage_started_at")
+    coverage_ended = payload.get("coverage_ended_at")
+    if coverage_started in (None, "") or coverage_ended in (None, ""):
+        return False
+    coverage_start = _required_datetime(coverage_started)
+    coverage_end = _required_datetime(coverage_ended)
+    if coverage_end <= coverage_start:
+        raise ValueError("Inventory adjustment review coverage is invalid")
+    return (
+        coverage_start <= interval_started_at
+        and coverage_end >= interval_ended_at
     )
 
 
@@ -914,6 +1010,114 @@ def _row_to_order_snapshot_item(row) -> OrderSnapshotItem:
         ),
         raw_observation_sha256=str(row["raw_observation_sha256"]),
     )
+
+
+def _insert_initial_rows(
+    connection,
+    summary: PlatformTradeDaySummary,
+    event: TradeDaySummaryEvent,
+    input_rows: tuple[TradeDaySummaryInput, ...],
+) -> None:
+    existing = connection.execute(
+        """
+        SELECT summary_id
+        FROM platform_trade_day_summaries
+        WHERE summary_series_id = ? AND is_current = 1
+        """,
+        (summary.summary_series_id,),
+    ).fetchone()
+    if existing is not None:
+        raise ValueError("A current summary already exists for the series")
+    _insert_summary(connection, summary)
+    _insert_summary_inputs(
+        connection,
+        summary.summary_id,
+        summary.input_manifest_sha256,
+        input_rows,
+    )
+    _insert_event(connection, event)
+
+
+def _transition_rows(
+    connection,
+    *,
+    before: PlatformTradeDaySummary,
+    after: PlatformTradeDaySummary,
+    event: TradeDaySummaryEvent,
+    input_rows: tuple[TradeDaySummaryInput, ...],
+    finalization_validator: Callable[[object], None] | None,
+) -> bool:
+    if after.summary_status is SummaryStatus.FINAL:
+        if finalization_validator is None:
+            raise ValueError("FINAL requires an atomic evidence validator")
+        finalization_validator(connection)
+        blocking_count = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM operational_incidents
+                WHERE source_type = 'TRADE_DAY_SUMMARY'
+                  AND source_ref_id = ?
+                  AND blocks_finalization = 1
+                  AND resolved_at IS NULL
+                """,
+                (before.summary_id,),
+            ).fetchone()[0]
+        )
+        if blocking_count:
+            raise ValueError(
+                "Cannot finalize while blocking S3/S4 incidents remain open"
+            )
+    cursor = connection.execute(
+        """
+        UPDATE platform_trade_day_summaries
+        SET fact_source = ?,
+            quality_level = ?,
+            summary_status = ?,
+            sold_qty = ?,
+            order_count = ?,
+            transaction_amount_total = ?,
+            quality_reason = ?,
+            source_proportions_json = ?,
+            input_manifest_sha256 = ?,
+            mapping_version = ?,
+            algorithm_version = ?,
+            finalized_at = ?,
+            updated_at = ?
+        WHERE summary_id = ?
+          AND summary_status = ?
+          AND input_manifest_sha256 = ?
+          AND is_current = 1
+        """,
+        (
+            after.fact_source.value if after.fact_source else None,
+            after.quality_level.value,
+            after.summary_status.value,
+            after.sold_qty,
+            after.order_count,
+            _decimal_to_text(after.transaction_amount_total),
+            after.quality_reason,
+            _json_dump(after.source_proportions),
+            after.input_manifest_sha256,
+            after.mapping_version,
+            after.algorithm_version,
+            _datetime_to_text(after.finalized_at),
+            _datetime_to_text(after.updated_at),
+            before.summary_id,
+            before.summary_status.value,
+            before.input_manifest_sha256,
+        ),
+    )
+    if cursor.rowcount != 1:
+        return False
+    _insert_summary_inputs(
+        connection,
+        after.summary_id,
+        after.input_manifest_sha256,
+        input_rows,
+    )
+    _insert_event(connection, event)
+    return True
 
 
 def _insert_summary(connection, summary: PlatformTradeDaySummary) -> None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timezone
+from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
 from typing import Iterable, Mapping
 from zoneinfo import ZoneInfo
@@ -33,6 +33,9 @@ class SalesFactSelectionService:
         order_snapshots: Iterable[OrderSnapshot],
         estimate_segments: Iterable[SalesEstimateSegment],
         sku_dimensions: Mapping[str, Mapping[str, str]] | None = None,
+        estimate_algorithm_version: str | None = None,
+        coverage_started_at: datetime | None = None,
+        coverage_ended_at: datetime | None = None,
     ) -> SalesFactSelection:
         scope = scope_type.strip().upper()
         if scope not in SUPPORTED_SCOPE_TYPES:
@@ -71,21 +74,60 @@ class SalesFactSelectionService:
                 sku_dimensions=dimensions,
             )
 
-        selected_segments = tuple(
+        scope_segments = tuple(
             segment
             for segment in estimate_segments
             if segment.platform_name == platform_name
             and segment.platform_trade_date == platform_trade_date
-            and segment.estimation_eligible
-            and segment.estimated_sold_qty is not None
             and _segment_in_scope(
                 segment,
                 scope_type=scope,
                 scope_key=key,
                 sku_dimensions=dimensions,
+                platform_trade_date=platform_trade_date,
             )
         )
-        if selected_segments and not _segments_overlap(selected_segments):
+        chosen_algorithm = (
+            str(estimate_algorithm_version).strip()
+            if estimate_algorithm_version is not None
+            else _latest_algorithm_version(scope_segments)
+        )
+        selected_segments = tuple(
+            segment
+            for segment in scope_segments
+            if segment.algorithm_version == chosen_algorithm
+        )
+        if scope == "TIME_BUCKET":
+            bucket_start, bucket_end = _time_bucket_window(
+                platform_trade_date,
+                key,
+            )
+            coverage_started_at = bucket_start
+            coverage_ended_at = bucket_end
+        elif coverage_started_at is None or coverage_ended_at is None:
+            coverage_started_at, coverage_ended_at = _observed_window(
+                selected_segments
+            )
+        coverage = _estimate_coverage(
+            selected_segments,
+            scope_type=scope,
+            scope_key=key,
+            sku_dimensions=dimensions,
+            coverage_started_at=coverage_started_at,
+            coverage_ended_at=coverage_ended_at,
+        )
+        all_refs = tuple(
+            (
+                "SALES_ESTIMATE_SEGMENT",
+                segment.estimate_segment_id,
+                estimate_segment_sha256(segment),
+            )
+            for segment in sorted(
+                selected_segments,
+                key=lambda item: item.estimate_segment_id,
+            )
+        )
+        if coverage["complete"]:
             quality = (
                 DataQualityLevel.SCAN_ESTIMATED_HIGH
                 if all(
@@ -108,22 +150,14 @@ class SalesFactSelectionService:
                 ),
                 order_count=None,
                 transaction_amount_total=None,
-                mapping_version=_common_mapping_version(
-                    segment.mapping_version for segment in selected_segments
-                ),
-                quality_reason="ELIGIBLE_SCAN_ESTIMATE",
-                source_proportions={"SCAN_ESTIMATED": 1.0},
-                input_refs=tuple(
-                    (
-                        "SALES_ESTIMATE_SEGMENT",
-                        segment.estimate_segment_id,
-                        estimate_segment_sha256(segment),
-                    )
-                    for segment in sorted(
-                        selected_segments,
-                        key=lambda item: item.estimate_segment_id,
-                    )
-                ),
+                mapping_version=coverage["mapping_version"],
+                algorithm_version=chosen_algorithm,
+                quality_reason="COMPLETE_SCAN_ESTIMATE_TIMELINE",
+                source_proportions={
+                    "SCAN_ESTIMATED": 1.0,
+                    "coverage_ratio": 1.0,
+                },
+                input_refs=all_refs,
             )
 
         return SalesFactSelection(
@@ -137,12 +171,13 @@ class SalesFactSelectionService:
             order_count=None,
             transaction_amount_total=None,
             mapping_version="",
-            quality_reason=(
-                "OVERLAPPING_ESTIMATE_SEGMENTS"
-                if selected_segments
-                else "NO_ACCEPTABLE_SALES_FACT"
-            ),
-            source_proportions={},
+            algorithm_version=chosen_algorithm,
+            quality_reason=str(coverage["reason"]),
+            source_proportions={
+                "SCAN_ESTIMATED": float(coverage["ratio"]),
+                "coverage_ratio": float(coverage["ratio"]),
+            },
+            input_refs=all_refs,
         )
 
 
@@ -259,6 +294,7 @@ def _selection_from_order(
             Decimal("0"),
         ),
         mapping_version=mapping_version,
+        algorithm_version="",
         quality_reason=(
             "COMPLETE_CLOSED_ORDER_SNAPSHOT"
             if quality_level is DataQualityLevel.ORDER_COMPLETE
@@ -311,6 +347,7 @@ def _segment_in_scope(
     scope_type: str,
     scope_key: str,
     sku_dimensions: Mapping[str, Mapping[str, str]],
+    platform_trade_date: date,
 ) -> bool:
     if scope_type == "PLATFORM":
         return True
@@ -320,6 +357,20 @@ def _segment_in_scope(
         return (
             sku_dimensions.get(segment.internal_sku, {}).get("variety", "").strip()
             == scope_key
+        )
+    if scope_type == "GRADE":
+        return (
+            sku_dimensions.get(segment.internal_sku, {}).get("grade", "").strip()
+            == scope_key
+        )
+    if scope_type == "TIME_BUCKET":
+        bucket_start, bucket_end = _time_bucket_window(
+            platform_trade_date,
+            scope_key,
+        )
+        return (
+            segment.interval_started_at < bucket_end
+            and segment.interval_ended_at > bucket_start
         )
     return False
 
@@ -350,6 +401,200 @@ def _segments_overlap(segments: tuple[SalesEstimateSegment, ...]) -> bool:
         ):
             return True
     return False
+
+
+def _latest_algorithm_version(
+    segments: tuple[SalesEstimateSegment, ...],
+) -> str:
+    if not segments:
+        return ""
+    return max(
+        segments,
+        key=lambda item: (item.created_at, item.algorithm_version),
+    ).algorithm_version
+
+
+def _observed_window(
+    segments: tuple[SalesEstimateSegment, ...],
+) -> tuple[datetime | None, datetime | None]:
+    if not segments:
+        return None, None
+    return (
+        min(item.interval_started_at for item in segments),
+        max(item.interval_ended_at for item in segments),
+    )
+
+
+def _expected_skus(
+    segments: tuple[SalesEstimateSegment, ...],
+    *,
+    scope_type: str,
+    scope_key: str,
+    sku_dimensions: Mapping[str, Mapping[str, str]],
+) -> tuple[str, ...]:
+    if scope_type == "SKU":
+        return (scope_key,)
+    if scope_type == "VARIETY":
+        values = {
+            sku
+            for sku, dimensions in sku_dimensions.items()
+            if dimensions.get("variety", "").strip() == scope_key
+        }
+    elif scope_type == "GRADE":
+        values = {
+            sku
+            for sku, dimensions in sku_dimensions.items()
+            if dimensions.get("grade", "").strip() == scope_key
+        }
+    else:
+        values = set(sku_dimensions)
+    if not values:
+        values = {segment.internal_sku for segment in segments}
+    return tuple(sorted(value for value in values if value))
+
+
+def _estimate_coverage(
+    segments: tuple[SalesEstimateSegment, ...],
+    *,
+    scope_type: str,
+    scope_key: str,
+    sku_dimensions: Mapping[str, Mapping[str, str]],
+    coverage_started_at: datetime | None,
+    coverage_ended_at: datetime | None,
+) -> dict[str, object]:
+    if not segments:
+        return {
+            "complete": False,
+            "reason": "NO_ACCEPTABLE_SALES_FACT",
+            "ratio": 0.0,
+            "mapping_version": "",
+        }
+    if (
+        coverage_started_at is None
+        or coverage_ended_at is None
+        or coverage_ended_at <= coverage_started_at
+    ):
+        return {
+            "complete": False,
+            "reason": "INVALID_ESTIMATE_COVERAGE_WINDOW",
+            "ratio": 0.0,
+            "mapping_version": "",
+        }
+    mapping_version = _common_mapping_version(
+        segment.mapping_version for segment in segments
+    )
+    if not mapping_version:
+        return {
+            "complete": False,
+            "reason": "MAPPING_VERSION_INCONSISTENT",
+            "ratio": 0.0,
+            "mapping_version": "",
+        }
+    if scope_type == "TIME_BUCKET" and any(
+        segment.interval_started_at < coverage_started_at
+        or segment.interval_ended_at > coverage_ended_at
+        for segment in segments
+    ):
+        return {
+            "complete": False,
+            "reason": "CROSS_TIME_BUCKET_ESTIMATE",
+            "ratio": 0.0,
+            "mapping_version": mapping_version,
+        }
+    expected_skus = _expected_skus(
+        segments,
+        scope_type=scope_type,
+        scope_key=scope_key,
+        sku_dimensions=sku_dimensions,
+    )
+    if not expected_skus:
+        return {
+            "complete": False,
+            "reason": "NO_EXPECTED_SKU_DIMENSIONS",
+            "ratio": 0.0,
+            "mapping_version": mapping_version,
+        }
+    total_seconds = (coverage_ended_at - coverage_started_at).total_seconds()
+    ratios: list[float] = []
+    reason = "INCOMPLETE_ESTIMATE_TIMELINE"
+    for sku in expected_skus:
+        sku_segments = tuple(
+            sorted(
+                (item for item in segments if item.internal_sku == sku),
+                key=lambda item: (
+                    item.interval_started_at,
+                    item.interval_ended_at,
+                    item.estimate_segment_id,
+                ),
+            )
+        )
+        if not sku_segments:
+            ratios.append(0.0)
+            reason = "MISSING_SKU_ESTIMATE_TIMELINE"
+            continue
+        if _segments_overlap(sku_segments):
+            ratios.append(0.0)
+            reason = "OVERLAPPING_ESTIMATE_SEGMENTS"
+            continue
+        eligible = tuple(
+            item
+            for item in sku_segments
+            if item.estimation_eligible
+            and item.estimated_sold_qty is not None
+        )
+        if len(eligible) != len(sku_segments):
+            reason = "INELIGIBLE_ESTIMATE_INTERVAL"
+        covered_seconds = 0.0
+        cursor = coverage_started_at
+        for item in eligible:
+            start = max(item.interval_started_at, coverage_started_at)
+            end = min(item.interval_ended_at, coverage_ended_at)
+            if end <= start:
+                continue
+            if start > cursor:
+                reason = "GAPPED_ESTIMATE_TIMELINE"
+            if end > cursor:
+                covered_seconds += max(
+                    0.0,
+                    (end - max(start, cursor)).total_seconds(),
+                )
+                cursor = end
+        ratios.append(min(covered_seconds / total_seconds, 1.0))
+    ratio = min(ratios, default=0.0)
+    complete = ratio == 1.0 and all(
+        item.estimation_eligible and item.estimated_sold_qty is not None
+        for item in segments
+    )
+    return {
+        "complete": complete,
+        "reason": "COMPLETE_SCAN_ESTIMATE_TIMELINE" if complete else reason,
+        "ratio": ratio,
+        "mapping_version": mapping_version,
+    }
+
+
+def _time_bucket_window(
+    platform_trade_date: date,
+    scope_key: str,
+) -> tuple[datetime, datetime]:
+    start_hour, end_hour = _parse_time_bucket(scope_key)
+    local_date = (
+        platform_trade_date - timedelta(days=1)
+        if start_hour >= 18
+        else platform_trade_date
+    )
+    zone = ZoneInfo("Asia/Shanghai")
+    started_at = datetime.combine(
+        local_date,
+        time(hour=start_hour),
+        tzinfo=zone,
+    )
+    ended_at = datetime.combine(
+        local_date,
+        time(hour=end_hour),
+        tzinfo=zone,
+    ) + timedelta(hours=1)
+    return started_at, ended_at
 
 
 def _common_mapping_version(values: Iterable[str]) -> str:

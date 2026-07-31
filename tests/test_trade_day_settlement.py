@@ -20,6 +20,11 @@ from app.repositories.operational_summary_repository import (
     OperationalSummaryRepository,
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.sales_settlement_models import SalesEstimateSegment
+from app.services.sales_estimate import (
+    SALES_ESTIMATE_ALGORITHM_VERSION,
+    SalesEstimateService,
+)
 from app.services.operational_time import (
     DEFAULT_OPERATIONAL_TIME_POLICY_VERSION,
 )
@@ -438,6 +443,263 @@ def test_automation_settlement_builds_grade_variety_sku_and_hour_scopes(
         result.summary.summary_status is SummaryStatus.PROVISIONAL
         for result in results
     )
+
+
+def test_final_rejects_estimate_added_after_reconciliation(
+    settlement,
+) -> None:
+    service, repository, runtime = settlement
+    _insert_order_snapshot(
+        runtime,
+        "batch-1",
+        completed_at=BASE + timedelta(hours=1),
+        rows=(("fingerprint-a", 2, "24", "SKU-1", "VERIFIED"),),
+    )
+    summary_id = _create_provisional(service).summary.summary_id
+    service.observe(summary_id, changed_by="test")
+    service.reconcile(summary_id, changed_by="test")
+    _append_complete_estimate_day(repository, sold_qty=2)
+
+    with pytest.raises(ValueError, match="estimate evidence changed"):
+        service.finalize(summary_id, changed_by="test")
+
+
+def test_final_rejects_new_selected_estimate_algorithm(
+    settlement,
+) -> None:
+    service, repository, runtime = settlement
+    _insert_order_snapshot(
+        runtime,
+        "batch-1",
+        completed_at=BASE + timedelta(hours=1),
+        rows=(("fingerprint-a", 2, "24", "SKU-1", "VERIFIED"),),
+    )
+    _append_complete_estimate_day(repository, sold_qty=2)
+    summary_id = _create_provisional(service).summary.summary_id
+    service.observe(summary_id, changed_by="test")
+    service.reconcile(summary_id, changed_by="test")
+    _append_complete_estimate_day(
+        repository,
+        sold_qty=2,
+        algorithm_version="sales-estimate-v2",
+    )
+    revised_algorithm_service = TradeDaySettlementService(
+        repository,
+        estimate_service=SalesEstimateService(
+            algorithm_version="sales-estimate-v2"
+        ),
+    )
+
+    with pytest.raises(ValueError, match="estimate evidence changed"):
+        revised_algorithm_service.finalize(summary_id, changed_by="test")
+
+
+def test_historical_order_backfill_supersedes_only_final_and_is_idempotent(
+    settlement,
+) -> None:
+    service, repository, runtime = settlement
+    _insert_order_snapshot(
+        runtime,
+        "batch-1",
+        completed_at=BASE + timedelta(hours=1),
+        rows=(("fingerprint-a", 2, "24", "SKU-1", "VERIFIED"),),
+    )
+    old_id = _create_provisional(service).summary.summary_id
+    service.observe(old_id, changed_by="test")
+    service.reconcile(old_id, changed_by="test")
+    old_final = service.finalize(old_id, changed_by="test").summary
+    _insert_order_snapshot(
+        runtime,
+        "batch-2",
+        completed_at=BASE + timedelta(hours=2),
+        rows=(("fingerprint-b", 3, "36", "SKU-1", "VERIFIED"),),
+    )
+
+    refreshed = service.refresh_after_order_import(
+        platform_name=PLATFORM,
+        platform_trade_date=TRADE_DATE,
+        observation_batch_id="batch-2",
+    )
+    assert len(refreshed) == 1
+    revision = refreshed[0].summary
+    assert revision.summary_status is SummaryStatus.OBSERVED
+    assert revision.version_no == old_final.version_no + 1
+    assert revision.supersedes_summary_id == old_final.summary_id
+    assert revision.sold_qty == 3
+    persisted_old = repository.get_summary(old_final.summary_id)
+    assert persisted_old is not None
+    assert persisted_old.summary_status is SummaryStatus.FINAL
+    assert persisted_old.sold_qty == 2
+    assert not persisted_old.is_current
+
+    replay = service.refresh_after_order_import(
+        platform_name=PLATFORM,
+        platform_trade_date=TRADE_DATE,
+        observation_batch_id="batch-2",
+    )
+    assert len(replay) == 1
+    assert not replay[0].changed
+    assert replay[0].summary.summary_id == revision.summary_id
+
+
+def test_non_final_order_backfill_refreshes_same_version(
+    settlement,
+) -> None:
+    service, _, runtime = settlement
+    _insert_order_snapshot(
+        runtime,
+        "batch-1",
+        completed_at=BASE + timedelta(hours=1),
+        rows=(("fingerprint-a", 2, "24", "SKU-1", "VERIFIED"),),
+    )
+    observed = service.observe(
+        _create_provisional(service).summary.summary_id,
+        changed_by="test",
+    ).summary
+    _insert_order_snapshot(
+        runtime,
+        "batch-2",
+        completed_at=BASE + timedelta(hours=2),
+        rows=(("fingerprint-b", 3, "36", "SKU-1", "VERIFIED"),),
+    )
+
+    refreshed = service.refresh_after_order_import(
+        platform_name=PLATFORM,
+        platform_trade_date=TRADE_DATE,
+        observation_batch_id="batch-2",
+    )[0].summary
+    assert refreshed.summary_id == observed.summary_id
+    assert refreshed.version_no == observed.version_no
+    assert refreshed.supersedes_summary_id is None
+    assert refreshed.summary_status is SummaryStatus.OBSERVED
+    assert refreshed.sold_qty == 3
+
+
+def test_scan_only_settlement_builds_all_supported_scopes_from_fresh_dimensions(
+    settlement,
+) -> None:
+    _, repository, runtime = settlement
+    _append_complete_estimate_day(repository, sold_qty=4)
+    with closing(runtime.connect_write()) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO listing_status(
+                listing_status_id, platform_name, internal_sku,
+                variety, grade, current_price, updated_at
+            ) VALUES ('listing-scan-only', ?, 'SKU-1', 'Rose', 'B', '12', ?)
+            """,
+            (PLATFORM, BASE.isoformat()),
+        )
+    service = TradeDaySettlementService(repository)
+    run = AutomationRun(
+        run_id="settlement-scan-only",
+        job_id="settlement-job",
+        job_type="PLATFORM_TRADE_DAY_SETTLEMENT",
+        logical_run_key="settlement-scan-only-key",
+        run_status=AutomationRunStatus.RUNNING,
+        platform_name=PLATFORM,
+        platform_trade_date=TRADE_DATE + timedelta(days=1),
+        seller_operation_date=TRADE_DATE + timedelta(days=1),
+        seller_phase=SellerPhase.NORMAL_SALES,
+        time_policy_version=DEFAULT_OPERATIONAL_TIME_POLICY_VERSION,
+        scheduled_for=BASE + timedelta(days=1),
+    )
+
+    results = service.create_provisionals_for_run(run)
+    by_scope = {
+        (item.summary.scope_type, item.summary.scope_key): item.summary
+        for item in results
+    }
+    assert by_scope[("PLATFORM", PLATFORM)].sold_qty == 4
+    assert by_scope[("VARIETY", "Rose")].sold_qty == 4
+    assert by_scope[("GRADE", "B")].sold_qty == 4
+    assert by_scope[("SKU", "SKU-1")].sold_qty == 4
+    assert len(
+        [scope for scope in by_scope if scope[0] == "TIME_BUCKET"]
+    ) == 24
+
+
+def test_multi_scope_settlement_rolls_back_as_one_transaction(
+    settlement,
+) -> None:
+    _, repository, runtime = settlement
+    _insert_order_snapshot(
+        runtime,
+        "batch-atomic",
+        completed_at=BASE + timedelta(hours=1),
+        rows=(("fingerprint-a", 2, "24", "SKU-1", "VERIFIED"),),
+    )
+    service = TradeDaySettlementService(repository)
+    run = AutomationRun(
+        run_id="settlement-atomic",
+        job_id="settlement-job",
+        job_type="PLATFORM_TRADE_DAY_SETTLEMENT",
+        logical_run_key="settlement-atomic-key",
+        run_status=AutomationRunStatus.RUNNING,
+        platform_name=PLATFORM,
+        platform_trade_date=TRADE_DATE + timedelta(days=1),
+        seller_operation_date=TRADE_DATE + timedelta(days=1),
+        seller_phase=SellerPhase.NORMAL_SALES,
+        time_policy_version=DEFAULT_OPERATIONAL_TIME_POLICY_VERSION,
+        scheduled_for=BASE + timedelta(days=1),
+    )
+    validations = 0
+
+    def fail_second_scope(_connection) -> None:
+        nonlocal validations
+        validations += 1
+        if validations == 2:
+            raise RuntimeError("injected multi-scope failure")
+
+    with pytest.raises(RuntimeError, match="injected multi-scope failure"):
+        service.create_provisionals_for_run(
+            run,
+            transaction_validator=fail_second_scope,
+        )
+
+    assert repository.list_current_summaries(
+        platform_name=PLATFORM,
+        platform_trade_date=TRADE_DATE,
+    ) == ()
+
+
+def _append_complete_estimate_day(
+    repository: OperationalSummaryRepository,
+    *,
+    sold_qty: int,
+    algorithm_version: str = SALES_ESTIMATE_ALGORITHM_VERSION,
+) -> None:
+    started_at = datetime(2026, 7, 30, 10, 0, tzinfo=timezone.utc)
+    for index in range(96):
+        interval_start = started_at + timedelta(minutes=15 * index)
+        interval_end = interval_start + timedelta(minutes=15)
+        repository.append_estimate_segment(
+            SalesEstimateSegment(
+                estimate_segment_id=(
+                    f"estimate-{algorithm_version}-{index:03}"
+                ),
+                platform_name=PLATFORM,
+                internal_sku="SKU-1",
+                platform_trade_date=TRADE_DATE,
+                interval_started_at=interval_start,
+                interval_ended_at=interval_end,
+                inventory_before=100,
+                inventory_after=100 - sold_qty if index == 0 else 100,
+                known_inventory_adjustment=0,
+                known_adjustment_source_refs=(),
+                estimated_sold_qty=sold_qty if index == 0 else 0,
+                estimation_eligible=True,
+                estimation_reason="ELIGIBLE_NO_ADJUSTMENT",
+                quality_level=DataQualityLevel.SCAN_ESTIMATED_HIGH,
+                mapping_version="mapping-v1",
+                supporting_observation_ids=(
+                    f"before-{algorithm_version}-{index}",
+                    f"after-{algorithm_version}-{index}",
+                ),
+                algorithm_version=algorithm_version,
+                created_at=BASE + timedelta(hours=3),
+            )
+        )
 
 
 def hashlib_for(value: str) -> str:

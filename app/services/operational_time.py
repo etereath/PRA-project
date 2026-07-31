@@ -185,6 +185,58 @@ class OperationalTimeService:
             timezone_name=policy.timezone_name,
         )
 
+    def platform_trade_day_window(
+        self,
+        platform_trade_date: date,
+        *,
+        policy_version: str = DEFAULT_OPERATIONAL_TIME_POLICY_VERSION,
+    ) -> tuple[datetime, datetime]:
+        policy = self._policy_by_version(policy_version)
+        zone = ZoneInfo(policy.timezone_name)
+        started_at = datetime.combine(
+            platform_trade_date - timedelta(days=1),
+            policy.platform_cutoff_local_time,
+            tzinfo=zone,
+        )
+        ended_at = datetime.combine(
+            platform_trade_date,
+            policy.platform_cutoff_local_time,
+            tzinfo=zone,
+        )
+        return started_at.astimezone(timezone.utc), ended_at.astimezone(timezone.utc)
+
+    def seller_operation_day_window(
+        self,
+        seller_operation_date: date,
+        *,
+        policy_version: str = DEFAULT_OPERATIONAL_TIME_POLICY_VERSION,
+    ) -> tuple[datetime, datetime]:
+        policy = self._policy_by_version(policy_version)
+        zone = ZoneInfo(policy.timezone_name)
+        started_at = datetime.combine(
+            seller_operation_date - timedelta(days=1),
+            policy.seller_cutoff_local_time,
+            tzinfo=zone,
+        )
+        ended_at = datetime.combine(
+            seller_operation_date,
+            policy.seller_cutoff_local_time,
+            tzinfo=zone,
+        )
+        return started_at.astimezone(timezone.utc), ended_at.astimezone(timezone.utc)
+
+    def _policy_by_version(self, policy_version: str) -> OperationalTimePolicy:
+        matches = tuple(
+            policy
+            for policy in self.policy_registry.policies
+            if policy.policy_version == policy_version
+        )
+        if len(matches) != 1:
+            raise ValueError(
+                f"Unknown operational time policy version: {policy_version}"
+            )
+        return matches[0]
+
 
 def _as_utc(value: datetime, field_name: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -82,7 +83,7 @@ def _estimate() -> SalesEstimateSegment:
     )
 
 
-def _select(*, orders=(), estimates=()):
+def _select(*, orders=(), estimates=(), **kwargs):
     return SalesFactSelectionService().select(
         platform_name="platform",
         platform_trade_date=TRADE_DATE,
@@ -90,6 +91,7 @@ def _select(*, orders=(), estimates=()):
         scope_key="platform",
         order_snapshots=orders,
         estimate_segments=estimates,
+        **kwargs,
     )
 
 
@@ -128,3 +130,92 @@ def test_estimate_is_used_only_when_no_acceptable_order_exists() -> None:
     assert selected.sold_qty == 5
     assert selected.order_count is None
     assert selected.transaction_amount_total is None
+
+
+def test_ineligible_interval_prevents_subset_from_becoming_daily_total() -> None:
+    first = _estimate()
+    second = replace(
+        first,
+        estimate_segment_id="segment-2",
+        interval_started_at=NOW + timedelta(minutes=10),
+        interval_ended_at=NOW + timedelta(minutes=20),
+        estimated_sold_qty=None,
+        estimation_eligible=False,
+        estimation_reason="UNRESOLVED_INVENTORY_WRITE",
+        quality_level=DataQualityLevel.SCAN_ESTIMATED_LOW,
+    )
+    selected = _select(
+        estimates=(first, second),
+        estimate_algorithm_version="estimate-v1",
+        coverage_started_at=NOW,
+        coverage_ended_at=NOW + timedelta(minutes=20),
+    )
+
+    assert selected.quality_level is DataQualityLevel.UNAVAILABLE
+    assert selected.sold_qty is None
+    assert selected.quality_reason == "INELIGIBLE_ESTIMATE_INTERVAL"
+    assert selected.source_proportions["coverage_ratio"] == 0.5
+    assert len(selected.input_refs) == 2
+
+
+def test_explicit_algorithm_version_ignores_overlapping_old_algorithm() -> None:
+    old = _estimate()
+    current = replace(
+        old,
+        estimate_segment_id="segment-current",
+        estimated_sold_qty=4,
+        algorithm_version="estimate-v2",
+        created_at=NOW + timedelta(hours=1),
+    )
+    selected = _select(
+        estimates=(old, current),
+        estimate_algorithm_version="estimate-v2",
+        coverage_started_at=NOW,
+        coverage_ended_at=NOW + timedelta(minutes=10),
+    )
+
+    assert selected.quality_level is DataQualityLevel.SCAN_ESTIMATED_HIGH
+    assert selected.sold_qty == 4
+    assert selected.algorithm_version == "estimate-v2"
+    assert {ref[1] for ref in selected.input_refs} == {"segment-current"}
+
+
+def test_mapping_version_drift_makes_estimate_unavailable() -> None:
+    first = _estimate()
+    second = replace(
+        first,
+        estimate_segment_id="segment-2",
+        interval_started_at=NOW + timedelta(minutes=10),
+        interval_ended_at=NOW + timedelta(minutes=20),
+        mapping_version="mapping-v2",
+    )
+    selected = _select(
+        estimates=(first, second),
+        estimate_algorithm_version="estimate-v1",
+        coverage_started_at=NOW,
+        coverage_ended_at=NOW + timedelta(minutes=20),
+    )
+
+    assert selected.quality_level is DataQualityLevel.UNAVAILABLE
+    assert selected.quality_reason == "MAPPING_VERSION_INCONSISTENT"
+
+
+def test_cross_hour_estimate_is_not_arbitrarily_allocated_to_time_bucket() -> None:
+    bucket_start = datetime(2026, 7, 30, 10, 50, tzinfo=timezone.utc)
+    crossing = replace(
+        _estimate(),
+        interval_started_at=bucket_start,
+        interval_ended_at=bucket_start + timedelta(minutes=20),
+    )
+    selected = SalesFactSelectionService().select(
+        platform_name="platform",
+        platform_trade_date=TRADE_DATE,
+        scope_type="TIME_BUCKET",
+        scope_key="18:00-18:59",
+        order_snapshots=(),
+        estimate_segments=(crossing,),
+        estimate_algorithm_version="estimate-v1",
+    )
+
+    assert selected.quality_level is DataQualityLevel.UNAVAILABLE
+    assert selected.quality_reason == "CROSS_TIME_BUCKET_ESTIMATE"

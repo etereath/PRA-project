@@ -12,6 +12,7 @@ from app.repositories.operational_summary_repository import (
     OperationalSummaryRepository,
 )
 from app.repositories.automation_repository import (
+    AutomationRepository,
     validate_live_automation_claim_in_transaction,
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
@@ -21,13 +22,20 @@ from app.services.automation import (
     PLATFORM_TRADE_DAY_SETTLEMENT,
     SALES_PLAN_INPUT_BUILD,
 )
-from app.services.sales_plan_input import SalesPlanInputService
+from app.services.sales_plan_input import (
+    SalesPlanInputService,
+    sales_plan_manifest_sha256,
+)
+from app.services.settlement_pipeline import (
+    SettlementPipeline,
+    snapshot_event_payload,
+)
 from app.services.trade_day_settlement import TradeDaySettlementService
 
 
 @dataclass(frozen=True, slots=True)
 class TradeDaySettlementAutomationHandler:
-    service: TradeDaySettlementService
+    pipeline: SettlementPipeline
 
     def __call__(
         self,
@@ -48,10 +56,11 @@ class TradeDaySettlementAutomationHandler:
                 now=context.clock(),
             )
 
-        results = self.service.create_provisionals_for_run(
+        pipeline_result = self.pipeline.run(
             run,
             transaction_validator=validate_claim,
         )
+        results = pipeline_result.mutations
         manifest_sha256 = _settlement_run_manifest_sha256(results)
         context.bind_input_manifest(manifest_sha256)
         platform_result = next(
@@ -61,8 +70,11 @@ class TradeDaySettlementAutomationHandler:
         )
         return AutomationRunOutcome(
             status=AutomationRunStatus.SUCCESS,
-            output_manifest_sha256=manifest_sha256,
+            output_manifest_sha256=(
+                pipeline_result.snapshot.snapshot_sha256
+            ),
             event_payload={
+                **snapshot_event_payload(pipeline_result.snapshot),
                 "summary_id": platform_result.summary.summary_id,
                 "summary_ids": [
                     result.summary.summary_id for result in results
@@ -90,7 +102,7 @@ class TradeDaySettlementAutomationHandler:
 
 @dataclass(frozen=True, slots=True)
 class SalesPlanInputAutomationHandler:
-    service: SalesPlanInputService
+    automation_repository: AutomationRepository
 
     def __call__(
         self,
@@ -104,18 +116,73 @@ class SalesPlanInputAutomationHandler:
         if not context.heartbeat():
             raise RuntimeError("Automation lease was lost before plan input")
         settled_date = run.platform_trade_date - timedelta(days=1)
-        manifest = self.service.build(
-            platform_name=run.platform_name,
-            settled_platform_trade_date=settled_date,
+        settlement_runs = self.automation_repository.list_runs(
+            job_id="AUTOMATION-TRADE-DAY-SETTLEMENT",
+            statuses=(AutomationRunStatus.SUCCESS,),
         )
-        context.bind_input_manifest(manifest.manifest_sha256)
+        source_run = next(
+            (
+                candidate
+                for candidate in settlement_runs
+                if candidate.platform_name == run.platform_name
+                and candidate.seller_operation_date
+                == run.seller_operation_date
+                and candidate.platform_trade_date - timedelta(days=1)
+                == settled_date
+            ),
+            None,
+        )
+        if source_run is None:
+            raise ValueError(
+                "Sales plan input requires a successful settlement pipeline"
+            )
+        finished = next(
+            (
+                event
+                for event in reversed(
+                    self.automation_repository.list_events(source_run.run_id)
+                )
+                if event.event_type == "RUN_FINISHED"
+            ),
+            None,
+        )
+        if finished is None or not isinstance(
+            finished.payload.get("sales_plan_input"),
+            dict,
+        ):
+            raise ValueError("Settlement pipeline has no persisted plan projection")
+        plan_payload = dict(finished.payload["sales_plan_input"])
+        manifest_sha256 = sales_plan_manifest_sha256(plan_payload)
+        audit_receipt = finished.payload.get("audit_receipt")
+        if (
+            not isinstance(audit_receipt, dict)
+            or audit_receipt.get("plan_input_manifest_sha256")
+            != manifest_sha256
+        ):
+            raise ValueError("Persisted plan projection failed hash readback")
+        context.bind_input_manifest(manifest_sha256)
+        eligible = plan_payload.get("plan_input_status") == "ELIGIBLE"
         return AutomationRunOutcome(
-            status=AutomationRunStatus.SUCCESS,
-            output_manifest_sha256=manifest.manifest_sha256,
+            status=(
+                AutomationRunStatus.SUCCESS
+                if eligible
+                else AutomationRunStatus.SKIPPED
+            ),
+            output_manifest_sha256=manifest_sha256,
+            error_code="" if eligible else "PLAN_INPUT_INELIGIBLE",
             event_payload={
-                "schema_version": manifest.payload["schema_version"],
+                "schema_version": plan_payload["schema_version"],
                 "settled_platform_trade_date": settled_date.isoformat(),
-                "source_ref_count": len(manifest.input_refs),
+                "plan_for_seller_operation_date": (
+                    run.seller_operation_date.isoformat()
+                ),
+                "source_settlement_run_id": source_run.run_id,
+                "source_ref_count": int(
+                    audit_receipt.get("source_ref_count") or 0
+                ),
+                "projection_role": plan_payload.get("projection_role"),
+                "plan_input_status": plan_payload.get("plan_input_status"),
+                "recovered_from_settlement_snapshot": True,
                 "prediction_performed": False,
                 "platform_write_performed": False,
             },
@@ -128,20 +195,22 @@ def build_sales_settlement_handlers(
     platform_name: str,
 ) -> Mapping[str, AutomationHandler]:
     repository = OperationalSummaryRepository(runtime_repository)
-    dimensions = repository.list_sku_dimensions(
-        platform_name=platform_name,
+    settlement_service = TradeDaySettlementService(repository)
+    plan_service = SalesPlanInputService(repository)
+    pipeline = SettlementPipeline(
+        repository,
+        settlement_service=settlement_service,
+        plan_input_service=plan_service,
     )
+    automation_repository = AutomationRepository(runtime_repository)
     return {
         PLATFORM_TRADE_DAY_SETTLEMENT: (
             TradeDaySettlementAutomationHandler(
-                TradeDaySettlementService(
-                    repository,
-                    sku_dimensions=dimensions,
-                )
+                pipeline
             )
         ),
         SALES_PLAN_INPUT_BUILD: SalesPlanInputAutomationHandler(
-            SalesPlanInputService(repository)
+            automation_repository,
         ),
     }
 

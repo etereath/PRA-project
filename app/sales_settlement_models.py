@@ -16,6 +16,7 @@ class InventoryObservationPoint:
     internal_sku: str | None
     platform_trade_date: date
     observed_at: datetime
+    observed_price: Decimal | None
     observed_inventory: int | None
     observed_online: bool
     mapping_status: ProductMappingStatus
@@ -25,6 +26,27 @@ class InventoryObservationPoint:
     scope_complete: bool
     end_marker_verified: bool
     content_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class ProductScanExecution:
+    automation_run_id: str
+    observation_batch_id: str | None
+    run_status: str
+    batch_status: str | None
+    scan_started_at: datetime
+    scan_completed_at: datetime
+    scope_complete: bool
+    end_marker_verified: bool
+
+    @property
+    def critical_failure(self) -> bool:
+        return (
+            self.run_status in {"FAILED", "MISSED"}
+            or self.batch_status in {"PARTIAL", "UNAVAILABLE", "FAILED"}
+            or not self.scope_complete
+            or not self.end_marker_verified
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +149,7 @@ class SalesFactSelection:
     order_count: int | None
     transaction_amount_total: Decimal | None
     mapping_version: str
+    algorithm_version: str
     quality_reason: str
     source_proportions: dict[str, Any]
     input_refs: tuple[tuple[str, str, str], ...] = field(
@@ -148,6 +171,20 @@ class ReconciliationDecision:
 class SalesPlanInputManifest:
     platform_name: str
     settled_platform_trade_date: date
+    plan_for_seller_operation_date: date
+    projection_role: str
     payload: dict[str, Any]
     input_refs: tuple[tuple[str, str, str], ...]
     manifest_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
+class SettlementSnapshot:
+    platform_name: str
+    platform_trade_date: date
+    seller_operation_date: date
+    summaries: tuple[dict[str, Any], ...]
+    sales_plan_input: SalesPlanInputManifest
+    management_report: dict[str, Any]
+    audit_receipt: dict[str, Any]
+    snapshot_sha256: str

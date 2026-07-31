@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from contextlib import closing
 import json
@@ -46,6 +47,7 @@ def _point(
         internal_sku="SKU-1",
         platform_trade_date=trade_date,
         observed_at=observed_at,
+        observed_price=Decimal("12"),
         observed_inventory=inventory,
         observed_online=online,
         mapping_status=mapping_status,
@@ -361,8 +363,8 @@ def test_review_attestation_is_auditable_adjustment_source(
             (
                 json.dumps(payload, ensure_ascii=False),
                 START.isoformat(),
-                (START + timedelta(minutes=5)).isoformat(),
-                (START + timedelta(minutes=5)).isoformat(),
+                (START + timedelta(minutes=30)).isoformat(),
+                (START + timedelta(minutes=30)).isoformat(),
             ),
         )
     refs = OperationalSummaryRepository(
@@ -377,3 +379,104 @@ def test_review_attestation_is_auditable_adjustment_source(
     assert refs[0].source_type == "MANUAL_PLATFORM_MODIFICATION"
     assert refs[0].adjustment_qty == 3
     assert refs[0].source_ref_id == "review-1"
+
+
+def test_review_coverage_interval_can_be_confirmed_after_interval_end(
+    tmp_path: Path,
+) -> None:
+    runtime = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
+    runtime.init_schema()
+    payload = {
+        "schema_version": "inventory-adjustment-attestation-v1",
+        "source_type": "ADJUSTMENT_COVERAGE_ATTESTATION",
+        "adjustment_id": "coverage-late-review",
+        "adjustment_qty": 0,
+        "occurred_at": (START + timedelta(minutes=30)).isoformat(),
+        "coverage_started_at": START.isoformat(),
+        "coverage_ended_at": (START + timedelta(minutes=10)).isoformat(),
+        "evidence_sha256": EVIDENCE,
+    }
+    with closing(runtime.connect_write()) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO review_tasks(
+                review_task_id, scope_type, scope_key, dedupe_key,
+                review_type, review_status, internal_sku, platform_name,
+                reason, review_payload_json, resolution_payload_json,
+                created_at, updated_at, resolved_by, resolved_at
+            ) VALUES (
+                'review-coverage', 'SKU', 'SKU-1', 'review-coverage',
+                'INVENTORY_ADJUSTMENT_ATTESTATION', 'approved',
+                'SKU-1', 'platform', 'coverage evidence', '{}', ?,
+                ?, ?, 'operator', ?
+            )
+            """,
+            (
+                json.dumps(payload, ensure_ascii=False),
+                START.isoformat(),
+                (START + timedelta(minutes=30)).isoformat(),
+                (START + timedelta(minutes=30)).isoformat(),
+            ),
+        )
+    refs = OperationalSummaryRepository(
+        runtime
+    ).list_inventory_adjustment_sources(
+        platform_name="platform",
+        internal_sku="SKU-1",
+        interval_started_at=START,
+        interval_ended_at=START + timedelta(minutes=10),
+    )
+
+    assert len(refs) == 1
+    assert refs[0].source_type == "ADJUSTMENT_COVERAGE_ATTESTATION"
+    assert refs[0].occurred_at == START + timedelta(minutes=10)
+
+
+def test_unresolved_write_before_interval_continues_to_block(
+    tmp_path: Path,
+) -> None:
+    runtime = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
+    runtime.init_schema()
+    occurred_at = START - timedelta(minutes=10)
+    with closing(runtime.connect_write()) as connection:
+        connection.execute("PRAGMA foreign_keys = OFF")
+        with connection:
+            connection.execute(
+                """
+                INSERT INTO shadowbot_listing_action_batches(
+                    batch_id, contract_version, execution_profile,
+                    action_type, platform_name, manifest_sha256,
+                    status, created_at, updated_at
+                ) VALUES (
+                    'batch-unresolved', 5, 'production', 'set_online',
+                    'platform', 'sha256:test', 'UNKNOWN', ?, ?
+                )
+                """,
+                (occurred_at.isoformat(), occurred_at.isoformat()),
+            )
+            connection.execute(
+                """
+                INSERT INTO shadowbot_listing_action_batch_items(
+                    item_id, batch_id, source_task_id, operation_id,
+                    item_execution_attempt_id, internal_sku,
+                    expected_product_name, expected_grade,
+                    item_payload_sha256, write_identity_key,
+                    page_identity_key, expected_old_status, target_status,
+                    detail_effect_state, listing_effect_state,
+                    operation_result, updated_at
+                ) VALUES (
+                    'item-unresolved', 'batch-unresolved', 'task-test',
+                    'operation-test', 'attempt-test', 'SKU-1', 'Rose', 'B',
+                    'sha256:item', 'write-key', 'page-key', 'offline', 'online',
+                    'UNKNOWN', 'UNKNOWN', 'NEEDS_RECONCILIATION', ?
+                )
+                """,
+                (occurred_at.isoformat(),),
+            )
+    repository = OperationalSummaryRepository(runtime)
+    assert repository.has_unresolved_inventory_write(
+        platform_name="platform",
+        internal_sku="SKU-1",
+        interval_started_at=START,
+        interval_ended_at=START + timedelta(minutes=10),
+    )
