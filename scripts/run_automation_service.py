@@ -35,6 +35,9 @@ from app.services.order_automation_runtime import (  # noqa: E402
     build_order_read_only_handlers,
 )
 from app.services.runtime import DEFAULT_RUNTIME_DB  # noqa: E402
+from app.services.settlement_automation import (  # noqa: E402
+    build_sales_settlement_handlers,
+)
 
 
 DEFAULT_HEARTBEAT_PATH = Path(
@@ -212,9 +215,14 @@ def main() -> int:
             operational_time = OperationalTimeService(
                 policies=repository.load_operational_time_policies()
             )
-            handlers = {}
+            handlers = dict(
+                build_sales_settlement_handlers(
+                    runtime_repository=runtime_repository,
+                    platform_name=args.platform_name,
+                )
+            )
             if args.enable_order_read_only:
-                handlers = dict(
+                handlers.update(
                     build_order_read_only_handlers(
                         runtime_repository=runtime_repository,
                         queue_dir=args.shadowbot_queue_dir,
@@ -241,9 +249,9 @@ def main() -> int:
                     "schema_version": "automation-heartbeat-1.0",
                     "status": "RUNNING",
                     "mode": (
-                        "ORDER_READ_ONLY"
+                        "ORDER_READ_ONLY_AND_SETTLEMENT"
                         if args.enable_order_read_only
-                        else "SCHEDULER_ONLY"
+                        else "SETTLEMENT_ONLY"
                     ),
                     "registered_job_types": sorted(handlers),
                     "platform_write_handlers_registered": False,

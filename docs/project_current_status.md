@@ -128,6 +128,18 @@ Watchdog 输出精确匹配的 `READY_REQUEST_VALIDATED` 后，Worker、Importer
 完整通过，20 条历史订单写入隔离 DB，活动队列清空且平台写操作为 0。验收后原真实 DB
 队列服务按原参数恢复，真实 Runtime DB 仍未写入订单事实。
 
+13.5-5 已实现只读销售事实链：继续使用 v14 的 `sales_estimate_segments`、交易日日结、
+版本、事件和输入表，没有新增表、字段、锁、平台合同、结算状态或真实平台动作。估算
+区间只有在库存调整覆盖被明确证明时才计算；既有上架读回、结构化人工确认和未决写结果
+参与资格判断，没有 PRA 写记录不能反推没有人工修改。完整 CLOSED 订单优先于扫描估算，
+部分订单与估算只并列保留、不拼成一个总数；取消由相邻完整快照的多重集合减少派生，
+不写伪订单，也不重复扣减销量。20:00 作业生成平台、品种、等级、SKU 和本地小时桶的
+PROVISIONAL；FINAL 必须经过订单完整性、复算、差异分类、输入版本和现有阻断 Incident
+的同事务门禁。Automation Service 已接入日结与只读计划输入 Handler，计划输入明确不
+执行预测、不创建任务、不写平台。合同与实施见
+[13.5-5 销售估算与日结合同](plans/task13_5_5_sales_estimation_settlement_contract.md)和
+[13.5-5 实施报告](reports/task13_5_5_sales_settlement.md)。
+
 当前代码中的 runtime schema 最新版本为 v14。v3 新增自动规则评估运行记录，v4 新增 ShadowBot Executor 账本，v5 新增队列审计字段和 `retry_authorizations`，v6 新增事务型通知 Outbox，v7-v9 建立 `listing_status` 并将业务身份统一为“平台 + 品种 + 等级”，v10 将 `tasks.expected_old_price` 结构化，v11 新增单次请求的 `shadowbot_commit_batches` 和 `shadowbot_commit_batch_items`，v12 新增逐商品操作/尝试身份、活动写锁、观察时间和持久化结果回执，v13 新增公共批次注册表、通用上下架 operation、共享写锁、v5 动作账本、两页快照和页面异常事实表，v14 新增双时间轴、Automation、不可变观察、日结、Incident 和任务来源结构。真实 Runtime DB 是否已升级必须单独核实；`app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION` 是代码版本唯一权威来源。
 
 ### 2.3 人工复核闭环

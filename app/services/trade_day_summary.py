@@ -82,6 +82,7 @@ class TradeDaySummaryService:
         time_policy_version: str = (
             DEFAULT_OPERATIONAL_TIME_POLICY_VERSION
         ),
+        transaction_validator: Callable[[object], None] | None = None,
     ) -> SummaryMutationResult:
         now = _require_aware(self._clock())
         series_id = build_summary_series_id(
@@ -150,7 +151,12 @@ class TradeDaySummaryService:
             reason=quality_reason,
         )
         input_rows = tuple(inputs)
-        self.repository.insert_initial(summary, event, input_rows)
+        self.repository.insert_initial(
+            summary,
+            event,
+            input_rows,
+            transaction_validator=transaction_validator,
+        )
         return SummaryMutationResult(
             summary=summary,
             changed=True,
@@ -177,8 +183,24 @@ class TradeDaySummaryService:
         changed_by: str,
         trigger_type: str,
         trigger_ref_id: str = "",
+        finalization_validator: Callable[[object], None] | None = None,
+        transaction_validator: Callable[[object], None] | None = None,
     ) -> SummaryMutationResult:
         before = self._require_current(summary_id)
+        if to_status is SummaryStatus.FINAL:
+            if finalization_validator is None:
+                raise ValueError(
+                    "FINAL requires an atomic evidence validator"
+                )
+            if trigger_type != "FINALIZATION_POLICY":
+                raise ValueError(
+                    "FINAL requires trigger_type FINALIZATION_POLICY"
+                )
+            _require_text(trigger_ref_id, "trigger_ref_id")
+        elif finalization_validator is not None:
+            raise ValueError(
+                "Atomic finalization validator is only valid for FINAL"
+            )
         if (
             before.summary_status is to_status
             and before.input_manifest_sha256 == input_manifest_sha256
@@ -257,6 +279,8 @@ class TradeDaySummaryService:
             after=after,
             event=event,
             inputs=input_rows,
+            finalization_validator=finalization_validator,
+            transaction_validator=transaction_validator,
         ):
             raise RuntimeError(
                 "Summary changed concurrently; reload before retrying"
@@ -286,6 +310,7 @@ class TradeDaySummaryService:
         changed_by: str,
         trigger_type: str = "MATERIAL_INPUT_REVISION",
         trigger_ref_id: str = "",
+        transaction_validator: Callable[[object], None] | None = None,
     ) -> SummaryMutationResult:
         """Audit a PROVISIONAL update or restart later states as OBSERVED."""
 
@@ -308,6 +333,7 @@ class TradeDaySummaryService:
                 changed_by=changed_by,
                 trigger_type=trigger_type,
                 trigger_ref_id=trigger_ref_id,
+                transaction_validator=transaction_validator,
             )
         return self._create_revision(
             previous=previous,

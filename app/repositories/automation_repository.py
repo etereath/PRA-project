@@ -52,6 +52,15 @@ CHILD_PARENT_CLAIM_STATUSES = frozenset(
 COVERAGE_CANDIDATE = "COVERAGE_CANDIDATE"
 LISTING_STATUS_SCAN = "LISTING_STATUS_SCAN"
 ORDER_SCAN = "ORDER_SCAN"
+PLATFORM_TRADE_DAY_SETTLEMENT = "PLATFORM_TRADE_DAY_SETTLEMENT"
+SALES_PLAN_INPUT_BUILD = "SALES_PLAN_INPUT_BUILD"
+INPUT_MANIFEST_JOB_TYPES = frozenset(
+    {
+        LISTING_STATUS_SCAN,
+        PLATFORM_TRADE_DAY_SETTLEMENT,
+        SALES_PLAN_INPUT_BUILD,
+    }
+)
 ORDER_SCAN_TARGET_SELECTED = "ORDER_SCAN_TARGET_SELECTED"
 
 
@@ -793,9 +802,12 @@ class AutomationRepository:
                     """,
                     (claim.run.run_id,),
                 ).fetchone()
-                if row is None or str(row["job_type"]) != LISTING_STATUS_SCAN:
+                if (
+                    row is None
+                    or str(row["job_type"]) not in INPUT_MANIFEST_JOB_TYPES
+                ):
                     raise ValueError(
-                        "Only LISTING_STATUS_SCAN can bind a listing manifest"
+                        "Automation job type cannot bind an input manifest"
                     )
                 existing_manifest = str(
                     row["input_manifest_sha256"] or ""
@@ -804,7 +816,10 @@ class AutomationRepository:
                     raise ValueError(
                         "Automation run already has a different input manifest"
                     )
-                if not existing_manifest:
+                if (
+                    not existing_manifest
+                    and str(row["job_type"]) == LISTING_STATUS_SCAN
+                ):
                     batches = connection.execute(
                         """
                         SELECT batch_id, action_type, platform_name,
