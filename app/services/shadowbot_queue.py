@@ -1220,6 +1220,7 @@ class ShadowBotQueueWatchdog:
         self.stale_seconds = stale_seconds
         self.repository = repository
         self._last_heartbeat_alert_key = ""
+        self._validated_ready_attempts: set[str] = set()
 
     def inspect(self, *, now: datetime | None = None) -> list[dict[str, Any]]:
         current = now or datetime.now(UTC)
@@ -1274,12 +1275,14 @@ class ShadowBotQueueWatchdog:
             return []
         events: list[dict[str, Any]] = []
         seen: set[str] = set()
+        ready_attempts: set[str] = set()
         for request_path in sorted(self.paths.inbox.glob("*.ready.json")):
             try:
                 request = _read_json_object(request_path)
                 attempt_id = str(request.get("execution_attempt_id") or "").strip()
                 if not attempt_id:
                     raise ValidationError("ready request has no execution_attempt_id")
+                ready_attempts.add(attempt_id)
                 duplicate = attempt_id in seen or (self.paths.working / f"{attempt_id}.request.json").exists()
                 seen.add(attempt_id)
                 if duplicate:
@@ -1334,6 +1337,23 @@ class ShadowBotQueueWatchdog:
                         reason = "ORPHAN_READY_REQUEST"
                         target_root = self.paths.quarantine
                     elif str(run["run_status"]) == "RUNNING":
+                        if attempt_id not in self._validated_ready_attempts:
+                            events.append(
+                                {
+                                    "status": "READY_REQUEST_VALIDATED",
+                                    "contract_version": (
+                                        ORDER_SCAN_CONTRACT_VERSION
+                                    ),
+                                    "execution_attempt_id": attempt_id,
+                                    "automation_run_id": str(
+                                        request.get("automation_run_id") or ""
+                                    ),
+                                    "requested_platform_trade_date": (
+                                        target_trade_date
+                                    ),
+                                }
+                            )
+                            self._validated_ready_attempts.add(attempt_id)
                         continue
                     elif str(run["run_status"]) in {
                         "SUCCESS",
@@ -1554,6 +1574,7 @@ class ShadowBotQueueWatchdog:
                         "path": str(destination),
                     }
                 )
+        self._validated_ready_attempts.intersection_update(ready_attempts)
         return events
 
     def _heartbeat_stale(self, now: datetime) -> bool:

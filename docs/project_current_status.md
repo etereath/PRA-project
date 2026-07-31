@@ -122,7 +122,11 @@ Worker 请求和 Importer 精确校验；每小时完整扫描对齐 `HH:10`，�
 字段；同一 7 月 10 日的 20 条实机回归将首末 `observed_at` 跨度由约 29 秒降至 10 秒，
 范围、尾部、Importer、归档和零平台写副作用仍全部成立。
 通用队列 Watchdog 已识别 v6 `ORDER_SCAN` Run 绑定，旧版 Result Importer 不再抢占
-订单结果，超时恢复保持 v6 零写语义。
+订单结果，超时恢复保持 v6 零写语义。最终合并门禁又让常驻 Watchdog、验收
+Automation Run、唯一目标日期事件和订单 Importer 共用同一个一次性 v14 Runtime DB；
+Watchdog 输出精确匹配的 `READY_REQUEST_VALIDATED` 后，Worker、Importer 和 Archive
+完整通过，20 条历史订单写入隔离 DB，活动队列清空且平台写操作为 0。验收后原真实 DB
+队列服务按原参数恢复，真实 Runtime DB 仍未写入订单事实。
 
 当前代码中的 runtime schema 最新版本为 v14。v3 新增自动规则评估运行记录，v4 新增 ShadowBot Executor 账本，v5 新增队列审计字段和 `retry_authorizations`，v6 新增事务型通知 Outbox，v7-v9 建立 `listing_status` 并将业务身份统一为“平台 + 品种 + 等级”，v10 将 `tasks.expected_old_price` 结构化，v11 新增单次请求的 `shadowbot_commit_batches` 和 `shadowbot_commit_batch_items`，v12 新增逐商品操作/尝试身份、活动写锁、观察时间和持久化结果回执，v13 新增公共批次注册表、通用上下架 operation、共享写锁、v5 动作账本、两页快照和页面异常事实表，v14 新增双时间轴、Automation、不可变观察、日结、Incident 和任务来源结构。真实 Runtime DB 是否已升级必须单独核实；`app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION` 是代码版本唯一权威来源。
 

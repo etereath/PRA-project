@@ -224,6 +224,13 @@ v6 请求进入 `working` 前，Watchdog 必须确认其绑定到同平台、唯
 `RUNNING` 的 `ORDER_SCAN`；超时恢复只能生成 `FAILED`、零写副作用的 v6 结果，后续
 仍由订单 Importer 完成业务导入和归档。
 
+Watchdog 对合法 v6 ready 请求输出一次去重的 `READY_REQUEST_VALIDATED` 审计事件，
+事件只包含合同版本、execution attempt、Automation Run 和目标交易日，不包含订单值。
+合并验收必须让常驻 Watchdog、验收 Automation Run、唯一目标日期事件和
+`OrderObservationImporter` 使用同一个一次性 v14 Runtime DB，并以该事件证明请求在
+Worker 领取前通过精确绑定校验。通用 Result Importer 对 v6 继续显式 `DEFERRED`，避免
+与持有 Automation claim 的订单 Importer 争抢结果；订单 Importer 成功提交后才归档。
+
 正式 Automation Service 通过显式 `--enable-order-read-only` 门禁注册
 `FULL_MARKET_SCAN` 只读派生 Handler 与 `ORDER_SCAN` Handler。父 run 的成功只表示
 子 run 调度完成，不声明页面扫描事实；订单事实仍只由子 run 和 Importer 接受。该组合
@@ -251,6 +258,7 @@ v6 请求进入 `working` 前，Watchdog 必须确认其绑定到同平台、唯
 - 未映射、歧义商品；
 - 平台或 Run 错绑；
 - 未冻结目标、目标漂移和历史目标 Watchdog 绑定；
+- Watchdog 审计事件只输出一次，且必须精确匹配 attempt、Run 和目标交易日；
 - `18:10 FULL_MARKET_SCAN` 对齐及跨 18:00 整批失败；
 - 正式 Automation Service 只读 Handler 组合且零写 Handler；
 - 数据库失败整体回滚；
@@ -265,6 +273,12 @@ PII 不进入仓库；仓库只保留合成 fixture、结构化测试和脱敏�
 “没有更多了”、可见数与读取数一致、任一中间失败整批失败。两项可以在同一日期合并，
 但总计仍需两个不同历史日期，并验证目标日期从 Watchdog、Worker、Importer 到归档
 保持一致。
+
+最终合并门禁使用单个一次性 v14 Runtime DB 完整执行
+`Watchdog → Worker → OrderObservationImporter → Archive`。未映射商品可以按合同使
+完整页面降级为 `PARTIAL / UNMAPPED`，但链路通过仍必须同时满足页面能力成功、范围与
+尾部完整、结果已导入、结果已归档、活动队列清空、零平台写操作和 Watchdog 审计匹配；
+不得把合法映射降级误报为队列链路失败。
 
 触发滚动的真实批次必须记录共享列表物化助手实际执行了焦点绑定、`END`、尾部验证、
 `HOME` 和首项恢复；仅有日期选择器滚动或订单列表 `page_count=1` 不满足本门禁。

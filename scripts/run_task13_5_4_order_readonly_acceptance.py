@@ -97,6 +97,7 @@ def run_acceptance(
     queue_dir: Path,
     timeout_seconds: float,
     target_trade_date: date | None = None,
+    watchdog_audit_log: Path | None = None,
 ) -> dict[str, object]:
     now = datetime.now(timezone.utc)
     operational_time = OperationalTimeService()
@@ -242,6 +243,18 @@ def run_acceptance(
         name: len(list((queue_dir / name).glob("*")))
         for name in ("inbox", "working", "results")
     }
+    watchdog_validated = (
+        _watchdog_validated_request(
+            watchdog_audit_log,
+            execution_attempt_id=attempt_id,
+            automation_run_id=child_run_id,
+            target_trade_date=(
+                target_trade_date or time_context.platform_trade_date
+            ),
+        )
+        if watchdog_audit_log is not None
+        else False
+    )
     return {
         "schema_version": "task13.5-4-order-readonly-acceptance-1.0",
         "execution_mode": "READ_ONLY",
@@ -262,7 +275,56 @@ def run_acceptance(
         "result_archived": archive_dir.is_dir(),
         "queue_counts": queue_counts,
         "platform_write_operations": 0,
+        "watchdog_validation_required": watchdog_audit_log is not None,
+        "watchdog_validated": watchdog_validated,
     }
+
+
+def _watchdog_validated_request(
+    audit_log: Path,
+    *,
+    execution_attempt_id: str,
+    automation_run_id: str,
+    target_trade_date: date,
+) -> bool:
+    for line in Path(audit_log).read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        if not isinstance(event, dict):
+            continue
+        if (
+            event.get("status") == "READY_REQUEST_VALIDATED"
+            and str(event.get("execution_attempt_id") or "")
+            == execution_attempt_id
+            and str(event.get("automation_run_id") or "")
+            == automation_run_id
+            and str(event.get("requested_platform_trade_date") or "")
+            == target_trade_date.isoformat()
+        ):
+            return True
+    return False
+
+
+def acceptance_gate_passed(result: dict[str, object]) -> bool:
+    """Separate transport-chain success from legitimate mapping partials."""
+
+    watchdog_ok = (
+        not bool(result.get("watchdog_validation_required"))
+        or bool(result.get("watchdog_validated"))
+    )
+    return (
+        result.get("batch_status") in {"ACCEPTED", "PARTIAL"}
+        and result.get("capability_result") == "SUCCEEDED"
+        and bool(result.get("scope_complete"))
+        and bool(result.get("end_marker_verified"))
+        and bool(result.get("result_imported"))
+        and bool(result.get("result_archived"))
+        and result.get("queue_counts")
+        == {"inbox": 0, "working": 0, "results": 0}
+        and result.get("platform_write_operations") == 0
+        and watchdog_ok
+    )
 
 
 def main() -> int:
@@ -278,25 +340,25 @@ def main() -> int:
         default=None,
         help="Optional current or historical platform trade date (YYYY-MM-DD)",
     )
+    parser.add_argument(
+        "--watchdog-audit-log",
+        type=Path,
+        default=None,
+        help=(
+            "Require a READY_REQUEST_VALIDATED audit event emitted by the "
+            "long-running queue service bound to the acceptance Runtime DB"
+        ),
+    )
     args = parser.parse_args()
     result = run_acceptance(
         runtime_db=args.runtime_db,
         queue_dir=args.queue_dir,
         timeout_seconds=args.timeout_seconds,
         target_trade_date=args.target_trade_date,
+        watchdog_audit_log=args.watchdog_audit_log,
     )
     print(json.dumps(result, ensure_ascii=True, sort_keys=True))
-    return 0 if (
-        result["batch_status"] == "ACCEPTED"
-        and result["scope_complete"]
-        and result["end_marker_verified"]
-        and result["result_archived"]
-        and result["queue_counts"] == {
-            "inbox": 0,
-            "working": 0,
-            "results": 0,
-        }
-    ) else 1
+    return 0 if acceptance_gate_passed(result) else 1
 
 
 if __name__ == "__main__":

@@ -91,12 +91,13 @@ FULL_MARKET_SCAN
 本地统一回归：
 
 ```text
-pytest: 904 passed, 3 skipped, 97 subtests passed
+pytest: 907 passed, 3 skipped, 97 subtests passed
 system smoke: 16 passed, 0 failed
 ```
 
 完整 pytest 首轮仅出现一个未修改的任务 12 并发归档竞态型不稳定失败；该单项立即
-重跑通过，随后第二次完整统一回归以上述 `904 passed` 通过。
+重跑通过，随后第二次完整统一回归通过；同库 Watchdog 门禁补充 3 项测试后，最终统一
+回归以上述 `907 passed` 通过。
 
 复用优先整改后的首轮受影响专项回归：
 
@@ -259,10 +260,41 @@ platform_write_operations: 0
 日期选择、列表物化和尾部验证，不能用逐项读取区间替代全流程耗时。`PARTIAL` 仍仅由
 隔离验收 DB 的空 Mapping 集合导致。
 
-一次性 Runtime DB 与绑定真实 Runtime DB 的常驻 Watchdog 存在竞态：两个重试请求在
-Worker 领取前被正确隔离为 `ORPHAN_READY_REQUEST`。验收期间仅在活动队列为 0 时短暂
-暂停队列 Watchdog/Importer 服务，完成后已按原参数恢复；`test2` Worker 始终保持
-`RUNNING`。因此本轮不能宣称“历史一次性 DB 请求已通过常驻 Watchdog 绑定”。
+### 5.4 同库常驻 Watchdog 合并门禁
+
+2026-07-31 使用新的单个一次性 Runtime Schema v14 数据库，把常驻
+`run_shadowbot_queue_services.py`、验收 Automation Run、唯一
+`ORDER_SCAN_TARGET_SELECTED` 事件和 `OrderObservationImporter` 绑定到同一数据库，
+再次读取 2026-07-10。Watchdog 在 Worker 领取前输出一次去重的
+`READY_REQUEST_VALIDATED`；审计事件中的 attempt、Run 和目标日期与数据库记录精确
+一致。随后 Worker 生成 v6 零副作用结果，订单 Importer 原子写入批次和 20 条原始观察，
+最后归档请求、phase、结果及各自 checksum：
+
+```text
+execution_attempt_id: ORDER-READ-T1354-20260731T144733Z
+runtime_schema: v14 healthy
+platform_trade_date: 2026-07-10
+trade_day_status: CLOSED
+watchdog_validated: true
+capability_result: SUCCEEDED
+batch_status: PARTIAL
+scope_complete: true
+end_marker_verified: true
+item_count: 20
+result_imported: true
+result_archived: true
+queue_counts: inbox=0, working=0, results=0
+platform_write_operations: 0
+```
+
+`PARTIAL` 仍只由一次性数据库使用空 Mapping 集合而按合同降级为 `UNMAPPED`；页面读取、
+范围、尾部、数据库提交和归档均完整成功。验收 CLI 现将“队列/导入链通过”与“商品映射
+完整”分开判定，合法的完整 `PARTIAL / UNMAPPED` 快照可通过链路门禁，但页面能力失败、
+不完整范围、未归档、残留队列、平台写副作用或缺少 Watchdog 精确审计仍返回失败。
+
+验收完成后临时队列服务已停止，绑定真实 Runtime DB 的原常驻服务按原参数恢复；
+`test2` Worker 全程保持新鲜 `RUNNING`，`stop.signal` 不存在。真实 Runtime DB 未迁移、
+未写入订单事实，仓库未保存真实订单值、截图、平台订单号或买家 PII。
 
 ## 6. 当前限制
 
@@ -270,8 +302,8 @@ Worker 领取前被正确隔离为 `ORPHAN_READY_REQUEST`。验收期间仅在�
 - 当前日和两个历史日期已完成真实页面只读读取；7 月 30 日覆盖 5 张连续卡片，
   7 月 22 日覆盖 4 张连续卡片；7 月 10 日覆盖 20 张卡片并以 2 次 `END` 完成真实
   订单列表滚动门禁；
-- 较早历史日期全自动日期选择和订单列表实际滚动均已通过；常驻 Watchdog 与一次性
-  验收 DB 的精确绑定仍未形成合并证据；
+- 较早历史日期全自动日期选择和订单列表实际滚动均已通过；常驻 Watchdog、Worker、
+  订单 Importer 与归档已经使用同一个一次性 v14 Runtime DB 形成合并证据；
 - 复用优先整改已经删除订单专属 `_order_scroll_to_end`，商品与订单共同调用
   `_materialize_list_with_end_and_restore`；商品调用方聚焦首项，订单调用方点击
   `订单管理_容器` 右边缘空白带；共享助手重复 `END`、验证尾部、`HOME` 回顶并验证首项

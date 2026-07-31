@@ -165,13 +165,23 @@ def test_watchdog_accepts_v6_ready_request_bound_to_running_order_scan(
     request = _request(run_id)
     ShadowBotFileQueueRunner(queue_dir).start(request)
 
-    events = ShadowBotQueueWatchdog(
+    watchdog = ShadowBotQueueWatchdog(
         queue_dir,
         stale_seconds=30,
         repository=runtime,
-    ).inspect(now=NOW)
+    )
+    events = watchdog.inspect(now=NOW)
 
-    assert events == []
+    assert events == [
+        {
+            "status": "READY_REQUEST_VALIDATED",
+            "contract_version": ORDER_SCAN_CONTRACT_VERSION,
+            "execution_attempt_id": "ORDER-READ-SYNTHETIC-QUEUE",
+            "automation_run_id": run_id,
+            "requested_platform_trade_date": "2026-07-31",
+        }
+    ]
+    assert watchdog.inspect(now=NOW) == []
     assert (
         queue_dir
         / "inbox"
@@ -195,13 +205,23 @@ def test_watchdog_accepts_only_the_frozen_historical_trade_date(
     historical["instruction_hash"] = order_scan_instruction_hash(historical)
     ShadowBotFileQueueRunner(queue_dir).start(historical)
 
-    events = ShadowBotQueueWatchdog(
+    watchdog = ShadowBotQueueWatchdog(
         queue_dir,
         stale_seconds=30,
         repository=runtime,
-    ).inspect(now=NOW)
+    )
+    events = watchdog.inspect(now=NOW)
 
-    assert events == []
+    assert events == [
+        {
+            "status": "READY_REQUEST_VALIDATED",
+            "contract_version": ORDER_SCAN_CONTRACT_VERSION,
+            "execution_attempt_id": "ORDER-READ-HISTORICAL",
+            "automation_run_id": run_id,
+            "requested_platform_trade_date": "2026-07-30",
+        }
+    ]
+    assert watchdog.inspect(now=NOW) == []
     assert (
         queue_dir / "inbox" / "ORDER-READ-HISTORICAL.ready.json"
     ).exists()
@@ -210,11 +230,7 @@ def test_watchdog_accepts_only_the_frozen_historical_trade_date(
     wrong["execution_attempt_id"] = "ORDER-READ-WRONG-DATE"
     wrong["instruction_hash"] = order_scan_instruction_hash(wrong)
     ShadowBotFileQueueRunner(queue_dir).start(wrong)
-    events = ShadowBotQueueWatchdog(
-        queue_dir,
-        stale_seconds=30,
-        repository=runtime,
-    ).inspect(now=NOW)
+    events = watchdog.inspect(now=NOW)
 
     assert any(
         event.get("error_code") == "ORPHAN_READY_REQUEST"
