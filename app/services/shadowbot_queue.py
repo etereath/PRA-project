@@ -61,6 +61,70 @@ SUBMIT_PHASES = {"SUBMIT_INTENT_RECORDED", "SUBMIT_CLICKED"}
 PRE_SUBMIT_PHASES = {"CLAIMED", "UI_STARTED", "PRICE_VERIFIED", "TARGET_FILLED"}
 
 
+def read_checked_queue_json(
+    path: Path,
+    *,
+    max_bytes: int | None = None,
+) -> tuple[dict[str, Any], bytes]:
+    """Read one checksummed queue JSON object through the shared trust boundary."""
+
+    payload_bytes = Path(path).read_bytes()
+    if max_bytes is not None and len(payload_bytes) > int(max_bytes):
+        raise ValidationError(
+            "RESULT_CONTRACT_INVALID: queue JSON exceeds the size limit."
+        )
+    _verify_checksum(Path(path), payload_bytes)
+    try:
+        payload = json.loads(payload_bytes.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValidationError(
+            "RESULT_CONTRACT_INVALID: queue JSON is invalid."
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ValidationError(
+            "RESULT_CONTRACT_INVALID: queue JSON must be an object."
+        )
+    return payload, payload_bytes
+
+
+def require_fresh_running_worker(
+    queue_dir: Path,
+    *,
+    now: datetime,
+    heartbeat_max_age_seconds: float = 30.0,
+) -> dict[str, Any]:
+    """Validate the shared Worker heartbeat before publishing synchronous work."""
+
+    heartbeat_path = Path(queue_dir) / "heartbeat.json"
+    if not heartbeat_path.exists():
+        raise ValidationError("ShadowBot worker heartbeat is unavailable")
+    try:
+        payload = json.loads(
+            heartbeat_path.read_bytes().decode("utf-8-sig")
+        )
+        if not isinstance(payload, dict):
+            raise ValueError("heartbeat must be an object")
+        updated_at = datetime.fromisoformat(
+            str(payload.get("updated_at") or "").replace("Z", "+00:00")
+        )
+    except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValidationError("ShadowBot worker heartbeat is invalid") from exc
+    if (
+        str(payload.get("status") or "") != "RUNNING"
+        or updated_at.tzinfo is None
+    ):
+        raise ValidationError("ShadowBot worker is not in RUNNING state")
+    current = now
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValidationError("worker heartbeat clock must be timezone-aware")
+    age = (
+        current.astimezone(UTC) - updated_at.astimezone(UTC)
+    ).total_seconds()
+    if age < -5 or age > float(heartbeat_max_age_seconds):
+        raise ValidationError("ShadowBot worker heartbeat is stale")
+    return payload
+
+
 def _parse_shadowbot_observed_at(value: Any) -> datetime:
     text = str(value or "").strip()
     if not text:
@@ -171,11 +235,7 @@ class ShadowBotResultImporter:
         return events
 
     def import_one(self, result_path: Path) -> dict[str, Any]:
-        result_bytes = result_path.read_bytes()
-        _verify_checksum(result_path, result_bytes)
-        data = json.loads(result_bytes.decode("utf-8-sig"))
-        if not isinstance(data, dict):
-            raise ValidationError("RESULT_CONTRACT_INVALID: result JSON must be an object.")
+        data, result_bytes = read_checked_queue_json(result_path)
         execution_attempt_id = str(data.get("execution_attempt_id") or "").strip()
         if not execution_attempt_id:
             raise ValidationError("RESULT_CONTRACT_INVALID: execution_attempt_id is required.")

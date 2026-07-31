@@ -122,7 +122,35 @@ def test_order_reader_does_not_locate_a_separate_total_amount_element():
         "_order_calculate_transaction_amount(unit_price, qty)"
         in reader_source
     )
-    assert '"订单卡片字段关联校验失败: " + field' in reader_source
+    assert "window.find_all(" in reader_source
+    assert reader_source.count("window.find_all(") == 1
+    assert "_order_row_field_selector(ordinal" not in reader_source
+    assert '"grade": 2' in reader_source
+    assert '"platform_product_name": 3' in reader_source
+    assert '"order_qty": 5' in reader_source
+    assert '"unit_price": 6' in reader_source
+    assert '"order_created_at": 7' in reader_source
+    assert "_order_indexed_children_from_grade_anchor" in reader_source
+    assert "ORDER_ROW_INDEX_STEP * (ordinal - 1)" in reader_source
+    assert "expected_anchor=grade_anchor" in reader_source
+
+
+def test_order_anchor_collection_removes_only_the_repeated_grade_index():
+    source = FLOW_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    helper = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_order_row_anchor_collection_selector"
+    )
+    helper_source = ast.get_source_segment(source, helper)
+
+    assert 'ORDER_ROW_SELECTOR_TEMPLATES["grade"]' in helper_source
+    assert 'not in {"index", "acc-name", "value"}' in helper_source
+    assert 'ORDER_ROW_SELECTOR_TEMPLATES["order_qty"]' not in helper_source
+    assert 'ORDER_ROW_SELECTOR_TEMPLATES["unit_price"]' not in helper_source
+    assert 'ORDER_ROW_SELECTOR_TEMPLATES["order_created_at"]' not in helper_source
 
 
 def test_v5_waiting_row_scroll_probes_before_adaptive_keyboard_navigation():

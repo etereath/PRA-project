@@ -25,7 +25,8 @@ FULL_MARKET_SCAN
 - `ShadowBotOrderPageReader` 与 v6 合同：只允许 `READ_ONLY`，拒绝平台订单 ID、
   买家 PII、请求错绑、checksum 错误和任何平台写副作用声明；
 - `ShadowBotFileQueueOrderTransport`：复用既有单 Worker 文件队列、heartbeat、phase、
-  checksum 和归档；事实导入成功后才归档结果；
+  checksum 和归档；文件校验与 Worker 新鲜度检查使用通用队列函数，事实导入成功后
+  才归档结果；
 - 通用队列 Watchdog：识别 v6 `ORDER_SCAN` 绑定，避免把合法订单请求隔离为孤儿；
   通用 Result Importer 对 v6 让路给订单 Importer，超时恢复生成零写的 v6
   `FAILED` 结果；
@@ -81,12 +82,27 @@ FULL_MARKET_SCAN
 - 历史目标精确冻结、错日期拒绝和跨 18:00 失败关闭；
 - `18:10` 小时扫描对齐及正式只读服务组合；
 - `FULL_MARKET_SCAN → ORDER_SCAN` 父子集成。
+- 商品与订单共用列表物化助手，统一执行“聚焦首项 → `END` → 尾部验证 → `HOME`
+  → 首项恢复”；订单结果使用独立的 `scroll_count` 和
+  `scroll_progress_verified`，不再从 `page_count` 猜测滚动动作。
+- 订单只执行一次安全等级锚点集合查询，并按列表全局 index 和步长读取允许字段；
+  覆盖锚点错位、列表结构不完整和禁止字段不可访问。
 
 本地统一回归：
 
 ```text
-pytest: 896 passed, 3 skipped, 97 subtests passed
+pytest: 904 passed, 3 skipped, 97 subtests passed
 system smoke: 16 passed, 0 failed
+```
+
+完整 pytest 首轮仅出现一个未修改的任务 12 并发归档竞态型不稳定失败；该单项立即
+重跑通过，随后第二次完整统一回归以上述 `904 passed` 通过。
+
+复用优先整改后的首轮受影响专项回归：
+
+```text
+共享列表物化、任务12/13读取基线、订单Adapter/Transport、动态选择器、通用队列：
+145 passed
 ```
 
 ## 5. 受控实机 READ_ONLY
@@ -175,11 +191,73 @@ platform_write_operations: 0
 `ORDER-READ-T1354-20260731T083228Z` 又从 7 月 22 日自动向下滚动回 7 月 31 日，
 完成当前交易日 3 条订单观察。日期轮两个方向均由最终部署版本验证。
 
-仍需补验的门禁：
+### 5.2 订单列表滚动门禁补验
 
-- 三个成功批次的 `page_count` 均为 1，因此没有满足“至少一个历史日期实际发生滚动并
-  验证滚动结束”的合并门禁。7 月 30 日的 5 条记录满足连续多卡片样本，但不能替代
-  订单列表滚动批次。日期选择器滚动已通过，不等价于订单列表滚动。
+2026-07-31 根据真实页面操作复盘，确认订单卡片内的品种/等级字段会触发页面导航，
+汇总栏静态文本也不能把键盘焦点交给内部滚动容器。最终复用共享
+`_materialize_list_with_end_and_restore` 助手，仅将订单调用方的聚焦动作参数化为：
+动态定位新捕获元素 `订单管理_容器`，点击其右边缘中点附近的空白带。订单懒加载期间
+共享助手重复发送 `END` 并逐次等待，只有明确读取“没有更多了”后才发送 `HOME`、验证
+首卡恢复并解析订单。
+
+7 月 10 日受控 READ_ONLY 的脱敏结果：
+
+```text
+execution_attempt_id: ORDER-READ-T1354-20260731T130321Z
+platform_trade_date: 2026-07-10
+trade_day_status: CLOSED
+worker_status: SUCCESS
+capability_result: SUCCEEDED
+batch_status: PARTIAL
+scope_complete: true
+page_count: 1
+scroll_count: 2
+scroll_progress_verified: true
+no_more_marker_visible: true
+item_count: 20
+result_imported: true
+result_archived: true
+queue_counts: inbox=0, working=0, results=0
+platform_write_operations: 0
+```
+
+`PARTIAL` 仍仅由一次性验收 DB 使用空 Mapping 集合导致；执行端读取、重复 END、尾部、
+HOME、范围完整性、Importer 和归档均已通过。本次证据关闭了“至少一个历史日期实际进入
+订单列表滚动分支”的合并门禁；`page_count=1` 继续只表示单个订单页面范围，不用于
+推断是否发生滚动。
+
+### 5.3 订单字段按全局 index 批量读取
+
+原实现对每条订单的等级、品种、数量、单价和下单时间分别执行一次全页面元素查找，
+20 条订单共需约 100 次查找，真实页面首条至末条 `observed_at` 跨度约 29 秒。整改后
+执行端只执行一次安全等级锚点集合查询，再从共同列表容器按全局 index
+`2 / 3 / 5 / 6 / 7`、步长 `9` 读取允许字段；未访问订单号、买家或地域对应元素。
+
+第一次实机校验 `ORDER-READ-T1354-20260731T133226Z` 将 index 错误地解释为单张卡片
+内部 index，在第 3 条等级变化时由锚点一致性检查以 `ORDER_CARD_INDEX_MISMATCH`
+关闭；结果为 0 条、未导入订单事实、平台写操作为 0。修正为列表全局 index 后，
+`ORDER-READ-T1354-20260731T133619Z` 的脱敏结果为：
+
+```text
+platform_trade_date: 2026-07-10
+worker_status: SUCCESS
+capability_result: SUCCEEDED
+batch_status: PARTIAL
+scope_complete: true
+scroll_count: 1
+scroll_progress_verified: true
+no_more_marker_visible: true
+item_count: 20
+first_to_last_observed_at_span: 10s
+result_imported: true
+result_archived: true
+queue_counts: inbox=0, working=0, results=0
+platform_write_operations: 0
+```
+
+逐项读取区间由约 29 秒降至 10 秒，约为 0.5 秒/条；完整请求耗时仍同时包含进入页面、
+日期选择、列表物化和尾部验证，不能用逐项读取区间替代全流程耗时。`PARTIAL` 仍仅由
+隔离验收 DB 的空 Mapping 集合导致。
 
 一次性 Runtime DB 与绑定真实 Runtime DB 的常驻 Watchdog 存在竞态：两个重试请求在
 Worker 领取前被正确隔离为 `ORPHAN_READY_REQUEST`。验收期间仅在活动队列为 0 时短暂
@@ -190,8 +268,13 @@ Worker 领取前被正确隔离为 `ORPHAN_READY_REQUEST`。验收期间仅在�
 
 - 真实 Runtime DB 未迁移，也未写入订单事实；
 - 当前日和两个历史日期已完成真实页面只读读取；7 月 30 日覆盖 5 张连续卡片，
-  7 月 22 日覆盖 4 张连续卡片；
-- 较早历史日期全自动日期选择已通过；订单列表实际滚动批次和常驻 Watchdog 精确绑定
-  仍未形成合并证据；
+  7 月 22 日覆盖 4 张连续卡片；7 月 10 日覆盖 20 张卡片并以 2 次 `END` 完成真实
+  订单列表滚动门禁；
+- 较早历史日期全自动日期选择和订单列表实际滚动均已通过；常驻 Watchdog 与一次性
+  验收 DB 的精确绑定仍未形成合并证据；
+- 复用优先整改已经删除订单专属 `_order_scroll_to_end`，商品与订单共同调用
+  `_materialize_list_with_end_and_restore`；商品调用方聚焦首项，订单调用方点击
+  `订单管理_容器` 右边缘空白带；共享助手重复 `END`、验证尾部、`HOME` 回顶并验证首项
+  恢复。通用队列读取同时统一了 checksum JSON 和 Worker 新鲜度检查；
 - 取消、退款净额、财务实收和 `FINAL` 日结属于后续阶段；
 - 当前实现不扩大到第二平台或多 Worker 并发。

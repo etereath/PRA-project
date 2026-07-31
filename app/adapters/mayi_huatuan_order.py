@@ -35,6 +35,8 @@ CAPTURE_FIELDS = frozenset(
         "no_more_marker_visible",
         "trusted_empty_marker_visible",
         "page_count",
+        "scroll_count",
+        "scroll_progress_verified",
         "rows",
         "unavailable_code",
         "failure_code",
@@ -82,6 +84,8 @@ class MayiHuatuanOrderPageCapture:
     no_more_marker_visible: bool
     trusted_empty_marker_visible: bool
     page_count: int
+    scroll_count: int = 0
+    scroll_progress_verified: bool = False
     rows: tuple[MayiHuatuanOrderPageRow, ...] = ()
     unavailable_code: str = ""
     failure_code: str = ""
@@ -504,6 +508,12 @@ def page_capture_from_json(
             "trusted_empty_marker_visible",
         ),
         page_count=_non_negative_int(payload.get("page_count")),
+        scroll_count=_non_negative_int(payload.get("scroll_count", 0)),
+        scroll_progress_verified=(
+            _required_bool(payload, "scroll_progress_verified")
+            if "scroll_progress_verified" in payload
+            else False
+        ),
         rows=tuple(rows),
         unavailable_code=_error_code(payload.get("unavailable_code")),
         failure_code=_error_code(payload.get("failure_code")),

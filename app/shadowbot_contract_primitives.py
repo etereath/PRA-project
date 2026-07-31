@@ -279,6 +279,8 @@ def build_order_scan_failure_result(
             "no_more_marker_visible": False,
             "trusted_empty_marker_visible": False,
             "page_count": 0,
+            "scroll_count": 0,
+            "scroll_progress_verified": False,
             "rows": [],
             "unavailable_code": "",
             "failure_code": failure_code,

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import re
 import time
 from collections.abc import Callable, Mapping
@@ -16,8 +14,13 @@ from app.adapters.mayi_huatuan_order import (
     OrderReadOnlyRequest,
     page_capture_from_json,
 )
+from app.exceptions import ValidationError
 from app.services.order_observation import OrderObservationError
 from app.services.shadowbot_executor import ShadowBotFileQueueRunner
+from app.services.shadowbot_queue import (
+    read_checked_queue_json,
+    require_fresh_running_worker,
+)
 from app.shadowbot_contract_primitives import (
     ORDER_SCAN_CONTRACT_VERSION,
     ORDER_SCAN_REQUEST_SCHEMA_VERSION,
@@ -237,7 +240,16 @@ class ShadowBotFileQueueOrderTransport:
     ) -> Mapping[str, Any]:
         request_data = dict(request)
         if self.require_fresh_heartbeat:
-            self._require_running_worker()
+            try:
+                require_fresh_running_worker(
+                    self.queue_dir,
+                    now=_as_utc(self.clock()),
+                    heartbeat_max_age_seconds=(
+                        self.heartbeat_max_age_seconds
+                    ),
+                )
+            except ValidationError as exc:
+                raise OrderObservationError(str(exc)) from exc
         attempt_id = str(
             request_data.get("execution_attempt_id") or ""
         )
@@ -255,7 +267,13 @@ class ShadowBotFileQueueOrderTransport:
         next_heartbeat = self.monotonic() + 5.0
         while self.monotonic() < deadline:
             if result_path.exists():
-                result = self._read_checked_result(result_path)
+                try:
+                    result, _ = read_checked_queue_json(
+                        result_path,
+                        max_bytes=4 * 1024 * 1024,
+                    )
+                except (OSError, ValidationError) as exc:
+                    raise OrderObservationError(str(exc)) from exc
                 expected_request_sha256 = (
                     "sha256:" + self._last_request_sha256
                 )
@@ -290,81 +308,6 @@ class ShadowBotFileQueueOrderTransport:
         self.runner.archive_attempt_artifacts(attempt_id)
         self._last_attempt_id = ""
         self._last_request_sha256 = ""
-
-    def _require_running_worker(self) -> None:
-        heartbeat_path = self.queue_dir / "heartbeat.json"
-        if not heartbeat_path.exists():
-            raise OrderObservationError(
-                "ShadowBot worker heartbeat is unavailable"
-            )
-        try:
-            payload = json.loads(
-                heartbeat_path.read_bytes().decode("utf-8-sig")
-            )
-            if not isinstance(payload, dict):
-                raise ValueError("heartbeat must be an object")
-            updated_at = datetime.fromisoformat(
-                str(payload.get("updated_at") or "").replace(
-                    "Z",
-                    "+00:00",
-                )
-            )
-        except (OSError, ValueError, json.JSONDecodeError) as exc:
-            raise OrderObservationError(
-                "ShadowBot worker heartbeat is invalid"
-            ) from exc
-        if (
-            str(payload.get("status") or "") != "RUNNING"
-            or updated_at.tzinfo is None
-        ):
-            raise OrderObservationError(
-                "ShadowBot worker is not in RUNNING state"
-            )
-        age = (
-            _as_utc(self.clock()) - updated_at.astimezone(timezone.utc)
-        ).total_seconds()
-        if age < -5 or age > self.heartbeat_max_age_seconds:
-            raise OrderObservationError(
-                "ShadowBot worker heartbeat is stale"
-            )
-
-    @staticmethod
-    def _read_checked_result(
-        result_path: Path,
-    ) -> Mapping[str, Any]:
-        result_bytes = result_path.read_bytes()
-        if len(result_bytes) > 4 * 1024 * 1024:
-            raise OrderObservationError(
-                "ShadowBot order result exceeds the size limit"
-            )
-        checksum_path = result_path.with_suffix(
-            result_path.suffix + ".sha256"
-        )
-        try:
-            expected = checksum_path.read_text(
-                encoding="ascii"
-            ).strip()
-        except OSError as exc:
-            raise OrderObservationError(
-                "ShadowBot order result checksum is unavailable"
-            ) from exc
-        actual = hashlib.sha256(result_bytes).hexdigest()
-        if expected.casefold() != actual:
-            raise OrderObservationError(
-                "ShadowBot order result checksum does not match"
-            )
-        try:
-            payload = json.loads(result_bytes.decode("utf-8-sig"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise OrderObservationError(
-                "ShadowBot order result JSON is invalid"
-            ) from exc
-        if not isinstance(payload, dict):
-            raise OrderObservationError(
-                "ShadowBot order result must be an object"
-            )
-        return payload
-
 
 def _reject_forbidden_keys(value: Any) -> None:
     if isinstance(value, Mapping):
