@@ -40,8 +40,9 @@ FULL_MARKET_SCAN
 `OPEN` 不构成完整闭市事实，也不能进入 `FINAL`。
 
 订单数量使用 `order_qty`，成交金额使用 `order_transaction_amount`，汇总使用
-`transaction_amount_total`。成交金额不解释为卖家实收、扣佣收入、退款净额或财务
-到账。
+`transaction_amount_total`。执行端读取页面展示的单价与数量并使用 `Decimal` 精确
+相乘，不单独定位页面合计金额元素。成交金额不解释为卖家实收、扣佣收入、退款净额
+或财务到账。
 
 平台订单 ID 不采集。订单身份由平台、交易日、下单时间、平台品种和等级生成；数量、
 金额和观察时间进入原始内容哈希。相同指纹的真实重复订单以 `occurrence_no` 全部
@@ -75,7 +76,7 @@ FULL_MARKET_SCAN
 本地统一回归：
 
 ```text
-pytest: 886 passed, 3 skipped, 97 subtests passed
+pytest: 888 passed, 3 skipped, 97 subtests passed
 system smoke: 16 passed, 0 failed
 ```
 
@@ -107,6 +108,27 @@ platform_write_operations: 0
 后 `test2` Worker 保持新鲜 `RUNNING`，`stop.signal` 不存在，通用队列服务已恢复。
 仓库未保存真实订单值、截图、平台订单号或买家 PII。
 
+同日页面出现订单后，执行端最初因错误复用单价选择器定位合计金额而失败关闭。按业务
+裁决改为“页面单价 × 数量”后重新同步并完成真实页面复验：
+
+```text
+execution_attempt_id: ORDER-READ-T1354-20260731T041749Z
+trade_day_status: OPEN
+capability_result: SUCCEEDED
+batch_status: PARTIAL
+scope_complete: true
+end_marker_verified: true
+item_count: 1
+mapping_status: UNMAPPED
+result_imported: true
+result_archived: true
+queue_counts: inbox=0, working=0, results=0
+platform_write_operations: 0
+```
+
+`PARTIAL` 仅由隔离验收使用空 Mapping 集合导致；页面日期、订单卡片、成交金额计算和
+尾部标记均读取成功。仓库仍不保存真实订单值、截图、平台订单号或买家 PII。
+
 真实 Runtime DB 的尝试在父 run claim 前被既有
 `READ-READ-BATCH-T11-20260719-082740` 的 `NEEDS_RECONCILIATION` 正确阻断；没有绕过、
 修改或清理该账本，只精确回滚了本次验收临时创建的父 run/job。
@@ -114,6 +136,6 @@ platform_write_operations: 0
 ## 6. 当前限制
 
 - 真实 Runtime DB 未迁移，也未写入订单事实；
-- 订单卡片仍使用当前平台专属步长 `9`，但日期、字段解析和尾部标记均失败关闭；
+- 单卡片真实页面已验证当前平台专属候选步长 `9`；多卡片页面仍需继续复验；
 - 取消、退款净额、财务实收和 `FINAL` 日结属于后续阶段；
 - 当前实现不扩大到第二平台或多 Worker 并发。

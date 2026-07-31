@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import re
+from decimal import Decimal
 from pathlib import Path
 
 
@@ -74,6 +75,54 @@ def test_order_date_values_use_global_exact_accessibility_labels():
 
     assert "_exact_acc_label_selector(" in helper_source
     assert "value[\"path\"].append" not in helper_source
+
+
+def test_order_transaction_amount_is_calculated_from_displayed_price_and_qty():
+    source = FLOW_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    calculator = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_order_calculate_transaction_amount"
+    )
+    namespace = {"Decimal": Decimal}
+    module = ast.Module(body=[calculator], type_ignores=[])
+    exec(
+        compile(ast.fix_missing_locations(module), str(FLOW_PATH), "exec"),
+        namespace,
+    )
+
+    calculate = namespace["_order_calculate_transaction_amount"]
+    assert calculate("5.50", "2") == "11.00"
+    assert calculate("3.33", "3") == "9.99"
+
+
+def test_order_reader_does_not_locate_a_separate_total_amount_element():
+    source = FLOW_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    selector = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_order_row_field_selector"
+    )
+    reader = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_order_read_rows"
+    )
+    selector_source = ast.get_source_segment(source, selector)
+    reader_source = ast.get_source_segment(source, reader)
+
+    assert '"order_transaction_amount":' not in selector_source
+    assert 'read_field("unit_price", _order_normalize_amount)' in reader_source
+    assert (
+        "_order_calculate_transaction_amount(unit_price, qty)"
+        in reader_source
+    )
+    assert '"订单卡片字段关联校验失败: " + field' in reader_source
 
 
 def test_v5_waiting_row_scroll_probes_before_adaptive_keyboard_navigation():

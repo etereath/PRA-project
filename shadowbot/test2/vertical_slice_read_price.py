@@ -164,7 +164,6 @@ ORDER_DATE_PICKER_SELECTORS = {
     "cancel": "订单管理_订单日期选择_选择框取消按钮",
 }
 ORDER_ROW_INDEX_STEP = 9
-ORDER_TRANSACTION_AMOUNT_INDEX = 8
 ORDER_LIST_END_LABEL = "没有更多了"
 ORDER_LIST_EMPTY_LABEL = "暂无订单"
 V5_KEYBOARD_LOAD_WAIT_SECONDS = 0.1
@@ -6592,7 +6591,6 @@ def _order_row_field_selector(row_ordinal, field):
         "order_qty": 5,
         "unit_price": 6,
         "order_created_at": 7,
-        "order_transaction_amount": ORDER_TRANSACTION_AMOUNT_INDEX,
     }.get(field)
     if base_index is None:
         raise SliceError(
@@ -6600,11 +6598,8 @@ def _order_row_field_selector(row_ordinal, field):
             "不支持的订单字段",
             retryable=False,
         )
-    template_field = (
-        "unit_price" if field == "order_transaction_amount" else field
-    )
     return _clone_order_row_selector(
-        ORDER_ROW_SELECTOR_TEMPLATES[template_field],
+        ORDER_ROW_SELECTOR_TEMPLATES[field],
         "动态_订单_%d_%s" % (int(row_ordinal), field),
         base_index + ORDER_ROW_INDEX_STEP * (int(row_ordinal) - 1),
     )
@@ -6917,6 +6912,10 @@ def _order_normalize_amount(value):
     return format(amount, "f")
 
 
+def _order_calculate_transaction_amount(unit_price, qty):
+    return format(Decimal(str(unit_price)) * Decimal(str(qty)), "f")
+
+
 def _order_normalize_created_at(value):
     match = re.search(
         r"(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})",
@@ -6950,48 +6949,30 @@ def _order_read_rows(window, timeout_seconds, max_rows):
             )
         except SliceError:
             break
-        try:
-            product_name = _read_text(
-                window,
-                _order_row_field_selector(
-                    ordinal,
-                    "platform_product_name",
-                ),
-                timeout_seconds,
-            )
-            qty = _order_normalize_qty(
-                _read_text(
+
+        def read_field(field, normalizer=None):
+            try:
+                value = _read_text(
                     window,
-                    _order_row_field_selector(ordinal, "order_qty"),
+                    _order_row_field_selector(ordinal, field),
                     timeout_seconds,
                 )
-            )
-            amount = _order_normalize_amount(
-                _read_text(
-                    window,
-                    _order_row_field_selector(
-                        ordinal,
-                        "order_transaction_amount",
-                    ),
-                    timeout_seconds,
+                return normalizer(value) if normalizer is not None else value
+            except SliceError as exc:
+                raise SliceError(
+                    exc.code,
+                    "订单卡片字段关联校验失败: " + field,
+                    retryable=exc.retryable,
                 )
-            )
-            created_at = _order_normalize_created_at(
-                _read_text(
-                    window,
-                    _order_row_field_selector(
-                        ordinal,
-                        "order_created_at",
-                    ),
-                    timeout_seconds,
-                )
-            )
-        except SliceError as exc:
-            raise SliceError(
-                exc.code,
-                "订单卡片字段关联校验失败",
-                retryable=exc.retryable,
-            )
+
+        product_name = read_field("platform_product_name")
+        qty = read_field("order_qty", _order_normalize_qty)
+        unit_price = read_field("unit_price", _order_normalize_amount)
+        amount = _order_calculate_transaction_amount(unit_price, qty)
+        created_at = read_field(
+            "order_created_at",
+            _order_normalize_created_at,
+        )
         grade = str(grade or "").strip()
         product_name = str(product_name or "").strip()
         if not grade or not product_name:

@@ -8,7 +8,7 @@ PRA 当前定位为：
 
 鲜切花预测性销售决策系统 + 运行态任务运营后台。
 
-PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、多商品、受控 RPA 改价与上下架闭环；任务 13.5 已插入任务 13 与任务 14 之间，用于补齐 18:00 平台交易日/20:00 卖家作业日双时间轴、持续只读扫描、历史订单观察、销售日结、S0–S4 异常治理、任务来源对齐、受控紧急保护和运营 Web 重写。当前 13.5-1 已完成双时间轴、Runtime Schema v14、六级质量约束和日结状态机；13.5-2 已通过 PR #23 合并商品映射编译、扫描 JSON 输入、任务 13 双页快照适配和 v14 商品观察导入；13.5-3 已通过 PR #24 合并独立 Automation Service 的计划窗口、租约、合并、补跑、父子 run、心跳和健康控制面。13.5-4 已实现订单只读合同、蚂蚁花团 Adapter、平台无关 Importer、v6 ShadowBot 只读队列边界和 `FULL_MARKET_SCAN → ORDER_SCAN → ORDER_HISTORY_IMPORT` 接入；当前日按 `OPEN`、历史日按 `CLOSED`，重复订单按指纹多重集合保留。受控真实页面 READ_ONLY 已使用一次性 v14 Runtime DB 验收可信空页、完整范围、尾部标记、导入归档和零平台写副作用；真实 Runtime DB 因既有 `NEEDS_RECONCILIATION` 安全门禁保持未迁移、未写入订单事实，因此仍不承诺生产级无人值守写操作，也未扩展到第二平台。系统核心职责是：
+PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、多商品、受控 RPA 改价与上下架闭环；任务 13.5 已插入任务 13 与任务 14 之间，用于补齐 18:00 平台交易日/20:00 卖家作业日双时间轴、持续只读扫描、历史订单观察、销售日结、S0–S4 异常治理、任务来源对齐、受控紧急保护和运营 Web 重写。当前 13.5-1 已完成双时间轴、Runtime Schema v14、六级质量约束和日结状态机；13.5-2 已通过 PR #23 合并商品映射编译、扫描 JSON 输入、任务 13 双页快照适配和 v14 商品观察导入；13.5-3 已通过 PR #24 合并独立 Automation Service 的计划窗口、租约、合并、补跑、父子 run、心跳和健康控制面。13.5-4 已实现订单只读合同、蚂蚁花团 Adapter、平台无关 Importer、v6 ShadowBot 只读队列边界和 `FULL_MARKET_SCAN → ORDER_SCAN → ORDER_HISTORY_IMPORT` 接入；当前日按 `OPEN`、历史日按 `CLOSED`，重复订单按指纹多重集合保留。受控真实页面 READ_ONLY 已使用一次性 v14 Runtime DB 验收可信空页和完整有数据页、范围与尾部标记、单价乘数量、导入归档和零平台写副作用；真实 Runtime DB 因既有 `NEEDS_RECONCILIATION` 安全门禁保持未迁移、未写入订单事实，因此仍不承诺生产级无人值守写操作，也未扩展到第二平台。系统核心职责是：
 
 - 从 Excel 读取业务输入。
 - 根据规则和预测输入生成运行态任务。
@@ -105,10 +105,13 @@ v6 ShadowBot 请求/结果和既有文件队列传输，并通过 Automation 父
 `FULL_MARKET_SCAN → ORDER_SCAN → ORDER_HISTORY_IMPORT`。当前交易日保存为
 `OPEN`，历史交易日保存为 `CLOSED`；完整有数据页要求验证滚动和“没有更多了”，
 可信空页要求“暂无订单”。平台订单 ID 和买家 PII 被合同拒绝，相同指纹的真实重复
-订单用 `occurrence_no` 保留。页面数量和金额分别固定为 `order_qty` 与
-`order_transaction_amount`，取消推导留到 13.5-5。真实 Runtime DB 仍未写入订单事实，
-受控实机验收已在一次性 v14 Runtime DB 上通过：当前交易日 `OPEN`、可信空页、
-`scope_complete=true`、`end_marker_verified=true`、结果已导入归档且平台写操作为 0。
+订单用 `occurrence_no` 保留。页面数量固定为 `order_qty`；执行端用页面单价乘数量
+计算 `order_transaction_amount`，不单独定位合计金额元素。取消推导留到 13.5-5。
+真实 Runtime DB 仍未写入订单事实，
+受控实机验收已在一次性 v14 Runtime DB 上通过：当前交易日 `OPEN` 的可信空页和
+完整有数据页均已验证，最新有数据页为 `scope_complete=true`、
+`end_marker_verified=true`，结果已导入归档且平台写操作为 0；批次仅因隔离验收使用
+空 Mapping 集合而标记 `PARTIAL / UNMAPPED`。
 通用队列 Watchdog 已识别 v6 `ORDER_SCAN` Run 绑定，旧版 Result Importer 不再抢占
 订单结果，超时恢复保持 v6 零写语义。
 
