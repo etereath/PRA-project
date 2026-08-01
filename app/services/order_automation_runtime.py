@@ -7,6 +7,9 @@ from pathlib import Path
 from app.adapters.mayi_huatuan_order import MayiHuatuanOrderReadOnlyAdapter
 from app.automation_models import AutomationRun
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.repositories.operational_summary_repository import (
+    OperationalSummaryRepository,
+)
 from app.services.automation import (
     AutomationHandler,
     FULL_MARKET_SCAN,
@@ -23,6 +26,7 @@ from app.services.shadowbot_order_read import (
     ShadowBotFileQueueOrderTransport,
     ShadowBotOrderPageReader,
 )
+from app.services.trade_day_settlement import TradeDaySettlementService
 
 
 def build_order_read_only_handlers(
@@ -42,6 +46,9 @@ def build_order_read_only_handlers(
         timeout_seconds=timeout_seconds,
     )
     reader = ShadowBotOrderPageReader(transport)
+    settlement_service = TradeDaySettlementService(
+        OperationalSummaryRepository(runtime_repository)
+    )
     order_handler = OrderScanHandler(
         adapter=MayiHuatuanOrderReadOnlyAdapter(
             reader,
@@ -60,6 +67,7 @@ def build_order_read_only_handlers(
             if target_trade_date is not None
             else lambda run: run.platform_trade_date
         ),
+        post_import_refresh=settlement_service.refresh_after_order_import,
     )
     return {
         FULL_MARKET_SCAN: FullMarketScanOrderDispatchHandler(),

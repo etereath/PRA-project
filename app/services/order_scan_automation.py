@@ -42,6 +42,7 @@ class OrderScanHandler:
     target_trade_date: Callable[[AutomationRun], date] = (
         lambda run: run.platform_trade_date
     )
+    post_import_refresh: Callable[..., object] | None = None
 
     def __call__(
         self,
@@ -71,6 +72,17 @@ class OrderScanHandler:
                 mappings=self.mappings_provider(),
                 claim=context.claim,
             )
+            if (
+                self.post_import_refresh is not None
+                and imported.batch_status in {"ACCEPTED", "PARTIAL"}
+            ):
+                self.post_import_refresh(
+                    platform_name=run.platform_name,
+                    platform_trade_date=(
+                        imported.requested_platform_trade_date
+                    ),
+                    observation_batch_id=imported.observation_batch_id,
+                )
             acknowledge = getattr(
                 reader,
                 "acknowledge_last_result",

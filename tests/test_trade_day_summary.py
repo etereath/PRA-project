@@ -193,6 +193,8 @@ def _finalize(service: TradeDaySummaryService, summary_id: str):
         inputs=(*_input("order-1"), *_input("scan-1")),
         changed_by="finalization-service",
         trigger_type="FINALIZATION_POLICY",
+        trigger_ref_id="test-finalization-policy-v1",
+        finalization_validator=lambda connection: None,
     )
 
 
@@ -291,6 +293,35 @@ def test_finalization_is_blocked_by_open_s3_incident(
 
     with pytest.raises(ValueError, match="blocking S3/S4"):
         _finalize(service, summary_id)
+
+
+def test_finalization_requires_atomic_evidence_validator(
+    summary_service,
+) -> None:
+    service, _, _ = summary_service
+    summary_id = _create_provisional(service).summary.summary_id
+    _observe(service, summary_id)
+    _reconcile(service, summary_id)
+
+    with pytest.raises(ValueError, match="atomic evidence validator"):
+        service.transition(
+            summary_id,
+            to_status=SummaryStatus.FINAL,
+            fact_source=FactSource.ORDER_OBSERVED,
+            quality_level=DataQualityLevel.ORDER_COMPLETE,
+            sold_qty=11,
+            order_count=5,
+            transaction_amount_total=Decimal("123.45"),
+            quality_reason="missing validator",
+            source_proportions={"ORDER_OBSERVED": 1.0},
+            input_manifest_sha256="sha256:no-validator",
+            mapping_version="mapping-v1",
+            algorithm_version="final-v1",
+            inputs=_input("order-1"),
+            changed_by="test",
+            trigger_type="FINALIZATION_POLICY",
+            trigger_ref_id="policy-v1",
+        )
 
 
 def test_finalization_rechecks_concurrent_incident_in_write_transaction(

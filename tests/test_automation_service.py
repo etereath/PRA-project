@@ -2299,7 +2299,11 @@ def test_once_cli_writes_stopped_heartbeat_and_default_jobs(
     assert completed.returncode == 0, completed.stderr + completed.stdout
     payload = json.loads(heartbeat.read_text(encoding="utf-8"))
     assert payload["status"] == "STOPPED"
-    assert payload["mode"] == "SCHEDULER_ONLY"
+    assert payload["mode"] == "SETTLEMENT_ONLY"
+    assert payload["registered_job_types"] == [
+        "PLATFORM_TRADE_DAY_SETTLEMENT",
+        "SALES_PLAN_INPUT_BUILD",
+    ]
     runtime_repository = SQLiteRuntimeRepository(runtime_db)
     stored_jobs = AutomationRepository(runtime_repository).list_jobs()
     assert len(stored_jobs) == 8

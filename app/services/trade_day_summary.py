@@ -82,6 +82,8 @@ class TradeDaySummaryService:
         time_policy_version: str = (
             DEFAULT_OPERATIONAL_TIME_POLICY_VERSION
         ),
+        transaction_validator: Callable[[object], None] | None = None,
+        connection=None,
     ) -> SummaryMutationResult:
         now = _require_aware(self._clock())
         series_id = build_summary_series_id(
@@ -90,7 +92,10 @@ class TradeDaySummaryService:
             scope_type=scope_type,
             scope_key=scope_key,
         )
-        existing = self.repository.get_current_summary(series_id)
+        existing = self.repository.get_current_summary(
+            series_id,
+            connection=connection,
+        )
         if existing is not None:
             if (
                 existing.summary_status is SummaryStatus.PROVISIONAL
@@ -150,7 +155,13 @@ class TradeDaySummaryService:
             reason=quality_reason,
         )
         input_rows = tuple(inputs)
-        self.repository.insert_initial(summary, event, input_rows)
+        self.repository.insert_initial(
+            summary,
+            event,
+            input_rows,
+            transaction_validator=transaction_validator,
+            connection=connection,
+        )
         return SummaryMutationResult(
             summary=summary,
             changed=True,
@@ -177,8 +188,25 @@ class TradeDaySummaryService:
         changed_by: str,
         trigger_type: str,
         trigger_ref_id: str = "",
+        finalization_validator: Callable[[object], None] | None = None,
+        transaction_validator: Callable[[object], None] | None = None,
+        connection=None,
     ) -> SummaryMutationResult:
-        before = self._require_current(summary_id)
+        before = self._require_current(summary_id, connection=connection)
+        if to_status is SummaryStatus.FINAL:
+            if finalization_validator is None:
+                raise ValueError(
+                    "FINAL requires an atomic evidence validator"
+                )
+            if trigger_type != "FINALIZATION_POLICY":
+                raise ValueError(
+                    "FINAL requires trigger_type FINALIZATION_POLICY"
+                )
+            _require_text(trigger_ref_id, "trigger_ref_id")
+        elif finalization_validator is not None:
+            raise ValueError(
+                "Atomic finalization validator is only valid for FINAL"
+            )
         if (
             before.summary_status is to_status
             and before.input_manifest_sha256 == input_manifest_sha256
@@ -205,6 +233,7 @@ class TradeDaySummaryService:
                 changed_by=changed_by,
                 trigger_type="MATERIAL_INPUT_REVISION",
                 trigger_ref_id=trigger_ref_id,
+                connection=connection,
             )
         if not same_status_material_revision:
             expected = ALLOWED_SUMMARY_TRANSITIONS.get(
@@ -257,6 +286,9 @@ class TradeDaySummaryService:
             after=after,
             event=event,
             inputs=input_rows,
+            finalization_validator=finalization_validator,
+            transaction_validator=transaction_validator,
+            connection=connection,
         ):
             raise RuntimeError(
                 "Summary changed concurrently; reload before retrying"
@@ -286,10 +318,12 @@ class TradeDaySummaryService:
         changed_by: str,
         trigger_type: str = "MATERIAL_INPUT_REVISION",
         trigger_ref_id: str = "",
+        transaction_validator: Callable[[object], None] | None = None,
+        connection=None,
     ) -> SummaryMutationResult:
         """Audit a PROVISIONAL update or restart later states as OBSERVED."""
 
-        previous = self._require_current(summary_id)
+        previous = self._require_current(summary_id, connection=connection)
         if previous.summary_status is SummaryStatus.PROVISIONAL:
             return self.transition(
                 summary_id,
@@ -308,6 +342,8 @@ class TradeDaySummaryService:
                 changed_by=changed_by,
                 trigger_type=trigger_type,
                 trigger_ref_id=trigger_ref_id,
+                transaction_validator=transaction_validator,
+                connection=connection,
             )
         return self._create_revision(
             previous=previous,
@@ -325,6 +361,83 @@ class TradeDaySummaryService:
             changed_by=changed_by,
             trigger_type=trigger_type,
             trigger_ref_id=trigger_ref_id,
+            connection=connection,
+        )
+
+    def refresh_non_final_from_order(
+        self,
+        summary_id: str,
+        *,
+        quality_level: DataQualityLevel,
+        sold_qty: int,
+        order_count: int,
+        transaction_amount_total: Decimal,
+        quality_reason: str,
+        source_proportions: dict,
+        input_manifest_sha256: str,
+        mapping_version: str,
+        algorithm_version: str,
+        inputs: Iterable[TradeDaySummaryInput],
+        changed_by: str,
+        trigger_ref_id: str = "",
+        connection=None,
+    ) -> SummaryMutationResult:
+        """Refresh one non-FINAL version after immutable order backfill."""
+
+        previous = self._require_current(summary_id, connection=connection)
+        if previous.summary_status is SummaryStatus.FINAL:
+            raise ValueError("FINAL must be refreshed through revise_final")
+        if previous.input_manifest_sha256 == input_manifest_sha256:
+            return SummaryMutationResult(summary=previous, changed=False)
+        now = _require_aware(self._clock())
+        refreshed = replace(
+            previous,
+            fact_source=FactSource.ORDER_OBSERVED,
+            quality_level=quality_level,
+            summary_status=SummaryStatus.OBSERVED,
+            sold_qty=sold_qty,
+            order_count=order_count,
+            transaction_amount_total=transaction_amount_total,
+            quality_reason=quality_reason,
+            source_proportions=dict(source_proportions),
+            input_manifest_sha256=_require_text(
+                input_manifest_sha256,
+                "input_manifest_sha256",
+            ),
+            mapping_version=mapping_version,
+            algorithm_version=_require_text(
+                algorithm_version,
+                "algorithm_version",
+            ),
+            finalized_at=None,
+            updated_at=now,
+        )
+        _validate_summary(refreshed)
+        event = _build_event(
+            summary=refreshed,
+            from_summary=previous,
+            changed_at=now,
+            changed_by=changed_by,
+            trigger_type="LATE_ORDER_REFRESH",
+            trigger_ref_id=trigger_ref_id,
+            reason=quality_reason,
+        )
+        input_rows = tuple(inputs)
+        if not self.repository.transition(
+            before=previous,
+            after=refreshed,
+            event=event,
+            inputs=input_rows,
+            connection=connection,
+        ):
+            raise RuntimeError(
+                "Summary changed concurrently; reload before retrying"
+            )
+        return SummaryMutationResult(
+            summary=refreshed,
+            changed=True,
+            event=event,
+            inputs=input_rows,
         )
 
     def revise_final(
@@ -344,8 +457,9 @@ class TradeDaySummaryService:
         inputs: Iterable[TradeDaySummaryInput],
         changed_by: str,
         trigger_ref_id: str = "",
+        connection=None,
     ) -> SummaryMutationResult:
-        previous = self._require_current(summary_id)
+        previous = self._require_current(summary_id, connection=connection)
         if previous.summary_status is not SummaryStatus.FINAL:
             raise ValueError("Only a current FINAL summary can be revised")
         return self._create_revision(
@@ -364,6 +478,7 @@ class TradeDaySummaryService:
             changed_by=changed_by,
             trigger_type="LATE_DATA_REVISION",
             trigger_ref_id=trigger_ref_id,
+            connection=connection,
         )
 
     def _create_revision(
@@ -384,6 +499,7 @@ class TradeDaySummaryService:
         changed_by: str,
         trigger_type: str,
         trigger_ref_id: str,
+        connection=None,
     ) -> SummaryMutationResult:
         if previous.input_manifest_sha256 == input_manifest_sha256:
             return SummaryMutationResult(summary=previous, changed=False)
@@ -431,6 +547,7 @@ class TradeDaySummaryService:
             revision=revision,
             event=event,
             inputs=input_rows,
+            connection=connection,
         ):
             raise RuntimeError(
                 "Summary changed concurrently; reload before retrying"
@@ -445,8 +562,13 @@ class TradeDaySummaryService:
     def _require_current(
         self,
         summary_id: str,
+        *,
+        connection=None,
     ) -> PlatformTradeDaySummary:
-        summary = self.repository.get_summary(summary_id)
+        summary = self.repository.get_summary(
+            summary_id,
+            connection=connection,
+        )
         if summary is None:
             raise ValueError(f"Unknown summary_id: {summary_id}")
         if not summary.is_current:
