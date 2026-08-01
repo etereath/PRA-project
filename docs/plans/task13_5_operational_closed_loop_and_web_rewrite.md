@@ -472,22 +472,33 @@ Issue #20 中的细分来源名称是运营语义，不扩张为第二套数据�
 
 ### 8.1 统一异常分类
 
-`category` 只能使用以下稳定值：
+运营表和通知使用中文名称；英文稳定代码只用于合同、数据库和排障。初始类别为：
 
-- `PLATFORM_LOGIN`
-- `PLATFORM_NETWORK`
-- `PAGE_STRUCTURE`
-- `SCAN_INCOMPLETE`
-- `WORKER_UNAVAILABLE`
-- `QUEUE_BACKLOG`
-- `PRODUCT_MAPPING`
-- `PRICE_ANOMALY`
-- `INVENTORY_ANOMALY`
-- `ORDER_PAGE_UNAVAILABLE`
-- `ORDER_DATA_INCONSISTENT`
-- `SALES_ESTIMATE_LOW_CONFIDENCE`
-- `NOTIFICATION_FAILURE`
-- `WRITE_UNKNOWN`
+- 平台登录异常（`PLATFORM_LOGIN`）
+- 平台网络异常（`PLATFORM_NETWORK`）
+- 页面结构异常（`PAGE_STRUCTURE`）
+- 扫描不完整（`SCAN_INCOMPLETE`）
+- Worker 不可用（`WORKER_UNAVAILABLE`）
+- 队列积压（`QUEUE_BACKLOG`）
+- 商品映射异常（`PRODUCT_MAPPING`）
+- 价格异常（`PRICE_ANOMALY`）
+- 库存异常（`INVENTORY_ANOMALY`）
+- 订单页面不可用（`ORDER_PAGE_UNAVAILABLE`）
+- 订单数据不一致（`ORDER_DATA_INCONSISTENT`）
+- 销售估算置信度低（`SALES_ESTIMATE_LOW_CONFIDENCE`）
+- 通知投递异常（`NOTIFICATION_FAILURE`）
+- 写结果不明（`WRITE_UNKNOWN`）
+- 自动化服务异常（`AUTOMATION_SERVICE`）
+- 运行数据库或存储异常（`RUNTIME_STORAGE`）
+- 队列或结果导入异常（`QUEUE_IMPORT`）
+- 交易日或系统时间异常（`TRADE_DAY_TIME`）
+- 商品上下架状态异常（`LISTING_STATE`）
+- 成本或经营主数据异常（`MASTER_DATA`）
+- 日结处理异常（`SETTLEMENT_PROCESSING`）
+- 人工复核通道异常（`REVIEW_CHANNEL`）
+
+登录凭据、日期选择、单次重试、映射候选等细节继续使用稳定 reason code，不扩张为
+独立类别。严重度表示当前业务风险，不是类别的永久属性。
 
 ### 8.2 严重度和处置策略
 
@@ -496,67 +507,65 @@ Issue #20 中的细分来源名称是运营语义，不扩张为第二套数据�
 | `S0` | `INFO` | 记录信息，不要求处置 |
 | `S1` | `LOW` | 日报汇总 |
 | `S2` | `MEDIUM` | 首次提醒；未解决时按较长周期提醒 |
-| `S3` | `HIGH` | 立即通知并默认每 10 分钟重复提醒，直到介入或解决 |
-| `S4` | `CRITICAL` | 立即通知，默认每 5 分钟重复提醒；必要时进入受控自动保护 |
+| `S3` | `HIGH` | 立即通知，目标响应时限 30 分钟；按处置状态跟进 |
+| `S4` | `CRITICAL` | 立即请求复核；只有极端低价可评估受控自动保护 |
 
 每个异常至少记录：
 
 - 稳定异常代码和去重指纹。
 - 严重度、当前状态、首次出现、最后出现和累计次数。
 - 影响平台、商品、订单摘要、运行或批次。
-- 责任人、确认时间、处置截止时间。
-- 自动处理记录、人工处理记录和恢复证据。
-- `OPEN / RETRYING / WAITING_HUMAN / ACKNOWLEDGED / AUTO_PROTECTING /
-  RESOLVED / CLOSED` 状态；确认不等于已解决。
+- 不可变检测、状态变化、Review、Run、Task 和恢复证据引用。
+- `OPEN / WAITING_HUMAN / AUTO_PROTECTING / RESOLVED / CLOSED` 核心状态。
 
 自动处理只允许安全重试、重新只读扫描、补发通知和恢复数据库投影。任何可能重复产生
 平台副作用的异常仍必须遵守写锁、phase 和唯一 RECONCILE。
 
+`ACK` 是事件，不是主状态，也不是复核结果。`RETRYING/ACKNOWLEDGED` 仅为 v14 历史
+兼容值，新 Incident 流程不再写入。提醒按“需要什么业务动作”发送；S4 价格 Review
+最多为初始消息和一次中途提醒，不再每 5 分钟无限广播。
+
 ### 8.3 S4 紧急下架
 
-普通低于成本异常可以是 S3。S4 仍是任务 13.5 的完成目标，但不在 13.5-1 固化最终
-方案。实施顺序为：
+普通低于成本异常是 S3，极端低价才是可进入自动保护评估的 S4。实施顺序为：
 
-1. 先完成异常发现、重复通知、人工确认、豁免、修价和人工下架闭环。
-2. 在 13.5-6 使用 13.5-2～5 的真实扫描、销售和人工处置数据冻结最终策略。
-3. 策略结构完成迁移、管理员预审批并启用后，才允许编码和开放自动保护。
+1. v15 增加 `occurrence_count` 和一张 append-only Incident Event 表，先完成人工闭环；
+2. v16 增加一张极简 `emergency_offline_policies`，只进行影子判定；
+3. 专用授权通过受控验收后，才允许临时开放一次自动下架。
 
 在上述门禁全部完成前，`automatic_emergency_offline=false`，任何 Agent、Web、Scheduler
 或脚本都不得创建或执行 `SYSTEM_EMERGENCY` 自动下架。
 
-版本化 `EmergencyPolicy` 至少冻结：
+最低安全价固定为商品 `base_cost`；缺失基础成本视为主数据损坏并 fail closed。使用
+Decimal 精确计算，紧急比例固定为 `0.80`：
 
 ```text
-policy_version
-enabled
-effective_from
-effective_until
-cost_source
-cost_freshness_limit
-emergency_price_threshold
-first_alert_wait_window
-second_observation_requirement
-max_auto_offline_per_product_trade_day
-cooldown_window
-forbidden_conditions
-auto_relist = false
+异常低价且 P >= base_cost                 → 首次 S1，连续两次 S2
+base_cost × 0.80 < P < base_cost           → S3，只允许人工处置
+P <= base_cost × 0.80                      → S4，先发起人工复核
 ```
 
-只有命中已启用策略并同时满足下列流程，才允许紧急下架：
+人工复核只提供：`改价到（输入值） / 立即下架 / 我来处理`。前两项分别复用任务 12
+v4 `UPDATE_PRICE` 和任务 13 v5 `SET_OFFLINE`；“我来处理”不创建平台任务。任一复核
+结果都结束本轮无人值守路径，ACK 不算复核结果。
+
+只有命中已批准、未退休策略并同时满足下列流程，才允许无人值守紧急下架：
 
 1. 第一次完整观察创建 Incident 并通知。
-2. 等待策略规定的一个完整 `ONLINE_PULSE` 周期。
-3. 重新读取当前价格，并检查期间是否有人工作业、豁免或状态变化。
-4. 若条件仍成立且无人工干预，创建 `SYSTEM_EMERGENCY` 授权和单一
+2. Outbox 明确发送成功后，等待下一个计划槽的另一个完整、已导入 `ONLINE_PULSE`；
+   失败、不完整或错过的 Pulse 只延后，跨 18:00 则重新建轮次。
+3. 重新读取当前价格、在线状态、`base_cost`、策略、Review 和写锁。
+4. 若紧急情况仍存在且没有复核结果，创建 `SYSTEM_EMERGENCY` 授权和单一
    `SET_OFFLINE` 业务任务。
 5. 复用 v5 写动作和 Importer；结果为 UNKNOWN 时只允许现有唯一 RECONCILE。
 
 以下任一条件存在时禁止自动下架：映射不是 `VERIFIED`、成本缺失或过期、价格不可读、
-扫描不完整、存在活动/UNKNOWN/Review 阻塞写锁、商品已下架、达到每商品每交易日
-次数上限、处于冷却期、策略未启用/未生效/已过期、人工已介入/豁免或页面结构异常。
+扫描不完整、存在活动/UNKNOWN 写锁、商品已下架、策略未批准/已退休、功能开关关闭、
+Review 有结果或其通知未确认送达，以及页面结构异常。
 
-Incident ACK、Review 已处理、保护暂停、策略修改/停用、人工写任务、人工修价/下架/
-豁免均视为人工已经介入并阻止本轮自动保护。紧急下架后不得自动重新上架。
+不使用每商品每日次数上限或冷却期。紧急下架后不得自动重新上架；人工重新上架后若
+条件仍成立，重新走正常 S3/S4 检测和 Review。详细合同以
+[任务 13.5-6 审查计划](task13_5_6_incident_and_emergency_protection_review_plan.md)为准。
 
 ## 9. Web 前端重写
 
@@ -647,6 +656,8 @@ Web 主控端以运营人员的工作问题组织页面：
 
 - `operational_incidents`
 - `incident_notification_state`
+- v15 `operational_incident_events`
+- v16 `emergency_offline_policies`
 
 ### 10.5 现有表扩展
 
@@ -665,8 +676,8 @@ Web 主控端以运营人员的工作问题组织页面：
 - `listing_anomaly_cases` 与 `operational_incidents` 的兼容投影，避免两个异常系统。
 
 核心 v14 只在任务来源字段中预留 `SYSTEM_EMERGENCY` 和策略扩展边界。
-`emergency_action_policies` 的最终字段、约束和迁移在进入 13.5-6 前冻结；具体 Schema
-版本号由该阶段决定，不在核心 v14 提前固化尚无运营证据的策略字段。
+13.5-6 已裁决 v15 只增加 Incident 出现次数、事件流水和类别扩展，v16 只增加极简
+`emergency_offline_policies`；授权证据复用 Automation Event，不新增授权表。
 
 ## 11. 调度、幂等和恢复要求
 
@@ -722,8 +733,8 @@ Web 主控端以运营人员的工作问题组织页面：
 - 冻结 `fact_source / quality_level / summary_status` 三个正交维度、六级数据质量矩阵和
   `PROVISIONAL → OBSERVED → RECONCILED → FINAL`。
 - 冻结自动化账本、观察批次、日结、任务来源和 Incident 核心合同。
-- 预留 `SYSTEM_EMERGENCY` 来源和扩展边界，但不冻结最终 S4 阈值、成本新鲜度、
-  等待周期、次数上限或冷却时间，不实现自动紧急下架。
+- 预留 `SYSTEM_EMERGENCY` 来源和扩展边界；该阶段不实现自动紧急下架。最终 S4
+  业务口径已在后续 13.5-6 计划中冻结，不回填或改写核心 v14。
 
 验收：质量矩阵和日结状态机先通过评审，随后 17:59、18:00、19:59、20:00 边界
 测试、迁移测试和事务失败注入通过。
@@ -786,15 +797,17 @@ Web 主控端以运营人员的工作问题组织页面：
 
 ### T13.5-6：异常、重复提醒与紧急保护
 
-- 落实 S0–S4、固定类别、状态机、指纹、确认、指派和恢复时间线。
-- 先完成 S3/S4 重复提醒，以及人工确认、豁免、修价和人工下架闭环。
-- 使用 13.5-2～5 的真实数据和处置经验评审并冻结 S4 策略。
-- 在自动保护编码前迁移策略结构，落实管理员预授权、二次观察、次数上限、冷却、
-  禁止条件和 `auto_relist=false`。
-- 实现 `SYSTEM_EMERGENCY`、v5 下架和 UNKNOWN 恢复。
+- 13.5-6A-0 以 v15 增加 `occurrence_count`、Incident Event 和类别扩展。
+- 13.5-6A-1 复用 Review、Mobile Review、Outbox、飞书和 Worker 恢复完成人工闭环。
+- 人工复核固定为“改价到 / 立即下架 / 我来处理”，分别复用 v4/v5 或进入人工等待。
+- 13.5-6B 以 v16 迁移极简策略：最低安全价为 `base_cost`，紧急比例为 `0.80`；
+  shadow/dry-run 不创建任务。
+- 13.5-6C 只在极端低价仍存在、没有复核结果、另一个完整 Pulse 已导入时创建
+  `SYSTEM_EMERGENCY`，复用 v5 下架和 UNKNOWN 恢复。
+- 不增加每日次数上限、冷却、自动重新上架或通用策略引擎。
 
-验收：人工闭环和支撑数据先通过评审；确认不等于解决；同异常不刷屏；禁止条件逐项
-阻断；紧急下架后不能自动上架。
+验收：人工闭环和支撑数据先通过评审；ACK 只是事件；同异常不刷屏；Worker 异常运行
+完整恢复程序；禁止条件逐项阻断；紧急下架后不能自动上架。
 
 ### T13.5-7：控制服务、脚本和任务来源对齐
 
@@ -862,8 +875,10 @@ Web 主控端以运营人员的工作问题组织页面：
 - 重复商品身份、商品双页出现、双页缺失和订单业务键冲突。
 - Worker 心跳失效、Outbox 堵塞、磁盘不足和备份失败。
 - UNKNOWN 只由现有唯一 RECONCILE 恢复。
-- S3/S4 重复提醒符合策略，`ACKNOWLEDGED` 不关闭未解决异常。
-- S4 二次观察、人工干预、成本新鲜度、映射、页面完整性和写锁禁止条件逐项通过。
+- 通知按业务动作和状态提醒；ACK 不关闭异常，也不作为 S4 复核结果。
+- Worker 不可用执行既有完整恢复链，不重复启动或覆盖活动请求。
+- S4 只对极端低价开放；`base_cost`、`0.80`、第二个完整 Pulse、无复核结果、映射、
+  页面完整性、功能开关和写锁门禁逐项通过。
 - 紧急下架后只允许人工审查重新上架。
 
 ### 14.4 Web
@@ -902,10 +917,10 @@ Web 主控端以运营人员的工作问题组织页面：
 1. 不营业日、临时维护窗口和节假日的维护方式。
 2. 非交易时段脉冲是否降频，以及错过运行的最大补跑窗口。
 3. 订单页面可稳定读取的历史天数、分页范围和取消量推导方法。
-4. S4 阈值、成本新鲜度、人工豁免、策略审批人、次数上限、冷却和回滚规则；这些内容
-   在 13.5-6 编码前冻结，不是 13.5-1 或核心 v14 门禁。
-5. S3/S4 通知对象、响应时限和重复提醒升级路径。
-6. 运营员与管理员的最小权限差异。
+4. S4 价格口径已冻结为 `base_cost × 0.80`，最低安全价为 `base_cost`；策略审批人为
+   管理员，且不使用次数上限和冷却。编码时只需冻结配置落点、迁移和回滚步骤。
+5. 通知动作和响应时限已冻结；编码时只需确认当前飞书收件范围和运营文案。
+6. 管理员负责策略版本/开关，运营员负责 Review 和任务；更复杂权限不在本阶段。
 7. 自动化、日志、订单观察、商品观察和证据的保留周期。
 8. 冷态/暖态扫描、页面首屏和列表查询的 SLO。
 9. 模板层是否引入 Jinja；若引入，必须补齐 wheel 依赖和隔离安装测试。

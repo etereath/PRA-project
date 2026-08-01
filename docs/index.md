@@ -18,6 +18,7 @@
 - [plans/task13_5_4_order_history_observation_contract.md](plans/task13_5_4_order_history_observation_contract.md)：任务13.5-4 订单字段、`OPEN/CLOSED`、多重集合、完整性、Importer 和 v6 零写合同。
 - [plans/task13_5_5_sales_estimation_settlement_contract.md](plans/task13_5_5_sales_estimation_settlement_contract.md)：任务13.5-5 库存估算资格、已知调整、订单/估算权威、取消推导和 FINAL 门禁。
 - [reports/task13_5_5_sales_settlement.md](reports/task13_5_5_sales_settlement.md)：任务13.5-5 销量估算、订单权威、取消多重集合、交易日日结、计划输入和 Automation 接入实施报告。
+- [plans/task13_5_6_incident_and_emergency_protection_review_plan.md](plans/task13_5_6_incident_and_emergency_protection_review_plan.md)：任务13.5-6 已评议的 Incident 人工闭环、复用矩阵、Worker 恢复、`base_cost × 0.80` 极端低价、三个复核动作、极简策略和受控 v5 下架计划。
 - [reports/task13_5_4_order_page_exploration_20260731.md](reports/task13_5_4_order_page_exploration_20260731.md)：蚂蚁花团订单页无副作用探索、元素步长和数据最小化证据。
 - [reports/task13_5_4_order_observation.md](reports/task13_5_4_order_observation.md)：任务13.5-4 实施、测试、迁移纠正和实机验收报告。
 - [plans/task13_5_operational_closed_loop_and_web_rewrite.md](plans/task13_5_operational_closed_loop_and_web_rewrite.md)：任务13.5双时间轴、自动扫描、历史订单观察、销售日结、S0–S4、受控紧急保护、任务来源对齐和Web主控重写实施计划。

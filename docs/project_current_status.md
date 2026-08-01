@@ -10,6 +10,8 @@ PRA 当前定位为：
 
 PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、多商品、受控 RPA 改价与上下架闭环；任务 13.5 已插入任务 13 与任务 14 之间，用于补齐 18:00 平台交易日/20:00 卖家作业日双时间轴、持续只读扫描、历史订单观察、销售日结、S0–S4 异常治理、任务来源对齐、受控紧急保护和运营 Web 重写。当前 13.5-1 已完成双时间轴、Runtime Schema v14、六级质量约束和日结状态机；13.5-2 已通过 PR #23 合并商品映射编译、扫描 JSON 输入、任务 13 双页快照适配和 v14 商品观察导入；13.5-3 已通过 PR #24 合并独立 Automation Service 的计划窗口、租约、合并、补跑、父子 run、心跳和健康控制面。13.5-4 已实现订单只读合同、蚂蚁花团 Adapter、平台无关 Importer、v6 ShadowBot 只读队列边界和 `FULL_MARKET_SCAN → ORDER_SCAN → ORDER_HISTORY_IMPORT` 接入；当前日按 `OPEN`、历史日按 `CLOSED`，重复订单按指纹多重集合保留。最新审查修复已增加历史目标日期 Run Event 精确冻结、Watchdog/Importer 全链路绑定、`HH:10` 完整扫描、跨 18:00 整批失败和正式 Automation Service 只读 Handler 组合。受控真实页面 READ_ONLY 已完成 2026-07-31、2026-07-30 和 2026-07-22 三日期矩阵，分别读取 3、5、4 条并完成范围/尾部验证、导入归档和零平台写副作用；日期轮已修复“隐藏日期存在于无障碍树却不在视口”的误判，从 7 月 30 日到 7 月 22 日的向上滚动以及从 7 月 22 日回到 7 月 31 日的向下滚动、确认和精确日期回读均已通过。2026-07-10 又完成 20 条历史订单 READ_ONLY：订单调用方点击新捕获的 `订单管理_容器` 右边缘空白带，共享助手发送 2 次 `END` 后验证“没有更多了”，再由 `HOME` 恢复首卡；`scroll_progress_verified=true`，订单列表真实滚动门禁已关闭。复用优先整改保留商品和订单共用的参数化列表物化助手，并以 `scroll_count / scroll_progress_verified` 独立记录滚动证据。真实 Runtime DB 因既有 `NEEDS_RECONCILIATION` 安全门禁保持未迁移、未写入订单事实，因此仍不承诺生产级无人值守写操作，也未扩展到第二平台。系统核心职责是：
 
+13.5-6 当前处于编码前计划冻结。已逐项确认：v15 只为 Incident 增加出现次数、类别扩展和一张不可变事件表；v16 只增加极简紧急下架策略表；Review、Mobile Review、飞书 Outbox、Automation Run、Worker 恢复、v4 改价、v5 下架、共享写锁、Importer 和唯一 RECONCILE 均优先复用。价格异常的最低安全价为商品 `base_cost`，极端线为 `base_cost × 0.80`；S3/S4 人工操作固定为“改价到 / 立即下架 / 我来处理”。只有极端低价在另一个完整 `ONLINE_PULSE` 后仍存在且没有复核结果时，才允许评估 `SYSTEM_EMERGENCY`；不使用每日次数上限、冷却或自动重新上架。当前仍为纯计划，`automatic_emergency_offline=false`。
+
 - 从 Excel 读取业务输入。
 - 根据规则和预测输入生成运行态任务。
 - 用 SQLite 保存运行态事实。
