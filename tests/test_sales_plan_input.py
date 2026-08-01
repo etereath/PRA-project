@@ -295,6 +295,107 @@ def test_trusted_empty_early_snapshot_is_confirmed_zero() -> None:
     assert early["transaction_amount_total"] == "0"
 
 
+def test_stale_empty_snapshot_and_later_failure_are_not_trusted() -> None:
+    stale_empty = _order_snapshot(
+        "batch-s",
+        completed_at=datetime(2026, 8, 1, 10, 10, tzinfo=timezone.utc),
+        items=(),
+    )
+    later_failure = _order_snapshot(
+        "batch-f",
+        completed_at=datetime(2026, 8, 1, 11, 50, tzinfo=timezone.utc),
+        capability_result="FAILED",
+        source_batch_status="FAILED",
+    )
+
+    manifest = SalesPlanInputService(
+        FakePlanRepository(
+            summaries=(_summary(),),
+            orders=(stale_empty, later_failure),
+        )
+    ).build(
+        platform_name=PLATFORM,
+        settled_platform_trade_date=SETTLED_DATE,
+        plan_for_seller_operation_date=PLAN_DATE,
+        as_of=AS_OF,
+    )
+
+    early = manifest.payload["pre_plan_early_signal"]
+    assert early["quality_state"] == "EVIDENCE_INSUFFICIENT"
+    assert early["trusted_zero"] is False
+    assert early["sold_qty"] is None
+    assert early["reason"] == "LATER_ORDER_SCAN_FAILED_OR_INCOMPLETE"
+    assert {
+        ref_id
+        for input_type, ref_id, _ in manifest.input_refs
+        if input_type == "EARLY_ORDER_OBSERVATION_BATCH"
+    } == {"batch-s", "batch-f"}
+
+
+def test_stale_empty_snapshot_without_boundary_coverage_is_not_trusted() -> None:
+    stale_empty = _order_snapshot(
+        "batch-s",
+        completed_at=datetime(2026, 8, 1, 10, 10, tzinfo=timezone.utc),
+        items=(),
+    )
+    manifest = SalesPlanInputService(
+        FakePlanRepository(summaries=(_summary(),), orders=(stale_empty,))
+    ).build(
+        platform_name=PLATFORM,
+        settled_platform_trade_date=SETTLED_DATE,
+        plan_for_seller_operation_date=PLAN_DATE,
+        as_of=AS_OF,
+    )
+
+    early = manifest.payload["pre_plan_early_signal"]
+    assert early["quality_state"] == "EVIDENCE_INSUFFICIENT"
+    assert early["trusted_zero"] is False
+    assert early["reason"] == "ORDER_SNAPSHOT_STALE_AT_PLAN_BOUNDARY"
+
+
+def test_latest_fresh_complete_snapshot_wins() -> None:
+    older = _order_snapshot(
+        "batch-o",
+        completed_at=datetime(2026, 8, 1, 11, 52, tzinfo=timezone.utc),
+        items=(
+            _order_item(
+                "older",
+                created_at=datetime(2026, 8, 1, 10, 30, tzinfo=timezone.utc),
+                qty=1,
+                amount="12",
+            ),
+        ),
+    )
+    newer = _order_snapshot(
+        "batch-n",
+        completed_at=datetime(2026, 8, 1, 12, 1, tzinfo=timezone.utc),
+        items=(
+            _order_item(
+                "newer",
+                created_at=datetime(2026, 8, 1, 11, 30, tzinfo=timezone.utc),
+                qty=2,
+                amount="24",
+            ),
+        ),
+    )
+    manifest = SalesPlanInputService(
+        FakePlanRepository(
+            summaries=(_summary(),),
+            orders=(older, newer),
+        )
+    ).build(
+        platform_name=PLATFORM,
+        settled_platform_trade_date=SETTLED_DATE,
+        plan_for_seller_operation_date=PLAN_DATE,
+        as_of=AS_OF,
+    )
+
+    early = manifest.payload["pre_plan_early_signal"]
+    assert early["quality_state"] == "CONFIRMED"
+    assert early["observation_batch_id"] == "batch-n"
+    assert early["sold_qty"] == 2
+
+
 def test_low_quality_and_historical_plan_are_not_executable() -> None:
     partial = _summary(
         quality=DataQualityLevel.ORDER_PARTIAL,
@@ -311,7 +412,12 @@ def test_low_quality_and_historical_plan_are_not_executable() -> None:
         as_of=AS_OF,
     )
     historical = SalesPlanInputService(
-        FakePlanRepository(summaries=(_summary(),))
+        FakePlanRepository(
+            summaries=(_summary(),),
+            orders=(
+                _order_snapshot("batch-h", completed_at=AS_OF, items=()),
+            ),
+        )
     ).build(
         platform_name=PLATFORM,
         settled_platform_trade_date=SETTLED_DATE,
@@ -324,6 +430,9 @@ def test_low_quality_and_historical_plan_are_not_executable() -> None:
     assert historical.projection_role == "AUDIT_ONLY"
     assert historical.payload["plan_input_status"] == "INELIGIBLE"
     assert "HISTORICAL_AUDIT_ONLY" in historical.payload["ineligibility_reasons"]
+    historical_early = historical.payload["pre_plan_early_signal"]
+    assert historical_early["projection_role"] == "AUDIT_ONLY"
+    assert historical_early["operational_use_allowed"] is False
 
 
 @pytest.mark.parametrize(

@@ -42,8 +42,10 @@ Automation Run 的输入/输出 hash；没有销售平台副作用。
   `inventory-adjustment-attestation-v1` 结构化 resolution payload；
 - 没有覆盖声明时固定为 `ADJUSTMENT_COVERAGE_UNPROVEN`，不能把库存下降默认当作销售。
 
-Repository 对 segment 使用确定性 ID、精确重放和同 ID 异内容冲突拒绝。`created_at`
-只是落库元数据，不会让同一算法输入的安全重放误报冲突。
+Repository 对 segment 使用确定性 ID、精确重放和同 ID 异内容冲突拒绝。调整引用及
+未决写、冲突、关键扫描失败等规范化证据 manifest 已进入 v2 segment 身份；事后补充
+人工证明会追加新 segment，旧证据仍保留审计。选数只采用同算法、同观察区间最新的
+不可变证据版本；`created_at` 不会让相同证据的安全重放误报冲突。
 
 ## 3. 订单权威与取消
 
@@ -88,6 +90,11 @@ OBSERVED 必须绑定已接受订单批次。非零订单/估算差异必须有�
 批次、复算数量/订单数/成交金额、验证 hash、映射和时间策略，并重算相邻取消比较。
 若对账后出现更新订单批次，即使汇总数值恰好相同，也必须重新对账，不能直接 FINAL。
 
+历史订单导入回调已复用同一多范围事务：在一个 `BEGIN IMMEDIATE` 中冻结 current
+summaries、订单、估算和 SKU 维度，重新计算全部范围；非 FINAL 原版本刷新，FINAL 创建
+OBSERVED supersedes，新出现的品种、等级、SKU 和时间桶按既有状态机创建。任一范围
+故障会回滚全部修改，不会出现部分范围已修订、其余范围仍引用旧证据。
+
 ## 5. Automation 与计划输入
 
 Automation Service 继续注册两个无 UI、无平台写 Handler：
@@ -113,7 +120,9 @@ Handler 复用现有 Run、租约、心跳、输入 manifest 绑定和完成接�
 投影汇总以下销售过程中已能采集的事实：
 
 - 已结算销量、成交金额、观察订单数、品种、等级、SKU 和本地小时桶；
-- 当前计划前 18:00–20:00 的 OPEN 订单早期信号，严格按 `order_created_at` 归属；
+- 当前计划前 18:00–20:00 的 OPEN 订单早期信号，严格按 `order_created_at` 归属；只有
+  20:00 前后10分钟内完成的完整已接受快照、且其后没有失败或不完整扫描，才能确认总量
+  或可信零值；否则输出 `EVIDENCE_INSUFFICIENT` 和 NULL；
 - 每个 SKU 的开盘/收盘/最低/最高库存和价格、价格变化次数、在售观察次数；
 - 数据质量、投影资格和全部来源引用。
 
@@ -147,19 +156,21 @@ algorithm version、原始 JSON 或 supersedes ID。可信空页显示“当天�
 
 - 正、负、零库存调整和调整去重；
 - 缺少覆盖声明、未知或未决写、上架重设、target inventory、映射和扫描间隔门禁；
-- segment 精确重放与冲突；
+- segment 精确重放、冲突、事后补证重物化和当前证据版本选择；
 - 完整/部分/OPEN/可信空订单和订单优先级；
 - 重复订单、取消多重集合、歧义和禁止重复扣减；
 - 多范围 PROVISIONAL、单向状态机和 FINAL 同事务复算；
-- 历史订单回补后的同版本刷新、FINAL supersedes 修订和精确重放；
+- 历史订单回补后的同版本刷新、FINAL supersedes、新范围创建、多范围故障整体回滚和
+  精确重放；
+- 18:10空页、边界快照、后续失败、较新完整快照、20:00新鲜度和历史 `AUDIT_ONLY`；
 - 统一流水线、快照回读、计划资格、价格/库存轨迹、报告三态和事件大小门禁；
 - Automation 租约、manifest、输出事件及零平台副作用。
 
 本地 Ready-for-review 验证结果：
 
-- 本轮最终新增/受影响专项：`52 passed`；事务与汇总定向回归：`35 passed`；
-- 完整 pytest：`961 passed, 3 skipped, 97 subtests passed`；
-- 临时 v14 Runtime DB 系统冒烟：16 项通过、0 项失败。
+- 最新复审整改联合专项：`54 passed`；受影响集成：`105 passed`；
+- 完整 pytest：`968 passed, 3 skipped, 97 subtests passed`；
+- 复审整改后临时 v14 Runtime DB 系统冒烟：16 项通过、0 项失败。
 
 2026-08-01 追加执行蚂蚁花团订单管理页实机 READ_ONLY，目标平台交易日为
 `2026-07-10`。主 Runtime DB 中既有 `NEEDS_RECONCILIATION` 正确阻断了 UI 通道，验收

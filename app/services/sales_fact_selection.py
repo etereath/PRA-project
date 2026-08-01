@@ -92,11 +92,12 @@ class SalesFactSelectionService:
             if estimate_algorithm_version is not None
             else _latest_algorithm_version(scope_segments)
         )
-        selected_segments = tuple(
+        algorithm_segments = tuple(
             segment
             for segment in scope_segments
             if segment.algorithm_version == chosen_algorithm
         )
+        selected_segments = _latest_evidence_segments(algorithm_segments)
         if scope == "TIME_BUCKET":
             bucket_start, bucket_end = _time_bucket_window(
                 platform_trade_date,
@@ -412,6 +413,44 @@ def _latest_algorithm_version(
         segments,
         key=lambda item: (item.created_at, item.algorithm_version),
     ).algorithm_version
+
+
+def _latest_evidence_segments(
+    segments: tuple[SalesEstimateSegment, ...],
+) -> tuple[SalesEstimateSegment, ...]:
+    """Keep the newest immutable evidence revision for each interval."""
+
+    current: dict[tuple[object, ...], SalesEstimateSegment] = {}
+    for segment in segments:
+        identity = (
+            segment.platform_name,
+            segment.internal_sku,
+            segment.platform_trade_date,
+            segment.interval_started_at,
+            segment.interval_ended_at,
+            segment.supporting_observation_ids,
+            segment.algorithm_version,
+        )
+        previous = current.get(identity)
+        if previous is None or (
+            segment.created_at,
+            segment.estimate_segment_id,
+        ) > (
+            previous.created_at,
+            previous.estimate_segment_id,
+        ):
+            current[identity] = segment
+    return tuple(
+        sorted(
+            current.values(),
+            key=lambda item: (
+                item.interval_started_at,
+                item.interval_ended_at,
+                item.internal_sku,
+                item.estimate_segment_id,
+            ),
+        )
+    )
 
 
 def _observed_window(

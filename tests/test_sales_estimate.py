@@ -22,6 +22,8 @@ from app.services.sales_estimate import (
     SalesEstimateError,
     SalesEstimateService,
 )
+from app.services.sales_fact_selection import SalesFactSelectionService
+from app.services.trade_day_settlement import TradeDaySettlementService
 
 
 TRADE_DATE = date(2026, 7, 31)
@@ -330,6 +332,126 @@ def test_estimate_repository_exact_replay_and_conflict(tmp_path: Path) -> None:
         repository.append_estimate_segment(
             replace(segment, estimated_sold_qty=99)
         )
+
+
+def test_estimate_identity_versions_immutable_adjustment_evidence() -> None:
+    before = _point("before", observed_at=START, inventory=20)
+    after = _point(
+        "after",
+        observed_at=START + timedelta(minutes=10),
+        inventory=18,
+    )
+    service = SalesEstimateService(
+        clock=lambda: START + timedelta(hours=1)
+    )
+
+    unproven = service.calculate_segment(before, after)
+    confirmed = service.calculate_segment(
+        before,
+        after,
+        adjustments=(_attestation("late"),),
+    )
+    replay = service.calculate_segment(
+        before,
+        after,
+        adjustments=(_attestation("late"),),
+    )
+
+    assert not unproven.estimation_eligible
+    assert confirmed.estimation_eligible
+    assert unproven.estimate_segment_id != confirmed.estimate_segment_id
+    assert confirmed.estimate_segment_id == replay.estimate_segment_id
+    assert confirmed.estimate_segment_id.startswith("estimate-segment-v2-")
+
+
+def test_late_attestation_rematerializes_and_selects_current_evidence(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    runtime = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
+    runtime.init_schema()
+    repository = OperationalSummaryRepository(runtime)
+    clock_values = iter(
+        (
+            START + timedelta(hours=1),
+            START + timedelta(hours=2),
+            START + timedelta(hours=3),
+        )
+    )
+    estimate_service = SalesEstimateService(clock=lambda: next(clock_values))
+    settlement_service = TradeDaySettlementService(
+        repository,
+        estimate_service=estimate_service,
+    )
+    points = (
+        _point("before", observed_at=START, inventory=20),
+        _point(
+            "after",
+            observed_at=START + timedelta(minutes=10),
+            inventory=18,
+        ),
+    )
+    current_adjustments = []
+    monkeypatch.setattr(
+        repository,
+        "list_inventory_observations",
+        lambda **_kwargs: points,
+    )
+    monkeypatch.setattr(
+        repository,
+        "list_product_scan_executions",
+        lambda **_kwargs: (),
+    )
+    monkeypatch.setattr(
+        repository,
+        "list_inventory_adjustment_sources",
+        lambda **_kwargs: tuple(current_adjustments),
+    )
+    monkeypatch.setattr(
+        repository,
+        "has_unresolved_inventory_write",
+        lambda **_kwargs: False,
+    )
+
+    unproven = settlement_service.materialize_estimates(
+        platform_name="platform",
+        platform_trade_date=TRADE_DATE,
+    )[0]
+    current_adjustments.append(_attestation("late-materialized"))
+    confirmed = settlement_service.materialize_estimates(
+        platform_name="platform",
+        platform_trade_date=TRADE_DATE,
+    )[0]
+    replay = settlement_service.materialize_estimates(
+        platform_name="platform",
+        platform_trade_date=TRADE_DATE,
+    )[0]
+
+    stored = repository.list_estimate_segments(
+        platform_name="platform",
+        platform_trade_date=TRADE_DATE,
+    )
+    selected = SalesFactSelectionService().select(
+        platform_name="platform",
+        platform_trade_date=TRADE_DATE,
+        scope_type="PLATFORM",
+        scope_key="platform",
+        order_snapshots=(),
+        estimate_segments=stored,
+        estimate_algorithm_version=estimate_service.algorithm_version,
+        coverage_started_at=START,
+        coverage_ended_at=START + timedelta(minutes=10),
+    )
+
+    assert not unproven.estimation_eligible
+    assert confirmed.estimation_eligible
+    assert confirmed.estimate_segment_id != unproven.estimate_segment_id
+    assert replay.estimate_segment_id == confirmed.estimate_segment_id
+    assert len(stored) == 2
+    assert selected.sold_qty == 2
+    assert {ref[1] for ref in selected.input_refs} == {
+        confirmed.estimate_segment_id
+    }
 
 
 def test_review_attestation_is_auditable_adjustment_source(

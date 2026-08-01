@@ -233,6 +233,7 @@ class TradeDaySummaryService:
                 changed_by=changed_by,
                 trigger_type="MATERIAL_INPUT_REVISION",
                 trigger_ref_id=trigger_ref_id,
+                connection=connection,
             )
         if not same_status_material_revision:
             expected = ALLOWED_SUMMARY_TRANSITIONS.get(
@@ -360,6 +361,7 @@ class TradeDaySummaryService:
             changed_by=changed_by,
             trigger_type=trigger_type,
             trigger_ref_id=trigger_ref_id,
+            connection=connection,
         )
 
     def refresh_non_final_from_order(
@@ -455,8 +457,9 @@ class TradeDaySummaryService:
         inputs: Iterable[TradeDaySummaryInput],
         changed_by: str,
         trigger_ref_id: str = "",
+        connection=None,
     ) -> SummaryMutationResult:
-        previous = self._require_current(summary_id)
+        previous = self._require_current(summary_id, connection=connection)
         if previous.summary_status is not SummaryStatus.FINAL:
             raise ValueError("Only a current FINAL summary can be revised")
         return self._create_revision(
@@ -475,6 +478,7 @@ class TradeDaySummaryService:
             changed_by=changed_by,
             trigger_type="LATE_DATA_REVISION",
             trigger_ref_id=trigger_ref_id,
+            connection=connection,
         )
 
     def _create_revision(
@@ -495,6 +499,7 @@ class TradeDaySummaryService:
         changed_by: str,
         trigger_type: str,
         trigger_ref_id: str,
+        connection=None,
     ) -> SummaryMutationResult:
         if previous.input_manifest_sha256 == input_manifest_sha256:
             return SummaryMutationResult(summary=previous, changed=False)
@@ -542,6 +547,7 @@ class TradeDaySummaryService:
             revision=revision,
             event=event,
             inputs=input_rows,
+            connection=connection,
         ):
             raise RuntimeError(
                 "Summary changed concurrently; reload before retrying"

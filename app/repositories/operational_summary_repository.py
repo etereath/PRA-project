@@ -462,19 +462,22 @@ class OperationalSummaryRepository:
         *,
         platform_name: str,
         platform_trade_date: date,
+        connection=None,
     ) -> tuple[PlatformTradeDaySummary, ...]:
-        with closing(self.runtime_repository.connect_read()) as connection:
-            rows = connection.execute(
-                """
-                SELECT *
-                FROM platform_trade_day_summaries
-                WHERE platform_name = ?
-                  AND platform_trade_date = ?
-                  AND is_current = 1
-                ORDER BY scope_type, scope_key
-                """,
-                (platform_name, platform_trade_date.isoformat()),
-            ).fetchall()
+        query = """
+            SELECT *
+            FROM platform_trade_day_summaries
+            WHERE platform_name = ?
+              AND platform_trade_date = ?
+              AND is_current = 1
+            ORDER BY scope_type, scope_key
+        """
+        values = (platform_name, platform_trade_date.isoformat())
+        if connection is not None:
+            rows = connection.execute(query, values).fetchall()
+        else:
+            with closing(self.runtime_repository.connect_read()) as read_connection:
+                rows = read_connection.execute(query, values).fetchall()
         return tuple(_row_to_summary(row) for row in rows)
 
     def list_sku_dimensions(
@@ -598,44 +601,37 @@ class OperationalSummaryRepository:
         revision: PlatformTradeDaySummary,
         event: TradeDaySummaryEvent,
         inputs: Iterable[TradeDaySummaryInput],
+        connection=None,
     ) -> bool:
         input_rows = tuple(inputs)
+        if connection is not None:
+            return _insert_revision_rows(
+                connection,
+                previous=previous,
+                revision=revision,
+                event=event,
+                input_rows=input_rows,
+            )
         with closing(
             self.runtime_repository.connect_write()
-        ) as connection:
+        ) as write_connection:
             try:
-                connection.execute("BEGIN IMMEDIATE")
-                cursor = connection.execute(
-                    """
-                    UPDATE platform_trade_day_summaries
-                    SET is_current = 0
-                    WHERE summary_id = ?
-                      AND summary_status = ?
-                      AND is_current = 1
-                      AND input_manifest_sha256 = ?
-                    """,
-                    (
-                        previous.summary_id,
-                        previous.summary_status.value,
-                        previous.input_manifest_sha256,
-                    ),
+                write_connection.execute("BEGIN IMMEDIATE")
+                changed = _insert_revision_rows(
+                    write_connection,
+                    previous=previous,
+                    revision=revision,
+                    event=event,
+                    input_rows=input_rows,
                 )
-                if cursor.rowcount != 1:
-                    connection.rollback()
+                if not changed:
+                    write_connection.rollback()
                     return False
-                _insert_summary(connection, revision)
-                _insert_summary_inputs(
-                    connection,
-                    revision.summary_id,
-                    revision.input_manifest_sha256,
-                    input_rows,
-                )
-                _insert_event(connection, event)
-                connection.commit()
+                write_connection.commit()
                 return True
             except Exception:
-                if connection.in_transaction:
-                    connection.rollback()
+                if write_connection.in_transaction:
+                    write_connection.rollback()
                 raise
 
     def count_blocking_incidents(self, summary_id: str) -> int:
@@ -1036,6 +1032,42 @@ def _insert_initial_rows(
         input_rows,
     )
     _insert_event(connection, event)
+
+
+def _insert_revision_rows(
+    connection,
+    *,
+    previous: PlatformTradeDaySummary,
+    revision: PlatformTradeDaySummary,
+    event: TradeDaySummaryEvent,
+    input_rows: tuple[TradeDaySummaryInput, ...],
+) -> bool:
+    cursor = connection.execute(
+        """
+        UPDATE platform_trade_day_summaries
+        SET is_current = 0
+        WHERE summary_id = ?
+          AND summary_status = ?
+          AND is_current = 1
+          AND input_manifest_sha256 = ?
+        """,
+        (
+            previous.summary_id,
+            previous.summary_status.value,
+            previous.input_manifest_sha256,
+        ),
+    )
+    if cursor.rowcount != 1:
+        return False
+    _insert_summary(connection, revision)
+    _insert_summary_inputs(
+        connection,
+        revision.summary_id,
+        revision.input_manifest_sha256,
+        input_rows,
+    )
+    _insert_event(connection, event)
+    return True
 
 
 def _transition_rows(

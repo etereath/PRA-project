@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -133,6 +134,12 @@ class SalesEstimateService:
                 before,
                 after,
                 algorithm_version=self.algorithm_version,
+                adjustment_refs=refs,
+                unresolved_inventory_write=unresolved_inventory_write,
+                conflicting_observation=conflicting_observation,
+                critical_scan_failure=critical_scan_failure,
+                overlaps_existing=overlaps_existing,
+                merged_full_scan_replacement=merged_full_scan_replacement,
             ),
             platform_name=before.platform_name,
             internal_sku=internal_sku,
@@ -452,18 +459,48 @@ def _segment_id(
     after: InventoryObservationPoint,
     *,
     algorithm_version: str,
+    adjustment_refs: tuple[InventoryAdjustmentSourceRef, ...],
+    unresolved_inventory_write: bool,
+    conflicting_observation: bool,
+    critical_scan_failure: bool,
+    overlaps_existing: bool,
+    merged_full_scan_replacement: bool,
 ) -> str:
-    identity = "\x1f".join(
-        (
-            before.platform_name,
-            before.internal_sku or "",
-            before.platform_trade_date.isoformat(),
-            before.observation_item_id,
-            after.observation_item_id,
-            algorithm_version,
-        )
+    evidence_manifest = {
+        "adjustment_refs": [
+            {
+                "adjustment_id": ref.adjustment_id,
+                "source_type": ref.source_type,
+                "source_ref_id": ref.source_ref_id,
+                "adjustment_qty": ref.adjustment_qty,
+                "occurred_at": ref.occurred_at.astimezone(
+                    timezone.utc
+                ).isoformat(),
+                "evidence_sha256": ref.evidence_sha256,
+            }
+            for ref in adjustment_refs
+        ],
+        "unresolved_inventory_write": unresolved_inventory_write,
+        "conflicting_observation": conflicting_observation,
+        "critical_scan_failure": critical_scan_failure,
+        "overlaps_existing": overlaps_existing,
+        "merged_full_scan_replacement": merged_full_scan_replacement,
+    }
+    identity = json.dumps(
+        {
+            "platform_name": before.platform_name,
+            "internal_sku": before.internal_sku or "",
+            "platform_trade_date": before.platform_trade_date.isoformat(),
+            "before_observation_item_id": before.observation_item_id,
+            "after_observation_item_id": after.observation_item_id,
+            "algorithm_version": algorithm_version,
+            "evidence_manifest": evidence_manifest,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
     )
-    return "estimate-segment-v1-" + hashlib.sha256(
+    return "estimate-segment-v2-" + hashlib.sha256(
         identity.encode("utf-8")
     ).hexdigest()
 

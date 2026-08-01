@@ -19,6 +19,7 @@ from app.services.operational_time import OperationalTimeService
 
 
 SALES_PLAN_INPUT_VERSION = "sales-plan-input-v2"
+EARLY_SIGNAL_MAX_STALENESS = timedelta(minutes=10)
 PLAN_ELIGIBLE_QUALITIES = frozenset(
     {
         DataQualityLevel.ORDER_COMPLETE,
@@ -146,12 +147,13 @@ class SalesPlanInputService:
             platform_name=platform_name,
             platform_trade_date=plan_date,
         )
-        early_order_payload, early_ref = self._early_order_projection(
+        early_order_payload, early_refs = self._early_order_projection(
             early_orders,
             plan_for_seller_operation_date=plan_date,
+            observed_as_of=observed_as_of,
+            projection_role=projection_role,
         )
-        if early_ref is not None:
-            input_refs.append(early_ref)
+        input_refs.extend(early_refs)
 
         seller_started_at, seller_ended_at = (
             self.operational_time.seller_operation_day_window(plan_date)
@@ -234,15 +236,21 @@ class SalesPlanInputService:
         snapshots: tuple[OrderSnapshot, ...],
         *,
         plan_for_seller_operation_date: date,
-    ) -> tuple[dict[str, object], tuple[str, str, str] | None]:
-        candidates = tuple(
+        observed_as_of: datetime,
+        projection_role: str,
+    ) -> tuple[
+        dict[str, object],
+        tuple[tuple[str, str, str], ...],
+    ]:
+        visible = tuple(
             snapshot
             for snapshot in snapshots
-            if snapshot.trade_day_status == "OPEN"
-            and snapshot.capability_result == "SUCCEEDED"
-            and snapshot.source_batch_status == "ACCEPTED"
-            and snapshot.scope_complete
-            and snapshot.end_marker_verified
+            if snapshot.scan_completed_at <= observed_as_of
+        )
+        candidates = tuple(
+            snapshot
+            for snapshot in visible
+            if _acceptable_open_snapshot(snapshot)
         )
         latest = max(
             candidates,
@@ -253,27 +261,102 @@ class SalesPlanInputService:
             default=None,
         )
         if latest is None:
-            state = "UNAVAILABLE" if snapshots else "NO_DATA"
+            state = "UNAVAILABLE" if visible else "NO_DATA"
+            latest_visible = (
+                max(
+                    visible,
+                    key=lambda item: (
+                        item.scan_completed_at,
+                        item.observation_batch_id,
+                    ),
+                )
+                if visible
+                else None
+            )
+            refs = (
+                (_early_order_ref(latest_visible),)
+                if latest_visible is not None
+                else ()
+            )
             return (
                 {
                     "feature_role": "PRE_PLAN_EARLY_SIGNAL",
+                    "projection_role": projection_role,
+                    "operational_use_allowed": False,
                     "quality_state": state,
                     "order_count": None,
                     "sold_qty": None,
                     "transaction_amount_total": None,
+                    "trusted_zero": False,
                     "reason": (
                         "NO_ACCEPTABLE_OPEN_ORDER_SNAPSHOT"
-                        if snapshots
+                        if visible
                         else "NO_ORDER_SNAPSHOT"
                     ),
                 },
-                None,
+                refs,
             )
         seller_start, _ = self.operational_time.seller_operation_day_window(
             plan_for_seller_operation_date,
             policy_version=latest.time_policy_version,
         )
         early_start = seller_start - timedelta(hours=2)
+        freshness_started_at = (
+            seller_start - EARLY_SIGNAL_MAX_STALENESS
+        )
+        freshness_ended_at = seller_start + EARLY_SIGNAL_MAX_STALENESS
+        later_unacceptable = tuple(
+            snapshot
+            for snapshot in visible
+            if snapshot.scan_completed_at >= latest.scan_completed_at
+            and not _acceptable_open_snapshot(snapshot)
+        )
+        evidence_refs = tuple(
+            _early_order_ref(snapshot)
+            for snapshot in (
+                latest,
+                *sorted(
+                    later_unacceptable,
+                    key=lambda item: (
+                        item.scan_completed_at,
+                        item.observation_batch_id,
+                    ),
+                ),
+            )
+        )
+        if (
+            latest.scan_completed_at < freshness_started_at
+            or latest.scan_completed_at > freshness_ended_at
+            or later_unacceptable
+        ):
+            reason = (
+                "LATER_ORDER_SCAN_FAILED_OR_INCOMPLETE"
+                if later_unacceptable
+                else "ORDER_SNAPSHOT_STALE_AT_PLAN_BOUNDARY"
+            )
+            return (
+                {
+                    "feature_role": "PRE_PLAN_EARLY_SIGNAL",
+                    "projection_role": projection_role,
+                    "operational_use_allowed": False,
+                    "quality_state": "EVIDENCE_INSUFFICIENT",
+                    "window_started_at": early_start.isoformat(),
+                    "window_ended_at": seller_start.isoformat(),
+                    "freshness_started_at": (
+                        freshness_started_at.isoformat()
+                    ),
+                    "freshness_ended_at": freshness_ended_at.isoformat(),
+                    "observation_batch_id": latest.observation_batch_id,
+                    "observed_at": latest.scan_completed_at.isoformat(),
+                    "order_count": None,
+                    "sold_qty": None,
+                    "transaction_amount_total": None,
+                    "trusted_zero": False,
+                    "reason": reason,
+                    "time_policy_version": latest.time_policy_version,
+                },
+                evidence_refs,
+            )
         items = tuple(
             item
             for item in latest.items
@@ -285,6 +368,10 @@ class SalesPlanInputService:
         )
         payload = {
             "feature_role": "PRE_PLAN_EARLY_SIGNAL",
+            "projection_role": projection_role,
+            "operational_use_allowed": (
+                projection_role == "CURRENT_OPERATIONS"
+            ),
             "quality_state": "CONFIRMED",
             "source_platform_trade_date": (
                 latest.platform_trade_date.isoformat()
@@ -297,16 +384,29 @@ class SalesPlanInputService:
             "transaction_amount_total": format(amount, "f"),
             "trusted_zero": not items,
             "observed_at": latest.scan_completed_at.isoformat(),
+            "freshness_started_at": freshness_started_at.isoformat(),
+            "freshness_ended_at": freshness_ended_at.isoformat(),
             "time_policy_version": latest.time_policy_version,
         }
-        return (
-            payload,
-            (
-                "EARLY_ORDER_OBSERVATION_BATCH",
-                latest.observation_batch_id,
-                latest.content_sha256,
-            ),
-        )
+        return payload, evidence_refs
+
+
+def _acceptable_open_snapshot(snapshot: OrderSnapshot) -> bool:
+    return (
+        snapshot.trade_day_status == "OPEN"
+        and snapshot.capability_result == "SUCCEEDED"
+        and snapshot.source_batch_status == "ACCEPTED"
+        and snapshot.scope_complete
+        and snapshot.end_marker_verified
+    )
+
+
+def _early_order_ref(snapshot: OrderSnapshot) -> tuple[str, str, str]:
+    return (
+        "EARLY_ORDER_OBSERVATION_BATCH",
+        snapshot.observation_batch_id,
+        snapshot.content_sha256,
+    )
 
 
 def _deduplicate_refs(

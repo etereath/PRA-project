@@ -135,9 +135,14 @@ platform_name
 + inventory_before_observation_id
 + inventory_after_observation_id
 + algorithm_version
++ evidence_manifest
 ```
 
-`estimate_segment_id` 由上述规范化身份确定性生成。前后观察按 `observed_at` 严格递增，
+`evidence_manifest` 规范化包含调整来源引用及未决写、冲突观察、关键扫描失败、重叠和
+完整扫描替代标志。`estimate_segment_id` 由上述身份确定性生成；同一观察区间事后补充
+人工证明时创建可并存的新不可变 segment，不原地更新旧 segment。选数时同一算法、同一
+观察区间只采用 `created_at` 最新的证据版本，旧版本只保留审计用途；相同证据精确重放
+仍生成相同 ID。前后观察按 `observed_at` 严格递增，
 使用规范时间线中的相邻合格观察；不得同时按 `ONLINE_PULSE` 和 `FULL_MARKET_SCAN` 建立
 重叠区间并重复累计。同一时刻同一 SKU 出现相互冲突的库存观察时，该区间不合格。
 
@@ -349,6 +354,12 @@ PROVISIONAL。`OBSERVED → RECONCILED` 必须完成订单/估算比较，所有
 Run 成功，均不能单独进入 FINAL。FINAL 后迟到订单或人工修正继续复用现有
 supersedes 版本链，新版本从 OBSERVED 开始。
 
+历史订单回补必须在一个 `BEGIN IMMEDIATE` 中冻结 current summaries、最新订单、估算和
+当前 SKU 维度，并按新输入重新计算全部应有范围。既有非 FINAL 范围刷新同一版本，既有
+FINAL 范围创建 current OBSERVED supersedes，新出现的品种、等级、SKU 和时间桶复用
+PROVISIONAL→OBSERVED 状态机创建；范围、输入和事件必须同时提交或全部回滚。相同订单
+batch 和 manifest 重放不得再创建版本。
+
 ## 10. Repository、应用服务和 Automation 边界
 
 编码阶段只允许增加以下职责：
@@ -395,6 +406,12 @@ supersedes 版本链，新版本从 OBSERVED 开始。
 计划投影并复算 hash，不重新选择订单、汇总销量或创建版本。历史回补投影必须标记
 `AUDIT_ONLY`，不得作为当前运营计划。
 
+`PRE_PLAN_EARLY_SIGNAL` 的可信零值和确认总量要求最新完整、已接受 OPEN 快照在20:00
+边界前后10分钟内完成，即默认 `[19:50,20:10]`；生成时刻之后的快照不进入当前投影。
+该快照之后只要出现 FAILED、UNAVAILABLE、PARTIAL、范围不完整或尾部未确认的订单扫描，
+结果即为 `EVIDENCE_INSUFFICIENT`，数量与金额保持 NULL，`trusted_zero=false`。没有边界
+附近快照同样属于证据不足；历史补跑只可标记 `AUDIT_ONLY`。
+
 ### 10.1 销售管理报告与技术审计分离
 
 人工可读结算报告面向销售管理，不承担数据库审计回执职责。正文不得展示 Run、Summary、
@@ -436,6 +453,7 @@ CI；本阶段没有新增真实页面或平台动作，不要求重复 13.5-4 �
 - PRA 写、人工修改、上架重设、target inventory、对账修正、未知增减逐类处理；
 - 没有记录不等于调整覆盖完整；UNKNOWN/RECONCILE 阻断；
 - 相邻、缺失、冲突、重叠、跨 18:00、离线、映射漂移和算法版本变化；
+- segment 精确重放、事后补证后的不可变新身份和当前证据版本选择；
 - HIGH/MEDIUM/LOW 映射，订单和估算绝不重复累计；
 - 完整 CLOSED、部分订单、仅估算和 UNAVAILABLE 四种来源选择；
 - 重复订单、多重集合减少、数量唯一、内容变化歧义和取消不重复扣减；
@@ -444,13 +462,15 @@ CI；本阶段没有新增真实页面或平台动作，不要求重复 13.5-4 �
 - FINAL 复算订单、估算 segment 集合、算法/映射版本、差值和对账决定绑定；
 - 旧 FINAL 回补生成 current OBSERVED supersedes；非 FINAL 回补保持同一版本并回到/保持
   OBSERVED；相同 manifest 精确重放；
-- 多范围来自同一冻结输入且同一事务提交；任一范围失败时整体回滚；
+- 历史回补新建品种/等级/SKU/时间桶，多范围来自同一冻结输入且同一事务提交；任一范围
+  失败时全部旧 FINAL 继续保持 current；
 - PRA 交易日严格使用 20:00 边界，跨两个平台交易日的事实按逐项时间重新归属；
 - 平台日结只作为来源，不被直接冒充为 PRA 交易日样本；18:00–20:00 领先信号不进入
   目标日实际销量标签；
 - 价格、库存和上下架观察进入销售过程汇总；未采集购买序号时复购指标保持不可用；
 - 人工报告正文不出现 ID、hash、manifest、原始 JSON 或版本链，只保留销售管理关键结论；
-- 可信零值、证据不足、无数据/不可读取三态互不混用；Automation Event payload 有界；
+- 20:00 前后10分钟快照新鲜度、后续失败/缺失门禁和历史 `AUDIT_ONLY`；可信零值、证据
+  不足、无数据/不可读取三态互不混用；Automation Event payload 有界；
 - 不创建 Incident、不注册平台写 Handler、零平台副作用；
 - 平台、交易日、SKU、映射版本和输入引用隔离。
 

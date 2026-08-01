@@ -290,96 +290,249 @@ class TradeDaySettlementService:
         platform_trade_date: date,
         observation_batch_id: str,
         changed_by: str = "order-history-import",
+        transaction_validator: Callable[[object], None] | None = None,
     ) -> tuple[SummaryMutationResult, ...]:
-        """Refresh existing summary series from one committed order import."""
+        """Atomically refresh every summary scope from one order import."""
 
-        summaries = self.repository.list_current_summaries(
-            platform_name=platform_name,
-            platform_trade_date=platform_trade_date,
-        )
-        if not summaries:
-            return ()
-        orders = self.repository.list_order_snapshots(
-            platform_name=platform_name,
-            platform_trade_date=platform_trade_date,
-        )
-        estimates = self.repository.list_estimate_segments(
-            platform_name=platform_name,
-            platform_trade_date=platform_trade_date,
-        )
-        dimensions = self._current_sku_dimensions(platform_name)
-        results: list[SummaryMutationResult] = []
-        for current in summaries:
-            coverage_started_at, coverage_ended_at = (
-                self.estimate_service.operational_time.platform_trade_day_window(
-                    platform_trade_date,
-                    policy_version=current.time_policy_version,
+        with closing(
+            self.repository.runtime_repository.connect_write()
+        ) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                summaries = self.repository.list_current_summaries(
+                    platform_name=platform_name,
+                    platform_trade_date=platform_trade_date,
+                    connection=connection,
                 )
-            )
-            selection = self.fact_selector.select(
-                platform_name=platform_name,
-                platform_trade_date=platform_trade_date,
-                scope_type=current.scope_type,
-                scope_key=current.scope_key,
-                order_snapshots=orders,
-                estimate_segments=estimates,
-                sku_dimensions=dimensions,
-                estimate_algorithm_version=(
-                    self.estimate_service.algorithm_version
-                ),
-                coverage_started_at=coverage_started_at,
-                coverage_ended_at=coverage_ended_at,
-            )
-            if (
-                selection.fact_source is not FactSource.ORDER_OBSERVED
-                or selection.selected_order_batch_id != observation_batch_id
-                or selection.sold_qty is None
-                or selection.order_count is None
-                or selection.transaction_amount_total is None
-            ):
-                continue
-            inputs = _summary_inputs(
-                (
-                    _settlement_window_ref(
+                if not summaries:
+                    connection.commit()
+                    return ()
+                platform_summaries = tuple(
+                    summary
+                    for summary in summaries
+                    if summary.scope_type == "PLATFORM"
+                    and summary.scope_key == platform_name
+                )
+                if len(platform_summaries) != 1:
+                    raise ValueError(
+                        "Order backfill requires one current PLATFORM summary"
+                    )
+                anchor = platform_summaries[0]
+                business_contexts = {
+                    (
+                        summary.seller_operation_date,
+                        summary.seller_phase,
+                        summary.time_policy_version,
+                    )
+                    for summary in summaries
+                }
+                if len(business_contexts) != 1:
+                    raise ValueError(
+                        "Current summary scopes have inconsistent time context"
+                    )
+
+                orders = self.repository.list_order_snapshots(
+                    platform_name=platform_name,
+                    platform_trade_date=platform_trade_date,
+                    connection=connection,
+                )
+                estimates = self.repository.list_estimate_segments(
+                    platform_name=platform_name,
+                    platform_trade_date=platform_trade_date,
+                    connection=connection,
+                )
+                dimensions = self._current_sku_dimensions(
+                    platform_name,
+                    connection=connection,
+                )
+                coverage_started_at, coverage_ended_at = (
+                    self.estimate_service.operational_time.platform_trade_day_window(
+                        platform_trade_date,
+                        policy_version=anchor.time_policy_version,
+                    )
+                )
+                platform_selection = self.fact_selector.select(
+                    platform_name=platform_name,
+                    platform_trade_date=platform_trade_date,
+                    scope_type="PLATFORM",
+                    scope_key=platform_name,
+                    order_snapshots=orders,
+                    estimate_segments=estimates,
+                    sku_dimensions=dimensions,
+                    estimate_algorithm_version=(
+                        self.estimate_service.algorithm_version
+                    ),
+                    coverage_started_at=coverage_started_at,
+                    coverage_ended_at=coverage_ended_at,
+                )
+                if (
+                    platform_selection.fact_source
+                    is not FactSource.ORDER_OBSERVED
+                    or platform_selection.selected_order_batch_id
+                    != observation_batch_id
+                ):
+                    connection.commit()
+                    return ()
+
+                scopes = set(
+                    self._automatic_scopes(
                         platform_name=platform_name,
                         platform_trade_date=platform_trade_date,
-                        scope_type=current.scope_type,
-                        scope_key=current.scope_key,
-                        time_policy_version=current.time_policy_version,
-                    ),
-                    *selection.input_refs,
+                        orders=orders,
+                        estimates=estimates,
+                        dimensions=dimensions,
+                    )
                 )
-            )
-            manifest_sha256 = input_manifest_sha256(inputs)
-            common = {
-                "quality_level": selection.quality_level,
-                "sold_qty": selection.sold_qty,
-                "order_count": selection.order_count,
-                "transaction_amount_total": (
-                    selection.transaction_amount_total
-                ),
-                "quality_reason": "ORDER_HISTORY_IMPORT_REFRESH",
-                "source_proportions": selection.source_proportions,
-                "input_manifest_sha256": manifest_sha256,
-                "mapping_version": selection.mapping_version,
-                "algorithm_version": SETTLEMENT_ALGORITHM_VERSION,
-                "inputs": inputs,
-                "changed_by": changed_by,
-                "trigger_ref_id": observation_batch_id,
-            }
-            if current.summary_status is SummaryStatus.FINAL:
-                result = self.summary_service.revise_final(
-                    current.summary_id,
-                    fact_source=FactSource.ORDER_OBSERVED,
-                    **common,
+                scopes.update(
+                    (summary.scope_type, summary.scope_key)
+                    for summary in summaries
                 )
-            else:
-                result = self.summary_service.refresh_non_final_from_order(
-                    current.summary_id,
-                    **common,
-                )
-            results.append(result)
-        return tuple(results)
+                existing_by_scope = {
+                    (summary.scope_type, summary.scope_key): summary
+                    for summary in summaries
+                }
+                frozen: list[
+                    tuple[
+                        str,
+                        str,
+                        SalesFactSelection,
+                        tuple[TradeDaySummaryInput, ...],
+                        str,
+                    ]
+                ] = []
+                scope_order = {
+                    "PLATFORM": 0,
+                    "VARIETY": 1,
+                    "GRADE": 2,
+                    "SKU": 3,
+                    "TIME_BUCKET": 4,
+                }
+                for scope_type, scope_key in sorted(
+                    scopes,
+                    key=lambda item: (scope_order[item[0]], item[1]),
+                ):
+                    selection = self.fact_selector.select(
+                        platform_name=platform_name,
+                        platform_trade_date=platform_trade_date,
+                        scope_type=scope_type,
+                        scope_key=scope_key,
+                        order_snapshots=orders,
+                        estimate_segments=estimates,
+                        sku_dimensions=dimensions,
+                        estimate_algorithm_version=(
+                            self.estimate_service.algorithm_version
+                        ),
+                        coverage_started_at=coverage_started_at,
+                        coverage_ended_at=coverage_ended_at,
+                    )
+                    if (
+                        selection.fact_source
+                        is not FactSource.ORDER_OBSERVED
+                        or selection.selected_order_batch_id
+                        != observation_batch_id
+                        or selection.sold_qty is None
+                        or selection.order_count is None
+                        or selection.transaction_amount_total is None
+                    ):
+                        raise ValueError(
+                            "Order backfill scope did not bind the frozen batch"
+                        )
+                    inputs = _summary_inputs(
+                        (
+                            _settlement_window_ref(
+                                platform_name=platform_name,
+                                platform_trade_date=platform_trade_date,
+                                scope_type=scope_type,
+                                scope_key=scope_key,
+                                time_policy_version=anchor.time_policy_version,
+                            ),
+                            *selection.input_refs,
+                        )
+                    )
+                    frozen.append(
+                        (
+                            scope_type,
+                            scope_key,
+                            selection,
+                            inputs,
+                            input_manifest_sha256(inputs),
+                        )
+                    )
+
+                results: list[SummaryMutationResult] = []
+                for (
+                    scope_type,
+                    scope_key,
+                    selection,
+                    inputs,
+                    manifest_sha256,
+                ) in frozen:
+                    if transaction_validator is not None:
+                        transaction_validator(connection)
+                    common = {
+                        "quality_level": selection.quality_level,
+                        "sold_qty": selection.sold_qty,
+                        "order_count": selection.order_count,
+                        "transaction_amount_total": (
+                            selection.transaction_amount_total
+                        ),
+                        "quality_reason": "ORDER_HISTORY_IMPORT_REFRESH",
+                        "source_proportions": selection.source_proportions,
+                        "input_manifest_sha256": manifest_sha256,
+                        "mapping_version": selection.mapping_version,
+                        "algorithm_version": SETTLEMENT_ALGORITHM_VERSION,
+                        "inputs": inputs,
+                        "changed_by": changed_by,
+                        "trigger_ref_id": observation_batch_id,
+                    }
+                    current = existing_by_scope.get(
+                        (scope_type, scope_key)
+                    )
+                    if current is None:
+                        provisional = self.summary_service.create_provisional(
+                            platform_name=platform_name,
+                            platform_trade_date=platform_trade_date,
+                            seller_operation_date=(
+                                anchor.seller_operation_date
+                            ),
+                            seller_phase=anchor.seller_phase,
+                            scope_type=scope_type,
+                            scope_key=scope_key,
+                            fact_source=FactSource.ORDER_OBSERVED,
+                            time_policy_version=anchor.time_policy_version,
+                            connection=connection,
+                            **common,
+                        )
+                        result = self.summary_service.transition(
+                            provisional.summary.summary_id,
+                            to_status=SummaryStatus.OBSERVED,
+                            fact_source=FactSource.ORDER_OBSERVED,
+                            trigger_type="ORDER_BATCH_ACCEPTED",
+                            connection=connection,
+                            **common,
+                        )
+                    elif current.summary_status is SummaryStatus.FINAL:
+                        result = self.summary_service.revise_final(
+                            current.summary_id,
+                            fact_source=FactSource.ORDER_OBSERVED,
+                            connection=connection,
+                            **common,
+                        )
+                    else:
+                        result = (
+                            self.summary_service.refresh_non_final_from_order(
+                                current.summary_id,
+                                connection=connection,
+                                **common,
+                            )
+                        )
+                    results.append(result)
+                connection.commit()
+                return tuple(results)
+            except Exception:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
 
     def materialize_estimates(
         self,

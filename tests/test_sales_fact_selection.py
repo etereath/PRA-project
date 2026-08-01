@@ -180,6 +180,38 @@ def test_explicit_algorithm_version_ignores_overlapping_old_algorithm() -> None:
     assert {ref[1] for ref in selected.input_refs} == {"segment-current"}
 
 
+def test_latest_evidence_revision_replaces_old_interval_without_overlap() -> None:
+    unproven = replace(
+        _estimate(),
+        estimate_segment_id="segment-unproven",
+        estimated_sold_qty=None,
+        estimation_eligible=False,
+        estimation_reason="ADJUSTMENT_COVERAGE_UNPROVEN",
+        quality_level=DataQualityLevel.SCAN_ESTIMATED_LOW,
+    )
+    confirmed = replace(
+        _estimate(),
+        estimate_segment_id="segment-confirmed",
+        estimated_sold_qty=5,
+        estimation_eligible=True,
+        estimation_reason="ELIGIBLE_NO_ADJUSTMENT",
+        created_at=NOW + timedelta(hours=1),
+    )
+
+    selected = _select(
+        estimates=(unproven, confirmed),
+        estimate_algorithm_version="estimate-v1",
+        coverage_started_at=NOW,
+        coverage_ended_at=NOW + timedelta(minutes=10),
+    )
+
+    assert selected.quality_level is DataQualityLevel.SCAN_ESTIMATED_HIGH
+    assert selected.sold_qty == 5
+    assert {ref[1] for ref in selected.input_refs} == {
+        "segment-confirmed"
+    }
+
+
 def test_mapping_version_drift_makes_estimate_unavailable() -> None:
     first = _estimate()
     second = replace(

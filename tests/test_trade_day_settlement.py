@@ -514,14 +514,35 @@ def test_historical_order_backfill_supersedes_only_final_and_is_idempotent(
         completed_at=BASE + timedelta(hours=2),
         rows=(("fingerprint-b", 3, "36", "SKU-1", "VERIFIED"),),
     )
+    with closing(runtime.connect_write()) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO listing_status(
+                listing_status_id, platform_name, internal_sku,
+                variety, grade, current_price, updated_at
+            ) VALUES (
+                'listing-backfill', ?, 'SKU-1', 'Rose', 'B', '12', ?
+            )
+            """,
+            (PLATFORM, BASE.isoformat()),
+        )
 
     refreshed = service.refresh_after_order_import(
         platform_name=PLATFORM,
         platform_trade_date=TRADE_DATE,
         observation_batch_id="batch-2",
     )
-    assert len(refreshed) == 1
-    revision = refreshed[0].summary
+    by_scope = {
+        (result.summary.scope_type, result.summary.scope_key): result
+        for result in refreshed
+    }
+    assert {"PLATFORM", "VARIETY", "GRADE", "SKU", "TIME_BUCKET"} == {
+        scope_type for scope_type, _ in by_scope
+    }
+    assert len(
+        [scope for scope in by_scope if scope[0] == "TIME_BUCKET"]
+    ) == 24
+    revision = by_scope[("PLATFORM", PLATFORM)].summary
     assert revision.summary_status is SummaryStatus.OBSERVED
     assert revision.version_no == old_final.version_no + 1
     assert revision.supersedes_summary_id == old_final.summary_id
@@ -537,9 +558,16 @@ def test_historical_order_backfill_supersedes_only_final_and_is_idempotent(
         platform_trade_date=TRADE_DATE,
         observation_batch_id="batch-2",
     )
-    assert len(replay) == 1
-    assert not replay[0].changed
-    assert replay[0].summary.summary_id == revision.summary_id
+    replay_by_scope = {
+        (result.summary.scope_type, result.summary.scope_key): result
+        for result in replay
+    }
+    assert replay_by_scope.keys() == by_scope.keys()
+    assert all(not result.changed for result in replay)
+    assert (
+        replay_by_scope[("PLATFORM", PLATFORM)].summary.summary_id
+        == revision.summary_id
+    )
 
 
 def test_non_final_order_backfill_refreshes_same_version(
@@ -573,6 +601,74 @@ def test_non_final_order_backfill_refreshes_same_version(
     assert refreshed.supersedes_summary_id is None
     assert refreshed.summary_status is SummaryStatus.OBSERVED
     assert refreshed.sold_qty == 3
+
+
+def test_historical_backfill_rolls_back_all_scope_revisions(
+    settlement,
+) -> None:
+    service, repository, runtime = settlement
+    _insert_order_snapshot(
+        runtime,
+        "batch-before-atomic",
+        completed_at=BASE + timedelta(hours=1),
+        rows=(("fingerprint-a", 2, "24", "SKU-1", "VERIFIED"),),
+    )
+    final_ids = {}
+    for scope_type, scope_key in (
+        ("PLATFORM", PLATFORM),
+        ("SKU", "SKU-1"),
+    ):
+        provisional = service.create_provisional(
+            platform_name=PLATFORM,
+            platform_trade_date=TRADE_DATE,
+            seller_operation_date=date(2026, 8, 1),
+            seller_phase=SellerPhase.NORMAL_SALES,
+            time_policy_version=DEFAULT_OPERATIONAL_TIME_POLICY_VERSION,
+            scope_type=scope_type,
+            scope_key=scope_key,
+            changed_by="test",
+        ).summary
+        service.observe(provisional.summary_id, changed_by="test")
+        service.reconcile(provisional.summary_id, changed_by="test")
+        final = service.finalize(
+            provisional.summary_id,
+            changed_by="test",
+        ).summary
+        final_ids[(scope_type, scope_key)] = final.summary_id
+
+    _insert_order_snapshot(
+        runtime,
+        "batch-after-atomic",
+        completed_at=BASE + timedelta(hours=2),
+        rows=(("fingerprint-b", 3, "36", "SKU-1", "VERIFIED"),),
+    )
+    validations = 0
+
+    def fail_before_second_final_scope(_connection) -> None:
+        nonlocal validations
+        validations += 1
+        if validations == 3:
+            raise RuntimeError("injected backfill scope failure")
+
+    with pytest.raises(RuntimeError, match="injected backfill scope failure"):
+        service.refresh_after_order_import(
+            platform_name=PLATFORM,
+            platform_trade_date=TRADE_DATE,
+            observation_batch_id="batch-after-atomic",
+            transaction_validator=fail_before_second_final_scope,
+        )
+
+    current = {
+        (summary.scope_type, summary.scope_key): summary
+        for summary in repository.list_current_summaries(
+            platform_name=PLATFORM,
+            platform_trade_date=TRADE_DATE,
+        )
+    }
+    assert set(current) == set(final_ids)
+    for scope, summary_id in final_ids.items():
+        assert current[scope].summary_id == summary_id
+        assert current[scope].summary_status is SummaryStatus.FINAL
 
 
 def test_scan_only_settlement_builds_all_supported_scopes_from_fresh_dimensions(
