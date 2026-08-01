@@ -127,6 +127,8 @@ def _order_snapshot(
     items=(),
     capability_result: str = "SUCCEEDED",
     source_batch_status: str = "ACCEPTED",
+    scope_complete: bool | None = None,
+    end_marker_verified: bool | None = None,
 ) -> OrderSnapshot:
     accepted = capability_result == "SUCCEEDED" and source_batch_status == "ACCEPTED"
     return OrderSnapshot(
@@ -137,8 +139,12 @@ def _order_snapshot(
         capability_result=capability_result,
         batch_status="ACCEPTED" if accepted else "FAILED",
         source_batch_status=source_batch_status,
-        scope_complete=accepted,
-        end_marker_verified=accepted,
+        scope_complete=(accepted if scope_complete is None else scope_complete),
+        end_marker_verified=(
+            accepted
+            if end_marker_verified is None
+            else end_marker_verified
+        ),
         scan_started_at=completed_at - timedelta(minutes=1),
         scan_completed_at=completed_at,
         content_sha256="sha256:" + batch_id[-1] * 64,
@@ -351,6 +357,114 @@ def test_stale_empty_snapshot_without_boundary_coverage_is_not_trusted() -> None
     assert early["quality_state"] == "EVIDENCE_INSUFFICIENT"
     assert early["trusted_zero"] is False
     assert early["reason"] == "ORDER_SNAPSHOT_STALE_AT_PLAN_BOUNDARY"
+
+
+@pytest.mark.parametrize(
+    "items",
+    (
+        (),
+        (
+            _order_item(
+                "pre-boundary",
+                created_at=datetime(2026, 8, 1, 11, 30, tzinfo=timezone.utc),
+                qty=2,
+                amount="24",
+            ),
+        ),
+    ),
+)
+def test_pre_boundary_complete_snapshot_cannot_confirm_full_window(items) -> None:
+    snapshot = _order_snapshot(
+        "batch-p",
+        completed_at=datetime(2026, 8, 1, 11, 55, tzinfo=timezone.utc),
+        items=items,
+    )
+    manifest = SalesPlanInputService(
+        FakePlanRepository(summaries=(_summary(),), orders=(snapshot,))
+    ).build(
+        platform_name=PLATFORM,
+        settled_platform_trade_date=SETTLED_DATE,
+        plan_for_seller_operation_date=PLAN_DATE,
+        as_of=AS_OF,
+    )
+
+    early = manifest.payload["pre_plan_early_signal"]
+    assert early["quality_state"] == "EVIDENCE_INSUFFICIENT"
+    assert early["trusted_zero"] is False
+    assert early["order_count"] is None
+    assert early["sold_qty"] is None
+    assert early["transaction_amount_total"] is None
+    assert early["reason"] == "ORDER_SNAPSHOT_STALE_AT_PLAN_BOUNDARY"
+
+
+@pytest.mark.parametrize("minute", (1, 10))
+def test_post_boundary_complete_empty_snapshot_can_confirm_zero(
+    minute: int,
+) -> None:
+    snapshot = _order_snapshot(
+        f"batch-{minute}",
+        completed_at=datetime(2026, 8, 1, 12, minute, tzinfo=timezone.utc),
+        items=(),
+    )
+    as_of = max(AS_OF, snapshot.scan_completed_at)
+    manifest = SalesPlanInputService(
+        FakePlanRepository(summaries=(_summary(),), orders=(snapshot,))
+    ).build(
+        platform_name=PLATFORM,
+        settled_platform_trade_date=SETTLED_DATE,
+        plan_for_seller_operation_date=PLAN_DATE,
+        as_of=as_of,
+    )
+
+    early = manifest.payload["pre_plan_early_signal"]
+    assert early["quality_state"] == "CONFIRMED"
+    assert early["trusted_zero"] is True
+    assert early["order_count"] == 0
+    assert early["sold_qty"] == 0
+    assert early["transaction_amount_total"] == "0"
+
+
+@pytest.mark.parametrize(
+    "later",
+    (
+        _order_snapshot(
+            "batch-f",
+            completed_at=datetime(2026, 8, 1, 12, 4, tzinfo=timezone.utc),
+            capability_result="FAILED",
+            source_batch_status="FAILED",
+        ),
+        _order_snapshot(
+            "batch-i",
+            completed_at=datetime(2026, 8, 1, 12, 4, tzinfo=timezone.utc),
+            scope_complete=False,
+        ),
+    ),
+)
+def test_post_boundary_complete_snapshot_is_blocked_by_later_failure(
+    later: OrderSnapshot,
+) -> None:
+    complete = _order_snapshot(
+        "batch-c",
+        completed_at=datetime(2026, 8, 1, 12, 1, tzinfo=timezone.utc),
+        items=(),
+    )
+    manifest = SalesPlanInputService(
+        FakePlanRepository(
+            summaries=(_summary(),),
+            orders=(complete, later),
+        )
+    ).build(
+        platform_name=PLATFORM,
+        settled_platform_trade_date=SETTLED_DATE,
+        plan_for_seller_operation_date=PLAN_DATE,
+        as_of=AS_OF,
+    )
+
+    early = manifest.payload["pre_plan_early_signal"]
+    assert early["quality_state"] == "EVIDENCE_INSUFFICIENT"
+    assert early["trusted_zero"] is False
+    assert early["sold_qty"] is None
+    assert early["reason"] == "LATER_ORDER_SCAN_FAILED_OR_INCOMPLETE"
 
 
 def test_latest_fresh_complete_snapshot_wins() -> None:

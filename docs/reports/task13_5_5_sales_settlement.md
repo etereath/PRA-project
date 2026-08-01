@@ -121,8 +121,9 @@ Handler 复用现有 Run、租约、心跳、输入 manifest 绑定和完成接�
 
 - 已结算销量、成交金额、观察订单数、品种、等级、SKU 和本地小时桶；
 - 当前计划前 18:00–20:00 的 OPEN 订单早期信号，严格按 `order_created_at` 归属；只有
-  20:00 前后10分钟内完成的完整已接受快照、且其后没有失败或不完整扫描，才能确认总量
-  或可信零值；否则输出 `EVIDENCE_INSUFFICIENT` 和 NULL；
+  20:00 后10分钟内完成的完整已接受快照、且其后没有失败或不完整扫描，才能确认总量
+  或可信零值；20:00 前快照只能作为部分领先证据，否则输出 `EVIDENCE_INSUFFICIENT`
+  和 NULL；
 - 每个 SKU 的开盘/收盘/最低/最高库存和价格、价格变化次数、在售观察次数；
 - 数据质量、投影资格和全部来源引用。
 
@@ -162,14 +163,15 @@ algorithm version、原始 JSON 或 supersedes ID。可信空页显示“当天�
 - 多范围 PROVISIONAL、单向状态机和 FINAL 同事务复算；
 - 历史订单回补后的同版本刷新、FINAL supersedes、新范围创建、多范围故障整体回滚和
   精确重放；
-- 18:10空页、边界快照、后续失败、较新完整快照、20:00新鲜度和历史 `AUDIT_ONLY`；
+- 18:10空页、19:55空/非空快照、20:01/20:10边界、后续失败或不完整扫描、较新完整
+  快照、20:00尾段覆盖和历史 `AUDIT_ONLY`；
 - 统一流水线、快照回读、计划资格、价格/库存轨迹、报告三态和事件大小门禁；
 - Automation 租约、manifest、输出事件及零平台副作用。
 
 本地 Ready-for-review 验证结果：
 
-- 最新复审整改联合专项：`54 passed`；受影响集成：`105 passed`；
-- 完整 pytest：`968 passed, 3 skipped, 97 subtests passed`；
+- 最新尾段覆盖专项：`17 passed`；受影响集成：`65 passed`；
+- 完整 pytest：`974 passed, 3 skipped, 97 subtests passed`；
 - 复审整改后临时 v14 Runtime DB 系统冒烟：16 项通过、0 项失败。
 
 2026-08-01 追加执行蚂蚁花团订单管理页实机 READ_ONLY，目标平台交易日为

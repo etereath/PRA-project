@@ -301,9 +301,7 @@ class SalesPlanInputService:
             policy_version=latest.time_policy_version,
         )
         early_start = seller_start - timedelta(hours=2)
-        freshness_started_at = (
-            seller_start - EARLY_SIGNAL_MAX_STALENESS
-        )
+        freshness_started_at = seller_start
         freshness_ended_at = seller_start + EARLY_SIGNAL_MAX_STALENESS
         later_unacceptable = tuple(
             snapshot
