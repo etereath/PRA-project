@@ -38,8 +38,6 @@ from app.services.shadowbot_listing_sync import (
 )
 from app.shadowbot_contract_primitives import contract_identity_key
 from app.shadowbot_listing_contract import derive_v5_batch_semantics, v5_result_counts
-from shadowbot.test2 import shadowbot_queue_worker
-
 NOW = datetime(2026, 8, 3, 2, tzinfo=timezone.utc)
 
 
@@ -614,7 +612,11 @@ def _emergency_write_request(proposal: dict[str, object]) -> dict[str, object]:
     )
 
 
-def test_emergency_reuses_v5_persistence_and_shared_write_lock(tmp_path: Path) -> None:
+def test_shadowbot_emergency_reuses_v5_persistence_and_shared_write_lock(
+    tmp_path: Path,
+) -> None:
+    from shadowbot.test2 import shadowbot_queue_worker
+
     repository = _repository(tmp_path)
     current = datetime.now(timezone.utc)
     authorized = _authorize(
