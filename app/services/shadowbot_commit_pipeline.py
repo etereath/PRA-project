@@ -33,6 +33,12 @@ from app.shadowbot_contract_primitives import (
     derive_v4_batch_semantics,
     sha256_json,
 )
+from app.services.incident_task_result_projection import (
+    project_manual_incident_task_result,
+)
+from app.task_dispatch_priority import (
+    assert_selected_tasks_have_dispatch_priority,
+)
 
 
 RESULT_SCHEMA_VERSION = "shadowbot-commit-batch-result-1.1"
@@ -122,6 +128,12 @@ def build_task_commit_manifest(
             }
         )
 
+    with closing(repository.connect_read()) as connection:
+        assert_selected_tasks_have_dispatch_priority(
+            connection,
+            selected_task_ids=ids,
+            platform_name=platform_name,
+        )
     mapping = load_identity_mapping(mapping_path, expected_platform_name=platform_name)
     manifest = build_commit_manifest(
         batch_id=batch_id,
@@ -167,6 +179,13 @@ def publish_task_commit_batch(
     now_value = datetime.fromisoformat(now)
     with closing(repository.connect_write()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
+        assert_selected_tasks_have_dispatch_priority(
+            connection,
+            selected_task_ids=[
+                item["source_task_id"] for item in request["items"]
+            ],
+            platform_name=request["platform_name"],
+        )
         if has_active_automation_ui_run(connection, now=now_value):
             raise ValidationError(
                 "Automation UI 扫描正在运行，当前不能获取平台写锁。"
@@ -617,6 +636,14 @@ def import_task_commit_result(
             connection.execute(
                 "UPDATE tasks SET task_status = ?, result_message = ?, updated_at = ? WHERE task_id = ?",
                 (task_status.value, result_message, now, task_id),
+            )
+            project_manual_incident_task_result(
+                connection,
+                source_task_id=task_id,
+                operation_id=item["operation_id"],
+                outcome=status,
+                result_id=plan.result_id,
+                occurred_at=now,
             )
             attempt_status, operation_status, lock_status = _terminal_item_ledger_states(
                 status,

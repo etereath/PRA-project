@@ -49,6 +49,9 @@ class EmergencyOfflineAuthorizationService:
     def __init__(self, runtime_repository: SQLiteRuntimeRepository) -> None:
         self.runtime_repository = runtime_repository
         self.shadow = EmergencyOfflineShadowService(runtime_repository)
+        self.product_cost_reader = (
+            EmergencyOfflineShadowService._read_authoritative_base_cost
+        )
 
     def authorize(
         self,
@@ -125,6 +128,19 @@ class EmergencyOfflineAuthorizationService:
             platform_trade_date = str(incident["platform_trade_date"] or "")
             if not platform_name or not internal_sku or not platform_trade_date:
                 raise ValidationError("Incident scope is incomplete")
+            locked_base_cost, locked_source_ref, locked_error = self.product_cost_reader(
+                products_path,
+                internal_sku=internal_sku,
+            )
+            if (
+                locked_error
+                or locked_base_cost is None
+                or locked_base_cost != shadow.base_cost
+                or locked_source_ref != shadow.base_cost_source_ref
+            ):
+                raise ValidationError(
+                    "authoritative product cost changed before authorization commit"
+                )
 
             review = connection.execute(
                 "SELECT * FROM review_tasks WHERE review_task_id = ?",
@@ -138,6 +154,31 @@ class EmergencyOfflineAuthorizationService:
                 or str(review["internal_sku"] or "") != internal_sku
             ):
                 raise ValidationError("human Review already resolved or drifted")
+            usable_token = connection.execute(
+                """
+                SELECT allowed_actions
+                FROM review_tokens
+                WHERE review_task_id = ?
+                  AND used_at IS NULL
+                  AND revoked_at IS NULL
+                  AND julianday(expires_at) > julianday(?)
+                ORDER BY julianday(expires_at) DESC, token_id DESC
+                LIMIT 1
+                """,
+                (review_task_id, now),
+            ).fetchone()
+            allowed_review_actions = (
+                set(_json_list(usable_token["allowed_actions"]))
+                if usable_token is not None
+                else set()
+            )
+            if not allowed_review_actions.intersection(
+                {"adjusted", "approved", "rejected"}
+            ):
+                raise ValidationError(
+                    "human Review has no usable token; reissue and restart "
+                    "the notification/Pulse window"
+                )
 
             flag_job = connection.execute(
                 "SELECT * FROM automation_jobs WHERE job_id = ?",
@@ -324,7 +365,7 @@ class EmergencyOfflineAuthorizationService:
                 internal_sku=internal_sku,
                 platform_name=platform_name,
                 action_type=TaskActionType.SET_OFFLINE,
-                priority=100,
+                priority=1,
                 task_status=TaskStatus.PENDING,
                 created_at=authorized_at,
                 target_status="offline",
@@ -459,28 +500,23 @@ def _observation(connection, observation_id: str):
 
 
 def _initial_notification(connection, *, incident_id: str, review_task_id: str):
-    events = connection.execute(
-        """
-        SELECT event_payload_json FROM operational_incident_events
-        WHERE incident_id = ? AND event_type = 'REVIEW_RECORDED'
-        ORDER BY occurred_at, event_id
-        """,
-        (incident_id,),
-    ).fetchall()
-    notification_id = ""
-    for row in events:
-        payload = _json_object(row["event_payload_json"])
-        if str(payload.get("review_task_id") or "") == review_task_id:
-            notification_id = str(payload.get("notification_id") or "")
-            break
-    if not notification_id:
-        return None
     return connection.execute(
         """
-        SELECT notification_id, sent_at FROM notification_outbox
-        WHERE notification_id = ? AND status = 'SENT' AND sent_at IS NOT NULL
+        SELECT notification_id, sent_at
+        FROM (
+            SELECT outbox.notification_id, outbox.sent_at, outbox.status
+            FROM notification_outbox AS outbox
+            JOIN review_tasks AS review
+              ON review.review_task_id = outbox.related_review_task_id
+            WHERE review.review_task_id = ? AND review.scope_key = ?
+              AND outbox.notification_type = 'mobile_review_required'
+              AND outbox.status <> 'CANCELLED'
+            ORDER BY outbox.created_at DESC, outbox.notification_id DESC
+            LIMIT 1
+        ) AS latest
+        WHERE status = 'SENT' AND sent_at IS NOT NULL
         """,
-        (notification_id,),
+        (review_task_id, incident_id),
     ).fetchone()
 
 
@@ -574,6 +610,16 @@ def _json_object(value: object) -> dict[str, object]:
     except (TypeError, ValueError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _json_list(value: object) -> list[str]:
+    try:
+        payload = json.loads(str(value or "[]"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [str(item) for item in payload]
 
 
 def _sha256_json(value: object) -> str:

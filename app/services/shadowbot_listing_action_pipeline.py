@@ -23,7 +23,11 @@ from app.exceptions import ValidationError
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.listing_automation_gate import (
     evaluate_automation_gate,
+    open_review_context,
     review_block_reasons,
+)
+from app.services.incident_task_result_projection import (
+    project_manual_incident_task_result,
 )
 from app.services.shadowbot_executor import (
     ShadowBotFileQueueRunner,
@@ -54,6 +58,9 @@ from app.shadowbot_listing_contract import (
     canonical_nonnegative_inventory,
     derive_v5_batch_semantics,
     v5_result_counts,
+)
+from app.task_dispatch_priority import (
+    assert_selected_tasks_have_dispatch_priority,
 )
 
 
@@ -145,6 +152,12 @@ def propose_listing_action_batch(
             item["target_inventory"] = int(task.target_inventory)
         tasks.append(item)
 
+    with closing(repository.connect_read()) as connection:
+        assert_selected_tasks_have_dispatch_priority(
+            connection,
+            selected_task_ids=[task.task_id for task in source_tasks],
+            platform_name=platform_name,
+        )
     mapping = load_identity_mapping(mapping_path)
     manifest = build_listing_action_manifest(
         batch_id=batch_id,
@@ -199,7 +212,7 @@ def propose_listing_action_batch(
                 internal_sku=item["internal_sku"],
                 action_type=action_type,
             )
-            reviews = _open_review_context(
+            reviews = open_review_context(
                 connection,
                 platform_name=platform_name,
                 internal_sku=item["internal_sku"],
@@ -570,6 +583,14 @@ def import_listing_action_result(
             _project_emergency_incident_after_import(
                 connection,
                 request_item=request_item,
+                outcome=outcome,
+                result_id=result_id,
+                occurred_at=now,
+            )
+            project_manual_incident_task_result(
+                connection,
+                source_task_id=request_item["source_task_id"],
+                operation_id=request_item["operation_id"],
                 outcome=outcome,
                 result_id=result_id,
                 occurred_at=now,
@@ -1117,6 +1138,14 @@ def _import_listing_action_reconcile_result(
             result_id=result_id,
             occurred_at=now,
         )
+        project_manual_incident_task_result(
+            connection,
+            source_task_id=item["source_task_id"],
+            operation_id=item["operation_id"],
+            outcome=outcome,
+            result_id=result_id,
+            occurred_at=now,
+        )
         projected: list[str] = []
         if outcome == "VERIFIED":
             _project_verified_listing(
@@ -1452,7 +1481,7 @@ def _persist_prepared_write_batch(
                 """,
                 (item["write_identity_key"],),
             ).fetchone()
-            open_reviews = _open_review_context(
+            open_reviews = open_review_context(
                 connection,
                 platform_name=request["platform_name"],
                 internal_sku=item["internal_sku"],
@@ -1486,6 +1515,13 @@ def _persist_prepared_write_batch(
             )
             if blocking_lock is not None and not authorized_old_lock:
                 raise ValidationError("商品存在阻断写锁：" + item["internal_sku"])
+        assert_selected_tasks_have_dispatch_priority(
+            connection,
+            selected_task_ids=[
+                item["source_task_id"] for item in request["items"]
+            ],
+            platform_name=request["platform_name"],
+        )
         connection.execute(
             """
             INSERT INTO shadowbot_batch_registry(
@@ -1941,68 +1977,6 @@ def _latest_listing_context(
         "observed_price": row[f"{prefix}_observed_price"],
         "observed_inventory": row[f"{prefix}_observed_inventory"],
     }
-
-
-def _open_review_context(
-    connection: Any,
-    *,
-    platform_name: str,
-    internal_sku: str,
-) -> list[dict[str, Any]]:
-    rows = connection.execute(
-        """
-        SELECT reason_code, diagnostic_message, blocked_actions_json
-        FROM listing_anomaly_cases
-        WHERE platform_name = ? AND internal_sku = ? AND cleared_at IS NULL
-        """,
-        (platform_name, internal_sku),
-    ).fetchall()
-    contexts: list[dict[str, Any]] = []
-    for row in rows:
-        payload = _json_value(row["blocked_actions_json"])
-        contexts.append(
-            {
-                "reason_code": str(
-                    row["reason_code"]
-                    or row["diagnostic_message"]
-                    or "LISTING_ANOMALY_REVIEW_OPEN"
-                ),
-                "blocked_actions": payload
-                if isinstance(payload, list)
-                else payload.get("blocked_actions")
-                if isinstance(payload, dict)
-                else None,
-            }
-        )
-
-    review_rows = connection.execute(
-        """
-        SELECT review_task_id, review_type, reason, review_payload_json
-        FROM review_tasks
-        WHERE platform_name = ?
-          AND internal_sku = ?
-          AND review_status = 'pending'
-        ORDER BY created_at, review_task_id
-        """,
-        (platform_name, internal_sku),
-    ).fetchall()
-    for row in review_rows:
-        payload = _json_object(row["review_payload_json"])
-        contexts.append(
-            {
-                "review_task_id": str(row["review_task_id"]),
-                "reason_code": str(
-                    payload.get("reason_code")
-                    or row["reason"]
-                    or row["review_type"]
-                    or "REVIEW_TASK_OPEN"
-                ),
-                # Missing or malformed blocked_actions intentionally remains
-                # invalid so the gate fails closed.
-                "blocked_actions": payload.get("blocked_actions"),
-            }
-        )
-    return contexts
 
 
 def _corrective_retry_authorizations(

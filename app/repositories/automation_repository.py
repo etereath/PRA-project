@@ -30,6 +30,7 @@ from app.services.operational_time import (
     OperationalTimeContext,
     OperationalTimePolicy,
 )
+from app.task_dispatch_priority import has_pending_urgent_incident_task
 
 
 CLAIMABLE_STATUSES = (
@@ -1290,6 +1291,8 @@ class AutomationRepository:
                     now=current,
                 ):
                     blocker = "AUTOMATION_UI_ACTIVE"
+                if not blocker and has_pending_urgent_incident_task(connection):
+                    blocker = "URGENT_INCIDENT_TASK_PENDING"
                 claimable_types = tuple(
                     job_type
                     for job_type in allowed
@@ -2150,6 +2153,8 @@ def _claim_specific_run_connection(
         return None
 
     if str(row["job_type"]) in frozenset(ui_job_types):
+        if has_pending_urgent_incident_task(connection):
+            return None
         if _active_ui_blocker_connection(connection):
             return None
         if has_active_automation_ui_run(

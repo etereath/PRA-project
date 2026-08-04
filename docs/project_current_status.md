@@ -85,6 +85,14 @@ Windows PowerShell 5.1 对无 BOM UTF-8 中文控制常量的错误解释；help
 `16 passed, 0 failed`。详见
 [通知与手机复核验收报告](reports/task13_5_6_notification_mobile_review_acceptance_20260804.md)。
 
+2026-08-04 的 PR #28 完整实现审查已按七项统一顺序完成本地整改：事件时间单调性、正式人工
+抢占与入口续期、Incident 人工任务/SYSTEM_EMERGENCY 对普通任务的全链路插队、Worker
+最终 Review 栅栏、商品工作簿锁内二次校验、人工任务结果回投和 FINAL 真实 subject 范围
+匹配。整改继续复用现有 v4/v5、Automation、Review/Token/Outbox、Importer、写锁和唯一
+RECONCILE，没有新增表、全局锁、平台动作或合同版本，也没有再次操作真实平台。生产开关
+仍为 `automatic_emergency_offline=false`。最终本地完整 pytest 为
+`1116 passed, 3 skipped, 97 subtests passed`，隔离系统冒烟为 `16 passed, 0 failed`。
+
 - 从 Excel 读取业务输入。
 - 根据规则和预测输入生成运行态任务。
 - 用 SQLite 保存运行态事实。

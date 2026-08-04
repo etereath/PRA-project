@@ -3959,7 +3959,15 @@ class SQLiteRuntimeRepository:
             params.append(scope_key)
         if clauses:
             query = f"{query} WHERE {' AND '.join(clauses)}"
-        query = f"{query} ORDER BY priority ASC, created_at ASC, task_id ASC"
+        query = f"""{query} ORDER BY
+            CASE
+                WHEN origin_type = 'MANUAL'
+                 AND origin_ref_id LIKE 'incident-review:%' THEN 0
+                WHEN origin_type = 'SYSTEM_EMERGENCY' THEN 1
+                ELSE 2
+            END ASC,
+            priority ASC, created_at ASC, task_id ASC
+        """
         with closing(self.connect()) as connection:
             rows = connection.execute(query, params).fetchall()
         return [_row_to_task(row) for row in rows]
@@ -4469,6 +4477,7 @@ class SQLiteRuntimeRepository:
         compatibility_log: NotificationLog,
         *,
         expected_required_by: datetime | None,
+        review_token: ReviewToken | None = None,
     ) -> tuple[int, int]:
         """Atomically extend one pending review and persist its reminder."""
 
@@ -4498,6 +4507,35 @@ class SQLiteRuntimeRepository:
                 review_task.review_task_id,
                 changed_at=review_task.updated_at or self._clock(),
             )
+            if review_token is not None:
+                connection.execute(
+                    """
+                    UPDATE review_tokens
+                    SET revoked_at = ?
+                    WHERE review_task_id = ? AND used_at IS NULL
+                      AND revoked_at IS NULL
+                    """,
+                    (
+                        _datetime_to_text(review_task.updated_at),
+                        review_task.review_task_id,
+                    ),
+                )
+                token_row = _review_token_to_row(review_token)
+                if connection.execute(
+                    """
+                    INSERT INTO review_tokens(
+                        token_id, review_task_id, token_hash, token_subject,
+                        allowed_actions, expires_at, used_at, revoked_at,
+                        created_at, created_by, last_used_at, note
+                    ) VALUES(
+                        :token_id, :review_task_id, :token_hash, :token_subject,
+                        :allowed_actions, :expires_at, :used_at, :revoked_at,
+                        :created_at, :created_by, :last_used_at, :note
+                    )
+                    """,
+                    token_row,
+                ).rowcount != 1:
+                    raise ValueError("reissued review token was not inserted")
             outbox_inserted = self._insert_notification_outbox_on_connection(
                 connection,
                 notification,
@@ -4582,6 +4620,9 @@ class SQLiteRuntimeRepository:
         resolution_payload: dict[str, object] | None = None,
         emergency_base_cost: Decimal | None = None,
         emergency_base_cost_source_ref: str = "",
+        emergency_product_snapshot_verifier: (
+            Callable[[], tuple[Decimal, str]] | None
+        ) = None,
         now: datetime | None = None,
         failure_injector: Callable[[str], None] | None = None,
     ) -> MobileReviewAtomicResult:
@@ -4679,6 +4720,9 @@ class SQLiteRuntimeRepository:
                         timestamp=timestamp,
                         emergency_base_cost=emergency_base_cost,
                         emergency_base_cost_source_ref=emergency_base_cost_source_ref,
+                        emergency_product_snapshot_verifier=(
+                            emergency_product_snapshot_verifier
+                        ),
                         inject=inject,
                     )
                     connection.commit()
@@ -4993,6 +5037,9 @@ class SQLiteRuntimeRepository:
         timestamp: datetime,
         emergency_base_cost: Decimal | None,
         emergency_base_cost_source_ref: str,
+        emergency_product_snapshot_verifier: (
+            Callable[[], tuple[Decimal, str]] | None
+        ),
         inject: Callable[[str], None],
     ) -> MobileReviewAtomicResult:
         if status not in {
@@ -5017,7 +5064,10 @@ class SQLiteRuntimeRepository:
         if (
             incident_row is None
             or str(incident_row["incident_status"])
-            != IncidentStatus.WAITING_HUMAN.value
+            not in {
+                IncidentStatus.WAITING_HUMAN.value,
+                IncidentStatus.AUTO_PROTECTING.value,
+            }
         ):
             raise MobileReviewTransactionError(
                 MobileReviewErrorCode.CONCURRENT_UPDATE,
@@ -5048,6 +5098,22 @@ class SQLiteRuntimeRepository:
                 raise MobileReviewTransactionError(
                     MobileReviewErrorCode.CONCURRENT_UPDATE,
                     "商品基础成本不可用，已阻止创建平台任务",
+                )
+            if emergency_product_snapshot_verifier is None:
+                raise MobileReviewTransactionError(
+                    MobileReviewErrorCode.CONCURRENT_UPDATE,
+                    "商品主数据提交校验不可用，已阻止创建平台任务",
+                )
+            locked_base_cost, locked_source_ref = (
+                emergency_product_snapshot_verifier()
+            )
+            if (
+                locked_base_cost != emergency_base_cost
+                or locked_source_ref != emergency_base_cost_source_ref
+            ):
+                raise MobileReviewTransactionError(
+                    MobileReviewErrorCode.CONCURRENT_UPDATE,
+                    "商品主数据在复核提交前发生变化，请重试",
                 )
             listing_rows = connection.execute(
                 """
@@ -5137,7 +5203,7 @@ class SQLiteRuntimeRepository:
                 internal_sku=internal_sku,
                 platform_name=platform_name,
                 action_type=action_type,
-                priority=1,
+                priority=0,
                 task_status=TaskStatus.PENDING,
                 created_at=timestamp,
                 origin_type=TaskOriginType.MANUAL,
@@ -5241,6 +5307,32 @@ class SQLiteRuntimeRepository:
             changed_at=timestamp,
         )
 
+        incident_from_status = str(incident_row["incident_status"])
+        if incident_from_status == IncidentStatus.AUTO_PROTECTING.value:
+            connection.execute(
+                """
+                UPDATE tasks
+                SET task_status = 'cancelled', updated_at = ?,
+                    result_message = '人工复核已在平台副作用前抢占自动紧急下架'
+                WHERE origin_type = 'SYSTEM_EMERGENCY'
+                  AND task_status = 'pending'
+                  AND json_extract(decision_trace_json, '$.incident_id') = ?
+                """,
+                (_datetime_to_text(timestamp), incident_id),
+            )
+            transitioned = connection.execute(
+                """
+                UPDATE operational_incidents
+                SET incident_status = 'WAITING_HUMAN', updated_at = ?
+                WHERE incident_id = ? AND incident_status = 'AUTO_PROTECTING'
+                """,
+                (_datetime_to_text(timestamp), incident_id),
+            ).rowcount
+            if transitioned != 1:
+                raise MobileReviewTransactionError(
+                    MobileReviewErrorCode.CONCURRENT_UPDATE,
+                    "关联异常记录已变化，请刷新后重试",
+                )
         review_event_key = f"incident-review-resolution:{review_model.review_task_id}"
         event_id = f"incident-event-{hashlib.sha256(review_event_key.encode('utf-8')).hexdigest()[:24]}"
         connection.execute(
@@ -5258,7 +5350,7 @@ class SQLiteRuntimeRepository:
                 _datetime_to_text(timestamp),
                 "MOBILE_REVIEW",
                 review_model.review_task_id,
-                IncidentStatus.WAITING_HUMAN.value,
+                incident_from_status,
                 IncidentStatus.WAITING_HUMAN.value,
                 str(incident_row["severity"]),
                 _json_dump(
@@ -5290,7 +5382,7 @@ class SQLiteRuntimeRepository:
                     _datetime_to_text(timestamp),
                     "MOBILE_REVIEW",
                     task.task_id,
-                    IncidentStatus.WAITING_HUMAN.value,
+                    incident_from_status,
                     IncidentStatus.WAITING_HUMAN.value,
                     str(incident_row["severity"]),
                     _json_dump(
@@ -5304,8 +5396,19 @@ class SQLiteRuntimeRepository:
                 ),
             )
         connection.execute(
-            "UPDATE operational_incidents SET updated_at = ? WHERE incident_id = ?",
-            (_datetime_to_text(timestamp), incident_id),
+            """
+            UPDATE operational_incidents
+            SET updated_at = CASE
+                WHEN julianday(updated_at) < julianday(?) THEN ?
+                ELSE updated_at
+            END
+            WHERE incident_id = ?
+            """,
+            (
+                _datetime_to_text(timestamp),
+                _datetime_to_text(timestamp),
+                incident_id,
+            ),
         )
         inject("after_incident_review_resolution")
 
@@ -7341,7 +7444,8 @@ class SQLiteRuntimeRepository:
                     SELECT * FROM notification_outbox
                     WHERE related_review_task_id = ?
                       AND notification_type = 'mobile_review_required'
-                    ORDER BY created_at, notification_id
+                      AND status <> 'CANCELLED'
+                    ORDER BY created_at DESC, notification_id DESC
                     """,
                     (review_task_id,),
                 ).fetchall()
@@ -7351,19 +7455,6 @@ class SQLiteRuntimeRepository:
                     )
                 initial = outboxes[0]
                 channel = str(initial["channel"])
-                state = connection.execute(
-                    """
-                    SELECT * FROM incident_notification_state
-                    WHERE incident_id = ? AND channel = ?
-                    """,
-                    (incident_id, channel),
-                ).fetchone()
-                if state is not None and str(state["escalation_state"]).startswith(
-                    "MIDPOINT_"
-                ):
-                    connection.commit()
-                    return dict(state)
-
                 identity_sha256 = hashlib.sha256(
                     _json_dump(
                         {
@@ -7375,6 +7466,20 @@ class SQLiteRuntimeRepository:
                         }
                     ).encode("utf-8")
                 ).hexdigest()
+                state = connection.execute(
+                    """
+                    SELECT * FROM incident_notification_state
+                    WHERE incident_id = ? AND channel = ?
+                    """,
+                    (incident_id, channel),
+                ).fetchone()
+                if (
+                    state is not None
+                    and str(state["escalation_state"]).startswith("MIDPOINT_")
+                    and str(state["payload_sha256"]) == identity_sha256
+                ):
+                    connection.commit()
+                    return dict(state)
                 status = str(initial["status"])
                 sent_at = _text_to_datetime(initial["sent_at"])
                 if status == "SENT" and sent_at is not None:

@@ -6,18 +6,21 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
+from openpyxl import Workbook
 
 from app.emergency_offline_fence import (
     EmergencyOfflineFenceError,
     build_emergency_authorization_binding,
     revalidate_emergency_offline_facts,
 )
-from app.enums import TaskActionType, TaskOriginType, TaskStatus
+from app.enums import ReviewTaskStatus, TaskActionType, TaskOriginType, TaskStatus
 from app.exceptions import ValidationError
 from app.models import ListingStatus, Task
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.repositories.workbook_repository import PRODUCT_HEADERS
 from app.services.emergency_offline_authorization import (
     EMERGENCY_EVENT_TYPE,
     EmergencyOfflineAuthorizationService,
@@ -205,6 +208,20 @@ def _seed_authorization_facts(repository: SQLiteRuntimeRepository) -> None:
         )
         connection.execute(
             """
+            INSERT INTO review_tokens(
+                token_id, review_task_id, token_hash, token_subject,
+                allowed_actions, expires_at, used_at, revoked_at,
+                created_at, created_by, last_used_at, note
+            ) VALUES (
+                'TOKEN-1', 'REVIEW-1', 'synthetic-token-hash', 'operations',
+                '["adjusted","approved","rejected"]', ?, NULL, NULL,
+                ?, 'synthetic-fixture', NULL, 'synthetic'
+            )
+            """,
+            ((NOW + timedelta(days=7)).isoformat(), sent_at),
+        )
+        connection.execute(
+            """
             INSERT INTO notification_outbox(
                 notification_id, notification_key, notification_type,
                 related_task_id, related_review_task_id, recipient_type,
@@ -246,6 +263,11 @@ def _seed_authorization_facts(repository: SQLiteRuntimeRepository) -> None:
 def _service(repository: SQLiteRuntimeRepository) -> EmergencyOfflineAuthorizationService:
     service = EmergencyOfflineAuthorizationService(repository)
     service.shadow = _Shadow(_decision())  # type: ignore[assignment]
+    service.product_cost_reader = lambda *_args, **_kwargs: (  # type: ignore[method-assign]
+        Decimal("10.00"),
+        "products.xlsx:sha256:test",
+        "",
+    )
     return service
 
 
@@ -262,6 +284,31 @@ def _authorize(service: EmergencyOfflineAuthorizationService, **overrides):
     }
     values.update(overrides)
     return service.authorize(**values)
+
+
+def _write_products_workbook(path: Path, *, base_cost: int) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "data"
+    sheet.append(PRODUCT_HEADERS)
+    sheet.append(
+        [
+            "SKU-1",
+            "Synthetic flower",
+            "B",
+            "60",
+            "bundle",
+            base_cost,
+            50,
+            True,
+            8,
+            12,
+            "",
+            "synthetic",
+            "green",
+        ]
+    )
+    workbook.save(path)
 
 
 def test_authorization_event_task_and_incident_transition_are_atomic(
@@ -301,11 +348,199 @@ def test_authorization_accepts_shadow_decision_after_feature_flag_is_enabled(
             blockers=(),
         )
     )
+    service.product_cost_reader = lambda *_args, **_kwargs: (  # type: ignore[method-assign]
+        Decimal("10.00"),
+        "products.xlsx:sha256:test",
+        "",
+    )
 
     result = _authorize(service)
 
     assert result.task.origin_type is TaskOriginType.SYSTEM_EMERGENCY
     assert result.task.action_type is TaskActionType.SET_OFFLINE
+
+
+def test_automatic_authorization_cost_snapshot_fails_closed_after_database_lock_wait(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    products_path = tmp_path / "products-lock-wait.xlsx"
+    _write_products_workbook(products_path, base_cost=10)
+    reader = EmergencyOfflineAuthorizationService(repository).product_cost_reader
+    base_cost, source_ref, error = reader(products_path, internal_sku="SKU-1")
+    assert error == ""
+    reached_database_lock = Event()
+
+    class SignallingShadow(_Shadow):
+        def evaluate(self, **kwargs) -> EmergencyOfflineShadowDecision:
+            decision = super().evaluate(**kwargs)
+            reached_database_lock.set()
+            return decision
+
+    second_repository = SQLiteRuntimeRepository(repository.db_path)
+    service = EmergencyOfflineAuthorizationService(second_repository)
+    service.shadow = SignallingShadow(  # type: ignore[assignment]
+        replace(
+            _decision(),
+            base_cost=base_cost,
+            base_cost_source_ref=source_ref,
+        )
+    )
+    errors: list[BaseException] = []
+    blocker = repository.connect_write()
+    blocker.execute("BEGIN IMMEDIATE")
+
+    def authorize() -> None:
+        try:
+            _authorize(service, products_path=products_path)
+        except BaseException as exc:  # noqa: BLE001 - thread assertion capture
+            errors.append(exc)
+
+    thread = Thread(target=authorize)
+    thread.start()
+    assert reached_database_lock.wait(timeout=2)
+    _write_products_workbook(products_path, base_cost=11)
+    blocker.commit()
+    blocker.close()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], ValidationError)
+    assert "authoritative product cost changed" in str(errors[0])
+    assert not any(
+        task.origin_type is TaskOriginType.SYSTEM_EMERGENCY
+        for task in repository.list_tasks()
+    )
+
+
+def test_review_lock_first_prevents_waiting_authorization(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    with closing(repository.connect_write()) as connection, connection:
+        connection.execute(
+            "UPDATE review_tasks SET review_payload_json = ? "
+            "WHERE review_task_id = 'REVIEW-1'",
+            ('{"incident_id":"INCIDENT-1"}',),
+        )
+    review_repository = SQLiteRuntimeRepository(repository.db_path)
+    authorization_repository = SQLiteRuntimeRepository(repository.db_path)
+    review_has_lock = Event()
+    release_review = Event()
+    review_results: list[object] = []
+    authorization_errors: list[BaseException] = []
+
+    def hold_review_transaction(point: str) -> None:
+        if point == "after_incident_review_resolution":
+            review_has_lock.set()
+            assert release_review.wait(timeout=5)
+
+    def resolve_review() -> None:
+        review_results.append(
+            review_repository.resolve_mobile_review_atomic(
+                review_task_id="REVIEW-1",
+                token_hash="synthetic-token-hash",
+                status=ReviewTaskStatus.REJECTED,
+                actor_source="mobile_review_token",
+                note="operator handling",
+                now=NOW + timedelta(seconds=1),
+                failure_injector=hold_review_transaction,
+            )
+        )
+
+    def authorize() -> None:
+        try:
+            _authorize(_service(authorization_repository))
+        except BaseException as exc:  # noqa: BLE001 - thread assertion capture
+            authorization_errors.append(exc)
+
+    review_thread = Thread(target=resolve_review)
+    review_thread.start()
+    assert review_has_lock.wait(timeout=2)
+    authorization_thread = Thread(target=authorize)
+    authorization_thread.start()
+    release_review.set()
+    review_thread.join(timeout=5)
+    authorization_thread.join(timeout=5)
+
+    assert not review_thread.is_alive()
+    assert not authorization_thread.is_alive()
+    assert len(review_results) == 1
+    assert len(authorization_errors) == 1
+    assert isinstance(authorization_errors[0], ValidationError)
+    assert "Review already resolved" in str(authorization_errors[0])
+    assert not any(
+        task.origin_type is TaskOriginType.SYSTEM_EMERGENCY
+        for task in repository.list_tasks()
+    )
+
+
+def test_authorization_lock_first_is_preempted_by_waiting_formal_review(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    with closing(repository.connect_write()) as connection, connection:
+        connection.execute(
+            "UPDATE review_tasks SET review_payload_json = ? "
+            "WHERE review_task_id = 'REVIEW-1'",
+            ('{"incident_id":"INCIDENT-1"}',),
+        )
+    authorization_repository = SQLiteRuntimeRepository(repository.db_path)
+    review_repository = SQLiteRuntimeRepository(repository.db_path)
+    authorization_has_lock = Event()
+    release_authorization = Event()
+    authorization_results: list[object] = []
+    review_results: list[object] = []
+
+    def hold_authorization_transaction(point: str) -> None:
+        if point == "after_emergency_task":
+            authorization_has_lock.set()
+            assert release_authorization.wait(timeout=5)
+
+    def authorize() -> None:
+        authorization_results.append(
+            _authorize(
+                _service(authorization_repository),
+                failure_injector=hold_authorization_transaction,
+            )
+        )
+
+    def resolve_review() -> None:
+        review_results.append(
+            review_repository.resolve_mobile_review_atomic(
+                review_task_id="REVIEW-1",
+                token_hash="synthetic-token-hash",
+                status=ReviewTaskStatus.REJECTED,
+                actor_source="mobile_review_token",
+                note="operator handling",
+                now=NOW + timedelta(seconds=2),
+            )
+        )
+
+    authorization_thread = Thread(target=authorize)
+    authorization_thread.start()
+    assert authorization_has_lock.wait(timeout=2)
+    review_thread = Thread(target=resolve_review)
+    review_thread.start()
+    release_authorization.set()
+    authorization_thread.join(timeout=5)
+    review_thread.join(timeout=5)
+
+    assert not authorization_thread.is_alive()
+    assert not review_thread.is_alive()
+    assert len(authorization_results) == 1
+    assert len(review_results) == 1
+    emergency_task = authorization_results[0].task
+    stored_task = repository.get_task(emergency_task.task_id)
+    assert stored_task is not None
+    assert stored_task.task_status is TaskStatus.CANCELLED
+    with closing(repository.connect_read()) as connection:
+        incident = connection.execute(
+            "SELECT incident_status FROM operational_incidents "
+            "WHERE incident_id = 'INCIDENT-1'"
+        ).fetchone()
+    assert incident["incident_status"] == "WAITING_HUMAN"
 
 
 def test_exact_authorization_replay_returns_same_task(tmp_path: Path) -> None:
@@ -319,6 +554,36 @@ def test_exact_authorization_replay_returns_same_task(tmp_path: Path) -> None:
     assert replay.replayed
     assert first.task.task_id == replay.task.task_id
     assert first.evidence_sha256 == replay.evidence_sha256
+
+
+def test_reissued_pending_notification_invalidates_old_sent_window(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    with closing(repository.connect_write()) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO notification_outbox(
+                notification_id, notification_key, notification_type,
+                related_task_id, related_review_task_id, recipient_type,
+                recipient_ref, channel, priority, payload_json, status,
+                attempt_count, max_attempts, created_at, updated_at
+            ) VALUES (
+                'OUTBOX-REISSUED', 'outbox-reissued', 'mobile_review_required',
+                NULL, 'REVIEW-1', 'operator', 'admin', 'feishu', 100, '{}',
+                'PENDING', 0, 3, ?, ?
+            )
+            """,
+            (NOW.isoformat(), NOW.isoformat()),
+        )
+
+    with pytest.raises(ValidationError, match="initial Review notification is not SENT"):
+        _authorize(_service(repository))
+
+    assert not any(
+        task.origin_type is TaskOriginType.SYSTEM_EMERGENCY
+        for task in repository.list_tasks()
+    )
 
 
 def test_disabled_flag_and_manual_task_fail_before_any_authorization_write(
@@ -361,6 +626,23 @@ def test_manual_task_blocks_authorization(tmp_path: Path) -> None:
 
     with pytest.raises(ValidationError, match="manual task"):
         _authorize(_service(repository))
+
+
+def test_authorization_requires_a_usable_human_review_token(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    with closing(repository.connect_write()) as connection, connection:
+        connection.execute(
+            "UPDATE review_tokens SET expires_at = ? WHERE review_task_id = 'REVIEW-1'",
+            ((NOW - timedelta(seconds=1)).isoformat(),),
+        )
+
+    with pytest.raises(ValidationError, match="no usable token"):
+        _authorize(_service(repository))
+
+    with closing(repository.connect_read()) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM tasks WHERE origin_type = 'SYSTEM_EMERGENCY'"
+        ).fetchone()[0] == 0
 
 
 @pytest.mark.parametrize(
@@ -418,6 +700,56 @@ def test_authorized_task_builds_replay_safe_click_binding(tmp_path: Path) -> Non
     assert binding["authorization_event_id"] == result.authorization_event_id
     assert binding["authorization_evidence_sha256"] == result.evidence_sha256
     assert evidence["review_task_id"] == "REVIEW-1"
+
+
+@pytest.mark.parametrize(
+    "review_payload",
+    [
+        '{"blocked_actions":["set_offline"],"reason_code":"PAGE_DRIFT"}',
+        '{"blocked_actions":"set_offline","reason_code":"MALFORMED"}',
+    ],
+)
+def test_final_fence_blocks_review_created_after_request_persistence(
+    tmp_path: Path,
+    review_payload: str,
+) -> None:
+    repository = _repository(tmp_path)
+    authorized = _authorize(_service(repository))
+    with closing(repository.connect_read()) as connection:
+        binding = build_emergency_authorization_binding(
+            connection,
+            task_id=authorized.task.task_id,
+        )
+    with closing(repository.connect_write()) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO review_tasks(
+                review_task_id, trade_date, scope_type, scope_key, dedupe_key,
+                source_task_id, review_type, review_status, internal_sku,
+                platform_name, reason, review_payload_json,
+                resolution_payload_json, required_by, created_at, updated_at
+            ) VALUES (
+                'REVIEW-LATE', '2026-08-03', 'sku', 'SKU-1', 'late-review',
+                NULL, 'listing_anomaly', 'pending', 'SKU-1', 'platform',
+                'late blocker', ?, '{}', ?, ?, ?
+            )
+            """,
+            (
+                review_payload,
+                (NOW + timedelta(hours=1)).isoformat(),
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+
+    with closing(repository.connect_read()) as connection:
+        with pytest.raises(EmergencyOfflineFenceError, match="BLOCKING_REVIEW"):
+            revalidate_emergency_offline_facts(
+                connection,
+                binding=binding,
+                now=NOW + timedelta(seconds=2),
+                allowed_task_statuses={"pending"},
+            )
 
 
 @pytest.mark.parametrize("revocation", ["flag", "review"])

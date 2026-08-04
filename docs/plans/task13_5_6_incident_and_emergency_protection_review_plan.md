@@ -1,7 +1,7 @@
 # 任务 13.5-6：异常人工闭环与受控紧急保护审查计划
 
 - 计划日期：2026-08-02
-- 状态：业务规则已逐项评议；本 PR 只冻结计划，不实现业务代码
+- 状态：业务规则、实现和受控实机已完成；2026-08-04 合并前七项整改本地完成，待复审
 - Review Profile：`R4`；13.5-6C 的真实写链额外执行完整 `R3` 门禁
 - 当前平台：蚂蚁花团供应商微信小程序；公共核心保持平台无关
 - 真实平台写操作：13.5-6A/6B 为否，13.5-6C 仅允许一次受控 `SET_OFFLINE`
@@ -674,5 +674,35 @@ Incident 事件表解决“同一异常多次发生、检测重放、状态变�
 - 全量回归、系统冒烟、Linux/Windows CI 和受控实机通过；
 - 自动重新上架不存在；次数上限和冷却规则不存在；
 - 任务 14 正式授权前 `automatic_emergency_offline=false`。
+
+## 20. 2026-08-04 合并前七项整改顺序
+
+最新完整实现审查的六项阻塞与运营补充的“人工/自动紧急任务必须插队”合并为一组整改，
+按依赖顺序执行，避免各自打补丁形成相互矛盾的控制流：
+
+1. **先固定 Incident 时间投影**：迟到检测和状态事件只追加不可变流水，不得倒退主投影、
+   重开已解决异常或重复触发保护；真正晚于当前投影的再现才允许重开。
+2. **再打通正式人工抢占**：Mobile Review 在 `AUTO_PROTECTING` 且平台副作用尚未发生时
+   仍可提交；人工结果原子取消 pending 自动紧急任务。自动评估截止时间不等于人工入口
+   失效时间；入口不可用时重新签发 Token、重新发送初始通知并重新开始 Pulse 等待窗口。
+3. **随后冻结紧急插队顺序**：同一全局待执行集合固定为
+   `Incident 人工 UPDATE_PRICE/SET_OFFLINE（priority=0） → SYSTEM_EMERGENCY（priority=1）
+   → 普通业务任务（lane=2）`。显式 task ID、v4/v5 发布入口和 Automation UI 调度均不得
+   绕过更高车道；紧急任务终态后才恢复普通 UI Automation。
+4. **补齐最终 Worker Fence**：请求持久化后新出现的页面、映射、部分操作或其他阻断
+   Review 必须在点击前被同一个共享 Review matcher 识别；只排除本次绑定的 emergency
+   Review，畸形 `blocked_actions` 继续 fail closed。
+5. **关闭商品成本 TOCTOU**：自动授权和人工“改价到/立即下架”在取得 SQLite 写锁后再次
+   无副作用读取商品工作簿，校验文件 hash、SKU 与 `base_cost`；锁等待期间工作簿变化则
+   整体回滚。本项不恢复最终点击前的 80% 阈值重算。
+6. **完成 MANUAL 任务结果回投**：v4/v5 Importer 在原事务内把人工任务结果幂等投影回
+   Incident。成功解决，失败保持人工待处理，UNKNOWN/部分完成继续复用既有 Review 或
+   唯一 RECONCILE；精确重放不重复事件或通知。
+7. **最后统一 FINAL 范围**：共享 matcher 规范化 `internal_sku/listing → SKU`；平台异常按
+   同平台/交易日传播，SKU 只精确阻断 SKU，只有已选订单/估算输入确实包含该 SKU 时才向
+   VARIETY/GRADE/TIME_BUCKET 传播，避免平台总量和无关聚合过阻断。
+
+上述整改不增加表、全局锁、平台合同版本、真实平台动作或结算状态；仍复用现有 Incident
+Event、Review/Token/Outbox、Automation、v4/v5、Importer、写锁和唯一 RECONCILE。
 
 Refs #20

@@ -3,8 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import dataclass
-from datetime import date, datetime
+from dataclasses import dataclass, replace
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Callable
 
@@ -243,6 +243,7 @@ class IncidentReviewService:
         ReviewTaskStatus.APPROVED.value,
         ReviewTaskStatus.REJECTED.value,
     ]
+    HUMAN_ENTRY_LIFETIME = timedelta(hours=24)
 
     def __init__(self, runtime_repository: SQLiteRuntimeRepository) -> None:
         self.runtime_repository = runtime_repository
@@ -321,7 +322,10 @@ class IncidentReviewService:
         token = self.tokens.build_reconstructable_token_candidate(
             review_task,
             allowed_actions=self.ALLOWED_ACTIONS,
-            expires_at=required_by,
+            expires_at=max(
+                required_by,
+                created_at + self.HUMAN_ENTRY_LIFETIME,
+            ),
             created_at=created_at,
         )
         notification, compatibility_log = (
@@ -424,6 +428,72 @@ class IncidentReviewService:
             replayed=True,
         )
 
+    def ensure_usable_human_entry(
+        self,
+        review_task_id: str,
+        *,
+        now: datetime,
+    ) -> IncidentReviewCreationResult | None:
+        review = self.runtime_repository.get_review_task(review_task_id)
+        if review is None or review.review_status is not ReviewTaskStatus.PENDING:
+            return None
+        for token in self.runtime_repository.list_review_tokens_by_review_task_id(
+            review_task_id
+        ):
+            if (
+                token.used_at is None
+                and token.revoked_at is None
+                and token.expires_at > now
+                and set(token.allowed_actions).intersection(self.ALLOWED_ACTIONS)
+            ):
+                return None
+        window = (
+            review.required_by - review.created_at
+            if review.required_by is not None
+            else timedelta(minutes=10)
+        )
+        if window <= timedelta(0):
+            window = timedelta(minutes=10)
+        renewed = replace(
+            review,
+            required_by=now + window,
+            updated_at=now,
+        )
+        token = self.tokens.build_reconstructable_token_candidate(
+            renewed,
+            allowed_actions=self.ALLOWED_ACTIONS,
+            expires_at=now + self.HUMAN_ENTRY_LIFETIME,
+            created_at=now,
+        )
+        notification, compatibility_log = (
+            self.notifications.outbox_service.build_review_notification_candidate(
+                renewed,
+                event_version="reissue-" + now.isoformat(timespec="seconds"),
+            )
+        )
+        updated, inserted = (
+            self.runtime_repository.renew_review_task_with_notification_outbox(
+                renewed,
+                notification,
+                compatibility_log,
+                expected_required_by=review.required_by,
+                review_token=token.review_token,
+            )
+        )
+        if updated != 1 or inserted != 1:
+            return None
+        incident = self.incidents.get(review.scope_key)
+        if incident is None:
+            raise RuntimeError("Incident disappeared during Review token reissue")
+        return IncidentReviewCreationResult(
+            incident=incident,
+            review_task=renewed,
+            review_token=token.review_token,
+            notification=notification,
+            raw_token=token.raw_token,
+            mobile_review_url=token.mobile_review_url,
+        )
+
 
 def _stable_review_id(value: str) -> str:
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:24]
@@ -482,7 +552,7 @@ class IncidentNotificationService:
             if candidate.notification_type == "mobile_review_required"
         ]
         initial = (
-            min(
+            max(
                 initial_candidates,
                 key=lambda item: (
                     item.created_at.isoformat() if item.created_at is not None else "",
@@ -501,7 +571,7 @@ class IncidentNotificationService:
         candidate, compatibility_log = (
             candidate_builder.build_review_notification_candidate(
                 review,
-                event_version="s4-midpoint-v1",
+                event_version=f"s4-midpoint-v1:{initial.notification_id}",
                 recipient_type=initial.recipient_type,
                 recipient_ref=initial.recipient_ref,
                 channel=initial.channel,
@@ -750,25 +820,27 @@ class IncidentNotificationService:
         incident_id: str,
         review_task_id: str,
     ) -> datetime | None:
-        initial_notification_id = next(
-            (
-                str(event.event_payload.get("notification_id") or "")
-                for event in self.incidents.list_events(incident_id)
-                if event.event_type is IncidentEventType.REVIEW_RECORDED
-                and event.event_payload.get("review_task_id") == review_task_id
-                and event.event_payload.get("notification_id")
-            ),
-            "",
-        )
-        initial = next(
-            (
-                candidate
-                for candidate in self.runtime_repository.list_notification_outbox(
-                    related_review_task_id=review_task_id
-                )
-                if candidate.notification_id == initial_notification_id
-            ),
-            None,
+        review = self.runtime_repository.get_review_task(review_task_id)
+        if review is None or review.scope_key != incident_id:
+            return None
+        initial_candidates = [
+            candidate
+            for candidate in self.runtime_repository.list_notification_outbox(
+                related_review_task_id=review_task_id
+            )
+            if candidate.notification_type == "mobile_review_required"
+            and candidate.status != "CANCELLED"
+        ]
+        initial = (
+            max(
+                initial_candidates,
+                key=lambda item: (
+                    item.created_at.isoformat() if item.created_at is not None else "",
+                    item.notification_id,
+                ),
+            )
+            if initial_candidates
+            else None
         )
         return (
             initial.sent_at

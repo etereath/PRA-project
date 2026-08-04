@@ -7,6 +7,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from app.services.listing_automation_gate import (
+    open_review_context,
+    review_block_reasons,
+)
+
 EMERGENCY_BINDING_SCHEMA_VERSION = "emergency-offline-authorization-binding-1.0"
 EMERGENCY_EVENT_TYPE = "EMERGENCY_OFFLINE_AUTHORIZED"
 EMERGENCY_JOB_TYPE = "SYSTEM_EMERGENCY_SET_OFFLINE"
@@ -225,6 +230,20 @@ def revalidate_emergency_offline_facts(
         or str(review["scope_key"]) != binding["incident_id"]
     ):
         raise EmergencyOfflineFenceError("EMERGENCY_REVIEW_ALREADY_RESOLVED")
+    open_reviews = [
+        candidate
+        for candidate in open_review_context(
+            connection,
+            platform_name=binding["platform_name"],
+            internal_sku=binding["internal_sku"],
+        )
+        if candidate.get("review_task_id") != binding["review_task_id"]
+    ]
+    review_reasons = review_block_reasons("set_offline", open_reviews)
+    if review_reasons:
+        raise EmergencyOfflineFenceError(
+            "EMERGENCY_BLOCKING_REVIEW:" + ",".join(review_reasons)
+        )
 
     policy = connection.execute(
         """

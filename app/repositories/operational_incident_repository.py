@@ -115,9 +115,24 @@ class OperationalIncidentRepository:
                 """,
                 (dedupe_key,),
             ).fetchone()
+            latest_event_at = (
+                self._latest_event_occurred_at_on_connection(
+                    connection,
+                    str(latest["incident_id"]),
+                )
+                if latest is not None
+                else None
+            )
+            late_event = (
+                latest_event_at is not None and occurred_at < latest_event_at
+            )
             create_new = (
                 latest is None
-                or str(latest["incident_status"]) == IncidentStatus.CLOSED.value
+                or (
+                    str(latest["incident_status"])
+                    == IncidentStatus.CLOSED.value
+                    and not late_event
+                )
             )
             event_type = (
                 IncidentEventType.DETECTED
@@ -133,7 +148,9 @@ class OperationalIncidentRepository:
                 None if create_new else IncidentStatus(str(latest["incident_status"]))
             )
             to_status = (
-                IncidentStatus.OPEN
+                from_status
+                if late_event
+                else IncidentStatus.OPEN
                 if from_status is IncidentStatus.RESOLVED
                 else from_status
             )
@@ -170,7 +187,7 @@ class OperationalIncidentRepository:
                         _datetime_text(occurred_at),
                     ),
                 )
-            else:
+            elif not late_event:
                 connection.execute(
                     """
                     UPDATE operational_incidents
@@ -239,7 +256,10 @@ class OperationalIncidentRepository:
         _require_aware_datetime(occurred_at, "occurred_at")
         _require_text(event_key, "event_key")
         _require_text(source_type, "source_type")
-        payload = {"transition": event_payload or {}}
+        payload = {
+            "transition": event_payload or {},
+            "requested_to_status": to_status.value,
+        }
         connection = self.runtime_repository.connect_write()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -254,13 +274,19 @@ class OperationalIncidentRepository:
                 event_payload=payload,
                 incident_id=incident_id,
                 event_type=IncidentEventType.STATUS_CHANGED,
-                to_status=to_status,
             )
             if replay is not None:
                 connection.rollback()
                 return replay
+            latest_event_at = self._latest_event_occurred_at_on_connection(
+                connection,
+                incident_id,
+            )
+            late_event = (
+                latest_event_at is not None and occurred_at < latest_event_at
+            )
             allowed = INCIDENT_TRANSITIONS.get(incident.incident_status)
-            if allowed is None or to_status not in allowed:
+            if not late_event and (allowed is None or to_status not in allowed):
                 raise IncidentTransitionError(
                     f"invalid Incident transition: {incident.incident_status.value} -> {to_status.value}"
                 )
@@ -271,21 +297,22 @@ class OperationalIncidentRepository:
             )
             if to_status is IncidentStatus.CLOSED and incident.resolved_at is not None:
                 resolved_at = incident.resolved_at
-            connection.execute(
-                """
-                UPDATE operational_incidents
-                SET incident_status = ?, resolved_at = ?, updated_at = ?
-                WHERE incident_id = ? AND incident_status = ?
-                """,
-                (
-                    to_status.value,
-                    _datetime_text(resolved_at),
-                    _datetime_text(occurred_at),
-                    incident_id,
-                    incident.incident_status.value,
-                ),
-            )
-            _inject(failure_injector, "after_incident_write")
+            if not late_event:
+                connection.execute(
+                    """
+                    UPDATE operational_incidents
+                    SET incident_status = ?, resolved_at = ?, updated_at = ?
+                    WHERE incident_id = ? AND incident_status = ?
+                    """,
+                    (
+                        to_status.value,
+                        _datetime_text(resolved_at),
+                        _datetime_text(occurred_at),
+                        incident_id,
+                        incident.incident_status.value,
+                    ),
+                )
+                _inject(failure_injector, "after_incident_write")
             event = self._insert_event(
                 connection,
                 event_key=event_key,
@@ -295,7 +322,7 @@ class OperationalIncidentRepository:
                 source_type=source_type,
                 source_ref_id=source_ref_id,
                 from_status=incident.incident_status,
-                to_status=to_status,
+                to_status=(incident.incident_status if late_event else to_status),
                 severity=incident.severity,
                 event_payload=payload,
             )
@@ -639,8 +666,19 @@ class OperationalIncidentRepository:
                 event_payload=event_payload,
             )
             connection.execute(
-                "UPDATE operational_incidents SET updated_at = ? WHERE incident_id = ?",
-                (_datetime_text(occurred_at), incident_id),
+                """
+                UPDATE operational_incidents
+                SET updated_at = CASE
+                    WHEN julianday(updated_at) < julianday(?) THEN ?
+                    ELSE updated_at
+                END
+                WHERE incident_id = ?
+                """,
+                (
+                    _datetime_text(occurred_at),
+                    _datetime_text(occurred_at),
+                    incident_id,
+                ),
             )
             updated = self._get_required_on_connection(connection, incident_id)
             connection.commit()
@@ -690,6 +728,25 @@ class OperationalIncidentRepository:
             )
         incident = self._get_required_on_connection(connection, event.incident_id)
         return IncidentMutationResult(incident=incident, event=event, replayed=True)
+
+    @staticmethod
+    def _latest_event_occurred_at_on_connection(
+        connection: sqlite3.Connection,
+        incident_id: str,
+    ) -> datetime | None:
+        row = connection.execute(
+            """
+            SELECT occurred_at
+            FROM operational_incident_events
+            WHERE incident_id = ?
+            ORDER BY julianday(occurred_at) DESC, occurred_at DESC, event_id DESC
+            LIMIT 1
+            """,
+            (incident_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return datetime.fromisoformat(str(row["occurred_at"]))
 
     @staticmethod
     def _get_required_on_connection(

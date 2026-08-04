@@ -437,30 +437,20 @@ def resolve_mobile_review(
                 MobileReviewErrorCode.CONCURRENT_UPDATE,
                 "商品主数据不可用，已阻止创建平台任务",
             )
-        product_bytes_before = products_path.read_bytes()
-        products = load_products(products_path)
-        product_bytes_after = products_path.read_bytes()
-        if product_bytes_after != product_bytes_before:
-            raise MobileReviewTransactionError(
-                MobileReviewErrorCode.CONCURRENT_UPDATE,
-                "商品主数据在复核期间发生变化，请重试",
+        emergency_base_cost, emergency_base_cost_source_ref = (
+            _read_authoritative_product_cost_snapshot(
+                products_path,
+                internal_sku=str(review_task.internal_sku or ""),
             )
-        product = next(
-            (
-                candidate
-                for candidate in products
-                if candidate.internal_sku == review_task.internal_sku
-            ),
-            None,
         )
-        if product is None:
-            raise MobileReviewTransactionError(
-                MobileReviewErrorCode.CONCURRENT_UPDATE,
-                "商品基础成本不可用，已阻止创建平台任务",
-            )
-        emergency_base_cost = product.base_cost
-        content_sha256 = hashlib.sha256(product_bytes_before).hexdigest()
-        emergency_base_cost_source_ref = f"{products_path.name}:sha256:{content_sha256}"
+    snapshot_verifier = (
+        lambda: _read_authoritative_product_cost_snapshot(
+            products_path,
+            internal_sku=str(review_task.internal_sku or ""),
+        )
+        if products_path is not None
+        else None
+    )
     atomic_result = repository.resolve_mobile_review_atomic(
         review_task_id=review_task_id,
         token_hash=token_hash,
@@ -470,6 +460,7 @@ def resolve_mobile_review(
         resolution_payload=resolution_payload,
         emergency_base_cost=emergency_base_cost,
         emergency_base_cost_source_ref=emergency_base_cost_source_ref,
+        emergency_product_snapshot_verifier=snapshot_verifier,
         now=now,
     )
     return MobileReviewResolutionSummary(
@@ -477,6 +468,41 @@ def resolve_mobile_review(
         review_token=atomic_result.review_token,
         source_task=atomic_result.source_task,
         source_task_status=atomic_result.source_task_status,
+    )
+
+
+def _read_authoritative_product_cost_snapshot(
+    products_path: Path,
+    *,
+    internal_sku: str,
+) -> tuple[Decimal, str]:
+    try:
+        content_before = products_path.read_bytes()
+        products = load_products(products_path)
+        content_after = products_path.read_bytes()
+    except (OSError, ValueError, ValidationError) as exc:
+        raise MobileReviewTransactionError(
+            MobileReviewErrorCode.CONCURRENT_UPDATE,
+            "商品主数据不可用，已阻止创建平台任务",
+        ) from exc
+    if content_after != content_before:
+        raise MobileReviewTransactionError(
+            MobileReviewErrorCode.CONCURRENT_UPDATE,
+            "商品主数据在复核期间发生变化，请重试",
+        )
+    product = next(
+        (candidate for candidate in products if candidate.internal_sku == internal_sku),
+        None,
+    )
+    if product is None:
+        raise MobileReviewTransactionError(
+            MobileReviewErrorCode.CONCURRENT_UPDATE,
+            "商品基础成本不可用，已阻止创建平台任务",
+        )
+    content_sha256 = hashlib.sha256(content_before).hexdigest()
+    return (
+        product.base_cost,
+        f"{products_path.name}:sha256:{content_sha256}",
     )
 
 

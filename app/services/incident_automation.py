@@ -18,7 +18,10 @@ from app.services.automation import (
     AutomationExecutionContext,
     AutomationHandler,
 )
-from app.services.incident_management import IncidentNotificationService
+from app.services.incident_management import (
+    IncidentNotificationService,
+    IncidentReviewService,
+)
 from app.services.shadowbot_worker_recovery import (
     ShadowBotWorkerRecoveryCoordinator,
 )
@@ -45,6 +48,7 @@ class IncidentNotificationAutomationHandler:
             raise RuntimeError("Automation lease was lost before Incident maintenance")
 
         service = IncidentNotificationService(self.runtime_repository)
+        review_service = IncidentReviewService(self.runtime_repository)
         results: list[dict[str, object]] = []
         pending_reviews = self.runtime_repository.list_review_tasks(
             status=ReviewTaskStatus.PENDING
@@ -61,6 +65,10 @@ class IncidentNotificationAutomationHandler:
                     "Automation lease was lost during Incident maintenance"
                 )
             incident_id = review.scope_key
+            reissued = review_service.ensure_usable_human_entry(
+                review.review_task_id,
+                now=context.clock(),
+            )
             timing = service.sync_initial_delivery(
                 incident_id,
                 review.review_task_id,
@@ -84,6 +92,7 @@ class IncidentNotificationAutomationHandler:
                 {
                     "incident_id": incident_id,
                     "review_task_id": review.review_task_id,
+                    "human_entry_reissued": reissued is not None,
                     "escalation_state": timing.escalation_state,
                     "notification_count": timing.notification_count,
                     "reminder_status": reminder.status,

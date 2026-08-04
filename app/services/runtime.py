@@ -635,6 +635,13 @@ class ReviewTaskService:
         pending_reviews = self.repository.list_pending_review_tasks_due_before(cutoff)
         summary = ExpireReviewTasksSummary(scanned_review_tasks=len(pending_reviews))
         for review in pending_reviews:
+            if review.review_type == "emergency_protection":
+                # ``required_by`` is the automatic-evaluation deadline for an
+                # emergency Review, not the final lifetime of the human entry.
+                # The formal Mobile Review remains pending until the platform
+                # side-effect boundary or an explicit resolution.
+                summary.skipped_review_tasks += 1
+                continue
             source_task = (
                 self.runtime_task_service.get_task(review.source_task_id)
                 if review.source_task_id

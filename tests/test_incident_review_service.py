@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from threading import Event, Thread
 
 import pytest
 from openpyxl import Workbook
@@ -19,7 +20,7 @@ from app.exceptions import (
     MobileReviewTransactionError,
     NotificationIdempotencyConflictError,
 )
-from app.models import ListingStatus, NotificationDeliveryResult
+from app.models import ListingStatus, NotificationDeliveryResult, Task
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import PRODUCT_HEADERS
 from app.services.incident_management import (
@@ -33,11 +34,19 @@ from app.services.notification_outbox import (
     NotificationOutboxService,
 )
 from app.services.runtime import ReviewTokenService
-from app.services.workflow import get_mobile_review_detail, resolve_mobile_review
+from app.services.workflow import (
+    _read_authoritative_product_cost_snapshot,
+    get_mobile_review_detail,
+    resolve_mobile_review,
+)
 from app.web import render_mobile_review_page
 from tests.test_incident_management import detection
 
 NOW = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+
+
+def stable_product_snapshot() -> tuple[Decimal, str]:
+    return Decimal("10.00"), "products.xlsx:sha256:synthetic"
 
 
 @pytest.fixture
@@ -945,6 +954,7 @@ def test_incident_mobile_review_creates_manual_v4_or_v5_task_atomically(
         resolution_payload=payload,
         emergency_base_cost=Decimal("10.00"),
         emergency_base_cost_source_ref="products.xlsx:sha256:synthetic",
+        emergency_product_snapshot_verifier=stable_product_snapshot,
         now=NOW + timedelta(minutes=2),
     )
 
@@ -991,6 +1001,7 @@ def test_incident_mobile_review_rejects_price_below_base_cost_without_consuming_
             resolution_payload={"adjustment": {"target_price": "9.99"}},
             emergency_base_cost=Decimal("10.00"),
             emergency_base_cost_source_ref="products.xlsx:sha256:synthetic",
+            emergency_product_snapshot_verifier=stable_product_snapshot,
             now=NOW + timedelta(minutes=2),
         )
 
@@ -1030,6 +1041,63 @@ def test_incident_mobile_review_human_handling_creates_no_platform_task(
     assert current.incident_status is IncidentStatus.WAITING_HUMAN
 
 
+def test_formal_mobile_review_preempts_auto_protecting_before_side_effect(
+    runtime_repository,
+):
+    incident, review = create_review_with_listing(runtime_repository)
+    automatic_task = Task(
+        task_id="TASK-EMERGENCY-SYNTHETIC",
+        internal_sku=review.review_task.internal_sku,
+        platform_name=review.review_task.platform_name,
+        action_type=TaskActionType.SET_OFFLINE,
+        priority=1,
+        task_status=TaskStatus.PENDING,
+        created_at=NOW + timedelta(minutes=1),
+        target_status="offline",
+        decision_trace={
+            "incident_id": incident.incident_id,
+            "review_task_id": review.review_task.review_task_id,
+        },
+        origin_type=TaskOriginType.SYSTEM_EMERGENCY,
+        origin_ref_id="emergency:synthetic",
+        expires_at=NOW + timedelta(hours=1),
+    )
+    with runtime_repository.connect_write() as connection, connection:
+        SQLiteRuntimeRepository._insert_tasks_on_connection(
+            connection,
+            [automatic_task],
+        )
+        connection.execute(
+            "UPDATE operational_incidents SET incident_status = 'AUTO_PROTECTING' "
+            "WHERE incident_id = ?",
+            (incident.incident_id,),
+        )
+    token_hash = ReviewTokenService(runtime_repository)._hash_raw_token(
+        review.raw_token
+    )
+
+    result = runtime_repository.resolve_mobile_review_atomic(
+        review_task_id=review.review_task.review_task_id,
+        token_hash=token_hash,
+        status=ReviewTaskStatus.APPROVED,
+        actor_source="mobile_review_token",
+        resolution_payload={},
+        emergency_base_cost=Decimal("10.00"),
+        emergency_base_cost_source_ref="products.xlsx:sha256:synthetic",
+        emergency_product_snapshot_verifier=stable_product_snapshot,
+        now=NOW + timedelta(minutes=2),
+    )
+
+    current = IncidentManagementService(runtime_repository).get(incident.incident_id)
+    cancelled = runtime_repository.get_task(automatic_task.task_id)
+    assert current is not None
+    assert current.incident_status is IncidentStatus.WAITING_HUMAN
+    assert cancelled is not None
+    assert cancelled.task_status is TaskStatus.CANCELLED
+    assert result.source_task is not None
+    assert result.source_task.priority == 0
+
+
 def test_incident_mobile_review_task_and_token_roll_back_together(runtime_repository):
     _, review = create_review_with_listing(runtime_repository)
     token_hash = ReviewTokenService(runtime_repository)._hash_raw_token(
@@ -1048,6 +1116,7 @@ def test_incident_mobile_review_task_and_token_roll_back_together(runtime_reposi
             actor_source="mobile_review_token",
             emergency_base_cost=Decimal("10.00"),
             emergency_base_cost_source_ref="products.xlsx:sha256:synthetic",
+            emergency_product_snapshot_verifier=stable_product_snapshot,
             now=NOW + timedelta(minutes=2),
             failure_injector=fail,
         )
@@ -1060,6 +1129,154 @@ def test_incident_mobile_review_task_and_token_roll_back_together(runtime_reposi
     assert stored_review.review_status is ReviewTaskStatus.PENDING
     assert stored_token is not None
     assert stored_token.used_at is None
+    assert runtime_repository.list_tasks() == []
+
+
+def test_incident_review_reissues_expired_human_entry_and_restarts_window(
+    runtime_repository,
+):
+    incident = create_s4_incident(runtime_repository)
+    service = IncidentReviewService(runtime_repository)
+    original = service.create_initial_review(
+        incident.incident_id,
+        required_by=NOW + timedelta(hours=2),
+        created_at=NOW + timedelta(minutes=1),
+    )
+    mark_notification(
+        runtime_repository,
+        original.notification.notification_id,
+        now=NOW + timedelta(minutes=2),
+    )
+    delivered = IncidentNotificationService(runtime_repository).sync_initial_delivery(
+        incident.incident_id,
+        original.review_task.review_task_id,
+    )
+    assert delivered.decision_window_started_at == NOW + timedelta(minutes=2)
+    reissue_at = NOW + timedelta(days=2)
+    with runtime_repository.connect_write() as connection, connection:
+        connection.execute(
+            "UPDATE review_tokens SET expires_at = ? WHERE token_id = ?",
+            (
+                (reissue_at - timedelta(seconds=1)).isoformat(),
+                original.review_token.token_id,
+            ),
+        )
+
+    reissued = service.ensure_usable_human_entry(
+        original.review_task.review_task_id,
+        now=reissue_at,
+    )
+
+    assert reissued is not None
+    assert reissued.raw_token != original.raw_token
+    assert reissued.review_task.required_by == reissue_at + timedelta(
+        hours=1, minutes=59
+    )
+    tokens = runtime_repository.list_review_tokens_by_review_task_id(
+        original.review_task.review_task_id
+    )
+    assert len(tokens) == 2
+    old_token = next(
+        token for token in tokens if token.token_id == original.review_token.token_id
+    )
+    new_token = next(
+        token for token in tokens if token.token_id == reissued.review_token.token_id
+    )
+    assert old_token.revoked_at == reissue_at
+    assert new_token.expires_at == reissue_at + timedelta(hours=24)
+    outboxes = runtime_repository.list_notification_outbox(
+        related_review_task_id=original.review_task.review_task_id
+    )
+    assert len(outboxes) == 2
+    assert outboxes[-1].notification_id == reissued.notification.notification_id
+    timing = IncidentNotificationService(runtime_repository).sync_initial_delivery(
+        incident.incident_id,
+        original.review_task.review_task_id,
+    )
+    assert timing.escalation_state == "WAITING_INITIAL_DELIVERY"
+    assert timing.decision_window_started_at is None
+
+
+def test_manual_review_cost_snapshot_fails_closed_after_database_lock_wait(
+    runtime_repository,
+    tmp_path,
+):
+    _, review = create_review_with_listing(runtime_repository)
+    products_path = tmp_path / "products-lock-wait.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "data"
+    sheet.append(PRODUCT_HEADERS)
+    sheet.append(
+        [
+            "SKU-SYNTHETIC-001",
+            "Synthetic flower",
+            "B",
+            "60",
+            "bundle",
+            10,
+            50,
+            True,
+            8,
+            12,
+            "",
+            "synthetic",
+            "green",
+        ]
+    )
+    workbook.save(products_path)
+    snapshot = _read_authoritative_product_cost_snapshot(
+        products_path,
+        internal_sku="SKU-SYNTHETIC-001",
+    )
+    token_hash = ReviewTokenService(runtime_repository)._hash_raw_token(
+        review.raw_token
+    )
+    second_repository = SQLiteRuntimeRepository(runtime_repository.db_path)
+    started = Event()
+    errors: list[BaseException] = []
+    blocker = runtime_repository.connect_write()
+    blocker.execute("BEGIN IMMEDIATE")
+
+    def submit_review() -> None:
+        started.set()
+        try:
+            second_repository.resolve_mobile_review_atomic(
+                review_task_id=review.review_task.review_task_id,
+                token_hash=token_hash,
+                status=ReviewTaskStatus.APPROVED,
+                actor_source="mobile_review_token",
+                emergency_base_cost=snapshot[0],
+                emergency_base_cost_source_ref=snapshot[1],
+                emergency_product_snapshot_verifier=lambda: (
+                    _read_authoritative_product_cost_snapshot(
+                        products_path,
+                        internal_sku="SKU-SYNTHETIC-001",
+                    )
+                ),
+                now=NOW + timedelta(minutes=2),
+            )
+        except BaseException as exc:  # noqa: BLE001 - thread assertion capture
+            errors.append(exc)
+
+    thread = Thread(target=submit_review)
+    thread.start()
+    assert started.wait(timeout=2)
+    sheet.cell(row=2, column=6, value=11)
+    workbook.save(products_path)
+    blocker.commit()
+    blocker.close()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], MobileReviewTransactionError)
+    assert "商品主数据在复核提交前发生变化" in str(errors[0])
+    stored_review = runtime_repository.get_review_task(
+        review.review_task.review_task_id
+    )
+    assert stored_review is not None
+    assert stored_review.review_status is ReviewTaskStatus.PENDING
     assert runtime_repository.list_tasks() == []
 
 

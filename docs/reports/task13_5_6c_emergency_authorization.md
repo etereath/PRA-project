@@ -145,3 +145,32 @@ Incident=`WAITING_HUMAN`、Review=`pending`、活动写锁为 0、活动队列�
 Queue Service 已重新绑定原 Runtime DB，长期 Worker 保持新鲜 `RUNNING`，生命周期最后
 attempt 与本次验收一致。该结果构成 13.5-6C 的单 SKU 真实紧急下架验收通过，但不代表
 生产开关已常驻启用。
+
+## 9. 2026-08-04 合并前审查整改
+
+本轮把六项完整实现审查阻塞与运营补充的紧急插队要求按同一安全链整改，未执行新的真实
+平台动作：
+
+- Incident 主投影采用事件时间单调门禁；迟到事件保留审计但不倒退当前状态；
+- 正式 Mobile Review 可抢占 `AUTO_PROTECTING`，并在一个事务中取消尚未执行的自动任务；
+  Review Token 最长入口期与自动评估截止时间分离，失效入口通过原 Review/Outbox 原子续期；
+- 任务调度固定为“Incident 人工任务 → SYSTEM_EMERGENCY → 普通任务”，v4、v5、显式选择
+  和 Automation UI claim 共用同一优先级判定；
+- Worker 最终栅栏复用主控端的 Review context 与 `review_block_reasons`，检查持久化后新增的
+  全部阻断 Review，只排除绑定的 emergency Review；
+- 自动授权和人工决策在 SQLite 写锁内二次读取权威商品工作簿；文件 hash、SKU 或成本变化
+  全部 fail closed，不在最终点击前重新计算 80% 阈值；
+- v4/v5 Importer 共用人工 Incident 结果投影：成功解决，失败保持待处理，UNKNOWN/部分完成
+  保留原 Review/RECONCILE 路径，事件与通知以稳定键防重；
+- FINAL 使用共享 subject/scope matcher，规范化真实 `internal_sku/listing` 合同，并只按已选
+  输入依赖向品种、等级和时段传播。
+
+并发测试使用两个独立 SQLite 连接覆盖人工先持锁与授权先持锁；两种顺序都以数据库提交
+顺序确定结果。另以外部 `BEGIN IMMEDIATE` 制造等待，并在等待期间修改合成工作簿，验证
+人工和自动两条成本路径均整笔失败、零任务残留。全部数据均为合成 fixture；未提交真实
+订单、买家信息、平台截图或新的真实写证据。
+
+受影响模块集中回归为 `195 passed`；补充通知窗口、结果投影和竞态用例后相关专项为
+`61 passed`。最终本地完整 pytest 为 `1116 passed, 3 skipped, 97 subtests passed`；隔离
+系统冒烟为 `16 passed, 0 failed`。本轮没有修改或同步 `shadowbot/test2` 文件，没有停止、
+覆盖或重启常驻 Worker，也没有再次执行真实平台写操作。

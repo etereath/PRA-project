@@ -109,6 +109,115 @@ def test_redetection_reuses_active_incident_and_reopens_resolved(runtime_reposit
     assert redetected.event.to_status is IncidentStatus.OPEN
 
 
+def test_late_detection_is_appended_without_reopening_resolved_projection(
+    runtime_repository,
+):
+    service = IncidentManagementService(runtime_repository)
+    first = service.detect(detection("detect-t1", occurred_at=NOW))
+    resolved = service.transition(
+        first.incident.incident_id,
+        to_status=IncidentStatus.RESOLVED,
+        event_key="resolve-t3",
+        occurred_at=NOW + timedelta(minutes=3),
+        source_type="RECOVERY_CHECK",
+    )
+
+    late = service.detect(
+        detection("detect-t2-late", occurred_at=NOW + timedelta(minutes=2))
+    )
+
+    assert late.incident.incident_id == first.incident.incident_id
+    assert late.incident.incident_status is IncidentStatus.RESOLVED
+    assert late.incident.resolved_at == resolved.incident.resolved_at
+    assert late.incident.last_detected_at == first.incident.last_detected_at
+    assert late.incident.updated_at == resolved.incident.updated_at
+    assert late.incident.occurrence_count == 1
+    assert late.event.event_type is IncidentEventType.REDETECTED
+    assert late.event.from_status is IncidentStatus.RESOLVED
+    assert late.event.to_status is IncidentStatus.RESOLVED
+
+
+def test_older_detection_after_newer_detection_does_not_regress_projection(
+    runtime_repository,
+):
+    service = IncidentManagementService(runtime_repository)
+    first = service.detect(detection("detect-t1", occurred_at=NOW))
+    newest = service.detect(
+        detection("detect-t4", occurred_at=NOW + timedelta(minutes=4))
+    )
+
+    late = service.detect(
+        detection("detect-t2-late", occurred_at=NOW + timedelta(minutes=2))
+    )
+
+    assert late.incident.incident_id == first.incident.incident_id
+    assert late.incident.last_detected_at == newest.incident.last_detected_at
+    assert late.incident.updated_at == newest.incident.updated_at
+    assert late.incident.occurrence_count == 2
+    assert len(service.list_events(first.incident.incident_id)) == 3
+
+
+def test_late_status_transition_is_audited_without_changing_current_projection(
+    runtime_repository,
+):
+    service = IncidentManagementService(runtime_repository)
+    first = service.detect(detection("detect-t1", occurred_at=NOW))
+    resolved = service.transition(
+        first.incident.incident_id,
+        to_status=IncidentStatus.RESOLVED,
+        event_key="resolve-t3",
+        occurred_at=NOW + timedelta(minutes=3),
+        source_type="RECOVERY_CHECK",
+    )
+
+    late = service.transition(
+        first.incident.incident_id,
+        to_status=IncidentStatus.WAITING_HUMAN,
+        event_key="wait-t2-late",
+        occurred_at=NOW + timedelta(minutes=2),
+        source_type="INCIDENT_SERVICE",
+    )
+
+    assert late.incident.incident_status is IncidentStatus.RESOLVED
+    assert late.incident.updated_at == resolved.incident.updated_at
+    assert late.event.from_status is IncidentStatus.RESOLVED
+    assert late.event.to_status is IncidentStatus.RESOLVED
+    assert late.event.event_payload["requested_to_status"] == "WAITING_HUMAN"
+
+
+def test_detection_after_closed_incident_uses_event_time_to_distinguish_recurrence(
+    runtime_repository,
+):
+    service = IncidentManagementService(runtime_repository)
+    first = service.detect(detection("detect-t1", occurred_at=NOW))
+    service.transition(
+        first.incident.incident_id,
+        to_status=IncidentStatus.RESOLVED,
+        event_key="resolve-t3",
+        occurred_at=NOW + timedelta(minutes=3),
+        source_type="RECOVERY_CHECK",
+    )
+    closed = service.transition(
+        first.incident.incident_id,
+        to_status=IncidentStatus.CLOSED,
+        event_key="close-t4",
+        occurred_at=NOW + timedelta(minutes=4),
+        source_type="OPERATIONS",
+    )
+
+    late = service.detect(
+        detection("detect-t2-late", occurred_at=NOW + timedelta(minutes=2))
+    )
+    recurrence = service.detect(
+        detection("detect-t5", occurred_at=NOW + timedelta(minutes=5))
+    )
+
+    assert late.incident.incident_id == closed.incident.incident_id
+    assert late.incident.incident_status is IncidentStatus.CLOSED
+    assert recurrence.incident.incident_id != closed.incident.incident_id
+    assert recurrence.incident.incident_status is IncidentStatus.OPEN
+
+
 def test_closed_incident_recurrence_creates_new_incident(runtime_repository):
     service = IncidentManagementService(runtime_repository)
     first = service.detect(detection("detect-001"))

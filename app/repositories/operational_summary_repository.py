@@ -18,6 +18,7 @@ from app.operational_models import (
     TradeDaySummaryEvent,
     TradeDaySummaryInput,
 )
+from app.incident_summary_scope import incident_blocks_summary_scope
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.sales_settlement_models import (
     InventoryAdjustmentSourceRef,
@@ -1095,11 +1096,7 @@ def _count_matching_blocking_incidents(
     summary: PlatformTradeDaySummary,
     input_rows: Iterable[TradeDaySummaryInput],
 ) -> int:
-    input_ref_ids = {
-        str(item.input_ref_id)
-        for item in input_rows
-        if str(item.input_ref_id)
-    }
+    frozen_inputs = tuple(input_rows)
     rows = connection.execute(
         """
         SELECT source_type, source_ref_id, subject_type, subject_key
@@ -1125,27 +1122,11 @@ def _count_matching_blocking_incidents(
     ).fetchall()
     matching_count = 0
     for row in rows:
-        source_type = str(row["source_type"] or "")
-        source_ref_id = str(row["source_ref_id"] or "")
-        subject_type = str(row["subject_type"] or "").upper()
-        subject_key = str(row["subject_key"] or "")
-        legacy_summary_link = (
-            source_type == "TRADE_DAY_SUMMARY"
-            and source_ref_id == summary.summary_id
-        )
-        platform_scope = subject_type == "PLATFORM"
-        exact_scope = (
-            subject_type == summary.scope_type.upper()
-            and subject_key == summary.scope_key
-        )
-        selected_input_dependency = (
-            bool(source_ref_id) and source_ref_id in input_ref_ids
-        )
-        if (
-            legacy_summary_link
-            or platform_scope
-            or exact_scope
-            or selected_input_dependency
+        if incident_blocks_summary_scope(
+            connection,
+            incident=row,
+            summary=summary,
+            input_rows=frozen_inputs,
         ):
             matching_count += 1
     return matching_count

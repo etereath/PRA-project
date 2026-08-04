@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping
@@ -149,9 +150,82 @@ def review_block_reasons(
     return reasons
 
 
+def open_review_context(
+    connection: Any,
+    *,
+    platform_name: str,
+    internal_sku: str,
+) -> list[dict[str, Any]]:
+    """Read every current listing write blocker using the shared gate shape."""
+
+    rows = connection.execute(
+        """
+        SELECT reason_code, diagnostic_message, blocked_actions_json
+        FROM listing_anomaly_cases
+        WHERE platform_name = ? AND internal_sku = ? AND cleared_at IS NULL
+        """,
+        (platform_name, internal_sku),
+    ).fetchall()
+    contexts: list[dict[str, Any]] = []
+    for row in rows:
+        payload = _json_value(row["blocked_actions_json"])
+        contexts.append(
+            {
+                "reason_code": str(
+                    row["reason_code"]
+                    or row["diagnostic_message"]
+                    or "LISTING_ANOMALY_REVIEW_OPEN"
+                ),
+                "blocked_actions": payload
+                if isinstance(payload, list)
+                else payload.get("blocked_actions")
+                if isinstance(payload, dict)
+                else None,
+            }
+        )
+    review_rows = connection.execute(
+        """
+        SELECT review_task_id, review_type, reason, review_payload_json
+        FROM review_tasks
+        WHERE platform_name = ?
+          AND internal_sku = ?
+          AND review_status = 'pending'
+        ORDER BY created_at, review_task_id
+        """,
+        (platform_name, internal_sku),
+    ).fetchall()
+    for row in review_rows:
+        payload = _json_object(row["review_payload_json"])
+        contexts.append(
+            {
+                "review_task_id": str(row["review_task_id"]),
+                "reason_code": str(
+                    payload.get("reason_code")
+                    or row["reason"]
+                    or row["review_type"]
+                    or "REVIEW_TASK_OPEN"
+                ),
+                "blocked_actions": payload.get("blocked_actions"),
+            }
+        )
+    return contexts
+
+
 # Backwards-compatible private alias for callers that imported the helper while
 # the gate module was still internal-only.
 _review_block_reasons = review_block_reasons
+
+
+def _json_value(value: Any) -> Any:
+    try:
+        return json.loads(str(value or "null"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _json_object(value: Any) -> dict[str, Any]:
+    payload = _json_value(value)
+    return payload if isinstance(payload, dict) else {}
 
 
 def _write_lock_block_reasons(
