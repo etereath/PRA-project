@@ -9,9 +9,9 @@ from typing import Callable, Iterable
 from app.enums import (
     DataQualityLevel,
     FactSource,
+    ProductMappingStatus,
     SellerPhase,
     SummaryStatus,
-    ProductMappingStatus,
 )
 from app.operational_models import (
     PlatformTradeDaySummary,
@@ -637,17 +637,36 @@ class OperationalSummaryRepository:
     def count_blocking_incidents(self, summary_id: str) -> int:
         with closing(self.runtime_repository.connect_read()) as connection:
             row = connection.execute(
-                """
-                SELECT COUNT(*)
-                FROM operational_incidents
-                WHERE source_type = 'TRADE_DAY_SUMMARY'
-                  AND source_ref_id = ?
-                  AND blocks_finalization = 1
-                  AND resolved_at IS NULL
-                """,
+                "SELECT * FROM platform_trade_day_summaries "
+                "WHERE summary_id = ?",
                 (summary_id,),
             ).fetchone()
-        return int(row[0]) if row is not None else 0
+            if row is None:
+                return 0
+            summary = _row_to_summary(row)
+            input_rows = connection.execute(
+                """
+                SELECT input_type, input_ref_id, input_sha256
+                FROM platform_trade_day_summary_inputs
+                WHERE summary_id = ?
+                  AND input_manifest_sha256 = ?
+                ORDER BY input_type, input_ref_id
+                """,
+                (summary_id, summary.input_manifest_sha256),
+            ).fetchall()
+            inputs = tuple(
+                TradeDaySummaryInput(
+                    input_type=str(item["input_type"]),
+                    input_ref_id=str(item["input_ref_id"]),
+                    input_sha256=str(item["input_sha256"]),
+                )
+                for item in input_rows
+            )
+            return _count_matching_blocking_incidents(
+                connection,
+                summary=summary,
+                input_rows=inputs,
+            )
 
 
 def _row_to_inventory_observation(row) -> InventoryObservationPoint:
@@ -1070,6 +1089,68 @@ def _insert_revision_rows(
     return True
 
 
+def _count_matching_blocking_incidents(
+    connection,
+    *,
+    summary: PlatformTradeDaySummary,
+    input_rows: Iterable[TradeDaySummaryInput],
+) -> int:
+    input_ref_ids = {
+        str(item.input_ref_id)
+        for item in input_rows
+        if str(item.input_ref_id)
+    }
+    rows = connection.execute(
+        """
+        SELECT source_type, source_ref_id, subject_type, subject_key
+        FROM operational_incidents
+        WHERE blocks_finalization = 1
+          AND resolved_at IS NULL
+          AND (
+              (
+                  source_type = 'TRADE_DAY_SUMMARY'
+                  AND source_ref_id = ?
+              )
+              OR (
+                  platform_name = ?
+                  AND platform_trade_date = ?
+              )
+          )
+        """,
+        (
+            summary.summary_id,
+            summary.platform_name,
+            summary.platform_trade_date.isoformat(),
+        ),
+    ).fetchall()
+    matching_count = 0
+    for row in rows:
+        source_type = str(row["source_type"] or "")
+        source_ref_id = str(row["source_ref_id"] or "")
+        subject_type = str(row["subject_type"] or "").upper()
+        subject_key = str(row["subject_key"] or "")
+        legacy_summary_link = (
+            source_type == "TRADE_DAY_SUMMARY"
+            and source_ref_id == summary.summary_id
+        )
+        platform_scope = subject_type == "PLATFORM"
+        exact_scope = (
+            subject_type == summary.scope_type.upper()
+            and subject_key == summary.scope_key
+        )
+        selected_input_dependency = (
+            bool(source_ref_id) and source_ref_id in input_ref_ids
+        )
+        if (
+            legacy_summary_link
+            or platform_scope
+            or exact_scope
+            or selected_input_dependency
+        ):
+            matching_count += 1
+    return matching_count
+
+
 def _transition_rows(
     connection,
     *,
@@ -1083,22 +1164,14 @@ def _transition_rows(
         if finalization_validator is None:
             raise ValueError("FINAL requires an atomic evidence validator")
         finalization_validator(connection)
-        blocking_count = int(
-            connection.execute(
-                """
-                SELECT COUNT(*)
-                FROM operational_incidents
-                WHERE source_type = 'TRADE_DAY_SUMMARY'
-                  AND source_ref_id = ?
-                  AND blocks_finalization = 1
-                  AND resolved_at IS NULL
-                """,
-                (before.summary_id,),
-            ).fetchone()[0]
+        blocking_count = _count_matching_blocking_incidents(
+            connection,
+            summary=before,
+            input_rows=input_rows,
         )
         if blocking_count:
             raise ValueError(
-                "Cannot finalize while blocking S3/S4 incidents remain open"
+                "Cannot finalize while blocking operational incidents remain open"
             )
     cursor = connection.execute(
         """

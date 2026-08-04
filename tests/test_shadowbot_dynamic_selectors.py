@@ -7,7 +7,6 @@ import re
 from decimal import Decimal
 from pathlib import Path
 
-
 FLOW_PATH = Path(__file__).resolve().parents[1] / "shadowbot" / "test2" / "vertical_slice_read_price.py"
 
 
@@ -214,6 +213,20 @@ def test_v5_set_offline_uses_online_only_scan_and_final_confirmation():
     assert '"ACTION_CLICKED"' in helper_source
     assert '"POSTCHECK_STILL_ONLINE"' in helper_source
     assert "return _run_set_offline_v5(args, request, result)" in source
+
+
+def test_system_emergency_revalidates_before_action_intent_and_confirm_click():
+    source = FLOW_PATH.read_text(encoding="utf-8")
+    run_start = source.index("def _run_set_offline_v5")
+    run_source = source[run_start:]
+    fence = run_source.index("_v5_open_emergency_click_fence")
+    intent = run_source.index('"ACTION_INTENT_RECORDED"')
+    confirm = run_source.index("confirm_button.click()")
+
+    assert fence < intent < confirm
+    assert "ONLINE_SET_OFFLINE_CANCEL_SELECTOR" in run_source[fence:intent]
+    assert "BEGIN IMMEDIATE" in source
+    assert 'allowed_task_statuses={"running"}' in source
 
 
 def test_v5_set_offline_button_uses_the_captured_row_offset():

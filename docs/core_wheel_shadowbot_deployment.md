@@ -67,7 +67,7 @@ Push-Location $verifyRoot
 Pop-Location
 ```
 
-预期结果：import、CLI 帮助、数据库初始化和 health 均为退出码 `0`；初始化输出包含从 `1` 连续到 `app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION` 的完整版本序列（当前为 `1..13`），health 输出包含 `ok=True`。数据库应位于临时目录，不写入 wheel 或仓库。
+预期结果：import、CLI 帮助、数据库初始化和 health 均为退出码 `0`；初始化输出包含从 `1` 连续到 `app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION` 的完整版本序列（当前为 `1..16`），health 输出包含 `ok=True`。数据库应位于临时目录，不写入 wheel 或仓库。
 
 如果机器上没有 `pra-mvp.exe`，可使用等价入口：
 
@@ -93,6 +93,11 @@ if (-not $appDir) { throw "Set SHADOWBOT_APP_DIR to an existing ShadowBot xbot_r
 ```
 
 第二次 `--check` 必须为每个受同步文件报告 `CURRENT`；配置文件只报告 `EXISTS`。在部署机上将 `shadowbot_worker_config.json` 从 example 复制后填写本机配置，但该文件不得回写仓库：
+
+同步清单还包含 `app/emergency_offline_fence.py`，目标名为
+`xbot_robot/emergency_offline_fence.py`。它是 13.5-6C 主控端与 Worker 共用的紧急授权
+重验器；部署校验必须把它与 `shadowbot_queue_worker.py`、
+`vertical_slice_read_price.py` 一并报告为 `CURRENT`，不得手工维护宿主副本。
 
 ```powershell
 Copy-Item shadowbot\test2\shadowbot_worker_config.example.json $appDir\shadowbot_worker_config.json

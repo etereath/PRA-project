@@ -1288,16 +1288,17 @@ class ShadowBotExecutor:
             note = "Worker stopped while waiting for phone verification"
         else:
             return
-        self.repository.update_review_task(
-            replace(
-                review,
-                review_status=status,
-                resolution_payload={"execution_attempt_id": execution_attempt_id, "error_code": result.error_code},
-                updated_at=utc_now(),
-                resolved_by=SHADOWBOT_EXECUTOR_NAME,
-                resolved_at=utc_now(),
-                resolution_note=note,
-            )
+        self.notification_outbox_service.resolve_verification_review_atomically(
+            review,
+            status=status,
+            resolved_by=SHADOWBOT_EXECUTOR_NAME,
+            resolution_note=note,
+            resolution_payload={
+                "execution_attempt_id": execution_attempt_id,
+                "error_code": result.error_code,
+                "verification_completed": bool(login.get("verification_completed")),
+            },
+            resolved_at=utc_now(),
         )
 
     def _validate_result_binding(

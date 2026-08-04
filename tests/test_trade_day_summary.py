@@ -107,6 +107,55 @@ def _insert_blocking_incident(
         )
 
 
+def _insert_scoped_blocking_incident(
+    runtime: SQLiteRuntimeRepository,
+    *,
+    incident_id: str,
+    category: str = "ORDER_DATA_INCONSISTENT",
+    platform_name: str = "platform",
+    platform_trade_date: str = "2026-07-29",
+    subject_type: str = "PLATFORM",
+    subject_key: str = "platform",
+    source_type: str = "ORDER_SCAN",
+    source_ref_id: str = "order-scan-run",
+    severity: str = "S2",
+) -> None:
+    now = "2026-07-29T12:00:00+00:00"
+    with closing(runtime.connect_write()) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO operational_incidents(
+                incident_id, dedupe_key, category,
+                source_type, source_ref_id,
+                severity, incident_status, blocks_finalization,
+                platform_name, platform_trade_date,
+                subject_type, subject_key, title,
+                first_detected_at, last_detected_at,
+                created_at, updated_at
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, 'OPEN', 1, ?, ?, ?, ?,
+                'scoped blocker', ?, ?, ?, ?
+            )
+            """,
+            (
+                incident_id,
+                f"scoped-blocker:{incident_id}",
+                category,
+                source_type,
+                source_ref_id,
+                severity,
+                platform_name,
+                platform_trade_date,
+                subject_type,
+                subject_key,
+                now,
+                now,
+                now,
+                now,
+            ),
+        )
+
+
 def _create_provisional(service: TradeDaySummaryService):
     return service.create_provisional(
         platform_name="platform",
@@ -291,7 +340,7 @@ def test_finalization_is_blocked_by_open_s3_incident(
         incident_id="INCIDENT-1",
     )
 
-    with pytest.raises(ValueError, match="blocking S3/S4"):
+    with pytest.raises(ValueError, match="blocking operational incidents"):
         _finalize(service, summary_id)
 
 
@@ -361,11 +410,70 @@ def test_finalization_rechecks_concurrent_incident_in_write_transaction(
         transition_after_concurrent_insert,
     )
 
-    with pytest.raises(ValueError, match="blocking S3/S4"):
+    with pytest.raises(ValueError, match="blocking operational incidents"):
         _finalize(service, summary_id)
     persisted = repository.get_summary(summary_id)
     assert persisted is not None
     assert persisted.summary_status is SummaryStatus.RECONCILED
+
+
+def test_finalization_matches_platform_incident_without_summary_id(
+    summary_service,
+) -> None:
+    service, _, runtime = summary_service
+    _insert_scoped_blocking_incident(
+        runtime,
+        incident_id="INCIDENT-PLATFORM-PREEXISTING",
+    )
+    summary_id = _create_provisional(service).summary.summary_id
+    _observe(service, summary_id)
+    _reconcile(service, summary_id)
+
+    with pytest.raises(ValueError, match="blocking operational incidents"):
+        _finalize(service, summary_id)
+
+
+def test_sku_price_incident_does_not_blanket_block_platform_total(
+    summary_service,
+) -> None:
+    service, _, runtime = summary_service
+    summary_id = _create_provisional(service).summary.summary_id
+    _observe(service, summary_id)
+    _reconcile(service, summary_id)
+    _insert_scoped_blocking_incident(
+        runtime,
+        incident_id="INCIDENT-SKU-PRICE",
+        category="PRICE_ANOMALY",
+        subject_type="SKU",
+        subject_key="SKU-1",
+        source_type="PRICE_OBSERVATION",
+        source_ref_id="price-observation-1",
+        severity="S4",
+    )
+
+    result = _finalize(service, summary_id)
+
+    assert result.summary.summary_status is SummaryStatus.FINAL
+
+
+def test_selected_input_dependency_blocks_aggregate_finalization(
+    summary_service,
+) -> None:
+    service, _, runtime = summary_service
+    summary_id = _create_provisional(service).summary.summary_id
+    _observe(service, summary_id)
+    _reconcile(service, summary_id)
+    _insert_scoped_blocking_incident(
+        runtime,
+        incident_id="INCIDENT-SKU-ORDER-INPUT",
+        subject_type="SKU",
+        subject_key="SKU-1",
+        source_type="ORDER_INPUT",
+        source_ref_id="order-1",
+    )
+
+    with pytest.raises(ValueError, match="blocking operational incidents"):
+        _finalize(service, summary_id)
 
 
 def test_provisional_material_change_is_atomically_audited(

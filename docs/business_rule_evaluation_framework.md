@@ -25,7 +25,7 @@
 
 ## 2. SQLite 运行态表
 
-自动规则评估框架在 runtime schema v3 引入以下表；项目全局 schema 当前已推进到 v11：
+自动规则评估框架在 runtime schema v3 引入以下表；项目全局 schema 当前已推进到 v15：
 
 - `script_runs`
 - `script_run_items`

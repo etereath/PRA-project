@@ -6,7 +6,6 @@ from app.enums import ReviewTaskStatus
 from app.models import ReviewTask, Task
 from app.services.manual_intervention import MANUAL_INTERVENTION_ACTIONS
 
-
 RETRY_TASK_DECISION = "retry_task"
 CANCEL_TASK_DECISION = "cancel_task"
 RETRY_TASK_DEADLINE_MINUTES = 30
@@ -108,6 +107,12 @@ def review_action_label(
     source_task: Task | None,
     status: ReviewTaskStatus,
 ) -> str:
+    if review_task.review_type == "emergency_protection":
+        return {
+            ReviewTaskStatus.ADJUSTED: "改价到",
+            ReviewTaskStatus.APPROVED: "立即下架",
+            ReviewTaskStatus.REJECTED: "我来处理",
+        }.get(status, "")
     decision = review_business_decision(review_task, source_task, status)
     if decision == RETRY_TASK_DECISION:
         return "重试任务"

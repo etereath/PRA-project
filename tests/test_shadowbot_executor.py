@@ -382,7 +382,7 @@ class ShadowBotExecutorTests(unittest.TestCase):
         self.assertLessEqual((review.required_by - review.created_at).total_seconds(), 600)
         self.assertEqual(len(notifications), 1)
         self.assertNotIn("password", str(review.review_payload).lower())
-        self.assertIn("ShadowBot 登录验证码人工接管", notifications[0].message)
+        self.assertIn("需要验证码：蚂蚁花团供应商登录", notifications[0].message)
         self.assertNotIn("Please complete", notifications[0].message)
 
     def test_login_verification_handoff_queues_outbox_for_real_channel_without_sending(self) -> None:
@@ -413,6 +413,103 @@ class ShadowBotExecutorTests(unittest.TestCase):
         self.assertEqual(outbox[0].status, NotificationOutboxStatus.PENDING.value)
         self.assertEqual(self.repository.list_notification_delivery_attempts(outbox[0].notification_id), [])
         self.assertEqual(self.repository.get_notification_log(outbox[0].notification_id).send_status, "pending")
+
+    def test_login_verification_completion_resolves_review_and_queues_feedback(self) -> None:
+        self.executor.start_execution(
+            ShadowBotExecutionRequest(
+                operation_id="OP-1",
+                execution_attempt_id="ATTEMPT-LOGIN-COMPLETED-1",
+                execution_mode=EXECUTION_MODE_COMMIT,
+                approval=_approval(),
+            )
+        )
+        phase = {
+            "execution_attempt_id": "ATTEMPT-LOGIN-COMPLETED-1",
+            "phase": "LOGIN_VERIFICATION_REQUIRED",
+            "login": {
+                "verification_detected_at": "2026-07-17T10:00:00+08:00",
+                "verification_deadline_at": "2026-07-17T10:05:00+08:00",
+                "verification_markers": ["验证码"],
+            },
+        }
+        with patch.dict(os.environ, {"DEFAULT_NOTIFICATION_CHANNEL": "mock"}, clear=False):
+            review_id = self.executor.open_login_verification_handoff(phase)
+        result = ShadowBotResultContract(
+            execution_attempt_id="ATTEMPT-LOGIN-COMPLETED-1",
+            status=STATUS_READ_COMPLETED,
+            run_success_flag=True,
+            business_operation_completed=False,
+            side_effect_state=SIDE_EFFECT_NOT_STARTED,
+            retryable=False,
+            raw_output={"login": {"verification_completed": True}},
+        )
+
+        self.executor._resolve_login_verification_handoff(
+            execution_attempt_id=result.execution_attempt_id,
+            result=result,
+        )
+        self.executor._resolve_login_verification_handoff(
+            execution_attempt_id=result.execution_attempt_id,
+            result=result,
+        )
+
+        review = self.repository.get_review_task(review_id)
+        outbox = self.repository.list_notification_outbox(
+            related_review_task_id=review_id
+        )
+        self.assertEqual(review.review_status, ReviewTaskStatus.APPROVED)
+        self.assertTrue(review.resolution_payload["verification_completed"])
+        self.assertEqual(
+            [row.notification_type for row in outbox],
+            ["verification_code_intervention", "verification_code_completed"],
+        )
+        self.assertEqual(outbox[0].status, NotificationOutboxStatus.CANCELLED.value)
+        self.assertEqual(outbox[1].status, NotificationOutboxStatus.PENDING.value)
+        self.assertIn("验证码处理完毕", outbox[1].payload["message"])
+
+    def test_login_verification_timeout_queues_failure_feedback(self) -> None:
+        self.executor.start_execution(
+            ShadowBotExecutionRequest(
+                operation_id="OP-1",
+                execution_attempt_id="ATTEMPT-LOGIN-TIMEOUT-1",
+                execution_mode=EXECUTION_MODE_COMMIT,
+                approval=_approval(),
+            )
+        )
+        phase = {
+            "execution_attempt_id": "ATTEMPT-LOGIN-TIMEOUT-1",
+            "phase": "LOGIN_VERIFICATION_REQUIRED",
+            "login": {
+                "verification_detected_at": "2026-07-17T10:00:00+08:00",
+                "verification_deadline_at": "2026-07-17T10:05:00+08:00",
+                "verification_markers": ["验证码"],
+            },
+        }
+        with patch.dict(os.environ, {"DEFAULT_NOTIFICATION_CHANNEL": "mock"}, clear=False):
+            review_id = self.executor.open_login_verification_handoff(phase)
+        result = ShadowBotResultContract(
+            execution_attempt_id="ATTEMPT-LOGIN-TIMEOUT-1",
+            status=STATUS_FAILED,
+            run_success_flag=False,
+            business_operation_completed=False,
+            side_effect_state=SIDE_EFFECT_NOT_STARTED,
+            retryable=False,
+            error_code="LOGIN_VERIFICATION_TIMEOUT",
+            raw_output={"login": {"verification_completed": False}},
+        )
+
+        self.executor._resolve_login_verification_handoff(
+            execution_attempt_id=result.execution_attempt_id,
+            result=result,
+        )
+
+        review = self.repository.get_review_task(review_id)
+        outbox = self.repository.list_notification_outbox(
+            related_review_task_id=review_id
+        )
+        self.assertEqual(review.review_status, ReviewTaskStatus.EXPIRED)
+        self.assertEqual(outbox[-1].notification_type, "verification_code_timeout")
+        self.assertIn("验证码处理超时", outbox[-1].payload["message"])
 
     def test_start_execution_requires_persisted_approved_review_task(self) -> None:
         approval = _approval()

@@ -2,7 +2,7 @@
 
 本文档是当前项目文档入口。项目说明文本以中文为主，英文键名和代码标识保持原样。
 
-运行态业务数据以 SQLite 为中心，当前代码结构版本为 v14。v9 使用“平台 + 品种 + 等级”作为 `listing_status` 业务身份，v10 将任务旧价结构化，v11 增加单次请求的 ShadowBot 多商品 COMMIT 批次账本，v12 增加逐商品操作/尝试身份、活动写锁、观察时间和技术回执，v13 增加公共批次注册表、通用上下架 operation、两页快照、页面异常和 v5 动作账本；v14 增加双时间轴、Automation 账本、不可变观察、销售日结、Incident 和任务来源字段。真实 Runtime DB 需按迁移手册另行升级。Excel 继续承担商品、规则等主数据输入，不是运行态任务数据库。
+运行态业务数据以 SQLite 为中心，当前代码结构版本为 v16。v9 使用“平台 + 品种 + 等级”作为 `listing_status` 业务身份，v10 将任务旧价结构化，v11 增加单次请求的 ShadowBot 多商品 COMMIT 批次账本，v12 增加逐商品操作/尝试身份、活动写锁、观察时间和技术回执，v13 增加公共批次注册表、通用上下架 operation、两页快照、页面异常和 v5 动作账本；v14 增加双时间轴、Automation 账本、不可变观察、销售日结、Incident 和任务来源字段；v15 增加 Incident 出现次数与 append-only 事件流水；v16 增加版本化极简紧急下架策略。真实 Runtime DB 需按迁移手册另行升级。Excel 继续承担商品、规则等主数据输入，不是运行态任务数据库。
 
 ## 当前状态与入口
 
@@ -18,7 +18,13 @@
 - [plans/task13_5_4_order_history_observation_contract.md](plans/task13_5_4_order_history_observation_contract.md)：任务13.5-4 订单字段、`OPEN/CLOSED`、多重集合、完整性、Importer 和 v6 零写合同。
 - [plans/task13_5_5_sales_estimation_settlement_contract.md](plans/task13_5_5_sales_estimation_settlement_contract.md)：任务13.5-5 库存估算资格、已知调整、订单/估算权威、取消推导和 FINAL 门禁。
 - [reports/task13_5_5_sales_settlement.md](reports/task13_5_5_sales_settlement.md)：任务13.5-5 销量估算、订单权威、取消多重集合、交易日日结、计划输入和 Automation 接入实施报告。
-- [plans/task13_5_6_incident_and_emergency_protection_review_plan.md](plans/task13_5_6_incident_and_emergency_protection_review_plan.md)：任务13.5-6 已评议的 Incident 人工闭环、复用矩阵、Worker 恢复、`base_cost × 0.80` 极端低价、三个复核动作、极简策略和受控 v5 下架计划。
+- [plans/task13_5_6_incident_and_emergency_protection_review_plan.md](plans/task13_5_6_incident_and_emergency_protection_review_plan.md)：任务13.5-6 已评议的 Incident 人工闭环、复用矩阵、Worker 恢复、通知发送后完整 Pulse、Review/人工任务竞态、FINAL 范围矩阵、`base_cost × 0.80` 极端低价、三个复核动作、极简策略和受控 v5 下架计划。
+- [reports/task13_5_6a0_runtime_schema_v15.md](reports/task13_5_6a0_runtime_schema_v15.md)：任务13.5-6A-0 的 Runtime Schema v15、Incident 出现次数、append-only 事件、v14 数据迁移、FINAL 动态范围门禁和专项测试报告。
+- [reports/task13_5_6a1_incident_application_service.md](reports/task13_5_6a1_incident_application_service.md)：任务13.5-6A-1 进行中的 Incident 原子事实链、S4 Review/Token/Outbox 同事务接入、无明文 Token 投递复用、唯一 Worker 恢复入口、专项测试及剩余受控验收。
+- [reports/task13_5_6a1_worker_recovery_acceptance_20260803.md](reports/task13_5_6a1_worker_recovery_acceptance_20260803.md)：真实影刀宿主缺失、核实路径重启、唯一 test2 启动、heartbeat、Incident、生命周期、正常停止和再次恢复的 R4 证据，以及未执行 Ctrl+Alt+Q 的明确边界。
+- [reports/task13_5_6_notification_mobile_review_acceptance_20260804.md](reports/task13_5_6_notification_mobile_review_acceptance_20260804.md)：S0–S4 飞书逐批验收、S3/S4 真实经营通知、验证码结果反馈、手机复核页、临时公网链接 404 整改和固定入口运行门禁。
+- [reports/task13_5_6b_emergency_policy_shadow.md](reports/task13_5_6b_emergency_policy_shadow.md)：13.5-6B 编码前复用矩阵、v16 极简策略边界和零副作用 shadow 判定语义。
+- [reports/task13_5_6c_emergency_authorization.md](reports/task13_5_6c_emergency_authorization.md)：13.5-6C 复用矩阵、专用授权事务、v5 最终点击前人工竞态栅栏及单 SKU 真实紧急下架验收。
 - [reports/task13_5_4_order_page_exploration_20260731.md](reports/task13_5_4_order_page_exploration_20260731.md)：蚂蚁花团订单页无副作用探索、元素步长和数据最小化证据。
 - [reports/task13_5_4_order_observation.md](reports/task13_5_4_order_observation.md)：任务13.5-4 实施、测试、迁移纠正和实机验收报告。
 - [plans/task13_5_operational_closed_loop_and_web_rewrite.md](plans/task13_5_operational_closed_loop_and_web_rewrite.md)：任务13.5双时间轴、自动扫描、历史订单观察、销售日结、S0–S4、受控紧急保护、任务来源对齐和Web主控重写实施计划。

@@ -125,9 +125,13 @@ $env:MOBILE_REVIEW_BASE_URL = "https://your-fixed-domain.cpolar.cn"
 要求：
 
 - `DEFAULT_NOTIFICATION_CHANNEL=feishu` 时建议必须配置。
-- 地址需要能从手机访问到本地 Web 服务。
+- 地址需要能从手机访问到本地 Web 服务，并使用受运维管理的稳定 HTTPS 域名；随机临时
+  cpolar 域名只能用于本地探索，不得进入发给运营人员的真实通知。
 - 结尾是否带 `/` 均可，系统会处理。
 - 不建议提交真实固定地址到 git。
+- 受控真实通知验收前必须从公网地址检查 `/health`，不能用本机回环地址的 200 替代。
+- 地址变更或旧 Token 到期后必须作废旧 Review/Token 并重新生成通知；不得修改、复用或
+  宣称旧消息中的链接已经恢复。
 
 ## 5. Web 后台登录变量
 

@@ -4,9 +4,10 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import time
 import uuid
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 import xbot  # noqa: F401 - ShadowBot runtime import initializes host bindings.
@@ -16,54 +17,71 @@ from xbot.selector import Selector
 from . import package
 
 try:
+    from app.emergency_offline_fence import (
+        EmergencyOfflineFenceError,
+        revalidate_emergency_offline_facts,
+    )
+except ImportError:
+    try:
+        from .emergency_offline_fence import (
+            EmergencyOfflineFenceError,
+            revalidate_emergency_offline_facts,
+        )
+    except ImportError:
+        from emergency_offline_fence import (
+            EmergencyOfflineFenceError,
+            revalidate_emergency_offline_facts,
+        )
+
+try:
     from app.shadowbot_contract_primitives import (
+        ORDER_SCAN_CONTRACT_VERSION,
+        ORDER_SCAN_RESULT_SCHEMA_VERSION,
         contract_identity_key,
         derive_v4_batch_semantics,
         derive_v5_batch_semantics,
-        normalize_order_scan_request,
         normalize_contract_grade,
         normalize_contract_sku,
         normalize_contract_text,
+        normalize_order_scan_request,
         set_offline_confirmation_matches,
         set_online_confirmation_matches,
         sha256_json,
-        ORDER_SCAN_CONTRACT_VERSION,
-        ORDER_SCAN_RESULT_SCHEMA_VERSION,
         v4_result_counts,
         v5_result_counts,
     )
 except ImportError:
     try:
         from .shadowbot_contract_primitives import (
+            ORDER_SCAN_CONTRACT_VERSION,
+            ORDER_SCAN_RESULT_SCHEMA_VERSION,
             contract_identity_key,
             derive_v4_batch_semantics,
             derive_v5_batch_semantics,
-            normalize_order_scan_request,
             normalize_contract_grade,
             normalize_contract_sku,
             normalize_contract_text,
+            normalize_order_scan_request,
             set_offline_confirmation_matches,
             set_online_confirmation_matches,
             sha256_json,
-            ORDER_SCAN_CONTRACT_VERSION,
-            ORDER_SCAN_RESULT_SCHEMA_VERSION,
             v4_result_counts,
             v5_result_counts,
         )
     except ImportError:
         from shadowbot_contract_primitives import (
+            ORDER_SCAN_CONTRACT_VERSION,
+            ORDER_SCAN_RESULT_SCHEMA_VERSION,
             contract_identity_key,
             derive_v4_batch_semantics,
             derive_v5_batch_semantics,
-            normalize_order_scan_request,
             normalize_contract_grade,
             normalize_contract_sku,
             normalize_contract_text,
+            normalize_order_scan_request,
             set_offline_confirmation_matches,
             set_online_confirmation_matches,
             sha256_json,
-            ORDER_SCAN_CONTRACT_VERSION,
-            ORDER_SCAN_RESULT_SCHEMA_VERSION,
             v4_result_counts,
             v5_result_counts,
         )
@@ -4977,6 +4995,7 @@ def _v5_dismiss_unconfirmed_detail_or_listing_dialog(window):
     """Best-effort cleanup before a read-only post-failure page scan."""
 
     for selector_name in (
+        ONLINE_SET_OFFLINE_CANCEL_SELECTOR,
         WAITING_SET_ONLINE_CANCEL_SELECTOR,
         WAITING_PRICE_CANCEL_SELECTOR,
         WAITING_INVENTORY_CANCEL_SELECTOR,
@@ -5385,6 +5404,48 @@ def _v5_phase_for_items(
             else "NOT_STARTED"
         ),
     )
+
+
+def _v5_open_emergency_click_fence(request, request_item):
+    binding = request.get("emergency_authorization")
+    if binding is None:
+        return None
+    runtime_db_path = str(binding.get("runtime_db_path") or "")
+    if (
+        not runtime_db_path
+        or not os.path.isabs(runtime_db_path)
+        or not os.path.isfile(runtime_db_path)
+    ):
+        raise EmergencyOfflineFenceError("EMERGENCY_RUNTIME_DB_UNAVAILABLE")
+    connection = sqlite3.connect(runtime_db_path, timeout=5.0)
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA busy_timeout = 5000")
+        connection.execute("BEGIN IMMEDIATE")
+        revalidate_emergency_offline_facts(
+            connection,
+            binding=binding,
+            now=datetime.now(timezone.utc),
+            allowed_task_statuses={"running"},
+            operation_id=str(request_item.get("operation_id") or ""),
+            require_active_lock=True,
+        )
+        return connection
+    except Exception:
+        if connection.in_transaction:
+            connection.rollback()
+        connection.close()
+        raise
+
+
+def _v5_close_emergency_click_fence(connection):
+    if connection is None:
+        return
+    try:
+        if connection.in_transaction:
+            connection.rollback()
+    finally:
+        connection.close()
 
 
 def _v5_classify_interrupted_items(
@@ -6477,17 +6538,41 @@ def _run_set_offline_v5(args, request, result):
                 request_item["expected_product_name"],
                 request_item["expected_grade"],
             )
-            _v5_phase_for_items(
-                request,
-                "ACTION_INTENT_RECORDED",
-                request_item,
-                item_results,
-            )
-            _find_element(
+            confirm_button = _find_element(
                 window,
                 ONLINE_SET_OFFLINE_CONFIRM_SELECTOR,
                 timeout_seconds,
-            ).click()
+            )
+            click_fence = None
+            try:
+                try:
+                    click_fence = _v5_open_emergency_click_fence(
+                        request,
+                        request_item,
+                    )
+                except EmergencyOfflineFenceError as exc:
+                    try:
+                        _find_element(
+                            window,
+                            ONLINE_SET_OFFLINE_CANCEL_SELECTOR,
+                            timeout_seconds,
+                        ).click()
+                    except Exception:
+                        pass
+                    raise SliceError(
+                        "EMERGENCY_AUTHORIZATION_REVOKED",
+                        str(exc),
+                        retryable=False,
+                    ) from exc
+                _v5_phase_for_items(
+                    request,
+                    "ACTION_INTENT_RECORDED",
+                    request_item,
+                    item_results,
+                )
+                confirm_button.click()
+            finally:
+                _v5_close_emergency_click_fence(click_fence)
             output["action_confirm_clicked"] = True
             output["action_clicked_at"] = _multi_product_utc_now()
             output["listing_effect_state"] = "UNKNOWN"

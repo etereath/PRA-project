@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
@@ -8,7 +9,11 @@ from pathlib import Path
 from uuid import uuid4
 
 from app.enums import ReviewTaskStatus, TaskActionType, TaskStatus
-from app.exceptions import MobileReviewErrorCode, MobileReviewTransactionError, ValidationError
+from app.exceptions import (
+    MobileReviewErrorCode,
+    MobileReviewTransactionError,
+    ValidationError,
+)
 from app.listing_identity import listing_identity_key
 from app.listing_status_policy import (
     has_current_platform_stock,
@@ -28,7 +33,12 @@ from app.models import (
     Task,
     TaskStatusHistory,
 )
-from app.platform_identity import canonical_platform_name, platform_identity_key, platform_names_match
+from app.platform_identity import (
+    canonical_platform_name,
+    platform_identity_key,
+    platform_names_match,
+)
+from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import (
     export_execution_logs,
     export_tasks,
@@ -43,12 +53,14 @@ from app.repositories.workbook_repository import (
     load_products,
     load_tasks,
 )
-from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.review_policy import allowed_review_statuses
 from app.services.ai import MockAISuggestionProvider, NullAISuggestionProvider
 from app.services.execution import ExecutionSimulationService
 from app.services.listing import ListingService
-from app.services.manual_intervention import MANUAL_INTERVENTION_ACTIONS, ManualInterventionService
+from app.services.manual_intervention import (
+    MANUAL_INTERVENTION_ACTIONS,
+    ManualInterventionService,
+)
 from app.services.pricing import PricingService
 from app.services.runtime import (
     DEFAULT_RUNTIME_DB,
@@ -215,7 +227,9 @@ def init_runtime_database(inputs: RuntimeDatabaseInputs) -> list[int]:
     return repository.schema_versions()
 
 
-def generate_runtime_tasks_from_sources(inputs: WorkflowInputs, *, db_path: Path = DEFAULT_RUNTIME_DB) -> RuntimeTaskGenerationSummary:
+def generate_runtime_tasks_from_sources(
+    inputs: WorkflowInputs, *, db_path: Path = DEFAULT_RUNTIME_DB
+) -> RuntimeTaskGenerationSummary:
     preview_inputs = WorkflowInputs(
         products_path=inputs.products_path,
         price_rules_path=inputs.price_rules_path,
@@ -233,7 +247,9 @@ def generate_runtime_tasks_from_sources(inputs: WorkflowInputs, *, db_path: Path
         runtime_db_path=inputs.runtime_db_path or db_path,
     )
     summary = generate_tasks_from_sources(preview_inputs)
-    return persist_task_generation_summary(summary, db_path=db_path, trade_date=inputs.trade_date)
+    return persist_task_generation_summary(
+        summary, db_path=db_path, trade_date=inputs.trade_date
+    )
 
 
 def persist_task_generation_summary(
@@ -248,15 +264,15 @@ def persist_task_generation_summary(
     if summary.tasks:
         generation_time = max(task.created_at for task in summary.tasks)
         if generation_time.tzinfo is not None:
-            generation_time = generation_time.astimezone(
-                timezone(timedelta(hours=8))
-            )
+            generation_time = generation_time.astimezone(timezone(timedelta(hours=8)))
         runtime_task_service.expire_overdue_pending_tasks(now=generation_time)
     inserted_task_rows = runtime_task_service.create_tasks_returning_inserted(
         summary.tasks,
         trade_date=trade_date,
     )
-    review_summary = ReviewTaskService(repository, runtime_task_service=runtime_task_service).create_from_tasks(
+    review_summary = ReviewTaskService(
+        repository, runtime_task_service=runtime_task_service
+    ).create_from_tasks(
         inserted_task_rows,
         trade_date=trade_date,
     )
@@ -313,7 +329,9 @@ def list_runtime_review_tasks(
 ) -> list[ReviewTask]:
     repository = SQLiteRuntimeRepository(db_path)
     RuntimeTaskService(repository).init_schema()
-    return ReviewTaskService(repository).list_review_tasks(trade_date=trade_date, status=status)
+    return ReviewTaskService(repository).list_review_tasks(
+        trade_date=trade_date, status=status
+    )
 
 
 def get_runtime_review_task(db_path: Path, review_task_id: str) -> ReviewTask | None:
@@ -326,7 +344,9 @@ def resolve_runtime_review_task(inputs: RuntimeReviewResolutionInputs) -> Review
     repository = SQLiteRuntimeRepository(inputs.db_path)
     runtime_task_service = RuntimeTaskService(repository)
     runtime_task_service.init_schema()
-    return ReviewTaskService(repository, runtime_task_service=runtime_task_service).resolve_review_task(
+    return ReviewTaskService(
+        repository, runtime_task_service=runtime_task_service
+    ).resolve_review_task(
         review_task_id=inputs.review_task_id,
         status=inputs.status,
         actor=inputs.actor,
@@ -337,13 +357,28 @@ def resolve_runtime_review_task(inputs: RuntimeReviewResolutionInputs) -> Review
     )
 
 
-def get_mobile_review_detail(db_path: Path, review_task_id: str, raw_token: str) -> MobileReviewDetail:
+def get_mobile_review_detail(
+    db_path: Path,
+    review_task_id: str,
+    raw_token: str,
+    *,
+    now: datetime | None = None,
+) -> MobileReviewDetail:
     repository = SQLiteRuntimeRepository(db_path)
     runtime_task_service = RuntimeTaskService(repository)
     runtime_task_service.init_schema()
     token_service = ReviewTokenService(repository)
-    validation = token_service.validate_token(review_task_id, raw_token, action=None)
-    if not validation.is_valid or validation.review_token is None or validation.review_task is None:
+    validation = token_service.validate_token(
+        review_task_id,
+        raw_token,
+        action=None,
+        now=now,
+    )
+    if (
+        not validation.is_valid
+        or validation.review_token is None
+        or validation.review_task is None
+    ):
         raise ValidationError("链接已失效或无权访问该复核任务")
     review_token = token_service.record_detail_access(validation.review_token.token_id)
     source_task = (
@@ -356,9 +391,7 @@ def get_mobile_review_detail(db_path: Path, review_task_id: str, raw_token: str)
         for status in allowed_review_statuses(validation.review_task, source_task)
     }
     allowed_actions = [
-        action
-        for action in review_token.allowed_actions
-        if action in policy_actions
+        action for action in review_token.allowed_actions if action in policy_actions
     ]
     return MobileReviewDetail(
         review_task=validation.review_task,
@@ -375,6 +408,8 @@ def resolve_mobile_review(
     action: str,
     note: str = "",
     resolution_payload: dict[str, object] | None = None,
+    products_path: Path | None = None,
+    now: datetime | None = None,
 ) -> MobileReviewResolutionSummary:
     repository = SQLiteRuntimeRepository(db_path)
     runtime_task_service = RuntimeTaskService(repository)
@@ -389,6 +424,43 @@ def resolve_mobile_review(
         ) from exc
 
     token_hash = token_service._hash_raw_token(raw_token)
+    emergency_base_cost = None
+    emergency_base_cost_source_ref = ""
+    review_task = repository.get_review_task(review_task_id)
+    if (
+        review_task is not None
+        and review_task.review_type == "emergency_protection"
+        and review_status in {ReviewTaskStatus.ADJUSTED, ReviewTaskStatus.APPROVED}
+    ):
+        if products_path is None:
+            raise MobileReviewTransactionError(
+                MobileReviewErrorCode.CONCURRENT_UPDATE,
+                "商品主数据不可用，已阻止创建平台任务",
+            )
+        product_bytes_before = products_path.read_bytes()
+        products = load_products(products_path)
+        product_bytes_after = products_path.read_bytes()
+        if product_bytes_after != product_bytes_before:
+            raise MobileReviewTransactionError(
+                MobileReviewErrorCode.CONCURRENT_UPDATE,
+                "商品主数据在复核期间发生变化，请重试",
+            )
+        product = next(
+            (
+                candidate
+                for candidate in products
+                if candidate.internal_sku == review_task.internal_sku
+            ),
+            None,
+        )
+        if product is None:
+            raise MobileReviewTransactionError(
+                MobileReviewErrorCode.CONCURRENT_UPDATE,
+                "商品基础成本不可用，已阻止创建平台任务",
+            )
+        emergency_base_cost = product.base_cost
+        content_sha256 = hashlib.sha256(product_bytes_before).hexdigest()
+        emergency_base_cost_source_ref = f"{products_path.name}:sha256:{content_sha256}"
     atomic_result = repository.resolve_mobile_review_atomic(
         review_task_id=review_task_id,
         token_hash=token_hash,
@@ -396,6 +468,9 @@ def resolve_mobile_review(
         actor_source="mobile_review_token",
         note=note,
         resolution_payload=resolution_payload,
+        emergency_base_cost=emergency_base_cost,
+        emergency_base_cost_source_ref=emergency_base_cost_source_ref,
+        now=now,
     )
     return MobileReviewResolutionSummary(
         review_task=atomic_result.review_task,
@@ -405,12 +480,17 @@ def resolve_mobile_review(
     )
 
 
-def source_task_status_for_review_resolution(source_task: Task | None, status: ReviewTaskStatus) -> TaskStatus | None:
+def source_task_status_for_review_resolution(
+    source_task: Task | None, status: ReviewTaskStatus
+) -> TaskStatus | None:
     if source_task is None:
         return None
     if source_task.task_status == TaskStatus.MANUAL_REVIEW:
         return _source_task_status_for_manual_review_source(status)
-    if source_task.task_status == TaskStatus.PENDING and source_task.action_type in MANUAL_INTERVENTION_ACTIONS:
+    if (
+        source_task.task_status == TaskStatus.PENDING
+        and source_task.action_type in MANUAL_INTERVENTION_ACTIONS
+    ):
         if status == ReviewTaskStatus.CANCELLED:
             return TaskStatus.CANCELLED
         if status == ReviewTaskStatus.ADJUSTED:
@@ -419,7 +499,9 @@ def source_task_status_for_review_resolution(source_task: Task | None, status: R
     return None
 
 
-def _source_task_status_for_manual_review_source(status: ReviewTaskStatus) -> TaskStatus:
+def _source_task_status_for_manual_review_source(
+    status: ReviewTaskStatus,
+) -> TaskStatus:
     if status in {ReviewTaskStatus.APPROVED, ReviewTaskStatus.ADJUSTED}:
         return TaskStatus.PENDING
     if status == ReviewTaskStatus.CANCELLED:
@@ -427,11 +509,15 @@ def _source_task_status_for_manual_review_source(status: ReviewTaskStatus) -> Ta
     return TaskStatus.SKIPPED
 
 
-def expire_runtime_review_tasks(inputs: ExpireReviewTasksInputs) -> ExpireReviewTasksSummary:
+def expire_runtime_review_tasks(
+    inputs: ExpireReviewTasksInputs,
+) -> ExpireReviewTasksSummary:
     repository = SQLiteRuntimeRepository(inputs.db_path)
     runtime_task_service = RuntimeTaskService(repository)
     runtime_task_service.init_schema()
-    return ReviewTaskService(repository, runtime_task_service=runtime_task_service).expire_pending_review_tasks(
+    return ReviewTaskService(
+        repository, runtime_task_service=runtime_task_service
+    ).expire_pending_review_tasks(
         now=inputs.now,
         apply=inputs.apply,
         enable_notification=inputs.enable_notification,
@@ -458,7 +544,9 @@ def list_runtime_notification_logs(
     return logs
 
 
-def get_runtime_notification_log(db_path: Path, notification_id: str) -> NotificationLog | None:
+def get_runtime_notification_log(
+    db_path: Path, notification_id: str
+) -> NotificationLog | None:
     repository = SQLiteRuntimeRepository(db_path)
     RuntimeTaskService(repository).init_schema()
     return NotificationLogService(repository).get_log(notification_id)
@@ -479,11 +567,25 @@ def validate_sources(inputs: WorkflowInputs) -> ValidationSummary:
     products = load_products(inputs.products_path)
     price_rules = load_price_rules(inputs.price_rules_path)
     listing_rules = load_listing_rules(inputs.listing_rules_path)
-    harvest_forecasts = load_harvest_forecasts(inputs.harvest_forecasts_path) if inputs.harvest_forecasts_path else None
-    price_forecasts = load_price_forecasts(inputs.price_forecasts_path) if inputs.price_forecasts_path else None
-    capacity_plan = load_capacity_plan(inputs.capacity_plan_path) if inputs.capacity_plan_path else None
+    harvest_forecasts = (
+        load_harvest_forecasts(inputs.harvest_forecasts_path)
+        if inputs.harvest_forecasts_path
+        else None
+    )
+    price_forecasts = (
+        load_price_forecasts(inputs.price_forecasts_path)
+        if inputs.price_forecasts_path
+        else None
+    )
+    capacity_plan = (
+        load_capacity_plan(inputs.capacity_plan_path)
+        if inputs.capacity_plan_path
+        else None
+    )
     cold_storage_status = (
-        load_cold_storage_status(inputs.cold_storage_status_path) if inputs.cold_storage_status_path else None
+        load_cold_storage_status(inputs.cold_storage_status_path)
+        if inputs.cold_storage_status_path
+        else None
     )
     return ValidationSummary(
         products=products,
@@ -499,24 +601,47 @@ def validate_sources(inputs: WorkflowInputs) -> ValidationSummary:
 def generate_tasks_from_sources(
     inputs: WorkflowInputs,
     *,
-    listing_task_overrides: dict[tuple[str, str, str], tuple[object, object]] | None = None,
+    listing_task_overrides: dict[tuple[str, str, str], tuple[object, object]]
+    | None = None,
 ) -> TaskGenerationSummary:
     products = load_products(inputs.products_path)
     price_rules = load_price_rules(inputs.price_rules_path)
     listing_rules = load_listing_rules(inputs.listing_rules_path)
-    harvest_forecasts = load_harvest_forecasts(inputs.harvest_forecasts_path) if inputs.harvest_forecasts_path else None
-    price_forecasts = load_price_forecasts(inputs.price_forecasts_path) if inputs.price_forecasts_path else None
-    capacity_plan = load_capacity_plan(inputs.capacity_plan_path) if inputs.capacity_plan_path else None
+    harvest_forecasts = (
+        load_harvest_forecasts(inputs.harvest_forecasts_path)
+        if inputs.harvest_forecasts_path
+        else None
+    )
+    price_forecasts = (
+        load_price_forecasts(inputs.price_forecasts_path)
+        if inputs.price_forecasts_path
+        else None
+    )
+    capacity_plan = (
+        load_capacity_plan(inputs.capacity_plan_path)
+        if inputs.capacity_plan_path
+        else None
+    )
     cold_storage_status = (
-        load_cold_storage_status(inputs.cold_storage_status_path) if inputs.cold_storage_status_path else None
+        load_cold_storage_status(inputs.cold_storage_status_path)
+        if inputs.cold_storage_status_path
+        else None
     )
 
-    ai_provider = MockAISuggestionProvider() if inputs.use_mock_ai else NullAISuggestionProvider()
+    ai_provider = (
+        MockAISuggestionProvider() if inputs.use_mock_ai else NullAISuggestionProvider()
+    )
     pricing_service = PricingService(ai_provider=ai_provider)
     listing_service = ListingService()
-    generator = TaskGenerationService(pricing_service=pricing_service, listing_service=listing_service)
-    resolved_platform_name = _resolve_runtime_platform_name(inputs.runtime_db_path, inputs.platform_name)
-    old_prices = _load_current_platform_prices(inputs.runtime_db_path, resolved_platform_name)
+    generator = TaskGenerationService(
+        pricing_service=pricing_service, listing_service=listing_service
+    )
+    resolved_platform_name = _resolve_runtime_platform_name(
+        inputs.runtime_db_path, inputs.platform_name
+    )
+    old_prices = _load_current_platform_prices(
+        inputs.runtime_db_path, resolved_platform_name
+    )
     platform_observations = _load_latest_platform_observations(
         inputs.runtime_db_path,
         resolved_platform_name,
@@ -574,7 +699,8 @@ def generate_tasks_from_selected_rule(
     rule_id: str,
     task_group_id: str | None = None,
     required_by: datetime | None = None,
-    listing_task_overrides: dict[tuple[str, str, str], tuple[object, object]] | None = None,
+    listing_task_overrides: dict[tuple[str, str, str], tuple[object, object]]
+    | None = None,
 ) -> TaskGenerationSummary:
     normalized_type = str(rule_type or "").strip().lower()
     selected_id = str(rule_id or "").strip()
@@ -584,17 +710,31 @@ def generate_tasks_from_selected_rule(
         raise ValidationError("请选择要生成任务的规则")
 
     products = load_products(inputs.products_path)
-    price_rules = [load_price_rule(inputs.price_rules_path, selected_id)] if normalized_type == "price" else []
-    listing_rules = [load_listing_rule(inputs.listing_rules_path, selected_id)] if normalized_type == "listing" else []
+    price_rules = (
+        [load_price_rule(inputs.price_rules_path, selected_id)]
+        if normalized_type == "price"
+        else []
+    )
+    listing_rules = (
+        [load_listing_rule(inputs.listing_rules_path, selected_id)]
+        if normalized_type == "listing"
+        else []
+    )
     selected_rule = price_rules[0] if price_rules else listing_rules[0]
     platform_names = _resolve_selected_rule_platforms(
         selected_rule.platform_filter,
         inputs,
         require_online_price=normalized_type == "price",
     )
-    resolved_group_id = str(task_group_id or "").strip() or f"RULE-GROUP-{uuid4().hex[:12]}"
-    resolved_required_by = required_by or datetime.now(timezone.utc) + timedelta(minutes=30)
-    ai_provider = MockAISuggestionProvider() if inputs.use_mock_ai else NullAISuggestionProvider()
+    resolved_group_id = (
+        str(task_group_id or "").strip() or f"RULE-GROUP-{uuid4().hex[:12]}"
+    )
+    resolved_required_by = required_by or datetime.now(timezone.utc) + timedelta(
+        minutes=30
+    )
+    ai_provider = (
+        MockAISuggestionProvider() if inputs.use_mock_ai else NullAISuggestionProvider()
+    )
     generator = TaskGenerationService(
         pricing_service=PricingService(ai_provider=ai_provider),
         listing_service=ListingService(),
@@ -602,7 +742,9 @@ def generate_tasks_from_selected_rule(
     tasks: list[Task] = []
     ignored_candidates: list[IgnoredTaskCandidate] = []
     for platform_name in platform_names:
-        old_prices = _load_current_platform_prices(inputs.runtime_db_path, platform_name)
+        old_prices = _load_current_platform_prices(
+            inputs.runtime_db_path, platform_name
+        )
         platform_observations = _load_latest_platform_observations(
             inputs.runtime_db_path,
             platform_name,
@@ -639,7 +781,10 @@ def generate_tasks_from_selected_rule(
             selected_tasks = [
                 task
                 for task in generated
-                if any(marker in str(step) for step in task.decision_trace.get("listing_trace", []))
+                if any(
+                    marker in str(step)
+                    for step in task.decision_trace.get("listing_trace", [])
+                )
             ]
         for task in selected_tasks:
             task.decision_trace = dict(task.decision_trace) | {
@@ -763,36 +908,42 @@ def _resolve_selected_rule_platforms(
         if inputs.runtime_db_path is not None:
             repository = SQLiteRuntimeRepository(inputs.runtime_db_path)
             repository.init_schema()
-            matching_platforms = list(dict.fromkeys(
-                status.platform_name
-                for status in repository.list_listing_statuses()
-                if (not require_online_price or is_price_task_listing(status))
-                and platform_names_match(rule_platform, status.platform_name)
-            ))
+            matching_platforms = list(
+                dict.fromkeys(
+                    status.platform_name
+                    for status in repository.list_listing_statuses()
+                    if (not require_online_price or is_price_task_listing(status))
+                    and platform_names_match(rule_platform, status.platform_name)
+                )
+            )
             if matching_platforms:
                 canonical_name = canonical_platform_name(rule_platform)
                 if canonical_name in matching_platforms:
                     return [canonical_name]
                 return [matching_platforms[0]]
         return [canonical_platform_name(rule_platform)]
-    candidates = list(dict.fromkeys(
-        platform
-        for platform in (*inputs.platform_names, inputs.platform_name)
-        if platform and platform != "default_platform"
-    ))
+    candidates = list(
+        dict.fromkeys(
+            platform
+            for platform in (*inputs.platform_names, inputs.platform_name)
+            if platform and platform != "default_platform"
+        )
+    )
     if inputs.runtime_db_path is not None:
         repository = SQLiteRuntimeRepository(inputs.runtime_db_path)
         repository.init_schema()
         listing_statuses = repository.list_listing_statuses()
-        snapshot_platforms = list(dict.fromkeys(
-            status.platform_name
-            for status in listing_statuses
-            if not require_online_price or is_price_task_listing(status)
-        ))
+        snapshot_platforms = list(
+            dict.fromkeys(
+                status.platform_name
+                for status in listing_statuses
+                if not require_online_price or is_price_task_listing(status)
+            )
+        )
         if require_online_price and not snapshot_platforms and listing_statuses:
-            snapshot_platforms = list(dict.fromkeys(
-                status.platform_name for status in listing_statuses
-            ))
+            snapshot_platforms = list(
+                dict.fromkeys(status.platform_name for status in listing_statuses)
+            )
         resolved_candidates: list[str] = []
         resolved_keys: set[str] = set()
         for candidate in candidates:
@@ -806,9 +957,7 @@ def _resolve_selected_rule_platforms(
             )
             if matching_platform is None and require_online_price:
                 continue
-            matching_platform = matching_platform or canonical_platform_name(
-                candidate
-            )
+            matching_platform = matching_platform or canonical_platform_name(candidate)
             identity = platform_identity_key(matching_platform)
             if identity not in resolved_keys:
                 resolved_keys.add(identity)
@@ -816,7 +965,9 @@ def _resolve_selected_rule_platforms(
         candidates = resolved_candidates
     if not candidates:
         if require_online_price:
-            raise ValidationError("全平台价格规则未找到带在线价格快照的平台，请先运行 ShadowBot READ_ONLY")
+            raise ValidationError(
+                "全平台价格规则未找到带在线价格快照的平台，请先运行 ShadowBot READ_ONLY"
+            )
         raise ValidationError("全平台规则未找到有效平台配置")
     return candidates
 
@@ -830,9 +981,12 @@ def _load_current_platform_prices(
     repository = SQLiteRuntimeRepository(runtime_db_path)
     repository.init_schema()
     return {
-        listing_identity_key(platform_name, status.variety, status.grade): status.current_price
+        listing_identity_key(
+            platform_name, status.variety, status.grade
+        ): status.current_price
         for status in repository.list_listing_statuses()
-        if is_price_task_listing(status) and platform_names_match(platform_name, status.platform_name)
+        if is_price_task_listing(status)
+        and platform_names_match(platform_name, status.platform_name)
     }
 
 
@@ -855,17 +1009,12 @@ def _load_latest_platform_observations(
             status.price_observed_at is None
             or status.inventory_observed_at is None
             or not status.price_source_attempt_id
-            or status.price_source_attempt_id
-            != status.inventory_source_attempt_id
+            or status.price_source_attempt_id != status.inventory_source_attempt_id
         ):
             continue
-        if (
-            status.last_listing_change_at is not None
-            and (
-                status.price_observed_at < status.last_listing_change_at
-                or status.inventory_observed_at
-                < status.last_listing_change_at
-            )
+        if status.last_listing_change_at is not None and (
+            status.price_observed_at < status.last_listing_change_at
+            or status.inventory_observed_at < status.last_listing_change_at
         ):
             continue
         observations[
@@ -905,17 +1054,21 @@ def _load_platform_listing_states(
     return states
 
 
-def _resolve_runtime_platform_name(runtime_db_path: Path | None, platform_name: str) -> str:
+def _resolve_runtime_platform_name(
+    runtime_db_path: Path | None, platform_name: str
+) -> str:
     canonical_name = canonical_platform_name(platform_name)
     if runtime_db_path is None:
         return canonical_name
     repository = SQLiteRuntimeRepository(runtime_db_path)
     repository.init_schema()
-    matching_platforms = list(dict.fromkeys(
-        status.platform_name
-        for status in repository.list_listing_statuses()
-        if platform_names_match(platform_name, status.platform_name)
-    ))
+    matching_platforms = list(
+        dict.fromkeys(
+            status.platform_name
+            for status in repository.list_listing_statuses()
+            if platform_names_match(platform_name, status.platform_name)
+        )
+    )
     if canonical_name in matching_platforms:
         return canonical_name
     return matching_platforms[0] if matching_platforms else canonical_name
@@ -941,7 +1094,9 @@ def preview_tasks_from_sources(inputs: WorkflowInputs) -> TaskGenerationSummary:
     return generate_tasks_from_sources(preview_inputs)
 
 
-def simulate_execution_from_tasks(inputs: ExecutionSimulationInputs) -> ExecutionSimulationSummary:
+def simulate_execution_from_tasks(
+    inputs: ExecutionSimulationInputs,
+) -> ExecutionSimulationSummary:
     tasks = load_tasks(inputs.tasks_path)
     service = ExecutionSimulationService()
     updated_tasks, logs = service.simulate(tasks, executor_name=inputs.executor_name)
@@ -962,7 +1117,9 @@ def list_manual_intervention_tasks(tasks_path: Path) -> list[Task]:
     return ManualInterventionService().list_open_tasks(tasks)
 
 
-def resolve_manual_intervention_task(inputs: ManualInterventionInputs) -> ManualInterventionSummary:
+def resolve_manual_intervention_task(
+    inputs: ManualInterventionInputs,
+) -> ManualInterventionSummary:
     raise ValidationError(
         "旧 Excel 人工介入入口已弃用，不能再执行正式处理。请改用 SQLite review_tasks 或 Web /runtime 入口。"
     )

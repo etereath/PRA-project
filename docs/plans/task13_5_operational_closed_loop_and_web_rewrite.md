@@ -552,12 +552,19 @@ v4 `UPDATE_PRICE` 和任务 13 v5 `SET_OFFLINE`；“我来处理”不创建平
 只有命中已批准、未退休策略并同时满足下列流程，才允许无人值守紧急下架：
 
 1. 第一次完整观察创建 Incident 并通知。
-2. Outbox 明确发送成功后，等待下一个计划槽的另一个完整、已导入 `ONLINE_PULSE`；
-   失败、不完整或错过的 Pulse 只延后，跨 18:00 则重新建轮次。
+2. 以初始 Outbox 的 `sent_at` 作为等待起点，只接受其后下一个计划槽开始的另一个
+   完整、已导入 `ONLINE_PULSE`；通知送达前的 Pulse 不得复用，失败、不完整或错过的
+   Pulse 只延后，跨 18:00 则重新建轮次。
 3. 重新读取当前价格、在线状态、`base_cost`、策略、Review 和写锁。
 4. 若紧急情况仍存在且没有复核结果，创建 `SYSTEM_EMERGENCY` 授权和单一
    `SET_OFFLINE` 业务任务。
 5. 复用 v5 写动作和 Importer；结果为 UNKNOWN 时只允许现有唯一 RECONCILE。
+
+第二次完整观察冻结价格业务判断。后续发布和点击只检查授权及执行安全，不因价格上涨重新
+计算 `base_cost × 0.80` 或撤销授权；但同平台/SKU 的更高优先级人工改价/下架意图、人工
+Review、策略/开关失效、活动写锁、未决 UNKNOWN/RECONCILE、身份不唯一或不再在线仍会
+阻止点击。自动评估时间不等于 Review/Token 到期；人工结果在 v5
+`SUBMIT_INTENT_RECORDED` 前到达时优先。
 
 以下任一条件存在时禁止自动下架：映射不是 `VERIFIED`、成本缺失或过期、价格不可读、
 扫描不完整、存在活动/UNKNOWN 写锁、商品已下架、策略未批准/已退休、功能开关关闭、
@@ -677,7 +684,9 @@ Web 主控端以运营人员的工作问题组织页面：
 
 核心 v14 只在任务来源字段中预留 `SYSTEM_EMERGENCY` 和策略扩展边界。
 13.5-6 已裁决 v15 只增加 Incident 出现次数、事件流水和类别扩展，v16 只增加极简
-`emergency_offline_policies`；授权证据复用 Automation Event，不新增授权表。
+`emergency_offline_policies`，并以数据库 CHECK 和 Decimal 服务双重固定 `0.80`；授权
+证据复用 Automation Event，不新增授权表。FINAL 在事务内按平台、交易日、subject 与
+当前 Summary 输入清单动态匹配阻断 Incident，不要求 Incident 预先引用 Summary ID。
 
 ## 11. 调度、幂等和恢复要求
 
@@ -802,8 +811,9 @@ Web 主控端以运营人员的工作问题组织页面：
 - 人工复核固定为“改价到 / 立即下架 / 我来处理”，分别复用 v4/v5 或进入人工等待。
 - 13.5-6B 以 v16 迁移极简策略：最低安全价为 `base_cost`，紧急比例为 `0.80`；
   shadow/dry-run 不创建任务。
-- 13.5-6C 只在极端低价仍存在、没有复核结果、另一个完整 Pulse 已导入时创建
-  `SYSTEM_EMERGENCY`，复用 v5 下架和 UNKNOWN 恢复。
+- 13.5-6C 只在极端低价仍存在、没有复核结果、初始通知 `sent_at` 后下一个计划槽的
+  另一个完整 Pulse 已导入时创建 `SYSTEM_EMERGENCY`，复用 v5 下架和 UNKNOWN 恢复；
+  第二次观察后不再重算价格阈值，但仍重验人工任务冲突和全部执行安全门禁。
 - 不增加每日次数上限、冷却、自动重新上架或通用策略引擎。
 
 验收：人工闭环和支撑数据先通过评审；ACK 只是事件；同异常不刷屏；Worker 异常运行

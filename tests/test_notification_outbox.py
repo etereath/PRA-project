@@ -947,12 +947,34 @@ def test_verification_intervention_has_priority_and_short_deadline(repository):
         recipient_type="role",
         recipient_ref="operator",
         channel="fake",
+        payload={"platform_name": "蚂蚁花团供应商"},
         now=now,
     )
     claimed = repository.claim_notification_outbox(now=now, lease_seconds=30)[0]
     assert claimed.notification_id == verification.notification_id
     assert claimed.priority == 100
     assert claimed.deadline_at == now + timedelta(seconds=300)
+    assert claimed.payload["message"] == "需要验证码：蚂蚁花团供应商登录，请立即处理"
+
+
+def test_expired_review_message_is_business_readable_beijing_time(repository):
+    now = datetime(2026, 7, 17, 10, 0, tzinfo=UTC)
+    review = _review("REVIEW-EXPIRED-TITLE")
+    review.reason = "艾莎 D级价格异常待处理"
+    candidate = NotificationOutboxService(
+        repository, clock=lambda: now
+    )._candidate_expired_notification(
+        review,
+        timeout_at=now,
+        recipient_type="role",
+        recipient_ref="operations",
+        channel="feishu",
+    )
+
+    assert candidate.payload["message"].splitlines() == [
+        "复核已超时：艾莎 D级价格异常待处理",
+        "超时时间：2026-07-17 18:00（北京时间）",
+    ]
 
 
 @pytest.mark.parametrize("ttl_seconds", [-1, 60, 601, 3600])
@@ -1050,6 +1072,7 @@ def test_feishu_worker_sends_ephemeral_mobile_review_link_without_persisting_tok
 
     assert delivered is not None and delivered.status == "SENT"
     serialized_body = json.dumps(captured["body"], ensure_ascii=False)
+    assert captured["body"]["content"]["post"]["zh_cn"]["title"] == "人工复核"
     assert (
         "https://pra.example/mobile/review/REVIEW-MOBILE-LINK?token="
         in serialized_body

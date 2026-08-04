@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+import json
 from contextlib import closing
 from datetime import UTC, datetime
 from decimal import Decimal
 from hashlib import sha256
-import json
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.automation_ui_channel import has_active_automation_ui_run
-from app.enums import TaskActionType, TaskStatus
+from app.emergency_offline_fence import (
+    EmergencyOfflineFenceError,
+    build_emergency_authorization_binding,
+    revalidate_emergency_offline_facts,
+)
+from app.enums import TaskActionType, TaskOriginType, TaskStatus
 from app.exceptions import ValidationError
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.listing_automation_gate import (
@@ -26,8 +31,8 @@ from app.services.shadowbot_executor import (
     ShadowBotStartResult,
 )
 from app.services.shadowbot_listing_action_contract import (
-    build_listing_action_reconcile_request,
     build_listing_action_manifest,
+    build_listing_action_reconcile_request,
     build_listing_action_request,
     compute_listing_item_payload_hash,
     required_development_confirmation,
@@ -93,6 +98,7 @@ def propose_listing_action_batch(
     if not task_ids:
         raise ValidationError("至少需要一个任务。")
     tasks = []
+    source_tasks = []
     action_type = ""
     platform_name = ""
     now = datetime.now(UTC)
@@ -118,6 +124,7 @@ def propose_listing_action_batch(
             raise ValidationError("同一批次只能包含同平台、同动作任务。")
         if not task.internal_sku:
             raise ValidationError("任务缺少 internal_sku：" + task.task_id)
+        source_tasks.append(task)
         item = {
             "source_task_id": task.task_id,
             "internal_sku": task.internal_sku,
@@ -147,9 +154,34 @@ def propose_listing_action_batch(
         platform_name=platform_name,
         mapping_source_version=mapping_source_version(mapping_path),
     )
+    emergency_authorization: dict[str, str] | None = None
+    emergency_tasks = [
+        task
+        for task in source_tasks
+        if task.origin_type is TaskOriginType.SYSTEM_EMERGENCY
+    ]
+    if emergency_tasks:
+        if len(source_tasks) != 1 or len(emergency_tasks) != 1:
+            raise ValidationError("SYSTEM_EMERGENCY 不得与其他任务混合成批。")
+        if str(execution_profile).strip().lower() != "production":
+            raise ValidationError("SYSTEM_EMERGENCY 只允许正式运行合同。")
     gate_items = []
     corrective_authorizations: list[dict[str, str]] = []
     with closing(repository.connect_read()) as connection:
+        if emergency_tasks:
+            try:
+                emergency_authorization = build_emergency_authorization_binding(
+                    connection,
+                    task_id=emergency_tasks[0].task_id,
+                )
+                revalidate_emergency_offline_facts(
+                    connection,
+                    binding=emergency_authorization,
+                    now=now,
+                    allowed_task_statuses={TaskStatus.PENDING.value},
+                )
+            except EmergencyOfflineFenceError as exc:
+                raise ValidationError(str(exc)) from exc
         corrective_authorizations = _corrective_retry_authorizations(
             connection,
             platform_name=platform_name,
@@ -172,6 +204,13 @@ def propose_listing_action_batch(
                 platform_name=platform_name,
                 internal_sku=item["internal_sku"],
             )
+            if emergency_authorization is not None:
+                reviews = [
+                    review
+                    for review in reviews
+                    if review.get("review_task_id")
+                    != emergency_authorization["review_task_id"]
+                ]
             locks = _write_lock_context(
                 connection,
                 write_identity_key=item["write_identity_key"],
@@ -225,6 +264,7 @@ def propose_listing_action_batch(
         "execution_profile": str(execution_profile).strip().lower(),
         "gate_items": gate_items,
         "corrective_authorizations": corrective_authorizations,
+        "emergency_authorization": emergency_authorization,
         "publishable": all(
             item["decision"] in {"EXECUTE", "ALREADY_APPLIED"}
             for item in gate_items
@@ -294,6 +334,7 @@ def publish_listing_action_batch(
         capture_evidence=capture_evidence,
         fault_injection=fault_injection,
         fault_injection_item_ordinal=fault_injection_item_ordinal,
+        emergency_authorization=proposal.get("emergency_authorization"),
     )
     validate_listing_action_request(request)
     _persist_prepared_write_batch(
@@ -526,6 +567,13 @@ def import_listing_action_result(
                     request_item["source_task_id"],
                 ),
             )
+            _project_emergency_incident_after_import(
+                connection,
+                request_item=request_item,
+                outcome=outcome,
+                result_id=result_id,
+                occurred_at=now,
+            )
             if outcome in {"VERIFIED", "ALREADY_APPLIED"}:
                 _project_verified_listing(
                     connection,
@@ -587,6 +635,92 @@ def import_listing_action_result(
         "already_imported": False,
         "manual_review_summary": review_summary,
     }
+
+
+def _project_emergency_incident_after_import(
+    connection,
+    *,
+    request_item: dict[str, Any],
+    outcome: str,
+    result_id: str,
+    occurred_at: str,
+) -> None:
+    """Return completed or safely failed protection to the pending human Review."""
+
+    if outcome not in {
+        "VERIFIED",
+        "ALREADY_APPLIED",
+        "FAILED",
+        "NOT_ATTEMPTED",
+        "NOT_APPLIED",
+    }:
+        return
+    task = connection.execute(
+        "SELECT origin_type, decision_trace_json FROM tasks WHERE task_id = ?",
+        (request_item["source_task_id"],),
+    ).fetchone()
+    if task is None or str(task["origin_type"]) != TaskOriginType.SYSTEM_EMERGENCY.value:
+        return
+    trace = _json_object(task["decision_trace_json"])
+    incident_id = str(trace.get("incident_id") or "")
+    review_task_id = str(trace.get("review_task_id") or "")
+    incident = connection.execute(
+        "SELECT incident_status, severity FROM operational_incidents WHERE incident_id = ?",
+        (incident_id,),
+    ).fetchone()
+    review = connection.execute(
+        "SELECT review_status FROM review_tasks WHERE review_task_id = ?",
+        (review_task_id,),
+    ).fetchone()
+    if (
+        incident is None
+        or review is None
+        or str(incident["incident_status"]) != "AUTO_PROTECTING"
+        or str(review["review_status"]) != "pending"
+    ):
+        raise ValidationError(
+            "SYSTEM_EMERGENCY 结果无法回到原人工复核，Importer 已回滚。"
+        )
+    updated = connection.execute(
+        """
+        UPDATE operational_incidents
+        SET incident_status = 'WAITING_HUMAN', updated_at = ?
+        WHERE incident_id = ? AND incident_status = 'AUTO_PROTECTING'
+        """,
+        (occurred_at, incident_id),
+    )
+    if updated.rowcount != 1:
+        raise ValidationError("SYSTEM_EMERGENCY Incident 状态并发变化。")
+    event_key = "emergency-result:" + result_id + ":" + request_item["operation_id"]
+    payload = {
+        "task_id": request_item["source_task_id"],
+        "review_task_id": review_task_id,
+        "operation_id": request_item["operation_id"],
+        "operation_result": outcome,
+        "human_review_still_required": True,
+        "automatic_reonline_allowed": False,
+    }
+    connection.execute(
+        """
+        INSERT INTO operational_incident_events(
+            event_id, event_key, incident_id, event_type, occurred_at,
+            source_type, source_ref_id, from_status, to_status, severity,
+            event_payload_json, created_at
+        ) VALUES (?, ?, ?, 'RECOVERY_RECORDED', ?,
+                  'SHADOWBOT_RESULT_IMPORTER', ?, 'AUTO_PROTECTING',
+                  'WAITING_HUMAN', ?, ?, ?)
+        """,
+        (
+            _stable_id("incident-event", event_key),
+            event_key,
+            incident_id,
+            occurred_at,
+            request_item["source_task_id"],
+            incident["severity"],
+            _json_text(payload),
+            occurred_at,
+        ),
+    )
 
 
 def ensure_listing_action_reconcile_attempt(
@@ -976,6 +1110,13 @@ def _import_listing_action_reconcile_result(
                 item["source_task_id"],
             ),
         )
+        _project_emergency_incident_after_import(
+            connection,
+            request_item=item,
+            outcome=outcome,
+            result_id=result_id,
+            occurred_at=now,
+        )
         projected: list[str] = []
         if outcome == "VERIFIED":
             _project_verified_listing(
@@ -1199,6 +1340,17 @@ def _persist_prepared_write_batch(
             raise ValidationError(
                 "Automation UI 扫描正在运行，当前不能获取平台写锁。"
             )
+        emergency_authorization = request.get("emergency_authorization")
+        if emergency_authorization is not None:
+            try:
+                revalidate_emergency_offline_facts(
+                    connection,
+                    binding=emergency_authorization,
+                    now=now_value,
+                    allowed_task_statuses={TaskStatus.PENDING.value},
+                )
+            except EmergencyOfflineFenceError as exc:
+                raise ValidationError(str(exc)) from exc
         validated_corrective = _corrective_retry_authorizations(
             connection,
             platform_name=request["platform_name"],
@@ -1300,13 +1452,21 @@ def _persist_prepared_write_batch(
                 """,
                 (item["write_identity_key"],),
             ).fetchone()
+            open_reviews = _open_review_context(
+                connection,
+                platform_name=request["platform_name"],
+                internal_sku=item["internal_sku"],
+            )
+            if emergency_authorization is not None:
+                open_reviews = [
+                    review
+                    for review in open_reviews
+                    if review.get("review_task_id")
+                    != emergency_authorization["review_task_id"]
+                ]
             review_reasons = review_block_reasons(
                 request["action_type"],
-                _open_review_context(
-                    connection,
-                    platform_name=request["platform_name"],
-                    internal_sku=item["internal_sku"],
-                ),
+                open_reviews,
             )
             if review_reasons:
                 raise ValidationError(

@@ -10,7 +10,80 @@ PRA 当前定位为：
 
 PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、多商品、受控 RPA 改价与上下架闭环；任务 13.5 已插入任务 13 与任务 14 之间，用于补齐 18:00 平台交易日/20:00 卖家作业日双时间轴、持续只读扫描、历史订单观察、销售日结、S0–S4 异常治理、任务来源对齐、受控紧急保护和运营 Web 重写。当前 13.5-1 已完成双时间轴、Runtime Schema v14、六级质量约束和日结状态机；13.5-2 已通过 PR #23 合并商品映射编译、扫描 JSON 输入、任务 13 双页快照适配和 v14 商品观察导入；13.5-3 已通过 PR #24 合并独立 Automation Service 的计划窗口、租约、合并、补跑、父子 run、心跳和健康控制面。13.5-4 已实现订单只读合同、蚂蚁花团 Adapter、平台无关 Importer、v6 ShadowBot 只读队列边界和 `FULL_MARKET_SCAN → ORDER_SCAN → ORDER_HISTORY_IMPORT` 接入；当前日按 `OPEN`、历史日按 `CLOSED`，重复订单按指纹多重集合保留。最新审查修复已增加历史目标日期 Run Event 精确冻结、Watchdog/Importer 全链路绑定、`HH:10` 完整扫描、跨 18:00 整批失败和正式 Automation Service 只读 Handler 组合。受控真实页面 READ_ONLY 已完成 2026-07-31、2026-07-30 和 2026-07-22 三日期矩阵，分别读取 3、5、4 条并完成范围/尾部验证、导入归档和零平台写副作用；日期轮已修复“隐藏日期存在于无障碍树却不在视口”的误判，从 7 月 30 日到 7 月 22 日的向上滚动以及从 7 月 22 日回到 7 月 31 日的向下滚动、确认和精确日期回读均已通过。2026-07-10 又完成 20 条历史订单 READ_ONLY：订单调用方点击新捕获的 `订单管理_容器` 右边缘空白带，共享助手发送 2 次 `END` 后验证“没有更多了”，再由 `HOME` 恢复首卡；`scroll_progress_verified=true`，订单列表真实滚动门禁已关闭。复用优先整改保留商品和订单共用的参数化列表物化助手，并以 `scroll_count / scroll_progress_verified` 独立记录滚动证据。真实 Runtime DB 因既有 `NEEDS_RECONCILIATION` 安全门禁保持未迁移、未写入订单事实，因此仍不承诺生产级无人值守写操作，也未扩展到第二平台。系统核心职责是：
 
-13.5-6 当前处于编码前计划冻结。已逐项确认：v15 只为 Incident 增加出现次数、类别扩展和一张不可变事件表；v16 只增加极简紧急下架策略表；Review、Mobile Review、飞书 Outbox、Automation Run、Worker 恢复、v4 改价、v5 下架、共享写锁、Importer 和唯一 RECONCILE 均优先复用。价格异常的最低安全价为商品 `base_cost`，极端线为 `base_cost × 0.80`；S3/S4 人工操作固定为“改价到 / 立即下架 / 我来处理”。只有极端低价在另一个完整 `ONLINE_PULSE` 后仍存在且没有复核结果时，才允许评估 `SYSTEM_EMERGENCY`；不使用每日次数上限、冷却或自动重新上架。当前仍为纯计划，`automatic_emergency_offline=false`。
+13.5-6 已完成编码前计划评议、6A-0/6A-1 本地实现以及 6B 的 Runtime Schema v16
+极简策略和零副作用影子判定。v15 只增加 Incident 出现次数、扩展类别和一张 append-only
+Event 表；v16 只增加一张 `emergency_offline_policies`，数据库和 Decimal 解释器共同固定
+`emergency_ratio=0.80`。策略先以未批准草稿创建，批准后不可原地修改，只允许版本替换和
+退休；同平台最多一个有效版本。影子服务原样复用 Review、Outbox `sent_at`、完整
+`ONLINE_PULSE`、映射/在线/价格事实和共享写锁，并像人工复核链一样从权威商品工作簿
+一致性回读 `base_cost` 与内容哈希。只有 `P <= base_cost × 0.80` 的 S4 进入 allowlist；
+S3 永不自动。成本缺失/非法或来源不可追溯时复用 `MASTER_DATA` Incident fail closed。
+6B 专项为 `33 passed`，受影响回归为 `107 passed`；完整 pytest 为
+`1064 passed, 3 skipped, 97 subtests passed`，隔离系统冒烟为 `16 passed, 0 failed`。
+6B 本身保持零平台副作用；后续 6C 已在一次性 v16 数据库完成一次明确授权的真实写验收，
+验收结束后 `automatic_emergency_offline=false` 已恢复。
+
+13.5-6C 已完成本地代码与合成链：专用授权在同一事务追加 Automation Event、创建唯一
+`SYSTEM_EMERGENCY SET_OFFLINE` Task 并把 Incident 转为 `AUTO_PROTECTING`；通用
+Repository 仍拒绝该来源。现有 v5 合同版本、SET_OFFLINE 执行链、operation/attempt、共享
+写锁、phase、Importer 和 UNKNOWN/RECONCILE 均原样复用。主控端在写账本前重验可撤销
+事实；Worker 在唯一定位并核对确认弹窗后，以同一个 Runtime DB 的短
+`BEGIN IMMEDIATE` 在线性化边界内再次重验，通过后才记录 `ACTION_INTENT_RECORDED` 和
+点击确认。失败先取消弹窗且不记录写意图。成功导入后 Incident 回到
+`WAITING_HUMAN`，不自动重新上架。验收前受影响组合为
+`127 passed, 3 subtests passed`；修正真实默认装配后授权与 shadow 专项为 `37 passed`，
+完整 pytest 为 `1079 passed, 3 skipped, 97 subtests passed`，系统冒烟为
+`16 passed, 0 failed`。
+Worker 文件已在正常停止、应用列表核对和逐文件哈希一致后同步到真实 `test2`。2026-08-03
+对 `AISHA-D-50-Z` 完成唯一一次真实 `SYSTEM_EMERGENCY SET_OFFLINE`：两次完整在线观察、
+初始飞书通知后的下一有效 Pulse、S4 阈值、待处理 Review、策略和写入禁止条件均通过；v5
+结果为 `VERIFIED`，最终在线列表回读不再包含目标商品，Importer/ACK/Archive 完整通过，
+无 RECONCILE。Task 为 `success`，Incident 回到 `WAITING_HUMAN`，Review 保持 `pending`，
+没有自动重新上架。验收控制器已在 `finally` 中恢复开关为 false，活动写锁和队列文件均为
+0；长期 Worker 保持新鲜 `RUNNING`，原 Queue Service 已恢复绑定原 Runtime DB。该结论只
+表示单 SKU 受控实机通过，不表示生产开关已常驻启用。
+
+13.5-6A-1 已完成本地实现和当前安全前提允许的真实 R4 验收。当前新增 Incident 可信检测、精确重放冲突、开放去重、
+`RESOLVED` 重开、`CLOSED` 后新建、核心状态转换、ACK、严重度和恢复事件的原子服务；
+S3/S4 价格初始 Review、Token、Outbox、兼容通知日志、`REVIEW_RECORDED` 事件和
+`WAITING_HUMAN` 状态已在同一事务内提交。Token 仍只保存 hash，飞书 Worker 可在投递
+时通过既有 secret 在内存中重建链接并复用预创建 Token。等待只从初始 Outbox 的真实
+`sent_at` 开始；失败或 UNKNOWN 投递阻断无人介入推断。S4 只允许一条五分钟中途提醒，
+ACK、复核结果或恢复会抑制提醒；恢复和任务结果继续使用同一 Outbox 的稳定业务键。
+decision-first Mobile Review 已在原 GET/POST 和单事务入口增加 Incident 分支：“改价到”
+按权威工作簿最新 `base_cost` 校验后创建 MANUAL v4 任务，“立即下架”创建 MANUAL v5
+任务，“我来处理”不创建平台任务；原 source-task 复核保持回归。完整 Pulse 资格已复用
+Automation Run、`MERGED_RUN` 和商品观察事实，只接受通知送达后开始、已完成导入、范围
+完整、尾部确认、同平台/交易日/SKU、`VERIFIED` 且仍在线的第二观察；失败或不完整只
+延后。新增 Incident/Review 专项为 `33 passed`，当前受影响回归为
+`295 passed, 36 subtests passed`；Worker/队列/Automation 组合专项为 `122 passed`；完整
+pytest 为 `1031 passed, 3 skipped, 97 subtests passed`，隔离系统冒烟为
+`16 passed, 0 failed`。
+通知同步、中点提醒和 Pulse 资格已通过显式 `--enable-incident-monitoring` 接入既有
+Automation Service 的一分钟维护 Handler，继续复用计划窗口、租约、Run/Event 和
+Outbox，默认入口不自动启用，Run 明确保持零平台写。Worker 请求级 stale 恢复继续复用
+Queue Watchdog；宿主级恢复已收敛为唯一 `ShadowBotWorkerRecoveryCoordinator` 和严格 JSON
+Windows helper，并接入同一个 Incident Automation Handler。活动 working、待导入 result、
+写副作用未知、未保存编辑内容和未核实进程路径都会 fail closed；每个 Incident 出现次数只
+领取一轮动作，必须在后续周期看到新鲜 `RUNNING` heartbeat 才记为恢复成功。该能力需要
+`--enable-incident-monitoring --enable-worker-recovery` 与独立环境开关同时成立，默认关闭。
+2026-08-03 已完成真实宿主缺失、核实安装路径重启、唯一 `test2` 语义启动、新鲜
+heartbeat、Incident 解决、生命周期更新、空队列正常停止和再次恢复。实机发现并修复
+Windows PowerShell 5.1 对无 BOM UTF-8 中文控制常量的错误解释；helper 现为纯 ASCII
+源码并以 Unicode 码点匹配 UIA 标签。`Ctrl+Alt+Q` 只在活动 working 正常停止失败时允许，
+本轮未伪造该高风险前提，因此该分支不写为实机通过。随后 6C 已另获单 SKU 明确授权并
+完成一次受控真实下架；该授权不扩张 6A-1 的宿主恢复权限，也不得复用于其他真实写动作。
+
+2026-08-03 至 2026-08-04 已完成 S0–S4 飞书逐批和手机复核验收。隔离 v16 Outbox 中
+14 次真实业务投递均为 `SENT / ACKNOWLEDGED / HTTP 200`，活动待发数为 0；S3/S4 经营
+通知、验证码“处理完毕”权威反馈、S4 初始与中点提醒以及“改价到 / 立即下架 / 我来处理”
+页面均由用户确认。首次 S4 使用的临时公网域名次日退出导致旧消息 404；已切换到受运维
+管理的固定入口、作废旧 Token、重新签发并补发通过。后续真实通知禁止使用随机临时域名，
+发送前必须以公网 `/health` 作为部署门禁。手机页面验收未提交经营动作，且未改变
+`automatic_emergency_offline=false`。最终受影响组合为 `181 passed, 20 subtests passed`，
+完整 pytest 为 `1082 passed, 3 skipped, 97 subtests passed`，隔离系统冒烟为
+`16 passed, 0 failed`。详见
+[通知与手机复核验收报告](reports/task13_5_6_notification_mobile_review_acceptance_20260804.md)。
 
 - 从 Excel 读取业务输入。
 - 根据规则和预测输入生成运行态任务。
@@ -156,7 +229,7 @@ PROVISIONAL；FINAL 必须经过订单完整性、复算、差异分类、输入
 v14 Runtime DB 中通过，平台写操作为 0。批次 `PARTIAL` 仅源于验收使用空映射，20 条
 均为 `UNMAPPED`，不是页面读取失败；主 Runtime DB 队列服务和长期 Worker 已恢复。
 
-当前代码中的 runtime schema 最新版本为 v14。v3 新增自动规则评估运行记录，v4 新增 ShadowBot Executor 账本，v5 新增队列审计字段和 `retry_authorizations`，v6 新增事务型通知 Outbox，v7-v9 建立 `listing_status` 并将业务身份统一为“平台 + 品种 + 等级”，v10 将 `tasks.expected_old_price` 结构化，v11 新增单次请求的 `shadowbot_commit_batches` 和 `shadowbot_commit_batch_items`，v12 新增逐商品操作/尝试身份、活动写锁、观察时间和持久化结果回执，v13 新增公共批次注册表、通用上下架 operation、共享写锁、v5 动作账本、两页快照和页面异常事实表，v14 新增双时间轴、Automation、不可变观察、日结、Incident 和任务来源结构。真实 Runtime DB 是否已升级必须单独核实；`app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION` 是代码版本唯一权威来源。
+当前代码中的 runtime schema 最新版本为 v16。v3 新增自动规则评估运行记录，v4 新增 ShadowBot Executor 账本，v5 新增队列审计字段和 `retry_authorizations`，v6 新增事务型通知 Outbox，v7-v9 建立 `listing_status` 并将业务身份统一为“平台 + 品种 + 等级”，v10 将 `tasks.expected_old_price` 结构化，v11 新增单次请求的 `shadowbot_commit_batches` 和 `shadowbot_commit_batch_items`，v12 新增逐商品操作/尝试身份、活动写锁、观察时间和持久化结果回执，v13 新增公共批次注册表、通用上下架 operation、共享写锁、v5 动作账本、两页快照和页面异常事实表，v14 新增双时间轴、Automation、不可变观察、日结、Incident 和任务来源结构，v15 增加 Incident 出现次数、类别扩展和 append-only 事件流水，v16 增加唯一的版本化极简紧急下架策略表。真实 Runtime DB 是否已升级必须单独核实；`app.runtime_schema.LATEST_RUNTIME_SCHEMA_VERSION` 是代码版本唯一权威来源。
 
 ### 2.3 人工复核闭环
 
@@ -185,7 +258,7 @@ v14 Runtime DB 中通过，平台写操作为 0。批次 `PARTIAL` 仅源于验�
 已完成飞书 Webhook Outbox 通知链路：
 
 - `NotificationChannelRegistry` 按持久化 `channel` 绑定 `fake / scripted / feishu`；默认运行态 review 不再直接调用 provider。
-- ShadowBot 登录验证码人工介入使用 `ReviewTask + verification_code_intervention Outbox` 单事务创建。
+- ShadowBot 登录验证码人工介入使用 `ReviewTask + verification_code_intervention Outbox` 单事务创建；执行端自动回读确认登录恢复、超时或停止等待后，同事务完成 Review 并创建唯一结果通知，分别为“验证码处理完毕 / 验证码处理超时 / 验证码等待已取消”。
 - 验证码 deadline 强制限制为 120 至 600 秒；Review 完成后会在业务事务中取消尚未发送的旧人工介入通知。
 - `FeishuOutboxSender` 使用飞书自定义机器人 Webhook；`notification-worker` CLI 提供一次 Watchdog/Worker 调度入口。
 - 新旧 Feishu 适配器复用官方签名实现；仅显式成功码可确认投递，HTTP 5xx 与缺少确认码的有效 JSON 均按不确定投递处理。

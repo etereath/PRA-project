@@ -22,11 +22,16 @@ from app.repositories.sqlite_connection import (  # noqa: E402
 from app.repositories.sqlite_runtime_repository import (  # noqa: E402
     SQLiteRuntimeRepository,
 )
+from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION  # noqa: E402
 from app.services.automation import (  # noqa: E402
     AutomationHeartbeatStore,
     AutomationService,
     ensure_default_automation_jobs,
     safe_automation_error_message,
+)
+from app.services.incident_automation import (  # noqa: E402
+    build_incident_notification_handlers,
+    ensure_incident_notification_automation_job,
 )
 from app.services.operational_time import (  # noqa: E402
     OperationalTimeService,
@@ -38,20 +43,18 @@ from app.services.runtime import DEFAULT_RUNTIME_DB  # noqa: E402
 from app.services.settlement_automation import (  # noqa: E402
     build_sales_settlement_handlers,
 )
-
-
-DEFAULT_HEARTBEAT_PATH = Path(
-    "data/runtime/automation_service/heartbeat.json"
+from app.services.shadowbot_worker_recovery import (  # noqa: E402
+    build_worker_recovery_coordinator_from_environment,
 )
+
+DEFAULT_HEARTBEAT_PATH = Path("data/runtime/automation_service/heartbeat.json")
 DEFAULT_SHADOWBOT_QUEUE_DIR = Path(
     os.environ.get(
         "SHADOWBOT_QUEUE_DIR",
         "data/runtime/shadowbot_queue",
     )
 )
-DEFAULT_PLATFORM_MAPPINGS = (
-    PROJECT_ROOT / "data" / "samples" / "platform_mappings.xlsx"
-)
+DEFAULT_PLATFORM_MAPPINGS = PROJECT_ROOT / "data" / "samples" / "platform_mappings.xlsx"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -85,6 +88,23 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Register only FULL_MARKET_SCAN order dispatch and ORDER_SCAN "
             "READ_ONLY handlers; no platform-write handler is registered."
+        ),
+    )
+    parser.add_argument(
+        "--enable-incident-monitoring",
+        action="store_true",
+        help=(
+            "Register the read-only Incident notification/reminder maintenance "
+            "handler; it never registers a platform-write handler."
+        ),
+    )
+    parser.add_argument(
+        "--enable-worker-recovery",
+        action="store_true",
+        help=(
+            "Attach the fail-closed ShadowBot host recovery coordinator to "
+            "Incident monitoring. Real host actions additionally require "
+            "PRA_ENABLE_SHADOWBOT_HOST_RECOVERY=true and a reviewed helper."
         ),
     )
     parser.add_argument(
@@ -136,9 +156,7 @@ class ProcessFileLock:
         except OSError:
             self._stream.close()
             self._stream = None
-            raise RuntimeError(
-                "Automation Service 已有实例持有单实例锁。"
-            ) from None
+            raise RuntimeError("Automation Service 已有实例持有单实例锁。") from None
         return self
 
     def __exit__(
@@ -186,6 +204,10 @@ def main() -> int:
         raise ValueError("--lease-seconds 必须为正整数。")
     if args.order_timeout_seconds <= 0:
         raise ValueError("--order-timeout-seconds 必须为正数。")
+    if args.enable_worker_recovery and not args.enable_incident_monitoring:
+        raise ValueError(
+            "--enable-worker-recovery 要求同时启用 --enable-incident-monitoring。"
+        )
 
     heartbeat = AutomationHeartbeatStore(args.heartbeat)
     lock_path = automation_service_lock_path(args.runtime_db)
@@ -202,9 +224,13 @@ def main() -> int:
             )
             runtime_repository.init_schema()
             schema_health = runtime_repository.check_schema_health()
-            if not schema_health.ok or schema_health.actual_version != 14:
+            if (
+                not schema_health.ok
+                or schema_health.actual_version != LATEST_RUNTIME_SCHEMA_VERSION
+            ):
                 raise RuntimeError(
-                    "Automation Service 要求健康的 Runtime Schema v14。"
+                    "Automation Service 要求健康的 Runtime Schema "
+                    f"v{LATEST_RUNTIME_SCHEMA_VERSION}。"
                 )
             repository = AutomationRepository(runtime_repository)
             ensure_default_automation_jobs(
@@ -212,6 +238,12 @@ def main() -> int:
                 platform_name=args.platform_name,
                 now=datetime.now(timezone.utc),
             )
+            if args.enable_incident_monitoring:
+                ensure_incident_notification_automation_job(
+                    repository,
+                    platform_name=args.platform_name,
+                    now=datetime.now(timezone.utc),
+                )
             operational_time = OperationalTimeService(
                 policies=repository.load_operational_time_policies()
             )
@@ -231,6 +263,21 @@ def main() -> int:
                         timeout_seconds=args.order_timeout_seconds,
                     )
                 )
+            if args.enable_incident_monitoring:
+                worker_recovery = (
+                    build_worker_recovery_coordinator_from_environment(
+                        runtime_repository,
+                        queue_dir=args.shadowbot_queue_dir,
+                    )
+                    if args.enable_worker_recovery
+                    else None
+                )
+                handlers.update(
+                    build_incident_notification_handlers(
+                        runtime_repository=runtime_repository,
+                        worker_recovery=worker_recovery,
+                    )
+                )
             service = AutomationService(
                 repository,
                 handlers=handlers,
@@ -242,36 +289,45 @@ def main() -> int:
             while True:
                 cycle_started_at = datetime.now(timezone.utc)
                 cycle = service.run_cycle()
-                health = repository.health_snapshot(
-                    now=datetime.now(timezone.utc)
-                )
+                health = repository.health_snapshot(now=datetime.now(timezone.utc))
                 payload = {
                     "schema_version": "automation-heartbeat-1.0",
                     "status": "RUNNING",
                     "mode": (
-                        "ORDER_READ_ONLY_AND_SETTLEMENT"
+                        "ORDER_READ_ONLY_INCIDENT_AND_SETTLEMENT"
                         if args.enable_order_read_only
-                        else "SETTLEMENT_ONLY"
+                        and args.enable_incident_monitoring
+                        else (
+                            "ORDER_READ_ONLY_AND_SETTLEMENT"
+                            if args.enable_order_read_only
+                            else (
+                                "INCIDENT_AND_SETTLEMENT"
+                                if args.enable_incident_monitoring
+                                else "SETTLEMENT_ONLY"
+                            )
+                        )
                     ),
                     "registered_job_types": sorted(handlers),
                     "platform_write_handlers_registered": False,
+                    "worker_recovery_handler_registered": bool(
+                        args.enable_worker_recovery
+                    ),
+                    "shadowbot_host_recovery_enabled": (
+                        os.environ.get(
+                            "PRA_ENABLE_SHADOWBOT_HOST_RECOVERY",
+                            "",
+                        )
+                        .strip()
+                        .lower()
+                        in {"1", "true", "yes"}
+                    ),
                     "service_instance_id": service_instance_id,
                     "cycle_started_at": cycle_started_at.isoformat(),
-                    "last_cycle_at": datetime.now(
-                        timezone.utc
-                    ).isoformat(),
-                    "scheduled_run_count": len(
-                        cycle.scheduled.created_run_ids
-                    ),
-                    "missed_run_count": len(
-                        cycle.scheduled.missed_run_ids
-                    ),
-                    "merged_run_count": len(
-                        cycle.scheduled.merged_run_ids
-                    ),
-                    "truncated_window_count": (
-                        cycle.scheduled.truncated_window_count
-                    ),
+                    "last_cycle_at": datetime.now(timezone.utc).isoformat(),
+                    "scheduled_run_count": len(cycle.scheduled.created_run_ids),
+                    "missed_run_count": len(cycle.scheduled.missed_run_ids),
+                    "merged_run_count": len(cycle.scheduled.merged_run_ids),
+                    "truncated_window_count": (cycle.scheduled.truncated_window_count),
                     "claimed_run_count": len(cycle.claimed_run_ids),
                     "completed_run_count": len(cycle.completed_run_ids),
                     "blocked_reason": cycle.blocked_reason,
@@ -292,9 +348,7 @@ def main() -> int:
                         {
                             **payload,
                             "status": "STOPPED",
-                            "stopped_at": datetime.now(
-                                timezone.utc
-                            ).isoformat(),
+                            "stopped_at": datetime.now(timezone.utc).isoformat(),
                             "reason": "ONCE_COMPLETED",
                         }
                     )
