@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import re
 import sqlite3
 import time
@@ -13,12 +13,17 @@ from typing import Any, Callable, Iterable
 from uuid import uuid4
 
 from app.enums import (
+    IncidentStatus,
     PricingSource,
     ReviewTaskStatus,
     SellerPhase,
     TaskActionType,
     TaskOriginType,
     TaskStatus,
+)
+from app.emergency_offline_fence import (
+    EMERGENCY_HUMAN_PREEMPTED_TASK_MESSAGE,
+    has_emergency_final_click_fence_won,
 )
 from app.exceptions import (
     MobileReviewErrorCode,
@@ -27,21 +32,19 @@ from app.exceptions import (
     NotificationLeaseError,
 )
 from app.listing_identity import normalize_listing_text, require_listing_identity
-from app.mobile_review import normalize_mobile_review_resolution_payload, resolution_payload_summary
-from app.review_policy import (
-    allowed_review_statuses,
-    review_business_decision,
-    review_source_task_ids,
-    retry_task_deadline,
+from app.mobile_review import (
+    normalize_mobile_review_resolution_payload,
+    resolution_payload_summary,
 )
 from app.models import (
     ExecutionLog,
+    ListingStatus,
     MobileReviewAtomicResult,
-    NotificationLog,
     NotificationDeliveryAttempt,
     NotificationDeliveryResult,
+    NotificationLog,
     NotificationOutbox,
-    ListingStatus,
+    OperationalIncidentEvent,
     RetryAuthorization,
     ReviewTask,
     ReviewToken,
@@ -61,15 +64,20 @@ from app.repositories.sqlite_connection import (
     _execute_with_sqlite_retry,
     is_sqlite_concurrency_error,
 )
+from app.review_policy import (
+    allowed_review_statuses,
+    retry_task_deadline,
+    review_business_decision,
+    review_source_task_ids,
+)
 from app.runtime_schema import (
     LATEST_RUNTIME_SCHEMA_VERSION,
-    RuntimeSchemaHealth,
     V14_APPEND_ONLY_TABLES,
+    V15_APPEND_ONLY_TABLES,
+    RuntimeSchemaHealth,
     inspect_runtime_schema,
 )
-from app.utils import serialize_decimal
-from app.utils import utc_now
-
+from app.utils import serialize_decimal, utc_now
 
 TERMINAL_TASK_STATUSES = ("success", "skipped", "cancelled", "expired")
 
@@ -80,23 +88,27 @@ WHERE dedupe_key <> ''
   AND task_status NOT IN ('success', 'failed', 'skipped', 'cancelled', 'expired')
 """
 
-MOBILE_REVIEW_ACTIONS = frozenset({
-    ReviewTaskStatus.APPROVED.value,
-    ReviewTaskStatus.REJECTED.value,
-    ReviewTaskStatus.ADJUSTED.value,
-    ReviewTaskStatus.CANCELLED.value,
-})
+MOBILE_REVIEW_ACTIONS = frozenset(
+    {
+        ReviewTaskStatus.APPROVED.value,
+        ReviewTaskStatus.REJECTED.value,
+        ReviewTaskStatus.ADJUSTED.value,
+        ReviewTaskStatus.CANCELLED.value,
+    }
+)
 
-MANUAL_REVIEW_SOURCE_ACTIONS = frozenset({
-    TaskActionType.CAPACITY_WARNING,
-    TaskActionType.LABOR_REQUIRED,
-    TaskActionType.MANUAL_PRICE_REVIEW,
-    TaskActionType.BELOW_BREAK_EVEN_REVIEW,
-    TaskActionType.SHORTAGE_WARNING,
-    TaskActionType.COLD_STORAGE_WARNING,
-    TaskActionType.CLEARANCE_WARNING,
-    TaskActionType.MANUAL_REVIEW,
-})
+MANUAL_REVIEW_SOURCE_ACTIONS = frozenset(
+    {
+        TaskActionType.CAPACITY_WARNING,
+        TaskActionType.LABOR_REQUIRED,
+        TaskActionType.MANUAL_PRICE_REVIEW,
+        TaskActionType.BELOW_BREAK_EVEN_REVIEW,
+        TaskActionType.SHORTAGE_WARNING,
+        TaskActionType.COLD_STORAGE_WARNING,
+        TaskActionType.CLEARANCE_WARNING,
+        TaskActionType.MANUAL_REVIEW,
+    }
+)
 
 ATOMIC_TASK_TRANSITIONS = {
     TaskStatus.PENDING: {
@@ -509,7 +521,12 @@ def _migrate_listing_status_to_v9(connection: sqlite3.Connection) -> None:
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'listing_status'"
     ).fetchone()
     table_sql = str(table_row[0] or "") if table_row else ""
-    required = {"grade", "inventory_source", "inventory_observed_at", "inventory_source_attempt_id"}
+    required = {
+        "grade",
+        "inventory_source",
+        "inventory_observed_at",
+        "inventory_source_attempt_id",
+    }
     has_nonnegative_stock = re.search(
         r"CHECK\s*\(\s*platform_stock_qty\s*>=\s*0\s*\)", table_sql, re.IGNORECASE
     )
@@ -543,9 +560,17 @@ def _migrate_listing_status_to_v9(connection: sqlite3.Connection) -> None:
         )
         """
     )
-    inventory_source_expr = "inventory_source" if "inventory_source" in columns else "'default'"
-    observed_at_expr = "inventory_observed_at" if "inventory_observed_at" in columns else "NULL"
-    attempt_expr = "inventory_source_attempt_id" if "inventory_source_attempt_id" in columns else "''"
+    inventory_source_expr = (
+        "inventory_source" if "inventory_source" in columns else "'default'"
+    )
+    observed_at_expr = (
+        "inventory_observed_at" if "inventory_observed_at" in columns else "NULL"
+    )
+    attempt_expr = (
+        "inventory_source_attempt_id"
+        if "inventory_source_attempt_id" in columns
+        else "''"
+    )
     grade_expr = (
         "CASE WHEN TRIM(grade) <> '' THEN grade ELSE 'LEGACY_UNMAPPED:' || listing_status_id END"
         if "grade" in columns
@@ -1817,6 +1842,220 @@ for _append_only_table in V14_APPEND_ONLY_TABLES:
     )
 
 
+CREATE_OPERATIONAL_INCIDENTS_V15_TABLE_SQL = """
+CREATE TABLE operational_incidents_v15_new (
+    incident_id TEXT PRIMARY KEY,
+    dedupe_key TEXT NOT NULL,
+    category TEXT NOT NULL CHECK (category IN (
+        'PLATFORM_LOGIN', 'PLATFORM_NETWORK', 'PAGE_STRUCTURE',
+        'SCAN_INCOMPLETE', 'WORKER_UNAVAILABLE', 'QUEUE_BACKLOG',
+        'PRODUCT_MAPPING', 'PRICE_ANOMALY', 'INVENTORY_ANOMALY',
+        'ORDER_PAGE_UNAVAILABLE', 'ORDER_DATA_INCONSISTENT',
+        'SALES_ESTIMATE_LOW_CONFIDENCE', 'NOTIFICATION_FAILURE',
+        'WRITE_UNKNOWN', 'AUTOMATION_SERVICE', 'RUNTIME_STORAGE',
+        'QUEUE_IMPORT', 'TRADE_DAY_TIME', 'LISTING_STATE',
+        'MASTER_DATA', 'SETTLEMENT_PROCESSING', 'REVIEW_CHANNEL'
+    )),
+    source_type TEXT NOT NULL,
+    source_ref_id TEXT NOT NULL DEFAULT '',
+    severity TEXT NOT NULL CHECK (severity IN (
+        'S0', 'S1', 'S2', 'S3', 'S4'
+    )),
+    incident_status TEXT NOT NULL CHECK (incident_status IN (
+        'OPEN', 'RETRYING', 'WAITING_HUMAN', 'ACKNOWLEDGED',
+        'AUTO_PROTECTING', 'RESOLVED', 'CLOSED'
+    )),
+    blocks_finalization INTEGER NOT NULL DEFAULT 0 CHECK (
+        blocks_finalization IN (0, 1)
+    ),
+    platform_name TEXT,
+    platform_trade_date TEXT,
+    seller_operation_date TEXT,
+    subject_type TEXT NOT NULL,
+    subject_key TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    first_detected_at TEXT NOT NULL,
+    last_detected_at TEXT NOT NULL,
+    resolved_at TEXT,
+    occurrence_count INTEGER NOT NULL DEFAULT 1 CHECK (occurrence_count >= 1),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+        (
+            incident_status IN ('RESOLVED', 'CLOSED')
+            AND resolved_at IS NOT NULL
+        )
+        OR (
+            incident_status NOT IN ('RESOLVED', 'CLOSED')
+            AND resolved_at IS NULL
+        )
+    )
+)
+"""
+
+
+SCHEMA_V15_SQL = [
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_operational_incidents_open_dedupe
+    ON operational_incidents(dedupe_key)
+    WHERE resolved_at IS NULL
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_operational_incidents_status
+    ON operational_incidents(incident_status, severity, last_detected_at)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS operational_incident_events (
+        event_id TEXT PRIMARY KEY,
+        event_key TEXT NOT NULL CHECK (event_key <> ''),
+        incident_id TEXT NOT NULL,
+        event_type TEXT NOT NULL CHECK (event_type IN (
+            'DETECTED', 'REDETECTED', 'STATUS_CHANGED',
+            'SEVERITY_CHANGED', 'ACK', 'RECOVERY_RECORDED',
+            'REVIEW_RECORDED', 'TASK_RECORDED'
+        )),
+        occurred_at TEXT NOT NULL,
+        source_type TEXT NOT NULL CHECK (source_type <> ''),
+        source_ref_id TEXT NOT NULL DEFAULT '',
+        from_status TEXT CHECK (
+            from_status IS NULL OR from_status IN (
+                'OPEN', 'RETRYING', 'WAITING_HUMAN', 'ACKNOWLEDGED',
+                'AUTO_PROTECTING', 'RESOLVED', 'CLOSED'
+            )
+        ),
+        to_status TEXT CHECK (
+            to_status IS NULL OR to_status IN (
+                'OPEN', 'RETRYING', 'WAITING_HUMAN', 'ACKNOWLEDGED',
+                'AUTO_PROTECTING', 'RESOLVED', 'CLOSED'
+            )
+        ),
+        severity TEXT NOT NULL CHECK (severity IN (
+            'S0', 'S1', 'S2', 'S3', 'S4'
+        )),
+        event_payload_json TEXT NOT NULL DEFAULT '{}'
+            CHECK (json_valid(event_payload_json)),
+        created_at TEXT NOT NULL,
+        FOREIGN KEY(incident_id)
+            REFERENCES operational_incidents(incident_id)
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_operational_incident_events_key
+    ON operational_incident_events(event_key)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_operational_incident_events_incident
+    ON operational_incident_events(incident_id, occurred_at, event_id)
+    """,
+]
+
+for _append_only_table in V15_APPEND_ONLY_TABLES:
+    SCHEMA_V15_SQL.extend(
+        (
+            f"""
+            CREATE TRIGGER IF NOT EXISTS
+                trg_{_append_only_table}_append_only_update
+            BEFORE UPDATE ON {_append_only_table}
+            FOR EACH ROW
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    '{_append_only_table} is append-only'
+                );
+            END
+            """,
+            f"""
+            CREATE TRIGGER IF NOT EXISTS
+                trg_{_append_only_table}_append_only_delete
+            BEFORE DELETE ON {_append_only_table}
+            FOR EACH ROW
+            BEGIN
+                SELECT RAISE(
+                    ABORT,
+                    '{_append_only_table} is append-only'
+                );
+            END
+            """,
+        )
+    )
+
+
+SCHEMA_V16_SQL = [
+    """
+    CREATE TABLE IF NOT EXISTS emergency_offline_policies (
+        policy_version TEXT PRIMARY KEY CHECK (trim(policy_version) <> ''),
+        platform_name TEXT NOT NULL CHECK (trim(platform_name) <> ''),
+        emergency_ratio TEXT NOT NULL DEFAULT '0.80' CHECK (
+            emergency_ratio = '0.80'
+        ),
+        approved_by TEXT,
+        approved_at TEXT,
+        created_at TEXT NOT NULL,
+        retired_at TEXT,
+        CHECK (
+            (approved_by IS NULL AND approved_at IS NULL)
+            OR (
+                approved_by IS NOT NULL
+                AND trim(approved_by) <> ''
+                AND approved_at IS NOT NULL
+            )
+        ),
+        CHECK (retired_at IS NULL OR approved_at IS NOT NULL)
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_emergency_offline_policies_active
+    ON emergency_offline_policies(platform_name)
+    WHERE approved_at IS NOT NULL AND retired_at IS NULL
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_emergency_offline_policies_lifecycle_update
+    BEFORE UPDATE ON emergency_offline_policies
+    FOR EACH ROW
+    WHEN NOT (
+        NEW.policy_version IS OLD.policy_version
+        AND NEW.platform_name IS OLD.platform_name
+        AND NEW.emergency_ratio IS OLD.emergency_ratio
+        AND NEW.created_at IS OLD.created_at
+        AND (
+            (
+                OLD.approved_at IS NULL
+                AND OLD.approved_by IS NULL
+                AND OLD.retired_at IS NULL
+                AND NEW.approved_at IS NOT NULL
+                AND NEW.approved_by IS NOT NULL
+                AND trim(NEW.approved_by) <> ''
+                AND NEW.retired_at IS NULL
+            )
+            OR (
+                OLD.approved_at IS NOT NULL
+                AND OLD.approved_by IS NOT NULL
+                AND OLD.retired_at IS NULL
+                AND NEW.approved_at IS OLD.approved_at
+                AND NEW.approved_by IS OLD.approved_by
+                AND NEW.retired_at IS NOT NULL
+            )
+        )
+    )
+    BEGIN
+        SELECT RAISE(
+            ABORT,
+            'emergency policy versions are immutable outside approval and retirement'
+        );
+    END
+    """,
+    """
+    CREATE TRIGGER IF NOT EXISTS trg_emergency_offline_policies_no_delete
+    BEFORE DELETE ON emergency_offline_policies
+    FOR EACH ROW
+    BEGIN
+        SELECT RAISE(ABORT, 'emergency policy versions cannot be deleted');
+    END
+    """,
+]
+
+
 def _backfill_shadowbot_batch_registry(
     connection: sqlite3.Connection,
 ) -> None:
@@ -1943,9 +2182,7 @@ def _migrate_shadowbot_operations_to_v13(
             else "'update_price'"
         ),
         "expected_old_status": (
-            "expected_old_status"
-            if "expected_old_status" in column_names
-            else "NULL"
+            "expected_old_status" if "expected_old_status" in column_names else "NULL"
         ),
         "target_status": (
             "target_status" if "target_status" in column_names else "NULL"
@@ -1964,9 +2201,7 @@ def _migrate_shadowbot_operations_to_v13(
             else "'UNRESOLVED'"
         ),
         "resolved_by": (
-            "COALESCE(resolved_by, '')"
-            if "resolved_by" in column_names
-            else "''"
+            "COALESCE(resolved_by, '')" if "resolved_by" in column_names else "''"
         ),
         "resolved_at": "resolved_at" if "resolved_at" in column_names else "NULL",
         "superseded_by_operation_id": (
@@ -2008,8 +2243,7 @@ def _migrate_shadowbot_operations_to_v13(
     )
     connection.execute("DROP TABLE shadowbot_operations")
     connection.execute(
-        "ALTER TABLE shadowbot_operations_v13_new "
-        "RENAME TO shadowbot_operations"
+        "ALTER TABLE shadowbot_operations_v13_new RENAME TO shadowbot_operations"
     )
 
 
@@ -2092,16 +2326,34 @@ def _migrate_listing_action_batch_items_to_v13(
         """
     )
     columns = [
-        "item_id", "batch_id", "source_task_id", "operation_id",
-        "item_execution_attempt_id", "internal_sku", "expected_product_name",
-        "expected_grade", "item_payload_sha256", "write_identity_key",
-        "page_identity_key", "expected_old_status", "target_status",
-        "target_price", "target_inventory", "detail_effect_state",
-        "listing_effect_state", "observed_price_before_action",
-        "observed_inventory_before_action", "observed_price_after_detail_save",
-        "observed_inventory_after_detail_save", "detail_save_clicked_at",
-        "action_clicked_at", "readback_observed_at", "operation_result",
-        "error_code", "error_message", "updated_at",
+        "item_id",
+        "batch_id",
+        "source_task_id",
+        "operation_id",
+        "item_execution_attempt_id",
+        "internal_sku",
+        "expected_product_name",
+        "expected_grade",
+        "item_payload_sha256",
+        "write_identity_key",
+        "page_identity_key",
+        "expected_old_status",
+        "target_status",
+        "target_price",
+        "target_inventory",
+        "detail_effect_state",
+        "listing_effect_state",
+        "observed_price_before_action",
+        "observed_inventory_before_action",
+        "observed_price_after_detail_save",
+        "observed_inventory_after_detail_save",
+        "detail_save_clicked_at",
+        "action_clicked_at",
+        "readback_observed_at",
+        "operation_result",
+        "error_code",
+        "error_message",
+        "updated_at",
     ]
     names = ", ".join(columns)
     connection.execute(
@@ -2173,8 +2425,7 @@ def _migrate_shadowbot_write_locks_to_v13(
         )
         connection.execute("DROP TABLE shadowbot_write_locks")
     connection.execute(
-        "ALTER TABLE shadowbot_write_locks_v13_new "
-        "RENAME TO shadowbot_write_locks"
+        "ALTER TABLE shadowbot_write_locks_v13_new RENAME TO shadowbot_write_locks"
     )
     connection.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS "
@@ -2240,9 +2491,7 @@ def _backfill_listing_status_latest_scan_observations(
             "both",
         }
         observed_price = row[
-            "online_observed_price"
-            if online_preferred
-            else "waiting_observed_price"
+            "online_observed_price" if online_preferred else "waiting_observed_price"
         ]
         observed_inventory = row[
             "online_observed_inventory"
@@ -2250,15 +2499,9 @@ def _backfill_listing_status_latest_scan_observations(
             else "waiting_observed_inventory"
         ]
         observed_at = row[
-            "online_observed_at"
-            if online_preferred
-            else "waiting_observed_at"
+            "online_observed_at" if online_preferred else "waiting_observed_at"
         ]
-        if (
-            observed_price is None
-            or observed_inventory is None
-            or observed_at is None
-        ):
+        if observed_price is None or observed_inventory is None or observed_at is None:
             continue
         connection.execute(
             """
@@ -2353,9 +2596,7 @@ def _requires_runtime_schema_v13_migration(
         "AND name = 'shadowbot_listing_action_batch_items'"
     ).fetchone()
     action_table_sql = (
-        str(action_table_row[0] or "").upper()
-        if action_table_row is not None
-        else ""
+        str(action_table_row[0] or "").upper() if action_table_row is not None else ""
     )
     if "'NOT_ATTEMPTED'" not in action_table_sql:
         return True
@@ -2406,8 +2647,7 @@ def _requires_runtime_schema_v14_migration(
     if version_row is None or not required_tables.issubset(tables):
         return True
     task_columns = {
-        str(row[1])
-        for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
+        str(row[1]) for row in connection.execute("PRAGMA table_info(tasks)").fetchall()
     }
     if not {
         "origin_type",
@@ -2462,10 +2702,9 @@ def _requires_runtime_schema_v14_migration(
         "purchase_sequence",
         "source_row_fingerprint",
     }
-    if (
-        not required_order_item_columns.issubset(order_item_columns)
-        or retired_order_item_columns.intersection(order_item_columns)
-    ):
+    if not required_order_item_columns.issubset(
+        order_item_columns
+    ) or retired_order_item_columns.intersection(order_item_columns):
         return True
     summary_columns = {
         str(row[1])
@@ -2485,6 +2724,143 @@ def _requires_runtime_schema_v14_migration(
         ).fetchall()
     }
     return "input_manifest_sha256" not in summary_input_columns
+
+
+def _requires_runtime_schema_v15_migration(
+    connection: sqlite3.Connection,
+) -> bool:
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if "runtime_schema_migrations" not in tables:
+        return True
+    version_row = connection.execute(
+        "SELECT 1 FROM runtime_schema_migrations WHERE schema_version = 15"
+    ).fetchone()
+    if version_row is None:
+        return True
+    if not {
+        "operational_incidents",
+        "operational_incident_events",
+    }.issubset(tables):
+        return True
+    incident_columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(operational_incidents)"
+        ).fetchall()
+    }
+    if "occurrence_count" not in incident_columns:
+        return True
+    incident_table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'operational_incidents'"
+    ).fetchone()
+    incident_table_sql = (
+        str(incident_table_row[0] or "").upper()
+        if incident_table_row is not None
+        else ""
+    )
+    return any(
+        value not in incident_table_sql
+        for value in (
+            "'AUTOMATION_SERVICE'",
+            "'RUNTIME_STORAGE'",
+            "'QUEUE_IMPORT'",
+            "'TRADE_DAY_TIME'",
+            "'LISTING_STATE'",
+            "'MASTER_DATA'",
+            "'SETTLEMENT_PROCESSING'",
+            "'REVIEW_CHANNEL'",
+        )
+    )
+
+
+def _requires_runtime_schema_v16_migration(
+    connection: sqlite3.Connection,
+) -> bool:
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if "runtime_schema_migrations" not in tables:
+        return True
+    version_row = connection.execute(
+        "SELECT 1 FROM runtime_schema_migrations WHERE schema_version = 16"
+    ).fetchone()
+    return (
+        version_row is None
+        or "emergency_offline_policies" not in tables
+    )
+
+
+def _migrate_operational_incidents_to_v15(
+    connection: sqlite3.Connection,
+) -> None:
+    table_row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'operational_incidents'"
+    ).fetchone()
+    if table_row is None:
+        return
+    columns = {
+        str(row[1])
+        for row in connection.execute(
+            "PRAGMA table_info(operational_incidents)"
+        ).fetchall()
+    }
+    table_sql_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'operational_incidents'"
+    ).fetchone()
+    table_sql = str(table_sql_row[0] or "").upper() if table_sql_row else ""
+    expanded_categories = all(
+        value in table_sql
+        for value in (
+            "'AUTOMATION_SERVICE'",
+            "'RUNTIME_STORAGE'",
+            "'QUEUE_IMPORT'",
+            "'TRADE_DAY_TIME'",
+            "'LISTING_STATE'",
+            "'MASTER_DATA'",
+            "'SETTLEMENT_PROCESSING'",
+            "'REVIEW_CHANNEL'",
+        )
+    )
+    if "occurrence_count" in columns and expanded_categories:
+        return
+
+    occurrence_expression = "occurrence_count" if "occurrence_count" in columns else "1"
+    connection.execute("DROP TABLE IF EXISTS operational_incidents_v15_new")
+    connection.execute(CREATE_OPERATIONAL_INCIDENTS_V15_TABLE_SQL)
+    connection.execute(
+        f"""
+        INSERT INTO operational_incidents_v15_new(
+            incident_id, dedupe_key, category,
+            source_type, source_ref_id, severity, incident_status,
+            blocks_finalization, platform_name, platform_trade_date,
+            seller_operation_date, subject_type, subject_key,
+            title, description, first_detected_at, last_detected_at,
+            resolved_at, occurrence_count, created_at, updated_at
+        )
+        SELECT incident_id, dedupe_key, category,
+               source_type, source_ref_id, severity, incident_status,
+               blocks_finalization, platform_name, platform_trade_date,
+               seller_operation_date, subject_type, subject_key,
+               title, description, first_detected_at, last_detected_at,
+               resolved_at, {occurrence_expression}, created_at, updated_at
+        FROM operational_incidents
+        """
+    )
+    connection.execute("DROP TABLE operational_incidents")
+    connection.execute(
+        "ALTER TABLE operational_incidents_v15_new RENAME TO operational_incidents"
+    )
 
 
 def _migrate_order_observation_v14_contract(
@@ -2538,14 +2914,12 @@ def _migrate_order_observation_v14_contract(
     if already_frozen:
         return
     batch_count = int(
-        connection.execute(
-            "SELECT COUNT(*) FROM order_observation_batches"
-        ).fetchone()[0]
+        connection.execute("SELECT COUNT(*) FROM order_observation_batches").fetchone()[
+            0
+        ]
     )
     item_count = int(
-        connection.execute(
-            "SELECT COUNT(*) FROM order_observation_items"
-        ).fetchone()[0]
+        connection.execute("SELECT COUNT(*) FROM order_observation_items").fetchone()[0]
     )
     if batch_count or item_count:
         raise RuntimeError(
@@ -2575,13 +2949,9 @@ def _migrate_trade_day_summary_transaction_amount(
             "PRAGMA table_info(platform_trade_day_summaries)"
         ).fetchall()
     }
-    if (
-        "seller_received_amount" in columns
-        and "transaction_amount_total" in columns
-    ):
+    if "seller_received_amount" in columns and "transaction_amount_total" in columns:
         raise RuntimeError(
-            "Runtime v14 must not retain two equivalent transaction "
-            "amount columns"
+            "Runtime v14 must not retain two equivalent transaction amount columns"
         )
     if "seller_received_amount" in columns:
         connection.execute(
@@ -2620,9 +2990,7 @@ def _migrate_trade_day_summary_inputs_manifest_dimension(
         RENAME TO platform_trade_day_summary_inputs_v14_legacy
         """
     )
-    connection.execute(
-        "DROP INDEX IF EXISTS ix_trade_day_summary_inputs_ref"
-    )
+    connection.execute("DROP INDEX IF EXISTS ix_trade_day_summary_inputs_ref")
     connection.execute(
         """
         CREATE TABLE platform_trade_day_summary_inputs (
@@ -2658,9 +3026,7 @@ def _migrate_trade_day_summary_inputs_manifest_dimension(
             ON summary.summary_id = legacy.summary_id
         """
     )
-    connection.execute(
-        "DROP TABLE platform_trade_day_summary_inputs_v14_legacy"
-    )
+    connection.execute("DROP TABLE platform_trade_day_summary_inputs_v14_legacy")
 
 
 def _ensure_open_task_dedupe_index(connection: sqlite3.Connection) -> None:
@@ -2731,16 +3097,17 @@ class SQLiteRuntimeRepository:
     def init_schema(self) -> None:
         def initialize_schema(connection: sqlite3.Connection) -> None:
             connection.commit()
-            requires_v13_migration = _requires_runtime_schema_v13_migration(
-                connection
-            )
-            requires_v14_migration = _requires_runtime_schema_v14_migration(
-                connection
-            )
+            requires_v13_migration = _requires_runtime_schema_v13_migration(connection)
+            requires_v14_migration = _requires_runtime_schema_v14_migration(connection)
+            requires_v15_migration = _requires_runtime_schema_v15_migration(connection)
+            requires_v16_migration = _requires_runtime_schema_v16_migration(connection)
             requires_runtime_migration = (
-                requires_v13_migration or requires_v14_migration
+                requires_v13_migration
+                or requires_v14_migration
+                or requires_v15_migration
+                or requires_v16_migration
             )
-            if requires_v13_migration:
+            if requires_v13_migration or requires_v15_migration:
                 connection.execute("PRAGMA foreign_keys = OFF")
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -2828,6 +3195,8 @@ class SQLiteRuntimeRepository:
                     12: "per-item commit identity, write locks, observation times, and durable result receipts",
                     13: "listing action batches, status snapshots, anomalies, and shared write locks",
                     14: "operational time, automation, immutable observations, sales summaries, and incidents",
+                    15: "incident occurrence counts and append-only incident events",
+                    16: "versioned emergency offline policies for shadow evaluation",
                 }
                 for statement in SCHEMA_V6_SQL:
                     connection.execute(statement)
@@ -2898,8 +3267,7 @@ class SQLiteRuntimeRepository:
                 )
                 _backfill_commit_item_identities(connection)
                 connection.execute(
-                    "DROP INDEX IF EXISTS "
-                    "ux_shadowbot_commit_batch_items_operation_id"
+                    "DROP INDEX IF EXISTS ux_shadowbot_commit_batch_items_operation_id"
                 )
                 for statement in SCHEMA_V12_SQL:
                     connection.execute(statement)
@@ -2913,9 +3281,7 @@ class SQLiteRuntimeRepository:
                 for statement in SCHEMA_V13_SQL:
                     connection.execute(statement)
                 _backfill_listing_status_latest_scan_observations(connection)
-                _migrate_trade_day_summary_inputs_manifest_dimension(
-                    connection
-                )
+                _migrate_trade_day_summary_inputs_manifest_dimension(connection)
                 _migrate_order_observation_v14_contract(connection)
                 _migrate_trade_day_summary_transaction_amount(connection)
                 connection.execute(
@@ -2926,6 +3292,11 @@ class SQLiteRuntimeRepository:
                     """
                 )
                 for statement in SCHEMA_V14_SQL:
+                    connection.execute(statement)
+                _migrate_operational_incidents_to_v15(connection)
+                for statement in SCHEMA_V15_SQL:
+                    connection.execute(statement)
+                for statement in SCHEMA_V16_SQL:
                     connection.execute(statement)
                 connection.execute(
                     """
@@ -2945,18 +3316,18 @@ class SQLiteRuntimeRepository:
                     WHERE policy_version = ?
                 )
                 """,
-                (
-                    "CN_SINGLE_PLATFORM_2026_V1",
+                    (
+                        "CN_SINGLE_PLATFORM_2026_V1",
                         "Asia/Shanghai",
                         "18:00:00",
                         "20:00:00",
                         "16:00:00",
-                    "2025-12-31T16:00:00+00:00",
-                    _datetime_to_text(datetime.now()),
-                    "runtime_schema_v14",
-                    "CN_SINGLE_PLATFORM_2026_V1",
-                ),
-            )
+                        "2025-12-31T16:00:00+00:00",
+                        _datetime_to_text(datetime.now()),
+                        "runtime_schema_v14",
+                        "CN_SINGLE_PLATFORM_2026_V1",
+                    ),
+                )
                 for version in range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1):
                     connection.execute(
                         """
@@ -2989,25 +3360,20 @@ class SQLiteRuntimeRepository:
                         )
                     integrity_rows = [
                         str(row[0])
-                        for row in connection.execute(
-                            "PRAGMA integrity_check"
-                        )
+                        for row in connection.execute("PRAGMA integrity_check")
                     ]
                     if integrity_rows != ["ok"]:
                         raise RuntimeError(
-                            "Runtime Schema migration failed "
-                            "integrity_check"
+                            "Runtime Schema migration failed integrity_check"
                         )
                 connection.commit()
             except Exception:
                 connection.rollback()
                 raise
             finally:
-                if requires_v13_migration:
+                if requires_v13_migration or requires_v15_migration:
                     connection.execute("PRAGMA foreign_keys = ON")
-                enabled = connection.execute(
-                    "PRAGMA foreign_keys"
-                ).fetchone()
+                enabled = connection.execute("PRAGMA foreign_keys").fetchone()
                 if enabled is None or int(enabled[0]) != 1:
                     raise RuntimeError(
                         "SQLite foreign key enforcement was not restored "
@@ -3030,7 +3396,9 @@ class SQLiteRuntimeRepository:
 
         normalized_price = Decimal(str(status.current_price))
         if not normalized_price.is_finite() or normalized_price < 0:
-            raise ValueError("listing status current_price must be a finite non-negative decimal")
+            raise ValueError(
+                "listing status current_price must be a finite non-negative decimal"
+            )
         platform_name, variety, grade = require_listing_identity(
             status.platform_name, status.variety, status.grade
         )
@@ -3097,8 +3465,12 @@ class SQLiteRuntimeRepository:
     ) -> bool:
         normalized_price = Decimal(str(current_price))
         if not normalized_price.is_finite() or normalized_price < 0:
-            raise ValueError("listing status current_price must be a finite non-negative decimal")
-        platform_name, variety, grade = require_listing_identity(platform_name, variety, grade)
+            raise ValueError(
+                "listing status current_price must be a finite non-negative decimal"
+            )
+        platform_name, variety, grade = require_listing_identity(
+            platform_name, variety, grade
+        )
 
         def operation() -> bool:
             with closing(self.connection_factory.connect_write()) as connection:
@@ -3123,7 +3495,9 @@ class SQLiteRuntimeRepository:
                 connection.commit()
                 return cursor.rowcount == 1
 
-        return bool(self._run_sqlite_retry(operation, operation_name="update listing price"))
+        return bool(
+            self._run_sqlite_retry(operation, operation_name="update listing price")
+        )
 
     def apply_shadowbot_inventory_observation(
         self,
@@ -3145,7 +3519,9 @@ class SQLiteRuntimeRepository:
         normalized_price = Decimal(str(observed_price))
         if not normalized_price.is_finite() or normalized_price < 0:
             raise ValueError("observed_price must be a finite non-negative decimal")
-        platform_name, variety, grade = require_listing_identity(platform_name, variety, grade)
+        platform_name, variety, grade = require_listing_identity(
+            platform_name, variety, grade
+        )
         normalized_source = str(source or "shadowbot_read").strip()
         normalized_internal_sku = str(internal_sku or "").strip()
         if observed_at.tzinfo is None:
@@ -3167,10 +3543,15 @@ class SQLiteRuntimeRepository:
                     existing_at = _text_to_datetime(existing["inventory_observed_at"])
                     if existing_at is not None and existing_at.tzinfo is None:
                         existing_at = existing_at.replace(tzinfo=timezone.utc)
-                    existing_attempt = str(existing["inventory_source_attempt_id"] or "")
+                    existing_attempt = str(
+                        existing["inventory_source_attempt_id"] or ""
+                    )
                     if existing_at is not None and existing_at > observed_at:
                         return "STALE_IGNORED"
-                    if existing_at == observed_at and existing_attempt not in {"", execution_attempt_id}:
+                    if existing_at == observed_at and existing_attempt not in {
+                        "",
+                        execution_attempt_id,
+                    }:
                         return "STALE_IGNORED"
                 cursor = connection.execute(
                     """
@@ -3227,10 +3608,18 @@ class SQLiteRuntimeRepository:
                     return "STALE_IGNORED"
                 return "UPDATED" if existing is not None else "CREATED"
 
-        return str(self._run_sqlite_retry(operation, operation_name="apply ShadowBot inventory observation"))
+        return str(
+            self._run_sqlite_retry(
+                operation, operation_name="apply ShadowBot inventory observation"
+            )
+        )
 
-    def get_listing_status(self, platform_name: str, variety: str, grade: str) -> ListingStatus | None:
-        platform_name, variety, grade = require_listing_identity(platform_name, variety, grade)
+    def get_listing_status(
+        self, platform_name: str, variety: str, grade: str
+    ) -> ListingStatus | None:
+        platform_name, variety, grade = require_listing_identity(
+            platform_name, variety, grade
+        )
         with closing(self.connection_factory.connect_read()) as connection:
             row = connection.execute(
                 "SELECT * FROM listing_status WHERE platform_name = ? AND variety = ? AND grade = ?",
@@ -3238,7 +3627,9 @@ class SQLiteRuntimeRepository:
             ).fetchone()
         return _listing_status_from_row(row) if row is not None else None
 
-    def list_listing_statuses(self, *, platform_name: str | None = None) -> list[ListingStatus]:
+    def list_listing_statuses(
+        self, *, platform_name: str | None = None
+    ) -> list[ListingStatus]:
         query = "SELECT * FROM listing_status"
         params: tuple[object, ...] = ()
         if platform_name:
@@ -3290,12 +3681,16 @@ class SQLiteRuntimeRepository:
                 foreign_keys_row = connection.execute("PRAGMA foreign_keys").fetchone()
                 busy_timeout_row = connection.execute("PRAGMA busy_timeout").fetchone()
             journal_mode = str(journal_row[0]).lower() if journal_row else None
-            synchronous = {
-                0: "OFF",
-                1: "NORMAL",
-                2: "FULL",
-                3: "EXTRA",
-            }.get(int(synchronous_row[0]), "UNKNOWN") if synchronous_row else None
+            synchronous = (
+                {
+                    0: "OFF",
+                    1: "NORMAL",
+                    2: "FULL",
+                    3: "EXTRA",
+                }.get(int(synchronous_row[0]), "UNKNOWN")
+                if synchronous_row
+                else None
+            )
             foreign_keys = int(foreign_keys_row[0]) if foreign_keys_row else None
             busy_timeout_ms = int(busy_timeout_row[0]) if busy_timeout_row else None
             ok = (
@@ -3364,9 +3759,7 @@ class SQLiteRuntimeRepository:
             )
         )
         if not expected_version:
-            raise ValueError(
-                "expected_current_policy_version must not be blank"
-            )
+            raise ValueError("expected_current_policy_version must not be blank")
         if not successor_version:
             raise ValueError("successor_policy_version must not be blank")
         if successor_version == expected_version:
@@ -3407,9 +3800,7 @@ class SQLiteRuntimeRepository:
                         f"expected {expected_version}, found {current_version}"
                     )
                 if current_timezone != normalized_timezone:
-                    raise ValueError(
-                        "successor timezone must match the current policy"
-                    )
+                    raise ValueError("successor timezone must match the current policy")
 
                 updated = connection.execute(
                     """
@@ -3458,8 +3849,7 @@ class SQLiteRuntimeRepository:
                 ).fetchall()
                 if (
                     len(current_after) != 1
-                    or str(current_after[0]["policy_version"])
-                    != successor_version
+                    or str(current_after[0]["policy_version"]) != successor_version
                 ):
                     raise RuntimeError(
                         "operational time policy replacement did not leave "
@@ -3480,6 +3870,14 @@ class SQLiteRuntimeRepository:
 
     def insert_tasks(self, tasks: Iterable[Task]) -> int:
         task_rows = list(tasks)
+        self._validate_tasks_for_insert(task_rows)
+        if not task_rows:
+            return 0
+        with closing(self.connect()) as connection, connection:
+            return self._insert_tasks_on_connection(connection, task_rows)
+
+    @staticmethod
+    def _validate_tasks_for_insert(task_rows: list[Task]) -> None:
         for task in task_rows:
             if task.origin_type is TaskOriginType.LEGACY:
                 raise ValueError(
@@ -3492,44 +3890,46 @@ class SQLiteRuntimeRepository:
                     "the dedicated 13.5-6 authorization service"
                 )
             if (
-                task.origin_type
-                in {TaskOriginType.MANUAL, TaskOriginType.AUTOMATION}
+                task.origin_type in {TaskOriginType.MANUAL, TaskOriginType.AUTOMATION}
                 and not str(task.origin_ref_id or "").strip()
             ):
-                raise ValueError(
-                    "MANUAL and AUTOMATION tasks require an origin_ref_id"
-                )
+                raise ValueError("MANUAL and AUTOMATION tasks require an origin_ref_id")
+
+    @staticmethod
+    def _insert_tasks_on_connection(
+        connection: sqlite3.Connection,
+        task_rows: list[Task],
+    ) -> int:
         rows = [_task_to_row(task) for task in task_rows]
         if not rows:
             return 0
-        with closing(self.connect()) as connection, connection:
-            before = connection.total_changes
-            connection.executemany(
-                """
-                INSERT OR IGNORE INTO tasks(
-                    task_id, trade_date, scope_type, scope_key, dedupe_key, internal_sku,
-                    platform_name, action_type, priority, task_status, created_at, scheduled_at,
-                    expires_at, expected_old_price, target_price, target_inventory,
-                    target_status, pricing_source, decision_trace_json,
-                    result_message, required_by, updated_at,
-                    origin_type, origin_ref_id, approval_policy, policy_version,
-                    platform_trade_date, seller_operation_date, seller_phase,
-                    time_policy_version
-                )
-                VALUES(
-                    :task_id, :trade_date, :scope_type, :scope_key, :dedupe_key, :internal_sku,
-                    :platform_name, :action_type, :priority, :task_status, :created_at, :scheduled_at,
-                    :expires_at, :expected_old_price, :target_price, :target_inventory,
-                    :target_status, :pricing_source, :decision_trace_json,
-                    :result_message, :required_by, :updated_at,
-                    :origin_type, :origin_ref_id, :approval_policy, :policy_version,
-                    :platform_trade_date, :seller_operation_date, :seller_phase,
-                    :time_policy_version
-                )
-                """,
-                rows,
+        before = connection.total_changes
+        connection.executemany(
+            """
+            INSERT OR IGNORE INTO tasks(
+                task_id, trade_date, scope_type, scope_key, dedupe_key, internal_sku,
+                platform_name, action_type, priority, task_status, created_at, scheduled_at,
+                expires_at, expected_old_price, target_price, target_inventory,
+                target_status, pricing_source, decision_trace_json,
+                result_message, required_by, updated_at,
+                origin_type, origin_ref_id, approval_policy, policy_version,
+                platform_trade_date, seller_operation_date, seller_phase,
+                time_policy_version
             )
-            return connection.total_changes - before
+            VALUES(
+                :task_id, :trade_date, :scope_type, :scope_key, :dedupe_key, :internal_sku,
+                :platform_name, :action_type, :priority, :task_status, :created_at, :scheduled_at,
+                :expires_at, :expected_old_price, :target_price, :target_inventory,
+                :target_status, :pricing_source, :decision_trace_json,
+                :result_message, :required_by, :updated_at,
+                :origin_type, :origin_ref_id, :approval_policy, :policy_version,
+                :platform_trade_date, :seller_operation_date, :seller_phase,
+                :time_policy_version
+            )
+            """,
+            rows,
+        )
+        return connection.total_changes - before
 
     def insert_task(self, task: Task) -> int:
         return self.insert_tasks([task])
@@ -3563,14 +3963,24 @@ class SQLiteRuntimeRepository:
             params.append(scope_key)
         if clauses:
             query = f"{query} WHERE {' AND '.join(clauses)}"
-        query = f"{query} ORDER BY priority ASC, created_at ASC, task_id ASC"
+        query = f"""{query} ORDER BY
+            CASE
+                WHEN origin_type = 'MANUAL'
+                 AND origin_ref_id LIKE 'incident-review:%' THEN 0
+                WHEN origin_type = 'SYSTEM_EMERGENCY' THEN 1
+                ELSE 2
+            END ASC,
+            priority ASC, created_at ASC, task_id ASC
+        """
         with closing(self.connect()) as connection:
             rows = connection.execute(query, params).fetchall()
         return [_row_to_task(row) for row in rows]
 
     def get_task(self, task_id: str) -> Task | None:
         with closing(self.connect()) as connection:
-            row = connection.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+            row = connection.execute(
+                "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
         return _row_to_task(row) if row is not None else None
 
     def get_open_task_by_dedupe_key(self, dedupe_key: str) -> Task | None:
@@ -3589,7 +3999,9 @@ class SQLiteRuntimeRepository:
             ).fetchone()
         return _row_to_task(row) if row is not None else None
 
-    def update_task_status(self, task_id: str, status: TaskStatus, *, result_message: str = "") -> None:
+    def update_task_status(
+        self, task_id: str, status: TaskStatus, *, result_message: str = ""
+    ) -> None:
         updated_at = _datetime_to_text(datetime.now())
         with closing(self.connect()) as connection, connection:
             connection.execute(
@@ -3629,7 +4041,9 @@ class SQLiteRuntimeRepository:
                 (
                     history.history_id,
                     history.task_id,
-                    history.from_status.value if history.from_status is not None else None,
+                    history.from_status.value
+                    if history.from_status is not None
+                    else None,
                     history.to_status.value,
                     history.changed_by,
                     _datetime_to_text(history.changed_at),
@@ -3726,7 +4140,9 @@ class SQLiteRuntimeRepository:
             ).fetchone()
         return _row_to_review_task(row) if row is not None else None
 
-    def get_pending_review_task_by_dedupe_key(self, dedupe_key: str) -> ReviewTask | None:
+    def get_pending_review_task_by_dedupe_key(
+        self, dedupe_key: str
+    ) -> ReviewTask | None:
         if not dedupe_key:
             return None
         with closing(self.connect()) as connection:
@@ -3741,7 +4157,9 @@ class SQLiteRuntimeRepository:
             ).fetchone()
         return _row_to_review_task(row) if row is not None else None
 
-    def list_pending_review_tasks_due_before(self, cutoff: datetime) -> list[ReviewTask]:
+    def list_pending_review_tasks_due_before(
+        self, cutoff: datetime
+    ) -> list[ReviewTask]:
         with closing(self.connect()) as connection:
             rows = connection.execute(
                 """
@@ -3841,7 +4259,9 @@ class SQLiteRuntimeRepository:
                 (
                     history.history_id,
                     history.task_id,
-                    history.from_status.value if history.from_status is not None else None,
+                    history.from_status.value
+                    if history.from_status is not None
+                    else None,
                     history.to_status.value,
                     history.changed_by,
                     _datetime_to_text(history.changed_at),
@@ -3854,9 +4274,7 @@ class SQLiteRuntimeRepository:
         self,
         review_task: ReviewTask,
         *,
-        task_updates: list[
-            tuple[str, TaskStatus, TaskStatus, TaskStatusHistory]
-        ],
+        task_updates: list[tuple[str, TaskStatus, TaskStatus, TaskStatusHistory]],
         result_message: str = "",
         retry_required_by: datetime | None = None,
     ) -> None:
@@ -3881,17 +4299,13 @@ class SQLiteRuntimeRepository:
                 review_row,
             ).rowcount
             if review_updated != 1:
-                raise ValueError(
-                    "review task was not pending during group resolution"
-                )
+                raise ValueError("review task was not pending during group resolution")
             self._cancel_review_outbox_on_connection(
                 connection,
                 review_task.review_task_id,
                 changed_at=review_task.updated_at or self._clock(),
             )
-            changed_at = _datetime_to_text(
-                review_task.updated_at or self._clock()
-            )
+            changed_at = _datetime_to_text(review_task.updated_at or self._clock())
             for task_id, from_status, to_status, history in task_updates:
                 task_updated = connection.execute(
                     """
@@ -3995,11 +4409,15 @@ class SQLiteRuntimeRepository:
                         result_message,
                         _datetime_to_text(review_task.updated_at or self._clock()),
                         task_id,
-                        history.from_status.value if history.from_status is not None else "",
+                        history.from_status.value
+                        if history.from_status is not None
+                        else "",
                     ),
                 ).rowcount
                 if changed_task != 1:
-                    raise ValueError("source task was not updated while expiring review")
+                    raise ValueError(
+                        "source task was not updated while expiring review"
+                    )
                 connection.execute(
                     """
                     INSERT INTO task_status_history(
@@ -4010,7 +4428,9 @@ class SQLiteRuntimeRepository:
                     (
                         history.history_id,
                         history.task_id,
-                        history.from_status.value if history.from_status is not None else None,
+                        history.from_status.value
+                        if history.from_status is not None
+                        else None,
                         history.to_status.value,
                         history.changed_by,
                         _datetime_to_text(history.changed_at),
@@ -4020,7 +4440,9 @@ class SQLiteRuntimeRepository:
                 )
             if failure_injector is not None:
                 failure_injector("after_business_update")
-            outbox_inserted = self._insert_notification_outbox_on_connection(connection, notification)
+            outbox_inserted = self._insert_notification_outbox_on_connection(
+                connection, notification
+            )
             if outbox_inserted != 1:
                 raise ValueError("expired review notification_key already exists")
             if failure_injector is not None:
@@ -4059,6 +4481,7 @@ class SQLiteRuntimeRepository:
         compatibility_log: NotificationLog,
         *,
         expected_required_by: datetime | None,
+        review_token: ReviewToken | None = None,
     ) -> tuple[int, int]:
         """Atomically extend one pending review and persist its reminder."""
 
@@ -4088,6 +4511,35 @@ class SQLiteRuntimeRepository:
                 review_task.review_task_id,
                 changed_at=review_task.updated_at or self._clock(),
             )
+            if review_token is not None:
+                connection.execute(
+                    """
+                    UPDATE review_tokens
+                    SET revoked_at = ?
+                    WHERE review_task_id = ? AND used_at IS NULL
+                      AND revoked_at IS NULL
+                    """,
+                    (
+                        _datetime_to_text(review_task.updated_at),
+                        review_task.review_task_id,
+                    ),
+                )
+                token_row = _review_token_to_row(review_token)
+                if connection.execute(
+                    """
+                    INSERT INTO review_tokens(
+                        token_id, review_task_id, token_hash, token_subject,
+                        allowed_actions, expires_at, used_at, revoked_at,
+                        created_at, created_by, last_used_at, note
+                    ) VALUES(
+                        :token_id, :review_task_id, :token_hash, :token_subject,
+                        :allowed_actions, :expires_at, :used_at, :revoked_at,
+                        :created_at, :created_by, :last_used_at, :note
+                    )
+                    """,
+                    token_row,
+                ).rowcount != 1:
+                    raise ValueError("reissued review token was not inserted")
             outbox_inserted = self._insert_notification_outbox_on_connection(
                 connection,
                 notification,
@@ -4110,9 +4562,7 @@ class SQLiteRuntimeRepository:
                 log_row,
             ).rowcount
             if inserted_log != 1:
-                raise ValueError(
-                    "renewed review compatibility log was not inserted"
-                )
+                raise ValueError("renewed review compatibility log was not inserted")
             connection.commit()
             return updated_review, outbox_inserted
         except Exception:
@@ -4172,6 +4622,11 @@ class SQLiteRuntimeRepository:
         actor: str | None = None,
         note: str = "",
         resolution_payload: dict[str, object] | None = None,
+        emergency_base_cost: Decimal | None = None,
+        emergency_base_cost_source_ref: str = "",
+        emergency_product_snapshot_verifier: (
+            Callable[[], tuple[Decimal, str]] | None
+        ) = None,
         now: datetime | None = None,
         failure_injector: Callable[[str], None] | None = None,
     ) -> MobileReviewAtomicResult:
@@ -4255,6 +4710,28 @@ class SQLiteRuntimeRepository:
                         "链接已失效或无权访问该复核任务",
                     )
 
+                review_model = _row_to_review_task(review_row)
+                if review_model.review_type == "emergency_protection":
+                    result = self._resolve_incident_mobile_review_on_connection(
+                        connection,
+                        review_model=review_model,
+                        token_row=token_row,
+                        status=status,
+                        actor_source=actor_source,
+                        actor=actor,
+                        note=note,
+                        payload=payload,
+                        timestamp=timestamp,
+                        emergency_base_cost=emergency_base_cost,
+                        emergency_base_cost_source_ref=emergency_base_cost_source_ref,
+                        emergency_product_snapshot_verifier=(
+                            emergency_product_snapshot_verifier
+                        ),
+                        inject=inject,
+                    )
+                    connection.commit()
+                    return result
+
                 source_task_id = review_row["source_task_id"]
                 if not source_task_id:
                     raise MobileReviewTransactionError(
@@ -4274,7 +4751,6 @@ class SQLiteRuntimeRepository:
                         MobileReviewErrorCode.SOURCE_TASK_NOT_FOUND,
                         "关联源任务不存在或已失效",
                     )
-                review_model = _row_to_review_task(review_row)
                 source_model = _row_to_task(source_row)
                 affected_task_ids = review_source_task_ids(review_model)
                 source_rows = [source_row]
@@ -4284,21 +4760,13 @@ class SQLiteRuntimeRepository:
                         f"SELECT * FROM tasks WHERE task_id IN ({placeholders})",
                         affected_task_ids,
                     ).fetchall()
-                    rows_by_id = {
-                        str(row["task_id"]): row for row in grouped_rows
-                    }
-                    if any(
-                        task_id not in rows_by_id
-                        for task_id in affected_task_ids
-                    ):
+                    rows_by_id = {str(row["task_id"]): row for row in grouped_rows}
+                    if any(task_id not in rows_by_id for task_id in affected_task_ids):
                         raise MobileReviewTransactionError(
                             MobileReviewErrorCode.SOURCE_TASK_NOT_FOUND,
                             "复核任务组中的来源任务不存在或已失效",
                         )
-                    source_rows = [
-                        rows_by_id[task_id]
-                        for task_id in affected_task_ids
-                    ]
+                    source_rows = [rows_by_id[task_id] for task_id in affected_task_ids]
                 if status not in allowed_review_statuses(review_model, source_model):
                     raise MobileReviewTransactionError(
                         MobileReviewErrorCode.ACTION_NOT_ALLOWED_FOR_REVIEW_TYPE,
@@ -4330,7 +4798,11 @@ class SQLiteRuntimeRepository:
                         "关联源任务状态已变化，复核请求未提交",
                     )
                 resolved_actor = actor or str(token_row["token_subject"])
-                adjustment = payload.get("adjustment") if status == ReviewTaskStatus.ADJUSTED else None
+                adjustment = (
+                    payload.get("adjustment")
+                    if status == ReviewTaskStatus.ADJUSTED
+                    else None
+                )
                 adjusted_target_price = None
                 adjusted_target_status = None
                 adjusted_result_message = note
@@ -4338,7 +4810,9 @@ class SQLiteRuntimeRepository:
                 if isinstance(adjustment, dict):
                     adjusted_target_price = adjustment.get("target_price")
                     adjusted_target_status = adjustment.get("target_status")
-                    adjusted_result_message = str(adjustment.get("result_message") or note)
+                    adjusted_result_message = str(
+                        adjustment.get("result_message") or note
+                    )
                     if source_row is not None:
                         decision_trace = _json_load(source_row["decision_trace_json"])
                         decision_trace["mobile_review_adjustment"] = adjustment
@@ -4531,7 +5005,9 @@ class SQLiteRuntimeRepository:
                 result = MobileReviewAtomicResult(
                     review_task=_row_to_review_task(committed_review_row),
                     review_token=_row_to_review_token(committed_token_row),
-                    source_task=_row_to_task(committed_source_row) if committed_source_row is not None else None,
+                    source_task=_row_to_task(committed_source_row)
+                    if committed_source_row is not None
+                    else None,
                     source_task_status=source_task_status,
                 )
                 connection.commit()
@@ -4550,6 +5026,472 @@ class SQLiteRuntimeRepository:
             except Exception:
                 connection.rollback()
                 raise
+
+    def _resolve_incident_mobile_review_on_connection(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        review_model: ReviewTask,
+        token_row: sqlite3.Row,
+        status: ReviewTaskStatus,
+        actor_source: str,
+        actor: str | None,
+        note: str,
+        payload: dict[str, object],
+        timestamp: datetime,
+        emergency_base_cost: Decimal | None,
+        emergency_base_cost_source_ref: str,
+        emergency_product_snapshot_verifier: (
+            Callable[[], tuple[Decimal, str]] | None
+        ),
+        inject: Callable[[str], None],
+    ) -> MobileReviewAtomicResult:
+        if status not in {
+            ReviewTaskStatus.ADJUSTED,
+            ReviewTaskStatus.APPROVED,
+            ReviewTaskStatus.REJECTED,
+        }:
+            raise MobileReviewTransactionError(
+                MobileReviewErrorCode.ACTION_NOT_ALLOWED_FOR_REVIEW_TYPE,
+                "紧急保护复核只允许选择改价、立即下架或我来处理。",
+            )
+        incident_id = str(review_model.review_payload.get("incident_id") or "").strip()
+        if not incident_id:
+            raise MobileReviewTransactionError(
+                MobileReviewErrorCode.CONCURRENT_UPDATE,
+                "关联异常记录不存在或已变化，请刷新后重试",
+            )
+        incident_row = connection.execute(
+            "SELECT * FROM operational_incidents WHERE incident_id = ?",
+            (incident_id,),
+        ).fetchone()
+        if (
+            incident_row is None
+            or str(incident_row["incident_status"])
+            not in {
+                IncidentStatus.WAITING_HUMAN.value,
+                IncidentStatus.AUTO_PROTECTING.value,
+            }
+        ):
+            raise MobileReviewTransactionError(
+                MobileReviewErrorCode.CONCURRENT_UPDATE,
+                "关联异常记录不存在或已变化，请刷新后重试",
+            )
+        if str(incident_row["severity"]) not in {"S3", "S4"}:
+            raise MobileReviewTransactionError(
+                MobileReviewErrorCode.CONCURRENT_UPDATE,
+                "异常等级已变化，请刷新后重试",
+            )
+        emergency_task_row = connection.execute(
+            """
+            SELECT task_id
+            FROM tasks
+            WHERE origin_type = 'SYSTEM_EMERGENCY'
+              AND json_extract(decision_trace_json, '$.incident_id') = ?
+            ORDER BY created_at DESC, task_id DESC
+            LIMIT 1
+            """,
+            (incident_id,),
+        ).fetchone()
+        worker_final_click_fence_won = bool(
+            emergency_task_row is not None
+            and has_emergency_final_click_fence_won(
+                connection,
+                incident_id=incident_id,
+                source_task_id=str(emergency_task_row["task_id"]),
+            )
+        )
+        internal_sku = str(review_model.internal_sku or "").strip()
+        platform_name = str(review_model.platform_name or "").strip()
+        if not internal_sku or not platform_name:
+            raise MobileReviewTransactionError(
+                MobileReviewErrorCode.CONCURRENT_UPDATE,
+                "复核缺少商品或平台身份，请刷新后重试",
+            )
+
+        task: Task | None = None
+        decision = "human_handling"
+        if (
+            status in {ReviewTaskStatus.ADJUSTED, ReviewTaskStatus.APPROVED}
+            and not worker_final_click_fence_won
+        ):
+            if (
+                emergency_base_cost is None
+                or not emergency_base_cost.is_finite()
+                or emergency_base_cost <= 0
+                or not emergency_base_cost_source_ref.strip()
+            ):
+                raise MobileReviewTransactionError(
+                    MobileReviewErrorCode.CONCURRENT_UPDATE,
+                    "商品基础成本不可用，已阻止创建平台任务",
+                )
+            if emergency_product_snapshot_verifier is None:
+                raise MobileReviewTransactionError(
+                    MobileReviewErrorCode.CONCURRENT_UPDATE,
+                    "商品主数据提交校验不可用，已阻止创建平台任务",
+                )
+            locked_base_cost, locked_source_ref = (
+                emergency_product_snapshot_verifier()
+            )
+            if (
+                locked_base_cost != emergency_base_cost
+                or locked_source_ref != emergency_base_cost_source_ref
+            ):
+                raise MobileReviewTransactionError(
+                    MobileReviewErrorCode.CONCURRENT_UPDATE,
+                    "商品主数据在复核提交前发生变化，请重试",
+                )
+            listing_rows = connection.execute(
+                """
+                SELECT * FROM listing_status
+                WHERE platform_name = ? AND internal_sku = ?
+                ORDER BY price_observed_at DESC, updated_at DESC, listing_status_id DESC
+                """,
+                (platform_name, internal_sku),
+            ).fetchall()
+            if not listing_rows:
+                raise MobileReviewTransactionError(
+                    MobileReviewErrorCode.CONCURRENT_UPDATE,
+                    "当前平台价格事实不可用，已阻止创建平台任务",
+                )
+            listing_row = listing_rows[0]
+            try:
+                expected_old_price = Decimal(str(listing_row["current_price"]))
+            except (ArithmeticError, ValueError) as exc:
+                raise MobileReviewTransactionError(
+                    MobileReviewErrorCode.CONCURRENT_UPDATE,
+                    "当前平台价格事实不可用，已阻止创建平台任务",
+                ) from exc
+            if not expected_old_price.is_finite() or expected_old_price <= 0:
+                raise MobileReviewTransactionError(
+                    MobileReviewErrorCode.CONCURRENT_UPDATE,
+                    "当前平台价格事实不可用，已阻止创建平台任务",
+                )
+            collision = connection.execute(
+                """
+                SELECT task_id FROM tasks
+                WHERE platform_name = ? AND internal_sku = ?
+                  AND origin_type = 'MANUAL'
+                  AND action_type IN ('update_price', 'set_offline')
+                  AND task_status IN ('pending', 'running', 'manual_review')
+                LIMIT 1
+                """,
+                (platform_name, internal_sku),
+            ).fetchone()
+            if collision is not None:
+                raise MobileReviewTransactionError(
+                    MobileReviewErrorCode.CONCURRENT_UPDATE,
+                    "该商品已有待执行的人工改价或下架任务，请先处理现有任务",
+                )
+
+            target_price: Decimal | None = None
+            if status is ReviewTaskStatus.ADJUSTED:
+                if str(listing_row["online_status"]).strip().lower() != "online":
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.CONCURRENT_UPDATE,
+                        "商品当前不在上架中，已阻止创建改价任务",
+                    )
+                adjustment = payload.get("adjustment")
+                if not isinstance(adjustment, dict) or "target_price" not in adjustment:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.INVALID_ADJUSTMENT,
+                        "改价操作必须输入目标价格",
+                    )
+                if "target_status" in adjustment:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.INVALID_ADJUSTMENT,
+                        "改价操作不能同时修改上下架状态",
+                    )
+                target_price = Decimal(str(adjustment["target_price"]))
+                if target_price < emergency_base_cost:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.INVALID_ADJUSTMENT,
+                        "目标价格不得低于商品基础成本",
+                    )
+                action_type = TaskActionType.UPDATE_PRICE
+                target_status = None
+                pricing_source = PricingSource.MANUAL_OVERRIDE
+                decision = "manual_update_price"
+            else:
+                action_type = TaskActionType.SET_OFFLINE
+                target_status = "offline"
+                pricing_source = None
+                decision = "manual_set_offline"
+
+            task_identity = (
+                f"incident-review-task:{review_model.review_task_id}:{status.value}"
+            )
+            task_id = (
+                f"task-{hashlib.sha256(task_identity.encode('utf-8')).hexdigest()[:24]}"
+            )
+            task = Task(
+                task_id=task_id,
+                internal_sku=internal_sku,
+                platform_name=platform_name,
+                action_type=action_type,
+                priority=0,
+                task_status=TaskStatus.PENDING,
+                created_at=timestamp,
+                origin_type=TaskOriginType.MANUAL,
+                origin_ref_id=f"incident-review:{review_model.review_task_id}",
+                expected_old_price=expected_old_price,
+                target_price=target_price,
+                target_status=target_status,
+                pricing_source=pricing_source,
+                decision_trace={
+                    "incident_id": incident_id,
+                    "review_task_id": review_model.review_task_id,
+                    "review_status": status.value,
+                    "base_cost": serialize_decimal(emergency_base_cost),
+                    "base_cost_source_ref": emergency_base_cost_source_ref,
+                    "listing_status_id": str(listing_row["listing_status_id"]),
+                    "price_source_attempt_id": str(
+                        listing_row["price_source_attempt_id"]
+                    ),
+                    "actor_source": actor_source,
+                },
+                result_message=(
+                    str(payload.get("adjustment", {}).get("result_message") or note)
+                    if isinstance(payload.get("adjustment"), dict)
+                    else note
+                ),
+                required_by=review_model.required_by,
+                trade_date=review_model.trade_date,
+                approval_policy="MOBILE_REVIEW",
+                policy_version="incident-review-v1",
+                platform_trade_date=_text_to_date(incident_row["platform_trade_date"]),
+                seller_operation_date=_text_to_date(
+                    incident_row["seller_operation_date"]
+                ),
+                scope_type="sku",
+                scope_key=internal_sku,
+                dedupe_key=task_identity,
+                expires_at=review_model.required_by,
+                updated_at=timestamp,
+            )
+            self._validate_tasks_for_insert([task])
+            if self._insert_tasks_on_connection(connection, [task]) != 1:
+                raise MobileReviewTransactionError(
+                    MobileReviewErrorCode.CONCURRENT_UPDATE,
+                    "人工任务已存在或发生并发更新，请刷新后重试",
+                )
+            inject("after_incident_task_insert")
+
+        if worker_final_click_fence_won:
+            payload["requested_decision"] = {
+                ReviewTaskStatus.ADJUSTED: "manual_update_price",
+                ReviewTaskStatus.APPROVED: "manual_set_offline",
+                ReviewTaskStatus.REJECTED: "human_handling",
+            }[status]
+            decision = "late_after_emergency_final_click_fence"
+            payload["platform_side_effect_prevented"] = False
+            payload["awaiting_emergency_result_import"] = True
+            payload["automatic_task_id"] = str(emergency_task_row["task_id"])
+        payload["decision"] = decision
+        payload["incident_id"] = incident_id
+        if task is not None:
+            payload["created_task_id"] = task.task_id
+        resolved_actor = actor or str(token_row["token_subject"])
+        token_updated = connection.execute(
+            """
+            UPDATE review_tokens
+            SET used_at = ?, last_used_at = ?
+            WHERE token_id = ? AND review_task_id = ? AND used_at IS NULL
+              AND revoked_at IS NULL AND expires_at > ?
+            """,
+            (
+                _datetime_to_text(timestamp),
+                _datetime_to_text(timestamp),
+                token_row["token_id"],
+                review_model.review_task_id,
+                _datetime_to_text(timestamp),
+            ),
+        ).rowcount
+        if token_updated != 1:
+            raise MobileReviewTransactionError(
+                MobileReviewErrorCode.CONCURRENT_UPDATE,
+                "复核请求发生并发更新，请重试",
+            )
+        inject("after_token_update")
+        review_updated = connection.execute(
+            """
+            UPDATE review_tasks
+            SET review_status = ?, resolution_payload_json = ?, updated_at = ?,
+                resolved_by = ?, resolved_at = ?, resolution_note = ?
+            WHERE review_task_id = ? AND review_status = ?
+            """,
+            (
+                status.value,
+                _json_dump(payload),
+                _datetime_to_text(timestamp),
+                resolved_actor,
+                _datetime_to_text(timestamp),
+                note,
+                review_model.review_task_id,
+                ReviewTaskStatus.PENDING.value,
+            ),
+        ).rowcount
+        if review_updated != 1:
+            raise MobileReviewTransactionError(
+                MobileReviewErrorCode.REVIEW_ALREADY_RESOLVED,
+                "链接已失效或无权访问该复核任务",
+            )
+        inject("after_review_update")
+        self._cancel_review_outbox_on_connection(
+            connection,
+            review_model.review_task_id,
+            changed_at=timestamp,
+        )
+
+        incident_from_status = str(incident_row["incident_status"])
+        if (
+            incident_from_status == IncidentStatus.AUTO_PROTECTING.value
+            and not worker_final_click_fence_won
+        ):
+            cancelled = connection.execute(
+                """
+                UPDATE tasks
+                SET task_status = 'cancelled', result_message = ?, updated_at = ?
+                WHERE origin_type = 'SYSTEM_EMERGENCY'
+                  AND task_status IN ('pending', 'running')
+                  AND json_extract(decision_trace_json, '$.incident_id') = ?
+                """,
+                (
+                    EMERGENCY_HUMAN_PREEMPTED_TASK_MESSAGE,
+                    _datetime_to_text(timestamp),
+                    incident_id,
+                ),
+            ).rowcount
+            if cancelled != 1:
+                raise MobileReviewTransactionError(
+                    MobileReviewErrorCode.CONCURRENT_UPDATE,
+                    "自动紧急下架状态已变化，请刷新后重试",
+                )
+            transitioned = connection.execute(
+                """
+                UPDATE operational_incidents
+                SET incident_status = 'WAITING_HUMAN', updated_at = ?
+                WHERE incident_id = ? AND incident_status = 'AUTO_PROTECTING'
+                """,
+                (_datetime_to_text(timestamp), incident_id),
+            ).rowcount
+            if transitioned != 1:
+                raise MobileReviewTransactionError(
+                    MobileReviewErrorCode.CONCURRENT_UPDATE,
+                    "关联异常记录已变化，请刷新后重试",
+                )
+        review_event_key = f"incident-review-resolution:{review_model.review_task_id}"
+        event_id = f"incident-event-{hashlib.sha256(review_event_key.encode('utf-8')).hexdigest()[:24]}"
+        connection.execute(
+            """
+            INSERT INTO operational_incident_events(
+                event_id, event_key, incident_id, event_type, occurred_at,
+                source_type, source_ref_id, from_status, to_status, severity,
+                event_payload_json, created_at
+            ) VALUES(?, ?, ?, 'REVIEW_RECORDED', ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                review_event_key,
+                incident_id,
+                _datetime_to_text(timestamp),
+                "MOBILE_REVIEW",
+                review_model.review_task_id,
+                incident_from_status,
+                (
+                    incident_from_status
+                    if worker_final_click_fence_won
+                    else IncidentStatus.WAITING_HUMAN.value
+                ),
+                str(incident_row["severity"]),
+                _json_dump(
+                    {
+                        "review_task_id": review_model.review_task_id,
+                        "review_status": status.value,
+                        "decision": decision,
+                        "created_task_id": task.task_id if task is not None else None,
+                        "platform_side_effect_prevented": (
+                            False if worker_final_click_fence_won else True
+                        ),
+                    }
+                ),
+                _datetime_to_text(timestamp),
+            ),
+        )
+        if task is not None:
+            task_event_key = f"incident-task:{task.task_id}"
+            task_event_id = f"incident-event-{hashlib.sha256(task_event_key.encode('utf-8')).hexdigest()[:24]}"
+            connection.execute(
+                """
+                INSERT INTO operational_incident_events(
+                    event_id, event_key, incident_id, event_type, occurred_at,
+                    source_type, source_ref_id, from_status, to_status, severity,
+                    event_payload_json, created_at
+                ) VALUES(?, ?, ?, 'TASK_RECORDED', ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_event_id,
+                    task_event_key,
+                    incident_id,
+                    _datetime_to_text(timestamp),
+                    "MOBILE_REVIEW",
+                    task.task_id,
+                    incident_from_status,
+                    IncidentStatus.WAITING_HUMAN.value,
+                    str(incident_row["severity"]),
+                    _json_dump(
+                        {
+                            "task_id": task.task_id,
+                            "action_type": task.action_type.value,
+                            "origin_type": task.origin_type.value,
+                        }
+                    ),
+                    _datetime_to_text(timestamp),
+                ),
+            )
+        connection.execute(
+            """
+            UPDATE operational_incidents
+            SET updated_at = CASE
+                WHEN julianday(updated_at) < julianday(?) THEN ?
+                ELSE updated_at
+            END
+            WHERE incident_id = ?
+            """,
+            (
+                _datetime_to_text(timestamp),
+                _datetime_to_text(timestamp),
+                incident_id,
+            ),
+        )
+        inject("after_incident_review_resolution")
+
+        committed_review_row = connection.execute(
+            "SELECT * FROM review_tasks WHERE review_task_id = ?",
+            (review_model.review_task_id,),
+        ).fetchone()
+        committed_token_row = connection.execute(
+            "SELECT * FROM review_tokens WHERE token_id = ?",
+            (token_row["token_id"],),
+        ).fetchone()
+        committed_task_row = (
+            connection.execute(
+                "SELECT * FROM tasks WHERE task_id = ?",
+                (task.task_id,),
+            ).fetchone()
+            if task is not None
+            else None
+        )
+        return MobileReviewAtomicResult(
+            review_task=_row_to_review_task(committed_review_row),
+            review_token=_row_to_review_token(committed_token_row),
+            source_task=(
+                _row_to_task(committed_task_row)
+                if committed_task_row is not None
+                else None
+            ),
+            source_task_status=task.task_status if task is not None else None,
+        )
 
     def insert_review_token(self, review_token: ReviewToken) -> int:
         row = _review_token_to_row(review_token)
@@ -4586,7 +5528,9 @@ class SQLiteRuntimeRepository:
             ).fetchone()
         return _row_to_review_token(row) if row is not None else None
 
-    def list_review_tokens_by_review_task_id(self, review_task_id: str) -> list[ReviewToken]:
+    def list_review_tokens_by_review_task_id(
+        self, review_task_id: str
+    ) -> list[ReviewToken]:
         with closing(self.connect()) as connection:
             rows = connection.execute(
                 """
@@ -4629,7 +5573,9 @@ class SQLiteRuntimeRepository:
                 (_datetime_to_text(revoked_at), token_id),
             )
 
-    def revoke_review_tokens_by_review_task_id(self, review_task_id: str, revoked_at: datetime) -> int:
+    def revoke_review_tokens_by_review_task_id(
+        self, review_task_id: str, revoked_at: datetime
+    ) -> int:
         with closing(self.connect()) as connection, connection:
             before = connection.total_changes
             connection.execute(
@@ -4663,7 +5609,9 @@ class SQLiteRuntimeRepository:
             )
             return connection.total_changes - before
 
-    def list_execution_logs(self, *, task_id: str | None = None, limit: int | None = None) -> list[ExecutionLog]:
+    def list_execution_logs(
+        self, *, task_id: str | None = None, limit: int | None = None
+    ) -> list[ExecutionLog]:
         query = "SELECT * FROM execution_logs"
         params: list[object] = []
         if task_id:
@@ -4696,7 +5644,9 @@ class SQLiteRuntimeRepository:
             )
             return connection.total_changes - before
 
-    def get_shadowbot_operation(self, operation_id: str) -> ShadowBotOperationLedger | None:
+    def get_shadowbot_operation(
+        self, operation_id: str
+    ) -> ShadowBotOperationLedger | None:
         with closing(self.connect()) as connection:
             row = connection.execute(
                 "SELECT * FROM shadowbot_operations WHERE operation_id = ?",
@@ -4704,7 +5654,9 @@ class SQLiteRuntimeRepository:
             ).fetchone()
         return _row_to_shadowbot_operation(row) if row is not None else None
 
-    def acquire_shadowbot_operation_lock(self, operation_id: str, lock_owner: str) -> bool:
+    def acquire_shadowbot_operation_lock(
+        self, operation_id: str, lock_owner: str
+    ) -> bool:
         with closing(self.connect()) as connection, connection:
             cursor = connection.execute(
                 """
@@ -4712,11 +5664,18 @@ class SQLiteRuntimeRepository:
                 SET lock_owner = ?, updated_at = ?
                 WHERE operation_id = ? AND (lock_owner = '' OR lock_owner = ?)
                 """,
-                (lock_owner, _datetime_to_text(datetime.now()), operation_id, lock_owner),
+                (
+                    lock_owner,
+                    _datetime_to_text(datetime.now()),
+                    operation_id,
+                    lock_owner,
+                ),
             )
             return cursor.rowcount == 1
 
-    def update_shadowbot_operation_status(self, operation_id: str, status: str, *, lock_owner: str | None = None) -> None:
+    def update_shadowbot_operation_status(
+        self, operation_id: str, status: str, *, lock_owner: str | None = None
+    ) -> None:
         assignments = ["status = ?", "updated_at = ?"]
         params: list[object] = [status, _datetime_to_text(datetime.now())]
         if lock_owner is not None:
@@ -4729,7 +5688,9 @@ class SQLiteRuntimeRepository:
                 params,
             )
 
-    def release_shadowbot_write_lock(self, operation_id: str, *, released_at: datetime) -> bool:
+    def release_shadowbot_write_lock(
+        self, operation_id: str, *, released_at: datetime
+    ) -> bool:
         timestamp = _datetime_to_text(released_at)
         with closing(self.connect_write()) as connection, connection:
             cursor = connection.execute(
@@ -4742,7 +5703,9 @@ class SQLiteRuntimeRepository:
             )
         return cursor.rowcount == 1
 
-    def insert_shadowbot_execution_attempt(self, attempt: ShadowBotExecutionAttempt) -> int:
+    def insert_shadowbot_execution_attempt(
+        self, attempt: ShadowBotExecutionAttempt
+    ) -> int:
         row = _shadowbot_attempt_to_row(attempt)
         with closing(self.connect()) as connection, connection:
             before = connection.total_changes
@@ -4763,7 +5726,9 @@ class SQLiteRuntimeRepository:
             )
             return connection.total_changes - before
 
-    def get_shadowbot_execution_attempt(self, execution_attempt_id: str) -> ShadowBotExecutionAttempt | None:
+    def get_shadowbot_execution_attempt(
+        self, execution_attempt_id: str
+    ) -> ShadowBotExecutionAttempt | None:
         with closing(self.connect()) as connection:
             row = connection.execute(
                 "SELECT * FROM shadowbot_execution_attempts WHERE execution_attempt_id = ?",
@@ -4771,7 +5736,9 @@ class SQLiteRuntimeRepository:
             ).fetchone()
         return _row_to_shadowbot_attempt(row) if row is not None else None
 
-    def list_shadowbot_execution_attempts(self, *, operation_id: str) -> list[ShadowBotExecutionAttempt]:
+    def list_shadowbot_execution_attempts(
+        self, *, operation_id: str
+    ) -> list[ShadowBotExecutionAttempt]:
         with closing(self.connect()) as connection:
             rows = connection.execute(
                 """
@@ -4845,7 +5812,9 @@ class SQLiteRuntimeRepository:
                 projections.append(projection)
         return projections
 
-    def list_active_shadowbot_execution_attempts(self) -> list[ShadowBotExecutionAttempt]:
+    def list_active_shadowbot_execution_attempts(
+        self,
+    ) -> list[ShadowBotExecutionAttempt]:
         with closing(self.connect()) as connection:
             rows = connection.execute(
                 """
@@ -4856,7 +5825,9 @@ class SQLiteRuntimeRepository:
             ).fetchall()
         return [_row_to_shadowbot_attempt(row) for row in rows]
 
-    def freeze_duplicate_active_commit_attempts(self, operation_id: str, *, now: datetime) -> bool:
+    def freeze_duplicate_active_commit_attempts(
+        self, operation_id: str, *, now: datetime
+    ) -> bool:
         connection = self.connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -4891,8 +5862,13 @@ class SQLiteRuntimeRepository:
                     if checkpoint is not None
                     else str(row["side_effect_state"])
                 )
-                start_unknown = str(row["status"]) == "STARTING" and observed_side_effect == "NOT_STARTED"
-                attempt_status = "START_UNKNOWN" if start_unknown else "SIDE_EFFECT_UNKNOWN"
+                start_unknown = (
+                    str(row["status"]) == "STARTING"
+                    and observed_side_effect == "NOT_STARTED"
+                )
+                attempt_status = (
+                    "START_UNKNOWN" if start_unknown else "SIDE_EFFECT_UNKNOWN"
+                )
                 terminal_side_effect = "NOT_STARTED" if start_unknown else "UNKNOWN"
                 connection.execute(
                     """
@@ -4930,7 +5906,9 @@ class SQLiteRuntimeRepository:
         expected_operation_statuses: Iterable[str],
     ) -> ShadowBotExecutionAttempt | None:
         """Atomically bind a fresh attempt, lease and RUNNING operation."""
-        expected = tuple(dict.fromkeys(str(value) for value in expected_operation_statuses))
+        expected = tuple(
+            dict.fromkeys(str(value) for value in expected_operation_statuses)
+        )
         if not expected:
             raise ValueError("expected_operation_statuses must not be empty")
         connection = self.connect()
@@ -4940,7 +5918,11 @@ class SQLiteRuntimeRepository:
                 "SELECT status, lock_owner FROM shadowbot_operations WHERE operation_id = ?",
                 (attempt.operation_id,),
             ).fetchone()
-            if operation is None or str(operation["status"]) not in expected or str(operation["lock_owner"] or ""):
+            if (
+                operation is None
+                or str(operation["status"]) not in expected
+                or str(operation["lock_owner"] or "")
+            ):
                 connection.rollback()
                 return None
             active = connection.execute(
@@ -4954,7 +5936,9 @@ class SQLiteRuntimeRepository:
             if active is not None:
                 connection.rollback()
                 return None
-            lease_version = self._next_shadowbot_lease_version(connection, attempt.operation_id)
+            lease_version = self._next_shadowbot_lease_version(
+                connection, attempt.operation_id
+            )
             attempt.raw_output = {
                 **attempt.raw_output,
                 "operation_status_before_attempt": str(operation["status"]),
@@ -4986,7 +5970,12 @@ class SQLiteRuntimeRepository:
                 SET status = 'RUNNING', lock_owner = ?, updated_at = ?
                 WHERE operation_id = ? AND status IN ({placeholders}) AND lock_owner = ''
                 """,
-                (owner_token, _datetime_to_text(datetime.now()), attempt.operation_id, *expected),
+                (
+                    owner_token,
+                    _datetime_to_text(datetime.now()),
+                    attempt.operation_id,
+                    *expected,
+                ),
             )
             if cursor.rowcount != 1:
                 connection.rollback()
@@ -5030,9 +6019,17 @@ class SQLiteRuntimeRepository:
                 connection.rollback()
                 return False
             current_raw = _json_load(row["raw_output_json"])
-            lease = current_raw.get("lease") if isinstance(current_raw.get("lease"), dict) else {}
+            lease = (
+                current_raw.get("lease")
+                if isinstance(current_raw.get("lease"), dict)
+                else {}
+            )
             lease_expires_at = _text_to_datetime(lease.get("expires_at"))
-            lease_now = datetime.now(lease_expires_at.tzinfo) if lease_expires_at is not None else None
+            lease_now = (
+                datetime.now(lease_expires_at.tzinfo)
+                if lease_expires_at is not None
+                else None
+            )
             if (
                 str(lease.get("owner_token") or "") != owner_token
                 or int(lease.get("version") or 0) != lease_version
@@ -5148,7 +6145,11 @@ class SQLiteRuntimeRepository:
                 connection.rollback()
                 return False
             current_raw = _json_load(row["raw_output_json"])
-            lease = current_raw.get("lease") if isinstance(current_raw.get("lease"), dict) else {}
+            lease = (
+                current_raw.get("lease")
+                if isinstance(current_raw.get("lease"), dict)
+                else {}
+            )
             expires_at = _text_to_datetime(lease.get("expires_at"))
             if (
                 not bool(lease.get("active", False))
@@ -5203,7 +6204,12 @@ class SQLiteRuntimeRepository:
                 SET status = ?, lock_owner = '', updated_at = ?
                 WHERE operation_id = ? AND lock_owner = ?
                 """,
-                (operation_status, _datetime_to_text(ended_at), str(row["operation_id"]), owner_token),
+                (
+                    operation_status,
+                    _datetime_to_text(ended_at),
+                    str(row["operation_id"]),
+                    owner_token,
+                ),
             )
             if updated.rowcount != 1:
                 connection.rollback()
@@ -5245,7 +6251,9 @@ class SQLiteRuntimeRepository:
         try:
             connection.execute("BEGIN IMMEDIATE")
             locked_now = self._clock()
-            renewed_expires_at = locked_now + timedelta(seconds=max(int(lease_seconds), 1))
+            renewed_expires_at = locked_now + timedelta(
+                seconds=max(int(lease_seconds), 1)
+            )
             row = connection.execute(
                 """
                 SELECT a.raw_output_json, a.operation_id, o.lock_owner
@@ -5281,7 +6289,9 @@ class SQLiteRuntimeRepository:
         finally:
             connection.close()
 
-    def expire_shadowbot_lease(self, execution_attempt_id: str, *, now: datetime) -> bool:
+    def expire_shadowbot_lease(
+        self, execution_attempt_id: str, *, now: datetime
+    ) -> bool:
         """F10: fence a stale owner and move the operation to reconciliation."""
         connection = self.connect()
         try:
@@ -5301,7 +6311,11 @@ class SQLiteRuntimeRepository:
             raw = _json_load(row["raw_output_json"])
             lease = raw.get("lease") if isinstance(raw.get("lease"), dict) else {}
             expires_at = _text_to_datetime(lease.get("expires_at"))
-            if not bool(lease.get("active", False)) or expires_at is None or expires_at > now:
+            if (
+                not bool(lease.get("active", False))
+                or expires_at is None
+                or expires_at > now
+            ):
                 connection.rollback()
                 return False
             if str(row["lock_owner"] or "") != str(lease.get("owner_token") or ""):
@@ -5310,14 +6324,23 @@ class SQLiteRuntimeRepository:
             lease["active"] = False
             lease["expired_at"] = _datetime_to_text(now)
             raw["lease"] = lease
-            attempt_status = "START_UNKNOWN" if str(row["status"]) == "STARTING" else "SIDE_EFFECT_UNKNOWN"
+            attempt_status = (
+                "START_UNKNOWN"
+                if str(row["status"]) == "STARTING"
+                else "SIDE_EFFECT_UNKNOWN"
+            )
             connection.execute(
                 """
                 UPDATE shadowbot_execution_attempts
                 SET status = ?, side_effect_state = 'UNKNOWN', ended_at = ?, raw_output_json = ?
                 WHERE execution_attempt_id = ?
                 """,
-                (attempt_status, _datetime_to_text(now), _json_dump(raw), execution_attempt_id),
+                (
+                    attempt_status,
+                    _datetime_to_text(now),
+                    _json_dump(raw),
+                    execution_attempt_id,
+                ),
             )
             connection.execute(
                 """
@@ -5325,7 +6348,11 @@ class SQLiteRuntimeRepository:
                 SET status = 'NEEDS_RECONCILIATION', lock_owner = '', updated_at = ?
                 WHERE operation_id = ? AND lock_owner = ?
                 """,
-                (_datetime_to_text(now), str(row["operation_id"]), str(lease.get("owner_token") or "")),
+                (
+                    _datetime_to_text(now),
+                    str(row["operation_id"]),
+                    str(lease.get("owner_token") or ""),
+                ),
             )
             connection.commit()
             return True
@@ -5364,7 +6391,11 @@ class SQLiteRuntimeRepository:
                 )
             else:
                 side_effect = str(row["side_effect_state"])
-                attempt_status = "START_UNKNOWN" if side_effect == "NOT_STARTED" else "SIDE_EFFECT_UNKNOWN"
+                attempt_status = (
+                    "START_UNKNOWN"
+                    if side_effect == "NOT_STARTED"
+                    else "SIDE_EFFECT_UNKNOWN"
+                )
                 connection.execute(
                     """
                     UPDATE shadowbot_execution_attempts
@@ -5373,7 +6404,9 @@ class SQLiteRuntimeRepository:
                     """,
                     (
                         attempt_status,
-                        "UNKNOWN" if attempt_status == "SIDE_EFFECT_UNKNOWN" else side_effect,
+                        "UNKNOWN"
+                        if attempt_status == "SIDE_EFFECT_UNKNOWN"
+                        else side_effect,
                         _datetime_to_text(now),
                         _json_dump(raw),
                         execution_attempt_id,
@@ -5518,7 +6551,9 @@ class SQLiteRuntimeRepository:
             connection.close()
 
     @staticmethod
-    def _next_shadowbot_lease_version(connection: sqlite3.Connection, operation_id: str) -> int:
+    def _next_shadowbot_lease_version(
+        connection: sqlite3.Connection, operation_id: str
+    ) -> int:
         rows = connection.execute(
             "SELECT raw_output_json FROM shadowbot_execution_attempts WHERE operation_id = ?",
             (operation_id,),
@@ -5624,7 +6659,9 @@ class SQLiteRuntimeRepository:
             )
         return checkpoint
 
-    def latest_shadowbot_side_effect_checkpoint(self, operation_id: str) -> ShadowBotSideEffectCheckpoint | None:
+    def latest_shadowbot_side_effect_checkpoint(
+        self, operation_id: str
+    ) -> ShadowBotSideEffectCheckpoint | None:
         with closing(self.connect()) as connection:
             row = connection.execute(
                 """
@@ -5669,7 +6706,9 @@ class SQLiteRuntimeRepository:
         max_retry_window_seconds: int,
     ) -> bool:
         """Persist one authorization and expose RETRY_AUTHORIZED atomically."""
-        allowed = tuple(dict.fromkeys(str(value) for value in allowed_operation_statuses))
+        allowed = tuple(
+            dict.fromkeys(str(value) for value in allowed_operation_statuses)
+        )
         if not allowed:
             raise ValueError("allowed_operation_statuses must not be empty")
         connection = self.connect()
@@ -5683,14 +6722,36 @@ class SQLiteRuntimeRepository:
                 "SELECT * FROM shadowbot_execution_attempts WHERE execution_attempt_id = ?",
                 (authorization.source_execution_attempt_id,),
             ).fetchone()
-            reference_time = authorization.created_at or datetime.now(retry_window_deadline.tzinfo)
-            source_raw = _json_load(source["raw_output_json"]) if source is not None else {}
-            approval_expires_at = _text_to_datetime(source_raw.get("approval_expires_at"))
-            if approval_expires_at is not None and approval_expires_at.tzinfo is None and reference_time.tzinfo is not None:
-                approval_expires_at = approval_expires_at.replace(tzinfo=reference_time.tzinfo)
-            operation_created_at = _text_to_datetime(operation["created_at"]) if operation is not None else None
-            if operation_created_at is not None and operation_created_at.tzinfo is None and reference_time.tzinfo is not None:
-                operation_created_at = operation_created_at.replace(tzinfo=reference_time.tzinfo)
+            reference_time = authorization.created_at or datetime.now(
+                retry_window_deadline.tzinfo
+            )
+            source_raw = (
+                _json_load(source["raw_output_json"]) if source is not None else {}
+            )
+            approval_expires_at = _text_to_datetime(
+                source_raw.get("approval_expires_at")
+            )
+            if (
+                approval_expires_at is not None
+                and approval_expires_at.tzinfo is None
+                and reference_time.tzinfo is not None
+            ):
+                approval_expires_at = approval_expires_at.replace(
+                    tzinfo=reference_time.tzinfo
+                )
+            operation_created_at = (
+                _text_to_datetime(operation["created_at"])
+                if operation is not None
+                else None
+            )
+            if (
+                operation_created_at is not None
+                and operation_created_at.tzinfo is None
+                and reference_time.tzinfo is not None
+            ):
+                operation_created_at = operation_created_at.replace(
+                    tzinfo=reference_time.tzinfo
+                )
             commit_rows = connection.execute(
                 """
                 SELECT started_at FROM shadowbot_execution_attempts
@@ -5717,7 +6778,9 @@ class SQLiteRuntimeRepository:
                     min(retry_origins) + timedelta(seconds=max_retry_window_seconds),
                     approval_expires_at,
                 )
-                if retry_origins and approval_expires_at is not None and max_retry_window_seconds > 0
+                if retry_origins
+                and approval_expires_at is not None
+                and max_retry_window_seconds > 0
                 else None
             )
             authorization_expires_at = authorization.expires_at
@@ -5726,7 +6789,8 @@ class SQLiteRuntimeRepository:
                 or source is None
                 or str(operation["status"]) not in allowed
                 or str(operation["lock_owner"] or "")
-                or str(operation["approved_payload_hash"]) != authorization.approved_payload_hash
+                or str(operation["approved_payload_hash"])
+                != authorization.approved_payload_hash
                 or str(source["operation_id"]) != authorization.operation_id
                 or str(source["status"]) in {"STARTING", "RUNNING"}
                 or recomputed_deadline is None
@@ -5748,9 +6812,13 @@ class SQLiteRuntimeRepository:
             if active is not None:
                 connection.rollback()
                 return False
-            source_raw["retry_window_deadline"] = _datetime_to_text(retry_window_deadline)
+            source_raw["retry_window_deadline"] = _datetime_to_text(
+                retry_window_deadline
+            )
             source_raw["max_retry_window_seconds"] = max_retry_window_seconds
-            source_raw["retry_window_authorization_id"] = authorization.retry_authorization_id
+            source_raw["retry_window_authorization_id"] = (
+                authorization.retry_authorization_id
+            )
             connection.execute(
                 "UPDATE shadowbot_execution_attempts SET raw_output_json = ? WHERE execution_attempt_id = ?",
                 (_json_dump(source_raw), authorization.source_execution_attempt_id),
@@ -5778,7 +6846,11 @@ class SQLiteRuntimeRepository:
                 SET status = 'RETRY_AUTHORIZED', updated_at = ?
                 WHERE operation_id = ? AND status IN ({placeholders}) AND lock_owner = ''
                 """,
-                (_datetime_to_text(datetime.now()), authorization.operation_id, *allowed),
+                (
+                    _datetime_to_text(datetime.now()),
+                    authorization.operation_id,
+                    *allowed,
+                ),
             )
             if cursor.rowcount != 1:
                 connection.rollback()
@@ -5817,7 +6889,11 @@ class SQLiteRuntimeRepository:
                 connection.rollback()
                 return None
             expires_at = _text_to_datetime(authorization["expires_at"])
-            if expires_at is not None and expires_at.tzinfo is None and consumed_at.tzinfo is not None:
+            if (
+                expires_at is not None
+                and expires_at.tzinfo is None
+                and consumed_at.tzinfo is not None
+            ):
                 expires_at = expires_at.replace(tzinfo=consumed_at.tzinfo)
             if (
                 str(authorization["status"]) != "ACTIVE"
@@ -5844,29 +6920,47 @@ class SQLiteRuntimeRepository:
                 """,
                 (attempt.operation_id,),
             ).fetchone()
-            source_raw = _json_load(source["raw_output_json"]) if source is not None else {}
+            source_raw = (
+                _json_load(source["raw_output_json"]) if source is not None else {}
+            )
             source_status = str(source["status"]) if source is not None else ""
-            source_approval_expires_at = _text_to_datetime(source_raw.get("approval_expires_at"))
+            source_approval_expires_at = _text_to_datetime(
+                source_raw.get("approval_expires_at")
+            )
             if (
                 source_approval_expires_at is not None
                 and source_approval_expires_at.tzinfo is None
                 and consumed_at.tzinfo is not None
             ):
-                source_approval_expires_at = source_approval_expires_at.replace(tzinfo=consumed_at.tzinfo)
-            retry_window_deadline = _text_to_datetime(source_raw.get("retry_window_deadline"))
+                source_approval_expires_at = source_approval_expires_at.replace(
+                    tzinfo=consumed_at.tzinfo
+                )
+            retry_window_deadline = _text_to_datetime(
+                source_raw.get("retry_window_deadline")
+            )
             if (
                 retry_window_deadline is not None
                 and retry_window_deadline.tzinfo is None
                 and consumed_at.tzinfo is not None
             ):
-                retry_window_deadline = retry_window_deadline.replace(tzinfo=consumed_at.tzinfo)
+                retry_window_deadline = retry_window_deadline.replace(
+                    tzinfo=consumed_at.tzinfo
+                )
             try:
-                max_retry_window_seconds = int(source_raw.get("max_retry_window_seconds") or 0)
+                max_retry_window_seconds = int(
+                    source_raw.get("max_retry_window_seconds") or 0
+                )
             except (TypeError, ValueError):
                 max_retry_window_seconds = 0
             operation_created_at = _text_to_datetime(operation["created_at"])
-            if operation_created_at is not None and operation_created_at.tzinfo is None and consumed_at.tzinfo is not None:
-                operation_created_at = operation_created_at.replace(tzinfo=consumed_at.tzinfo)
+            if (
+                operation_created_at is not None
+                and operation_created_at.tzinfo is None
+                and consumed_at.tzinfo is not None
+            ):
+                operation_created_at = operation_created_at.replace(
+                    tzinfo=consumed_at.tzinfo
+                )
             commit_rows = connection.execute(
                 """
                 SELECT started_at FROM shadowbot_execution_attempts
@@ -5893,7 +6987,9 @@ class SQLiteRuntimeRepository:
                     min(retry_origins) + timedelta(seconds=max_retry_window_seconds),
                     source_approval_expires_at,
                 )
-                if retry_origins and source_approval_expires_at is not None and max_retry_window_seconds > 0
+                if retry_origins
+                and source_approval_expires_at is not None
+                and max_retry_window_seconds > 0
                 else None
             )
             retry_window_valid = bool(
@@ -5903,7 +6999,8 @@ class SQLiteRuntimeRepository:
             )
             source_approval_valid = bool(
                 source_raw.get("approval_id")
-                and str(source_raw.get("approved_payload_hash") or "") == approved_payload_hash
+                and str(source_raw.get("approved_payload_hash") or "")
+                == approved_payload_hash
                 and source_approval_expires_at is not None
                 and source_approval_expires_at > consumed_at
             )
@@ -5913,7 +7010,8 @@ class SQLiteRuntimeRepository:
                 and source_raw.get("frozen_reason") == "DUPLICATE_ACTIVE_COMMIT_ATTEMPT"
                 and (
                     (
-                        str(authorization["evidence_type"]) == "PRE_PUBLISH_NOT_PUBLISHED"
+                        str(authorization["evidence_type"])
+                        == "PRE_PUBLISH_NOT_PUBLISHED"
                         and source_status == "START_UNKNOWN"
                         and str(source["side_effect_state"]) == "NOT_STARTED"
                     )
@@ -5927,7 +7025,10 @@ class SQLiteRuntimeRepository:
                 source is not None
                 and source_status in {"START_FAILED", "FAILED", "NOT_APPLIED"}
                 and (
-                    (source_status == "START_FAILED" and str(source["side_effect_state"]) == "NOT_STARTED")
+                    (
+                        source_status == "START_FAILED"
+                        and str(source["side_effect_state"]) == "NOT_STARTED"
+                    )
                     or (
                         source_status in {"FAILED", "NOT_APPLIED"}
                         and str(source["side_effect_state"]) == "NOT_APPLIED"
@@ -5945,11 +7046,15 @@ class SQLiteRuntimeRepository:
             ):
                 connection.rollback()
                 return None
-            lease_version = self._next_shadowbot_lease_version(connection, attempt.operation_id)
+            lease_version = self._next_shadowbot_lease_version(
+                connection, attempt.operation_id
+            )
             attempt.raw_output = {
                 **attempt.raw_output,
                 "retry_authorization_id": retry_authorization_id,
-                "source_execution_attempt_id": str(authorization["source_execution_attempt_id"]),
+                "source_execution_attempt_id": str(
+                    authorization["source_execution_attempt_id"]
+                ),
                 "operation_status_before_attempt": str(operation["status"]),
                 "lease": {
                     "owner_token": owner_token,
@@ -6011,7 +7116,9 @@ class SQLiteRuntimeRepository:
         finally:
             connection.close()
 
-    def get_retry_authorization(self, retry_authorization_id: str) -> RetryAuthorization | None:
+    def get_retry_authorization(
+        self, retry_authorization_id: str
+    ) -> RetryAuthorization | None:
         with closing(self.connect()) as connection:
             row = connection.execute(
                 "SELECT * FROM retry_authorizations WHERE retry_authorization_id = ?",
@@ -6019,7 +7126,9 @@ class SQLiteRuntimeRepository:
             ).fetchone()
         return _row_to_retry_authorization(row) if row is not None else None
 
-    def list_retry_authorizations(self, *, operation_id: str | None = None) -> list[RetryAuthorization]:
+    def list_retry_authorizations(
+        self, *, operation_id: str | None = None
+    ) -> list[RetryAuthorization]:
         query = "SELECT * FROM retry_authorizations"
         params: tuple[str, ...] = ()
         if operation_id:
@@ -6115,19 +7224,22 @@ class SQLiteRuntimeRepository:
         sent_at: datetime | None = None,
         error_message: str = "",
     ) -> bool:
-        return connection.execute(
-            """
+        return (
+            connection.execute(
+                """
             UPDATE notification_logs
             SET send_status = ?, sent_at = ?, error_message = ?
             WHERE notification_id = ?
             """,
-            (
-                send_status,
-                _datetime_to_text(sent_at),
-                _sanitize_persisted_error(error_message),
-                notification_id,
-            ),
-        ).rowcount == 1
+                (
+                    send_status,
+                    _datetime_to_text(sent_at),
+                    _sanitize_persisted_error(error_message),
+                    notification_id,
+                ),
+            ).rowcount
+            == 1
+        )
 
     # ------------------------------------------------------------------
     # Schema v6 durable notification outbox
@@ -6141,7 +7253,9 @@ class SQLiteRuntimeRepository:
         """
 
         with closing(self.connect()) as connection, connection:
-            return self._insert_notification_outbox_on_connection(connection, notification)
+            return self._insert_notification_outbox_on_connection(
+                connection, notification
+            )
 
     @staticmethod
     def _insert_notification_outbox_on_connection(
@@ -6178,6 +7292,8 @@ class SQLiteRuntimeRepository:
         review_task: ReviewTask,
         notification: NotificationOutbox,
         *,
+        review_token: ReviewToken | None = None,
+        incident_event: OperationalIncidentEvent | None = None,
         compatibility_log: NotificationLog | None = None,
         failure_injector: Callable[[str], None] | None = None,
     ) -> tuple[int, int]:
@@ -6211,9 +7327,35 @@ class SQLiteRuntimeRepository:
                 return 0, 0
             if failure_injector is not None:
                 failure_injector("after_review_insert")
-            outbox_inserted = self._insert_notification_outbox_on_connection(connection, notification)
+            if review_token is not None:
+                token_row = _review_token_to_row(review_token)
+                inserted_token = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO review_tokens(
+                        token_id, review_task_id, token_hash, token_subject, allowed_actions,
+                        expires_at, used_at, revoked_at, created_at, created_by,
+                        last_used_at, note
+                    ) VALUES(
+                        :token_id, :review_task_id, :token_hash, :token_subject,
+                        :allowed_actions, :expires_at, :used_at, :revoked_at,
+                        :created_at, :created_by, :last_used_at, :note
+                    )
+                    """,
+                    token_row,
+                ).rowcount
+                if inserted_token != 1:
+                    raise ValueError(
+                        "review token already exists for a new review task"
+                    )
+                if failure_injector is not None:
+                    failure_injector("after_review_token_insert")
+            outbox_inserted = self._insert_notification_outbox_on_connection(
+                connection, notification
+            )
             if outbox_inserted != 1:
-                raise ValueError("notification_key already exists for a new review task")
+                raise ValueError(
+                    "notification_key already exists for a new review task"
+                )
             if failure_injector is not None:
                 failure_injector("after_outbox_insert")
             if compatibility_log is not None:
@@ -6233,9 +7375,87 @@ class SQLiteRuntimeRepository:
                     log_row,
                 ).rowcount
                 if inserted_log != 1:
-                    raise ValueError("compatibility notification log already exists for a new outbox")
+                    raise ValueError(
+                        "compatibility notification log already exists for a new outbox"
+                    )
                 if failure_injector is not None:
                     failure_injector("after_compatibility_log_insert")
+            if incident_event is not None:
+                if incident_event.event_type.value != "REVIEW_RECORDED":
+                    raise ValueError(
+                        "atomic review bundle requires REVIEW_RECORDED Incident event"
+                    )
+                if incident_event.from_status is not incident_event.to_status:
+                    if (
+                        incident_event.from_status is None
+                        or incident_event.to_status is None
+                    ):
+                        raise ValueError(
+                            "Incident review transition requires both statuses"
+                        )
+                    if incident_event.to_status not in {
+                        IncidentStatus.WAITING_HUMAN,
+                        IncidentStatus.RESOLVED,
+                    }:
+                        raise ValueError("unsupported Incident review target status")
+                    resolved_at = (
+                        _datetime_to_text(incident_event.occurred_at)
+                        if incident_event.to_status is IncidentStatus.RESOLVED
+                        else None
+                    )
+                    updated_incident = connection.execute(
+                        """
+                        UPDATE operational_incidents
+                        SET incident_status = ?, resolved_at = ?, updated_at = ?
+                        WHERE incident_id = ? AND incident_status = ?
+                        """,
+                        (
+                            incident_event.to_status.value,
+                            resolved_at,
+                            _datetime_to_text(incident_event.occurred_at),
+                            incident_event.incident_id,
+                            incident_event.from_status.value,
+                        ),
+                    ).rowcount
+                    if updated_incident != 1:
+                        raise ValueError("Incident changed before Review bundle commit")
+                inserted_event = connection.execute(
+                    """
+                    INSERT INTO operational_incident_events(
+                        event_id, event_key, incident_id, event_type, occurred_at,
+                        source_type, source_ref_id, from_status, to_status, severity,
+                        event_payload_json, created_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        incident_event.event_id,
+                        incident_event.event_key,
+                        incident_event.incident_id,
+                        incident_event.event_type.value,
+                        _datetime_to_text(incident_event.occurred_at),
+                        incident_event.source_type,
+                        incident_event.source_ref_id,
+                        (
+                            incident_event.from_status.value
+                            if incident_event.from_status is not None
+                            else None
+                        ),
+                        (
+                            incident_event.to_status.value
+                            if incident_event.to_status is not None
+                            else None
+                        ),
+                        incident_event.severity,
+                        _json_dump(incident_event.event_payload),
+                        _datetime_to_text(incident_event.created_at),
+                    ),
+                ).rowcount
+                if inserted_event != 1:
+                    raise ValueError(
+                        "Incident Review event already exists for a new review task"
+                    )
+                if failure_injector is not None:
+                    failure_injector("after_incident_review_event_insert")
             connection.commit()
             return review_inserted, outbox_inserted
         except Exception:
@@ -6244,7 +7464,345 @@ class SQLiteRuntimeRepository:
         finally:
             connection.close()
 
-    def get_notification_outbox(self, notification_id: str) -> NotificationOutbox | None:
+    def sync_incident_initial_notification_state(
+        self,
+        *,
+        incident_id: str,
+        review_task_id: str,
+        midpoint_minutes: int = 5,
+    ) -> dict[str, object]:
+        """Project initial Review delivery into the existing Incident notification state."""
+
+        if midpoint_minutes <= 0:
+            raise ValueError("midpoint_minutes must be positive")
+        with closing(self.connect_write()) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                incident = connection.execute(
+                    "SELECT * FROM operational_incidents WHERE incident_id = ?",
+                    (incident_id,),
+                ).fetchone()
+                review = connection.execute(
+                    "SELECT * FROM review_tasks WHERE review_task_id = ?",
+                    (review_task_id,),
+                ).fetchone()
+                if incident is None or review is None:
+                    raise ValueError(
+                        "Incident or Review not found for notification sync"
+                    )
+                review_payload = _json_load(review["review_payload_json"])
+                if str(review_payload.get("incident_id") or "") != incident_id:
+                    raise ValueError("Review is not bound to the requested Incident")
+                outboxes = connection.execute(
+                    """
+                    SELECT * FROM notification_outbox
+                    WHERE related_review_task_id = ?
+                      AND notification_type = 'mobile_review_required'
+                      AND status <> 'CANCELLED'
+                    ORDER BY created_at DESC, notification_id DESC
+                    """,
+                    (review_task_id,),
+                ).fetchall()
+                if not outboxes:
+                    raise ValueError(
+                        "Incident Review has no initial notification Outbox"
+                    )
+                initial = outboxes[0]
+                channel = str(initial["channel"])
+                identity_sha256 = hashlib.sha256(
+                    _json_dump(
+                        {
+                            "incident_id": incident_id,
+                            "review_task_id": review_task_id,
+                            "notification_id": str(initial["notification_id"]),
+                            "notification_key": str(initial["notification_key"]),
+                            "channel": channel,
+                        }
+                    ).encode("utf-8")
+                ).hexdigest()
+                state = connection.execute(
+                    """
+                    SELECT * FROM incident_notification_state
+                    WHERE incident_id = ? AND channel = ?
+                    """,
+                    (incident_id, channel),
+                ).fetchone()
+                if (
+                    state is not None
+                    and str(state["escalation_state"]).startswith("MIDPOINT_")
+                    and str(state["payload_sha256"]) == identity_sha256
+                ):
+                    connection.commit()
+                    return dict(state)
+                status = str(initial["status"])
+                sent_at = _text_to_datetime(initial["sent_at"])
+                if status == "SENT" and sent_at is not None:
+                    escalation_state = "INITIAL_SENT"
+                    notification_count = 1
+                    last_notified_at = sent_at
+                    next_notification_at = (
+                        sent_at + timedelta(minutes=midpoint_minutes)
+                        if str(incident["severity"]) == "S4"
+                        else None
+                    )
+                elif status in {
+                    "UNKNOWN_DELIVERY",
+                    "FAILED",
+                    "EXPIRED",
+                    "CANCELLED",
+                } or (status == "SENT" and sent_at is None):
+                    escalation_state = "INITIAL_DELIVERY_BLOCKED"
+                    notification_count = 0
+                    last_notified_at = None
+                    next_notification_at = None
+                else:
+                    escalation_state = "WAITING_INITIAL_DELIVERY"
+                    notification_count = 0
+                    last_notified_at = None
+                    next_notification_at = None
+                updated_at = sent_at or self._clock()
+                connection.execute(
+                    """
+                    INSERT INTO incident_notification_state(
+                        incident_id, channel, notification_count, last_notified_at,
+                        next_notification_at, escalation_state, payload_sha256, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(incident_id, channel) DO UPDATE SET
+                        notification_count = excluded.notification_count,
+                        last_notified_at = excluded.last_notified_at,
+                        next_notification_at = excluded.next_notification_at,
+                        escalation_state = excluded.escalation_state,
+                        payload_sha256 = excluded.payload_sha256,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        incident_id,
+                        channel,
+                        notification_count,
+                        _datetime_to_text(last_notified_at),
+                        _datetime_to_text(next_notification_at),
+                        escalation_state,
+                        identity_sha256,
+                        _datetime_to_text(updated_at),
+                    ),
+                )
+                projected = connection.execute(
+                    """
+                    SELECT * FROM incident_notification_state
+                    WHERE incident_id = ? AND channel = ?
+                    """,
+                    (incident_id, channel),
+                ).fetchone()
+                connection.commit()
+                return dict(projected)
+            except Exception:
+                connection.rollback()
+                raise
+
+    def enqueue_incident_midpoint_notification_atomic(
+        self,
+        *,
+        incident_id: str,
+        review_task_id: str,
+        notification: NotificationOutbox,
+        compatibility_log: NotificationLog,
+        now: datetime,
+    ) -> str:
+        """Queue at most one S4 midpoint reminder after all suppression checks."""
+
+        with closing(self.connect_write()) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                state = connection.execute(
+                    """
+                    SELECT * FROM incident_notification_state
+                    WHERE incident_id = ? AND channel = ?
+                    """,
+                    (incident_id, notification.channel),
+                ).fetchone()
+                if state is None:
+                    raise ValueError("initial Incident notification state is missing")
+                escalation_state = str(state["escalation_state"])
+                if escalation_state != "INITIAL_SENT":
+                    connection.commit()
+                    return (
+                        "MIDPOINT_ALREADY_QUEUED"
+                        if escalation_state == "MIDPOINT_QUEUED"
+                        else escalation_state
+                    )
+                due_at = _text_to_datetime(state["next_notification_at"])
+                if due_at is None or due_at > now:
+                    connection.commit()
+                    return "NOT_DUE"
+                incident = connection.execute(
+                    "SELECT * FROM operational_incidents WHERE incident_id = ?",
+                    (incident_id,),
+                ).fetchone()
+                review = connection.execute(
+                    "SELECT * FROM review_tasks WHERE review_task_id = ?",
+                    (review_task_id,),
+                ).fetchone()
+                if incident is None or review is None:
+                    raise ValueError(
+                        "Incident or Review not found for midpoint notification"
+                    )
+                if str(incident["severity"]) != "S4" or str(
+                    incident["incident_status"]
+                ) in {
+                    "RESOLVED",
+                    "CLOSED",
+                }:
+                    connection.execute(
+                        """
+                        UPDATE incident_notification_state
+                        SET next_notification_at = NULL,
+                            escalation_state = 'MIDPOINT_CONDITION_CLEARED',
+                            updated_at = ?
+                        WHERE incident_id = ? AND channel = ?
+                        """,
+                        (_datetime_to_text(now), incident_id, notification.channel),
+                    )
+                    connection.commit()
+                    return "MIDPOINT_CONDITION_CLEARED"
+                if str(review["review_status"]) != ReviewTaskStatus.PENDING.value:
+                    connection.execute(
+                        """
+                        UPDATE incident_notification_state
+                        SET next_notification_at = NULL,
+                            escalation_state = 'MIDPOINT_REVIEW_RESOLVED',
+                            updated_at = ?
+                        WHERE incident_id = ? AND channel = ?
+                        """,
+                        (_datetime_to_text(now), incident_id, notification.channel),
+                    )
+                    connection.commit()
+                    return "MIDPOINT_REVIEW_RESOLVED"
+                ack = connection.execute(
+                    """
+                    SELECT 1 FROM operational_incident_events
+                    WHERE incident_id = ? AND event_type = 'ACK'
+                      AND occurred_at >= ?
+                    LIMIT 1
+                    """,
+                    (incident_id, str(review["created_at"])),
+                ).fetchone()
+                if ack is not None:
+                    connection.execute(
+                        """
+                        UPDATE incident_notification_state
+                        SET next_notification_at = NULL,
+                            escalation_state = 'MIDPOINT_ACK_SUPPRESSED',
+                            updated_at = ?
+                        WHERE incident_id = ? AND channel = ?
+                        """,
+                        (_datetime_to_text(now), incident_id, notification.channel),
+                    )
+                    connection.commit()
+                    return "MIDPOINT_ACK_SUPPRESSED"
+
+                if (
+                    self._insert_notification_outbox_on_connection(
+                        connection, notification
+                    )
+                    != 1
+                ):
+                    raise ValueError(
+                        "midpoint notification key already exists unexpectedly"
+                    )
+                log_row = _notification_log_to_row(compatibility_log)
+                if (
+                    connection.execute(
+                        """
+                    INSERT OR IGNORE INTO notification_logs(
+                        notification_id, related_task_id, related_review_task_id,
+                        recipient_type, recipient, channel, sent_at, send_status,
+                        dedupe_key, message, error_message, created_at
+                    ) VALUES(
+                        :notification_id, :related_task_id, :related_review_task_id,
+                        :recipient_type, :recipient, :channel, :sent_at, :send_status,
+                        :dedupe_key, :message, :error_message, :created_at
+                    )
+                    """,
+                        log_row,
+                    ).rowcount
+                    != 1
+                ):
+                    raise ValueError("midpoint compatibility log already exists")
+                connection.execute(
+                    """
+                    UPDATE incident_notification_state
+                    SET next_notification_at = NULL,
+                        escalation_state = 'MIDPOINT_QUEUED',
+                        updated_at = ?
+                    WHERE incident_id = ? AND channel = ?
+                    """,
+                    (_datetime_to_text(now), incident_id, notification.channel),
+                )
+                connection.commit()
+                return "MIDPOINT_QUEUED"
+            except Exception:
+                connection.rollback()
+                raise
+
+    def sync_incident_midpoint_notification_state(
+        self,
+        *,
+        incident_id: str,
+        notification_id: str,
+    ) -> dict[str, object]:
+        with closing(self.connect_write()) as connection, connection:
+            notification = connection.execute(
+                "SELECT * FROM notification_outbox WHERE notification_id = ?",
+                (notification_id,),
+            ).fetchone()
+            if notification is None:
+                raise ValueError("midpoint notification not found")
+            channel = str(notification["channel"])
+            status = str(notification["status"])
+            sent_at = _text_to_datetime(notification["sent_at"])
+            if status == "SENT" and sent_at is not None:
+                escalation_state = "MIDPOINT_SENT"
+                notification_count = 2
+                last_notified_at = sent_at
+            elif status in {"UNKNOWN_DELIVERY", "FAILED", "EXPIRED", "CANCELLED"}:
+                escalation_state = "MIDPOINT_DELIVERY_FAILED"
+                notification_count = 1
+                last_notified_at = None
+            else:
+                escalation_state = "MIDPOINT_QUEUED"
+                notification_count = 1
+                last_notified_at = None
+            connection.execute(
+                """
+                UPDATE incident_notification_state
+                SET notification_count = ?,
+                    last_notified_at = COALESCE(?, last_notified_at),
+                    escalation_state = ?, updated_at = ?
+                WHERE incident_id = ? AND channel = ?
+                """,
+                (
+                    notification_count,
+                    _datetime_to_text(last_notified_at),
+                    escalation_state,
+                    _datetime_to_text(sent_at or self._clock()),
+                    incident_id,
+                    channel,
+                ),
+            )
+            state = connection.execute(
+                """
+                SELECT * FROM incident_notification_state
+                WHERE incident_id = ? AND channel = ?
+                """,
+                (incident_id, channel),
+            ).fetchone()
+            if state is None:
+                raise ValueError("Incident notification state not found")
+            return dict(state)
+
+    def get_notification_outbox(
+        self, notification_id: str
+    ) -> NotificationOutbox | None:
         with closing(self.connect()) as connection:
             row = connection.execute(
                 "SELECT * FROM notification_outbox WHERE notification_id = ?",
@@ -6252,7 +7810,9 @@ class SQLiteRuntimeRepository:
             ).fetchone()
         return _row_to_notification_outbox(row) if row is not None else None
 
-    def get_notification_outbox_by_key(self, notification_key: str) -> NotificationOutbox | None:
+    def get_notification_outbox_by_key(
+        self, notification_key: str
+    ) -> NotificationOutbox | None:
         with closing(self.connect()) as connection:
             row = connection.execute(
                 "SELECT * FROM notification_outbox WHERE notification_key = ?",
@@ -6367,7 +7927,13 @@ class SQLiteRuntimeRepository:
                          created_at ASC, notification_id ASC
                 LIMIT ?
                 """,
-                [reference_text, reference_text, reference_text, *channel_params, int(limit)],
+                [
+                    reference_text,
+                    reference_text,
+                    reference_text,
+                    *channel_params,
+                    int(limit),
+                ],
             ).fetchall()
             for row in rows:
                 owner_token = uuid4().hex
@@ -6444,7 +8010,9 @@ class SQLiteRuntimeRepository:
                   AND lease_expires_at > ?
                 """,
                 (
-                    _datetime_to_text(reference_time + timedelta(seconds=lease_seconds)),
+                    _datetime_to_text(
+                        reference_time + timedelta(seconds=lease_seconds)
+                    ),
                     _datetime_to_text(reference_time),
                     notification_id,
                     owner_token,
@@ -6486,17 +8054,31 @@ class SQLiteRuntimeRepository:
                 or str(row["status"]) != "LEASED"
                 or str(row["lease_owner_token"] or "") != owner_token
                 or int(row["lease_version"] or 0) != int(lease_version)
-                or _coerce_datetime_for_comparison(_text_to_datetime(row["lease_expires_at"]), reference_time) is None
-                or _coerce_datetime_for_comparison(_text_to_datetime(row["lease_expires_at"]), reference_time) <= reference_time
+                or _coerce_datetime_for_comparison(
+                    _text_to_datetime(row["lease_expires_at"]), reference_time
+                )
+                is None
+                or _coerce_datetime_for_comparison(
+                    _text_to_datetime(row["lease_expires_at"]), reference_time
+                )
+                <= reference_time
                 or (
                     row["deadline_at"] is not None
-                    and _coerce_datetime_for_comparison(_text_to_datetime(row["deadline_at"]), reference_time) is not None
-                    and _coerce_datetime_for_comparison(_text_to_datetime(row["deadline_at"]), reference_time) <= reference_time
+                    and _coerce_datetime_for_comparison(
+                        _text_to_datetime(row["deadline_at"]), reference_time
+                    )
+                    is not None
+                    and _coerce_datetime_for_comparison(
+                        _text_to_datetime(row["deadline_at"]), reference_time
+                    )
+                    <= reference_time
                 )
                 or int(row["attempt_count"] or 0) >= int(row["max_attempts"] or 0)
             ):
                 connection.rollback()
-                raise NotificationLeaseError("notification lease is not valid for sending")
+                raise NotificationLeaseError(
+                    "notification lease is not valid for sending"
+                )
 
             attempt_no = int(row["attempt_count"] or 0) + 1
             attempt = NotificationDeliveryAttempt(
@@ -6521,7 +8103,9 @@ class SQLiteRuntimeRepository:
             ).rowcount
             if changed != 1:
                 connection.rollback()
-                raise NotificationLeaseError("notification lease was fenced before sending")
+                raise NotificationLeaseError(
+                    "notification lease was fenced before sending"
+                )
             connection.execute(
                 """
                 INSERT INTO notification_delivery_attempts(
@@ -6565,9 +8149,13 @@ class SQLiteRuntimeRepository:
         result: NotificationDeliveryResult,
         now: datetime | None = None,
     ) -> NotificationOutbox:
-        classification = str(getattr(result.classification, "value", result.classification)).upper()
+        classification = str(
+            getattr(result.classification, "value", result.classification)
+        ).upper()
         if classification not in {"SUCCESS", "TEMP_FAILED", "PERM_FAILED", "UNKNOWN"}:
-            raise ValueError(f"unsupported delivery classification: {result.classification}")
+            raise ValueError(
+                f"unsupported delivery classification: {result.classification}"
+            )
         connection = self.connect_write()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -6594,7 +8182,9 @@ class SQLiteRuntimeRepository:
                 or int(attempt["lease_version"]) != int(lease_version)
             ):
                 connection.rollback()
-                raise NotificationDeliveryError("notification delivery result was fenced")
+                raise NotificationDeliveryError(
+                    "notification delivery result was fenced"
+                )
 
             lease_expires_at = _coerce_datetime_for_comparison(
                 _text_to_datetime(row["lease_expires_at"]), reference_time
@@ -6640,7 +8230,9 @@ class SQLiteRuntimeRepository:
                 deadline = _coerce_datetime_for_comparison(
                     _text_to_datetime(row["deadline_at"]), reference_time
                 )
-                max_attempts_reached = int(row["attempt_count"] or 0) >= int(row["max_attempts"] or 0)
+                max_attempts_reached = int(row["attempt_count"] or 0) >= int(
+                    row["max_attempts"] or 0
+                )
                 if deadline is not None and deadline <= reference_time:
                     outbox_status = "EXPIRED"
                     next_attempt_at = None
@@ -6653,9 +8245,13 @@ class SQLiteRuntimeRepository:
                     outbox_status = "RETRY_WAIT"
                     retry_seconds = result.retry_after_seconds
                     if retry_seconds is None:
-                        retry_seconds = min(300, 2 ** max(0, int(row["attempt_count"] or 1) - 1))
+                        retry_seconds = min(
+                            300, 2 ** max(0, int(row["attempt_count"] or 1) - 1)
+                        )
                     retry_seconds = max(0, min(int(retry_seconds), 3600))
-                    next_attempt_at = _datetime_to_text(reference_time + timedelta(seconds=retry_seconds))
+                    next_attempt_at = _datetime_to_text(
+                        reference_time + timedelta(seconds=retry_seconds)
+                    )
                     last_error_code = str(result.error_code or "TEMP_FAILED")[:200]
                 sent_at = None
                 last_error_message = error_message
@@ -6684,7 +8280,9 @@ class SQLiteRuntimeRepository:
             ).rowcount
             if attempt_changed != 1:
                 connection.rollback()
-                raise NotificationDeliveryError("notification attempt writeback was fenced")
+                raise NotificationDeliveryError(
+                    "notification attempt writeback was fenced"
+                )
             changed = connection.execute(
                 """
                 UPDATE notification_outbox
@@ -6732,7 +8330,9 @@ class SQLiteRuntimeRepository:
                 (notification_id,),
             ).fetchone()
             if final_row is None:
-                raise NotificationDeliveryError("notification disappeared after writeback")
+                raise NotificationDeliveryError(
+                    "notification disappeared after writeback"
+                )
             return _row_to_notification_outbox(final_row)
         except Exception:
             if connection.in_transaction:
@@ -6863,9 +8463,11 @@ class SQLiteRuntimeRepository:
                     send_status="failed",
                     error_message="worker lease or deadline expired while sending",
                 )
-            changed_ids = [row["notification_id"] for row in leased_rows] + [
-                row["notification_id"] for row in sending_rows
-            ] + [row["notification_id"] for row in deadline_rows]
+            changed_ids = (
+                [row["notification_id"] for row in leased_rows]
+                + [row["notification_id"] for row in sending_rows]
+                + [row["notification_id"] for row in deadline_rows]
+            )
             changed_ids = list(dict.fromkeys(changed_ids))
             connection.commit()
             if not changed_ids:
@@ -6886,7 +8488,9 @@ class SQLiteRuntimeRepository:
 
     watchdog_notification_leases = recover_expired_notification_leases
 
-    def cancel_notification_outbox(self, notification_id: str, *, now: datetime | None = None) -> bool:
+    def cancel_notification_outbox(
+        self, notification_id: str, *, now: datetime | None = None
+    ) -> bool:
         connection = self.connect_write()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -7058,7 +8662,9 @@ def _row_to_task(row: sqlite3.Row) -> Task:
         expected_old_price=Decimal(str(row["expected_old_price"]))
         if row["expected_old_price"] not in ("", None)
         else None,
-        target_price=Decimal(str(row["target_price"])) if row["target_price"] not in ("", None) else None,
+        target_price=Decimal(str(row["target_price"]))
+        if row["target_price"] not in ("", None)
+        else None,
         target_inventory=(
             int(row["target_inventory"])
             if "target_inventory" in row.keys()
@@ -7066,7 +8672,9 @@ def _row_to_task(row: sqlite3.Row) -> Task:
             else None
         ),
         target_status=row["target_status"],
-        pricing_source=PricingSource(str(row["pricing_source"])) if row["pricing_source"] not in ("", None) else None,
+        pricing_source=PricingSource(str(row["pricing_source"]))
+        if row["pricing_source"] not in ("", None)
+        else None,
         decision_trace=_json_load(row["decision_trace_json"]),
         result_message=str(row["result_message"] or ""),
         required_by=_text_to_datetime(row["required_by"]),
@@ -7113,12 +8721,8 @@ def _listing_status_from_row(row: sqlite3.Row) -> ListingStatus:
         price_source_attempt_id=str(row["price_source_attempt_id"]),
         last_listing_change_at=_text_to_datetime(row["last_listing_change_at"]),
         last_listing_operation_id=str(row["last_listing_operation_id"] or ""),
-        online_status_observed_at=_text_to_datetime(
-            row["online_status_observed_at"]
-        ),
-        online_status_source_type=str(
-            row["online_status_source_type"] or ""
-        ),
+        online_status_observed_at=_text_to_datetime(row["online_status_observed_at"]),
+        online_status_source_type=str(row["online_status_source_type"] or ""),
         online_status_source_id=str(row["online_status_source_id"] or ""),
     )
 
@@ -7261,8 +8865,13 @@ def _shadowbot_operation_to_row(operation: ShadowBotOperationLedger) -> dict[str
     }
 
 
-def _ensure_column(connection: sqlite3.Connection, table: str, column: str, declaration: str) -> None:
-    columns = {str(row["name"]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+def _ensure_column(
+    connection: sqlite3.Connection, table: str, column: str, declaration: str
+) -> None:
+    columns = {
+        str(row["name"])
+        for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+    }
     if column not in columns:
         connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
 
@@ -7333,8 +8942,7 @@ def _backfill_commit_item_identities(connection: sqlite3.Connection) -> None:
         item_id = str(row["item_id"] or "") or f"ITEM-{item_digest[:32]}"
         operation_id = str(row["operation_id"] or "") or f"OP-{payload_digest[:32]}"
         item_attempt_id = (
-            str(row["item_execution_attempt_id"] or "")
-            or f"ATTEMPT-{item_digest[:32]}"
+            str(row["item_execution_attempt_id"] or "") or f"ATTEMPT-{item_digest[:32]}"
         )
         write_identity_key = str(row["write_identity_key"] or "") or (
             f"{normalize_listing_text(row['platform_name'])}|"
@@ -7565,7 +9173,9 @@ def _row_to_notification_outbox(row: sqlite3.Row) -> NotificationOutbox:
     )
 
 
-def _row_to_notification_delivery_attempt(row: sqlite3.Row) -> NotificationDeliveryAttempt:
+def _row_to_notification_delivery_attempt(
+    row: sqlite3.Row,
+) -> NotificationDeliveryAttempt:
     return NotificationDeliveryAttempt(
         delivery_attempt_id=str(row["delivery_attempt_id"]),
         notification_id=str(row["notification_id"]),
@@ -7660,7 +9270,9 @@ def _row_to_status_history(row: sqlite3.Row) -> TaskStatusHistory:
     return TaskStatusHistory(
         history_id=str(row["history_id"]),
         task_id=str(row["task_id"]),
-        from_status=TaskStatus(str(row["from_status"])) if row["from_status"] not in ("", None) else None,
+        from_status=TaskStatus(str(row["from_status"]))
+        if row["from_status"] not in ("", None)
+        else None,
         to_status=TaskStatus(str(row["to_status"])),
         changed_by=str(row["changed_by"]),
         changed_at=_text_to_datetime(row["changed_at"]) or datetime.now(),
@@ -7719,7 +9331,9 @@ def _text_to_datetime(value: str | None) -> datetime | None:
     return datetime.fromisoformat(str(value))
 
 
-def _coerce_datetime_for_comparison(value: datetime | None, reference: datetime) -> datetime | None:
+def _coerce_datetime_for_comparison(
+    value: datetime | None, reference: datetime
+) -> datetime | None:
     """Compare legacy naive timestamps with current timezone-aware timestamps safely."""
 
     if value is None:
@@ -7764,7 +9378,9 @@ def _sanitize_persisted_error(value: object) -> str:
 
 
 def _json_dump(value: Any) -> str:
-    return json.dumps({} if value is None else value, ensure_ascii=False, sort_keys=True)
+    return json.dumps(
+        {} if value is None else value, ensure_ascii=False, sort_keys=True
+    )
 
 
 def _json_load(value: str | None) -> dict[str, Any]:

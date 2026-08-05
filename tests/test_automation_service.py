@@ -2188,6 +2188,51 @@ def test_ui_blocker_is_rechecked_atomically_before_each_claim(
     ).run_status is AutomationRunStatus.SCHEDULED
 
 
+def test_pending_incident_action_preempts_scheduled_ui_automation(
+    repository: AutomationRepository,
+    runtime_repository: SQLiteRuntimeRepository,
+) -> None:
+    now = datetime(2026, 8, 4, 2, 0, tzinfo=timezone.utc)
+    ui_job = _store_job(
+        repository,
+        _job(job_id="PULSE-URGENT-PREEMPT", job_type=ONLINE_PULSE),
+        now=now,
+    )
+    ui_run = _ensure_run(repository, ui_job, scheduled_for=now)
+    runtime_repository.insert_task(
+        Task(
+            task_id="TASK-INCIDENT-HUMAN-URGENT",
+            internal_sku="SKU-A",
+            platform_name=PLATFORM,
+            action_type=TaskActionType.UPDATE_PRICE,
+            priority=0,
+            task_status=TaskStatus.PENDING,
+            created_at=now,
+            origin_type=TaskOriginType.MANUAL,
+            origin_ref_id="incident-review:REVIEW-URGENT",
+            expected_old_price=Decimal("8.00"),
+            target_price=Decimal("10.00"),
+            dedupe_key="TASK-INCIDENT-HUMAN-URGENT",
+        )
+    )
+    calls: list[str] = []
+
+    cycle = AutomationService(
+        repository,
+        handlers={
+            ONLINE_PULSE: lambda run, context: (
+                calls.append(run.run_id)
+                or AutomationRunOutcome(status=AutomationRunStatus.SUCCESS)
+            )
+        },
+        clock=MutableClock(now),
+    ).run_cycle()
+
+    assert calls == []
+    assert cycle.blocked_reason == "URGENT_INCIDENT_TASK_PENDING"
+    assert repository.get_run(ui_run.run_id).run_status is AutomationRunStatus.SCHEDULED
+
+
 def test_heartbeat_is_atomic_utf8_json(tmp_path: Path) -> None:
     path = tmp_path / "自动化服务" / "heartbeat.json"
     store = AutomationHeartbeatStore(path)

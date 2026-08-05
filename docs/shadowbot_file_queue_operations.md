@@ -60,7 +60,7 @@ provider 使用 Python 标准库 `ctypes` 调用 `CredReadW`/`CredFree`，不依
 3. 投递一个脱敏的登录测试请求，确认结果为成功或 `LOGIN_CREDENTIALS_UNAVAILABLE`/`LOGIN_CREDENTIALS_REJECTED` 等稳定登录错误；凭据 provider 失败时，Worker 结果最多保留 allowlist 中的 `provider_error_code`（例如 `CREDENTIAL_NOT_FOUND`），未知异常仍使用安全兜底码。检查请求 JSON、结果、phase、日志和证据目录均不含账号、密码、`CredentialBlob` 或明文 target。
 4. 测试结束后在 Credential Manager 图形界面删除受控测试凭据，并删除部署机上的未跟踪 `shadowbot_worker_config.json` 副本（若不再使用）。
 
-蚂蚁花团供应商的员工账号需要先点击“员工”模式按钮，再填写账号密码；该点击仅记录无敏感状态，失败时返回 `LOGIN_AUTOFILL_FAILED`，不会尝试其他登录模式。Worker 每个 attempt 最多提交一次账号密码登录。账号和密码仅使用元素原生输入方法，禁止走剪贴板输入，避免进入 Windows 剪贴板历史。识别到手机验证码后写 `LOGIN_VERIFICATION_REQUIRED` phase；PRA 队列服务创建唯一人工介入 review 和通知。该通知使用专用标题“ShadowBot 登录验证码人工接管”，仅展示平台、执行尝试、截止时间和操作提示，不复用通用业务复核的业务日期、处理对象和原因字段。操作员只在由 Worker 打开或此前已存在的小程序中完成验证码，不向 PRA、影刀请求或飞书回复验证码。首页“商品管理”入口重新出现后，Worker 继续同一 attempt。等待超时返回 `FAILED/LOGIN_VERIFICATION_TIMEOUT/NOT_STARTED`；账号密码错误返回 `LOGIN_CREDENTIALS_REJECTED`，均不自动重试。
+蚂蚁花团供应商的员工账号需要先点击“员工”模式按钮，再填写账号密码；该点击仅记录无敏感状态，失败时返回 `LOGIN_AUTOFILL_FAILED`，不会尝试其他登录模式。Worker 每个 attempt 最多提交一次账号密码登录。账号和密码仅使用元素原生输入方法，禁止走剪贴板输入，避免进入 Windows 剪贴板历史。识别到手机验证码后写 `LOGIN_VERIFICATION_REQUIRED` phase；PRA 队列服务创建唯一人工介入 review 和通知。该通知使用运营标题“需要验证码，请立即处理”，仅展示平台、截止时间和操作提示，不复用通用业务复核的业务日期、处理对象和原因字段。操作员只在由 Worker 打开或此前已存在的小程序中完成验证码，不向 PRA、影刀请求或飞书回复验证码。首页“商品管理”入口重新出现后，Worker 继续同一 attempt；结果导入时以 `verification_completed=true` 为权威证据，在同一事务内完成 Review 并创建唯一“验证码处理完毕”反馈通知。等待超时或 Worker 停止时分别创建“验证码处理超时”或“验证码等待已取消”反馈；人工声明不能替代执行端回读。等待超时返回 `FAILED/LOGIN_VERIFICATION_TIMEOUT/NOT_STARTED`；账号密码错误返回 `LOGIN_CREDENTIALS_REJECTED`，均不自动重试。
 
 默认验证码人工接管窗口为 10 分钟（`600` 秒）。验证码等待到期时，Worker 会额外执行一次无副作用的首页入口检查，避免操作员恰好在最后一轮轮询后完成验证而被误判超时。该检查不延长等待时限，也不重新提交账号密码。
 
@@ -148,7 +148,23 @@ python scripts\check_shadowbot_worker_health.py `
 
 报告会校验心跳年龄、连续写失败、线程重启和遗留临时文件。Worker 会将 heartbeat 写错误追加到 `control/heartbeat_errors.jsonl`；Watchdog 会对 stale 的 `RUNNING` heartbeat 输出一次 `WORKER_HEARTBEAT_STALE`。
 
+13.5-6A-1 增加了唯一宿主恢复入口，但默认不启用。只有 Incident Automation Service 同时
+使用 `--enable-incident-monitoring --enable-worker-recovery`，且环境中显式设置
+`PRA_ENABLE_SHADOWBOT_HOST_RECOVERY=true`，才允许 Coordinator 调用
+`scripts/shadowbot_windows_host_helper.ps1`。helper 通过严格 JSON 和 Windows UI Automation
+定位精确 `test2` 及其语义运行按钮，不使用屏幕坐标；结束进程前必须证明进程路径位于批准
+的影刀安装根目录。存在活动 working、未导入 result、未保存编辑内容或写副作用不明时均
+拒绝启动第二实例。真实启动、重启和 `Ctrl+Alt+Q` 必须先完成单独受控 R4 验收；在此之前
+不得把默认关闭的代码入口视为生产恢复承诺。
+
 Result Importer 遇到 Windows 瞬时文件 I/O 错误时返回 `RETRY_PENDING/RESULT_IO_RETRY_PENDING`，保留 `results` 中的原文件并在下一轮重试，不得立即隔离。只有确定的契约、JSON 或 checksum 错误进入 `quarantine`；同名 `.error.json` 记录隔离原因。修改 Importer 代码后必须重启 PRA 队列服务进程才能生效。
+
+13.5-6C 的 `SYSTEM_EMERGENCY SET_OFFLINE` 不新增队列或 Worker。请求必须是原 v5 单商品
+COMMIT，并携带由 Runtime 授权 Event 派生的 `emergency_authorization`。Worker 在下架确认
+弹窗身份核对后、`ACTION_INTENT_RECORDED` 前，对请求绑定的同一个 Runtime DB 取得短
+`BEGIN IMMEDIATE` 并重读 Incident、Review、策略、功能开关、人工任务、Automation UI
+租约、任务和共享写锁。任一事实失效时点击“取消”并以确定的未应用结果退出；通过时事务
+跨越 Action Intent 与一次确认点击后立即释放。该规则不改变普通 v5，也不允许自动重新上架。
 
 Watchdog 读取 `heartbeat.json`、phase 或 request 时同样可能遇到 Windows 瞬时共享冲突。读取层会自动重试；重试后仍失败时，常驻服务输出 `RETRY_PENDING/WATCHDOG_INSPECTION_FAILED` 并继续下一轮。该事件不得终止 Result Importer 进程，也不得直接把 working attempt 判为失败。
 
@@ -181,5 +197,9 @@ python scripts\verify_shadowbot_deployment.py --app-dir $env:SHADOWBOT_APP_DIR
 ```powershell
 python scripts\sync_shadowbot_test2.py --app-dir $env:SHADOWBOT_APP_DIR
 ```
+
+13.5-6C 起同步清单包含公共 `emergency_offline_fence.py`。若该文件缺失或与仓库哈希不同，
+`verify_shadowbot_deployment.py` 必须失败。同步前仍须按本手册正常停止长期 Worker 并关闭
+影刀编辑器，不能在运行中覆盖 Python 文件。
 
 同步后确认编辑器处于关闭状态，并从影刀“应用”主页面的 `test2` 行内“运行应用”图标直接启动。该路径是外部 Python 同步后的默认测试方式。普通任务完成后保持 Worker 运行；只有准备结束本轮应用时才按第 4 节创建 `stop.signal`，由主流程末端 `关闭.flow` 清理残留运行窗口。

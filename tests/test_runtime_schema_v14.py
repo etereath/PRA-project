@@ -22,7 +22,6 @@ from app.repositories import sqlite_runtime_repository as runtime_module
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION
 
-
 V14_TABLES = {
     "operational_time_policies",
     "automation_jobs",
@@ -42,6 +41,8 @@ V14_TABLES = {
 }
 
 V14_DROP_ORDER = (
+    "emergency_offline_policies",
+    "operational_incident_events",
     "incident_notification_state",
     "operational_incidents",
     "platform_trade_day_summary_inputs",
@@ -82,8 +83,8 @@ def test_v14_new_database_has_frozen_tables_policy_and_task_origin(
 ) -> None:
     repository = _repository(tmp_path)
 
-    assert LATEST_RUNTIME_SCHEMA_VERSION == 14
-    assert repository.schema_versions() == list(range(1, 15))
+    assert LATEST_RUNTIME_SCHEMA_VERSION == 16
+    assert repository.schema_versions() == list(range(1, 17))
     health = repository.check_schema_health()
     assert health.ok, health.summary
 
@@ -1065,7 +1066,7 @@ def test_v13_to_v14_migration_backfills_legacy_without_guessing_dates(
 
     repository.init_schema()
 
-    assert repository.schema_versions() == list(range(1, 15))
+    assert repository.schema_versions() == list(range(1, 17))
     assert repository.check_schema_health().ok
     with closing(repository.connect_read()) as connection:
         row = connection.execute(
@@ -1241,7 +1242,7 @@ def _downgrade_fixture_to_v13(
                     f"ALTER TABLE tasks DROP COLUMN {column}"
                 )
             connection.execute(
-                "DELETE FROM runtime_schema_migrations WHERE schema_version = 14"
+                "DELETE FROM runtime_schema_migrations WHERE schema_version >= 14"
             )
             connection.commit()
         except Exception:

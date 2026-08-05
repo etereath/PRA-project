@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import json
-import ipaddress
 import io
+import ipaddress
+import json
 import os
 import re
 import sqlite3
 from contextvars import ContextVar
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from html import escape
 from hmac import compare_digest
+from html import escape
 from http.cookies import SimpleCookie
 from pathlib import Path
 from secrets import token_urlsafe
@@ -21,62 +21,107 @@ from urllib.parse import parse_qs, unquote, urlencode, urlparse
 from uuid import uuid4
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
-from app.enums import NotificationSendStatus, ReviewTaskStatus, TaskActionType, TaskStatus
-from app.exceptions import MobileReviewErrorCode, MobileReviewTransactionError, TableValidationError, ValidationError
-from app.field_labels import FIELD_LABELS, TABLE_LABELS
-from app.models import ListingStatus, NotificationLog
-from app.listing_status_policy import has_current_platform_stock
-from app.repositories.sqlite_connection import SQLiteConnectionError, SQLiteConnectionFactory
-from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.review_policy import (
-    allowed_review_statuses,
-    is_execution_failure_review,
-    review_action_label,
+from app.enums import (
+    NotificationSendStatus,
+    ReviewTaskStatus,
+    TaskActionType,
+    TaskStatus,
 )
-from app.repositories.mock_platform_repository import DEFAULT_MOCK_PLATFORM_DB, MockPlatformRepository
-from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION
+from app.exceptions import (
+    MobileReviewErrorCode,
+    MobileReviewTransactionError,
+    TableValidationError,
+    ValidationError,
+)
+from app.field_labels import FIELD_LABELS, TABLE_LABELS
+from app.listing_status_policy import has_current_platform_stock
+from app.models import ListingStatus, NotificationLog
+from app.path_policy import PathAccessPolicy, PathPolicyError
+from app.repositories.mock_platform_repository import (
+    DEFAULT_MOCK_PLATFORM_DB,
+    MockPlatformRepository,
+)
+from app.repositories.sqlite_connection import (
+    SQLiteConnectionError,
+    SQLiteConnectionFactory,
+)
+from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import (
     get_table_headers,
     load_table_records,
     save_table_records,
 )
-from app.path_policy import PathAccessPolicy, PathPolicyError
-from app.services.security import LOGIN_RATE_LIMITER, record_security_event
-from app.services.workflow import (
-    ExecutionSimulationInputs,
-    ExecutionSimulationSummary,
-    RuntimeReviewResolutionInputs,
-    TaskGenerationSummary,
-    ValidationSummary,
-    WorkflowInputs,
-    generate_tasks_from_sources,
-    generate_tasks_from_selected_rule,
-    get_runtime_notification_log,
-    get_runtime_review_task,
-    get_runtime_task,
-    get_mobile_review_detail,
-    list_runtime_execution_logs,
-    list_runtime_notification_logs,
-    list_runtime_task_history,
-    list_runtime_review_tasks,
-    list_runtime_tasks,
-    list_manual_intervention_tasks,
-    listing_task_override_key,
-    preview_tasks_from_sources,
-    preview_tasks_from_selected_rule,
-    persist_task_generation_summary,
-    resolve_mobile_review,
-    resolve_runtime_review_task,
-    simulate_execution_from_tasks,
-    source_task_status_for_review_resolution,
+from app.review_policy import (
+    allowed_review_statuses,
+    is_execution_failure_review,
+    review_action_label,
 )
-from app.services.runtime import DEFAULT_RUNTIME_DB, NotificationLogService, NotificationSenderFactory
-from app.services.shadowbot_executor import ShadowBotExecutor, build_shadowbot_task_runner_from_environment
-from app.web_styles import common_styles
+from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION
+from app.services.capacity_plan_input import (
+    CapacityPlanInputError,
+    apply_capacity_plan_edit,
+    apply_capacity_plan_input,
+    computed_capacity_from_row,
+    format_capacity_number,
+    load_capacity_plan_input_rows,
+    persist_capacity_plan_rows,
+    validate_capacity_plan_form,
+)
+from app.services.capacity_plan_input import (
+    active_display as capacity_active_display,
+)
+from app.services.cold_storage_input import (
+    ColdStorageInputError,
+    apply_cold_storage_edit,
+    apply_cold_storage_input,
+    computed_projected_occupied_from_row,
+    computed_remaining_capacity_from_row,
+    format_cold_storage_number,
+    load_cold_storage_input_rows,
+    persist_cold_storage_rows,
+    validate_cold_storage_form,
+)
+from app.services.cold_storage_input import (
+    active_display as cold_storage_active_display,
+)
+from app.services.listing_rule_input import (
+    LISTING_STRATEGY_OPTIONS,
+    ListingRuleInputError,
+    apply_listing_rule_edit,
+    apply_listing_rule_input,
+    format_listing_rule_number,
+    format_listing_rule_scope,
+    load_listing_rule_input_rows,
+    persist_listing_rule_rows,
+    validate_listing_rule_form,
+)
+from app.services.listing_rule_input import (
+    active_display as listing_active_display,
+)
+from app.services.platform_mapping_input import (
+    PlatformMappingInputError,
+    apply_platform_input,
+    ensure_platform_mappings_workbook,
+    load_platform_mapping_rows,
+    persist_platform_mapping_rows,
+    platform_options_from_rows,
+)
+from app.services.price_rule_input import (
+    PRICING_METHOD_OPTIONS,
+    ROUNDING_RULE_OPTIONS,
+    PriceRuleInputError,
+    active_display,
+    apply_price_rule_edit,
+    apply_price_rule_input,
+    format_price_rule_number,
+    load_price_rule_input_rows,
+    persist_price_rule_rows,
+    validate_price_rule_form,
+)
 from app.services.product_inventory_input import (
     FOLLOW_GRADE_VALUE,
-    GRADE_STEM_LENGTH_MAP,
     GRADE_OPTIONS,
+    GRADE_STEM_LENGTH_MAP,
     PLATFORM_OPTIONS,
     STEM_LENGTH_OPTIONS,
     UNIT_OPTIONS,
@@ -91,63 +136,46 @@ from app.services.product_inventory_input import (
     validate_inventory_form,
     validate_product_edit_form,
 )
-from app.services.price_rule_input import (
-    PRICING_METHOD_OPTIONS,
-    ROUNDING_RULE_OPTIONS,
-    PriceRuleInputError,
-    active_display,
-    apply_price_rule_edit,
-    apply_price_rule_input,
-    format_price_rule_number,
-    load_price_rule_input_rows,
-    persist_price_rule_rows,
-    validate_price_rule_form,
+from app.services.runtime import (
+    DEFAULT_RUNTIME_DB,
+    NotificationLogService,
+    NotificationSenderFactory,
 )
-from app.services.listing_rule_input import (
-    LISTING_STRATEGY_OPTIONS,
-    ListingRuleInputError,
-    active_display as listing_active_display,
-    apply_listing_rule_edit,
-    apply_listing_rule_input,
-    format_listing_rule_number,
-    format_listing_rule_scope,
-    load_listing_rule_input_rows,
-    persist_listing_rule_rows,
-    validate_listing_rule_form,
+from app.services.security import LOGIN_RATE_LIMITER, record_security_event
+from app.services.shadowbot_executor import (
+    ShadowBotExecutor,
+    build_shadowbot_task_runner_from_environment,
 )
-from app.services.capacity_plan_input import (
-    CapacityPlanInputError,
-    active_display as capacity_active_display,
-    apply_capacity_plan_edit,
-    apply_capacity_plan_input,
-    computed_capacity_from_row,
-    format_capacity_number,
-    load_capacity_plan_input_rows,
-    persist_capacity_plan_rows,
-    validate_capacity_plan_form,
-)
-from app.services.cold_storage_input import (
-    ColdStorageInputError,
-    active_display as cold_storage_active_display,
-    apply_cold_storage_edit,
-    apply_cold_storage_input,
-    computed_projected_occupied_from_row,
-    computed_remaining_capacity_from_row,
-    format_cold_storage_number,
-    load_cold_storage_input_rows,
-    persist_cold_storage_rows,
-    validate_cold_storage_form,
-)
-from app.services.platform_mapping_input import (
-    PlatformMappingInputError,
-    apply_platform_input,
-    ensure_platform_mappings_workbook,
-    load_platform_mapping_rows,
-    persist_platform_mapping_rows,
-    platform_options_from_rows,
+from app.services.workflow import (
+    ExecutionSimulationInputs,
+    ExecutionSimulationSummary,
+    RuntimeReviewResolutionInputs,
+    TaskGenerationSummary,
+    ValidationSummary,
+    WorkflowInputs,
+    generate_tasks_from_selected_rule,
+    generate_tasks_from_sources,
+    get_mobile_review_detail,
+    get_runtime_notification_log,
+    get_runtime_review_task,
+    get_runtime_task,
+    list_manual_intervention_tasks,
+    list_runtime_execution_logs,
+    list_runtime_notification_logs,
+    list_runtime_review_tasks,
+    list_runtime_task_history,
+    list_runtime_tasks,
+    listing_task_override_key,
+    persist_task_generation_summary,
+    preview_tasks_from_selected_rule,
+    preview_tasks_from_sources,
+    resolve_mobile_review,
+    resolve_runtime_review_task,
+    simulate_execution_from_tasks,
+    source_task_status_for_review_resolution,
 )
 from app.utils import parse_date
-
+from app.web_styles import common_styles
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PRODUCTS = ROOT / "data" / "samples" / "products.xlsx"
@@ -289,6 +317,7 @@ DISPLAY_ENUM_LABELS = {
         "manual_review": "人工复核",
         "manual_price_review": "人工价格复核",
         "below_break_even_review": "低于保本价复核",
+        "emergency_protection": "价格异常处理",
         "labor_required": "临时工确认",
         "capacity_warning": "产能预警",
         "shortage_warning": "短缺预警",
@@ -1555,6 +1584,12 @@ def _handle_mobile_review(method: str, path: str, environ) -> str | tuple[str, s
             resolution_payload = _parse_mobile_resolution_payload(
                 _first(parsed, "resolution_payload_json", "")
             )
+            target_price = _first(parsed, "target_price", "").strip()
+            if action == ReviewTaskStatus.ADJUSTED.value and target_price:
+                resolution_payload = dict(resolution_payload or {})
+                adjustment = dict(resolution_payload.get("adjustment") or {})
+                adjustment["target_price"] = target_price
+                resolution_payload["adjustment"] = adjustment
             resolve_mobile_review(
                 DEFAULT_RUNTIME_DB,
                 review_task_id,
@@ -1562,6 +1597,7 @@ def _handle_mobile_review(method: str, path: str, environ) -> str | tuple[str, s
                 action,
                 note=note,
                 resolution_payload=resolution_payload,
+                products_path=DEFAULT_PRODUCTS,
             )
             record_security_event(
                 "MOBILE_REVIEW_TOKEN_CONSUMED",
@@ -3542,6 +3578,22 @@ def render_mobile_review_page(*, detail, raw_token: str) -> str:
     )
     if not actions_html:
         actions_html = f"<p class='subtle'>{escape(UI_TEXT['mobile_review_handled'])}</p>"
+    emergency_price_html = (
+        """
+        <div class="field">
+          <label for="target_price">改价目标（仅选择“改价到”时填写）</label>
+          <input id="target_price" name="target_price" inputmode="decimal" placeholder="不得低于基础成本">
+        </div>
+        """
+        if review.review_type == "emergency_protection"
+        else ""
+    )
+    review_type_label = display_enum_label("review_type", review.review_type)
+    if (
+        review.review_type == "emergency_protection"
+        and str(review.review_payload.get("severity") or "").upper() == "S4"
+    ):
+        review_type_label = "极端低价处理"
 
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -3555,7 +3607,7 @@ def render_mobile_review_page(*, detail, raw_token: str) -> str:
   <main class="shell">
     {_hero(UI_TEXT["mobile_review_title"], UI_TEXT["mobile_review_lede"])}
     <section class="panel">
-      <h2>{escape(display_enum_label("review_type", review.review_type))}</h2>
+      <h2>{escape(review_type_label)}</h2>
       <div class="metrics">
         <div class="metric"><span class="label">业务日期</span><strong>{escape(str(review.trade_date or "-"))}</strong></div>
         <div class="metric"><span class="label">当前状态</span><strong>{escape(display_enum_label("review_status", review.review_status.value))}</strong></div>
@@ -3582,6 +3634,7 @@ def render_mobile_review_page(*, detail, raw_token: str) -> str:
           <label for="resolution_note">{escape(UI_TEXT["mobile_review_note"])}</label>
           <textarea id="resolution_note" name="resolution_note"></textarea>
         </div>
+        {emergency_price_html}
         <div class="field">
           <label for="resolution_payload_json">{escape(UI_TEXT["mobile_review_payload"])}</label>
           <textarea id="resolution_payload_json" name="resolution_payload_json" placeholder='{{}}'></textarea>

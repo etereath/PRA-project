@@ -1,22 +1,28 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import time
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-import os
 from typing import Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 from uuid import uuid4
 
-from app.enums import NotificationSendStatus, ReviewTaskStatus, TaskActionType, TaskStatus
+from app.enums import (
+    NotificationSendStatus,
+    ReviewTaskStatus,
+    TaskActionType,
+    TaskStatus,
+)
 from app.exceptions import ValidationError
 from app.mobile_review import resolution_payload_summary
 from app.models import (
@@ -32,10 +38,10 @@ from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.review_policy import (
     allowed_review_statuses,
     is_execution_failure_review,
+    retry_task_deadline,
     review_business_decision,
     review_source_task_ids,
     review_task_group_id,
-    retry_task_deadline,
     task_group_id,
 )
 from app.services.execution import ExecutionSimulationService
@@ -45,7 +51,6 @@ from app.services.notification_outbox import (
     OutboxReviewNotificationService,
 )
 from app.utils import serialize_decimal
-
 
 DEFAULT_RUNTIME_DB = Path("data/runtime/pra_runtime.sqlite3")
 FEISHU_DISPLAY_TIMEZONE = timezone(timedelta(hours=8))
@@ -58,7 +63,11 @@ ALLOWED_TASK_TRANSITIONS = {
         TaskStatus.CANCELLED,
         TaskStatus.EXPIRED,
     },
-    TaskStatus.RUNNING: {TaskStatus.SUCCESS, TaskStatus.FAILED, TaskStatus.MANUAL_REVIEW},
+    TaskStatus.RUNNING: {
+        TaskStatus.SUCCESS,
+        TaskStatus.FAILED,
+        TaskStatus.MANUAL_REVIEW,
+    },
     TaskStatus.FAILED: {TaskStatus.PENDING, TaskStatus.CANCELLED},
     TaskStatus.MANUAL_REVIEW: {
         TaskStatus.PENDING,
@@ -98,8 +107,13 @@ def _deadline_has_passed(deadline: datetime, now: datetime) -> bool:
     if deadline.tzinfo is None:
         comparable_now = now.replace(tzinfo=None)
     else:
-        comparable_now = now.astimezone(deadline.tzinfo) if now.tzinfo is not None else now.astimezone()
+        comparable_now = (
+            now.astimezone(deadline.tzinfo)
+            if now.tzinfo is not None
+            else now.astimezone()
+        )
     return deadline <= comparable_now
+
 
 FEISHU_WEBHOOK_URL_REQUIRED = "FEISHU_WEBHOOK_URL is required for feishu notification"
 FEISHU_TOKEN_URL_CREATION_FAILED = "mobile_review_url creation failed"
@@ -137,7 +151,9 @@ class RuntimeTaskService:
     def create_tasks(self, tasks: list[Task], *, trade_date: date | None = None) -> int:
         return len(self.create_tasks_returning_inserted(tasks, trade_date=trade_date))
 
-    def create_tasks_returning_inserted(self, tasks: list[Task], *, trade_date: date | None = None) -> list[Task]:
+    def create_tasks_returning_inserted(
+        self, tasks: list[Task], *, trade_date: date | None = None
+    ) -> list[Task]:
         inserted: list[Task] = []
         for task in tasks:
             normalized = self._normalize_task(task, trade_date=trade_date)
@@ -183,7 +199,10 @@ class RuntimeTaskService:
                 to_status=TaskStatus.EXPIRED,
                 changed_by=changed_by,
                 reason="required_by_deadline_passed",
-                metadata={"deadline": deadline.isoformat(), "detected_at": current.isoformat()},
+                metadata={
+                    "deadline": deadline.isoformat(),
+                    "detected_at": current.isoformat(),
+                },
                 result_message="任务已超过截止时间，系统自动标记为过期。",
             )
             expired_count += 1
@@ -230,12 +249,16 @@ class RuntimeTaskService:
     def get_task(self, task_id: str) -> Task | None:
         return self.repository.get_task(task_id)
 
-    def _validate_transition(self, from_status: TaskStatus, to_status: TaskStatus) -> None:
+    def _validate_transition(
+        self, from_status: TaskStatus, to_status: TaskStatus
+    ) -> None:
         if from_status == to_status:
             return
         allowed = ALLOWED_TASK_TRANSITIONS.get(from_status, set())
         if to_status not in allowed:
-            raise ValidationError(f"invalid task status transition: {from_status.value} -> {to_status.value}")
+            raise ValidationError(
+                f"invalid task status transition: {from_status.value} -> {to_status.value}"
+            )
 
     def _normalize_task(self, task: Task, *, trade_date: date | None) -> Task:
         resolved_trade_date = task.trade_date or trade_date
@@ -271,8 +294,12 @@ class ReviewTaskService:
         notification_service: "ReviewNotificationService | OutboxReviewNotificationService | None" = None,
     ) -> None:
         self.repository = repository
-        self.runtime_task_service = runtime_task_service or RuntimeTaskService(repository)
-        self.notification_service = notification_service or OutboxReviewNotificationService(repository)
+        self.runtime_task_service = runtime_task_service or RuntimeTaskService(
+            repository
+        )
+        self.notification_service = (
+            notification_service or OutboxReviewNotificationService(repository)
+        )
 
     def create_from_tasks(
         self,
@@ -293,8 +320,10 @@ class ReviewTaskService:
         for review_task in review_tasks:
             if isinstance(self.notification_service, OutboxReviewNotificationService):
                 try:
-                    inserted_count, outbox_count, _ = self.notification_service.create_review_task_atomically(
-                        review_task
+                    inserted_count, outbox_count, _ = (
+                        self.notification_service.create_review_task_atomically(
+                            review_task
+                        )
                     )
                 except Exception as exc:
                     notification_errors.append(f"{review_task.review_task_id}: {exc}")
@@ -313,7 +342,9 @@ class ReviewTaskService:
             if review_task.review_status != ReviewTaskStatus.PENDING:
                 continue
             try:
-                created = self.notification_service.create_initial_notification(review_task)
+                created = self.notification_service.create_initial_notification(
+                    review_task
+                )
             except Exception as exc:
                 notification_errors.append(f"{review_task.review_task_id}: {exc}")
                 continue
@@ -368,11 +399,7 @@ class ReviewTaskService:
 
         all_runtime_tasks = self.repository.list_tasks()
         for group_key, supplied_tasks in execution_groups.items():
-            actual_group_id = (
-                group_key
-                if not group_key.startswith("task:")
-                else ""
-            )
+            actual_group_id = group_key if not group_key.startswith("task:") else ""
             if actual_group_id:
                 group_members = [
                     task
@@ -438,13 +465,10 @@ class ReviewTaskService:
             if (task := self.runtime_task_service.get_task(task_id)) is not None
         ]
         source_task = source_tasks[0] if source_tasks else None
-        if (
-            status != ReviewTaskStatus.EXPIRED
-            and status not in allowed_review_statuses(review_task, source_task)
+        if status != ReviewTaskStatus.EXPIRED and status not in allowed_review_statuses(
+            review_task, source_task
         ):
-            raise ValidationError(
-                "执行失败复核只允许选择“重试任务”或“取消任务”。"
-            )
+            raise ValidationError("执行失败复核只允许选择“重试任务”或“取消任务”。")
         now = datetime.now()
         resolved_payload = dict(resolution_payload or {})
         business_decision = review_business_decision(
@@ -462,14 +486,10 @@ class ReviewTaskService:
             ]
             resolved_payload["affected_task_count"] = len(source_tasks)
         retry_required_by = (
-            retry_task_deadline(now)
-            if business_decision == "retry_task"
-            else None
+            retry_task_deadline(now) if business_decision == "retry_task" else None
         )
         if retry_required_by is not None:
-            resolved_payload["retry_required_by"] = (
-                retry_required_by.isoformat()
-            )
+            resolved_payload["retry_required_by"] = retry_required_by.isoformat()
         if (
             is_execution_failure_review(review_task, source_task)
             and status != ReviewTaskStatus.EXPIRED
@@ -537,10 +557,7 @@ class ReviewTaskService:
                     to_status=source_task_status,
                     changed_by=actor,
                     changed_at=now,
-                    reason=(
-                        f"review_task_group:{review_task_id}:"
-                        f"{business_decision}"
-                    ),
+                    reason=(f"review_task_group:{review_task_id}:{business_decision}"),
                     metadata=metadata,
                 )
                 task_updates.append(
@@ -561,15 +578,22 @@ class ReviewTaskService:
         source_task_id: str | None = None
         source_history: TaskStatusHistory | None = None
         if source_task_status is not None and review_task.source_task_id:
-            if source_task is not None and source_task.task_status in {TaskStatus.MANUAL_REVIEW, TaskStatus.PENDING}:
-                self.runtime_task_service._validate_transition(source_task.task_status, source_task_status)
+            if source_task is not None and source_task.task_status in {
+                TaskStatus.MANUAL_REVIEW,
+                TaskStatus.PENDING,
+            }:
+                self.runtime_task_service._validate_transition(
+                    source_task.task_status, source_task_status
+                )
                 metadata = {
                     "review_task_id": review_task_id,
                     "review_status": status.value,
                     "actor": actor,
                     "actor_source": actor_source,
                     "resolution_note": note,
-                    "resolution_payload_summary": resolution_payload_summary(resolved_payload),
+                    "resolution_payload_summary": resolution_payload_summary(
+                        resolved_payload
+                    ),
                     "retry_required_by": (
                         retry_required_by.isoformat()
                         if retry_required_by is not None
@@ -611,9 +635,23 @@ class ReviewTaskService:
         pending_reviews = self.repository.list_pending_review_tasks_due_before(cutoff)
         summary = ExpireReviewTasksSummary(scanned_review_tasks=len(pending_reviews))
         for review in pending_reviews:
-            source_task = self.runtime_task_service.get_task(review.source_task_id) if review.source_task_id else None
+            if review.review_type == "emergency_protection":
+                # ``required_by`` is the automatic-evaluation deadline for an
+                # emergency Review, not the final lifetime of the human entry.
+                # The formal Mobile Review remains pending until the platform
+                # side-effect boundary or an explicit resolution.
+                summary.skipped_review_tasks += 1
+                continue
+            source_task = (
+                self.runtime_task_service.get_task(review.source_task_id)
+                if review.source_task_id
+                else None
+            )
             source_task_status = None
-            if source_task is not None and source_task.task_status == TaskStatus.MANUAL_REVIEW:
+            if (
+                source_task is not None
+                and source_task.task_status == TaskStatus.MANUAL_REVIEW
+            ):
                 source_task_status = TaskStatus.EXPIRED
             elif review.source_task_id:
                 summary.skipped_source_tasks += 1
@@ -624,13 +662,17 @@ class ReviewTaskService:
 
             resolution_payload = {
                 "timeout_at": cutoff.isoformat(),
-                "required_by": review.required_by.isoformat() if review.required_by else None,
+                "required_by": review.required_by.isoformat()
+                if review.required_by
+                else None,
                 "timeout_reason": "required_by passed",
                 "timeout_policy": "uniform_conservative_v1",
             }
             metadata_extra = {
                 "review_type": review.review_type,
-                "required_by": review.required_by.isoformat() if review.required_by else None,
+                "required_by": review.required_by.isoformat()
+                if review.required_by
+                else None,
                 "timeout_at": cutoff.isoformat(),
                 "timeout_reason": "required_by passed",
                 "timeout_policy": "uniform_conservative_v1",
@@ -652,7 +694,9 @@ class ReviewTaskService:
                     summary.expired_source_tasks += 1
                 continue
 
-            if enable_notification and isinstance(self.notification_service, OutboxReviewNotificationService):
+            if enable_notification and isinstance(
+                self.notification_service, OutboxReviewNotificationService
+            ):
                 resolved = replace(
                     review,
                     review_status=ReviewTaskStatus.EXPIRED,
@@ -680,7 +724,9 @@ class ReviewTaskService:
                             "actor": actor,
                             "actor_source": "system_timeout",
                             "resolution_note": "expired by required_by timeout",
-                            "resolution_payload_summary": resolution_payload_summary(resolution_payload),
+                            "resolution_payload_summary": resolution_payload_summary(
+                                resolution_payload
+                            ),
                             **metadata_extra,
                         },
                     )
@@ -690,14 +736,16 @@ class ReviewTaskService:
                         timeout_at=cutoff,
                     )
                 )
-                updated_count, outbox_count = self.repository.expire_review_task_with_notification_outbox(
-                    resolved,
-                    notification,
-                    compatibility_log,
-                    task_id=source_task_id,
-                    task_status=source_task_status if source_task_id else None,
-                    history=history,
-                    result_message="expired by required_by timeout",
+                updated_count, outbox_count = (
+                    self.repository.expire_review_task_with_notification_outbox(
+                        resolved,
+                        notification,
+                        compatibility_log,
+                        task_id=source_task_id,
+                        task_status=source_task_status if source_task_id else None,
+                        history=history,
+                        result_message="expired by required_by timeout",
+                    )
                 )
                 if updated_count != 1:
                     continue
@@ -716,11 +764,17 @@ class ReviewTaskService:
             summary.expired_review_tasks += 1
             if source_task_status is not None:
                 summary.expired_source_tasks += 1
-            if enable_notification and not isinstance(self.notification_service, OutboxReviewNotificationService):
+            if enable_notification and not isinstance(
+                self.notification_service, OutboxReviewNotificationService
+            ):
                 try:
-                    created = self.notification_service.create_expired_notification(resolved, timeout_at=cutoff)
+                    created = self.notification_service.create_expired_notification(
+                        resolved, timeout_at=cutoff
+                    )
                 except Exception as exc:
-                    summary.errors.append(f"{review.review_task_id}: expire notification failed: {exc}")
+                    summary.errors.append(
+                        f"{review.review_task_id}: expire notification failed: {exc}"
+                    )
                 else:
                     if created is not None:
                         summary.notification_logs_created += 1
@@ -735,12 +789,8 @@ class ReviewTaskService:
         if reminder_interval_minutes <= 0:
             raise ValueError("reminder_interval_minutes must be positive")
         cutoff = now or datetime.now(timezone.utc)
-        pending_reviews = self.repository.list_pending_review_tasks_due_before(
-            cutoff
-        )
-        summary = ReviewReminderSummary(
-            scanned_review_tasks=len(pending_reviews)
-        )
+        pending_reviews = self.repository.list_pending_review_tasks_due_before(cutoff)
+        summary = ReviewReminderSummary(scanned_review_tasks=len(pending_reviews))
         if not isinstance(
             self.notification_service,
             OutboxReviewNotificationService,
@@ -776,21 +826,16 @@ class ReviewTaskService:
                 required_by=new_required_by,
                 updated_at=comparable_cutoff,
             )
-            event_version = (
-                "reminder-"
-                + new_required_by.isoformat(timespec="seconds")
-            )
+            event_version = "reminder-" + new_required_by.isoformat(timespec="seconds")
             notification, compatibility_log = (
-                self.notification_service.outbox_service
-                .build_review_notification_candidate(
+                self.notification_service.outbox_service.build_review_notification_candidate(
                     renewed,
                     event_version=event_version,
                 )
             )
             try:
                 updated_count, outbox_count = (
-                    self.repository
-                    .renew_review_task_with_notification_outbox(
+                    self.repository.renew_review_task_with_notification_outbox(
                         renewed,
                         notification,
                         compatibility_log,
@@ -812,12 +857,16 @@ class ReviewTaskService:
             summary.notification_logs_created += outbox_count
         return summary
 
-    def _validate_transition(self, from_status: ReviewTaskStatus, to_status: ReviewTaskStatus) -> None:
+    def _validate_transition(
+        self, from_status: ReviewTaskStatus, to_status: ReviewTaskStatus
+    ) -> None:
         if from_status == to_status:
             return
         allowed = ALLOWED_REVIEW_TRANSITIONS.get(from_status, set())
         if to_status not in allowed:
-            raise ValidationError(f"invalid review status transition: {from_status.value} -> {to_status.value}")
+            raise ValidationError(
+                f"invalid review status transition: {from_status.value} -> {to_status.value}"
+            )
 
 
 @dataclass(slots=True)
@@ -837,6 +886,8 @@ class ReviewTokenValidationResult:
 
 
 class ReviewTokenService:
+    RECONSTRUCTABLE_TOKEN_NOTE = "reconstructable_mobile_review_token:v1"
+
     def __init__(self, repository: SQLiteRuntimeRepository) -> None:
         self.repository = repository
 
@@ -854,7 +905,9 @@ class ReviewTokenService:
         if review_task is None:
             raise ValidationError(f"review task not found: {review_task_id}")
         if review_task.review_status != ReviewTaskStatus.PENDING:
-            raise ValidationError(f"cannot create review token for non-pending review task: {review_task_id}")
+            raise ValidationError(
+                f"cannot create review token for non-pending review task: {review_task_id}"
+            )
 
         raw_token = secrets.token_urlsafe(32)
         token_hash = self._hash_raw_token(raw_token)
@@ -864,10 +917,11 @@ class ReviewTokenService:
             else None
         )
         policy_actions = [
-            status.value
-            for status in allowed_review_statuses(review_task, source_task)
+            status.value for status in allowed_review_statuses(review_task, source_task)
         ]
-        requested_actions = list(allowed_actions) if allowed_actions is not None else policy_actions
+        requested_actions = (
+            list(allowed_actions) if allowed_actions is not None else policy_actions
+        )
         resolved_actions = (
             [action for action in requested_actions if action in policy_actions]
             if is_execution_failure_review(review_task, source_task)
@@ -877,7 +931,10 @@ class ReviewTokenService:
             raise ValidationError(
                 "review token has no actions allowed by the review policy"
             )
-        if review_task.required_by is not None and review_task.required_by.tzinfo is not None:
+        if (
+            review_task.required_by is not None
+            and review_task.required_by.tzinfo is not None
+        ):
             now = datetime.now(review_task.required_by.tzinfo)
         else:
             now = datetime.now()
@@ -901,7 +958,71 @@ class ReviewTokenService:
             mobile_review_url=self.build_mobile_review_url(review_task_id, raw_token),
         )
 
-    def validate_token(self, review_task_id: str, raw_token: str, action: str | None = None) -> ReviewTokenValidationResult:
+    def build_reconstructable_token_candidate(
+        self,
+        review_task: ReviewTask,
+        *,
+        token_subject: str = "operations",
+        allowed_actions: list[str],
+        expires_at: datetime,
+        created_at: datetime,
+        created_by: str = "incident_review_service",
+    ) -> ReviewTokenCreationResult:
+        """Build a token that can be delivered later without persisting its raw value."""
+
+        if review_task.review_status is not ReviewTaskStatus.PENDING:
+            raise ValidationError(
+                "cannot create review token for a non-pending review task"
+            )
+        if not allowed_actions:
+            raise ValidationError("review token must allow at least one action")
+        token_id = uuid4().hex[:12]
+        raw_token = self._derive_raw_token(review_task.review_task_id, token_id)
+        review_token = ReviewToken(
+            token_id=token_id,
+            review_task_id=review_task.review_task_id,
+            token_hash=self._hash_raw_token(raw_token),
+            token_subject=token_subject,
+            allowed_actions=list(allowed_actions),
+            expires_at=expires_at,
+            created_at=created_at,
+            created_by=created_by,
+            note=self.RECONSTRUCTABLE_TOKEN_NOTE,
+        )
+        return ReviewTokenCreationResult(
+            review_token=review_token,
+            raw_token=raw_token,
+            mobile_review_url=self.build_mobile_review_url(
+                review_task.review_task_id, raw_token
+            ),
+        )
+
+    def reconstruct_token(self, review_token: ReviewToken) -> ReviewTokenCreationResult:
+        if review_token.note != self.RECONSTRUCTABLE_TOKEN_NOTE:
+            raise ValidationError("review token is not reconstructable")
+        raw_token = self._derive_raw_token(
+            review_token.review_task_id, review_token.token_id
+        )
+        if not hmac.compare_digest(
+            self._hash_raw_token(raw_token), review_token.token_hash
+        ):
+            raise ValidationError("reconstructed review token hash mismatch")
+        return ReviewTokenCreationResult(
+            review_token=review_token,
+            raw_token=raw_token,
+            mobile_review_url=self.build_mobile_review_url(
+                review_token.review_task_id, raw_token
+            ),
+        )
+
+    def validate_token(
+        self,
+        review_task_id: str,
+        raw_token: str,
+        action: str | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> ReviewTokenValidationResult:
         try:
             token_hash = self._hash_raw_token(raw_token)
         except ValidationError as exc:
@@ -909,7 +1030,9 @@ class ReviewTokenService:
 
         review_token = self.repository.get_review_token_by_hash(token_hash)
         if review_token is None:
-            return ReviewTokenValidationResult(is_valid=False, failure_reason="token not found")
+            return ReviewTokenValidationResult(
+                is_valid=False, failure_reason="token not found"
+            )
         review_task = self.repository.get_review_task(review_task_id)
         if review_task is None:
             return ReviewTokenValidationResult(
@@ -919,22 +1042,30 @@ class ReviewTokenService:
                 token_subject=review_token.token_subject,
             )
         if review_token.review_task_id != review_task_id:
-            return self._invalid("token review_task_id mismatch", review_token, review_task)
-        if review_token.expires_at.tzinfo is not None:
-            now = datetime.now(review_token.expires_at.tzinfo)
-        else:
-            now = datetime.now()
-        if review_token.expires_at <= now:
+            return self._invalid(
+                "token review_task_id mismatch", review_token, review_task
+            )
+        validation_time = now
+        if validation_time is None:
+            if review_token.expires_at.tzinfo is not None:
+                validation_time = datetime.now(review_token.expires_at.tzinfo)
+            else:
+                validation_time = datetime.now()
+        if review_token.expires_at <= validation_time:
             return self._invalid("token expired", review_token, review_task)
         if review_token.revoked_at is not None:
             return self._invalid("token revoked", review_token, review_task)
         if review_token.used_at is not None:
             return self._invalid("token already used", review_token, review_task)
         if review_task.review_status != ReviewTaskStatus.PENDING:
-            return self._invalid("review task is not pending", review_token, review_task)
+            return self._invalid(
+                "review task is not pending", review_token, review_task
+            )
         if action is not None:
             if action not in review_token.allowed_actions:
-                return self._invalid("action not allowed by token", review_token, review_task)
+                return self._invalid(
+                    "action not allowed by token", review_token, review_task
+                )
             source_task = (
                 self.repository.get_task(review_task.source_task_id)
                 if review_task.source_task_id
@@ -944,7 +1075,9 @@ class ReviewTokenService:
                 status.value
                 for status in allowed_review_statuses(review_task, source_task)
             }:
-                return self._invalid("action not allowed by review_type", review_token, review_task)
+                return self._invalid(
+                    "action not allowed by review_type", review_token, review_task
+                )
         return ReviewTokenValidationResult(
             is_valid=True,
             failure_reason="",
@@ -971,13 +1104,17 @@ class ReviewTokenService:
         if token.used_at is not None:
             raise ValidationError(f"review token already used: {token_id}")
         now = datetime.now()
-        self.repository.update_review_token_usage(token_id, used_at=now, last_used_at=now)
+        self.repository.update_review_token_usage(
+            token_id, used_at=now, last_used_at=now
+        )
         updated = self.repository.get_review_token(token_id)
         if updated is None:
             raise ValidationError(f"review token not found after update: {token_id}")
         return updated
 
-    def revoke_token(self, token_id: str, revoked_at: datetime | None = None) -> ReviewToken:
+    def revoke_token(
+        self, token_id: str, revoked_at: datetime | None = None
+    ) -> ReviewToken:
         token = self.repository.get_review_token(token_id)
         if token is None:
             raise ValidationError(f"review token not found: {token_id}")
@@ -987,8 +1124,12 @@ class ReviewTokenService:
             raise ValidationError(f"review token not found after revoke: {token_id}")
         return updated
 
-    def revoke_tokens_for_review_task(self, review_task_id: str, revoked_at: datetime | None = None) -> int:
-        return self.repository.revoke_review_tokens_by_review_task_id(review_task_id, revoked_at or datetime.now())
+    def revoke_tokens_for_review_task(
+        self, review_task_id: str, revoked_at: datetime | None = None
+    ) -> int:
+        return self.repository.revoke_review_tokens_by_review_task_id(
+            review_task_id, revoked_at or datetime.now()
+        )
 
     def build_mobile_review_url(self, review_task_id: str, raw_token: str) -> str:
         path = f"/mobile/review/{quote(review_task_id)}?token={quote(raw_token)}"
@@ -1001,8 +1142,21 @@ class ReviewTokenService:
         secret = os.getenv("REVIEW_TOKEN_SECRET", "").strip()
         if not secret:
             raise ValidationError("REVIEW_TOKEN_SECRET is required")
-        digest = hmac.new(secret.encode("utf-8"), raw_token.encode("utf-8"), hashlib.sha256)
+        digest = hmac.new(
+            secret.encode("utf-8"), raw_token.encode("utf-8"), hashlib.sha256
+        )
         return digest.hexdigest()
+
+    def _derive_raw_token(self, review_task_id: str, token_id: str) -> str:
+        secret = os.getenv("REVIEW_TOKEN_SECRET", "").strip()
+        if not secret:
+            raise ValidationError("REVIEW_TOKEN_SECRET is required")
+        digest = hmac.new(
+            secret.encode("utf-8"),
+            f"incident-review:v1:{review_task_id}:{token_id}".encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
 
     def _default_expires_at(self, review_task: ReviewTask, now: datetime) -> datetime:
         default_expiry = now + timedelta(hours=24)
@@ -1052,14 +1206,17 @@ class NotificationLogService:
 class NotificationSender(Protocol):
     channel: str
 
-    def send(self, log: NotificationLog, payload: dict[str, object] | None = None) -> NotificationSendResult:
-        ...
+    def send(
+        self, log: NotificationLog, payload: dict[str, object] | None = None
+    ) -> NotificationSendResult: ...
 
 
 class MockNotificationSender:
     channel = "mock"
 
-    def send(self, log: NotificationLog, payload: dict[str, object] | None = None) -> NotificationSendResult:
+    def send(
+        self, log: NotificationLog, payload: dict[str, object] | None = None
+    ) -> NotificationSendResult:
         return NotificationSendResult(
             send_status=NotificationSendStatus.SUCCESS.value,
             sent_at=datetime.now(),
@@ -1072,7 +1229,9 @@ class FailedNotificationSender:
         self.channel = channel
         self.error_message = error_message
 
-    def send(self, log: NotificationLog, payload: dict[str, object] | None = None) -> NotificationSendResult:
+    def send(
+        self, log: NotificationLog, payload: dict[str, object] | None = None
+    ) -> NotificationSendResult:
         return NotificationSendResult(
             send_status=NotificationSendStatus.FAILED.value,
             sent_at=None,
@@ -1084,7 +1243,9 @@ class FailedNotificationSender:
 class FeishuWebhookNotificationSender:
     channel = "feishu"
 
-    def send(self, log: NotificationLog, payload: dict[str, object] | None = None) -> NotificationSendResult:
+    def send(
+        self, log: NotificationLog, payload: dict[str, object] | None = None
+    ) -> NotificationSendResult:
         webhook_url = os.getenv("FEISHU_WEBHOOK_URL", "").strip()
         if not webhook_url:
             return NotificationSendResult(
@@ -1100,7 +1261,10 @@ class FeishuWebhookNotificationSender:
                 send_status=NotificationSendStatus.FAILED.value,
                 sent_at=None,
                 error_message=FEISHU_MESSAGE_TYPE_INVALID,
-                raw_response_json={"error": FEISHU_MESSAGE_TYPE_INVALID, "message_type": message_type},
+                raw_response_json={
+                    "error": FEISHU_MESSAGE_TYPE_INVALID,
+                    "message_type": message_type,
+                },
             )
 
         request_body = self._build_request_body(log, payload, message_type)
@@ -1121,7 +1285,9 @@ class FeishuWebhookNotificationSender:
                 send_status=NotificationSendStatus.FAILED.value,
                 sent_at=None,
                 error_message=f"feishu webhook HTTP {exc.code}",
-                raw_response_json=_feishu_response_summary(status_code=exc.code, response_text=response_text),
+                raw_response_json=_feishu_response_summary(
+                    status_code=exc.code, response_text=response_text
+                ),
             )
         except (TimeoutError, URLError, OSError) as exc:
             return NotificationSendResult(
@@ -1131,7 +1297,9 @@ class FeishuWebhookNotificationSender:
                 raw_response_json={"error_type": type(exc).__name__, "error": str(exc)},
             )
 
-        response_json = _feishu_response_summary(status_code=status_code, response_text=response_text)
+        response_json = _feishu_response_summary(
+            status_code=status_code, response_text=response_text
+        )
         if status_code < 200 or status_code >= 300:
             return NotificationSendResult(
                 send_status=NotificationSendStatus.FAILED.value,
@@ -1150,7 +1318,9 @@ class FeishuWebhookNotificationSender:
         return NotificationSendResult(
             send_status=NotificationSendStatus.SUCCESS.value,
             sent_at=datetime.now(),
-            provider_message_id=str(response_json.get("request_id") or response_json.get("RequestId") or ""),
+            provider_message_id=str(
+                response_json.get("request_id") or response_json.get("RequestId") or ""
+            ),
             raw_response_json=response_json,
         )
 
@@ -1184,11 +1354,20 @@ class ReviewNotificationService:
         self.notification_log_service = NotificationLogService(repository)
         self.sender_factory = sender_factory or NotificationSenderFactory()
 
-    def create_initial_notification(self, review_task: ReviewTask) -> NotificationLog | None:
-        recipient_type = os.getenv("DEFAULT_NOTIFICATION_RECIPIENT_TYPE", "role").strip() or "role"
-        recipient = os.getenv("DEFAULT_NOTIFICATION_RECIPIENT", "operations").strip() or "operations"
+    def create_initial_notification(
+        self, review_task: ReviewTask
+    ) -> NotificationLog | None:
+        recipient_type = (
+            os.getenv("DEFAULT_NOTIFICATION_RECIPIENT_TYPE", "role").strip() or "role"
+        )
+        recipient = (
+            os.getenv("DEFAULT_NOTIFICATION_RECIPIENT", "operations").strip()
+            or "operations"
+        )
         channel = os.getenv("DEFAULT_NOTIFICATION_CHANNEL", "mock").strip() or "mock"
-        message, send_payload, pre_send_failure = self._build_initial_notification_content(review_task, channel)
+        message, send_payload, pre_send_failure = (
+            self._build_initial_notification_content(review_task, channel)
+        )
         return self._create_notification(
             review_task,
             recipient_type=recipient_type,
@@ -1200,9 +1379,16 @@ class ReviewNotificationService:
             pre_send_failure=pre_send_failure,
         )
 
-    def create_expired_notification(self, review_task: ReviewTask, *, timeout_at: datetime) -> NotificationLog | None:
-        recipient_type = os.getenv("DEFAULT_NOTIFICATION_RECIPIENT_TYPE", "role").strip() or "role"
-        recipient = os.getenv("DEFAULT_NOTIFICATION_RECIPIENT", "operations").strip() or "operations"
+    def create_expired_notification(
+        self, review_task: ReviewTask, *, timeout_at: datetime
+    ) -> NotificationLog | None:
+        recipient_type = (
+            os.getenv("DEFAULT_NOTIFICATION_RECIPIENT_TYPE", "role").strip() or "role"
+        )
+        recipient = (
+            os.getenv("DEFAULT_NOTIFICATION_RECIPIENT", "operations").strip()
+            or "operations"
+        )
         channel = os.getenv("DEFAULT_NOTIFICATION_CHANNEL", "mock").strip() or "mock"
         return self._create_notification(
             review_task,
@@ -1210,7 +1396,9 @@ class ReviewNotificationService:
             recipient=recipient,
             channel=channel,
             dedupe_suffix="expired",
-            message=_build_expired_review_notification_message(review_task, timeout_at=timeout_at),
+            message=_build_expired_review_notification_message(
+                review_task, timeout_at=timeout_at
+            ),
         )
 
     def _create_notification(
@@ -1280,10 +1468,15 @@ class ReviewNotificationService:
                 )
             return (
                 f"{message} | mobile_review_url_created=true",
-                _build_feishu_review_notification_payload(review_task, token.mobile_review_url),
+                _build_feishu_review_notification_payload(
+                    review_task, token.mobile_review_url
+                ),
                 "",
             )
-        if os.getenv("ENABLE_MOBILE_REVIEW_URL_IN_NOTIFICATION", "").strip().lower() != "true":
+        if (
+            os.getenv("ENABLE_MOBILE_REVIEW_URL_IN_NOTIFICATION", "").strip().lower()
+            != "true"
+        ):
             return message, None, ""
         try:
             ReviewTokenService(self.repository).create_token(
@@ -1315,9 +1508,13 @@ class ExecutionRuntimeService:
         self.runtime_task_service = RuntimeTaskService(repository)
         self.execution_service = ExecutionSimulationService()
 
-    def simulate_pending(self, *, executor_name: str = "mock_executor") -> tuple[list[Task], list[ExecutionLog]]:
+    def simulate_pending(
+        self, *, executor_name: str = "mock_executor"
+    ) -> tuple[list[Task], list[ExecutionLog]]:
         tasks = self.repository.list_tasks(status=TaskStatus.PENDING)
-        updated_tasks, logs = self.execution_service.simulate(tasks, executor_name=executor_name)
+        updated_tasks, logs = self.execution_service.simulate(
+            tasks, executor_name=executor_name
+        )
         self.repository.insert_execution_logs(logs)
         for task in updated_tasks:
             self.runtime_task_service.change_status(
@@ -1391,7 +1588,9 @@ class ReviewReminderSummary:
 
 def _resolve_scope(task: Task, trade_date: date | None) -> tuple[str, str, str | None]:
     if task.scope_key and task.scope_type:
-        internal_sku = None if task.internal_sku == "__operation__" else task.internal_sku
+        internal_sku = (
+            None if task.internal_sku == "__operation__" else task.internal_sku
+        )
         return task.scope_type, task.scope_key, internal_sku
     if task.internal_sku in (None, "", "__operation__"):
         scope_key = trade_date.isoformat() if trade_date is not None else "global"
@@ -1470,7 +1669,9 @@ def _review_task_from_source(
             "task_id": task.task_id,
             "action_type": task.action_type.value,
             "task_status": task.task_status.value,
-            "target_price": str(task.target_price) if isinstance(task.target_price, Decimal) else task.target_price,
+            "target_price": str(task.target_price)
+            if isinstance(task.target_price, Decimal)
+            else task.target_price,
             "target_status": task.target_status,
             "decision_trace": task.decision_trace,
         },
@@ -1499,8 +1700,7 @@ def _review_task_from_execution_group(
     resolved_trade_date = representative.trade_date or trade_date
     resolved_group_id = task_group_id(representative)
     review_created_at = manual_review_created_at or max(
-        task.updated_at or task.created_at
-        for task in ordered_actionable
+        task.updated_at or task.created_at for task in ordered_actionable
     )
     platforms = {
         str(task.platform_name or "").strip()
@@ -1544,16 +1744,10 @@ def _review_task_from_execution_group(
             "task_group_id": resolved_group_id,
             "task_id": representative.task_id,
             "task_ids": [task.task_id for task in ordered_members],
-            "affected_task_ids": [
-                task.task_id for task in ordered_actionable
-            ],
+            "affected_task_ids": [task.task_id for task in ordered_actionable],
             "task_count": len(ordered_members),
             "affected_task_count": len(ordered_actionable),
-            "action_type": (
-                action_types[0]
-                if len(action_types) == 1
-                else "mixed"
-            ),
+            "action_type": (action_types[0] if len(action_types) == 1 else "mixed"),
             "action_types": action_types,
             "task_status": TaskStatus.MANUAL_REVIEW.value,
             "items": [
@@ -1589,7 +1783,9 @@ def _build_feishu_sign(timestamp: str, secret: str) -> str:
     return build_feishu_signature(timestamp, secret)
 
 
-def _feishu_response_summary(*, status_code: int, response_text: str) -> dict[str, object]:
+def _feishu_response_summary(
+    *, status_code: int, response_text: str
+) -> dict[str, object]:
     try:
         parsed = json.loads(response_text) if response_text else {}
     except json.JSONDecodeError:
@@ -1615,15 +1811,21 @@ def _feishu_error_message(response_json: dict[str, object]) -> str:
     return str(message)
 
 
-def _build_feishu_review_notification_payload(review_task: ReviewTask, mobile_review_url: str) -> dict[str, object]:
+def _build_feishu_review_notification_payload(
+    review_task: ReviewTask, mobile_review_url: str
+) -> dict[str, object]:
     return {
         "text": _build_feishu_review_notification_text(review_task, mobile_review_url),
         "review_type": review_task.review_type,
         "review_type_label": _feishu_review_type_label(review_task.review_type),
-        "trade_date": review_task.trade_date.isoformat() if review_task.trade_date else "-",
+        "trade_date": review_task.trade_date.isoformat()
+        if review_task.trade_date
+        else "-",
         "scope_type": review_task.scope_type,
         "scope_key": review_task.scope_key,
-        "scope_label": _feishu_scope_label(review_task.scope_type, review_task.scope_key),
+        "scope_label": _feishu_scope_label(
+            review_task.scope_type, review_task.scope_key
+        ),
         "required_by": _format_feishu_datetime(review_task.required_by),
         "reason": _truncate_for_feishu(review_task.reason, 200),
         "mobile_review_url": mobile_review_url,
@@ -1662,9 +1864,21 @@ def _build_feishu_review_notification_post_body(
     if values.get("notification_kind") == "shadowbot_login_verification":
         content: list[list[dict[str, str]]] = [
             [{"tag": "text", "text": f"平台：{values.get('platform_name') or '-'}"}],
-            [{"tag": "text", "text": f"执行尝试：{values.get('execution_attempt_id') or '-'}"}],
+            [
+                {
+                    "tag": "text",
+                    "text": f"执行尝试：{values.get('execution_attempt_id') or '-'}",
+                }
+            ],
             [{"tag": "text", "text": f"截止时间：{values.get('required_by') or '-'}"}],
-            [{"tag": "text", "text": str(values.get("action") or "请在已打开的小程序中完成手机验证码。")}],
+            [
+                {
+                    "tag": "text",
+                    "text": str(
+                        values.get("action") or "请在已打开的小程序中完成手机验证码。"
+                    ),
+                }
+            ],
         ]
         return {
             "msg_type": "post",
@@ -1675,7 +1889,12 @@ def _build_feishu_review_notification_post_body(
             [{"tag": "text", "text": "说明：这是由 /system 手动触发的测试消息。"}],
             [{"tag": "text", "text": "说明：不关联任何复核任务，不包含手机复核链接。"}],
             [{"tag": "text", "text": f"触发时间：{values.get('triggered_at') or '-'}"}],
-            [{"tag": "text", "text": f"当前通知模式：{values.get('notification_mode') or 'feishu'}"}],
+            [
+                {
+                    "tag": "text",
+                    "text": f"当前通知模式：{values.get('notification_mode') or 'feishu'}",
+                }
+            ],
         ]
         return {
             "msg_type": "post",
@@ -1689,11 +1908,15 @@ def _build_feishu_review_notification_post_body(
             },
         }
     review_type = str(values.get("review_type") or "-")
-    review_type_label = str(values.get("review_type_label") or _feishu_review_type_label(review_type))
+    review_type_label = str(
+        values.get("review_type_label") or _feishu_review_type_label(review_type)
+    )
     trade_date = str(values.get("trade_date") or "-")
     scope_label = str(
         values.get("scope_label")
-        or _feishu_scope_label(str(values.get("scope_type") or "-"), str(values.get("scope_key") or "-"))
+        or _feishu_scope_label(
+            str(values.get("scope_type") or "-"), str(values.get("scope_key") or "-")
+        )
     )
     required_by = str(values.get("required_by") or "-")
     reason = _truncate_for_feishu(values.get("reason") or log.message, 200)
@@ -1706,7 +1929,15 @@ def _build_feishu_review_notification_post_body(
         [{"tag": "text", "text": f"原因：{reason}"}],
     ]
     if mobile_review_url:
-        content.append([{"tag": "a", "text": FEISHU_POST_REVIEW_LINK_TEXT, "href": mobile_review_url}])
+        content.append(
+            [
+                {
+                    "tag": "a",
+                    "text": FEISHU_POST_REVIEW_LINK_TEXT,
+                    "href": mobile_review_url,
+                }
+            ]
+        )
     return {
         "msg_type": "post",
         "content": {
@@ -1720,7 +1951,9 @@ def _build_feishu_review_notification_post_body(
     }
 
 
-def _build_feishu_review_notification_text(review_task: ReviewTask, mobile_review_url: str) -> str:
+def _build_feishu_review_notification_text(
+    review_task: ReviewTask, mobile_review_url: str
+) -> str:
     trade_date = review_task.trade_date.isoformat() if review_task.trade_date else "-"
     required_by = _format_feishu_datetime(review_task.required_by)
     reason = _truncate_for_feishu(review_task.reason, 200)
@@ -1783,7 +2016,9 @@ def _build_review_notification_message(review_task: ReviewTask) -> str:
     return message
 
 
-def _build_expired_review_notification_message(review_task: ReviewTask, *, timeout_at: datetime) -> str:
+def _build_expired_review_notification_message(
+    review_task: ReviewTask, *, timeout_at: datetime
+) -> str:
     trade_date = review_task.trade_date.isoformat() if review_task.trade_date else "-"
     required_by = _format_feishu_datetime(review_task.required_by)
     return (

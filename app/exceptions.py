@@ -73,3 +73,19 @@ class NotificationIdempotencyConflictError(NotificationDeliveryError):
 
 class NotificationChannelMismatchError(NotificationDeliveryError):
     """A provider adapter does not match the persisted notification channel."""
+
+
+class IncidentError(Exception):
+    """Base error for operational Incident commands."""
+
+
+class IncidentNotFoundError(IncidentError):
+    """The requested Incident does not exist."""
+
+
+class IncidentTransitionError(IncidentError):
+    """The requested Incident lifecycle transition is not allowed."""
+
+
+class IncidentIdempotencyConflictError(IncidentError):
+    """An Incident event key was reused for different immutable content."""

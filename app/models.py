@@ -6,6 +6,9 @@ from decimal import Decimal
 from typing import Any
 
 from app.enums import (
+    IncidentCategory,
+    IncidentEventType,
+    IncidentStatus,
     ListingStrategy,
     PricingMethod,
     PricingSource,
@@ -680,6 +683,79 @@ class NotificationOutbox:
         """Compatibility alias for the v5 notification log vocabulary."""
 
         return self.recipient_ref
+
+
+@dataclass(slots=True)
+class OperationalIncident:
+    """Current operational view backed by the append-only incident event chain."""
+
+    incident_id: str
+    dedupe_key: str
+    category: IncidentCategory
+    source_type: str
+    source_ref_id: str
+    severity: str
+    incident_status: IncidentStatus
+    blocks_finalization: bool
+    platform_name: str | None
+    platform_trade_date: date | None
+    seller_operation_date: date | None
+    subject_type: str
+    subject_key: str
+    title: str
+    description: str
+    first_detected_at: datetime
+    last_detected_at: datetime
+    resolved_at: datetime | None
+    occurrence_count: int
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(slots=True)
+class OperationalIncidentEvent:
+    """Immutable fact appended to an operational incident."""
+
+    event_id: str
+    event_key: str
+    incident_id: str
+    event_type: IncidentEventType
+    occurred_at: datetime
+    source_type: str
+    source_ref_id: str
+    from_status: IncidentStatus | None
+    to_status: IncidentStatus | None
+    severity: str
+    event_payload: dict[str, Any]
+    created_at: datetime
+
+
+@dataclass(slots=True)
+class IncidentMutationResult:
+    incident: OperationalIncident
+    event: OperationalIncidentEvent
+    replayed: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class EmergencyOfflinePolicy:
+    """One immutable version of the narrow emergency-offline policy."""
+
+    policy_version: str
+    platform_name: str
+    emergency_ratio: Decimal
+    approved_by: str | None
+    approved_at: datetime | None
+    created_at: datetime
+    retired_at: datetime | None
+
+    @property
+    def is_approved(self) -> bool:
+        return self.approved_at is not None
+
+    @property
+    def is_active(self) -> bool:
+        return self.is_approved and self.retired_at is None
 
 
 @dataclass(slots=True)

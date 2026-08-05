@@ -4,29 +4,43 @@ import hashlib
 import json
 import msvcrt
 import os
+import re
 import socket
 import threading
 import time
 import uuid
-import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 try:
+    from app.emergency_offline_fence import (
+        validate_emergency_authorization_binding,
+    )
+except ImportError:
+    try:
+        from .emergency_offline_fence import (
+            validate_emergency_authorization_binding,
+        )
+    except ImportError:
+        from emergency_offline_fence import (
+            validate_emergency_authorization_binding,
+        )
+
+try:
     from app.shadowbot_contract_primitives import (
+        ORDER_SCAN_CONTRACT_VERSION,
+        ORDER_SCAN_RESULT_SCHEMA_VERSION,
         build_order_scan_failure_result,
         build_v4_recovery_result,
         canonical_positive_price,
         derive_v4_batch_semantics,
         derive_v5_batch_semantics,
-        normalize_order_scan_request,
         normalize_contract_grade,
         normalize_contract_sku,
         normalize_contract_text,
-        sha256_json,
+        normalize_order_scan_request,
         order_scan_instruction_hash,
-        ORDER_SCAN_CONTRACT_VERSION,
-        ORDER_SCAN_RESULT_SCHEMA_VERSION,
+        sha256_json,
         v4_result_counts,
         v4_result_item_skeleton,
         v5_result_counts,
@@ -34,38 +48,38 @@ try:
 except ImportError:
     try:
         from .shadowbot_contract_primitives import (
+            ORDER_SCAN_CONTRACT_VERSION,
+            ORDER_SCAN_RESULT_SCHEMA_VERSION,
             build_order_scan_failure_result,
             build_v4_recovery_result,
             canonical_positive_price,
             derive_v4_batch_semantics,
             derive_v5_batch_semantics,
-            normalize_order_scan_request,
             normalize_contract_grade,
             normalize_contract_sku,
             normalize_contract_text,
-            sha256_json,
+            normalize_order_scan_request,
             order_scan_instruction_hash,
-            ORDER_SCAN_CONTRACT_VERSION,
-            ORDER_SCAN_RESULT_SCHEMA_VERSION,
+            sha256_json,
             v4_result_counts,
             v4_result_item_skeleton,
             v5_result_counts,
         )
     except ImportError:
         from shadowbot_contract_primitives import (
+            ORDER_SCAN_CONTRACT_VERSION,
+            ORDER_SCAN_RESULT_SCHEMA_VERSION,
             build_order_scan_failure_result,
             build_v4_recovery_result,
             canonical_positive_price,
             derive_v4_batch_semantics,
             derive_v5_batch_semantics,
-            normalize_order_scan_request,
             normalize_contract_grade,
             normalize_contract_sku,
             normalize_contract_text,
-            sha256_json,
+            normalize_order_scan_request,
             order_scan_instruction_hash,
-            ORDER_SCAN_CONTRACT_VERSION,
-            ORDER_SCAN_RESULT_SCHEMA_VERSION,
+            sha256_json,
             v4_result_counts,
             v4_result_item_skeleton,
             v5_result_counts,
@@ -418,6 +432,7 @@ def _v5_instruction_hash(request):
         "fault_injection_item_ordinal",
         "source_execution_attempt_id",
         "source_result_id",
+        "emergency_authorization",
         "created_at",
         "expires_at",
     )
@@ -459,6 +474,7 @@ def _v5_validate_request(request):
             "operation_id",
             "gate_summary",
             "development_confirmation",
+            "emergency_authorization",
         ):
             if forbidden in request:
                 raise ValueError("SYNC_STATUS_WRITE_FIELD_FORBIDDEN")
@@ -516,6 +532,20 @@ def _v5_validate_request(request):
                 or "source_result_id" in request
             ):
                 raise ValueError("LISTING_ACTION_RECONCILE_SOURCE_FORBIDDEN")
+            emergency = request.get("emergency_authorization")
+            if emergency is not None:
+                validate_emergency_authorization_binding(emergency)
+                if (
+                    action_type != "set_offline"
+                    or len(items) != 1
+                    or emergency.get("source_task_id")
+                    != items[0].get("source_task_id")
+                    or emergency.get("platform_name")
+                    != request.get("platform_name")
+                    or emergency.get("internal_sku")
+                    != items[0].get("internal_sku")
+                ):
+                    raise ValueError("EMERGENCY_AUTHORIZATION_SCOPE_MISMATCH")
         else:
             if len(items) != 1:
                 raise ValueError("LISTING_ACTION_RECONCILE_ITEM_COUNT_INVALID")
@@ -524,6 +554,7 @@ def _v5_validate_request(request):
                 "development_confirmation",
                 "fault_injection",
                 "fault_injection_item_ordinal",
+                "emergency_authorization",
             ):
                 if forbidden in request:
                     raise ValueError("LISTING_ACTION_RECONCILE_WRITE_FIELD_FORBIDDEN")

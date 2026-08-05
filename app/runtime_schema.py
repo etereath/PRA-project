@@ -13,8 +13,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-
-LATEST_RUNTIME_SCHEMA_VERSION = 14
+LATEST_RUNTIME_SCHEMA_VERSION = 16
 RUNTIME_SCHEMA_VERSIONS = tuple(range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1))
 
 REQUIRED_RUNTIME_TABLES = frozenset(
@@ -60,7 +59,9 @@ REQUIRED_RUNTIME_TABLES = frozenset(
         "platform_trade_day_summary_events",
         "platform_trade_day_summary_inputs",
         "operational_incidents",
+        "operational_incident_events",
         "incident_notification_state",
+        "emergency_offline_policies",
     }
 )
 
@@ -73,6 +74,8 @@ V14_APPEND_ONLY_TABLES = (
     "platform_trade_day_summary_events",
     "platform_trade_day_summary_inputs",
 )
+
+V15_APPEND_ONLY_TABLES = ("operational_incident_events",)
 
 V7_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "listing_status": (
@@ -625,6 +628,36 @@ V14_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
     ),
 }
 
+V15_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
+    "operational_incidents": ("occurrence_count",),
+    "operational_incident_events": (
+        "event_id",
+        "event_key",
+        "incident_id",
+        "event_type",
+        "occurred_at",
+        "source_type",
+        "source_ref_id",
+        "from_status",
+        "to_status",
+        "severity",
+        "event_payload_json",
+        "created_at",
+    ),
+}
+
+V16_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
+    "emergency_offline_policies": (
+        "policy_version",
+        "platform_name",
+        "emergency_ratio",
+        "approved_by",
+        "approved_at",
+        "created_at",
+        "retired_at",
+    ),
+}
+
 V14_INDEX_SPECS: Mapping[str, tuple[str, ...]] = {
     "ux_operational_time_policies_current": ("timezone_name",),
     "ix_automation_jobs_type_enabled": ("job_type", "enabled"),
@@ -674,6 +707,19 @@ V14_INDEX_SPECS: Mapping[str, tuple[str, ...]] = {
     "ix_incident_notification_state_due": ("next_notification_at",),
 }
 
+V15_INDEX_SPECS: Mapping[str, tuple[str, ...]] = {
+    "ux_operational_incident_events_key": ("event_key",),
+    "ix_operational_incident_events_incident": (
+        "incident_id",
+        "occurred_at",
+        "event_id",
+    ),
+}
+
+V16_INDEX_SPECS: Mapping[str, tuple[str, ...]] = {
+    "ux_emergency_offline_policies_active": ("platform_name",),
+}
+
 V14_TASK_ORIGIN_VALUES = frozenset(
     {"MANUAL", "AUTOMATION", "SYSTEM_EMERGENCY", "LEGACY"}
 )
@@ -706,6 +752,30 @@ V14_INCIDENT_CATEGORY_VALUES = frozenset(
         "SALES_ESTIMATE_LOW_CONFIDENCE",
         "NOTIFICATION_FAILURE",
         "WRITE_UNKNOWN",
+    }
+)
+V15_INCIDENT_CATEGORY_VALUES = V14_INCIDENT_CATEGORY_VALUES | frozenset(
+    {
+        "AUTOMATION_SERVICE",
+        "RUNTIME_STORAGE",
+        "QUEUE_IMPORT",
+        "TRADE_DAY_TIME",
+        "LISTING_STATE",
+        "MASTER_DATA",
+        "SETTLEMENT_PROCESSING",
+        "REVIEW_CHANNEL",
+    }
+)
+V15_INCIDENT_EVENT_TYPE_VALUES = frozenset(
+    {
+        "DETECTED",
+        "REDETECTED",
+        "STATUS_CHANGED",
+        "SEVERITY_CHANGED",
+        "ACK",
+        "RECOVERY_RECORDED",
+        "REVIEW_RECORDED",
+        "TASK_RECORDED",
     }
 )
 V14_INCIDENT_STATUS_VALUES = frozenset(
@@ -953,6 +1023,8 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
             **V12_REQUIRED_COLUMNS,
             **V13_REQUIRED_COLUMNS,
             **V14_REQUIRED_COLUMNS,
+            **V15_REQUIRED_COLUMNS,
+            **V16_REQUIRED_COLUMNS,
         }.items():
             if table not in tables:
                 continue
@@ -1014,6 +1086,12 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
             missing_index_names.update(
                 _check_v14_constraints(connection, constraint_errors)
             )
+            missing_index_names.update(
+                _check_v15_constraints(connection, constraint_errors)
+            )
+            missing_index_names.update(
+                _check_v16_constraints(connection, constraint_errors)
+            )
         missing_indexes = tuple(sorted(missing_index_names))
 
         ok = not (
@@ -1048,6 +1126,7 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
                     | frozenset(V12_INDEX_SPECS)
                     | frozenset(V13_INDEX_SPECS)
                     | frozenset(V14_INDEX_SPECS)
+                    | frozenset(V15_INDEX_SPECS)
                 )
             ),
             constraint_errors=(),
@@ -1630,7 +1709,7 @@ def _check_v14_constraints(
     _check_exact_status_values(
         incident_sql,
         column="category",
-        expected=V14_INCIDENT_CATEGORY_VALUES,
+        expected=V15_INCIDENT_CATEGORY_VALUES,
         label="operational_incidents.category",
         errors=errors,
     )
@@ -1784,6 +1863,176 @@ def _check_v14_constraints(
             "CN_SINGLE_PLATFORM_2026_V1 operational time policy is missing "
             "or has incorrect frozen semantics"
         )
+
+    return tuple(sorted(missing_indexes))
+
+
+def _check_v15_constraints(
+    connection: sqlite3.Connection,
+    errors: list[str],
+) -> tuple[str, ...]:
+    missing_indexes: list[str] = []
+    for index_name, expected_columns in V15_INDEX_SPECS.items():
+        row = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index_name,),
+        ).fetchone()
+        if row is None:
+            missing_indexes.append(index_name)
+            continue
+        actual_columns = tuple(
+            str(index_row[2])
+            for index_row in connection.execute(
+                f"PRAGMA index_info('{index_name}')"
+            ).fetchall()
+        )
+        if actual_columns != expected_columns:
+            errors.append(
+                f"{index_name} columns expected {expected_columns}, "
+                f"actual {actual_columns}"
+            )
+
+    index_rows = {
+        str(row[1]): row
+        for row in connection.execute(
+            "PRAGMA index_list('operational_incident_events')"
+        ).fetchall()
+    }
+    event_key_index = index_rows.get("ux_operational_incident_events_key")
+    if event_key_index is not None and (
+        int(event_key_index[2]) != 1 or int(event_key_index[4]) != 0
+    ):
+        errors.append(
+            "ux_operational_incident_events_key must be unique and non-partial"
+        )
+
+    incident_sql = _table_sql(connection, "operational_incidents")
+    _check_exact_status_values(
+        incident_sql,
+        column="category",
+        expected=V15_INCIDENT_CATEGORY_VALUES,
+        label="operational_incidents.category",
+        errors=errors,
+    )
+    if not re.search(
+        r"occurrence_count\s+[^,]*CHECK\s*\(\s*occurrence_count\s*>=\s*1\s*\)",
+        incident_sql,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        errors.append("operational_incidents.occurrence_count must be >= 1")
+
+    event_sql = _table_sql(connection, "operational_incident_events")
+    _check_exact_status_values(
+        event_sql,
+        column="event_type",
+        expected=V15_INCIDENT_EVENT_TYPE_VALUES,
+        label="operational_incident_events.event_type",
+        errors=errors,
+    )
+    if "json_valid(event_payload_json)" not in event_sql.replace(" ", ""):
+        compact_event_sql = re.sub(r"\s+", "", event_sql).lower()
+        if "json_valid(event_payload_json)" not in compact_event_sql:
+            errors.append(
+                "operational_incident_events.event_payload_json must be valid JSON"
+            )
+
+    actual_foreign_keys = {
+        (str(row[3]), str(row[2]), str(row[4]))
+        for row in connection.execute(
+            "PRAGMA foreign_key_list('operational_incident_events')"
+        ).fetchall()
+    }
+    required_foreign_key = (
+        "incident_id",
+        "operational_incidents",
+        "incident_id",
+    )
+    if required_foreign_key not in actual_foreign_keys:
+        errors.append(
+            "missing foreign key operational_incident_events.incident_id -> "
+            "operational_incidents(incident_id)"
+        )
+
+    for table_name in V15_APPEND_ONLY_TABLES:
+        for suffix in ("update", "delete"):
+            trigger_name = f"trg_{table_name}_append_only_{suffix}"
+            trigger_row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+                (trigger_name,),
+            ).fetchone()
+            trigger_sql = str(trigger_row[0] or "") if trigger_row else ""
+            if "append-only" not in trigger_sql.lower():
+                errors.append(f"missing trigger {trigger_name}")
+
+    return tuple(sorted(missing_indexes))
+
+
+def _check_v16_constraints(
+    connection: sqlite3.Connection,
+    errors: list[str],
+) -> tuple[str, ...]:
+    missing_indexes: list[str] = []
+    for index_name, expected_columns in V16_INDEX_SPECS.items():
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index_name,),
+        ).fetchone()
+        if row is None:
+            missing_indexes.append(index_name)
+            continue
+        actual_columns = tuple(
+            str(index_row[2])
+            for index_row in connection.execute(
+                f"PRAGMA index_info('{index_name}')"
+            ).fetchall()
+        )
+        if actual_columns != expected_columns:
+            errors.append(
+                f"{index_name} columns expected {expected_columns}, "
+                f"actual {actual_columns}"
+            )
+        index_sql = re.sub(r"\s+", " ", str(row[0] or "")).upper()
+        if (
+            "UNIQUE INDEX" not in index_sql
+            or "APPROVED_AT IS NOT NULL" not in index_sql
+            or "RETIRED_AT IS NULL" not in index_sql
+        ):
+            errors.append(
+                "ux_emergency_offline_policies_active must be a partial unique "
+                "index for approved, non-retired policies"
+            )
+
+    table_sql = re.sub(
+        r"\s+",
+        " ",
+        _table_sql(connection, "emergency_offline_policies"),
+    ).upper()
+    if not re.search(
+        r"CHECK\s*\(\s*EMERGENCY_RATIO\s*=\s*'0\.80'\s*\)",
+        table_sql,
+    ):
+        errors.append(
+            "emergency_offline_policies.emergency_ratio must be fixed at 0.80"
+        )
+    if "APPROVED_BY IS NULL AND APPROVED_AT IS NULL" not in table_sql:
+        errors.append(
+            "emergency_offline_policies approval fields must be coherent"
+        )
+    if "RETIRED_AT IS NULL OR APPROVED_AT IS NOT NULL" not in table_sql:
+        errors.append(
+            "emergency_offline_policies cannot retire an unapproved policy"
+        )
+
+    for trigger_name in (
+        "trg_emergency_offline_policies_lifecycle_update",
+        "trg_emergency_offline_policies_no_delete",
+    ):
+        row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            (trigger_name,),
+        ).fetchone()
+        if row is None or "emergency policy" not in str(row[0] or "").lower():
+            errors.append(f"missing trigger {trigger_name}")
 
     return tuple(sorted(missing_indexes))
 

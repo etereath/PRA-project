@@ -7,7 +7,6 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SOURCE_DIR = PROJECT_ROOT / "shadowbot" / "test2"
 REQUIRED_HOST_FILES = ("package.py", "selectorsV2.xml")
@@ -51,6 +50,10 @@ def sync(app_dir: Path, *, check_only: bool) -> list[dict[str, str]]:
             app_dir / "shadowbot_contract_primitives.py",
         ),
         (SOURCE_DIR / "vertical_slice_read_price.py", app_dir / "vertical_slice_read_price.py"),
+        (
+            PROJECT_ROOT / "app" / "emergency_offline_fence.py",
+            app_dir / "emergency_offline_fence.py",
+        ),
         (SOURCE_DIR / "shadowbot_queue_worker.py", app_dir / "shadowbot_queue_worker.py"),
         (
             SOURCE_DIR / "product_identity_mapping.json",

@@ -42,7 +42,6 @@ from app.shadowbot_listing_contract import (
     v5_result_counts,
 )
 
-
 MAX_ITEMS = 50
 EXECUTION_PROFILES = frozenset({"development", "production"})
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}")
@@ -233,6 +232,7 @@ def build_listing_action_request(
     ttl_minutes: int = 30,
     fault_injection: str = "",
     fault_injection_item_ordinal: int | None = None,
+    emergency_authorization: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     validate_listing_action_manifest(manifest)
     profile = str(execution_profile or "").strip().lower()
@@ -306,6 +306,27 @@ def build_listing_action_request(
         request["operation_id"] = batch_operation_id
         request["gate_summary"] = json.loads(
             json.dumps(gate_summary, ensure_ascii=False)
+        )
+    if emergency_authorization is not None:
+        if action != "set_offline" or len(request["items"]) != 1:
+            raise ValidationError(
+                "SYSTEM_EMERGENCY 只允许单商品 SET_OFFLINE 请求。"
+            )
+        from app.emergency_offline_fence import (
+            validate_emergency_authorization_binding,
+        )
+
+        validate_emergency_authorization_binding(emergency_authorization)
+        if (
+            emergency_authorization["source_task_id"]
+            != request["items"][0]["source_task_id"]
+            or emergency_authorization["platform_name"] != request["platform_name"]
+            or emergency_authorization["internal_sku"]
+            != request["items"][0]["internal_sku"]
+        ):
+            raise ValidationError("SYSTEM_EMERGENCY 授权与 v5 商品项不匹配。")
+        request["emergency_authorization"] = json.loads(
+            json.dumps(emergency_authorization, ensure_ascii=False)
         )
     if development_confirmation is not None:
         development_confirmation["confirmed_at"] = now.isoformat()
@@ -474,6 +495,7 @@ def compute_listing_instruction_hash(request: dict[str, Any]) -> str:
             "manifest_sha256",
             "gate_summary",
             "development_confirmation",
+            "emergency_authorization",
             "applet_uri",
             "window_title",
             "capture_evidence",
@@ -481,6 +503,7 @@ def compute_listing_instruction_hash(request: dict[str, Any]) -> str:
             "fault_injection_item_ordinal",
             "source_execution_attempt_id",
             "source_result_id",
+            "emergency_authorization",
             "created_at",
             "expires_at",
         )
@@ -524,6 +547,7 @@ def validate_listing_action_request(
         "created_at",
         "expires_at",
         "instruction_hash",
+        "emergency_authorization",
     }
     _reject_unexpected(request, allowed, "v5 request")
     if request.get("schema_version") != V5_REQUEST_SCHEMA_VERSION:
@@ -600,6 +624,23 @@ def validate_listing_action_request(
             ):
                 if forbidden in request:
                     raise ValidationError("COMMIT 请求不得携带 RECONCILE 来源字段。")
+            emergency = request.get("emergency_authorization")
+            if emergency is not None:
+                from app.emergency_offline_fence import (
+                    validate_emergency_authorization_binding,
+                )
+
+                validate_emergency_authorization_binding(emergency)
+                if (
+                    action != "set_offline"
+                    or len(items) != 1
+                    or emergency["source_task_id"] != items[0]["source_task_id"]
+                    or emergency["platform_name"] != platform
+                    or emergency["internal_sku"] != items[0]["internal_sku"]
+                ):
+                    raise ValidationError(
+                        "SYSTEM_EMERGENCY 授权与 v5 请求不匹配。"
+                    )
         else:
             if len(items) != 1:
                 raise ValidationError("RECONCILE 请求必须且只能包含一个商品。")
@@ -608,6 +649,7 @@ def validate_listing_action_request(
                 "development_confirmation",
                 "fault_injection",
                 "fault_injection_item_ordinal",
+                "emergency_authorization",
             ):
                 if forbidden in request:
                     raise ValidationError("RECONCILE 请求包含写入或测试字段。")

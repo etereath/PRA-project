@@ -12,6 +12,7 @@ import pytest
 from app.enums import (
     DataQualityLevel,
     FactSource,
+    IncidentCategory,
     SellerPhase,
     SummaryStatus,
 )
@@ -21,6 +22,10 @@ from app.repositories.operational_summary_repository import (
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.trade_day_summary import TradeDaySummaryService
+from app.services.incident_management import (
+    IncidentDetection,
+    IncidentManagementService,
+)
 
 
 class AdvancingClock:
@@ -99,6 +104,55 @@ def _insert_blocking_incident(
                 f"summary-blocker:{incident_id}",
                 summary_id,
                 summary_id,
+                now,
+                now,
+                now,
+                now,
+            ),
+        )
+
+
+def _insert_scoped_blocking_incident(
+    runtime: SQLiteRuntimeRepository,
+    *,
+    incident_id: str,
+    category: str = "ORDER_DATA_INCONSISTENT",
+    platform_name: str = "platform",
+    platform_trade_date: str = "2026-07-29",
+    subject_type: str = "PLATFORM",
+    subject_key: str = "platform",
+    source_type: str = "ORDER_SCAN",
+    source_ref_id: str = "order-scan-run",
+    severity: str = "S2",
+) -> None:
+    now = "2026-07-29T12:00:00+00:00"
+    with closing(runtime.connect_write()) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO operational_incidents(
+                incident_id, dedupe_key, category,
+                source_type, source_ref_id,
+                severity, incident_status, blocks_finalization,
+                platform_name, platform_trade_date,
+                subject_type, subject_key, title,
+                first_detected_at, last_detected_at,
+                created_at, updated_at
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, 'OPEN', 1, ?, ?, ?, ?,
+                'scoped blocker', ?, ?, ?, ?
+            )
+            """,
+            (
+                incident_id,
+                f"scoped-blocker:{incident_id}",
+                category,
+                source_type,
+                source_ref_id,
+                severity,
+                platform_name,
+                platform_trade_date,
+                subject_type,
+                subject_key,
                 now,
                 now,
                 now,
@@ -291,7 +345,7 @@ def test_finalization_is_blocked_by_open_s3_incident(
         incident_id="INCIDENT-1",
     )
 
-    with pytest.raises(ValueError, match="blocking S3/S4"):
+    with pytest.raises(ValueError, match="blocking operational incidents"):
         _finalize(service, summary_id)
 
 
@@ -361,11 +415,190 @@ def test_finalization_rechecks_concurrent_incident_in_write_transaction(
         transition_after_concurrent_insert,
     )
 
-    with pytest.raises(ValueError, match="blocking S3/S4"):
+    with pytest.raises(ValueError, match="blocking operational incidents"):
         _finalize(service, summary_id)
     persisted = repository.get_summary(summary_id)
     assert persisted is not None
     assert persisted.summary_status is SummaryStatus.RECONCILED
+
+
+def test_finalization_matches_platform_incident_without_summary_id(
+    summary_service,
+) -> None:
+    service, _, runtime = summary_service
+    _insert_scoped_blocking_incident(
+        runtime,
+        incident_id="INCIDENT-PLATFORM-PREEXISTING",
+    )
+    summary_id = _create_provisional(service).summary.summary_id
+    _observe(service, summary_id)
+    _reconcile(service, summary_id)
+
+    with pytest.raises(ValueError, match="blocking operational incidents"):
+        _finalize(service, summary_id)
+
+
+def _create_scoped_provisional(
+    service: TradeDaySummaryService,
+    *,
+    scope_type: str,
+    scope_key: str,
+):
+    return service.create_provisional(
+        platform_name="platform",
+        platform_trade_date=date(2026, 7, 29),
+        seller_operation_date=date(2026, 7, 30),
+        seller_phase=SellerPhase.NORMAL_SALES,
+        scope_type=scope_type,
+        scope_key=scope_key,
+        fact_source=FactSource.SCAN_ESTIMATED,
+        quality_level=DataQualityLevel.SCAN_ESTIMATED_HIGH,
+        sold_qty=3,
+        order_count=None,
+        transaction_amount_total=None,
+        quality_reason="scoped fixture",
+        source_proportions={"SCAN_ESTIMATED": 1.0},
+        input_manifest_sha256="sha256:scoped-provisional",
+        mapping_version="mapping-v1",
+        algorithm_version="estimate-v1",
+        inputs=_input("scan-1"),
+        changed_by="settlement-service",
+    )
+
+
+def _detect_real_sku_blocker(
+    runtime: SQLiteRuntimeRepository,
+    *,
+    event_key: str,
+    source_ref_id: str,
+) -> None:
+    IncidentManagementService(runtime).detect(
+        IncidentDetection(
+            event_key=event_key,
+            category=IncidentCategory.PRICE_ANOMALY,
+            source_type="PRODUCT_OBSERVATION",
+            source_ref_id=source_ref_id,
+            severity="S4",
+            blocks_finalization=True,
+            platform_name="platform",
+            platform_trade_date=date(2026, 7, 29),
+            seller_operation_date=date(2026, 7, 30),
+            subject_type="internal_sku",
+            subject_key="SKU-1",
+            title="extreme price",
+            description="synthetic",
+            occurred_at=datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc),
+            reason="fixture",
+        )
+    )
+def test_sku_price_incident_does_not_blanket_block_platform_total(
+    summary_service,
+) -> None:
+    service, _, runtime = summary_service
+    summary_id = _create_provisional(service).summary.summary_id
+    _observe(service, summary_id)
+    _reconcile(service, summary_id)
+    _detect_real_sku_blocker(
+        runtime,
+        event_key="detect-platform-independent-sku",
+        source_ref_id="price-observation-1",
+    )
+
+    result = _finalize(service, summary_id)
+
+    assert result.summary.summary_status is SummaryStatus.FINAL
+
+
+def test_real_internal_sku_incident_blocks_matching_sku_summary(
+    summary_service,
+) -> None:
+    service, _, runtime = summary_service
+    summary_id = _create_scoped_provisional(
+        service,
+        scope_type="SKU",
+        scope_key="SKU-1",
+    ).summary.summary_id
+    _observe(service, summary_id)
+    _reconcile(service, summary_id)
+    _detect_real_sku_blocker(
+        runtime,
+        event_key="detect-matching-sku",
+        source_ref_id="unselected-price-observation",
+    )
+
+    with pytest.raises(ValueError, match="blocking operational incidents"):
+        _finalize(service, summary_id)
+
+
+@pytest.mark.parametrize(
+    ("scope_type", "scope_key"),
+    [
+        ("VARIETY", "rose"),
+        ("GRADE", "B"),
+        ("TIME_BUCKET", "12:00-13:00"),
+    ],
+)
+def test_sku_incident_propagates_only_through_selected_aggregate_input(
+    summary_service,
+    scope_type: str,
+    scope_key: str,
+) -> None:
+    service, _, runtime = summary_service
+    summary_id = _create_scoped_provisional(
+        service,
+        scope_type=scope_type,
+        scope_key=scope_key,
+    ).summary.summary_id
+    _observe(service, summary_id)
+    _reconcile(service, summary_id)
+    _detect_real_sku_blocker(
+        runtime,
+        event_key=f"detect-{scope_type.lower()}-selected-input",
+        source_ref_id="order-1",
+    )
+
+    with pytest.raises(ValueError, match="blocking operational incidents"):
+        _finalize(service, summary_id)
+
+
+def test_unselected_sku_incident_does_not_overblock_aggregate_summary(
+    summary_service,
+) -> None:
+    service, _, runtime = summary_service
+    summary_id = _create_scoped_provisional(
+        service,
+        scope_type="GRADE",
+        scope_key="B",
+    ).summary.summary_id
+    _observe(service, summary_id)
+    _reconcile(service, summary_id)
+    _detect_real_sku_blocker(
+        runtime,
+        event_key="detect-grade-unselected-input",
+        source_ref_id="different-order-batch",
+    )
+
+    assert _finalize(service, summary_id).summary.summary_status is SummaryStatus.FINAL
+
+
+def test_selected_input_dependency_blocks_aggregate_finalization(
+    summary_service,
+) -> None:
+    service, _, runtime = summary_service
+    summary_id = _create_provisional(service).summary.summary_id
+    _observe(service, summary_id)
+    _reconcile(service, summary_id)
+    _insert_scoped_blocking_incident(
+        runtime,
+        incident_id="INCIDENT-SKU-ORDER-INPUT",
+        subject_type="SKU",
+        subject_key="SKU-1",
+        source_type="ORDER_INPUT",
+        source_ref_id="order-1",
+    )
+
+    with pytest.raises(ValueError, match="blocking operational incidents"):
+        _finalize(service, summary_id)
 
 
 def test_provisional_material_change_is_atomically_audited(
