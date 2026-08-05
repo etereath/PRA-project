@@ -36,9 +36,11 @@ from app.services.shadowbot_listing_action_contract import (
 )
 from app.services.shadowbot_listing_action_pipeline import (
     _persist_prepared_write_batch,
+    ensure_listing_action_reconcile_attempt,
     import_listing_action_result,
     propose_listing_action_batch,
 )
+from app.services.shadowbot_executor import ShadowBotFileQueueRunner
 from app.services.shadowbot_listing_sync import (
     import_listing_sync_result,
     prepare_listing_sync_batch,
@@ -956,7 +958,8 @@ def _emergency_write_result(
 ) -> dict[str, object]:
     request_item = request["items"][0]
     observed_at = datetime.now(timezone.utc).isoformat()
-    clicked = outcome == "VERIFIED"
+    clicked = outcome in {"VERIFIED", "NEEDS_RECONCILIATION"}
+    unknown = outcome == "NEEDS_RECONCILIATION"
     output = {
         "source_task_id": request_item["source_task_id"],
         "operation_id": request_item["operation_id"],
@@ -965,7 +968,9 @@ def _emergency_write_result(
         "item_payload_sha256": request_item["item_payload_sha256"],
         "operation_result": outcome,
         "detail_effect_state": "NOT_STARTED" if clicked else "NOT_APPLIED",
-        "listing_effect_state": "VERIFIED" if clicked else "NOT_APPLIED",
+        "listing_effect_state": (
+            "UNKNOWN" if unknown else "VERIFIED" if clicked else "NOT_APPLIED"
+        ),
         "detail_save_clicked": False,
         "action_confirm_clicked": clicked,
         "observed_price_before_action": "8.00",
@@ -974,11 +979,23 @@ def _emergency_write_result(
         "observed_inventory_after_detail_save": None,
         "detail_save_clicked_at": None,
         "action_clicked_at": observed_at if clicked else None,
-        "readback_observed_at": observed_at if clicked else None,
-        "actual_price": "8.00" if clicked else None,
-        "actual_inventory": 5 if clicked else None,
-        "error_code": "" if clicked else "EMERGENCY_AUTHORIZATION_REVOKED",
-        "error_message": "" if clicked else "formal Review won before click",
+        "readback_observed_at": observed_at if outcome == "VERIFIED" else None,
+        "actual_price": "8.00" if outcome == "VERIFIED" else None,
+        "actual_inventory": 5 if outcome == "VERIFIED" else None,
+        "error_code": (
+            "CONTROLLED_AFTER_ACTION_CLICK_UNKNOWN"
+            if unknown
+            else ""
+            if clicked
+            else "EMERGENCY_AUTHORIZATION_REVOKED"
+        ),
+        "error_message": (
+            "platform readback unavailable"
+            if unknown
+            else ""
+            if clicked
+            else "formal Review won before click"
+        ),
     }
     counts = v5_result_counts([output])
     result = {
@@ -997,8 +1014,208 @@ def _emergency_write_result(
         "items": [output],
         "counts": counts,
         **derive_v5_batch_semantics(counts),
-        "error_code": "" if clicked else "EMERGENCY_AUTHORIZATION_REVOKED",
-        "error_message": "" if clicked else "formal Review won before click",
+        "error_code": (
+            "CONTROLLED_AFTER_ACTION_CLICK_UNKNOWN"
+            if unknown
+            else ""
+            if clicked
+            else "EMERGENCY_AUTHORIZATION_REVOKED"
+        ),
+        "error_message": (
+            "platform readback unavailable"
+            if unknown
+            else ""
+            if clicked
+            else "formal Review won before click"
+        ),
+        "retryable": False,
+    }
+    result["result_payload_sha256"] = compute_listing_result_hash(result)
+    return result
+
+
+def _prepare_worker_won_unknown_reconcile(
+    tmp_path: Path,
+) -> tuple[
+    SQLiteRuntimeRepository,
+    object,
+    dict[str, object],
+    dict[str, object],
+    dict[str, object],
+]:
+    repository = _repository(tmp_path)
+    current = datetime.now(timezone.utc)
+    authorized = _authorize(
+        _service(repository),
+        authorized_at=current,
+        expires_at=current + timedelta(minutes=10),
+    )
+    mapping_path = tmp_path / "mapping-worker-unknown.json"
+    _seed_listing_context(repository, mapping_path)
+    proposal = propose_listing_action_batch(
+        repository,
+        batch_id="BATCH-EMERGENCY-WORKER-UNKNOWN",
+        task_ids=[authorized.task.task_id],
+        mapping_path=mapping_path,
+        execution_profile="production",
+    )
+    request = _emergency_write_request(proposal)
+    _persist_prepared_write_batch(repository, request)
+
+    with closing(repository.connect_write()) as worker_connection:
+        worker_connection.execute("BEGIN IMMEDIATE")
+        revalidate_emergency_offline_facts(
+            worker_connection,
+            binding=request["emergency_authorization"],
+            now=current + timedelta(seconds=1),
+            allowed_task_statuses={"running"},
+            operation_id=request["items"][0]["operation_id"],
+            require_active_lock=True,
+        )
+        record_emergency_final_click_fence_won(
+            worker_connection,
+            binding=request["emergency_authorization"],
+            crossed_at=current + timedelta(seconds=1),
+        )
+        worker_connection.commit()
+
+    review = repository.resolve_mobile_review_atomic(
+        review_task_id="REVIEW-1",
+        token_hash="synthetic-token-hash",
+        status=ReviewTaskStatus.APPROVED,
+        actor_source="mobile_review_token",
+        emergency_base_cost=Decimal("10.00"),
+        emergency_base_cost_source_ref="products.xlsx:sha256:test",
+        emergency_product_snapshot_verifier=lambda: (
+            Decimal("10.00"),
+            "products.xlsx:sha256:test",
+        ),
+        now=current + timedelta(seconds=2),
+    )
+    assert review.source_task is None
+
+    initial_result = _emergency_write_result(
+        request,
+        result_id="RESULT-EMERGENCY-WORKER-UNKNOWN",
+        outcome="NEEDS_RECONCILIATION",
+    )
+    imported = import_listing_action_result(
+        repository,
+        request=request,
+        result=initial_result,
+        result_file_sha256="3" * 64,
+        source_result_path="synthetic.worker-unknown.result.json",
+    )
+    assert imported["status"] == "UNKNOWN"
+    with closing(repository.connect_read()) as connection:
+        assert connection.execute(
+            "SELECT task_status FROM tasks WHERE task_id = ?",
+            (authorized.task.task_id,),
+        ).fetchone()[0] == "manual_review"
+        assert connection.execute(
+            "SELECT status FROM shadowbot_operations WHERE operation_id = ?",
+            (request["items"][0]["operation_id"],),
+        ).fetchone()[0] == "NEEDS_RECONCILIATION"
+        assert connection.execute(
+            "SELECT status FROM shadowbot_write_locks WHERE operation_id = ?",
+            (request["items"][0]["operation_id"],),
+        ).fetchone()[0] == "UNKNOWN"
+        assert connection.execute(
+            "SELECT incident_status FROM operational_incidents "
+            "WHERE incident_id = 'INCIDENT-1'"
+        ).fetchone()[0] == "AUTO_PROTECTING"
+
+    runner = ShadowBotFileQueueRunner(tmp_path / "reconcile-queue")
+    operation_id = request["items"][0]["operation_id"]
+    publication = ensure_listing_action_reconcile_attempt(
+        repository,
+        runner,
+        source_request=request,
+        source_result=initial_result,
+        operation_id=operation_id,
+    )
+    repeated = ensure_listing_action_reconcile_attempt(
+        repository,
+        runner,
+        source_request=request,
+        source_result=initial_result,
+        operation_id=operation_id,
+    )
+    assert publication["status"] == "PUBLISHED"
+    assert repeated["status"] == "ALREADY_EXISTS"
+    reconcile_path = Path(publication["queue_request_path"])
+    reconcile_request = json.loads(reconcile_path.read_text(encoding="utf-8-sig"))
+    return repository, authorized, request, initial_result, reconcile_request
+
+
+def _reconcile_result(
+    request: dict[str, object],
+    *,
+    outcome: str,
+    result_id: str,
+) -> dict[str, object]:
+    item = request["items"][0]
+    observed_at = datetime.now(timezone.utc).isoformat()
+    output = {
+        name: item[name]
+        for name in (
+            "source_task_id",
+            "operation_id",
+            "item_execution_attempt_id",
+            "internal_sku",
+            "item_payload_sha256",
+        )
+    } | {
+        "operation_result": outcome,
+        "detail_effect_state": "NOT_APPLIED",
+        "listing_effect_state": (
+            "VERIFIED"
+            if outcome == "VERIFIED"
+            else "NOT_APPLIED"
+            if outcome == "NOT_APPLIED"
+            else "UNKNOWN"
+        ),
+        "detail_save_clicked": False,
+        "action_confirm_clicked": False,
+        "observed_price_before_action": None,
+        "observed_inventory_before_action": None,
+        "observed_price_after_detail_save": None,
+        "observed_inventory_after_detail_save": None,
+        "actual_price": None,
+        "actual_inventory": None,
+        "detail_save_clicked_at": None,
+        "action_clicked_at": None,
+        "readback_observed_at": observed_at,
+        "error_code": (
+            "RECONCILE_STILL_UNKNOWN"
+            if outcome == "NEEDS_RECONCILIATION"
+            else ""
+        ),
+        "error_message": (
+            "read-only reconcile remains inconclusive"
+            if outcome == "NEEDS_RECONCILIATION"
+            else ""
+        ),
+    }
+    counts = v5_result_counts([output])
+    result = {
+        "schema_version": "shadowbot-listing-action-batch-result-1.0",
+        "contract_version": 5,
+        "action_type": "set_offline",
+        "batch_id": request["batch_id"],
+        "execution_attempt_id": request["execution_attempt_id"],
+        "execution_mode": "RECONCILE",
+        "manifest_sha256": request["manifest_sha256"],
+        "instruction_hash": request["instruction_hash"],
+        "request_file_sha256": "sha256:" + "4" * 64,
+        "result_id": result_id,
+        "started_at": observed_at,
+        "ended_at": observed_at,
+        "items": [output],
+        "counts": counts,
+        **derive_v5_batch_semantics(counts),
+        "error_code": output["error_code"],
+        "error_message": output["error_message"],
         "retryable": False,
     }
     result["result_payload_sha256"] = compute_listing_result_hash(result)
@@ -1371,6 +1588,274 @@ def test_worker_final_fence_wins_and_late_review_creates_no_second_write_task(
         )
     assert recovery_payload["resolution_order"] == "WORKER_FENCE_WON"
     assert recovery_payload["late_human_review_recorded"] is True
+
+
+def test_worker_won_unknown_import_preserves_unique_reconcile_state(
+    tmp_path: Path,
+) -> None:
+    repository, authorized, request, _source_result, reconcile_request = (
+        _prepare_worker_won_unknown_reconcile(tmp_path)
+    )
+    with closing(repository.connect_read()) as connection:
+        task = connection.execute(
+            "SELECT task_status, result_message FROM tasks WHERE task_id = ?",
+            (authorized.task.task_id,),
+        ).fetchone()
+        operation = connection.execute(
+            "SELECT status, operation_result FROM shadowbot_operations "
+            "WHERE operation_id = ?",
+            (request["items"][0]["operation_id"],),
+        ).fetchone()
+        write_lock = connection.execute(
+            "SELECT status FROM shadowbot_write_locks WHERE operation_id = ?",
+            (request["items"][0]["operation_id"],),
+        ).fetchone()
+        incident_status = connection.execute(
+            "SELECT incident_status FROM operational_incidents "
+            "WHERE incident_id = 'INCIDENT-1'"
+        ).fetchone()[0]
+        fence_events = connection.execute(
+            "SELECT COUNT(*) FROM operational_incident_events "
+            "WHERE event_key = ?",
+            (f"emergency-final-click-fence:{authorized.task.task_id}",),
+        ).fetchone()[0]
+        recovery_events = connection.execute(
+            "SELECT COUNT(*) FROM operational_incident_events "
+            "WHERE event_type = 'RECOVERY_RECORDED'"
+        ).fetchone()[0]
+    assert task["task_status"] == "manual_review"
+    assert task["result_message"] != EMERGENCY_FINAL_CLICK_FENCE_TASK_MESSAGE
+    assert tuple(operation) == ("RUNNING", "NEEDS_RECONCILIATION")
+    assert write_lock["status"] == "UNKNOWN"
+    assert incident_status == "AUTO_PROTECTING"
+    assert fence_events == 1
+    assert recovery_events == 0
+    assert reconcile_request["execution_mode"] == "RECONCILE"
+
+
+def test_worker_won_unknown_reconcile_verified_converges(
+    tmp_path: Path,
+) -> None:
+    repository, authorized, request, _source_result, reconcile_request = (
+        _prepare_worker_won_unknown_reconcile(tmp_path)
+    )
+    result = _reconcile_result(
+        reconcile_request,
+        outcome="VERIFIED",
+        result_id="RESULT-EMERGENCY-RECONCILE-VERIFIED",
+    )
+    imported = import_listing_action_result(
+        repository,
+        request=reconcile_request,
+        result=result,
+        result_file_sha256="5" * 64,
+        source_result_path="synthetic.emergency-reconcile-verified.result.json",
+    )
+    assert imported["status"] == "VERIFIED"
+    with closing(repository.connect_read()) as connection:
+        task_status = connection.execute(
+            "SELECT task_status FROM tasks WHERE task_id = ?",
+            (authorized.task.task_id,),
+        ).fetchone()[0]
+        operation = connection.execute(
+            "SELECT status, operation_result FROM shadowbot_operations "
+            "WHERE operation_id = ?",
+            (request["items"][0]["operation_id"],),
+        ).fetchone()
+        lock_status = connection.execute(
+            "SELECT status FROM shadowbot_write_locks WHERE operation_id = ?",
+            (request["items"][0]["operation_id"],),
+        ).fetchone()[0]
+        incident_status = connection.execute(
+            "SELECT incident_status FROM operational_incidents "
+            "WHERE incident_id = 'INCIDENT-1'"
+        ).fetchone()[0]
+        payload = json.loads(
+            connection.execute(
+                "SELECT event_payload_json FROM operational_incident_events "
+                "WHERE event_key LIKE "
+                "'emergency-result:RESULT-EMERGENCY-RECONCILE-VERIFIED:%'"
+            ).fetchone()[0]
+        )
+    assert task_status == "success"
+    assert tuple(operation) == ("VERIFIED", "VERIFIED")
+    assert lock_status == "RELEASED"
+    assert incident_status == "WAITING_HUMAN"
+    assert payload["resolution_order"] == "WORKER_FENCE_WON"
+    assert payload["late_human_review_recorded"] is True
+
+
+def test_worker_won_unknown_reconcile_not_applied_converges(
+    tmp_path: Path,
+) -> None:
+    repository, authorized, request, _source_result, reconcile_request = (
+        _prepare_worker_won_unknown_reconcile(tmp_path)
+    )
+    result = _reconcile_result(
+        reconcile_request,
+        outcome="NOT_APPLIED",
+        result_id="RESULT-EMERGENCY-RECONCILE-NOT-APPLIED",
+    )
+    imported = import_listing_action_result(
+        repository,
+        request=reconcile_request,
+        result=result,
+        result_file_sha256="6" * 64,
+        source_result_path="synthetic.emergency-reconcile-not-applied.result.json",
+    )
+    assert imported["status"] == "NOT_APPLIED"
+    with closing(repository.connect_read()) as connection:
+        task_status = connection.execute(
+            "SELECT task_status FROM tasks WHERE task_id = ?",
+            (authorized.task.task_id,),
+        ).fetchone()[0]
+        operation = connection.execute(
+            "SELECT status, operation_result FROM shadowbot_operations "
+            "WHERE operation_id = ?",
+            (request["items"][0]["operation_id"],),
+        ).fetchone()
+        lock_status = connection.execute(
+            "SELECT status FROM shadowbot_write_locks WHERE operation_id = ?",
+            (request["items"][0]["operation_id"],),
+        ).fetchone()[0]
+        incident_status = connection.execute(
+            "SELECT incident_status FROM operational_incidents "
+            "WHERE incident_id = 'INCIDENT-1'"
+        ).fetchone()[0]
+        payload = json.loads(
+            connection.execute(
+                "SELECT event_payload_json FROM operational_incident_events "
+                "WHERE event_key LIKE "
+                "'emergency-result:RESULT-EMERGENCY-RECONCILE-NOT-APPLIED:%'"
+            ).fetchone()[0]
+        )
+    assert task_status == "failed"
+    assert tuple(operation) == ("FAILED", "NOT_APPLIED")
+    assert lock_status == "RELEASED"
+    assert incident_status == "WAITING_HUMAN"
+    assert payload["resolution_order"] == "WORKER_FENCE_WON"
+
+
+def test_worker_won_reconcile_still_unknown_keeps_single_blocking_attempt(
+    tmp_path: Path,
+) -> None:
+    repository, authorized, request, source_result, reconcile_request = (
+        _prepare_worker_won_unknown_reconcile(tmp_path)
+    )
+    result = _reconcile_result(
+        reconcile_request,
+        outcome="NEEDS_RECONCILIATION",
+        result_id="RESULT-EMERGENCY-RECONCILE-STILL-UNKNOWN",
+    )
+    imported = import_listing_action_result(
+        repository,
+        request=reconcile_request,
+        result=result,
+        result_file_sha256="7" * 64,
+        source_result_path="synthetic.emergency-reconcile-unknown.result.json",
+    )
+    repeated = ensure_listing_action_reconcile_attempt(
+        repository,
+        ShadowBotFileQueueRunner(tmp_path / "unused-reconcile-queue"),
+        source_request=request,
+        source_result=source_result,
+        operation_id=request["items"][0]["operation_id"],
+    )
+    assert imported["status"] == "NEEDS_RECONCILIATION"
+    assert repeated["status"] == "ALREADY_EXISTS"
+    with closing(repository.connect_read()) as connection:
+        task_status = connection.execute(
+            "SELECT task_status FROM tasks WHERE task_id = ?",
+            (authorized.task.task_id,),
+        ).fetchone()[0]
+        operation_status = connection.execute(
+            "SELECT status FROM shadowbot_operations WHERE operation_id = ?",
+            (request["items"][0]["operation_id"],),
+        ).fetchone()[0]
+        lock_status = connection.execute(
+            "SELECT status FROM shadowbot_write_locks WHERE operation_id = ?",
+            (request["items"][0]["operation_id"],),
+        ).fetchone()[0]
+        incident_status = connection.execute(
+            "SELECT incident_status FROM operational_incidents "
+            "WHERE incident_id = 'INCIDENT-1'"
+        ).fetchone()[0]
+        attempt_count = connection.execute(
+            "SELECT COUNT(*) FROM shadowbot_execution_attempts "
+            "WHERE operation_id = ? AND execution_mode = 'RECONCILE'",
+            (request["items"][0]["operation_id"],),
+        ).fetchone()[0]
+    assert task_status == "manual_review"
+    assert operation_status == "NEEDS_RECONCILIATION"
+    assert lock_status == "UNKNOWN"
+    assert incident_status == "AUTO_PROTECTING"
+    assert attempt_count == 1
+
+
+def test_worker_won_reconcile_exact_replay_does_not_duplicate_projection(
+    tmp_path: Path,
+) -> None:
+    repository, _authorized, _request, _source_result, reconcile_request = (
+        _prepare_worker_won_unknown_reconcile(tmp_path)
+    )
+    result = _reconcile_result(
+        reconcile_request,
+        outcome="VERIFIED",
+        result_id="RESULT-EMERGENCY-RECONCILE-REPLAY",
+    )
+    first = import_listing_action_result(
+        repository,
+        request=reconcile_request,
+        result=result,
+        result_file_sha256="8" * 64,
+        source_result_path="synthetic.emergency-reconcile-replay.result.json",
+    )
+    with closing(repository.connect_read()) as connection:
+        before = {
+            "incident": tuple(
+                connection.execute(
+                    "SELECT incident_status, updated_at FROM operational_incidents "
+                    "WHERE incident_id = 'INCIDENT-1'"
+                ).fetchone()
+            ),
+            "events": connection.execute(
+                "SELECT COUNT(*) FROM operational_incident_events"
+            ).fetchone()[0],
+            "outbox": connection.execute(
+                "SELECT COUNT(*) FROM notification_outbox"
+            ).fetchone()[0],
+            "notification_logs": connection.execute(
+                "SELECT COUNT(*) FROM notification_logs"
+            ).fetchone()[0],
+        }
+    replay = import_listing_action_result(
+        repository,
+        request=reconcile_request,
+        result=result,
+        result_file_sha256="8" * 64,
+        source_result_path="synthetic.emergency-reconcile-replay.result.json",
+    )
+    with closing(repository.connect_read()) as connection:
+        after = {
+            "incident": tuple(
+                connection.execute(
+                    "SELECT incident_status, updated_at FROM operational_incidents "
+                    "WHERE incident_id = 'INCIDENT-1'"
+                ).fetchone()
+            ),
+            "events": connection.execute(
+                "SELECT COUNT(*) FROM operational_incident_events"
+            ).fetchone()[0],
+            "outbox": connection.execute(
+                "SELECT COUNT(*) FROM notification_outbox"
+            ).fetchone()[0],
+            "notification_logs": connection.execute(
+                "SELECT COUNT(*) FROM notification_logs"
+            ).fetchone()[0],
+        }
+    assert first["already_imported"] is False
+    assert replay["already_imported"] is True
+    assert after == before
 
 
 def test_emergency_persistence_rolls_back_if_flag_changes_after_proposal(

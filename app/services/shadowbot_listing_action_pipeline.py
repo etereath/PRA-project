@@ -18,6 +18,7 @@ from app.emergency_offline_fence import (
     EMERGENCY_HUMAN_PREEMPTED_TASK_MESSAGE,
     EmergencyOfflineFenceError,
     build_emergency_authorization_binding,
+    has_emergency_final_click_fence_won,
     revalidate_emergency_offline_facts,
 )
 from app.enums import TaskActionType, TaskOriginType, TaskStatus
@@ -705,6 +706,37 @@ def _emergency_import_resolution_order(
     result_message = str(task["result_message"])
     incident_status = str(incident["incident_status"]) if incident is not None else ""
     review_status = str(review["review_status"]) if review is not None else ""
+    worker_fence_won = has_emergency_final_click_fence_won(
+        connection,
+        incident_id=str(trace.get("incident_id") or ""),
+        source_task_id=str(request_item["source_task_id"]),
+    )
+    human_preemption_event = connection.execute(
+        """
+        SELECT 1 FROM operational_incident_events
+        WHERE incident_id = ? AND event_type = 'REVIEW_RECORDED'
+          AND source_ref_id = ?
+          AND json_extract(
+                event_payload_json,
+                '$.platform_side_effect_prevented'
+              ) = 1
+        LIMIT 1
+        """,
+        (
+            str(trace.get("incident_id") or ""),
+            str(trace.get("review_task_id") or ""),
+        ),
+    ).fetchone()
+    if (
+        human_preemption_event is not None
+        and incident_status == "WAITING_HUMAN"
+        and review_status != "pending"
+    ):
+        return "HUMAN_PREEMPTED"
+    if worker_fence_won and incident_status == "AUTO_PROTECTING":
+        return "WORKER_FENCE_WON"
+    # Compatibility for an in-flight request persisted before the immutable
+    # fence event was introduced. New requests never depend on this message.
     if (
         task_status == TaskStatus.CANCELLED.value
         and result_message == EMERGENCY_HUMAN_PREEMPTED_TASK_MESSAGE
@@ -1147,6 +1179,10 @@ def _import_listing_action_reconcile_result(
         operation_status, attempt_status, task_status, lock_status = (
             _outcome_projection(outcome)
         )
+        emergency_import_order = _emergency_import_resolution_order(
+            connection,
+            request_item=item,
+        )
         connection.execute(
             """
             UPDATE shadowbot_operations
@@ -1223,6 +1259,7 @@ def _import_listing_action_reconcile_result(
             outcome=outcome,
             result_id=result_id,
             occurred_at=now,
+            resolution_order=emergency_import_order,
         )
         project_manual_incident_task_result(
             connection,
@@ -1328,11 +1365,16 @@ def _import_listing_action_reconcile_result(
         raise
     finally:
         connection.close()
-    review_summary = _ensure_manual_review_intents(
-        repository,
-        request=request,
-        created_at=now_value,
-    )
+    # The originating UNKNOWN import already created the single human-review
+    # intent for this operation. A RECONCILE that remains UNKNOWN must retain
+    # that entry instead of deriving a second payload from the updated task
+    # message and conflicting with the existing dedupe key.
+    review_summary = {
+        "source_task_count": 0,
+        "inserted_review_tasks_count": 0,
+        "inserted_notification_logs_count": 0,
+        "notification_errors": [],
+    }
     return {
         "batch_id": request["batch_id"],
         "result_id": result_id,

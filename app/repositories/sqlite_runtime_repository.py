@@ -22,8 +22,8 @@ from app.enums import (
     TaskStatus,
 )
 from app.emergency_offline_fence import (
-    EMERGENCY_FINAL_CLICK_FENCE_TASK_MESSAGE,
     EMERGENCY_HUMAN_PREEMPTED_TASK_MESSAGE,
+    has_emergency_final_click_fence_won,
 )
 from app.exceptions import (
     MobileReviewErrorCode,
@@ -5084,7 +5084,7 @@ class SQLiteRuntimeRepository:
             )
         emergency_task_row = connection.execute(
             """
-            SELECT task_id, task_status, result_message
+            SELECT task_id
             FROM tasks
             WHERE origin_type = 'SYSTEM_EMERGENCY'
               AND json_extract(decision_trace_json, '$.incident_id') = ?
@@ -5095,10 +5095,11 @@ class SQLiteRuntimeRepository:
         ).fetchone()
         worker_final_click_fence_won = bool(
             emergency_task_row is not None
-            and str(emergency_task_row["task_status"])
-            == TaskStatus.MANUAL_REVIEW.value
-            and str(emergency_task_row["result_message"])
-            == EMERGENCY_FINAL_CLICK_FENCE_TASK_MESSAGE
+            and has_emergency_final_click_fence_won(
+                connection,
+                incident_id=incident_id,
+                source_task_id=str(emergency_task_row["task_id"]),
+            )
         )
         internal_sku = str(review_model.internal_sku or "").strip()
         platform_name = str(review_model.platform_name or "").strip()

@@ -23,6 +23,7 @@ EMERGENCY_FINAL_CLICK_FENCE_TASK_MESSAGE = (
 EMERGENCY_HUMAN_PREEMPTED_TASK_MESSAGE = (
     "人工复核已在平台副作用前抢占自动紧急下架"
 )
+EMERGENCY_FINAL_CLICK_FENCE_EVENT_KEY_PREFIX = "emergency-final-click-fence:"
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _UI_AUTOMATION_JOB_TYPES = (
@@ -348,6 +349,75 @@ def record_emergency_final_click_fence_won(
     ).rowcount
     if updated != 1:
         raise EmergencyOfflineFenceError("EMERGENCY_FINAL_CLICK_FENCE_NOT_CLAIMED")
+    incident = connection.execute(
+        "SELECT severity FROM operational_incidents WHERE incident_id = ?",
+        (binding["incident_id"],),
+    ).fetchone()
+    if incident is None:
+        raise EmergencyOfflineFenceError("EMERGENCY_INCIDENT_MISSING")
+    event_key = (
+        EMERGENCY_FINAL_CLICK_FENCE_EVENT_KEY_PREFIX
+        + binding["source_task_id"]
+    )
+    payload = {
+        "authorization_id": binding["authorization_id"],
+        "review_task_id": binding["review_task_id"],
+        "resolution_order": "WORKER_FENCE_WON",
+        "task_id": binding["source_task_id"],
+    }
+    connection.execute(
+        """
+        INSERT INTO operational_incident_events(
+            event_id, event_key, incident_id, event_type, occurred_at,
+            source_type, source_ref_id, from_status, to_status, severity,
+            event_payload_json, created_at
+        ) VALUES (?, ?, ?, 'TASK_RECORDED', ?, 'SHADOWBOT_WORKER', ?,
+                  'AUTO_PROTECTING', 'AUTO_PROTECTING', ?, ?, ?)
+        """,
+        (
+            _stable_id("incident-event", event_key),
+            event_key,
+            binding["incident_id"],
+            timestamp.astimezone(timezone.utc).isoformat(),
+            binding["source_task_id"],
+            str(incident["severity"]),
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            timestamp.astimezone(timezone.utc).isoformat(),
+        ),
+    )
+
+
+def has_emergency_final_click_fence_won(
+    connection,
+    *,
+    incident_id: str,
+    source_task_id: str,
+) -> bool:
+    """Read the immutable Worker-won ordering fact from the Incident ledger."""
+
+    event_key = EMERGENCY_FINAL_CLICK_FENCE_EVENT_KEY_PREFIX + str(source_task_id)
+    row = connection.execute(
+        """
+        SELECT event_payload_json FROM operational_incident_events
+        WHERE event_key = ? AND incident_id = ?
+          AND event_type = 'TASK_RECORDED'
+          AND source_type = 'SHADOWBOT_WORKER'
+          AND source_ref_id = ?
+        """,
+        (event_key, str(incident_id), str(source_task_id)),
+    ).fetchone()
+    if row is None:
+        return False
+    payload = _json_object(row["event_payload_json"])
+    return (
+        str(payload.get("resolution_order") or "") == "WORKER_FENCE_WON"
+        and str(payload.get("task_id") or "") == str(source_task_id)
+    )
 
 
 def _assert_equal(source: dict[str, Any], field: str, expected: str) -> None:
@@ -386,3 +456,7 @@ def _sha256_json(value: Any) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _stable_id(prefix: str, value: str) -> str:
+    return f"{prefix}-{hashlib.sha256(value.encode('utf-8')).hexdigest()[:24]}"
