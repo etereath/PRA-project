@@ -17,6 +17,12 @@ EMERGENCY_EVENT_TYPE = "EMERGENCY_OFFLINE_AUTHORIZED"
 EMERGENCY_JOB_TYPE = "SYSTEM_EMERGENCY_SET_OFFLINE"
 EMERGENCY_FLAG_NAME = "automatic_emergency_offline"
 EMERGENCY_APPROVAL_POLICY = "SYSTEM_EMERGENCY_V1"
+EMERGENCY_FINAL_CLICK_FENCE_TASK_MESSAGE = (
+    "自动紧急下架已越过最终点击栅栏，等待执行结果导入"
+)
+EMERGENCY_HUMAN_PREEMPTED_TASK_MESSAGE = (
+    "人工复核已在平台副作用前抢占自动紧急下架"
+)
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _UI_AUTOMATION_JOB_TYPES = (
@@ -310,6 +316,38 @@ def revalidate_emergency_offline_facts(
         if lock is None:
             raise EmergencyOfflineFenceError("EMERGENCY_WRITE_LOCK_DRIFTED")
     return evidence
+
+
+def record_emergency_final_click_fence_won(
+    connection,
+    *,
+    binding: dict[str, Any],
+    crossed_at: datetime,
+) -> None:
+    """Persist the Worker-won linearization state before releasing its write lock.
+
+    The caller must already hold the same ``BEGIN IMMEDIATE`` transaction used
+    by :func:`revalidate_emergency_offline_facts`.  The transaction is committed
+    only after the platform click boundary has been crossed.
+    """
+
+    validate_emergency_authorization_binding(binding)
+    timestamp = _aware_datetime(crossed_at, "crossed_at")
+    updated = connection.execute(
+        """
+        UPDATE tasks
+        SET task_status = 'manual_review', result_message = ?, updated_at = ?
+        WHERE task_id = ? AND origin_type = 'SYSTEM_EMERGENCY'
+          AND task_status = 'running'
+        """,
+        (
+            EMERGENCY_FINAL_CLICK_FENCE_TASK_MESSAGE,
+            timestamp.astimezone(timezone.utc).isoformat(),
+            binding["source_task_id"],
+        ),
+    ).rowcount
+    if updated != 1:
+        raise EmergencyOfflineFenceError("EMERGENCY_FINAL_CLICK_FENCE_NOT_CLAIMED")
 
 
 def _assert_equal(source: dict[str, Any], field: str, expected: str) -> None:

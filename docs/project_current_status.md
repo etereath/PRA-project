@@ -93,6 +93,16 @@ RECONCILE，没有新增表、全局锁、平台动作或合同版本，也没�
 仍为 `automatic_emergency_offline=false`。最终本地完整 pytest 为
 `1116 passed, 3 skipped, 97 subtests passed`，隔离系统冒烟为 `16 passed, 0 failed`。
 
+2026-08-05 的最新复审整改已关闭剩余两项：已持久化紧急请求支持人工 Review 在最终点击前
+抢占并由原 Importer 收敛 `NOT_APPLIED`、Worker 先越过最终栅栏时后到 Review 只记录人工事实
+且不创建第二个写任务；迟到严重度事件只追加 requested severity 审计，不倒退 Incident 主
+投影。两个相反竞态顺序均使用独立 SQLite 连接覆盖 request persistence → Review/Worker →
+result → Importer。整改没有新增表、全局锁、状态枚举、合同版本或平台动作；生产开关仍为
+`automatic_emergency_offline=false`。完整 pytest 为
+`1122 passed, 3 skipped, 97 subtests passed`，隔离系统冒烟为 `16 passed, 0 failed`。仓库内
+Worker/fence 源码已更新但尚未同步真实影刀宿主，本轮没有执行真实平台动作；后续部署必须
+重新完成正常停止、同步、哈希核对与长期 Worker 恢复门禁。
+
 - 从 Excel 读取业务输入。
 - 根据规则和预测输入生成运行态任务。
 - 用 SQLite 保存运行态事实。

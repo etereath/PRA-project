@@ -19,17 +19,20 @@ from . import package
 try:
     from app.emergency_offline_fence import (
         EmergencyOfflineFenceError,
+        record_emergency_final_click_fence_won,
         revalidate_emergency_offline_facts,
     )
 except ImportError:
     try:
         from .emergency_offline_fence import (
             EmergencyOfflineFenceError,
+            record_emergency_final_click_fence_won,
             revalidate_emergency_offline_facts,
         )
     except ImportError:
         from emergency_offline_fence import (
             EmergencyOfflineFenceError,
+            record_emergency_final_click_fence_won,
             revalidate_emergency_offline_facts,
         )
 
@@ -5430,6 +5433,11 @@ def _v5_open_emergency_click_fence(request, request_item):
             operation_id=str(request_item.get("operation_id") or ""),
             require_active_lock=True,
         )
+        record_emergency_final_click_fence_won(
+            connection,
+            binding=binding,
+            crossed_at=datetime.now(timezone.utc),
+        )
         return connection
     except Exception:
         if connection.in_transaction:
@@ -5438,12 +5446,15 @@ def _v5_open_emergency_click_fence(request, request_item):
         raise
 
 
-def _v5_close_emergency_click_fence(connection):
+def _v5_close_emergency_click_fence(connection, *, crossed_click_boundary=False):
     if connection is None:
         return
     try:
         if connection.in_transaction:
-            connection.rollback()
+            if crossed_click_boundary:
+                connection.commit()
+            else:
+                connection.rollback()
     finally:
         connection.close()
 
@@ -6544,6 +6555,7 @@ def _run_set_offline_v5(args, request, result):
                 timeout_seconds,
             )
             click_fence = None
+            click_boundary_crossed = False
             try:
                 try:
                     click_fence = _v5_open_emergency_click_fence(
@@ -6570,9 +6582,13 @@ def _run_set_offline_v5(args, request, result):
                     request_item,
                     item_results,
                 )
+                click_boundary_crossed = True
                 confirm_button.click()
             finally:
-                _v5_close_emergency_click_fence(click_fence)
+                _v5_close_emergency_click_fence(
+                    click_fence,
+                    crossed_click_boundary=click_boundary_crossed,
+                )
             output["action_confirm_clicked"] = True
             output["action_clicked_at"] = _multi_product_utc_now()
             output["listing_effect_state"] = "UNKNOWN"

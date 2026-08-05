@@ -21,6 +21,10 @@ from app.enums import (
     TaskOriginType,
     TaskStatus,
 )
+from app.emergency_offline_fence import (
+    EMERGENCY_FINAL_CLICK_FENCE_TASK_MESSAGE,
+    EMERGENCY_HUMAN_PREEMPTED_TASK_MESSAGE,
+)
 from app.exceptions import (
     MobileReviewErrorCode,
     MobileReviewTransactionError,
@@ -5078,6 +5082,24 @@ class SQLiteRuntimeRepository:
                 MobileReviewErrorCode.CONCURRENT_UPDATE,
                 "异常等级已变化，请刷新后重试",
             )
+        emergency_task_row = connection.execute(
+            """
+            SELECT task_id, task_status, result_message
+            FROM tasks
+            WHERE origin_type = 'SYSTEM_EMERGENCY'
+              AND json_extract(decision_trace_json, '$.incident_id') = ?
+            ORDER BY created_at DESC, task_id DESC
+            LIMIT 1
+            """,
+            (incident_id,),
+        ).fetchone()
+        worker_final_click_fence_won = bool(
+            emergency_task_row is not None
+            and str(emergency_task_row["task_status"])
+            == TaskStatus.MANUAL_REVIEW.value
+            and str(emergency_task_row["result_message"])
+            == EMERGENCY_FINAL_CLICK_FENCE_TASK_MESSAGE
+        )
         internal_sku = str(review_model.internal_sku or "").strip()
         platform_name = str(review_model.platform_name or "").strip()
         if not internal_sku or not platform_name:
@@ -5088,7 +5110,10 @@ class SQLiteRuntimeRepository:
 
         task: Task | None = None
         decision = "human_handling"
-        if status in {ReviewTaskStatus.ADJUSTED, ReviewTaskStatus.APPROVED}:
+        if (
+            status in {ReviewTaskStatus.ADJUSTED, ReviewTaskStatus.APPROVED}
+            and not worker_final_click_fence_won
+        ):
             if (
                 emergency_base_cost is None
                 or not emergency_base_cost.is_finite()
@@ -5251,6 +5276,16 @@ class SQLiteRuntimeRepository:
                 )
             inject("after_incident_task_insert")
 
+        if worker_final_click_fence_won:
+            payload["requested_decision"] = {
+                ReviewTaskStatus.ADJUSTED: "manual_update_price",
+                ReviewTaskStatus.APPROVED: "manual_set_offline",
+                ReviewTaskStatus.REJECTED: "human_handling",
+            }[status]
+            decision = "late_after_emergency_final_click_fence"
+            payload["platform_side_effect_prevented"] = False
+            payload["awaiting_emergency_result_import"] = True
+            payload["automatic_task_id"] = str(emergency_task_row["task_id"])
         payload["decision"] = decision
         payload["incident_id"] = incident_id
         if task is not None:
@@ -5308,18 +5343,29 @@ class SQLiteRuntimeRepository:
         )
 
         incident_from_status = str(incident_row["incident_status"])
-        if incident_from_status == IncidentStatus.AUTO_PROTECTING.value:
-            connection.execute(
+        if (
+            incident_from_status == IncidentStatus.AUTO_PROTECTING.value
+            and not worker_final_click_fence_won
+        ):
+            cancelled = connection.execute(
                 """
                 UPDATE tasks
-                SET task_status = 'cancelled', updated_at = ?,
-                    result_message = '人工复核已在平台副作用前抢占自动紧急下架'
+                SET task_status = 'cancelled', result_message = ?, updated_at = ?
                 WHERE origin_type = 'SYSTEM_EMERGENCY'
-                  AND task_status = 'pending'
+                  AND task_status IN ('pending', 'running')
                   AND json_extract(decision_trace_json, '$.incident_id') = ?
                 """,
-                (_datetime_to_text(timestamp), incident_id),
-            )
+                (
+                    EMERGENCY_HUMAN_PREEMPTED_TASK_MESSAGE,
+                    _datetime_to_text(timestamp),
+                    incident_id,
+                ),
+            ).rowcount
+            if cancelled != 1:
+                raise MobileReviewTransactionError(
+                    MobileReviewErrorCode.CONCURRENT_UPDATE,
+                    "自动紧急下架状态已变化，请刷新后重试",
+                )
             transitioned = connection.execute(
                 """
                 UPDATE operational_incidents
@@ -5351,7 +5397,11 @@ class SQLiteRuntimeRepository:
                 "MOBILE_REVIEW",
                 review_model.review_task_id,
                 incident_from_status,
-                IncidentStatus.WAITING_HUMAN.value,
+                (
+                    incident_from_status
+                    if worker_final_click_fence_won
+                    else IncidentStatus.WAITING_HUMAN.value
+                ),
                 str(incident_row["severity"]),
                 _json_dump(
                     {
@@ -5359,6 +5409,9 @@ class SQLiteRuntimeRepository:
                         "review_status": status.value,
                         "decision": decision,
                         "created_task_id": task.task_id if task is not None else None,
+                        "platform_side_effect_prevented": (
+                            False if worker_final_click_fence_won else True
+                        ),
                     }
                 ),
                 _datetime_to_text(timestamp),

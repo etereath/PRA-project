@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -12,8 +13,11 @@ import pytest
 from openpyxl import Workbook
 
 from app.emergency_offline_fence import (
+    EMERGENCY_FINAL_CLICK_FENCE_TASK_MESSAGE,
+    EMERGENCY_HUMAN_PREEMPTED_TASK_MESSAGE,
     EmergencyOfflineFenceError,
     build_emergency_authorization_binding,
+    record_emergency_final_click_fence_won,
     revalidate_emergency_offline_facts,
 )
 from app.enums import ReviewTaskStatus, TaskActionType, TaskOriginType, TaskStatus
@@ -201,7 +205,7 @@ def _seed_authorization_facts(repository: SQLiteRuntimeRepository) -> None:
             ) VALUES (
                 'REVIEW-1', '2026-08-03', 'incident', 'INCIDENT-1', 'review-1',
                 NULL, 'emergency_protection', 'pending', 'SKU-1', 'platform',
-                'extreme price', '{}', '{}', ?, ?, ?
+                'extreme price', '{"incident_id":"INCIDENT-1"}', '{}', ?, ?, ?
             )
             """,
             ((NOW + timedelta(hours=1)).isoformat(), sent_at, sent_at),
@@ -944,6 +948,63 @@ def _emergency_write_request(proposal: dict[str, object]) -> dict[str, object]:
     )
 
 
+def _emergency_write_result(
+    request: dict[str, object],
+    *,
+    result_id: str,
+    outcome: str,
+) -> dict[str, object]:
+    request_item = request["items"][0]
+    observed_at = datetime.now(timezone.utc).isoformat()
+    clicked = outcome == "VERIFIED"
+    output = {
+        "source_task_id": request_item["source_task_id"],
+        "operation_id": request_item["operation_id"],
+        "item_execution_attempt_id": request_item["item_execution_attempt_id"],
+        "internal_sku": request_item["internal_sku"],
+        "item_payload_sha256": request_item["item_payload_sha256"],
+        "operation_result": outcome,
+        "detail_effect_state": "NOT_STARTED" if clicked else "NOT_APPLIED",
+        "listing_effect_state": "VERIFIED" if clicked else "NOT_APPLIED",
+        "detail_save_clicked": False,
+        "action_confirm_clicked": clicked,
+        "observed_price_before_action": "8.00",
+        "observed_inventory_before_action": 5,
+        "observed_price_after_detail_save": None,
+        "observed_inventory_after_detail_save": None,
+        "detail_save_clicked_at": None,
+        "action_clicked_at": observed_at if clicked else None,
+        "readback_observed_at": observed_at if clicked else None,
+        "actual_price": "8.00" if clicked else None,
+        "actual_inventory": 5 if clicked else None,
+        "error_code": "" if clicked else "EMERGENCY_AUTHORIZATION_REVOKED",
+        "error_message": "" if clicked else "formal Review won before click",
+    }
+    counts = v5_result_counts([output])
+    result = {
+        "schema_version": "shadowbot-listing-action-batch-result-1.0",
+        "contract_version": 5,
+        "action_type": "set_offline",
+        "batch_id": request["batch_id"],
+        "execution_attempt_id": request["execution_attempt_id"],
+        "execution_mode": "COMMIT",
+        "manifest_sha256": request["manifest_sha256"],
+        "instruction_hash": request["instruction_hash"],
+        "request_file_sha256": "sha256:" + "d" * 64,
+        "result_id": result_id,
+        "started_at": observed_at,
+        "ended_at": observed_at,
+        "items": [output],
+        "counts": counts,
+        **derive_v5_batch_semantics(counts),
+        "error_code": "" if clicked else "EMERGENCY_AUTHORIZATION_REVOKED",
+        "error_message": "" if clicked else "formal Review won before click",
+        "retryable": False,
+    }
+    result["result_payload_sha256"] = compute_listing_result_hash(result)
+    return result
+
+
 def test_shadowbot_emergency_reuses_v5_persistence_and_shared_write_lock(
     tmp_path: Path,
 ) -> None:
@@ -1059,6 +1120,257 @@ def test_shadowbot_emergency_reuses_v5_persistence_and_shared_write_lock(
             "WHERE incident_id = 'INCIDENT-1' AND event_type = 'RECOVERY_RECORDED'"
         ).fetchone()
         assert json.loads(recovery[0])["automatic_reonline_allowed"] is False
+
+
+def test_formal_review_wins_after_emergency_request_persistence_and_import_converges(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    review_repository = SQLiteRuntimeRepository(repository.db_path)
+    worker_repository = SQLiteRuntimeRepository(repository.db_path)
+    current = datetime.now(timezone.utc)
+    authorized = _authorize(
+        _service(repository),
+        authorized_at=current,
+        expires_at=current + timedelta(minutes=10),
+    )
+    mapping_path = tmp_path / "mapping-human-wins.json"
+    _seed_listing_context(repository, mapping_path)
+    proposal = propose_listing_action_batch(
+        repository,
+        batch_id="BATCH-EMERGENCY-HUMAN-WINS",
+        task_ids=[authorized.task.task_id],
+        mapping_path=mapping_path,
+        execution_profile="production",
+    )
+    request = _emergency_write_request(proposal)
+    _persist_prepared_write_batch(repository, request)
+
+    review_result = review_repository.resolve_mobile_review_atomic(
+        review_task_id="REVIEW-1",
+        token_hash="synthetic-token-hash",
+        status=ReviewTaskStatus.APPROVED,
+        actor_source="mobile_review_token",
+        emergency_base_cost=Decimal("10.00"),
+        emergency_base_cost_source_ref="products.xlsx:sha256:test",
+        emergency_product_snapshot_verifier=lambda: (
+            Decimal("10.00"),
+            "products.xlsx:sha256:test",
+        ),
+        now=current + timedelta(seconds=2),
+    )
+    assert review_result.source_task is not None
+    assert review_result.source_task.origin_type is TaskOriginType.MANUAL
+
+    with closing(worker_repository.connect_write()) as worker_connection:
+        worker_connection.execute("BEGIN IMMEDIATE")
+        with pytest.raises(EmergencyOfflineFenceError):
+            revalidate_emergency_offline_facts(
+                worker_connection,
+                binding=request["emergency_authorization"],
+                now=current + timedelta(seconds=3),
+                allowed_task_statuses={"running"},
+                operation_id=request["items"][0]["operation_id"],
+                require_active_lock=True,
+            )
+        worker_connection.rollback()
+
+    result = _emergency_write_result(
+        request,
+        result_id="RESULT-EMERGENCY-HUMAN-WINS",
+        outcome="NOT_APPLIED",
+    )
+    summary = import_listing_action_result(
+        worker_repository,
+        request=request,
+        result=result,
+        result_file_sha256="1" * 64,
+        source_result_path="synthetic.human-wins.result.json",
+    )
+    replay = import_listing_action_result(
+        worker_repository,
+        request=request,
+        result=result,
+        result_file_sha256="1" * 64,
+        source_result_path="synthetic.human-wins.result.json",
+    )
+
+    assert summary["already_imported"] is False
+    assert replay["already_imported"] is True
+    with closing(repository.connect_read()) as connection:
+        automatic_task = connection.execute(
+            "SELECT task_status, result_message FROM tasks WHERE task_id = ?",
+            (authorized.task.task_id,),
+        ).fetchone()
+        manual_tasks = connection.execute(
+            "SELECT task_status FROM tasks WHERE origin_type = 'MANUAL'"
+        ).fetchall()
+        operation = connection.execute(
+            "SELECT status, operation_result FROM shadowbot_operations WHERE operation_id = ?",
+            (request["items"][0]["operation_id"],),
+        ).fetchone()
+        attempt = connection.execute(
+            "SELECT status, side_effect_state FROM shadowbot_execution_attempts "
+            "WHERE execution_attempt_id = ?",
+            (request["items"][0]["item_execution_attempt_id"],),
+        ).fetchone()
+        write_lock = connection.execute(
+            "SELECT status FROM shadowbot_write_locks WHERE operation_id = ?",
+            (request["items"][0]["operation_id"],),
+        ).fetchone()
+        incident_status = connection.execute(
+            "SELECT incident_status FROM operational_incidents WHERE incident_id = 'INCIDENT-1'"
+        ).fetchone()[0]
+        recovery_payload = json.loads(
+            connection.execute(
+                "SELECT event_payload_json FROM operational_incident_events "
+                "WHERE event_key LIKE 'emergency-result:RESULT-EMERGENCY-HUMAN-WINS:%'"
+            ).fetchone()[0]
+        )
+    assert tuple(automatic_task) == (
+        "cancelled",
+        EMERGENCY_HUMAN_PREEMPTED_TASK_MESSAGE,
+    )
+    assert [row["task_status"] for row in manual_tasks] == ["pending"]
+    assert tuple(operation) == ("FAILED", "NOT_APPLIED")
+    assert tuple(attempt) == ("FAILED", "NOT_APPLIED")
+    assert write_lock["status"] == "RELEASED"
+    assert incident_status == "WAITING_HUMAN"
+    assert recovery_payload["resolution_order"] == "HUMAN_PREEMPTED"
+    assert recovery_payload["human_preempted_before_side_effect"] is True
+
+
+def test_worker_final_fence_wins_and_late_review_creates_no_second_write_task(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    review_repository = SQLiteRuntimeRepository(repository.db_path)
+    current = datetime.now(timezone.utc)
+    authorized = _authorize(
+        _service(repository),
+        authorized_at=current,
+        expires_at=current + timedelta(minutes=10),
+    )
+    mapping_path = tmp_path / "mapping-worker-wins.json"
+    _seed_listing_context(repository, mapping_path)
+    proposal = propose_listing_action_batch(
+        repository,
+        batch_id="BATCH-EMERGENCY-WORKER-WINS",
+        task_ids=[authorized.task.task_id],
+        mapping_path=mapping_path,
+        execution_profile="production",
+    )
+    request = _emergency_write_request(proposal)
+    _persist_prepared_write_batch(repository, request)
+
+    worker_connection = repository.connect_write()
+    worker_connection.execute("BEGIN IMMEDIATE")
+    revalidate_emergency_offline_facts(
+        worker_connection,
+        binding=request["emergency_authorization"],
+        now=current + timedelta(seconds=1),
+        allowed_task_statuses={"running"},
+        operation_id=request["items"][0]["operation_id"],
+        require_active_lock=True,
+    )
+    record_emergency_final_click_fence_won(
+        worker_connection,
+        binding=request["emergency_authorization"],
+        crossed_at=current + timedelta(seconds=1),
+    )
+
+    started = Event()
+    review_results = []
+    review_errors: list[BaseException] = []
+
+    def submit_late_review() -> None:
+        started.set()
+        try:
+            review_results.append(
+                review_repository.resolve_mobile_review_atomic(
+                    review_task_id="REVIEW-1",
+                    token_hash="synthetic-token-hash",
+                    status=ReviewTaskStatus.APPROVED,
+                    actor_source="mobile_review_token",
+                    emergency_base_cost=Decimal("10.00"),
+                    emergency_base_cost_source_ref="products.xlsx:sha256:test",
+                    emergency_product_snapshot_verifier=lambda: (
+                        Decimal("10.00"),
+                        "products.xlsx:sha256:test",
+                    ),
+                    now=current + timedelta(seconds=2),
+                )
+            )
+        except BaseException as exc:  # noqa: BLE001 - thread assertion capture
+            review_errors.append(exc)
+
+    review_thread = Thread(target=submit_late_review)
+    review_thread.start()
+    assert started.wait(timeout=2)
+    time.sleep(0.1)
+    worker_connection.commit()
+    worker_connection.close()
+    review_thread.join(timeout=5)
+
+    assert not review_thread.is_alive()
+    assert review_errors == []
+    assert len(review_results) == 1
+    assert review_results[0].source_task is None
+    stored_review = review_repository.get_review_task("REVIEW-1")
+    assert stored_review is not None
+    assert stored_review.review_payload is not None
+    assert stored_review.resolution_payload["decision"] == (
+        "late_after_emergency_final_click_fence"
+    )
+    assert stored_review.resolution_payload["platform_side_effect_prevented"] is False
+
+    with closing(repository.connect_read()) as connection:
+        task_before_import = connection.execute(
+            "SELECT task_status, result_message FROM tasks WHERE task_id = ?",
+            (authorized.task.task_id,),
+        ).fetchone()
+        assert tuple(task_before_import) == (
+            "manual_review",
+            EMERGENCY_FINAL_CLICK_FENCE_TASK_MESSAGE,
+        )
+        assert connection.execute(
+            "SELECT COUNT(*) FROM tasks WHERE origin_type = 'MANUAL'"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT incident_status FROM operational_incidents WHERE incident_id = 'INCIDENT-1'"
+        ).fetchone()[0] == "AUTO_PROTECTING"
+
+    result = _emergency_write_result(
+        request,
+        result_id="RESULT-EMERGENCY-WORKER-WINS",
+        outcome="VERIFIED",
+    )
+    import_listing_action_result(
+        repository,
+        request=request,
+        result=result,
+        result_file_sha256="2" * 64,
+        source_result_path="synthetic.worker-wins.result.json",
+    )
+    with closing(repository.connect_read()) as connection:
+        assert connection.execute(
+            "SELECT task_status FROM tasks WHERE task_id = ?",
+            (authorized.task.task_id,),
+        ).fetchone()[0] == "success"
+        assert connection.execute(
+            "SELECT COUNT(*) FROM tasks WHERE origin_type = 'MANUAL'"
+        ).fetchone()[0] == 0
+        assert connection.execute(
+            "SELECT incident_status FROM operational_incidents WHERE incident_id = 'INCIDENT-1'"
+        ).fetchone()[0] == "WAITING_HUMAN"
+        recovery_payload = json.loads(
+            connection.execute(
+                "SELECT event_payload_json FROM operational_incident_events "
+                "WHERE event_key LIKE 'emergency-result:RESULT-EMERGENCY-WORKER-WINS:%'"
+            ).fetchone()[0]
+        )
+    assert recovery_payload["resolution_order"] == "WORKER_FENCE_WON"
+    assert recovery_payload["late_human_review_recorded"] is True
 
 
 def test_emergency_persistence_rolls_back_if_flag_changes_after_proposal(

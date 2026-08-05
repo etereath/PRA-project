@@ -369,7 +369,10 @@ class OperationalIncidentRepository:
     ) -> IncidentMutationResult:
         _require_severity(severity)
         _require_aware_datetime(occurred_at, "occurred_at")
-        payload = {"severity_change": {"reason": reason, "to_severity": severity}}
+        payload = {
+            "severity_change": {"reason": reason, "to_severity": severity},
+            "requested_to_severity": severity,
+        }
         connection = self.runtime_repository.connect_write()
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -388,14 +391,22 @@ class OperationalIncidentRepository:
             if replay is not None:
                 connection.rollback()
                 return replay
-            if severity == incident.severity:
+            latest_event_at = self._latest_event_occurred_at_on_connection(
+                connection,
+                incident_id,
+            )
+            late_event = (
+                latest_event_at is not None and occurred_at < latest_event_at
+            )
+            if not late_event and severity == incident.severity:
                 raise IncidentTransitionError(
                     f"Incident severity is already {severity}: {incident_id}"
                 )
-            connection.execute(
-                "UPDATE operational_incidents SET severity = ?, updated_at = ? WHERE incident_id = ?",
-                (severity, _datetime_text(occurred_at), incident_id),
-            )
+            if not late_event:
+                connection.execute(
+                    "UPDATE operational_incidents SET severity = ?, updated_at = ? WHERE incident_id = ?",
+                    (severity, _datetime_text(occurred_at), incident_id),
+                )
             event = self._insert_event(
                 connection,
                 event_key=event_key,
@@ -406,7 +417,7 @@ class OperationalIncidentRepository:
                 source_ref_id=source_ref_id,
                 from_status=incident.incident_status,
                 to_status=incident.incident_status,
-                severity=severity,
+                severity=incident.severity if late_event else severity,
                 event_payload=payload,
             )
             updated = self._get_required_on_connection(connection, incident_id)

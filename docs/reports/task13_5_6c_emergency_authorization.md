@@ -174,3 +174,29 @@ attempt 与本次验收一致。该结果构成 13.5-6C 的单 SKU 真实紧急�
 `61 passed`。最终本地完整 pytest 为 `1116 passed, 3 skipped, 97 subtests passed`；隔离
 系统冒烟为 `16 passed, 0 failed`。本轮没有修改或同步 `shadowbot/test2` 文件，没有停止、
 覆盖或重启常驻 Worker，也没有再次执行真实平台写操作。
+
+## 10. 2026-08-05 最新复审整改
+
+本轮关闭复审剩余的两个合并阻塞，继续复用既有 v5、Review、Importer、Incident Event 和
+共享 SQLite 写锁，没有新增表、状态枚举、全局锁、合同版本或平台动作：
+
+- 人工 Review 先取得写事务时，可在 Worker 最终点击栅栏前取消已经持久化为 `running` 的
+  `SYSTEM_EMERGENCY` Task。Worker 随后返回确定的 `NOT_APPLIED`；Importer 幂等接受结果，
+  释放 operation、attempt 和 ACTIVE 写锁，同时保留已创建的 MANUAL 任务和
+  `WAITING_HUMAN` Incident；
+- Worker 先取得最终点击栅栏时，在同一事务内把自动 Task 标记为“已越过最终点击栅栏”，
+  并在调用平台确认点击后提交该线性化事实。后到 Review 只保存请求动作和“未阻止平台
+  副作用”的事实，不创建第二个写任务；结果仍由原 Importer 收敛；
+- `change_severity()` 采用与 detection/status transition 相同的严格事件时间门禁。迟到事件
+  保留 `SEVERITY_CHANGED` 与 `requested_to_severity` 审计，但不覆盖当前 severity、状态或
+  `updated_at`；相同时间仍按实际事务顺序处理；
+- 两个独立 SQLite 连接覆盖 request persistence → Review/Worker 竞争 → Worker result →
+  Importer 的两个相反顺序，并覆盖确定未执行结果的精确重放；严重度测试覆盖新事实之后的
+  旧事件、`RESOLVED/CLOSED` 后的旧事件和精确重放。
+
+受影响的 Incident/Review/Importer 组合为 `91 passed`；ShadowBot/部署静态与执行链组合为
+`72 passed, 3 subtests passed`。完整 pytest 为
+`1122 passed, 3 skipped, 97 subtests passed`；隔离系统冒烟为 `16 passed, 0 failed`。
+本轮修改了仓库内 `shadowbot/test2/vertical_slice_read_price.py` 与公共 fence 源码，但未同步
+到真实影刀宿主、未停止或重启常驻 Worker，也未执行真实平台动作；生产开关继续保持
+`automatic_emergency_offline=false`。后续部署必须重新执行正常停止、逐文件同步和哈希门禁。

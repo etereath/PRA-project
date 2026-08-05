@@ -357,3 +357,99 @@ def test_severity_and_recovery_are_append_only_events(runtime_repository):
     assert recovery.incident.incident_status is IncidentStatus.OPEN
     assert recovery.event.event_type is IncidentEventType.RECOVERY_RECORDED
     assert recovery.incident.occurrence_count == 1
+
+
+def test_late_severity_change_is_audited_without_regressing_current_projection(
+    runtime_repository,
+):
+    service = IncidentManagementService(runtime_repository)
+    first = service.detect(detection("detect-severity-t1", occurred_at=NOW))
+    newest = service.change_severity(
+        first.incident.incident_id,
+        severity="S4",
+        event_key="severity-t4",
+        occurred_at=NOW + timedelta(minutes=4),
+        source_type="TRUSTED_EVALUATOR",
+        reason="current threshold",
+    )
+
+    late = service.change_severity(
+        first.incident.incident_id,
+        severity="S2",
+        event_key="severity-t2-late",
+        occurred_at=NOW + timedelta(minutes=2),
+        source_type="TRUSTED_EVALUATOR",
+        reason="delayed observation",
+    )
+
+    assert late.incident.severity == "S4"
+    assert late.incident.updated_at == newest.incident.updated_at
+    assert late.event.severity == "S4"
+    assert late.event.event_payload["requested_to_severity"] == "S2"
+
+
+@pytest.mark.parametrize("terminal_status", [IncidentStatus.RESOLVED, IncidentStatus.CLOSED])
+def test_late_severity_change_does_not_mutate_resolved_or_closed_projection(
+    runtime_repository,
+    terminal_status,
+):
+    service = IncidentManagementService(runtime_repository)
+    first = service.detect(detection("detect-terminal-severity", occurred_at=NOW))
+    resolved = service.transition(
+        first.incident.incident_id,
+        to_status=IncidentStatus.RESOLVED,
+        event_key="resolve-terminal-severity",
+        occurred_at=NOW + timedelta(minutes=3),
+        source_type="RECOVERY_CHECK",
+    )
+    current = resolved
+    if terminal_status is IncidentStatus.CLOSED:
+        current = service.transition(
+            first.incident.incident_id,
+            to_status=IncidentStatus.CLOSED,
+            event_key="close-terminal-severity",
+            occurred_at=NOW + timedelta(minutes=4),
+            source_type="OPERATIONS",
+        )
+
+    late = service.change_severity(
+        first.incident.incident_id,
+        severity="S4",
+        event_key=f"severity-late-{terminal_status.value.lower()}",
+        occurred_at=NOW + timedelta(minutes=2),
+        source_type="TRUSTED_EVALUATOR",
+        reason="delayed escalation",
+    )
+
+    assert late.incident.incident_status is terminal_status
+    assert late.incident.severity == current.incident.severity
+    assert late.incident.updated_at == current.incident.updated_at
+    assert late.event.event_payload["requested_to_severity"] == "S4"
+
+
+def test_late_severity_change_exact_replay_is_idempotent(runtime_repository):
+    service = IncidentManagementService(runtime_repository)
+    first = service.detect(detection("detect-severity-replay", occurred_at=NOW))
+    service.change_severity(
+        first.incident.incident_id,
+        severity="S4",
+        event_key="severity-replay-newest",
+        occurred_at=NOW + timedelta(minutes=4),
+        source_type="TRUSTED_EVALUATOR",
+        reason="current threshold",
+    )
+    kwargs = {
+        "severity": "S2",
+        "event_key": "severity-replay-late",
+        "occurred_at": NOW + timedelta(minutes=2),
+        "source_type": "TRUSTED_EVALUATOR",
+        "reason": "delayed observation",
+    }
+
+    initial = service.change_severity(first.incident.incident_id, **kwargs)
+    replay = service.change_severity(first.incident.incident_id, **kwargs)
+
+    assert initial.replayed is False
+    assert replay.replayed is True
+    assert replay.event.event_id == initial.event.event_id
+    assert replay.incident.severity == "S4"

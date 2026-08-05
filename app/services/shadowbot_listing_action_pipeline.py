@@ -14,6 +14,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.automation_ui_channel import has_active_automation_ui_run
 from app.emergency_offline_fence import (
+    EMERGENCY_FINAL_CLICK_FENCE_TASK_MESSAGE,
+    EMERGENCY_HUMAN_PREEMPTED_TASK_MESSAGE,
     EmergencyOfflineFenceError,
     build_emergency_authorization_binding,
     revalidate_emergency_offline_facts,
@@ -478,6 +480,21 @@ def import_listing_action_result(
         for output in result["items"]:
             request_item = request_by_operation[output["operation_id"]]
             outcome = str(output["operation_result"]).upper()
+            emergency_import_order = _emergency_import_resolution_order(
+                connection,
+                request_item=request_item,
+            )
+            if emergency_import_order == "HUMAN_PREEMPTED":
+                if (
+                    outcome != "NOT_APPLIED"
+                    or bool(output.get("action_confirm_clicked"))
+                    or bool(output.get("action_clicked_at"))
+                    or _item_side_effect_state(output)
+                    not in {"NOT_STARTED", "NOT_APPLIED"}
+                ):
+                    raise ValidationError(
+                        "人工抢占后的 SYSTEM_EMERGENCY 结果不是确定未执行状态。"
+                    )
             stored_operation_result = (
                 "VERIFIED"
                 if outcome == "ALREADY_APPLIED"
@@ -521,6 +538,10 @@ def import_listing_action_result(
             operation_status, attempt_status, task_status, lock_status = (
                 _outcome_projection(outcome)
             )
+            task_result_message = _task_result_message(outcome, request["batch_id"])
+            if emergency_import_order == "HUMAN_PREEMPTED":
+                task_status = TaskStatus.CANCELLED.value
+                task_result_message = EMERGENCY_HUMAN_PREEMPTED_TASK_MESSAGE
             connection.execute(
                 """
                 UPDATE shadowbot_operations
@@ -575,7 +596,7 @@ def import_listing_action_result(
                 """,
                 (
                     task_status,
-                    _task_result_message(outcome, request["batch_id"]),
+                    task_result_message,
                     now,
                     request_item["source_task_id"],
                 ),
@@ -586,6 +607,7 @@ def import_listing_action_result(
                 outcome=outcome,
                 result_id=result_id,
                 occurred_at=now,
+                resolution_order=emergency_import_order,
             )
             project_manual_incident_task_result(
                 connection,
@@ -658,6 +680,47 @@ def import_listing_action_result(
     }
 
 
+def _emergency_import_resolution_order(
+    connection,
+    *,
+    request_item: dict[str, Any],
+) -> str:
+    task = connection.execute(
+        "SELECT origin_type, task_status, result_message, decision_trace_json "
+        "FROM tasks WHERE task_id = ?",
+        (request_item["source_task_id"],),
+    ).fetchone()
+    if task is None or str(task["origin_type"]) != TaskOriginType.SYSTEM_EMERGENCY.value:
+        return ""
+    trace = _json_object(task["decision_trace_json"])
+    incident = connection.execute(
+        "SELECT incident_status FROM operational_incidents WHERE incident_id = ?",
+        (str(trace.get("incident_id") or ""),),
+    ).fetchone()
+    review = connection.execute(
+        "SELECT review_status FROM review_tasks WHERE review_task_id = ?",
+        (str(trace.get("review_task_id") or ""),),
+    ).fetchone()
+    task_status = str(task["task_status"])
+    result_message = str(task["result_message"])
+    incident_status = str(incident["incident_status"]) if incident is not None else ""
+    review_status = str(review["review_status"]) if review is not None else ""
+    if (
+        task_status == TaskStatus.CANCELLED.value
+        and result_message == EMERGENCY_HUMAN_PREEMPTED_TASK_MESSAGE
+        and incident_status == "WAITING_HUMAN"
+        and review_status != "pending"
+    ):
+        return "HUMAN_PREEMPTED"
+    if (
+        task_status == TaskStatus.MANUAL_REVIEW.value
+        and result_message == EMERGENCY_FINAL_CLICK_FENCE_TASK_MESSAGE
+        and incident_status == "AUTO_PROTECTING"
+    ):
+        return "WORKER_FENCE_WON"
+    return "NORMAL"
+
+
 def _project_emergency_incident_after_import(
     connection,
     *,
@@ -665,6 +728,7 @@ def _project_emergency_incident_after_import(
     outcome: str,
     result_id: str,
     occurred_at: str,
+    resolution_order: str = "",
 ) -> None:
     """Return completed or safely failed protection to the pending human Review."""
 
@@ -693,33 +757,54 @@ def _project_emergency_incident_after_import(
         "SELECT review_status FROM review_tasks WHERE review_task_id = ?",
         (review_task_id,),
     ).fetchone()
-    if (
-        incident is None
-        or review is None
-        or str(incident["incident_status"]) != "AUTO_PROTECTING"
-        or str(review["review_status"]) != "pending"
-    ):
+    incident_status = str(incident["incident_status"]) if incident is not None else ""
+    review_status = str(review["review_status"]) if review is not None else ""
+    human_preempted = resolution_order == "HUMAN_PREEMPTED"
+    worker_fence_won = resolution_order == "WORKER_FENCE_WON"
+    valid_state = (
+        incident is not None
+        and review is not None
+        and (
+            (
+                human_preempted
+                and incident_status == "WAITING_HUMAN"
+                and review_status != "pending"
+                and outcome == "NOT_APPLIED"
+            )
+            or (
+                not human_preempted
+                and incident_status == "AUTO_PROTECTING"
+                and (worker_fence_won or review_status == "pending")
+            )
+        )
+    )
+    if not valid_state:
         raise ValidationError(
             "SYSTEM_EMERGENCY 结果无法回到原人工复核，Importer 已回滚。"
         )
-    updated = connection.execute(
-        """
-        UPDATE operational_incidents
-        SET incident_status = 'WAITING_HUMAN', updated_at = ?
-        WHERE incident_id = ? AND incident_status = 'AUTO_PROTECTING'
-        """,
-        (occurred_at, incident_id),
-    )
-    if updated.rowcount != 1:
-        raise ValidationError("SYSTEM_EMERGENCY Incident 状态并发变化。")
+    if not human_preempted:
+        updated = connection.execute(
+            """
+            UPDATE operational_incidents
+            SET incident_status = 'WAITING_HUMAN', updated_at = ?
+            WHERE incident_id = ? AND incident_status = 'AUTO_PROTECTING'
+            """,
+            (occurred_at, incident_id),
+        )
+        if updated.rowcount != 1:
+            raise ValidationError("SYSTEM_EMERGENCY Incident 状态并发变化。")
     event_key = "emergency-result:" + result_id + ":" + request_item["operation_id"]
+    event_from_status = "WAITING_HUMAN" if human_preempted else "AUTO_PROTECTING"
     payload = {
         "task_id": request_item["source_task_id"],
         "review_task_id": review_task_id,
         "operation_id": request_item["operation_id"],
         "operation_result": outcome,
-        "human_review_still_required": True,
+        "human_review_still_required": review_status == "pending",
         "automatic_reonline_allowed": False,
+        "resolution_order": resolution_order or "NORMAL",
+        "late_human_review_recorded": worker_fence_won and review_status != "pending",
+        "human_preempted_before_side_effect": human_preempted,
     }
     connection.execute(
         """
@@ -728,8 +813,8 @@ def _project_emergency_incident_after_import(
             source_type, source_ref_id, from_status, to_status, severity,
             event_payload_json, created_at
         ) VALUES (?, ?, ?, 'RECOVERY_RECORDED', ?,
-                  'SHADOWBOT_RESULT_IMPORTER', ?, 'AUTO_PROTECTING',
-                  'WAITING_HUMAN', ?, ?, ?)
+                  'SHADOWBOT_RESULT_IMPORTER', ?, ?,
+                   'WAITING_HUMAN', ?, ?, ?)
         """,
         (
             _stable_id("incident-event", event_key),
@@ -737,6 +822,7 @@ def _project_emergency_incident_after_import(
             incident_id,
             occurred_at,
             request_item["source_task_id"],
+            event_from_status,
             incident["severity"],
             _json_text(payload),
             occurred_at,
