@@ -55,7 +55,9 @@ SQLite 中的价格是“最近一次已确认的平台快照”，不是对平�
 | `price_source_attempt_id` | 价格来源执行尝试 ID | 必须与库存来源 attempt 一致，任务生成器才接受该组观察 |
 | `last_listing_change_at` | 最近一次已确认上下架写操作时间 | 早于该时间的页面位置、价格和库存观察不得用于新的上下架任务 |
 
-`/business-inputs?input_tab=listing_status` 仅用于查看当前快照，不显示人工录入或修改窗口。正常状态下由通过合同校验的 ShadowBot READ_ONLY 结果新增或更新记录。为开发调试保留受登录、CSRF、路径策略和字段校验保护的 `save_listing_status` POST 动作，但页面不暴露该入口，写入来源标记为 `debug_web_request`。同一“平台 + 品种 + 等级”再次写入时更新原记录，不新增重复记录。
+`/business-inputs?input_tab=listing_status` 仅用于查看当前快照，不显示人工录入或修改窗口。正常状态下由通过合同校验的 ShadowBot READ_ONLY 结果新增或更新记录。
+
+**13.5-7A 控制面冻结说明：** 当前代码仍存在未渲染表单的 `save_listing_status` POST 调试动作，并写入 `source=debug_web_request`；这是待迁移的 Current 事实，不再是目标生产合同。PR #29 冻结为：7B 生产 Web 必须明确拒绝该动作，调试需求如仍存在只能迁到隔离的 dev/test 工具或测试 Runtime DB，并且不得伪造 ShadowBot attempt/evidence 或形成可被运营流程当作平台观察的正式状态。完成 7B 禁用后，本段 Current 事实应进一步删改为历史说明。
 
 `100` 只是当前开发阶段在尚无平台观测时的新记录默认值，不是真实库存证据。任务11的 v2 READ_ONLY 请求以“商品资料与库存录入”的全部 SKU 生成 `platform`、`expected_product_name`、`expected_grade` 映射提示；逐商品结果为 `SUCCESS` 且 `inventory` 是非负整数时，Result Importer 按该平台身份更新库存、观测时间和执行尝试 ID。任务13的完整两页 `SYNC_STATUS` 则把同一次扫描观察到的价格和库存一起投影到 `listing_status`，并保留父快照和商品项作为原始证据。页面商品能在库存商品表中按“商品名 + 等级”唯一匹配时，状态记录必须写入对应 `internal_sku`。较旧观测不得覆盖较新观察；早于最近一次上下架写操作的观察也不得重新成为任务生成依据。任务12价格回写始终保留库存，不能再次写入默认值。
 
