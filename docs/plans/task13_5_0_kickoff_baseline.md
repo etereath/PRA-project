@@ -169,7 +169,7 @@ hash 相同。后续每次同步仍须重新执行停机、编辑器关闭、备
 | `scripts/run_shadowbot_listing_sync.py` | 转为正式只读扫描服务的手工触发适配 |
 | `scripts/run_shadowbot_executor.py` | 保留明确 `task_id` 普通写入口 |
 | `scripts/run_shadowbot_commit_batch.py` | 保留兼容；不得成为 Scheduler 的批量 pending 入口 |
-| `scripts/reconcile_shadowbot_listing_skus.py` | 保留唯一 RECONCILE 的受控人工入口 |
+| `scripts/reconcile_shadowbot_listing_skus.py` | SKU 数据修正工具（DRY_RUN/APPLY）；不是 UNKNOWN 后的平台 RECONCILE，不得取得该 capability |
 | `scripts/run_mock_platform_executor.py` | 移入系统维护测试工具，不与真实任务混显 |
 | `scripts/create_sample_workbooks.py` | 保留开发/示例数据生成，不进入运营主流程 |
 | `scripts/generate_shadowbot_markdown_report.py` | 下沉报告服务或保留薄适配 |

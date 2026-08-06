@@ -22,9 +22,10 @@ PR #29 直接承担 **13.5-7A：控制面入口盘点、复用矩阵与合同冻
 5. capability 级 canonical identity 与分层幂等；
 6. 18:00 平台截单、20:00 卖家经营日切换的重试合同；
 7. Runtime DB Current → Migration → Target → Tests；
-8. Operation 状态转换和人工恢复资格门禁；
-9. 三层优先级和唯一 RECONCILE；
-10. 7B/7C 开工、验证和停止条件。
+8. 查询入口零业务写/零 Schema 写合同；
+9. Operation、Attempt、Task、共享写锁和 Importer 的人工恢复收敛合同；
+10. 三层优先级、唯一 RECONCILE 和独立服务生命周期；
+11. 7B/7C 开工、验证和停止条件。
 
 本阶段不修改 Runtime Schema、Web 路由、CLI、Scheduler、v4/v5、ShadowBot、Importer、Worker 部署或生产开关。
 
@@ -59,7 +60,8 @@ Review Profile: R4
   重复平台副作用、覆盖人工操作、隐藏 Web 直写污染平台事实、
   UNKNOWN 后二次写、错误 Runtime DB、跨时间边界第二事实、
   legacy root 平行写、generic Executor 绕过正式能力、
-  人工恢复覆盖 RUNNING/VERIFIED、第二 Importer 或第二写链
+  人工恢复覆盖 RUNNING/VERIFIED、查询触发迁移或过期任务、
+  Web 退出连带停止 Queue、Automation 未启动、第二 Importer 或第二写链
 人工恢复成本: 高
 新增数据库表: 0
 新增持久化字段: 0
@@ -191,7 +193,13 @@ Web Process Bootstrap / Composition Root
 | legacy `/manual-intervention` | 只读；正式 resolve 已拒绝 | `LEGACY_MANUAL_READ` | `READ_ONLY` | 归档候选 |
 | `/system/test-feishu-notification` | 发送受控测试通知 | `NOTIFICATION_DIAGNOSTIC` | 管理员运维 | 不进业务 Service |
 
-只读路由 `/dashboard`、`/tasks`、`/notifications`、`/system`、`/health` 分别保持 READ_ONLY/DIAGNOSTIC，不得夹带写分支。
+`/dashboard`、`/tasks`、legacy `/runtime` 和 CLI `list-tasks` 的 **Current** 并非真正零写：它们会进入
+`app.services.workflow.list_runtime_tasks`，后者先调用 `init_schema()`，再调用
+`expire_overdue_pending_tasks()`，最后才查询。`init_schema()` 还可能执行 Runtime Schema 迁移。因此这些
+入口的 Target 才是 `RUNTIME_QUERY / READ_ONLY`；入口盘点不得用目标标签覆盖当前风险。
+
+`/notifications`、`/system`、`/health` 的查询/诊断同样必须保持零业务生命周期写；若健康检查需要读取
+Schema 健康，只能使用只读连接，不得顺带初始化或升级。
 
 ### 8.1 `save_listing_status` Current 风险
 
@@ -221,81 +229,140 @@ action=save_listing_status
 - `docs/shadowbot_listing_status_integration.md` 中“保留该调试 Web POST”的描述从本计划起降级为 **历史 Current 事实**，不再代表目标合同；7B 禁用该动作时必须同步改写/删除该段说明；
 - 7B 测试必须构造隐藏 POST，断言被拒绝且 `listing_status` 零变化。
 
-## 9. 主 CLI、Automation、Queue 与平台入口
+### 8.3 查询零写合同
 
-### 9.1 主 CLI
+7B 必须把查询与维护拆开：
 
-| 子命令 | Capability / mode | 结论 |
-|---|---|---|
-| `templates` | `WORKBOOK_TEMPLATE_MAINTENANCE` / maintenance | 管理员工具 |
-| `validate`、`import-data` | `SOURCE_VALIDATE` / diagnostic | 保留；`import-data` 不等于正式 Importer |
-| `preview-tasks` | `TASK_PREVIEW` / DRY_RUN | 统一 Service |
-| `generate-tasks` | legacy export / maintenance | 兼容，不进 Runtime 主线 |
-| `mock-ai-decision` | mock preview / DRY_RUN | 测试 |
-| `simulate-execution` | legacy simulation / maintenance | 归档候选 |
-| `list-manual-tasks` | legacy read / READ_ONLY | 只读兼容 |
-| `resolve-manual-task` | denied | 保持硬失败 |
-| `init-runtime-db` | runtime maintenance | 管理员工具 |
-| `health` / `check-runtime-health` | diagnostic | 保留 |
-| `generate-runtime-tasks` | `TASK_APPLY` / APPLY | 薄 CLI |
-| Runtime/Review list commands | READ_ONLY | 保留 |
-| `resolve-review-task` | `REVIEW_APPLY` / APPLY | 薄适配 |
-| `expire-review-tasks` | DRY_RUN 或显式 APPLY | 参数化复用 |
-| `notification-worker` | internal delivery | 保持独立 Worker |
-| `serve-web` | bootstrap | 7B 在此绑定唯一 Web Repository |
+- `list_runtime_tasks`、Dashboard Presenter、Task Presenter 和 CLI list adapter 只接收已经完成 bootstrap
+  的 Repository；查询函数内部不得调用 `init_schema()`、迁移、过期任务或其他 maintenance；
+- Runtime Schema 初始化/迁移只允许可信进程 bootstrap 或显式管理员 maintenance；Web GET、CLI list、
+  Presenter 和模板渲染都无权触发；
+- 过期 Task/Review 的推进改由既有 Automation Service 维护窗口或显式管理员 `APPLY`，必须有 Run/Event
+  或管理员审计，不能伪装成一次读页面；
+- 只读入口可以更新纯进程内缓存/指标，但不得改变 Runtime DB、workbook、队列、Outbox、文件证据或平台；
+- 测试以同一 DB 的全表内容哈希/`total_changes` 与 Schema version 前后对比证明零写，不能只断言页面返回 200。
 
-### 9.2 Automation Service
+必须覆盖 `/dashboard` GET、`/tasks` GET、legacy `/runtime` GET、CLI `list-tasks`、空库/旧版本库拒绝以及
+已过期 Task 存在时的查询；旧版本库应返回明确“需要管理员迁移”，不得由查询静默升级。
 
-- bootstrap、window materialization/claim、settlement、order read-only、Incident、host recovery 均复用现有 Service；
-- 当前继续声明 `platform_write_handlers_registered=false`；
-- 13.5-7 不得变成“扫描全部 pending Task 后自动 COMMIT”。
+## 9. 完整入口矩阵与服务生命周期
 
-### 9.3 Queue Service
+### 9.1 盘点基线与纠错规则
 
-`run_shadowbot_queue_services.py` 是正式长驻 Composition Root：
+本节不另造一份缩略脚本清单，而是以
+[`task13_5_0_kickoff_baseline.md` §4](task13_5_0_kickoff_baseline.md#4-脚本与入口盘点)
+的 **全部文件** 为底表，再叠加截至本 PR 基线的代码差异与纠错。底表 §4.1–§4.5 中没有在下表
+逐项重复的文件，其分类、生产可达性和退役要求仍全部有效。
 
-```text
-login verification monitor
-→ v2/v4/v5 Result Importer
-→ Queue Watchdog
-→ overdue review reminders
-→ Notification Outbox watchdog/delivery
-```
+必须先纠正底表的一个历史误分类：`scripts/reconcile_shadowbot_listing_skus.py` 是对
+`listing_status.internal_sku` 做 DRY_RUN/APPLY 的数据修正工具，**不是** UNKNOWN 后的唯一平台
+RECONCILE。该文件不得取得 `UNKNOWN_RECONCILE` capability。
 
-- Queue Service 是 v2/v4/v5 正式 Importer/Watchdog 主线；
-- ORDER_SCAN 继续由 Automation observation importer 处理；
-- Watchdog 只能生成安全恢复或唯一 RECONCILE；
-- 普通 Web/Scheduler/兼容 CLI 不得为同一合同建立第二 Importer。
+13.5-0 之后新增、因此必须叠加到完整清单的入口：
 
-### 9.4 v4 commit batch
+| 文件 | Current | Capability / mode | Composition Root | 结论 |
+|---|---|---|---|---|
+| `scripts/run_automation_service.py` | 独立计划、租约、Run/Handler 进程 | `AUTOMATION_SERVICE` / internal | Automation bootstrap | 正式服务，保留 |
+| `scripts/compile_product_mappings.py` | 编译/校验商品映射文件 | `MAPPING_MAINTENANCE` / maintenance | 管理员 CLI | 保留，不进入平台控制面 |
+| `scripts/run_task13_5_4_order_readonly_acceptance.py` | 受控订单只读验收 | `ACCEPTANCE_READ_ONLY` / acceptance | 验收工具 | 仅验收，不进入生产调度 |
+| `scripts/shadowbot_windows_host_helper.ps1` | 受控 Windows 宿主恢复 | `HOST_RECOVERY` / internal admin | Automation Incident recovery | 保留 fail-closed，不由 Web 直接启动 |
 
-- `prepare` → `AUTHORIZED_WRITE_PREPARE / APPLY`；
-- `publish` → `AUTHORIZED_WRITE_COMMIT / COMMIT`；
-- `production-run` → composite COMMIT，但内部仍保持 prepare→publish 边界；
-- `import-result` → legacy internal/admin import，7C 引用审计后由 Queue Service 取代。
+`scripts/local_env.ps1` 是本机私有配置而非入口，继续不提交；`scripts/local_env.example.ps1` 是配置
+模板而非业务 capability。根目录 `start_web.bat` 仅是 Web bootstrap，保持 ASCII + CRLF。
 
-### 9.5 legacy generic Executor
+### 9.2 正式长驻服务与启动入口
 
-`run_shadowbot_executor.py start` 当前真实 accepted modes：
+| Entry / component | Current behavior | Target capability / mode | Composition Root | 保留/迁移 |
+|---|---|---|---|---|
+| `pra serve-web` / `start_web.bat` | Web 进程 | `WEB_SERVICE` / bootstrap | Web bootstrap 固定唯一 Runtime Repository | 保留 |
+| `scripts/start_local.ps1` | 当前把 Queue 作为 Web-owned 子进程启动，并在 Web 退出时停止；不启动 Automation | `WEB_DEV_BOOTSTRAP` | Web bootstrap | 7B 移除 Queue 所有权，降为 Web-only 本地兼容启动器 |
+| `scripts/run_shadowbot_queue_services.py` | Queue 单实例长驻进程 | `QUEUE_SERVICE` / internal | Queue bootstrap | 正式服务，独立启停/健康 |
+| Queue login monitor | 登录人工介入事实 | `LOGIN_MONITOR` / internal | Queue Service | 原样复用 |
+| Queue v2/v4/v5 Importer | 结果校验、回写、归档 | `RESULT_IMPORT` / internal | Queue Service | 唯一正式 v2/v4/v5 Importer |
+| Queue Watchdog/auto reconcile | 租约恢复、唯一 RECONCILE | `QUEUE_RECOVERY` / internal | Queue Service | 原样复用 |
+| Queue review reminders | 复核续期/提醒 | `REVIEW_MAINTENANCE` / internal | Queue Service | 保留现有所有权 |
+| Queue notification delivery/watchdog | Outbox 投递/租约恢复 | `NOTIFICATION_DELIVERY` / internal | Queue Service | 保留现有所有权 |
+| `scripts/run_automation_service.py` | 计划、租约、Run、扫描/日结/Incident handler | `AUTOMATION_SERVICE` / internal | Automation bootstrap | 正式服务，独立启停/健康 |
+| ORDER_SCAN observation importer | 订单只读结果导入 | `ORDER_OBSERVATION_IMPORT` / internal | Automation Handler | 保持独立于 v2/v4/v5 Queue Importer |
 
-```text
-READ_ONLY
-COMMIT
-RECONCILE
-```
+独立生命周期冻结为：
 
-`COMMIT` 只是 argparse 默认值，不是当前唯一能力。
+- Web、Queue Service、Automation Service 是三个独立进程；任一进程退出不得连带停止另外两个；
+- 每个进程分别拥有 start/status/health/stop 运行手册、PID/单实例边界和日志；`start_local.ps1` 不再
+  充当 Queue 的隐式父进程，也不得让“Web 可访问”冒充完整闭环已启动；
+- 完整闭环 ready 必须同时证明 Web health、Queue 单实例锁/Importer/Watchdog 健康、Automation
+  租约/heartbeat 健康以及三者绑定同一规范化 Runtime DB；
+- 7B 同步更新 README 与运行环境手册，写清三个进程的独立命令；增加“停止 Web 后 Queue/Automation
+  仍运行”“缺少任一服务时整体 readiness 降级但其他服务不被杀死”的生命周期测试。
 
-7B：
+### 9.3 主 CLI
 
-- 新 Application Service 永远不调用 generic `start`；
-- 新 Web/Scheduler/CLI 不透传用户 `execution_mode`；
-- 正式 READ_ONLY 只走 listing sync/Automation read-only；
-- 正式 COMMIT 只走 v4/v5 已授权发布；
-- 正式 RECONCILE 只走 existing UNKNOWN Operation → 唯一 reconcile service；
-- 不新增 generic executor 调用方。
+| 子命令 | Current / Target capability | Mode | Composition Root | 结论 |
+|---|---|---|---|---|
+| `templates` | `WORKBOOK_TEMPLATE_MAINTENANCE` | maintenance | 管理员 CLI | 保留 |
+| `validate`、`import-data` | `SOURCE_VALIDATE` | diagnostic/maintenance | 管理员 CLI | 保留；不等于 Result Importer |
+| `preview-tasks` | `TASK_PREVIEW` | `DRY_RUN` | 目标统一 Application Service | 薄适配 |
+| `generate-tasks` | legacy workbook export | maintenance | legacy CLI | 兼容，不进 Runtime 主线 |
+| `mock-ai-decision` | mock preview | `DRY_RUN` | test CLI | 测试隔离 |
+| `simulate-execution` | legacy simulation | maintenance | legacy CLI | 归档候选 |
+| `list-manual-tasks` | legacy read | `READ_ONLY` | CLI query adapter | 只读兼容；必须满足 §8.3 |
+| `resolve-manual-task` | denied | none | CLI adapter | 保持硬失败 |
+| `init-runtime-db` | `RUNTIME_SCHEMA_MAINTENANCE` | maintenance | 可信管理员 bootstrap | 唯一显式 Schema 初始化/迁移入口之一 |
+| `health`、`check-runtime-health` | `RUNTIME_HEALTH` | `DIAGNOSTIC` | read-only health adapter | 保留，禁止隐式迁移 |
+| `generate-runtime-tasks` | `TASK_APPLY` | `APPLY` | 目标统一 Application Service | 薄适配 |
+| Runtime/Review list commands | `RUNTIME_QUERY` | `READ_ONLY` | CLI query adapter | 保留；移除隐式 init/expire |
+| `resolve-review-task` | `REVIEW_APPLY` | `APPLY` | existing atomic review service | 参数化复用 |
+| `expire-review-tasks` | `REVIEW_MAINTENANCE` | `DRY_RUN`/显式 `APPLY` | existing review service | 管理员或 Automation 维护 |
+| `notification-worker` | `NOTIFICATION_DELIVERY` | internal | notification worker | 保持独立 Worker |
+| `serve-web` | `WEB_SERVICE` | bootstrap | Web Composition Root | 固定唯一 Repository |
 
-7C 完成 call-site、Runbook、部署和测试引用审计后退役或隔离为测试工具。
+### 9.4 业务、平台与人工入口
+
+| Entry / subcommand | Current behavior | Target capability / allowed mode | Composition Root | 保留/退役 |
+|---|---|---|---|---|
+| `evaluate_business_rules.py --dry-run` | evaluator 预览 | `TASK_PREVIEW / {DRY_RUN}` | 统一 Application Service | 保留薄 CLI |
+| `evaluate_business_rules.py --apply` | 写 Task/Review/通知 | `TASK_APPLY / {APPLY}` | 统一 Application Service | 保留薄 CLI |
+| `run_shadowbot_listing_sync.py` | 随机默认 Batch/Attempt，直接 prepare+publish；硬编码 Schema v13 | `MANUAL_SCAN_TRIGGER / {READ_ONLY}` | 既有 Automation scan Service | 7B 参数化迁移，禁止沿用 Current 直发 |
+| `run_shadowbot_commit_batch.py prepare` | 写 PREPARED 账本 | `AUTHORIZED_WRITE_PREPARE / {APPLY}` | existing v4 service | 保留薄 CLI |
+| 同脚本 `publish` | 投递既有 PREPARED | `AUTHORIZED_WRITE_COMMIT / {COMMIT}` | existing v4 service | 保留受控入口 |
+| 同脚本 `production-run` | prepare→publish composite | `AUTHORIZED_WRITE_COMMIT / {COMMIT}` | existing v4 service | 兼容；不得扫描全部 pending |
+| 同脚本 `import-result` | 手工执行正式 v4 Importer | `LEGACY_RESULT_IMPORT / internal admin` | legacy CLI | 7C 引用审计后由 Queue Service 取代 |
+| `run_shadowbot_executor.py start` | 外部可选 READ_ONLY/COMMIT/RECONCILE | `LEGACY_GENERIC_EXECUTION` / 新控制面无 allowed mode | legacy Executor | 7C 退役/测试隔离 |
+| 同脚本 `import-result` | 手工结果导入 | `LEGACY_RESULT_IMPORT / internal admin` | legacy Executor | 7C 退役，不保留第二正式 Importer |
+| 同脚本 `poll-yingdao-result` | 外部 runner 结果轮询 | `LEGACY_RUNNER_DIAGNOSTIC` / diagnostic | legacy Executor | 引用审计后隔离 |
+| 同脚本 `check-yingdao-app-params` | 影刀参数检查 | `RUNNER_DIAGNOSTIC / diagnostic` | 管理员 CLI | 保留运维诊断或抽取 |
+| `repair_shadowbot_expired_attempt.py` | 生成受控 expired rejected result 并直接 `import_one` | `QUEUE_REPAIR_RESULT_IMPORT / internal admin` | 隔离管理员修复 | 仅精确 attempt、Queue 停止/无竞态时使用；不得成为常规第二 Importer |
+| `reconcile_shadowbot_listing_skus.py` dry-run/apply | SKU 数据修正 | `SKU_DATA_MIGRATION / {DRY_RUN, MAINTENANCE}` | 管理员迁移工具 | 保留并纠正命名误导；绝非平台 RECONCILE |
+| `run_mock_platform_executor.py --dry-run/--apply` | 修改 Mock DB/测试 execution log | `MOCK_PLATFORM_LAB / test only` | Mock composition root | 测试隔离，生产不可达 |
+| `create_sample_workbooks.py` | 示例 workbook | `SAMPLE_DATA / maintenance` | 开发工具 | 不进入运营主线 |
+| `generate_shadowbot_markdown_report.py` | 报告生成 | `REPORT_EXPORT / READ_ONLY` | 报告 adapter | 保留薄适配或下沉服务 |
+| `compile_product_mappings.py` | 映射编译 | `MAPPING_MAINTENANCE / maintenance` | 管理员 CLI | 保留 |
+
+正式人工 READ_ONLY 不再等同于直接运行 `run_shadowbot_listing_sync.py`：7B 必须调用既有 Automation
+scan service，创建 `origin_type=MANUAL` 的稳定 Automation Run/intent，复用 `UI_CHANNEL_PRIORITY`、
+租约、父子 Run、Worker、Importer 和完成接口。调用方可选择既有 scan capability/目标日期，但不能提供
+随机身份或提升模式。listing sync 的 Schema 检查改用 `LATEST_RUNTIME_SCHEMA_VERSION`；订单人工只读也走
+同一入口，不再新增脚本/队列/Importer。
+
+### 9.5 运维、验收与归档入口
+
+- 13.5-0 §4.3 的 `check_runtime_env.py`、readiness/worker health、backup、ShadowBot sync/hash、
+  migration、evidence share 全部继续按管理员运维分类；其中 `repair_shadowbot_expired_attempt.py` 的
+  额外副作用边界已在 §9.4 单独覆盖；
+- `shadowbot_windows_host_helper.ps1` 仅能由已启用且通过 final fence 的 Incident host recovery 调用，
+  普通 Web/CLI 不得触发；
+- 13.5-0 §4.4 列出的每一个证据导出、故障注入、prepare、验收、Linux/Windows/packaging/verify 脚本，
+  加上 `run_task13_5_4_order_readonly_acceptance.py`，统一为 `ACCEPTANCE_ONLY`：不注册到生产 Composition
+  Root，不取得 Scheduler/COMMIT/Importer capability；
+- 13.5-0 §4.5 的四个归档候选继续保留引用审计门禁；`run_shadowbot_e2e_local_demo.py` 不得成为正式入口。
+
+### 9.6 legacy generic Executor Current → Target
+
+`run_shadowbot_executor.py start` 当前真实 accepted modes 为 `READ_ONLY / COMMIT / RECONCILE`；`COMMIT`
+只是 argparse 默认值。7B 新 Application Service 永远不调用 generic `start`，新 Web/Scheduler/CLI 不透传
+用户 `execution_mode`：正式 READ_ONLY 走 Automation scan，正式 COMMIT 走 v4/v5 已授权发布，正式
+RECONCILE 走 existing UNKNOWN Operation 的唯一 reconcile service。7C 完成 call-site、Runbook、部署和
+测试引用审计后退役或隔离 generic `start`，且不新增调用方。
 
 ## 10. Capability 绑定硬门禁
 
@@ -305,17 +372,25 @@ RECONCILE
 |---|---|---|
 | task generator preview | `TASK_PREVIEW` | `{DRY_RUN}` |
 | task generator persist | `TASK_APPLY` | `{APPLY}` |
+| Dashboard/Task/legacy Runtime/CLI list | `RUNTIME_QUERY` | `{READ_ONLY}`，零 Schema/业务写 |
 | execution logs query | `EXECUTION_LOG_QUERY` | `{READ_ONLY}` |
 | execution logs reconcile | `UNKNOWN_RECONCILE` | `{RECONCILE}` |
 | execution logs manual handled | `MANUAL_OPERATION_RECOVERY` | `{APPLY}` admin only |
 | hidden `save_listing_status` | `DEBUG_LISTING_STATUS_WRITE` | **production none / denied** |
-| listing sync | `LISTING_SYNC_READ_ONLY` | `{READ_ONLY}` |
+| formal manual listing/order scan | `MANUAL_SCAN_TRIGGER` | `{READ_ONLY}`，通过 Automation scan service |
+| current listing sync direct CLI | `LEGACY_LISTING_SYNC_DIRECT` | **不进入新业务白名单** |
 | commit prepare | `AUTHORIZED_WRITE_PREPARE` | `{APPLY}` |
 | commit publish | `AUTHORIZED_WRITE_COMMIT` | `{COMMIT}` |
 | v5 listing publish | `LISTING_ACTION_COMMIT` | `{COMMIT}` |
 | Queue Service Importer | `RESULT_IMPORT` | internal only |
 | Queue Watchdog | `QUEUE_RECOVERY` | internal only |
+| expired attempt repair | `QUEUE_REPAIR_RESULT_IMPORT` | internal admin、精确 attempt only |
+| SKU reconcile script | `SKU_DATA_MIGRATION` | `{DRY_RUN, MAINTENANCE}`，绝非 `RECONCILE` |
+| Mock Platform executor | `MOCK_PLATFORM_LAB` | test only，production none |
 | generic executor start | `LEGACY_GENERIC_EXECUTION` | **不进入新业务白名单** |
+
+每一个具体 route action、CLI subcommand 和脚本先由 Composition Root 绑定上述 capability，再校验 mode。
+请求中的 `requested_mode`、`execution_mode` 或 action 名称不能改变 capability；未知 entry/action fail closed。
 
 ## 11. 业务意图、来源与 canonical identity
 
@@ -407,43 +482,59 @@ MANUAL_HANDLED
 
 ### 14.2 允许状态白名单
 
-本阶段只允许已有业务证据支持的两种来源状态：
+`confirm_manual_handled` 不是通用“解除卡住”按钮。它只表达：操作人员已经在平台完成原批准动作，
+且后续正式 READ_ONLY 结果已验证目标状态。generic action 的来源状态白名单仅为：
 
 ```text
-FAILED
-NEEDS_RECONCILIATION
+FAILED + latest terminal attempt.side_effect_state in {NOT_STARTED, NOT_APPLIED}
 ```
 
-不为“以后可能有用”扩大白名单。
+这不是说“未执行也算已处理”：若没有人工完成动作，只能走既有 Retry Authorization 或明确取消流程；
+只有人工完成后、正式只读结果证明批准目标已经成立，才允许 `MANUAL_HANDLED`。
 
-明确禁止：
+状态/动作矩阵：
 
-```text
-PENDING
-RUNNING
-VERIFIED
-NOT_APPLIED
-RETRY_AUTHORIZED
-MANUAL_REVIEW
-```
+| Current Operation | 允许路径 | Operation/Task/共享写锁结果 | generic `confirm_manual_handled` |
+|---|---|---|---|
+| `PENDING` / `RUNNING` | 既有执行/Watchdog | 不变 | 拒绝 |
+| `FAILED` + `NOT_STARTED/NOT_APPLIED` | 无人工动作则 Retry Authorization；人工已完成且 Importer 证据验证目标时受控 close | close 时 Operation→`MANUAL_HANDLED`、Task→`SUCCESS`、锁必须此前已 `RELEASED`/不存在 | 仅后一种允许 |
+| `NOT_APPLIED` | 既有 Retry Authorization 或显式取消 | 不变直到权威路径推进 | 拒绝 |
+| `RETRY_AUTHORIZED` | 消费现有授权创建合法新 Attempt | 不变直到结果导入 | 拒绝 |
+| `NEEDS_RECONCILIATION` | **唯一 READ_ONLY RECONCILE** | 未决时 Task/UNKNOWN 写锁保持；结果只由 reconcile Importer 推进 | 拒绝，人工证据不能旁路 |
+| `VERIFIED` | 已由 Importer 终结 | 已完成事实不变 | 拒绝 |
+| `MANUAL_REVIEW` | 按 `quarantine_reason` 和 attempt evidence 进入专用 resolver | 见下文；不得永久悬挂，也不得一键放行 | generic action 拒绝 |
+| `MANUAL_HANDLED` | 仅同 canonical identity 精确重放 | 全部事实不变 | 返回 `ALREADY_HANDLED` |
 
-`MANUAL_HANDLED` 不再次执行 transition，只进入幂等重放判定。
+`MANUAL_REVIEW` 专用 resolver 不新增状态，按事实分流：
 
-若未来确需从其他状态人工接管，必须提供具体业务事故和单独评审，不在 7B 顺手放宽。
+1. 任一相关 Attempt 仍是 `STARTING/RUNNING`：拒绝并由 Watchdog 处理；
+2. 任一相关 Attempt 副作用未知：转入/保持 `NEEDS_RECONCILIATION`，保留 `UNKNOWN` 共享写锁，启动唯一 RECONCILE；
+3. 全部相关 Attempt 已确定 `NOT_STARTED/NOT_APPLIED`：进入既有 manual Retry Authorization 或明确取消；
+4. 正式 Importer 已验证批准目标完成，或人工完成后新的正式 READ_ONLY Importer 证据验证目标：允许专用
+   controlled close，把 Operation/Task/共享写锁一次性收敛；
+5. `DUPLICATE_ACTIVE_COMMIT_ATTEMPT` 等隔离原因必须先证明所有重复 Attempt 都已终止，并逐个归类；不得只改
+   Operation 状态掩盖重复 Attempt。
+
+所以 `MANUAL_REVIEW` 不再被简单列为“永远拒绝”，也不加入 generic 白名单；它有明确、按原因可完成的恢复路径。
 
 ### 14.3 并发与资格门禁
 
-人工确认必须在同一数据库事务/CAS 中满足全部条件：
+人工确认必须在同一数据库事务/CAS 中读取并校验全部权威对象：
 
-1. Operation 存在且状态在 `{FAILED, NEEDS_RECONCILIATION}`；
-2. `lock_owner` 为空；
-3. 该 Operation 无 `STARTING`/`RUNNING` 活动 Attempt；
-4. 无活动 RECONCILE attempt；
-5. 无 ACTIVE retry authorization；
-6. 若来源状态为 `NEEDS_RECONCILIATION`，必须提交人工平台核验的稳定 `evidence_type + evidence_hash`；
-7. 只有全部条件成立才更新 `MANUAL_HANDLED`；不得先清锁再判断。
+1. Operation 存在，状态/最新 terminal Attempt 符合 §14.2；
+2. `shadowbot_operations.lock_owner` 为空；它只是 Operation claim owner，**不能代替**共享业务写锁；
+3. `shadowbot_write_locks` 对该 Operation 不存在，或已经是 `RELEASED`；generic recovery 不得把
+   `ACTIVE/UNKNOWN` 写锁直接释放；
+4. 无 `STARTING/RUNNING` Attempt、无活动 RECONCILE、无 ACTIVE retry authorization；
+5. Task 仍绑定该 Operation/批准 payload，且没有被 supersede、取消或由其他结果推进；
+6. 证据来自已校验并导入的正式 READ_ONLY/RECONCILE 结果，证明平台当前状态等于该 Operation 的批准目标；
+7. 只有全部条件成立才执行一次原子收敛；不得先清 `lock_owner`、先释放共享锁或先写成功日志。
 
-非法状态或竞态统一返回 conflict/blocked，Operation、Attempt、Lock、Task 和执行日志均不得被修改。
+专用 `MANUAL_REVIEW` controlled close 可在同一事务把属于该 Operation 的 `ACTIVE/UNKNOWN` 共享锁改为
+`RELEASED`，但前提是 reason-specific resolver 已完成 §14.2 的全部 Attempt 归类且正式 Importer 证据已证明
+目标状态；它不能复用 generic action 绕过这些条件。
+
+非法状态或竞态统一返回 conflict/blocked，Operation、Attempt、共享 Lock、Task 和执行日志均不得改变。
 
 ### 14.4 幂等与异内容冲突
 
@@ -457,12 +548,20 @@ operation_id
 + evidence_hash
 ```
 
-`actor`、free-text `note`、`requested_at` 仅审计。
+`actor`、free-text `note`、`requested_at` 仅审计。`evidence_type` 只接受服务端白名单（例如已导入的
+`READ_ONLY_TARGET_VERIFIED`），不接受自由文本或客户端自报“已检查”。`evidence_hash` 由服务端对以下
+canonical JSON 计算 SHA-256：contract version、operation/task、approved payload hash、平台/商品身份、
+证据 result/attempt/observation ID、规范化已验证结果；UTF-8、键排序、无无意义空白。客户端不能直接指定 hash。
 
-- 首次合法确认：原子 transition + 一条成功审计 log；
+- 首次合法确认：一个 `BEGIN IMMEDIATE`/Repository 原子方法同时完成 Operation→`MANUAL_HANDLED`、
+  Task→`SUCCESS`、必要的 reason-specific 共享锁→`RELEASED` 和一条成功审计 log；
+- 原 Attempt 保持不可变 terminal 事实，不改写成成功；人工处置通过 Operation/Task projection 和审计表达；
 - 已是 `MANUAL_HANDLED` 且 canonical recovery identity 相同：返回 `ALREADY_HANDLED`，不重复写成功 log；
 - 已是 `MANUAL_HANDLED` 但 canonical identity 不同：409 conflict；
 - 不新增表/字段；必要的 recovery identity/evidence 可写入现有 execution log `raw_output`。
+
+`listing_status`、平台价格/上下架位置、订单观察等平台事实只能由现有正式 Importer 写入。人工恢复事务
+只引用已经导入的 evidence ID/hash，绝不根据人工 note 或 Web 表单直接“补写平台成功”。
 
 ## 15. 优先级
 
@@ -523,7 +622,7 @@ ShadowBot Worker
 
 ## 17. ApplicationResult
 
-允许投影：`CREATED / ALREADY_EXISTS / ALREADY_RUNNING / DEFERRED_BY_HIGHER_PRIORITY / BLOCKED_BY_REVIEW / BLOCKED_BY_UNKNOWN / BLOCKED_BY_UI_CHANNEL / BLOCKED_BY_IDENTITY / READ_ONLY_COMPLETED / DRY_RUN_COMPLETED / FAILED_BEFORE_SIDE_EFFECT / START_UNKNOWN / NEEDS_RECONCILIATION / COMPLETED`。
+允许投影：`CREATED / ALREADY_EXISTS / ALREADY_RUNNING / ALREADY_HANDLED / DEFERRED_BY_HIGHER_PRIORITY / BLOCKED_BY_REVIEW / BLOCKED_BY_UNKNOWN / BLOCKED_BY_UI_CHANNEL / BLOCKED_BY_IDENTITY / MIGRATION_REQUIRED / CONFLICT / READ_ONLY_COMPLETED / DRY_RUN_COMPLETED / FAILED_BEFORE_SIDE_EFFECT / START_UNKNOWN / NEEDS_RECONCILIATION / COMPLETED`。
 
 它只是非持久化适配器投影，必须同时返回底层领域状态、错误码、canonical intent、invocation audit、关联 Run/Task/Review/Batch/Operation/Attempt IDs、副作用和安全重试建议。不得形成第二生命周期。
 
@@ -535,21 +634,28 @@ ShadowBot Worker
 - v4/v5 gate、Batch、Operation、Attempt、写锁和 Task running 继续走既有事务；
 - Queue Service Importer 是 v2/v4/v5 结果主线；
 - ORDER_SCAN 继续由 Automation importer；
+- Web/CLI query 不得执行 Schema 初始化、迁移或 Task/Review 过期推进；
 - Web 不得在 Importer 之外“补写平台成功”；
 - `save_listing_status` 不得成为平台观察替代入口；
 - UNKNOWN 后只允许唯一 RECONCILE；
-- manual recovery 必须按 §14 CAS 门禁执行。
+- manual recovery 必须按 §14 把 Operation/Attempt/Task/共享写锁/日志一次性收敛；
+- Web、Queue、Automation 独立持有生命周期，Web 退出不得停止另外两个进程。
 
 ## 19. 保留、迁移与退役
 
-保留：Automation Service、Queue Service、business rules、listing sync、commit batch prepare/publish、主 CLI Runtime 查询/复核/APPLY、正式 Web query/review/reconcile 能力。
+保留：Automation Service、Queue Service、business rules、参数化后的正式人工 scan trigger、commit batch
+prepare/publish、主 CLI Runtime 查询/复核/APPLY、正式 Web query/review/reconcile 能力，以及 13.5-0 全量
+运维/验收工具分类。
 
 7B 迁移：
 
 - Web Runtime DB 请求级权威 → fixed Composition Root；
+- `list_runtime_tasks` 等 query → 零 Schema/业务写 Presenter；Schema migration 和过期推进迁到 bootstrap/Automation maintenance；
 - legacy `/` preview/persist → 同一 Application Service；
 - execution-log manual recovery → §14 门禁；
 - `save_listing_status` → production deny；
+- `run_shadowbot_listing_sync.py` → 既有 Automation scan service 的稳定 MANUAL Run adapter，并使用 `LATEST_RUNTIME_SCHEMA_VERSION`；
+- `start_local.ps1` → Web-only 本地启动；Queue/Automation 独立启停和健康；
 - generic Executor 不新增调用方。
 
 7C 退役：
@@ -574,31 +680,47 @@ ShadowBot Worker
 - `/execution-logs` GET、RECONCILE、manual recovery 三能力分离；
 - CSRF、登录和 PRG 保持。
 
-### 20.2 Manual operation recovery
+### 20.2 Query zero-write
+
+- `/dashboard`、`/tasks`、legacy `/runtime` GET 和 CLI `list-tasks` 前后全表内容、Schema version、
+  `connection.total_changes` 均不变；
+- 已过期 Task/Review 存在时，查询仍零写；显式 Automation/admin maintenance 才推进，并留下审计；
+- 空库或旧版本库由 query 明确拒绝并提示管理员 bootstrap/migration，不静默创建表或升级；
+- `/health` 只读报告 Schema 状态，不调用 `init_schema()`。
+
+### 20.3 Manual operation recovery
 
 必须覆盖：
 
-- `FAILED` 合法人工确认；
-- `NEEDS_RECONCILIATION` + 有效人工证据合法；
-- `NEEDS_RECONCILIATION` 无证据拒绝；
-- `PENDING/RUNNING/VERIFIED/NOT_APPLIED/RETRY_AUTHORIZED/MANUAL_REVIEW` 全拒绝；
+- `FAILED + NOT_STARTED/NOT_APPLIED` 但没有已导入目标验证：拒绝并提示 retry/cancel；
+- `FAILED + NOT_STARTED/NOT_APPLIED`、人工已完成且正式 Importer 证据验证批准目标：合法 controlled close；
+- `NEEDS_RECONCILIATION` 无论是否附人工文本/附件都不能旁路，只能唯一 RECONCILE；
+- `PENDING/RUNNING/VERIFIED/NOT_APPLIED/RETRY_AUTHORIZED` 全拒绝；
+- `MANUAL_REVIEW` generic action 拒绝；按 quarantine reason 覆盖活动 Attempt、UNKNOWN、确定未执行、
+  Importer 已验证四个专用分支，并证明不会永久悬挂；
 - 活动 STARTING/RUNNING Attempt 拒绝；
 - 活动 RECONCILE 拒绝；
-- 非空 lock 拒绝；
+- 非空 Operation `lock_owner` 拒绝；共享写锁 ACTIVE/UNKNOWN 对 generic close 拒绝；
 - ACTIVE retry authorization 拒绝；
+- controlled close 同事务更新 Operation/Task/允许的共享锁/单条日志，Attempt 不变；任一步失败整体回滚；
+- 人工 note/表单不能写 `listing_status` 或其他平台事实，只有现有 Importer 可以写；
 - 同 canonical recovery 重放幂等且不重复 log；
 - 异 canonical recovery 返回 conflict；
 - 非法请求前后 Operation/Attempt/Task/Lock/日志零变化。
 
-### 20.3 Runtime DB
+### 20.4 Runtime DB
 
 覆盖 login/session/CSRF/PRG、同路径兼容、异路径拒绝、伪造 Session DB、各运营页同 Repository、旧书签不静默切库。
 
-### 20.4 幂等、恢复与优先级
+### 20.5 入口、生命周期、幂等与优先级
 
-覆盖 Web 双击、CLI 重跑、Scheduler 重启、同引用精确重放、异内容冲突、18:00/20:00 跨界、PREPARED/COMMIT 分离、Queue Importer 重放、Watchdog、Review/Outbox 原子回滚、完整 UI priority、人工任务压制 emergency、UNKNOWN→唯一 RECONCILE。
+覆盖 13.5-0 §4 全量入口 + §9 delta 无遗漏、每个高风险子命令 capability 绑定、Web 双击、CLI 重跑、
+Scheduler 重启、同引用精确重放、异内容冲突、18:00/20:00 跨界、PREPARED/COMMIT 分离、Queue
+Importer 重放、Watchdog、Review/Outbox 原子回滚、完整 UI priority、人工任务压制 emergency、
+UNKNOWN→唯一 RECONCILE、正式人工 listing/order scan 复用 Automation Run/租约/priority/Importer、
+Schema v16+ 不再被 listing sync 的 v13 常量拒绝，以及 Web/Queue/Automation 独立启动/停止/健康。
 
-### 20.5 Ready
+### 20.6 Ready
 
 - 完整 pytest；
 - 系统冒烟；
@@ -612,12 +734,14 @@ ShadowBot Worker
 
 ## 21. Final Audit / Freeze Gate
 
-7A 最终复审只检查以下四组：
+7A 最终复审一次性检查以下六组：
 
 1. **Web mutation inventory**：所有生产/legacy/debug POST 写入口均已分类，尤其 `save_listing_status`；
-2. **Operation transition inventory**：所有 Operation mutation 使用既有权威方法，manual recovery 满足 §14；
-3. **Control-plane contracts**：capability/mode、Runtime DB、canonical identity、Importer、priority、RECONCILE 均与现有代码一致；
-4. **Validation**：当前 Head CI + diff check，通过且无生产代码/Schema/开关变化。
+2. **Query zero-write**：Web/CLI 查询不再隐式迁移 Schema 或推进过期任务；
+3. **Operation transition inventory**：所有 Operation mutation 使用既有权威方法，manual recovery 满足 §14；
+4. **Complete entry/lifecycle inventory**：13.5-0 全量底表 + 当前 delta、三个独立长驻服务、人工 scan 和 legacy 退役均有结论；
+5. **Control-plane contracts**：capability/mode、Runtime DB、canonical identity、Importer、priority、RECONCILE 均与现有代码一致；
+6. **Validation**：当前 Head CI + diff/link/UTF-8 check，通过且无生产代码/Schema/开关变化。
 
 若复审发现其他非 §8.2 安全例外问题，记录为后续技术债，不再重开 7A。
 
@@ -626,7 +750,8 @@ ShadowBot Worker
 必须同时满足：
 
 - PR #29 保持 Draft 并完成 7A 最终复审；
-- 第四轮 2 个 P1 已确认关闭：hidden listing status write + manual recovery eligibility；
+- hidden listing status write、query 隐式写、manual recovery 全状态/锁/Task 收敛已确认关闭；
+- 13.5-0 全量入口 + 当前 delta、listing/order 手工 scan 和三服务生命周期已确认关闭；
 - Final Audit / Freeze Gate 通过；
 - Web mutation 表与代码一致；
 - manual recovery 状态/竞态/幂等合同通过；
