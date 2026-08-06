@@ -371,8 +371,8 @@ requested_mode ∈ allowed_modes(entrypoint_capability)
 | executor `start` | `LEGACY_AUTHORIZED_WRITE_COMMIT` | 当前 `{COMMIT}` | CLI Repository + Runner | 不接入新主线 |
 | executor `import-result` | `LEGACY_RESULT_IMPORT` | internal/admin | CLI Repository | 退役 |
 | executor `poll-yingdao-result` | `LEGACY_OPENAPI_RESULT_IMPORT` | internal/admin | OpenAPI + CLI Repository | 隔离/退役 |
-| Queue Service Importer | `RESULT_IMPORT` | internal only | Queue Service Composition Root | 唯一正式主线 |
-| Queue Service Watchdog | `QUEUE_RECOVERY` | internal only | Queue Service Composition Root | 唯一恢复主线 |
+| Queue Service Importer | `RESULT_IMPORT` | internal only | Queue Service Composition Root | v2/v4/v5 唯一正式主线 |
+| Queue Service Watchdog | `QUEUE_RECOVERY` | internal only | Queue Service Composition Root | v2/v4/v5 唯一恢复主线 |
 | v5 publish | `LISTING_ACTION_COMMIT` | `{COMMIT}` | 正式发布 Composition Root | 保留 |
 | unique reconcile | `UNKNOWN_RECONCILE` | `{RECONCILE}` | 既有 Operation | 唯一入口 |
 
