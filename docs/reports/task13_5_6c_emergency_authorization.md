@@ -200,3 +200,23 @@ attempt 与本次验收一致。该结果构成 13.5-6C 的单 SKU 真实紧急�
 本轮修改了仓库内 `shadowbot/test2/vertical_slice_read_price.py` 与公共 fence 源码，但未同步
 到真实影刀宿主、未停止或重启常驻 Worker，也未执行真实平台动作；生产开关继续保持
 `automatic_emergency_offline=false`。后续部署必须重新执行正常停止、逐文件同步和哈希门禁。
+
+## 11. 2026-08-05 最终合并收口
+
+最后一轮修复不再用可变的 Task 状态或结果文案判断“Worker 已越过最终点击栅栏”，而是在
+同一事务写入稳定键唯一的 Incident `TASK_RECORDED` 事件，并以
+`resolution_order=WORKER_FENCE_WON` 作为不可变先后顺序事实。人工复核和结果导入均读取该
+事实，避免后续 UNKNOWN 投影覆盖 Task 文案后错误地把已发生的平台点击解释为人工抢占。
+
+Worker 已越过栅栏但首次回读为 UNKNOWN 时，Importer 保持 Incident=`AUTO_PROTECTING`、
+operation=`NEEDS_RECONCILIATION` 和写锁=`UNKNOWN`，并继续复用唯一只读 RECONCILE：
+
+- `RECONCILE=VERIFIED` 时收敛成功、释放写锁并回到 `WAITING_HUMAN`；
+- `RECONCILE=NOT_APPLIED` 时收敛失败、释放写锁并回到 `WAITING_HUMAN`；
+- RECONCILE 仍为 UNKNOWN 时保留单一阻断 attempt，不创建第二个 Review、通知或对账；
+- 精确结果重放不重复 Incident 投影、事件或通知。
+
+PR #28 已合并，merge commit `418c605`。最终头提交 `757eef7` 的 GitHub Actions 结果为：
+Linux Core `788 passed, 4 skipped, 9 deselected, 97 subtests passed`；Windows Core
+`1128 passed, 2 skipped, 97 subtests passed`。本轮只补齐仓库事实链和合成回归，没有再次
+执行真实平台动作；`automatic_emergency_offline=false` 保持不变。

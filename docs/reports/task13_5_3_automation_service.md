@@ -3,6 +3,7 @@
 - 实施日期：2026-07-29 至 2026-07-30
 - 分支：`codex/task13-5-3-automation-service`
 - 前置合并：PR #23，merge commit `64772b2`
+- 收口：PR #24 已合并，merge commit `6d46e3f`；Linux Core 与 Windows Core 均通过
 - 合同：[13.5-3 Automation Service 合同](../plans/task13_5_3_automation_service_contract.md)
 
 ## 1. 已实现

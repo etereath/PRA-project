@@ -184,10 +184,9 @@ secret_scan=PASS
 - PROVISIONAL 原子修订、OBSERVED/FINAL 新版本及输入 hash 幂等。
 - 自动化 `SUCCESS/MERGED/SKIPPED`、Incident 类别/状态和 resolved_at 一致性。
 
-### 3.3 未执行项目
+### 3.3 PR 收口与未执行项目
 
-- PR 初始版本的 Linux/Windows Core CI 均已通过；本轮评审修复将在推送后重新触发
-  GitHub Actions。
+- PR #22 已合并；最终评审修复后的 Linux Core 与 Windows Core GitHub Actions 均通过。
 - 未迁移真实 Runtime DB。
 - 未启动或同步 ShadowBot Worker。
 - 未读取订单页、执行平台扫描或产生真实平台写动作。

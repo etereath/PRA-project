@@ -103,6 +103,15 @@ result → Importer。整改没有新增表、全局锁、状态枚举、合同�
 Worker/fence 源码已更新但尚未同步真实影刀宿主，本轮没有执行真实平台动作；后续部署必须
 重新完成正常停止、同步、哈希核对与长期 Worker 恢复门禁。
 
+2026-08-05 最终收口把 Worker 越过最终点击栅栏写成稳定键唯一的不可变 Incident Event，
+不再依赖随后可能被 UNKNOWN/人工投影改写的 Task 状态或结果文案。Worker 已越过栅栏但首次
+结果 UNKNOWN 时保持 `AUTO_PROTECTING + NEEDS_RECONCILIATION + UNKNOWN 写锁`，先创建并
+完成唯一只读 RECONCILE，再允许普通写任务恢复；`VERIFIED`、`NOT_APPLIED`、仍
+`UNKNOWN` 和精确重放均已有合成回归。PR #28 已合并，merge commit 为 `418c605`；最终头提交的
+Linux Core 为 `788 passed, 4 skipped, 9 deselected, 97 subtests passed`，Windows Core 为
+`1128 passed, 2 skipped, 97 subtests passed`。生产开关继续为
+`automatic_emergency_offline=false`，本次最终修复没有再次执行真实平台动作。
+
 - 从 Excel 读取业务输入。
 - 根据规则和预测输入生成运行态任务。
 - 用 SQLite 保存运行态事实。
@@ -221,7 +230,7 @@ Watchdog 输出精确匹配的 `READY_REQUEST_VALIDATED` 后，Worker、Importer
 完整通过，20 条历史订单写入隔离 DB，活动队列清空且平台写操作为 0。验收后原真实 DB
 队列服务按原参数恢复，真实 Runtime DB 仍未写入订单事实。
 
-13.5-5 已实现只读销售事实链：继续使用 v14 的 `sales_estimate_segments`、交易日日结、
+13.5-5 已通过 PR #27 合并只读销售事实链：继续使用 v14 的 `sales_estimate_segments`、交易日日结、
 版本、事件和输入表，没有新增表、字段、锁、平台合同、结算状态或真实平台动作。估算
 区间只有在库存调整覆盖被明确证明时才计算；既有上架读回、结构化人工确认和未决写结果
 参与资格判断，没有 PRA 写记录不能反推没有人工修改。完整 CLOSED 订单优先于扫描估算，
@@ -622,86 +631,22 @@ Web 复核主入口：
 
 ## 8. 后续推荐优先级
 
-任务12审查修复版已通过 PR #18 合并，其正常 COMMIT 与受控
-UNKNOWN→唯一 RECONCILE 继续作为稳定基线。任务13的实现、受控实机验收、
-脱敏证据、最终本地回归、PR #19 审查修复和 Windows/Linux Core 均已完成。
-本轮文档整理不代替审查方执行合并或任务状态变更，也不扩大无人值守真实 RPA。
+任务12、任务13以及任务13.5-0至13.5-6均已通过对应 PR 合并。各阶段当时的回归数字、
+实机样本和未部署边界保留在独立实施报告中，不再把历史“等待推送/等待 CI”混入当前
+优先级。
 
-Code Review 后的高中低风险问题已完成修复，系统冒烟测试、全量单元测试和主控端到端流程测试均已通过。修复详情见 [reports/risk_fix_report_20260610.md](reports/risk_fix_report_20260610.md)。
-
-13.5-0 准备阶段于 2026-07-29 在当前 main 新鲜复跑完整 pytest：
-`679 passed, 3 skipped, 97 subtests passed in 144.54s`。该结果证明当前代码回归通过，
-不代替后续 v14、Automation、订单、S4、Web 或实机验收。
-
-推荐顺序：
-
-1. 以 [reports/task13_final_handoff_20260727.md](reports/task13_final_handoff_20260727.md) 为任务13审查入口，复核四维状态模型、Runtime Schema v13、v5上下架流水线、运行边界和证据矩阵。
-2. 任务13独立 PR #19 的 COMMENT Review 修复、Windows Core 和 Linux Core 已通过；后续合并和任务状态仍由审查方处理。
-3. 以 [GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20) 合并后的正文为
-   宏观权威，先按[13.5-0 开工基线](plans/task13_5_0_kickoff_baseline.md)完成评审：
-   当前 ShadowBot 生命周期、部署 hash 和部署后完整 READ_ONLY 基线已经收敛；六级
-   质量矩阵和日结状态机按
-   [13.5-1 冻结合同](plans/task13_5_1_quality_and_settlement_contract_review.md)
-    已通过门禁。Draft PR #22 已提交 v14 与 13.5-1 业务代码；本轮已按评审修复
-    FINAL 并发/不可变性、任务来源、Automation 状态、Incident、时间策略和非 FINAL
-    修订合同；复审新增的时间策略版本不可变、观察/审计 append-only 和人工任务来源
-    引用门禁也已落地。最终复审新增的时间策略原子替换、并发单一成功、任务来源
-    创建后不可变和粗粒度枚举/引用前缀映射也已完成，本地完整回归为
-    `744 passed, 3 skipped, 97 subtests passed`。13.5-2 商品映射与扫描输入已通过
-    PR #23 合并：评审要求的 run 类型/状态/平台/时间策略绑定、精确页面范围、
-    时间/价格/证据校验、同 run 内容幂等、跨 run 接收审计、批次状态矩阵、页面
-    顺序规范化和 WEB 平台登记隔离均已修复；显式停用的内置平台不会被默认值补回。
-    终态 run 对同 ID 和跨 ID 同内容重放保持一致幂等，只有新内容插入要求
-    `RUNNING`，同时仍校验 run 类型、平台和时间策略。
-    12 条迁入映射仅保留为 `candidate_internal_sku` 且全部 `DISABLED`，等待运营
-    逐条复核。
-    修复后本地完整回归为 `790 passed, 3 skipped, 97 subtests passed`，系统冒烟
-    16/16、编译、打包、包边界、敏感信息扫描、仓库外 wheel 安装和 Windows
-    ShadowBot 夹具门禁均通过。13.5-3 已建立独立 Automation Service 本地实现：
-    默认计划、逻辑 run 幂等、租约 fencing、错过/补跑/合并、父子 run、UI 写侧
-    阻断、单实例锁与 UTF-8 原子心跳均已有专项测试。PR 评审后进一步补齐了旧
-    `SCHEDULED` 每轮清理、崩溃后合并恢复、逐次领取原子 UI gate、受父租约
-    fencing 的原子子 run、禁用/子任务领取门禁、Runtime 时间策略热加载，以及按
-    Runtime DB 唯一化的进程锁和失败心跳。第二轮评审进一步把扫描合并收紧为
-    两阶段覆盖候选，无 handler、禁用、部分成功或失败目标都会让小扫描回退；业务
-    事实写入必须在同一事务校验 Automation claim，活动
-    Automation UI 租约与 v4/v5 写锁形成双向门禁，公开 `claim_run` 不再绕过策略，
-    子 run 只在父 run `SUCCESS/PARTIAL` 后可领取且父失败会取消未开始子 run。
-    第三轮评审继续把最终覆盖绑定到 `LISTING_STATUS_SCAN` 子 run 的已接受业务事实：
-    完整扫描父 run 完成后候选转交商品子 run，只有同一清单的任务 13 `VERIFIED`
-    双页快照和 v14 `ACCEPTED` 完整观察同时存在时才合并；订单子任务不影响该判定。
-    重启后任一必要 handler 丢失会释放既有候选。自动化清单采用不可变 SHA-256
-    绑定，权威 `SYNC_STATUS` 在写快照、投影、异常、复核和通知的同一事务内执行
-    claim fencing，同时保留未绑定批次的人工导入路径；事实接收时间改用应用服务
-    可信时钟。
-    第四轮评审进一步封闭跨交易日和来源替换：自动化快照、页面及逐项观察必须全部
-    匹配 run 冻结的 `platform_trade_date`，跨 18:00 完整扫描在权威写入前拒绝；
-    manifest 首次绑定只允许尚未发布、无任何结果事实的 `PREPARED sync_status`
-    批次，历史人工完成批次不能事后绑定。v14 观察通过 append-only 来源字段显式绑定
-    snapshot、manifest、result SHA、交易日和标准转换摘要，最终覆盖不再依赖批次 ID
-    命名；所有租约安全时钟均在取得 `BEGIN IMMEDIATE` 后采样。
-    第五轮评审继续封闭 Task 13 与 v14 的 SKU 分裂：明确 SKU，或
-    `UNMAPPED/AMBIGUOUS` 状态及候选 SKU 集合，均按 snapshot item/page 冻结并
-    纳入来源/转换摘要；当前映射解析发生漂移时观察整批零写，最终覆盖还会复核
-    持久化观察 SKU/映射状态与 snapshot 身份。
-    第六轮评审进一步把 ProductObservation 的既有事实读取与新事实写入分路：
-    终态 run 的幂等重放返回数据库保存的原批次、内容摘要和验收映射版本，不再依赖
-    当前全局映射；只有新事实才解析当前映射并要求实时 claim。PR #24 已于
-    2026-07-30 合并，合并提交为 `6d46e3f`。真实扫描 handler、Runtime DB 迁移和
-    生产部署仍未执行。最终 ProductObservation 专项 `46 passed`，完整回归为
-    `852 passed, 3 skipped, 97 subtests passed`；系统冒烟、构建、包边界、
-    secret scan、仓库外 wheel 安装、Windows ShadowBot 静态夹具和双平台 CI 门禁
-    均通过。下一阶段边界见
-    [13.5-4 订单历史只读观察合同](plans/task13_5_4_order_history_observation_contract.md)。
-4. 任务13.5通过验收后，任务14只进行多品种、多动作、异常恢复、正式授权和观察版本冻结的综合验收。普通写动作保持明确任务与授权；唯一自动写特例是验收后的版本化 `SYSTEM_EMERGENCY` 紧急下架。
-5. 任务12 PR #18 已合并；任务13也已完成 T13-0 页面探索、T13-1 合同、T13-2 Runtime Schema v13、独立两页 SYNC_STATUS、单商品状态往返、正常多商品严格串行上下架、整批预检异常零写、严格串行 UNKNOWN、最终确认点击后的 `UNKNOWN → 唯一自动 RECONCILE → VERIFIED` 和 `UNKNOWN → 唯一自动 RECONCILE → NOT_APPLIED`、`ALREADY_APPLIED` 0 写点击、跨动作共享写锁、phase/result 恢复、Web 运营投影、最终回归、PR #19 COMMENT Review 修复和双平台 CI。仓库内已保存脱敏证据、自然语言报告、数据库回读及 CI 复算入口；本轮文档整理不执行合并或任务状态变更。
-6. 继续运行系统冒烟、完整单元测试和 ShadowBot 成功基线测试，任务13.5不得重写已验证 COMMIT 动作链路。
-7. 基于自动规则评估框架继续完善上下架、冷库、包装产能等 evaluator，但保持 dry-run/apply 和 service 边界。
-8. AI Agent 自动决策应放在真实平台执行和运维边界通过更长期审查后再推进。
-9. 13.5-0 已建立独立分支、黄金基线、脚本/路由盘点、禁止重写点、Web 独立审计、
-   验收清单和 main 回滚点；13.5-1、13.5-2 已分别通过 PR #22、#23 合并，后续编码仍按
-   [任务12—13复用路径与失败复盘](shadowbot_task12_task13_reusable_lessons.md)
-   逐子 PR 建立最小差异和回归门禁。
+1. 先完成 Draft PR #29 的
+   [13.5-7 控制面对齐计划](plans/task13_5_7_control_plane_alignment_review_plan.md)
+   评审，关闭来源合同、账户范围、幂等账本、入口能力和复用清单的矛盾后再编码。
+2. 13.5-7 必须优先复用现有 Automation、Review、Outbox、v4/v5、写锁、Importer、唯一
+   RECONCILE 和紧急车道，不重构其他模块依赖的核心代码，不建立平行控制面。
+3. 后续 13.5 子任务继续按 Issue #20、风险治理和复用矩阵推进；Web 产品化完成前，原
+   Web 页面只作为既有能力入口，不提前宣称运营重写完成。
+4. 真实 Runtime DB 迁移、ShadowBot 宿主同步、生产开关和长期 Worker 状态必须各自依据
+   运行门禁验收。仓库合并或 CI 通过不能替代部署事实；当前
+   `automatic_emergency_offline=false`。
+5. 持续运行系统冒烟、完整测试和 ShadowBot 成功基线。任务13.5全部完成后，任务14只做
+   多品种、多动作、异常恢复、正式授权和观察版本冻结的综合验收。
 
 ## 9. 后续可复用资产
 

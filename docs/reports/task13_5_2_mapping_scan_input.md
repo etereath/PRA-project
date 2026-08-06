@@ -2,7 +2,8 @@
 
 - 实施日期：2026-07-29
 - 分支：`codex/task13-5-2-mapping-scan-input`
-- 状态：核心输入与持久化本地验收完成，等待 PR/CI；ShadowBot 宿主采集尚未部署
+- 状态：核心输入与持久化验收完成；PR #23 已合并，Linux Core 与 Windows Core 均通过；
+  ShadowBot 宿主采集尚未部署
 - 合同：
   [商品映射与扫描输入合同](../plans/task13_5_2_mapping_and_scan_input_contract.md)
 
@@ -119,6 +120,6 @@ Windows ShadowBot fixture/hash gates: PASS
 
 ## 4. 后续
 
-本分支已完成本轮复审修复，后续只继续等待最终复审和 PR 收口。`ONLINE_PULSE` 的 ShadowBot 页面采集
-需要在独立批次中先确认 Worker 停止和宿主 hash，再按本报告冻结的 JSON 边界接入；
+本阶段复审、PR #23 合并和双平台 CI 已收口。`ONLINE_PULSE` 的 ShadowBot 页面采集需要在
+独立批次中先确认 Worker 停止和宿主 hash，再按本报告冻结的 JSON 边界接入；
 调度频率、租约和补跑由 13.5-3 实现。

@@ -705,4 +705,14 @@ Incident 事件表解决“同一异常多次发生、检测重放、状态变�
 上述整改不增加表、全局锁、平台合同版本、真实平台动作或结算状态；仍复用现有 Incident
 Event、Review/Token/Outbox、Automation、v4/v5、Importer、写锁和唯一 RECONCILE。
 
+## 21. 2026-08-05 完成核对
+
+13.5-6 已通过 PR #28 合并并满足第 19 节完成定义：v15/v16、人工复核、飞书通知、Worker
+恢复、S4 影子判定、专用授权、单 SKU 受控真实下架、Importer/Archive、生产开关恢复和
+Linux/Windows CI 均已形成证据。最后一轮修复又把 Worker 最终点击先后顺序写成不可变
+Incident Event，并覆盖首次 UNKNOWN 后唯一 RECONCILE 的 `VERIFIED`、`NOT_APPLIED`、
+仍 `UNKNOWN` 和精确重放四条收敛路径；没有新增表、状态、锁、合同版本或平台动作。
+
+真实平台验收后以及 PR 合并时，`automatic_emergency_offline=false` 均保持为生产默认值。
+
 Refs #20

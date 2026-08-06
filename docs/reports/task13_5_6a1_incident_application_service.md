@@ -166,8 +166,9 @@ raw token 不落 Outbox、三个复核动作、成本下限、任务/Token 整�
 `stop.signal`、一次性宿主动作、20 秒登录等待、新鲜 heartbeat 成功门禁、生命周期原子写，
 以及旧通知与 source-task Mobile Review 回归。
 
-本轮尚未运行 Linux/Windows CI。2026-08-03 已完成真实宿主缺失、核实路径重启、唯一
-`test2` 启动、新鲜 heartbeat、Incident 解决、生命周期更新、空队列正常停止和再次恢复；
+本阶段初次记录时尚未运行 Linux/Windows CI；其后 PR #28 最终头提交的 Linux Core 与
+Windows Core 均通过。2026-08-03 已完成真实宿主缺失、核实路径重启、唯一 `test2`
+启动、新鲜 heartbeat、Incident 解决、生命周期更新、空队列正常停止和再次恢复；
 结束时 Worker 保持长期 `RUNNING`。实机同时发现并修复 Windows PowerShell 5.1 对无 BOM
 UTF-8 中文常量的错误解释，以及“先选择唯一应用、再调用工具栏唯一运行按钮”的真实 UIA
 结构。`Ctrl+Alt+Q` 只适用于活动 working 正常停止失败，本轮没有伪造该危险前提，因此仍

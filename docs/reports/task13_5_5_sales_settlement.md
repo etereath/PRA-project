@@ -4,6 +4,7 @@
 - Review Profile：`R4`
 - 数据库结构版本：Runtime Schema v14，未扩表、未增字段
 - 平台动作：0；未修改 ShadowBot Worker、队列、Adapter 或真实平台
+- 收口：PR #27 已合并，merge commit `36cf2ba`；Linux Core 与 Windows Core 均通过
 - 合同权威：GitHub Issue #20 评论 `5145772862` 与
   `docs/plans/task13_5_5_sales_estimation_settlement_contract.md`
 
@@ -192,7 +193,7 @@ Runtime DB。结果如下：
 - 实际影刀解释器为 Python 3.10.11。验收后主 Runtime DB 队列服务已恢复，Worker 保持
   `RUNNING`，`stop.signal` 不存在。
 
-GitHub Linux/Windows CI 结果需在本轮修复推送后记录。
+PR #27 最终修复推送后的 Linux Core 与 Windows Core GitHub Actions 均通过。
 
 ## 7. 当前限制
 

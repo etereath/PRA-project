@@ -5,6 +5,7 @@
 - 基线：`origin/main@4aa4c73`
 - 权威：GitHub Issue #20 最新正文及评论 `5136623832 / 5139601975`
 - 平台写操作：`0`
+- 收口：PR #26 已合并，merge commit `1ef2068`；Linux Core 与 Windows Core 均通过
 
 ## 1. 实施结果
 

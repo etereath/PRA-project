@@ -7,6 +7,7 @@
 ## 当前状态与入口
 
 - [project_current_status.md](project_current_status.md)：当前项目定位、已完成能力、主控流程、安全边界和下一步优先级。
+- [pra_review_risk_and_complexity_governance.md](pra_review_risk_and_complexity_governance.md)：按 R0–R4 风险、复杂度预算和证据门禁组织计划、实现与审查的全局治理规则。
 - [reports/task12_final_handoff_20260723.md](reports/task12_final_handoff_20260723.md)：任务12当前实现、正式合同、实机证据、已知限制和审查步骤的最终交接入口。
 - [reports/task13_final_handoff_20260727.md](reports/task13_final_handoff_20260727.md)：任务13当前实现、四维状态模型、v5上下架合同、实机证据、运行边界和审查步骤的最终交接入口。
 - [plans/task13_5_issue20_alignment_review.md](plans/task13_5_issue20_alignment_review.md)：GitHub Issue #20 与本地任务13.5计划的权威层级、差异裁决、Web实测补充和任务14新边界。
@@ -15,16 +16,20 @@
 - [reports/task13_5_1_runtime_schema_v14.md](reports/task13_5_1_runtime_schema_v14.md)：任务13.5-1 双时间轴、Runtime Schema v14、迁移兼容、质量约束、日结版本状态机和本地验收结果。
 - [runtime_schema_v14_migration.md](runtime_schema_v14_migration.md)：真实 Runtime DB 的备份、副本迁移、健康检查、切换和回滚门禁。
 - [plans/task13_5_2_mapping_and_scan_input_contract.md](plans/task13_5_2_mapping_and_scan_input_contract.md)：任务13.5-2 商品映射、ONLINE_PULSE、FULL_MARKET_SCAN 商品子结果和 v14 不可变观察输入合同。
+- [reports/task13_5_2_mapping_scan_input.md](reports/task13_5_2_mapping_scan_input.md)：任务13.5-2 商品映射编译、扫描输入、不可变商品观察和最终 PR/CI 收口报告。
+- [plans/task13_5_3_automation_service_contract.md](plans/task13_5_3_automation_service_contract.md)：任务13.5-3 计划窗口、租约、父子 Run、合并补跑、心跳和 UI 控制面合同。
+- [reports/task13_5_3_automation_service.md](reports/task13_5_3_automation_service.md)：任务13.5-3 独立 Automation Service、观察导入 fencing、回归与双平台 CI 实施报告。
 - [plans/task13_5_4_order_history_observation_contract.md](plans/task13_5_4_order_history_observation_contract.md)：任务13.5-4 订单字段、`OPEN/CLOSED`、多重集合、完整性、Importer 和 v6 零写合同。
 - [plans/task13_5_5_sales_estimation_settlement_contract.md](plans/task13_5_5_sales_estimation_settlement_contract.md)：任务13.5-5 库存估算资格、已知调整、订单/估算权威、取消推导和 FINAL 门禁。
 - [reports/task13_5_5_sales_settlement.md](reports/task13_5_5_sales_settlement.md)：任务13.5-5 销量估算、订单权威、取消多重集合、交易日日结、计划输入和 Automation 接入实施报告。
 - [plans/task13_5_6_incident_and_emergency_protection_review_plan.md](plans/task13_5_6_incident_and_emergency_protection_review_plan.md)：任务13.5-6 已评议的 Incident 人工闭环、复用矩阵、Worker 恢复、通知发送后完整 Pulse、Review/人工任务竞态、FINAL 范围矩阵、`base_cost × 0.80` 极端低价、三个复核动作、极简策略和受控 v5 下架计划。
 - [reports/task13_5_6a0_runtime_schema_v15.md](reports/task13_5_6a0_runtime_schema_v15.md)：任务13.5-6A-0 的 Runtime Schema v15、Incident 出现次数、append-only 事件、v14 数据迁移、FINAL 动态范围门禁和专项测试报告。
-- [reports/task13_5_6a1_incident_application_service.md](reports/task13_5_6a1_incident_application_service.md)：任务13.5-6A-1 进行中的 Incident 原子事实链、S4 Review/Token/Outbox 同事务接入、无明文 Token 投递复用、唯一 Worker 恢复入口、专项测试及剩余受控验收。
+- [reports/task13_5_6a1_incident_application_service.md](reports/task13_5_6a1_incident_application_service.md)：任务13.5-6A-1 已完成的 Incident 原子事实链、S4 Review/Token/Outbox 同事务接入、无明文 Token 投递复用、唯一 Worker 恢复入口和受控验收。
 - [reports/task13_5_6a1_worker_recovery_acceptance_20260803.md](reports/task13_5_6a1_worker_recovery_acceptance_20260803.md)：真实影刀宿主缺失、核实路径重启、唯一 test2 启动、heartbeat、Incident、生命周期、正常停止和再次恢复的 R4 证据，以及未执行 Ctrl+Alt+Q 的明确边界。
 - [reports/task13_5_6_notification_mobile_review_acceptance_20260804.md](reports/task13_5_6_notification_mobile_review_acceptance_20260804.md)：S0–S4 飞书逐批验收、S3/S4 真实经营通知、验证码结果反馈、手机复核页、临时公网链接 404 整改和固定入口运行门禁。
 - [reports/task13_5_6b_emergency_policy_shadow.md](reports/task13_5_6b_emergency_policy_shadow.md)：13.5-6B 编码前复用矩阵、v16 极简策略边界和零副作用 shadow 判定语义。
 - [reports/task13_5_6c_emergency_authorization.md](reports/task13_5_6c_emergency_authorization.md)：13.5-6C 复用矩阵、专用授权事务、v5 最终点击前人工竞态栅栏及单 SKU 真实紧急下架验收。
+- [plans/task13_5_7_control_plane_alignment_review_plan.md](plans/task13_5_7_control_plane_alignment_review_plan.md)：任务13.5-7 控制面入口、来源、模式、幂等、优先级和复用边界的编码前冻结计划。
 - [reports/task13_5_4_order_page_exploration_20260731.md](reports/task13_5_4_order_page_exploration_20260731.md)：蚂蚁花团订单页无副作用探索、元素步长和数据最小化证据。
 - [reports/task13_5_4_order_observation.md](reports/task13_5_4_order_observation.md)：任务13.5-4 实施、测试、迁移纠正和实机验收报告。
 - [plans/task13_5_operational_closed_loop_and_web_rewrite.md](plans/task13_5_operational_closed_loop_and_web_rewrite.md)：任务13.5双时间轴、自动扫描、历史订单观察、销售日结、S0–S4、受控紧急保护、任务来源对齐和Web主控重写实施计划。
@@ -139,28 +144,20 @@
 
 ## 当前下一步
 
-Code Review 后高中低风险问题已完成修复，系统冒烟测试、全量单元测试和端到端流程测试均已通过。
+任务13以及任务13.5-0至13.5-6均已通过对应 PR 合并。当前从 Draft PR #29 的
+[13.5-7 控制面对齐计划](plans/task13_5_7_control_plane_alignment_review_plan.md)
+开始冻结既有入口、来源、模式、幂等和任务优先级；计划通过评审前不重构其他模块依赖的
+核心代码。
 
-当前真实平台 / RPA 状态：
+当前优先级：
 
-- 已完成任务中心到蚂蚁花团供应商小程序的单平台、多商品、单次请求 v4 COMMIT 闭环；按页面实时位置严格串行执行，不依赖任务输入顺序。
-- 已完成写操作前整页预扫描、全目标唯一匹配、全批次旧价门禁、提交后逐商品独立回读和完整页面状态回传。
-- 已完成 `ShadowBotExecutor`、v4 批次账本、常驻文件队列 runner、Result Importer、Queue Watchdog、自动只读对账和 Web 队列状态入口。
-- 已完成 8 小时 READ_ONLY 常驻 Worker 连续运行验收；长期证据归档和运营告警闭环仍待完成。
-- 已完成提交意图后 `stop.signal` 实机验收，以及真实商品 `COMMIT -> UNKNOWN -> 自动 RECONCILE -> VERIFIED` 验收。
-- 任务13已完成独立两页 SYNC_STATUS、单商品往返、正常多商品上下架、整批预检零写、严格串行 UNKNOWN、`UNKNOWN -> 唯一自动 RECONCILE -> VERIFIED`、`UNKNOWN -> 唯一自动 RECONCILE -> NOT_APPLIED`、`ALREADY_APPLIED` 0 写点击、跨动作共享写锁、phase/result 恢复、Web 运营投影、最终本地回归和交接报告；PR #19 审查修复和 Windows/Linux Core 已通过。本轮文档整理不代替审查方执行合并或任务状态变更。
-- 最终暖态四商品批次 4/4 `VERIFIED`，总用时 `51.094 秒`；READ_ONLY 完整页面结束标记样本为 1 次扫描、0 次滚动、`27.445 秒`。
-- 暂不承诺无人值守生产改价。
-
-下一步优先级：
-
-1. 任务12审查修复已通过 PR #18 合并；其 v4 改价链路继续作为任务13和后续任务的稳定基线。
-2. 任务13计划中的实现、受控实机验收、最终本地回归、PR #19 审查修复和双平台 CI 均已覆盖；后续合并与任务状态由审查方处理。
-3. 以 [GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20) 合并后的正文为宏观权威，先评审[13.5-0开工基线](plans/task13_5_0_kickoff_baseline.md)和[本地实施计划](plans/task13_5_operational_closed_loop_and_web_rewrite.md)；六级质量矩阵与日结状态机冻结后才提交v14。
-4. 任务13.5完成双时间轴、自动化服务、商品/订单观察、销售日结、S0–S4、紧急保护、控制服务和Web产品化后，任务14只进行多品种/多动作/异常恢复、正式授权和观察版本冻结的综合验收。
-5. 为元素版本漂移和白屏建立可重复的专用测试夹具；登录、网络和证据上传失败的实机故障注入已经完成。
-6. 持续运行系统冒烟和 ShadowBot 成功基线测试，避免任务13.5或后续任务重写已验证 COMMIT 链路。
-7. 13.5-0 的黄金基线卡、脚本盘点、禁止重写清单和Web审计已形成；进入ShadowBot工作前仍须收敛生命周期记录与心跳不一致并完成部署hash对齐。普通写动作保持明确任务与授权，唯一自动写特例是在13.5-6完成正式策略后的版本化 `SYSTEM_EMERGENCY` 紧急下架。
+1. 关闭 PR #29 的合同矛盾和复用清单缺口，再开始 13.5-7 编码。
+2. 后续 13.5 子任务继续以 Issue #20、复用矩阵和 R0–R4 治理规则为门禁，不另建平行的
+   队列、状态机、幂等账本或平台写链。
+3. 持续运行系统冒烟、完整测试和 ShadowBot 成功基线；真实 Runtime DB 迁移、生产开关和
+   Worker 部署哈希必须分别验收，不能由仓库代码或 CI 结果代替。
+4. 任务13.5全部完成后，任务14只进行多品种、多动作、异常恢复、正式授权和观察版本冻结
+   的综合验收。
 
 当前不优先做：
 
