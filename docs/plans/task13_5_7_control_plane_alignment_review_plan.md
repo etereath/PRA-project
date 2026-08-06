@@ -1,6 +1,6 @@
 # 任务 13.5-7A：控制面入口盘点与合同冻结
 
-- 修订日期：2026-08-06
+- 修订日期：2026-08-07
 - 状态：编码前设计审查草案
 - Review Profile：R4（架构级审查）
 - 当前 PR：#29
@@ -14,15 +14,15 @@ PR #29 直接承担 **13.5-7A：入口盘点、复用矩阵和合同冻结**，�
 本 PR 必须在进入 13.5-7B 编码前完成：
 
 1. Web、主 CLI、Automation Scheduler、人工触发器、Queue Service、平台发布、结果导入、唯一 RECONCILE、运维和验收入口的真实盘点；
-2. 每个具有独立副作用边界的脚本子命令单独分类；
-3. `具体入口/子命令 → EntryPointCapability → allowed modes → Composition Root → 保留/退役` 矩阵；
-4. 业务意图身份、调用来源身份和 Task 来源三层分离；
-5. capability 级 canonical identity 与跨 18:00/20:00 重试规则；
-6. 分层幂等、事务、恢复和 Importer 权威边界；
-7. Incident 人工复核、SYSTEM_EMERGENCY、普通授权写、扫描和结算的完整优先级；
-8. 旧入口退役清单；
-9. 非持久化结构化结果投影；
-10. 13.5-7B/7C 的测试与开工门禁。
+2. 每个具有独立副作用边界的路由动作、脚本子命令和内部组件单独分类；
+3. `具体入口/子命令 → 当前真实能力 → EntryPointCapability → target allowed modes → Composition Root → 保留/迁移/退役` 矩阵；
+4. 当前代码事实与 7B 目标合同分开记录，禁止用目标状态覆盖现有风险面；
+5. 业务意图身份、调用来源身份和 Task 来源三层分离；
+6. capability 级 canonical identity 与跨 18:00/20:00 重试规则；
+7. 分层幂等、事务、恢复和 Importer 权威边界；
+8. Incident 人工复核、SYSTEM_EMERGENCY、普通授权写、扫描和结算的完整优先级；
+9. Web Runtime DB 从请求级选择迁移到进程级 Composition Root 的兼容和测试方案；
+10. 旧入口退役清单、非持久化结果投影与 13.5-7B/7C 开工门禁。
 
 本阶段不修改生产代码、Runtime Schema、Web 路由、CLI、Scheduler、v4/v5、ShadowBot、Importer、Worker 部署或生产开关。
 
@@ -37,7 +37,7 @@ PR #29 直接承担 **13.5-7A：入口盘点、复用矩阵和合同冻结**，�
 5. `docs/pra_review_risk_and_complexity_governance.md`；
 6. 本计划。
 
-历史脚本行为与正式合同冲突时，以现行 Task、Review、Automation Run、Batch、Operation、Attempt、共享 UI 写锁、Importer 和唯一 RECONCILE 为准。不得为了保留旧 CLI 而复制第二写链或第二导入链。
+历史脚本行为与正式合同冲突时，以现行 Task、Review、Automation Run、Batch、Operation、Attempt、共享 UI 写锁、Importer 和唯一 RECONCILE 为准。不得为了保留旧 Web/CLI 而复制第二写链、第二导入链或第二业务判断。
 
 ## 3. 审查配置
 
@@ -50,8 +50,9 @@ Review Profile: R4
   Attempt / Write Lock / Importer / ShadowBot File Queue
 最坏事故:
   重复平台副作用、覆盖人工操作、错误来源授权、UNKNOWN 后二次写、
-  错误 Runtime DB、跨时间边界形成第二业务事实、调度优先级绕过、
-  长期双控制面或第二 Importer
+  请求级 Runtime DB 指向错误账本、跨时间边界形成第二业务事实、
+  旧根路由继续形成平行 Task 写入口、旧 Executor 绕过正式能力边界、
+  调度优先级绕过、长期双控制面或第二 Importer
 人工恢复成本: 高
 新增数据库表: 0
 新增持久化字段: 0
@@ -64,7 +65,7 @@ Review Profile: R4
   Web UI 重写、第二平台、第二账号并行、Schema v17、自动普通任务 COMMIT
 ```
 
-## 4. 当前部署与时间约束
+## 4. 当前部署、时间与 Runtime DB 约束
 
 本阶段冻结为：
 
@@ -73,7 +74,7 @@ Review Profile: R4
 - 单一长期 ShadowBot Worker；
 - 单一 `run_shadowbot_queue_services.py` Queue Service 实例锁；
 - 当前仅一个真实平台和一个受控账号；
-- Web、CLI、Scheduler 可为不同进程，但由各自 Composition Root 绑定同一受控 Repository；
+- Web、CLI、Scheduler 可为不同进程，但目标状态必须由各自 Composition Root 绑定同一受控 Repository；
 - 真实平台写继续只走既有 v4/v5 文件队列；
 - UNKNOWN 继续只进入唯一只读 RECONCILE；
 - `automatic_emergency_offline=false` 保持生产默认值。
@@ -97,16 +98,70 @@ Review Profile: R4
 - 本阶段不宣称实现多账号账本隔离；
 - 真正多账号支持必须单独进行 R4 + Schema 评审。
 
-### 4.3 Runtime DB 边界
+### 4.3 Runtime DB：当前真实代码事实
 
-`runtime_db_path` 不是普通业务请求字段。
+目标合同是“Web 请求不能选择 Runtime DB”，但 **当前 `app/web.py` 尚未满足该目标**。13.5-7A 必须显式记录现状，不能把目标状态写成已实现事实。
 
-- Web 请求、表单和业务 payload 不得选择任意 Runtime DB；
-- CLI 的 `--runtime-db` 仅是管理员启动/运维配置；
-- Composition Root 解析路径并实例化 Repository；
-- Application Service 接收 Repository/Unit of Work，不接收请求传入的路径字符串；
-- `/health` 继续只读取进程可信配置；
+当前 Web 行为：
+
+1. `/runtime/login` GET 可以从 query 读取 `runtime_db`；
+2. `/runtime/login` POST 可以从 form 读取 `runtime_db`，没有 form 值时还会回退到 query；
+3. 登录 Session payload 当前保存 `runtime_db`；
+4. `_runtime_db_for_request` 当前优先读取 Session 中的 `runtime_db`，其次允许页面 query 提供 `runtime_db`；
+5. `_resolve_request_or_trusted_default` / 路径策略会对白名单路径做安全校验，这降低任意文件访问风险，但请求仍然拥有选择“哪个允许的 Runtime DB”的权威；
+6. `_build_runtime_url`、登录跳转、PRG 和多个页面链接当前会继续携带 `runtime_db`；
+7. `/runtime/logout` 也会读取 form 中的 `runtime_db` 用于跳转上下文。
+
+因此当前状态是：**路径受白名单限制，但 Web 请求、Session 和 URL 仍参与 Runtime DB 选择**。
+
+### 4.4 Runtime DB：7B 目标合同
+
+7B 必须迁移为：
+
+```text
+Web Process Bootstrap / Composition Root
+→ 从可信启动配置解析唯一 Runtime DB
+→ 创建唯一 SQLiteRuntimeRepository / Unit of Work factory
+→ Route / Handler / Application Service 只接收已绑定 Repository
+```
+
+硬规则：
+
+- Web query、form、JSON payload、cookie、Session、`next` 参数不得选择或切换 Runtime DB；
+- `_runtime_db_for_request` 的目标语义只能返回进程绑定的受控 Repository 标识，不再解析请求级数据库权威；
+- 新 Session 不保存 `runtime_db`；
+- `_build_runtime_url` 和 PRG 链路不再把 `runtime_db` 当作业务路由参数传播；
+- `/health`、Dashboard、Tasks、Reviews、Notifications、Execution Logs、System 和 Task Generator 必须共享同一进程绑定 Repository；
+- Mobile Review 继续使用同一固定 Runtime DB/Repository，不增加请求级选择；
+- CLI 的 `--runtime-db` 仍是管理员进程启动/运维配置，不等价于普通 Web 请求字段；
 - 不依赖当前工作目录推导生产数据库。
+
+### 4.5 Runtime DB：7B 迁移与兼容策略
+
+为了避免直接删除参数破坏登录、旧书签和 PRG，迁移按以下顺序执行：
+
+1. **先建立唯一 Web Composition Root**：在进程启动时完成 Runtime DB 解析和 Repository 装配；
+2. **请求参数失去权威性**：旧 `runtime_db` query/form 只作为兼容输入检查，不再决定 Repository；
+3. **同路径兼容**：若旧参数规范化后与进程绑定路径相同，可接受当前请求，但下一次重定向必须去掉该参数；
+4. **异路径拒绝**：若旧参数规范化后与进程绑定路径不同，返回明确的 4xx/配置错误，不静默切库；
+5. **Session 迁移**：新 Session payload 不再保存 `runtime_db`；旧形状 Session 不得继续作为数据库权威，部署切换时通过进程重启自然清除内存 Session，并在专项测试中验证旧形状 Session 被忽略或旋转；
+6. **登录迁移**：登录页可以短期识别旧 hidden/query 参数用于兼容提示，但认证成功后的 Session 和 redirect 不再携带数据库选择；
+7. **PRG/链接迁移**：`next`、页面筛选、POST/Redirect/GET 和 logout 跳转保留业务页面上下文，但移除 `runtime_db` 传播；
+8. **最后删除兼容读取**：完成页面和 Runbook 引用审计后，7C 删除 query/form/session 的旧数据库选择逻辑。
+
+### 4.6 Runtime DB：专项回归门禁
+
+7B/7C 至少覆盖：
+
+- `/runtime/login` GET/POST 正常登录、错误密码、rate limit、Session rotation；
+- 登录 CSRF、业务写 CSRF、PRG；
+- 无 `runtime_db` 参数的正常页面访问；
+- 旧参数等于绑定 DB 时规范化到无参数 URL；
+- 旧参数指向另一白名单 DB 时明确拒绝；
+- Session 中伪造/遗留 `runtime_db` 不改变绑定 Repository；
+- Dashboard、Tasks、Reviews、Notifications、Execution Logs、System、Task Generator 页面回归；
+- logout 和 `next` 跳转不重新引入请求级 DB 权威；
+- Web 请求不能通过 query/form/session 切换到测试库、备份库或其他允许路径。
 
 ## 5. 模式合同
 
@@ -136,14 +191,14 @@ Review Profile: R4
 ### 5.4 `APPLY`
 
 - 可创建或更新持久化、但尚未触发平台副作用的正式内部事实；
-- 包括 Task、Review、Outbox 意图、Automation/Script Run、PREPARED Batch/Operation 等；
+- 包括 Task、Review、Outbox 意图、Automation/Script Run、PREPARED Batch/Operation、人工恢复状态等；
 - 不得点击平台或发布 COMMIT 请求。
 
 ### 5.5 `COMMIT`
 
 - 只接受既有有效授权 Task/Batch/Operation；
 - 必须复用 gate、Batch、Operation、Attempt、共享 UI 写锁、队列发布和 Importer；
-- 入口不得重建批准载荷、修改来源或绕过更高优先级 lane；
+- 正式入口不得重建批准载荷、修改来源或绕过更高优先级 lane；
 - 不得默认启用。
 
 ### 5.6 `RECONCILE`
@@ -162,7 +217,7 @@ Review Profile: R4
 |---|---|
 | v5 请求与合同校验 | `build_listing_action_request`、`build_listing_action_reconcile_request`、相应 validate 函数 |
 | v5 上下架提案/发布/导入 | `propose_listing_action_batch`、`publish_listing_action_batch`、`import_listing_action_result` |
-| 唯一平台对账 | `ensure_listing_action_reconcile_attempt`、Importer/Watchdog 的自动 reconcile payload |
+| 唯一平台对账 | `ensure_listing_action_reconcile_attempt`、Importer/Watchdog 的自动 reconcile payload、`ShadowBotExecutor.start_reconcile_attempt` |
 | 两页只读同步 | `prepare_listing_sync_batch`、`publish_listing_sync_batch`、`import_listing_sync_result` |
 | v4 改价发布 | `prepare_task_commit_batch`、`publish_task_commit_batch`、`import_task_commit_result` |
 | 审批和门禁 | Review/Token/Outbox 原子服务、`evaluate_automation_gate`、`review_block_reasons` |
@@ -172,6 +227,7 @@ Review Profile: R4
 | Worker | 现有领取、请求校验、phase、结果发布和登录人工介入 |
 | Incident | Incident Event、通知、S4 授权、人工竞态和最终点击 fence |
 | Automation 优先级 | 现有 `UI_CHANNEL_PRIORITY`，不得复制第二份 |
+| Web 安全门禁 | Session、登录、CSRF、PRG、Path Policy、Legacy Route fail-closed gate |
 
 ## 7. 当前入口真实盘点
 
@@ -183,28 +239,58 @@ Review Profile: R4
 4. 确需新增；
 5. 归档或删除。
 
-### 7.1 Web 入口
+### 7.1 Web 正式入口
 
-| 具体入口 | 当前函数/服务 | Capability | 模式/副作用 | Composition Root | 7B/7C 结论 |
-|---|---|---|---|---|---|
-| WSGI 总入口 | `app.web::_application` | `WEB_ROUTER` | 路由、认证、CSRF、路径策略 | `app.web.serve` | 原样复用安全门禁；路由变薄 |
-| `/health` | 固定 Repository health | `HEALTH_DIAGNOSTIC` | `DIAGNOSTIC` | Web 进程可信配置 | 原样复用 |
-| `/dashboard`、`/tasks`、`/notifications`、`/execution-logs` | 查询服务 | `RUNTIME_QUERY` | `READ_ONLY` | Web 进程 Repository | 原样复用查询 |
-| `/system` | 配置与运行状态查询 | `SYSTEM_DIAGNOSTIC` | `DIAGNOSTIC` | Web 进程可信配置 | 原样复用 |
-| `/task-generator` 预览 | workflow preview | `TASK_PREVIEW` | `DRY_RUN` | Web Composition Root | 抽取公共能力 |
-| `/task-generator` 持久化 | workflow persist | `TASK_APPLY` | `APPLY` | Web Composition Root | 使用统一 Service |
-| `/reviews`、`/runtime` 查询 | Runtime/Review query | `REVIEW_QUERY` | `READ_ONLY` | Web Repository | 原样复用 |
-| `/reviews`、`/runtime` 处理 | `resolve_runtime_review_task` | `REVIEW_APPLY` | `APPLY` | Web Composition Root | 参数化复用 |
-| `/mobile/review/*` GET | `get_mobile_review_detail` | `MOBILE_REVIEW_QUERY` | `READ_ONLY` | 固定 Runtime DB | 原样复用 |
-| `/mobile/review/*` resolve | `resolve_mobile_review` | `MOBILE_REVIEW_APPLY` | `APPLY` | 固定 Runtime DB + Token 服务 | 原样复用原子事务 |
-| `/business-inputs`、`/tables` | workbook 输入服务 | `WORKBOOK_MAINTENANCE` | 管理员维护；写受控工作簿 | Web 路径策略 | 不并入平台控制面 |
-| `/execution` | `simulate_execution_from_tasks` | `LEGACY_SIMULATION` | 测试文件副作用，无平台写 | Web 路径策略 | 归档候选/兼容入口 |
-| `/manual-intervention` | `list_manual_intervention_tasks` | `LEGACY_MANUAL_READ` | `READ_ONLY`；正式 resolve 已拒绝 | Web 路径策略 | 保留只读说明或归档 |
-| `/system/test-feishu-notification` | 通知测试处理器 | `NOTIFICATION_DIAGNOSTIC` | 受控外部测试通知 | Web 运维配置 | 管理员能力，不进入业务模式 |
+| 具体入口/动作 | 当前函数/服务 | 当前真实能力/副作用 | Target Capability | Target Mode | Composition Root | 7B/7C 结论 |
+|---|---|---|---|---|---|---|
+| WSGI 总入口 | `app.web::_application` | 路由、认证、CSRF、路径策略 | `WEB_ROUTER` | 无业务模式 | `app.web.serve` | 原样复用安全门禁；路由变薄 |
+| `/health` | Repository health | 只读健康检查 | `HEALTH_DIAGNOSTIC` | `DIAGNOSTIC` | Web 可信启动配置 | 原样复用 |
+| `/dashboard` GET | Ops dashboard queries | Runtime 查询 | `RUNTIME_QUERY` | `READ_ONLY` | Web Repository | 原样复用 |
+| `/tasks` GET | Task/Automation/Projection queries | Runtime 查询 | `RUNTIME_QUERY` | `READ_ONLY` | Web Repository | 原样复用 |
+| `/notifications` GET | Notification queries | Runtime 查询 | `RUNTIME_QUERY` | `READ_ONLY` | Web Repository | 原样复用 |
+| `/execution-logs` GET | `list_runtime_execution_logs` 等 | Runtime/Queue 查询 | `EXECUTION_LOG_QUERY` | `READ_ONLY` | Web Repository | 原样复用查询 |
+| `/execution-logs` POST `start_shadowbot_reconcile` | `ShadowBotExecutor.start_reconcile_attempt` | 为既有 Operation 创建并启动只读 RECONCILE attempt | `UNKNOWN_RECONCILE` | `RECONCILE` | Web Repository + Runner | 保留为受控恢复入口；必须复用唯一 RECONCILE 合同 |
+| `/execution-logs` POST `confirm_shadowbot_manual_handled` | `ShadowBotExecutor.confirm_manual_handled` | 将既有 Operation 更新为 `MANUAL_HANDLED` | `MANUAL_OPERATION_RECOVERY` | 管理员 `APPLY` | Web Repository | 保留受控人工恢复；不得伪装为查询 |
+| `/system` GET | 配置与运行状态查询 | 诊断 | `SYSTEM_DIAGNOSTIC` | `DIAGNOSTIC` | Web 可信启动配置 | 原样复用 |
+| `/task-generator` GET/POST preview | workflow preview | 预览，无正式 Task | `TASK_PREVIEW` | `DRY_RUN` | Web Composition Root | 抽取公共能力 |
+| `/task-generator` POST persist | workflow persist | 创建 Runtime Task/Review/通知事实 | `TASK_APPLY` | `APPLY` | Web Composition Root | 使用统一 Application Service |
+| `/reviews`、`/runtime` 查询 | Runtime/Review query | 查询 | `REVIEW_QUERY` | `READ_ONLY` | Web Repository | 原样复用 |
+| `/reviews`、`/runtime` 处理 | `resolve_runtime_review_task` | 更新 Review/Task | `REVIEW_APPLY` | `APPLY` | Web Composition Root | 参数化复用 |
+| `/runtime/login` GET/POST | login + Session 创建 | 当前可从 query/form 选择允许的 Runtime DB，并写入 Session | `RUNTIME_AUTH` | 安全基础设施 | Web 可信绑定 Repository | 7B 迁移：DB 参数失去权威；登录/CSRF/Session 保留 |
+| `/runtime/logout` POST | Session 清理 | 当前可读取 form `runtime_db` 用于跳转上下文 | `RUNTIME_AUTH` | 安全基础设施 | Web 可信绑定 Repository | 7B 移除 DB 权威；保留 logout/CSRF |
+| `/mobile/review/*` GET | `get_mobile_review_detail` | 只读详情 | `MOBILE_REVIEW_QUERY` | `READ_ONLY` | 固定 Web Repository | 原样复用 |
+| `/mobile/review/*` resolve | `resolve_mobile_review` | 原子更新 Review/Task/Incident 授权 | `MOBILE_REVIEW_APPLY` | `APPLY` | 固定 Repository + Token 服务 | 原样复用原子事务 |
+| `/business-inputs` | workbook input services | 写受控工作簿 | `WORKBOOK_MAINTENANCE` | 管理员维护 | Web Path Policy | 不并入平台控制面 |
+| `/tables` | legacy workbook maintenance | 写受控工作簿；受 legacy gate | `WORKBOOK_MAINTENANCE` | 管理员维护 | Legacy Web + Path Policy | 7C 归档/重定向到业务输入 |
+| `/execution` | `simulate_execution_from_tasks` | 测试文件副作用，无平台写；受 legacy gate | `LEGACY_SIMULATION` | 维护/测试 | Legacy Web | 归档候选 |
+| `/manual-intervention` | `list_manual_intervention_tasks` | 只读；正式 resolve 已拒绝；受 legacy gate | `LEGACY_MANUAL_READ` | `READ_ONLY` | Legacy Web | 保留只读说明或归档 |
+| `/system/test-feishu-notification` | 通知测试处理器 | 受控外部测试通知 | `NOTIFICATION_DIAGNOSTIC` | 管理员运维能力 | Web 运维配置 | 不进入业务模式 |
 
-Web 不得通过 subprocess 调用 CLI，也不得直接拼接 ShadowBot 队列 JSON。
+`/execution-logs` 不能再被概括成单一 `RUNTIME_QUERY`：GET、RECONCILE 和人工恢复必须拥有不同 capability 和服务端门禁。
 
-### 7.2 主 CLI：`app/cli.py`
+### 7.2 旧根路由 `/`：受限但仍存在的平行任务生成入口
+
+当前代码事实：
+
+- `/` 位于 `LEGACY_WEB_ROUTES`；
+- 默认 fail-closed，只有显式 `PRA_ENABLE_LEGACY_WEB=1`、`PRA_LEGACY_ACCESS_MODE=direct_loopback`、无 reverse proxy/public tunnel 异常且已有登录 Session 时才可进入；
+- 该限制降低暴露面，但 **没有改变 `_handle_dashboard` POST 仍可 preview 和 `confirm_generate` 的业务能力**；
+- `confirm_generate` 当前可通过 `persist_task_generation_summary` 写 Runtime Task，因此它仍是受限的平行 Task 生成入口。
+
+| `/` 动作 | 当前真实能力 | Target Capability | 7B 兼容策略 | 7C 终态 |
+|---|---|---|---|---|
+| GET | 旧任务生成 UI/兼容说明 | `LEGACY_TASK_GENERATOR_VIEW` | 保留现有 legacy fail-closed gate；可显示迁移提示 | `/` 仅重定向到正式首页 `/dashboard` |
+| POST preview | 可执行 workflow preview | `TASK_PREVIEW` | 不再调用独立业务逻辑；必须委托同一个 Application Service | 旧 POST 不执行，明确 405/410，提示使用 `/task-generator` |
+| POST `confirm_generate` | 可直接持久化 Runtime Task | `TASK_APPLY` | 不再直接调用 `persist_task_generation_summary`；必须委托同一个 Application Service 与 canonical identity | 旧 POST 不执行，明确 405/410，提示使用 `/task-generator` |
+
+硬规则：
+
+- 7B 后 `/` 与 `/task-generator` 即便短期同时存在，也只能是两个 UI adapter，不得是两个业务控制面；
+- 两者必须共享同一个 `TASK_PREVIEW/TASK_APPLY` Application Service、canonical identity、幂等和 Review/Outbox 原子事务；
+- 不允许 `/` 使用独立 Runtime DB、独立 Task dedupe 或直接 persist；
+- 7C 完成引用审计后移除旧写表单和 root POST 业务能力。
+
+### 7.3 主 CLI：`app/cli.py`
 
 | 子命令 | 当前服务/行为 | Capability | 允许模式 | Composition Root | 7B/7C 结论 |
 |---|---|---|---|---|---|
@@ -227,9 +313,9 @@ Web 不得通过 subprocess 调用 CLI，也不得直接拼接 ShadowBot 队列 
 | `expire-review-tasks` 无 `--apply` | 超时预览 | `REVIEW_TIMEOUT_PREVIEW` | `DRY_RUN` | CLI Composition Root | 参数化复用 |
 | `expire-review-tasks --apply` | 超时 Review/Task/通知事实 | `REVIEW_TIMEOUT_APPLY` | `APPLY` | CLI Composition Root | 参数化复用 |
 | `notification-worker` | Outbox watchdog + delivery | `NOTIFICATION_DELIVERY` | 内部能力 | CLI Repository + channel adapter | 保持独立 Worker |
-| `serve-web` | 启动 WSGI | `PROCESS_BOOTSTRAP` | 无业务模式 | Web Composition Root | 保持启动器职责 |
+| `serve-web` | 启动 WSGI | `PROCESS_BOOTSTRAP` | 无业务模式 | Web Composition Root | 7B 在此绑定唯一 Web Repository |
 
-### 7.3 Automation Service
+### 7.4 Automation Service
 
 | 具体入口 | 当前函数/服务 | Capability | 允许模式 | Composition Root | 结论 |
 |---|---|---|---|---|---|
@@ -242,7 +328,7 @@ Web 不得通过 subprocess 调用 CLI，也不得直接拼接 ShadowBot 队列 
 
 Automation Service 当前不注册普通平台写 handler，且心跳声明 `platform_write_handlers_registered=false`。13.5-7 不得把它扩展为扫描全部 pending Task 后自动 COMMIT。
 
-### 7.4 人工只读与规则评估脚本
+### 7.5 人工只读与规则评估脚本
 
 | 具体入口 | 当前服务 | Capability | 允许模式 | Composition Root | 结论 |
 |---|---|---|---|---|---|
@@ -252,9 +338,9 @@ Automation Service 当前不注册普通平台写 handler，且心跳声明 `pla
 | `run_mock_platform_executor.py --dry-run` | Mock 平台服务 | `MOCK_PLATFORM_PREVIEW` | `DRY_RUN` | 隔离 Mock DB | 测试工具 |
 | `run_mock_platform_executor.py --apply` | Mock 平台服务 | `MOCK_PLATFORM_APPLY` | `APPLY` 但仅 Mock | 隔离 Mock DB | 不得连接真实平台 |
 
-### 7.5 正式 Queue Service：`run_shadowbot_queue_services.py`
+### 7.6 正式 Queue Service：`run_shadowbot_queue_services.py`
 
-该脚本不是单一“Importer 入口”，而是长驻 Composition Root。一个周期按既有顺序运行：
+该脚本是长驻 Composition Root。一个周期按既有顺序运行：
 
 ```text
 登录验证码监控
@@ -284,7 +370,7 @@ Automation Service 当前不注册普通平台写 handler，且心跳声明 `pla
 - `--queue-dir` 同时绑定新旧环境变量，避免 RECONCILE 请求落到第二队列；
 - `--once` 只改变进程循环，不改变 capability。
 
-### 7.6 v4 改价入口：`run_shadowbot_commit_batch.py`
+### 7.7 v4 改价入口：`run_shadowbot_commit_batch.py`
 
 | 子命令 | 当前服务 | Capability | 允许模式 | Composition Root | 7B/7C 结论 |
 |---|---|---|---|---|---|
@@ -295,23 +381,50 @@ Automation Service 当前不注册普通平台写 handler，且心跳声明 `pla
 
 `production-run` 不得被理解为新的自动 pending 扫描器；仍要求显式 task IDs、batch ID、mapping、queue 和 applet URI。
 
-### 7.7 旧 Executor 入口：`run_shadowbot_executor.py`
+### 7.8 旧 Executor：必须分开记录 Current 与 Target
 
-| 子命令 | 当前行为 | Capability | 允许模式 | Composition Root | 7B/7C 结论 |
+#### 7.8.1 当前真实风险面
+
+`scripts/run_shadowbot_executor.py start` 的 argparse 行为是：
+
+- `--execution-mode` 默认值为 `COMMIT`；
+- argparse 本身没有把参数限制为单一 COMMIT；
+- 底层 `ALLOWED_EXECUTION_MODES` 当前实际接受：
+
+```text
+READ_ONLY
+COMMIT
+RECONCILE
+```
+
+因此“当前 `{COMMIT}`”是错误的现状描述。该入口当前还是一个 generic executor adapter，并由 CLI 参数重建 approved payload。
+
+| 子命令 | 当前真实行为 | Current Accepted Modes | Current Capability | 7B Target | 7C 结论 |
 |---|---|---|---|---|---|
-| `start` | 由 CLI 参数重建 approved payload，并接受 `--execution-mode` | `LEGACY_AUTHORIZED_WRITE_COMMIT` | 当前可 COMMIT | CLI Repository + Runner | 7B 不接入公共控制面；7C 引用审计后退役或限制为测试 |
-| `import-result` | `ShadowBotExecutor.record_result` | `LEGACY_RESULT_IMPORT` | 内部/管理员 | CLI Repository + result file | 由 Queue Service Importer 取代后退役 |
-| `poll-yingdao-result` | 查询影刀任务并导入结果 | `LEGACY_OPENAPI_RESULT_IMPORT` | 内部/管理员 | Yingdao OpenAPI + CLI Repository | OpenAPI 引用审计后退役或隔离维护 |
-| `check-yingdao-app-params` | 查询机器人输入/输出参数 | `PLATFORM_ADAPTER_DIAGNOSTIC` | `DIAGNOSTIC` | Yingdao OpenAPI | 保留管理员诊断 |
+| `start` | CLI 重建 approved payload；调用者可指定 execution mode | `{READ_ONLY, COMMIT, RECONCILE}` | `LEGACY_GENERIC_EXECUTION` | 不接入统一 Application Service；不得由新 Web/Scheduler 调用 | 完成引用审计后退役或限制为隔离测试工具 |
+| `import-result` | `ShadowBotExecutor.record_result` | internal/admin | `LEGACY_RESULT_IMPORT` | 不成为正式 Importer | Queue Service 覆盖后退役 |
+| `poll-yingdao-result` | 查询 Yingdao job 并导入结果 | internal/admin | `LEGACY_OPENAPI_RESULT_IMPORT` | 不成为正式 Importer | OpenAPI 引用审计后隔离/退役 |
+| `check-yingdao-app-params` | 查询机器人参数 | `DIAGNOSTIC` | `PLATFORM_ADAPTER_DIAGNOSTIC` | 管理员诊断 | 保留 |
 
-在 `start` 退役前：
+#### 7.8.2 7B 兼容门禁
 
-- 普通 Web/Scheduler 不得调用；
-- `execution_mode` 不能被新统一 Service 原样信任；
-- 新 Service 只能从既有批准 Task/Operation 读取不可变载荷；
-- 不得把该脚本作为第二条正式 COMMIT 主线。
+7B 不能把 generic `start` 的当前 accepted set 直接映射成新的服务端 allowed modes。
 
-### 7.8 v5 上下架服务级入口
+冻结规则：
+
+- 新 `ControlPlaneApplicationService` 永远不调用 generic `run_shadowbot_executor.py start`；
+- 普通 Web、Scheduler 和新 CLI adapter 不得把用户提供的 `execution_mode` 原样透传；
+- 正式 COMMIT 继续只走 v4/v5 授权发布服务；
+- 正式 READ_ONLY 继续只走已盘点的 listing sync / Automation read-only handler；
+- 正式 RECONCILE 继续只走既有 UNKNOWN Operation → `start_reconcile_attempt` / `ensure_listing_action_reconcile_attempt`；
+- 在删除 generic `start` 前先完成 repository call-site、Runbook、部署脚本和测试引用审计；
+- 若审计发现仍有必须保留的兼容调用，7B 只能增加薄 compatibility gate：
+  - `RECONCILE` 必须委托唯一 `start_reconcile_attempt`，不能 generic start 自建第二恢复路径；
+  - `READ_ONLY` 必须委托既有正式只读 capability，或明确拒绝 generic path；
+  - `COMMIT` 只能消费既有有效授权对象并委托正式发布服务，不能重建批准事实；
+- 不新增任何 generic executor 的新调用方。
+
+### 7.9 v5 上下架服务级入口
 
 | 服务能力 | Capability | 模式 | 权威身份 | 结论 |
 |---|---|---|---|---|
@@ -321,7 +434,7 @@ Automation Service 当前不注册普通平台写 handler，且心跳声明 `pla
 | UNKNOWN 对账 | `UNKNOWN_RECONCILE` | `RECONCILE` | 既有 Operation + 唯一 reconcile attempt | 唯一恢复入口 |
 | SYSTEM_EMERGENCY 下架 | `SYSTEM_EMERGENCY_COMMIT` | `COMMIT` | S4 authorization + final fence | 原样复用；默认开关仍关闭 |
 
-### 7.9 迁移、运维、诊断和验收工具
+### 7.10 迁移、运维、诊断和验收工具
 
 以下入口不并入统一业务 Application Service：
 
@@ -336,7 +449,7 @@ Automation Service 当前不注册普通平台写 handler，且心跳声明 `pla
 
 ## 8. 具体入口能力绑定门禁
 
-所有生产入口必须在 Composition Root 中获得固定 `EntryPointCapability`。调用方不得通过请求参数声明 capability。
+所有正式生产入口必须在 Composition Root 中获得固定 `EntryPointCapability`。调用方不得通过请求参数声明 capability。
 
 ```text
 entrypoint_capability = composition_root.bind(entrypoint)
@@ -350,31 +463,40 @@ requested_mode ∈ allowed_modes(entrypoint_capability)
 - Importer、Watchdog、通知投递不接受用户模式；
 - `COMMIT` 只接受既有有效授权 Task/Batch/Operation；
 - `RECONCILE` 只接受既有 UNKNOWN/NEEDS_RECONCILIATION Operation；
-- 旧 CLI 的 `--execution-mode` 不得穿透新 Service 的能力上限；
+- `/execution-logs` 的 GET/RECONCILE/人工恢复是三个不同 capability；
+- 旧 `/` 不能保留独立 `TASK_APPLY` 实现；
+- Web Runtime DB 只能来自进程 Composition Root；
+- 旧 generic Executor 的 current accepted modes 不是新服务端白名单；
 - 当前普通 Web 不提供通用 COMMIT；
 - Scheduler 不注册普通平台写 handler。
 
-高风险入口的强制绑定：
+### 8.1 高风险入口强制绑定
 
-| 入口 | 固定 Capability | allowed modes | Repository/Adapter 来源 | 处置 |
-|---|---|---|---|---|
-| Web `/task-generator` preview | `TASK_PREVIEW` | `{DRY_RUN}` | Web Composition Root | 保留 |
-| Web `/task-generator` persist | `TASK_APPLY` | `{APPLY}` | Web Composition Root | 变薄 |
-| CLI `generate-runtime-tasks` | `TASK_APPLY` | `{APPLY}` | CLI Composition Root | 变薄 |
-| Automation order scan handler | `ORDER_SCAN_READ_ONLY` | `{READ_ONLY}` | claimed Run | 保留 |
-| Automation settlement handler | `SETTLEMENT_APPLY` | `{APPLY}` | claimed Run | 保留 |
-| `run_shadowbot_listing_sync.py` | `LISTING_SYNC_READ_ONLY` | `{READ_ONLY}` | CLI Composition Root | 变薄 |
-| commit batch `prepare` | `AUTHORIZED_WRITE_PREPARE` | `{APPLY}` | CLI Composition Root | 保留 |
-| commit batch `publish` | `AUTHORIZED_WRITE_COMMIT` | `{COMMIT}` | CLI Composition Root | 保留 |
-| commit batch `production-run` | `AUTHORIZED_WRITE_COMPOSITE_COMMIT` | `{COMMIT}` | CLI Composition Root | 兼容 |
-| commit batch `import-result` | `LEGACY_RESULT_IMPORT` | internal/admin | CLI Repository | 退役候选 |
-| executor `start` | `LEGACY_AUTHORIZED_WRITE_COMMIT` | 当前 `{COMMIT}` | CLI Repository + Runner | 不接入新主线 |
-| executor `import-result` | `LEGACY_RESULT_IMPORT` | internal/admin | CLI Repository | 退役 |
-| executor `poll-yingdao-result` | `LEGACY_OPENAPI_RESULT_IMPORT` | internal/admin | OpenAPI + CLI Repository | 隔离/退役 |
-| Queue Service Importer | `RESULT_IMPORT` | internal only | Queue Service Composition Root | v2/v4/v5 唯一正式主线 |
-| Queue Service Watchdog | `QUEUE_RECOVERY` | internal only | Queue Service Composition Root | v2/v4/v5 唯一恢复主线 |
-| v5 publish | `LISTING_ACTION_COMMIT` | `{COMMIT}` | 正式发布 Composition Root | 保留 |
-| unique reconcile | `UNKNOWN_RECONCILE` | `{RECONCILE}` | 既有 Operation | 唯一入口 |
+| 入口 | Current | Target Capability | Target Allowed Modes | Repository/Adapter 来源 | 处置 |
+|---|---|---|---|---|---|
+| Web `/task-generator` preview | workflow preview | `TASK_PREVIEW` | `{DRY_RUN}` | Web Composition Root | 保留 |
+| Web `/task-generator` persist | 直接 workflow persist | `TASK_APPLY` | `{APPLY}` | Web Composition Root | 变薄 |
+| Legacy `/` preview | 可独立 preview | `TASK_PREVIEW` | `{DRY_RUN}` | 同一 Web Composition Root | 7B 委托统一 Service，7C 移除旧 POST |
+| Legacy `/` persist | 可直接 persist Runtime Task | `TASK_APPLY` | `{APPLY}` | 同一 Web Composition Root | 7B 委托统一 Service，7C 移除旧 POST |
+| `/execution-logs` GET | 查询 | `EXECUTION_LOG_QUERY` | `{READ_ONLY}` | Web Repository | 保留 |
+| `/execution-logs` start reconcile | 启动 reconcile attempt | `UNKNOWN_RECONCILE` | `{RECONCILE}` | 既有 Operation + Runner | 保留受控恢复 |
+| `/execution-logs` manual handled | 更新 Operation | `MANUAL_OPERATION_RECOVERY` | `{APPLY}` admin only | Web Repository | 保留受控恢复 |
+| Web Runtime login/session | 当前 query/form/session 可选择允许 DB | `RUNTIME_AUTH` | 无业务模式 | Web 可信进程 Repository | 7B 移除 DB 权威 |
+| CLI `generate-runtime-tasks` | Runtime Task apply | `TASK_APPLY` | `{APPLY}` | CLI Composition Root | 变薄 |
+| Automation order scan handler | READ_ONLY scan | `ORDER_SCAN_READ_ONLY` | `{READ_ONLY}` | claimed Run | 保留 |
+| Automation settlement handler | settlement writes | `SETTLEMENT_APPLY` | `{APPLY}` | claimed Run | 保留 |
+| `run_shadowbot_listing_sync.py` | READ_ONLY scan | `LISTING_SYNC_READ_ONLY` | `{READ_ONLY}` | CLI Composition Root | 变薄 |
+| commit batch `prepare` | writes PREPARED ledger | `AUTHORIZED_WRITE_PREPARE` | `{APPLY}` | CLI Composition Root | 保留 |
+| commit batch `publish` | real publish | `AUTHORIZED_WRITE_COMMIT` | `{COMMIT}` | CLI Composition Root | 保留 |
+| commit batch `production-run` | prepare + real publish | `AUTHORIZED_WRITE_COMPOSITE_COMMIT` | `{COMMIT}` | CLI Composition Root | 兼容 |
+| commit batch `import-result` | manual import | `LEGACY_RESULT_IMPORT` | internal/admin | CLI Repository | 退役候选 |
+| executor `start` | current `{READ_ONLY, COMMIT, RECONCILE}` | `LEGACY_GENERIC_EXECUTION` | **不进入新业务白名单** | CLI Repository + Runner | 隔离并退役；无新调用方 |
+| executor `import-result` | manual import | `LEGACY_RESULT_IMPORT` | internal/admin | CLI Repository | 退役 |
+| executor `poll-yingdao-result` | OpenAPI import | `LEGACY_OPENAPI_RESULT_IMPORT` | internal/admin | OpenAPI + CLI Repository | 隔离/退役 |
+| Queue Service Importer | formal v2/v4/v5 import | `RESULT_IMPORT` | internal only | Queue Service Composition Root | 唯一正式主线 |
+| Queue Service Watchdog | formal recovery | `QUEUE_RECOVERY` | internal only | Queue Service Composition Root | 唯一恢复主线 |
+| v5 publish | real listing action | `LISTING_ACTION_COMMIT` | `{COMMIT}` | 正式发布 Composition Root | 保留 |
+| unique reconcile | UNKNOWN recovery | `UNKNOWN_RECONCILE` | `{RECONCILE}` | 既有 Operation | 唯一入口 |
 
 ## 9. 业务意图、调用来源和 Task 来源分离
 
@@ -399,7 +521,7 @@ parent_run_id
 request_trace
 ```
 
-这些字段保留 Web、CLI、Scheduler 和人工补跑的真实差异。
+这些字段保留 Web、CLI、Scheduler 和人工补跑的真实差异，不参与业务幂等身份，除非某个既有合同明确将稳定 trigger reference 作为业务引用。
 
 ### 9.3 Task 来源
 
@@ -419,7 +541,7 @@ request_trace
 ### 10.1 总规则
 
 - 只使用服务端规范化后的稳定业务字段；
-- `requested_at`、当前时钟、HTTP session、trace ID、actor 显示名、`manual_reason` 等审计字段绝不参与业务幂等键或内容指纹；
+- `requested_at`、当前时钟、HTTP session、trace ID、actor 显示名、`manual_reason` 等审计字段绝不参与业务幂等键或 canonical payload fingerprint；
 - 字符串统一 trim/case/枚举规范化；
 - 集合类输入排序后再哈希；
 - 金额、数量和时间按既有合同格式规范化；
@@ -436,6 +558,7 @@ request_trace
 | `TASK_APPLY` | platform + 冻结双日期 + scope/action + policy/rule version + logical target | seller date 仅对不适用能力可空 | entrypoint、actor、当前时钟 |
 | `RULE_EVALUATION_APPLY` | evaluator ID/version + platform + 冻结目标日期 + normalized input manifest | 不适用数据源可空 | CLI 启动时间 |
 | `REVIEW_APPLY` | `review_task_id` + resolution action + normalized adjustment payload hash | adjustment 可按动作为空 | actor、note、requested_at |
+| `MANUAL_OPERATION_RECOVERY` | existing `operation_id` + recovery action + normalized recovery payload | note 可空 | actor、requested_at |
 | `REVIEW_TIMEOUT_APPLY` | `review_task_id` + 已持久化 required_by + timeout policy version | 无 | 扫描发生时间 |
 | `LISTING_SYNC_READ_ONLY` | platform + scan type + frozen target date/run ID + mapping manifest hash | seller date按合同 | 触发入口和当前时间 |
 | `AUTHORIZED_WRITE_PREPARE` | ordered task IDs + approved payload hashes + batch/write identity | 无 | CLI actor、文件输出路径 |
@@ -546,11 +669,19 @@ Scheduler Handler┘       ├─ Runtime Task / Review / Incident Services
                           ├─ v4/v5 Proposal + Publish Services
                           └─ Structured ApplicationResult
 
-Composition Root
-  ├─ 绑定受控 Runtime Repository
+Web Composition Root
+  ├─ 从可信启动配置绑定唯一 Runtime Repository
   ├─ 绑定部署 platform/current account
   ├─ 绑定 queue/adapter
   └─ 为具体入口注入固定 EntryPointCapability
+
+Legacy Web `/`
+  → 7B 只作为同一 Application Service 的受限 adapter
+  → 7C 移除旧 POST 业务能力
+
+Legacy Executor generic `start`
+  → 不进入新 Application Service
+  → current accepted modes 与 target 正式能力严格分离
 
 ShadowBot Worker
   → v2/v4/v5 Result Files → Queue Service Importer
@@ -558,7 +689,7 @@ ShadowBot Worker
   → Runtime authoritative ledgers
 ```
 
-统一 Service 不直接操作页面、不直接拼接队列 JSON、不写第二套结果投影、不持有第二状态机。
+统一 Service 不直接操作页面、不直接拼接队列 JSON、不写第二套结果投影、不持有第二状态机，也不接受请求级 Runtime DB 或 generic execution mode 作为业务权限。
 
 ## 14. 结构化结果投影
 
@@ -600,14 +731,17 @@ COMPLETED
 - Scheduler claim、lease、Run Event 继续由 Automation Repository/Service 管理；
 - PREPARED Batch/Operation 属于 `APPLY`，不等于平台副作用；
 - v4/v5 gate、Batch、Operation、Attempt、写锁和 Task running 投影继续在既有发布事务完成；
+- `/execution-logs` 的 RECONCILE 必须调用唯一现有 reconcile 服务，不在 Web 中复制恢复状态机；
+- `/execution-logs` 的 `MANUAL_OPERATION_RECOVERY` 只更新既有 Operation 的受控人工恢复状态，不得创建新写意图；
 - Queue Service Importer 原子提交 v2/v4/v5 receipt、operation/attempt、Task、Lock、平台事实和 Incident 投影；
 - ORDER_SCAN 继续由既有 Automation observation importer 导入，不得被新 Service 吸收；
 - 兼容 CLI Importer 不得长期成为第二正式主线；
+- 旧 root adapter 不得绕开 Task/Review/Outbox 原子事务；
 - 入口层不得在 Importer 之外“补写成功”；
 - 超时只能精确重放，不得推测副作用状态；
 - UNKNOWN 后禁止第二次不安全写，只允许唯一 RECONCILE。
 
-## 16. 保留与退役清单
+## 16. 保留、迁移与退役清单
 
 ### 16.1 保留为正式 Composition Root/薄适配器
 
@@ -616,39 +750,54 @@ COMPLETED
 - `scripts/evaluate_business_rules.py`；
 - `scripts/run_shadowbot_listing_sync.py`；
 - `scripts/run_shadowbot_commit_batch.py prepare/publish/production-run`；
-- 主 CLI 的 Runtime 查询、复核和受控 APPLY 命令。
+- 主 CLI 的 Runtime 查询、复核和受控 APPLY 命令；
+- `/execution-logs` 查询、唯一 RECONCILE 与受控人工恢复动作；
+- Web 登录、Session、CSRF 和 PRG 安全基础设施，但 Runtime DB 权威从请求迁移到 Composition Root。
 
-### 16.2 受控运维/诊断
+### 16.2 7B 兼容迁移
+
+- 旧 `/` 仍受现有 legacy fail-closed gate；其 preview/persist 必须委托统一 Application Service；
+- 旧 `runtime_db` query/form/session 只允许兼容检查，不再决定 Repository；
+- 旧 generic Executor `start` 不增加新调用方，不接入 Application Service；
+- 如审计发现仍有兼容调用，按正式 READ_ONLY/COMMIT/RECONCILE capability 委托，不保留 generic mode 作为业务权限。
+
+### 16.3 受控运维/诊断
 
 - `run_shadowbot_executor.py check-yingdao-app-params`；
 - `reconcile_shadowbot_listing_skus.py`；
 - `repair_shadowbot_expired_attempt.py`；
 - 部署同步、hash 验证、备份和健康检查脚本。
 
-### 16.3 归档或退役候选
+### 16.4 7C 归档或退役候选
 
-- `run_shadowbot_executor.py start`；
+- 旧 `/` POST preview/persist 业务能力；
+- Web 请求、登录 form/query、Session 和 URL 中的 Runtime DB 选择兼容逻辑；
+- `run_shadowbot_executor.py start` generic executor；
 - `run_shadowbot_executor.py import-result`；
 - `run_shadowbot_executor.py poll-yingdao-result`；
 - `run_shadowbot_commit_batch.py import-result`；
 - 旧 Excel `resolve-manual-task` 和 Web `/manual-intervention` 正式处理路径；
 - 阶段性 demo、baseline build 和旧证据脚本。
 
-删除前必须完成 CI、Runbook、部署脚本、证据复算和运维引用审计。
+删除前必须完成 CI、Runbook、部署脚本、Web 旧链接、repository call-site、测试和运维引用审计。
 
 ## 17. 阶段拆分
 
 ### 17.1 13.5-7A：本 PR
 
-交付本文的真实入口清单、子命令级 capability 矩阵、canonical identity、完整优先级、退役清单和开工门禁。零业务代码、零真实平台副作用。
+交付本文的真实入口清单、Current/Target 分离、子命令级 capability 矩阵、Web Runtime DB 迁移合同、canonical identity、完整优先级、退役清单和开工门禁。零业务代码、零真实平台副作用。
 
-### 17.2 13.5-7B：统一 Application Service
+### 17.2 13.5-7B：统一 Application Service 与迁移
 
 仅在 7A 复审通过后开始：
 
 - 最多一组轻量 Application Service；
-- Composition Root 固定绑定 Repository、平台、账号和 capability；
+- Web Composition Root 固定绑定唯一 Repository、平台、账号和 capability；
 - 薄 Web/CLI/Scheduler/manual adapters；
+- `/execution-logs` GET/RECONCILE/人工恢复拆分能力；
+- legacy `/` 委托统一 Service，不再直接 persist；
+- Runtime DB 请求级权威迁移；
+- generic Executor 与正式能力隔离；
 - capability/mode 服务端白名单；
 - capability 级 canonical identity；
 - 分层幂等复用；
@@ -658,10 +807,11 @@ COMPLETED
 ### 17.3 13.5-7C：旧入口退役
 
 - 删除重复业务判断；
-- 兼容入口变薄或归档；
-- 收口第二 Importer/旧 Executor；
+- 移除 legacy `/` POST 业务能力并收口 root 导航；
+- 删除请求级 Runtime DB 兼容读取和 URL 传播；
+- 收口第二 Importer/旧 generic Executor；
 - 更新 Runbook 和启动脚本；
-- 重启、精确重放、跨 18:00/20:00 和人工补跑测试；
+- 重启、登录/CSRF/PRG、精确重放、跨 18:00/20:00 和人工补跑测试；
 - 系统冒烟与 Linux/Windows CI。
 
 ## 18. 复杂度预算
@@ -680,49 +830,80 @@ COMPLETED
 长期平行业务入口: 0
 ```
 
-若实现要求突破预算，停止编码并单独评审。
+Web Composition Root 和 compatibility guard 必须是薄适配/装配层，不得演化为第二套 Repository 或状态机。若实现要求突破预算，停止编码并单独评审。
 
 ## 19. P1 阻塞清单
 
-1. 入口盘点按脚本名合并，遗漏不同子命令的副作用边界；
-2. 具体入口未绑定固定 capability 和 allowed modes；
-3. capability 由请求参数决定；
-4. READ_ONLY/DIAGNOSTIC 获得 APPLY/COMMIT；
-5. COMMIT 接受未授权、过期或错误平台 Task；
-6. RECONCILE 接受非 UNKNOWN Operation 或执行第二次写；
-7. 业务身份使用 `requested_at` 或重试时当前时钟；
-8. 跨 18:00/20:00 重试形成第二业务事实；
-9. 人工补跑伪装成 Scheduler；
-10. 外部参数伪造来源、审批或策略字段；
-11. 请求可自由选择 Runtime DB 或账号；
-12. 一个统一幂等键覆盖 Run/Task/Operation/Attempt；
-13. 为同一 v2/v4/v5 合同在 Queue Service 之外保留第二正式 Importer/Watchdog；
-14. 旧 Executor 长期保留完整 COMMIT 主线；
-15. Web subprocess 调 CLI 或直接写队列 JSON；
-16. 调度优先级被复制、压平或绕过；
-17. UNKNOWN 被普通补跑或新写覆盖；
-18. 结构化结果变成第二持久化状态机；
-19. 第二队列、第二 Worker、第二写链；
-20. `automatic_emergency_offline` 被提前开启。
+1. 入口盘点按脚本名/路由名合并，遗漏不同动作的副作用边界；
+2. `/execution-logs` 被整体标为 READ_ONLY，掩盖 RECONCILE 和人工恢复；
+3. legacy `/` 保留独立 `persist_task_generation_summary` 写链；
+4. Web query/form/session 可以继续选择 Runtime DB；
+5. Runtime DB 只写目标禁令，没有旧 Session/登录/PRG/链接迁移方案；
+6. 具体入口未绑定固定 capability 和 allowed modes；
+7. capability 由请求参数决定；
+8. 旧 generic Executor 的 current `{READ_ONLY, COMMIT, RECONCILE}` 被错误写成 target `{COMMIT}`；
+9. 新 Service 信任或透传 generic `execution_mode`；
+10. READ_ONLY/DIAGNOSTIC 获得 APPLY/COMMIT；
+11. COMMIT 接受未授权、过期或错误平台 Task；
+12. RECONCILE 接受非 UNKNOWN Operation 或执行第二次写；
+13. 业务身份使用 `requested_at` 或重试时当前时钟；
+14. 跨 18:00/20:00 重试形成第二业务事实；
+15. 人工补跑伪装成 Scheduler；
+16. 外部参数伪造来源、审批或策略字段；
+17. 一个统一幂等键覆盖 Run/Task/Operation/Attempt；
+18. 为同一 v2/v4/v5 合同在 Queue Service 之外保留第二正式 Importer/Watchdog；
+19. 调度优先级被复制、压平或绕过；
+20. UNKNOWN 被普通补跑或新写覆盖；
+21. 结构化结果变成第二持久化状态机；
+22. 第二队列、第二 Worker、第二写链；
+23. `automatic_emergency_offline` 被提前开启。
 
 后续复审原则上只验证这些冻结问题及修复直接引入的回归。
 
 ## 20. 测试矩阵
 
-### 20.1 7A
+### 20.1 7A 静态核对
 
-- 对照真实代码核对所有入口、子命令、函数和副作用；
+- 对照真实代码核对所有入口、路由动作、子命令、函数和副作用；
+- 对照 `/execution-logs` GET/POST 分支；
+- 对照 legacy `/` 的 guard、preview 与 persist；
+- 对照 Runtime login/session/request DB 选择代码；
+- 对照 `ALLOWED_EXECUTION_MODES` 和 `run_shadowbot_executor.py --execution-mode`；
 - 对照 `UI_CHANNEL_PRIORITY`；
 - Markdown/链接检查；
 - 确认 diff 无业务代码、Schema、生产开关变化。
 
-### 20.2 7B/7C
+### 20.2 7B/7C capability 与跨入口
 
 - 每个具体入口绑定预期 capability；
 - capability → allowed modes 全矩阵；
-- 旧 CLI 不能通过 `--execution-mode` 升级；
-- Web/CLI/Scheduler 使用同一 Service；
+- `/execution-logs` GET 只能查询；
+- `/execution-logs` start reconcile 只接受既有 UNKNOWN/NEEDS_RECONCILIATION Operation；
+- `/execution-logs` manual handled 只执行受控管理员 APPLY；
+- legacy `/` 与 `/task-generator` 使用同一 Service 和 canonical identity；
+- 7C 后 legacy root POST 不执行 Task preview/persist；
+- Web/CLI/Scheduler 使用同一业务 Service；
 - 同业务意图、不同真实来源；
+- 旧 generic Executor 的 current accepted modes 测试与 target 隔离测试；
+- 新 Service 不通过 `execution_mode` 获得能力升级；
+- generic RECONCILE 不成为第二恢复入口；
+- generic READ_ONLY 不成为第二正式扫描入口。
+
+### 20.3 Runtime DB 迁移回归
+
+- Web 进程启动只绑定一个受控 Repository；
+- query/form/session 不能切换 Repository；
+- legacy 同路径参数规范化后被移除；
+- legacy 异路径参数明确拒绝；
+- 新 Session 不保存 Runtime DB；
+- 旧 Session 不再拥有数据库权威；
+- login、logout、CSRF、Session rotation、PRG、`next` 参数回归；
+- Dashboard/Tasks/Reviews/Notifications/Execution Logs/System/Task Generator 均使用同一 Repository；
+- `/health` 与业务页面数据库身份一致；
+- 旧书签和旧页面链接不会静默切库。
+
+### 20.4 幂等、事务与恢复
+
 - Web 双击、HTTP 重试、CLI 重跑、Scheduler 重启；
 - 同引用同 canonical payload 精确重放；
 - 同引用异 canonical payload 冲突；
@@ -735,10 +916,10 @@ COMPLETED
 - 完整 UI priority 顺序；
 - 人工任务在 final fence 前压制自动紧急任务；
 - UNKNOWN → 唯一 RECONCILE；
-- 错误账号与请求级 Runtime DB 注入拒绝；
+- 错误账号拒绝；
 - 旧入口退役引用审计。
 
-### 20.3 Ready for review
+### 20.5 Ready for review
 
 - 完整 pytest；
 - 系统冒烟；
@@ -755,10 +936,14 @@ COMPLETED
 必须同时满足：
 
 - PR #29 保持 Draft 并完成设计复审；
+- 第三轮复查的 3 个 P1 已确认关闭：Web 混合能力/legacy root、Runtime DB 迁移、旧 Executor current/target 分离；
 - 本文入口盘点与代码一致；
-- 所有高风险子命令有独立 capability、mode、Composition Root 和退役结论；
+- `/execution-logs` 查询、RECONCILE、人工恢复已独立冻结；
+- legacy `/` 的 7B 兼容和 7C 退役路径已冻结；
+- Web Runtime DB 的 Current → Migration → Target → Tests 已冻结；
+- 所有高风险子命令有 current capability、target capability/mode、Composition Root 和退役结论；
 - canonical identity 与跨 18:00/20:00 重试合同通过；
-- 单账号与 Runtime DB 边界通过；
+- 单账号边界通过；
 - 分层幂等矩阵通过；
 - Queue Service 是唯一正式 v2/v4/v5 Importer/Watchdog 主线，ORDER_SCAN 保持 Automation-owned importer；
 - 三层优先级合同通过；
