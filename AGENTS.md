@@ -56,6 +56,31 @@
   完成人工 Incident 闭环、策略评审、策略结构迁移、实机验收并由管理员显式启用前，
   任何 Agent、Web、Scheduler 或脚本都不得创建或执行 `SYSTEM_EMERGENCY` 自动下架。
 
+### 项目级业务调用通道（后续任务强制遵守）
+
+长期控制面只允许以下分工：人工运营走 Web，定时业务走 Automation，未来智能调用走
+Agent Gateway，平台执行走 Queue/Worker/Importer，开发测试、诊断和恢复走 CLI。各调用方
+共享权威 Query/Application Service，不得为同一职责另建平行状态机、数据库写入口或执行链。
+
+未来 Agent 接入必须遵守：
+
+- 读取经营数据只能走 `Agent Query Adapter → 权威 Query Service / Read Model`；不得抓取
+  Web HTML，不得直接读取 SQLite、Excel、Queue 文件或平台页面作为业务接口。
+- 发布任务只能走 `Agent Task Adapter → Task Application Service → 必要的 Review/授权 →
+  Runtime Task`；执行继续走既有 v4/v5 Queue、Worker 和 Importer。
+- Agent 可以提交候选任务或需要复核的正式任务，但不得直接调用 CLI、Web Route、平台
+  Adapter、ShadowBot 或 COMMIT，不得拼 Queue JSON，不得绕过任务中心和审批策略。
+- Agent 永远不得伪造 `SYSTEM_EMERGENCY`；该来源只能由 13.5-6 的专用授权服务创建。
+- 未来正式身份预留为 `origin_type=AGENT`、
+  `origin_ref_id=agent-run:<stable-run-id>` 和版本化审批策略。当前 Schema 尚未支持
+  `AGENT`，在独立评审和最小迁移完成前，不得冒充 `MANUAL` 或 `AUTOMATION` 落库。
+- 若 Agent 由 Automation 触发，必须同时保留父 `automation-run:<run_id>` 关联，但业务
+  来源仍为 `AGENT`，不能因此改写为普通自动任务。
+
+任务 13.5-7 只冻结上述合同，不实现 Agent，也不新增 Agent Schema、状态、队列或平台动作。
+任何后续 Agent 功能必须先复用本边界；不得再次开发直连 Web、CLI、数据库、Queue 或平台
+执行器的替代通道。
+
 最终希望实现：
 - 用户只维护一份商品和规则数据。
 - 系统根据库存、成本、销售状态等生成待执行任务。

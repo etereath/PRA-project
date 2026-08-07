@@ -4,6 +4,12 @@
 
 运行态业务数据以 SQLite 为中心，当前代码结构版本为 v16。v9 使用“平台 + 品种 + 等级”作为 `listing_status` 业务身份，v10 将任务旧价结构化，v11 增加单次请求的 ShadowBot 多商品 COMMIT 批次账本，v12 增加逐商品操作/尝试身份、活动写锁、观察时间和技术回执，v13 增加公共批次注册表、通用上下架 operation、两页快照、页面异常和 v5 动作账本；v14 增加双时间轴、Automation 账本、不可变观察、销售日结、Incident 和任务来源字段；v15 增加 Incident 出现次数与 append-only 事件流水；v16 增加版本化极简紧急下架策略。真实 Runtime DB 需按迁移手册另行升级。Excel 继续承担商品、规则等主数据输入，不是运行态任务数据库。
 
+项目长期控制面固定为：人工运营走 Web，定时业务走 Automation，未来智能调用走 Agent
+Gateway，平台执行走 Queue/Worker/Importer，开发测试与恢复走 CLI。Agent 只能通过
+Query/Task Adapter 复用权威 Query/Application Service；禁止抓取 Web、调用 CLI、直读
+SQLite/Excel、拼 Queue JSON、直连平台或伪造 `SYSTEM_EMERGENCY`。这是根级
+`AGENTS.md` 的强制约束，不因具体任务文档是否被阅读而失效。
+
 ## 当前状态与入口
 
 - [project_current_status.md](project_current_status.md)：当前项目定位、已完成能力、主控流程、安全边界和下一步优先级。
@@ -61,7 +67,9 @@
 
 - [business_decision_spec.md](business_decision_spec.md)：鲜切花预测性销售业务决策规则。
 - [project_overview.md](project_overview.md)：项目背景和早期架构说明。当前真实进度以 `project_current_status.md` 为准。
-- [ai_agent_integration_spec.md](ai_agent_integration_spec.md)：AI Agent 接入治理规范。当前不接 AI Agent 自动决策。
+- [ai_agent_integration_spec.md](ai_agent_integration_spec.md)：未来 Agent Gateway 的唯一
+  Query/Task Adapter 通道、来源身份、审批与审计边界；当前不接 AI Agent，也不批准
+  早期候选表或平行 Service。
 
 ## 运行态与 SQLite
 
@@ -83,7 +91,8 @@
 
 - [plans/task13_5_web_rewrite_plan.md](plans/task13_5_web_rewrite_plan.md)：2026-08-07
   重新冻结的 13.5-7 实施权威；直接替代旧 Web，不保留兼容层，并将 CLI 残留正式业务
-  迁移到 Web、Automation 和 Queue，同时保留测试、验收、诊断和恢复 CLI。
+  迁移到 Web、Automation 和 Queue，同时保留测试、验收、诊断和恢复 CLI；并按 R4
+  冻结安全、外部协议、来源、复用矩阵及项目级 Agent Gateway 预留。
 - [web_frontend_refresh_plan.md](web_frontend_refresh_plan.md)：Web 运行态运营后台刷新计划和当前进度。
 - [web_localization_display_spec.md](web_localization_display_spec.md)：Web 与飞书通知的运营中文展示术语表。
 - [product_inventory_input_spec.md](product_inventory_input_spec.md)：商品资料与库存补充录入规则，说明 `products.xlsx` 兼容、公共库存、SKU 生成、新增品种弹窗和旧 `/tables` 入口边界。

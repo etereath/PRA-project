@@ -317,6 +317,15 @@ v14 Runtime DB 中通过，平台写操作为 0。批次 `PARTIAL` 仅源于验�
 并把 CLI 中残留的日常正式业务职责迁移到 Web、Automation 和 Queue。开发测试、Mock、
 验收、诊断、备份和恢复 CLI 继续保留。
 
+项目级控制面已经同时冻结：人工运营走 Web，定时业务走 Automation，未来智能调用走
+Agent Gateway，平台执行走 Queue/Worker/Importer，开发测试与恢复走 CLI。未来 Agent
+读取只能经 Agent Query Adapter 调用权威 Query Service/Read Model；任务意图只能经
+Agent Task Adapter 调用 Task Application Service，再进入必要的 Review/授权和现有
+Runtime Task 执行链。禁止 Agent 抓取 Web、调用 CLI、直读 SQLite/Excel、拼 Queue JSON、
+直连平台 Adapter 或伪造 `SYSTEM_EMERGENCY`。正式 Agent 来源预留为 `AGENT +
+agent-run:<stable-run-id>`；当前 Schema 尚未支持，本阶段只冻结合同，不提前实现，也不
+冒充 `MANUAL` 或 `AUTOMATION`。
+
 ### 2.8 自动规则评估框架 MVP
 
 已完成轻量自动规则评估框架第一版：
@@ -589,7 +598,8 @@ Web 复核主入口：
 
 - 不承诺真实销售平台无人值守生产改价；当前 production profile 以有效 pending 任务为执行权威，并保留单 Worker 多商品严格串行、旧价校验和人工可对账边界。
 - 不承诺生产级无人值守 RPA；本地文件队列、自动对账和审计闭环代码已完成，但常驻实机样本、告警和长期证据运维仍未达到生产级。
-- 不接 AI Agent 自动决策。
+- 当前不接 AI Agent 自动决策；未来接入必须复用已冻结的 Agent Gateway，不得另建直连
+  Web、CLI、数据库、Queue 或平台执行器的通道。
 - 不引入 React / Vue。
 - 不做前后端分离。
 - 不迁移 Excel 主数据。
@@ -702,7 +712,9 @@ Code Review 后的高中低风险问题已完成修复，系统冒烟测试、�
 5. 任务12 PR #18 已合并；任务13也已完成 T13-0 页面探索、T13-1 合同、T13-2 Runtime Schema v13、独立两页 SYNC_STATUS、单商品状态往返、正常多商品严格串行上下架、整批预检异常零写、严格串行 UNKNOWN、最终确认点击后的 `UNKNOWN → 唯一自动 RECONCILE → VERIFIED` 和 `UNKNOWN → 唯一自动 RECONCILE → NOT_APPLIED`、`ALREADY_APPLIED` 0 写点击、跨动作共享写锁、phase/result 恢复、Web 运营投影、最终回归、PR #19 COMMENT Review 修复和双平台 CI。仓库内已保存脱敏证据、自然语言报告、数据库回读及 CI 复算入口；本轮文档整理不执行合并或任务状态变更。
 6. 继续运行系统冒烟、完整单元测试和 ShadowBot 成功基线测试，任务13.5不得重写已验证 COMMIT 动作链路。
 7. 基于自动规则评估框架继续完善上下架、冷库、包装产能等 evaluator，但保持 dry-run/apply 和 service 边界。
-8. AI Agent 自动决策应放在真实平台执行和运维边界通过更长期审查后再推进。
+8. AI Agent 自动决策应放在真实平台执行和运维边界通过更长期审查后再推进；接入时只能
+   使用项目级已冻结的 Agent Query/Task Adapter → 权威 Query/Application Service 通道，
+   并为 `AGENT` 来源执行独立评审和必要的最小 Schema 迁移。
 9. 13.5-0 已建立独立分支、黄金基线、脚本/路由盘点、禁止重写点、Web 独立审计、
    验收清单和 main 回滚点；13.5-1、13.5-2 已分别通过 PR #22、#23 合并，后续编码仍按
    [任务12—13复用路径与失败复盘](shadowbot_task12_task13_reusable_lessons.md)

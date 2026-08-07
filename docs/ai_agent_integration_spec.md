@@ -4,6 +4,13 @@
 
 本文档用于定义未来 AI Agent 接入当前项目时的系统边界、数据结构、审批流程和审计要求。
 
+> **项目级强制边界（2026-08-07 冻结）**：未来 Agent 是与 Web、Automation 并列的
+> 业务调用方，只能走 `Agent Query Adapter → 权威 Query Service / Read Model` 读取，
+> 只能走 `Agent Task Adapter → Task Application Service → 必要 Review/授权 → Runtime
+> Task` 发布任务。禁止抓取 Web、调用 CLI、直读 SQLite/Excel、拼 Queue JSON、直连
+> 平台 Adapter/ShadowBot 或伪造 `SYSTEM_EMERGENCY`。本文件后文的表和服务是历史候选，
+> 不构成实现授权；与本边界冲突时，以本节和根级 `AGENTS.md` 为准。
+
 当前项目已经完成：
 
 - SQLite 运行态任务系统
@@ -34,6 +41,10 @@
 
 AI Agent 不是一个绕过系统的“特殊模块”，而是运行态系统中的一种 actor。
 
+长期控制面分工为：人工运营走 Web，定时业务走 Automation，智能调用走 Agent Gateway，
+平台执行走 Queue/Worker/Importer，开发测试与恢复走 CLI。Agent 不复用 Web Session、
+Mobile Review Token 或 CLI，也不形成第二套状态机和执行队列。
+
 建议统一抽象：
 
 - `actor_type = human`
@@ -62,6 +73,8 @@ AI Agent 与现有运行态系统的关系应明确为：
 - 不能绕过 `RuntimeTaskService`
 - 不能绕过 `NotificationSender`
 - 不能直接写 SQLite 表
+- 不能直接读取 SQLite、Excel、Queue 文件或抓取 Web HTML 作为业务接口
+- 不能直接调用平台 Adapter、ShadowBot 或 COMMIT
 
 AI Agent 的所有动作都必须经过已有运行态服务边界，保证：
 
@@ -126,11 +139,16 @@ AI Agent 不能审批自己生成的高风险 proposal 或高风险任务。
 
 ---
 
-## 4. 建议预留的数据结构
+## 4. 未冻结的历史数据结构候选
+
+当前不得因本节直接新增表。首选路径是把 Agent 意图适配到既有 Task Application
+Service；只有未来真实用例证明“尚未形成 Runtime Task 的长期 proposal”无法由现有结构
+表达时，才允许通过独立 R4 评审和最小 Schema 迁移考虑专表。
 
 ## 4.1 `agent_proposals`
 
-建议未来新增 `agent_proposals`，用于承接 AI 输出但尚未成为正式任务或正式主数据变更的内容。
+`agent_proposals` 是早期候选，不是已批准方案。若未来评审仍选择该表，它只能承接尚未
+成为正式任务或主数据变更的内容，不能取代 Runtime Task、Review 或现有审计流水。
 
 建议字段：
 
@@ -298,6 +316,11 @@ AI Agent 不应复用人类管理员的 Web session，也不应伪装为普通�
 - service account
 - API key
 
+任务来源应在独立迁移后使用 `origin_type=AGENT`、
+`origin_ref_id=agent-run:<stable-run-id>` 和版本化审批策略。当前 Schema 尚未支持
+`AGENT`，不得把 Agent 冒充为 `MANUAL` 或 `AUTOMATION`。如果 Agent 由 Automation
+触发，应另保留父 `automation-run:<run_id>` 关联，但来源仍为 `AGENT`。
+
 并限制：
 
 - `allowed_actions`
@@ -333,6 +356,7 @@ AI Agent 不应复用人类管理员的 Web session，也不应伪装为普通�
 - 生成预测值草案
 - 生成 `recommended_price` 草案
 - 生成 task proposal
+- 通过 Agent Task Adapter 向既有任务中心提交候选或需要复核的正式任务
 - 触发 `review_task` 创建建议
 - 触发通知来源事件
 
@@ -344,6 +368,7 @@ AI Agent 不应复用人类管理员的 Web session，也不应伪装为普通�
 - 不能直接关闭人工复核
 - 不能直接调用真实平台执行
 - 不能绕过 `ReviewTaskService / RuntimeTaskService / NotificationSender`
+- 不能创建或伪造 `SYSTEM_EMERGENCY`
 
 ### 8.3 推荐接入顺序
 
@@ -357,9 +382,10 @@ AI Agent 不应复用人类管理员的 Web session，也不应伪装为普通�
 
 ---
 
-## 9. 对当前运行态系统的改造建议
+## 9. 未来独立评审候选
 
-当前阶段不改代码，但未来实现时建议优先考虑以下对象或字段扩展：
+当前阶段不改代码，也不预先批准下列扩展。未来实现先建设薄 Agent Query/Task Adapter 并
+复用既有 Query/Application Service；只有出现可复现表达缺口时，才独立评审以下候选：
 
 ### 9.1 建议补充的统一身份字段
 
@@ -376,9 +402,10 @@ AI Agent 不应复用人类管理员的 Web session，也不应伪装为普通�
 
 ### 9.3 建议补充的服务边界
 
-- `AgentProposalService`
-- `ProposalValidationService`
-- `AgentAuditService`
+- `AgentQueryAdapter`：只适配权威 Query Service / Read Model
+- `AgentTaskAdapter`：只适配既有 Task Application Service
+- `AgentProposalService`、`ProposalValidationService`、`AgentAuditService` 仅为历史候选；
+  不得与既有任务、Review、规则校验或审计服务平行承担同一职责
 
 ### 9.4 建议补充的通知来源字段
 
@@ -410,6 +437,8 @@ AI Agent 不应复用人类管理员的 Web session，也不应伪装为普通�
 5. 所有 AI 动作必须可追踪、可审计、可批量回溯
 6. AI 未来必须通过独立 agent identity 或 service account 接入
 7. AI 不得绕过现有运行态服务边界和状态流转规则
+8. AI 只能通过唯一 Agent Gateway 接入，不使用 Web、CLI、数据库、Queue 或平台直连路径
+9. 当前不实现 Agent；正式接入前必须独立评审 `AGENT` 来源和必要的最小迁移
 
 这意味着，未来 AI Agent 应被视为：
 

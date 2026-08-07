@@ -1,6 +1,7 @@
 # 任务 13.5：单平台运营自动化闭环与 Web 主控重写实施计划
 
-- 计划日期：2026-07-28；按父 Issue 合并正文修订于 2026-07-29
+- 计划日期：2026-07-28；按父 Issue 合并正文修订于 2026-07-29；13.5-7 替代重写与
+  Agent 通道边界修订于 2026-08-07
 - 插入位置：任务 13 完成后、任务 14 开始前
 - 当前状态：13.5-0 已通过 PR #21 合并；13.5-1
   [双时间轴、质量与日结合同](task13_5_1_quality_and_settlement_contract_review.md)
@@ -170,9 +171,16 @@ Automation Scheduler ──► Automation Run Ledger
 | `shadowbot-queue-services` | 文件队列 Importer、Watchdog、唯一 RECONCILE | 仅复用既有边界 |
 | `command-executor` | 接收明确授权后的普通写任务或 `SYSTEM_EMERGENCY` | 是，必须有明确任务和授权 |
 | Web 主控端 | 配置、观察、人工处置和审计 | 不直接执行平台动作 |
+| 未来 Agent Gateway | 适配 Agent 查询和任务意图到权威 Query/Application Service | 否；不得直接入队或 COMMIT |
 
 Web 请求线程不得承担长期调度、循环扫描或 ShadowBot Worker 生命周期。CLI 保留为
 排障和手工补跑入口，但日常业务不再依赖操作人员打开终端执行脚本。
+
+项目长期调用关系固定为：人工运营走 Web，定时业务走 Automation，未来智能调用走
+Agent Gateway，平台执行走 Queue/Worker/Importer，开发测试与恢复走 CLI。Agent 不得
+抓取 Web、调用 CLI、直读 Runtime DB/Excel、拼 Queue JSON 或直连平台 Adapter；读取必须
+经 Agent Query Adapter 调用权威 Query Service/Read Model，任务必须经 Agent Task Adapter
+调用 Task Application Service，并继续接受既有 Review、授权和执行链。
 
 ## 5. 自动扫描与日结流程
 
@@ -433,6 +441,11 @@ supporting_observation_ids
 - `SYSTEM_EMERGENCY`
 - `LEGACY`
 
+这是当前 v14—v16 的已实现集合。未来 Agent 正式接入时必须通过独立评审和最小迁移增加
+`AGENT`，使用 `origin_ref_id=agent-run:<stable-run-id>` 与版本化审批策略；当前任务不得
+把 Agent 冒充为 `MANUAL` 或 `AUTOMATION`。由 Automation 触发时另保留父
+`automation-run:<run_id>` 关联，但 Agent 业务来源不变。
+
 Issue #20 中的细分来源名称是运营语义，不扩张为第二套数据库枚举，固定映射为：
 
 | 运营语义 | 核心来源 |
@@ -465,8 +478,10 @@ Issue #20 中的细分来源名称是运营语义，不扩张为第二套数据�
 - 暂停自动化通道不得删除候选任务，也不得停止正在副作用区内执行的操作。
 - 除满足全部 S4 门禁的 `SYSTEM_EMERGENCY` 外，自动化通道的最高权限是创建
   proposal、Review 或候选任务。
-- Web、CLI 和 Scheduler 必须调用同一 application service；Web 不得通过 subprocess、
-  自定义队列 JSON 或备用 gate 绕过服务层。
+- Web、CLI、Automation 和未来 Agent Gateway 必须调用同一权威 application service；
+  Web/Agent 不得通过 subprocess、自定义队列 JSON 或备用 gate 绕过服务层。
+- `SYSTEM_EMERGENCY` 只能由 13.5-6 专用授权服务创建；Web、CLI、Automation 普通 Handler
+  和未来 Agent 均不得伪造该来源。
 
 ## 8. 异常分类与处理
 
@@ -830,14 +845,25 @@ Web 主控端以运营人员的工作问题组织页面：
 - 新建唯一运营 Web，按八个权威一级入口组织页面。
 - 直接复用 Task、Review、Automation、Incident、日结、Queue/Importer 和唯一
   RECONCILE，不重构已验证后台动作链。
+- 按 R4 冻结认证/Session/CSRF、Presenter 权威输入、单一可信 Runtime DB、`/health` 与
+  Mobile Review 外部协议切换、任务来源和恢复成本。
 - 将 CLI 中残留的日常任务生成、复核、超时维护和运营查询迁移到 Web、Automation 或
   Queue；保留测试、Mock、验收、诊断、备份、恢复和进程启动 CLI。
+- 业务资料页面复用既有商品库存、平台映射、价格规则和上下架规则输入服务；普通平台写
+  只展示事实，不在 Web 提供 COMMIT 按钮或 Route。
+- 在既有 Automation 框架增加“Review 超时”和“每日自动任务生成”两个薄 Handler，不
+  新建 Scheduler 或任务系统。
+- 在根级规则中预留唯一 Agent Gateway 通道；13.5-7 不实现 Agent、不扩 Schema，后续不得
+  另建直连 Web、CLI、数据库、Queue 或平台的 Agent 路径。
 - 完成新应用骨架、只读运营页面、人工流程、切换、旧 Web 删除和桌面/手机验收。
+- 7B—7F 至少拆为“骨架与只读 / 人工写与 CLI 迁移 / 切换删除 / 最终验收”四个顺序
+  小 PR；后一项只在前一项通过评审后开始。
 - 具体工作包、CLI 矩阵和复杂度预算见
   [任务 13.5-7 Web 重写计划](task13_5_web_rewrite_plan.md)。
 
 验收：新 Web 是唯一人工运营入口；日常业务不依赖 CLI；测试与管理员 CLI 仍可用；
-旧 Web 已删除；后台控制面和真实平台动作链未被重写。
+旧 Web 已删除；后台控制面和真实平台动作链未被重写；Agent 唯一通道已经在项目级文档
+冻结但没有提前实现。
 
 ### T13.5-8 / T13.5-9：内容并入 T13.5-7
 

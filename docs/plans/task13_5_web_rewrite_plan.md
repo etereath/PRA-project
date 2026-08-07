@@ -2,8 +2,8 @@
 
 - 决策日期：2026-08-07
 - 当前状态：编码前计划评审
-- Review Profile：R3
-- 真实平台写操作：否；本计划只规定现有正式服务的调用边界
+- Review Profile：R4
+- 真实平台写操作：否；新 Web 只展示既有平台写事实，不提供普通 COMMIT 入口
 - 宏观业务权威：[GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20)
 - 当前恢复检查点：`checkpoint/pre-task13-5-7-web-rewrite-20260807`
 - 检查点提交：`418c605f4ab4434eee422eb0217de3cfe64b01b0`
@@ -27,6 +27,29 @@
 Issue #20 当前仍把 13.5-7、13.5-8、13.5-9 分成入口对齐、架构拆分和 UI 重写。该阶段文字
 需要在本计划合并前同步更新；双时间轴、八个一级入口、扫描父子关系、S0–S4、唯一
 RECONCILE、唯一 `FINAL` 和任务 14 边界继续保持不变。
+
+### 1.1 项目级 Agent 唯一通道预留
+
+未来 Agent 是与 Web、Automation 并列的业务调用方，不是 Web 用户，也不是 CLI 包装器。
+本任务只冻结接口边界，不实现 Agent，不增加 Schema、状态、队列或平台动作：
+
+```text
+Agent 读取：Agent Query Adapter → 权威 Query Service / Read Model
+Agent 发起：Agent Task Adapter → Task Application Service → 必要的 Review / 授权
+执行链路：有效 Runtime Task → 既有 v4/v5 Queue → Worker → Importer
+```
+
+- Agent 不抓取 Web HTML，不直接读取 SQLite、Excel 或本地文件作为经营事实；
+- Agent 不调用 CLI、平台 Adapter、ShadowBot，不直接拼 Queue JSON 或发起 COMMIT；
+- Agent 只能向任务中心提交候选任务或需要复核的正式任务，不能绕过审批策略；
+- Agent 永远不能伪造 `SYSTEM_EMERGENCY`，该来源只属于 13.5-6 既有专用授权服务；
+- 未来正式来源应使用 `origin_type=AGENT` 与
+  `origin_ref_id=agent-run:<stable-run-id>`，并记录版本化审批策略；
+- 当前 Schema 尚不支持 `AGENT`。13.5-7 不得把 Agent 冒充为 `MANUAL` 或
+  `AUTOMATION`；未来接入必须用独立评审和必要的最小 Schema 迁移完成。
+
+该约束同时写入根级 `AGENTS.md`、项目总实施计划、项目当前状态和文档索引，后续开发
+不得另建 Agent 直连数据库、Web、CLI、队列或平台的平行路径。
 
 ## 2. 为什么选择替代重写
 
@@ -80,7 +103,14 @@ Automation Service 继续负责：
 - Result Importer、Watchdog、ACK 和归档；
 - `UNKNOWN →` 唯一只读 `RECONCILE`。
 
-### 3.4 系统维护和开发控制面：CLI
+### 3.4 未来智能调用控制面：Agent Gateway
+
+Agent Gateway 只负责把未来 Agent 的结构化查询和任务意图适配到权威 Query/Application
+Service。它与 Web、Automation 共享领域服务，但不共享 Web Session，不复用 Mobile
+Review Token，也不形成第二套任务状态机、授权服务或执行队列。当前阶段只冻结边界，
+不实现该模块。
+
+### 3.5 系统维护和开发控制面：CLI
 
 CLI 只承担：
 
@@ -92,6 +122,10 @@ CLI 只承担：
 - 启动 Web、Automation、Queue 等常驻进程。
 
 CLI 不再作为日常任务生成、复核处理、运营查询或计划维护的唯一入口。
+
+五类控制面长期固定为：人工操作走 Web，定时业务走 Automation，智能调用走 Agent
+Gateway，平台执行走 Queue/Worker/Importer，开发测试与恢复走 CLI。它们共享权威应用
+服务，不互相抓取界面或绕过服务层。
 
 ## 4. CLI 残留业务迁移矩阵
 
@@ -165,7 +199,8 @@ app/
 
 边界固定为：
 
-- `composition_root.py` 绑定 Runtime Repository、配置和权威 Service；
+- `composition_root.py` 在进程启动时只绑定一个受信 Runtime Repository、配置和权威
+  Service；request、query、form 和 Session 均不得选择或覆盖 Runtime DB；
 - Route 只解析 HTTP 输入、授权、调用 Service/Presenter 并返回响应；
 - Presenter/ViewModel 只转换运营显示语义，不修改状态；
 - Template 默认转义，不包含业务状态转换；
@@ -173,8 +208,36 @@ app/
 - Web 请求线程不得运行 ShadowBot、长期脚本或轮询 Worker；
 - Web 不直接拼 Queue JSON，不调用平台 Adapter，不直接写业务 SQL。
 
-现有认证、Session、CSRF 和安全 Header 可以抽取并复用已经验证的实现，但复用目的是保留
-安全属性，不构成旧 Web 兼容承诺。
+### 6.1 13.5-7A 冻结的安全属性
+
+现有认证代码可以抽取和参数化复用，但下列安全属性是新 Web 的验收合同，不以旧路由或
+旧 HTML 为兼容对象：
+
+- 登录表单在认证前也必须校验 CSRF；登录路由可改名，但不能删除该保护；
+- 登录失败按用户和来源做有界速率限制，阈值与窗口配置化并接受测试；
+- 登录成功必须轮换 Session 标识；Session 有明确 TTL，Cookie 至少启用
+  `HttpOnly`、`SameSite=Lax`，生产 HTTPS 启用 `Secure`；
+- 登出只接受带 CSRF 的 `POST`；其他方法返回 `405` 且零状态变化；
+- 所有基于 Session 的写请求必须校验 CSRF，并采用 Post/Redirect/Get 防止重复提交；
+- 所有响应保留已验证的安全 Header，模板默认转义，业务文本不得用未审查的 raw HTML；
+- Mobile Review Token 与后台 Session 是两个独立凭据域，不得相互兑换或复用；
+- 审计和错误页不得展示 secret、raw token、完整 webhook、买家 PII 或敏感本机路径。
+
+### 6.2 Presenter 权威输入矩阵
+
+Presenter 只把权威事实翻译成简明中文、数据质量和下一步，不重算领域状态或重新解释
+业务合同：
+
+| 页面领域 | 唯一权威输入 |
+| --- | --- |
+| 今日运营 | Automation、Incident、Settlement 的 Query Service / Read Model |
+| 平台商品 | ProductObservation 与正式 listing status 投影 |
+| 销售分析 | Settlement、OrderObservation、SalesEstimate 的只读查询 |
+| 系统健康 | 正式 heartbeat、Queue、Importer、Outbox 健康事实 |
+
+Route 或 Presenter 不得从原始表自行推导 `FINAL`、Incident 严重度、任务可执行性、平台
+在线状态或 Worker 健康。缺少正式 Query 时，只允许在既有 Service/Repository 上增加窄的
+只读查询，不允许复制一套判断逻辑。
 
 ## 7. 不兼容切换策略
 
@@ -189,8 +252,19 @@ app/
 - 旧浏览器书签；
 - 旧 Web 测试中只用于证明 HTML 结构相同的快照。
 
-切换时允许改变所有业务页面 URL。飞书和 Mobile Review 使用的链接由新 Web 重新生成，
-并在同一个切换 PR 中更新通知链接测试。因为尚未正式投入使用，不维护旧链接跳转。
+切换时允许改变内部业务页面 URL，但 `/health` 和 Mobile Review 是外部协议，不属于旧
+Web 页面兼容成本：
+
+- `/health` 保持稳定、无认证、无副作用，并继续作为公网部署和通知发送门禁；
+- 推荐保留 `/mobile/review/{token}`。如果必须改变路径，必须保持 Token、过期、幂等、
+  原子处置和错误语义，并完成显式版本化迁移；
+- 先让新 `/health` 通过，再验收新 Mobile Review 路由和 Token 合同，然后切换
+  `MOBILE_REVIEW_BASE_URL` 与链接生成器；
+- 已发出的旧 Token/Outbox 要么由旧端点服务到结束，要么显式作废、重新签发并补发；
+- 确认没有活动通知仍引用旧端点后，才可删除旧应用路由；
+- 随机临时公网域名不得用于真实通知。
+
+这是外部协议的受控切换，不要求保留旧导航、页面布局或普通业务路由。
 
 旧 Web 不作为运行时回退。紧急恢复固定使用 Git Tag：
 
@@ -290,7 +364,11 @@ checkpoint/pre-task13-5-7-web-rewrite-20260807
 | 订单观察 | OrderObservation Importer | 只读复用 |
 | 销售日结 | TradeDaySettlement、SalesPlanInput | 只读/受控应用服务复用 |
 | Incident | Incident Application Service | 原样复用 |
-| 平台写操作 | v4/v5、Operation/Attempt/Lock、Queue/Importer | 只显示或调用既有正式入口 |
+| 商品与库存录入 | `product_inventory_input.py` | Route 调用既有 validate/apply，再由既有工作簿持久化 |
+| 平台映射录入 | `platform_mapping_input.py` | Route 调用既有 validate/apply，再由既有工作簿持久化 |
+| 价格规则录入 | `price_rule_input.py` | Route 调用既有 validate/apply，再由既有工作簿持久化 |
+| 上下架规则录入 | `listing_rule_input.py` | Route 调用既有 validate/apply，再由既有工作簿持久化 |
+| 平台写操作 | v4/v5、Operation/Attempt/Lock、Queue/Importer | 只显示既有事实，不从 Web 发起普通 COMMIT |
 | UNKNOWN | 唯一 RECONCILE | 不新增恢复路径 |
 | 通知 | Outbox、通知 Worker | 原样复用 |
 | 运营显示 | 新 Presenter/ViewModel | 确需新增，仅显示语义 |
@@ -298,19 +376,44 @@ checkpoint/pre-task13-5-7-web-rewrite-20260807
 不得新增一个包揽所有领域的“统一控制面 Service”。新 Web 通过 Composition Root 组装现有
 领域服务，避免把稳定模块重新耦合到一起。
 
+业务资料 Route 不得直接调用通用 `save_table_records`，也不得重新实现 SKU、库存、
+`base_cost`、平台映射、价格规则或上下架规则校验。现有服务缺少 Web 参数时只做最小
+参数化；工作簿仍是该类主数据的权威持久化边界。
+
+普通 v4/v5 `COMMIT`、发布 pending、改价、上架、下架均不在新 Web 提供按钮或 Route
+调用。13.5-6 已有 `SYSTEM_EMERGENCY` 自动链不受影响；Web 只展示 Incident/Review、
+接收既有人工处置，不能手工触发或伪造系统紧急来源。
+
+### 9.1 任务来源最小参数化
+
+现有 `task_generation.py` 多个创建分支把来源固定为 `AUTOMATION`，构造入口只接收
+`origin_ref_id`。13.5-7D 只在既有 Task Application Service 上补充最小来源参数，不
+复制任务生成器：
+
+| 调用来源 | `origin_type` | `origin_ref_id` |
+| --- | --- | --- |
+| Web 人工生成 | `MANUAL` | `web:<stable-request-or-run-ref>` |
+| Automation 日常生成 | `AUTOMATION` | `automation-run:<run_id>` |
+| Incident 人工处置 | `MANUAL` | `incident-review:<review_id>` |
+| 未来 Agent | 预留 `AGENT`，本任务不落库 | `agent-run:<stable-run-id>` |
+
+`SYSTEM_EMERGENCY` 继续只能由 13.5-6 专用授权服务创建；Web、Automation 普通 Handler、
+CLI 和未来 Agent 均不能传入该来源。不得为来源对齐新增表、状态或通用万能 Service。
+
 ## 10. 实施工作包
 
 ### 13.5-7A：计划、恢复点与页面合同
 
 - 关闭旧控制面收口 PR；
 - 推送当前 `main` 恢复 Tag；
-- 冻结八入口、CLI 迁移矩阵、无兼容切换和复杂度预算；
+- 冻结八入口、CLI 迁移矩阵、R4 配置、安全属性、Presenter 输入、外部协议、Agent
+  Gateway 预留和复杂度预算；
 - 不修改生产代码。
 
 ### 13.5-7B：新应用骨架
 
 - 建立 `operations_web/`、路由、模板、静态资源和 Composition Root；
-- 抽取登录、Session、CSRF 和安全 Header；
+- 抽取登录、Session、CSRF 和安全 Header，并逐项证明 6.1 的属性；
 - 建立设计 token、导航、错误页和基础 ViewModel；
 - 完成源码与 wheel 安装测试。
 
@@ -318,19 +421,28 @@ checkpoint/pre-task13-5-7-web-rewrite-20260807
 
 - 今日运营、平台商品、销售分析、自动化和系统健康；
 - 列表分页、筛选、独立详情和按需高级诊断；
+- Presenter 只使用 6.2 的权威 Query/Read Model；
 - 先完成只读事实链，不迁移真实平台写按钮。
 
 ### 13.5-7D：人工流程与 CLI 残留迁移
 
 - 待处理、任务中心和业务资料；
 - 任务预览/生成、Review、Incident 处置和允许的只读补跑；
-- Automation 接管超时维护和日常自动生成；
+- 业务资料 Route 复用四个现有输入服务，不直接保存通用表格；
+- 任务创建按 9.1 参数化来源，不开放普通平台 COMMIT；
+- 在既有 Automation 框架注册两个薄 Handler：复核超时 Handler 只调用
+  `ReviewTaskService` 的既有 expire 能力并保留 `emergency_protection` 例外、原子
+  task/review/outbox/时间策略；每日自动生成 Handler 只调用既有 task/rule service，
+  使用 `AUTOMATION + automation-run:<run_id>`；
+- 两个 Handler 复用 Automation Job/Run/Event、租约和错误语义，不新增 Scheduler、
+  Task 系统或万能 Service；
 - CLI 正式业务入口降级，测试/管理员入口保留。
 
 ### 13.5-7E：切换与删除
 
 - 新 Web 接管正式启动入口；
-- 更新飞书/Mobile Review 链接；
+- 按“新 `/health` → 新 Mobile Review/Token 验收 → 切换 Base URL/链接生成器 →
+  消化或作废补发旧 Token/Outbox → 删除旧端点”的顺序切换外部协议；
 - 删除旧 Web Route、Renderer、样式和只服务旧结构的测试；
 - 更新 README、运行手册和项目状态；
 - 不保留旧路由兼容层。
@@ -341,6 +453,16 @@ checkpoint/pre-task13-5-7-web-rewrite-20260807
 - 完成日常运营脚本；
 - 验证 CLI 不再是日常业务必需入口；
 - 输出实施报告、页面地图、操作手册和已知限制。
+
+### 13.5-7 实现 PR 门禁
+
+7B—7F 是工作包，不允许重新合成一个大爆炸 PR。至少拆为以下可独立回滚、顺序评审的
+小 PR，后一项只有在前一项通过审查后才能开始：
+
+1. 新应用骨架、安全属性与只读页面；
+2. 人工写流程、业务输入复用与 CLI 日常职责迁移；
+3. 正式入口切换、外部协议迁移和旧 Web 删除；
+4. 桌面/手机/安装包/完整回归及最终运营验收。
 
 ## 11. 复杂度预算与非目标
 
@@ -364,6 +486,15 @@ checkpoint/pre-task13-5-7-web-rewrite-20260807
 - 删除旧 Web 和已迁移的正式 CLI 业务入口；
 - 测试 CLI 的隔离与命名修正。
 
+R4 实现预算还必须在每个实现 PR 中声明：
+
+- 预计生产代码与测试代码影响范围（以模块/文件和测试类别估算，不用硬性 LOC 指标）；
+- 新 Web Composition Root 允许建立的跨模块关系，只能是 Route/Presenter → 既有
+  Query/Application Service；
+- 本 PR 将删除的旧 Route、Renderer、样式、兼容测试和 CLI 正式业务入口；
+- 当前部署假设、故障模型、人工外部介入风险、最坏事故和恢复成本；
+- 该 PR 的非目标及其与后续小 PR 的边界。
+
 明确不做：
 
 - 重构 v4/v5、Queue、Worker、Importer、写锁或 RECONCILE；
@@ -375,6 +506,14 @@ checkpoint/pre-task13-5-7-web-rewrite-20260807
 - 生产、包装和冷库 ERP；
 - 为尚未投入使用的旧 Web 建立兼容层。
 
+当前 R4 基线假设为单机 Windows、单个受信 Runtime DB、一个正式 Web 进程以及既有
+Automation/Queue/Worker/Importer 独立运行。主要故障包括错误数据库绑定、重复表单、
+认证/Token 泄漏、通知旧链接、部分切换和外部人工直接操作平台。最坏事故是错误任务被
+授权进入既有写链或 Incident 处置丢失；恢复成本包括停用新入口、从固定 Git Tag 恢复、
+核对 Runtime Task/Review/Outbox/Operation/Attempt、对不明写结果执行唯一 RECONCILE。
+因此普通平台写入口明确不进入 Web，外部人工平台操作继续通过后续只读观察和既有
+Incident/RECONCILE 发现，不在本任务重构全部控制面。
+
 任何实现 PR 如果需要改变核心业务合同、增加表/状态/锁/队列或新增真实平台动作，必须
 从 Web PR 中拆出并单独评审，不能恢复 PR #29 的全控制面扩张。
 
@@ -384,7 +523,9 @@ checkpoint/pre-task13-5-7-web-rewrite-20260807
 
 - 所有 Web 写操作调用既有权威 Service；
 - Web 不直接写 SQL、拼 Queue JSON 或调用 ShadowBot Adapter；
-- 普通平台写继续经过任务、授权、Operation/Attempt、写锁和 Importer；
+- Web 不提供普通平台写入口；既有平台写事实只读展示；
+- Web 人工、Automation 和 Incident 人工任务分别写入冻结的来源身份；
+- 两个薄 Automation Handler 复用既有 Job/Run/Event、租约和领域 Service；
 - `UNKNOWN` 只进入唯一 RECONCILE；
 - Web 失败不影响 Automation、Queue 和 Worker 正常运行。
 
@@ -406,9 +547,12 @@ checkpoint/pre-task13-5-7-web-rewrite-20260807
 
 ### 12.4 安全与打包
 
-- 登录、Session、CSRF、PRG 和安全 Header 通过；
+- 认证前登录 CSRF、速率限制、成功登录 Session 轮换、TTL/Cookie flags 通过；
+- 登出仅允许带 CSRF 的 POST，其他方法 `405` 且零状态变化；
+- 所有 Session 写请求的 CSRF、PRG 和安全 Header 通过；
 - 不展示 secret、raw token、完整 webhook、买家 PII 或敏感本机路径；
-- 模板默认转义；
+- Mobile Review Token 与后台 Session 隔离，模板默认转义；
+- request/query/form/session 不能选择 Runtime DB；
 - 源码运行和隔离 wheel 安装均可加载模板与静态资源；
 - 新 Web 不提供 `SYSTEM_EMERGENCY` 手工旁路。
 
@@ -429,6 +573,8 @@ checkpoint/pre-task13-5-7-web-rewrite-20260807
 - 系统冒烟；
 - Linux/Windows CI；
 - 源码与 wheel 安装；
+- `/health`、Mobile Review、旧 Token/Outbox 消化或作废补发的切换验收；
+- Presenter 权威输入、四类业务输入服务复用、任务来源和两个薄 Handler 专项；
 - 内置浏览器桌面/手机运营验收；
 - 不执行未经单独授权的真实平台写操作。
 
@@ -445,4 +591,7 @@ checkpoint/pre-task13-5-7-web-rewrite-20260807
 7. 所有人工写操作调用已有权威 Service；
 8. Git Tag 可以恢复到重写前检查点；
 9. 文档、通知链接、运行手册和测试已切换到新 Web；
-10. 父 Issue 的阶段描述已与本计划同步。
+10. `/health` 与 Mobile Review 外部协议已按受控顺序切换，无活动通知引用旧端点；
+11. 根级规则、项目总览、文档索引和父 Issue 都冻结 Agent Gateway 唯一通道，且本任务
+    没有实现或伪造 `AGENT` 来源；
+12. 父 Issue 的阶段描述已与本计划同步。

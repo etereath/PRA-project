@@ -41,15 +41,16 @@
 | `/system` | 系统检查 | 升级为“系统维护”一级入口 |
 | `/system/test-feishu-notification` | 有外部效果的 POST | 保留认证、CSRF、目标和环境确认 |
 | `/runtime/login`、`/runtime/logout` | 登录与会话 | 保留安全行为；迁入 `auth.py` |
-| `/runtime` | 旧运行态聚合页 | 只读兼容或隐藏 |
+| `/runtime` | 旧运行态聚合页 | 新 Web 切换后删除，不建立兼容层 |
 | `/mobile/review/{token}` | Mobile Review | 保留 token、原子事务和失效语义 |
-| `/` | 旧任务生成入口 | 兼容迁移到正式运营入口 |
+| `/` | 旧任务生成入口 | 正式入口切换后删除 |
 | `/tables` | 旧 Excel 管理 | 降级为管理员高级工具 |
 | `/execution` | 旧执行入口 | 只读兼容到执行审计 |
 | `/manual-intervention` | 旧人工介入 | 只读兼容到“待处理” |
 
-代码路由清单来自 `app/web.py` 的 WSGI 分发；浏览器实测集中覆盖七个全局入口。旧路由
-不再承担新业务信息架构，但在 13.5-8 完成兼容测试前不得直接删除。
+代码路由清单来自 `app/web.py` 的 WSGI 分发；浏览器实测集中覆盖七个全局入口。旧业务
+路由不再承担新信息架构，也不建立兼容层；`/health` 与 Mobile Review 是必须受控迁移的
+外部协议，不属于旧 Web 页面兼容。
 
 ## 2. 浏览器证据
 
@@ -116,7 +117,11 @@ Runtime DB 同一快照中的相关计数为：`tasks=146`、`review_tasks=53`�
 - [x] 已区分数据库顶层执行日志与页面递归后代行，避免错误数据口径。
 - [x] 当前 `main` 已建立
   `checkpoint/pre-task13-5-7-web-rewrite-20260807`，不再冻结旧路由兼容合同。
-- [ ] 13.5-7 编码前冻结登录/Session/CSRF 安全属性、wheel 资源清单和正式 Presenter
-  输入；不要求旧 HTML 或路由行为一致。
-- [ ] Web 写操作继续只调用应用服务；不得直接写 SQL、拼 ShadowBot 队列或提供
-  `SYSTEM_EMERGENCY` 手工旁路。
+- [x] 13.5-7A 计划已冻结认证前登录 CSRF、速率限制、Session 轮换/TTL/Cookie、
+  POST-only 登出、Session 写 CSRF、PRG、安全 Header、模板转义、单一可信 Runtime DB、
+  wheel 资源清单和正式 Presenter 输入；实现仍须逐项验收。
+- [x] 已冻结 `/health` 与 Mobile Review 的外部协议顺序迁移，不把它们误作普通旧路由。
+- [x] Web 人工写只调用既有应用服务；普通平台 COMMIT 只展示事实，不提供按钮或 Route，
+  也不提供 `SYSTEM_EMERGENCY` 手工旁路。
+- [x] 项目级文档已冻结未来 Agent Gateway 唯一通道；13.5-7 不实现 Agent，不允许未来
+  通过 Web、CLI、数据库、Queue 或平台直连重复开发。
