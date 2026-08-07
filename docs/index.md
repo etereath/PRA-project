@@ -6,8 +6,10 @@
 
 项目长期控制面固定为：人工运营走 Web，定时业务走 Automation，未来智能调用走 Agent
 Gateway，平台执行走 Queue/Worker/Importer，开发测试与恢复走 CLI。Agent 只能通过
-Query/Task Adapter 复用权威 Query/Application Service；禁止抓取 Web、调用 CLI、直读
-SQLite/Excel、拼 Queue JSON、直连平台或伪造 `SYSTEM_EMERGENCY`。这是根级
+Query Adapter 读取，并通过 Task Adapter 提交结构化 `AgentIntent`；Review、Runtime Task
+和 Outbox/通知只能由既有确定性服务派生。Agent 来源的真实平台写任务必须先经人工复核，
+且当前不批准 proposal 表或实际 Agent 实现。禁止抓取 Web、调用 CLI、直读 SQLite/Excel、
+拼 Queue JSON、直连平台或伪造 `SYSTEM_EMERGENCY`。这是根级
 `AGENTS.md` 的强制约束，不因具体任务文档是否被阅读而失效。
 
 ## 当前状态与入口
@@ -68,8 +70,8 @@ SQLite/Excel、拼 Queue JSON、直连平台或伪造 `SYSTEM_EMERGENCY`。这�
 - [business_decision_spec.md](business_decision_spec.md)：鲜切花预测性销售业务决策规则。
 - [project_overview.md](project_overview.md)：项目背景和早期架构说明。当前真实进度以 `project_current_status.md` 为准。
 - [ai_agent_integration_spec.md](ai_agent_integration_spec.md)：未来 Agent Gateway 的唯一
-  Query/Task Adapter 通道、来源身份、审批与审计边界；当前不接 AI Agent，也不批准
-  早期候选表或平行 Service。
+  Query/Task Adapter 通道、`AgentIntent` 逻辑载荷、真实平台写任务人工复核、来源身份与
+  审计边界；当前不接 AI Agent，也不批准早期候选表、平行 Service 或自主平台写权限。
 
 ## 运行态与 SQLite
 

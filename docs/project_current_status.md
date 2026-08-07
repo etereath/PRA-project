@@ -319,12 +319,15 @@ v14 Runtime DB 中通过，平台写操作为 0。批次 `PARTIAL` 仅源于验�
 
 项目级控制面已经同时冻结：人工运营走 Web，定时业务走 Automation，未来智能调用走
 Agent Gateway，平台执行走 Queue/Worker/Importer，开发测试与恢复走 CLI。未来 Agent
-读取只能经 Agent Query Adapter 调用权威 Query Service/Read Model；任务意图只能经
-Agent Task Adapter 调用 Task Application Service，再进入必要的 Review/授权和现有
-Runtime Task 执行链。禁止 Agent 抓取 Web、调用 CLI、直读 SQLite/Excel、拼 Queue JSON、
-直连平台 Adapter 或伪造 `SYSTEM_EMERGENCY`。正式 Agent 来源预留为 `AGENT +
+读取只能经 Agent Query Adapter 调用权威 Query Service/Read Model；唯一写入口是 Agent
+Task Adapter 接收结构化 `AgentIntent`，再由既有权威服务和确定性规则决定拒绝、Review、
+Runtime Task 或 Outbox/通知。Agent 不能直接写 Review/通知，不能抓取 Web、调用 CLI、
+直读 SQLite/Excel、拼 Queue JSON、直连平台 Adapter 或伪造 `SYSTEM_EMERGENCY`。
+`AgentIntent` / `AgentProposal` 只是逻辑载荷，不批准为 Runtime 表；Agent 来源的改价、
+上架、下架必须先经人工 Review 和显式授权。正式 Agent 来源预留为 `AGENT +
 agent-run:<stable-run-id>`；当前 Schema 尚未支持，本阶段只冻结合同，不提前实现，也不
-冒充 `MANUAL` 或 `AUTOMATION`。
+冒充 `MANUAL` 或 `AUTOMATION`。任何实际接入属于未来独立 R4，不在 13.5-7B～7F 或
+任务 14 内实施。
 
 ### 2.8 自动规则评估框架 MVP
 
@@ -713,8 +716,8 @@ Code Review 后的高中低风险问题已完成修复，系统冒烟测试、�
 6. 继续运行系统冒烟、完整单元测试和 ShadowBot 成功基线测试，任务13.5不得重写已验证 COMMIT 动作链路。
 7. 基于自动规则评估框架继续完善上下架、冷库、包装产能等 evaluator，但保持 dry-run/apply 和 service 边界。
 8. AI Agent 自动决策应放在真实平台执行和运维边界通过更长期审查后再推进；接入时只能
-   使用项目级已冻结的 Agent Query/Task Adapter → 权威 Query/Application Service 通道，
-   并为 `AGENT` 来源执行独立评审和必要的最小 Schema 迁移。
+   使用项目级已冻结的 Agent Query Adapter 和 `AgentIntent` 唯一写通道，并为身份、
+   来源、审批、持久化需求和任何真实平台写权限执行独立 R4；任务 14 不承担该实现。
 9. 13.5-0 已建立独立分支、黄金基线、脚本/路由盘点、禁止重写点、Web 独立审计、
    验收清单和 main 回滚点；13.5-1、13.5-2 已分别通过 PR #22、#23 合并，后续编码仍按
    [任务12—13复用路径与失败复盘](shadowbot_task12_task13_reusable_lessons.md)

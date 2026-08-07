@@ -179,8 +179,10 @@ Web 请求线程不得承担长期调度、循环扫描或 ShadowBot Worker 生�
 项目长期调用关系固定为：人工运营走 Web，定时业务走 Automation，未来智能调用走
 Agent Gateway，平台执行走 Queue/Worker/Importer，开发测试与恢复走 CLI。Agent 不得
 抓取 Web、调用 CLI、直读 Runtime DB/Excel、拼 Queue JSON 或直连平台 Adapter；读取必须
-经 Agent Query Adapter 调用权威 Query Service/Read Model，任务必须经 Agent Task Adapter
-调用 Task Application Service，并继续接受既有 Review、授权和执行链。
+经 Agent Query Adapter 调用权威 Query Service/Read Model，写入只能经 Agent Task Adapter
+提交结构化 `AgentIntent`。既有权威 Application/Domain Service 与确定性规则决定拒绝、
+Review、Runtime Task 和 Outbox/通知；Agent 不得直接写 Review 或通知。这里的“Task
+Application Service”只是现有服务的逻辑统称，不授权新增万能服务。
 
 ## 5. 自动扫描与日结流程
 
@@ -446,6 +448,12 @@ supporting_observation_ids
 把 Agent 冒充为 `MANUAL` 或 `AUTOMATION`。由 Automation 触发时另保留父
 `automation-run:<run_id>` 关联，但 Agent 业务来源不变。
 
+`AgentIntent` / `AgentProposal` 只是在 Agent Adapter 边界传递的逻辑载荷，不是当前批准
+的 Runtime 表。Agent 来源的 `UPDATE_PRICE`、`SET_ONLINE`、`SET_OFFLINE` 必须先经人工
+Review 和显式授权，不得直接进入可执行 `PENDING`；只有对真实平台零副作用的任务才可
+讨论低风险直入。未形成 Task 或 Review 的建议直接返回，长期 proposal 持久化与任何自主
+真实平台写权限都必须在未来独立 R4 中重新评审。
+
 Issue #20 中的细分来源名称是运营语义，不扩张为第二套数据库枚举，固定映射为：
 
 | 运营语义 | 核心来源 |
@@ -480,6 +488,9 @@ Issue #20 中的细分来源名称是运营语义，不扩张为第二套数据�
   proposal、Review 或候选任务。
 - Web、CLI、Automation 和未来 Agent Gateway 必须调用同一权威 application service；
   Web/Agent 不得通过 subprocess、自定义队列 JSON 或备用 gate 绕过服务层。
+- Agent 只提交 `AgentIntent`，不得直接创建 Review 或通知；确定性业务服务根据结果复用
+  现有 Review、Runtime Task、Outbox 和通知链。Agent 审计优先复用现有来源、操作者、
+  metadata/event payload，不预先要求每张表增加专属字段。
 - `SYSTEM_EMERGENCY` 只能由 13.5-6 专用授权服务创建；Web、CLI、Automation 普通 Handler
   和未来 Agent 均不得伪造该来源。
 
@@ -853,8 +864,9 @@ Web 主控端以运营人员的工作问题组织页面：
   只展示事实，不在 Web 提供 COMMIT 按钮或 Route。
 - 在既有 Automation 框架增加“Review 超时”和“每日自动任务生成”两个薄 Handler，不
   新建 Scheduler 或任务系统。
-- 在根级规则中预留唯一 Agent Gateway 通道；13.5-7 不实现 Agent、不扩 Schema，后续不得
-  另建直连 Web、CLI、数据库、Queue 或平台的 Agent 路径。
+- 在根级规则中预留唯一 Agent Gateway 通道；13.5-7 不实现 Agent、不扩 Schema、不批准
+  proposal 表或自主平台写权限，后续不得另建直连 Web、CLI、数据库、Queue 或平台的
+  Agent 路径。任何实际 Agent 接入均为未来独立 R4，不属于 7B～7F 或任务 14。
 - 完成新应用骨架、只读运营页面、人工流程、切换、旧 Web 删除和桌面/手机验收。
 - 7B—7F 至少拆为“骨架与只读 / 人工写与 CLI 迁移 / 切换删除 / 最终验收”四个顺序
   小 PR；后一项只在前一项通过评审后开始。

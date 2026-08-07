@@ -35,18 +35,27 @@ RECONCILE、唯一 `FINAL` 和任务 14 边界继续保持不变。
 
 ```text
 Agent 读取：Agent Query Adapter → 权威 Query Service / Read Model
-Agent 发起：Agent Task Adapter → Task Application Service → 必要的 Review / 授权
+Agent 发起：Agent Task Adapter → 结构化 AgentIntent → 既有权威服务与确定性规则
+服务决定：拒绝 / Review / Runtime Task / Outbox
 执行链路：有效 Runtime Task → 既有 v4/v5 Queue → Worker → Importer
 ```
 
 - Agent 不抓取 Web HTML，不直接读取 SQLite、Excel 或本地文件作为经营事实；
 - Agent 不调用 CLI、平台 Adapter、ShadowBot，不直接拼 Queue JSON 或发起 COMMIT；
-- Agent 只能向任务中心提交候选任务或需要复核的正式任务，不能绕过审批策略；
+- Agent 只有 `AgentIntent` 一个写入口，不能直接写 Review、通知或 Runtime Task；
+- `AgentIntent` / `AgentProposal` 只是逻辑载荷，不是本任务批准的数据库表；未形成 Task
+  或 Review 的建议直接返回，不为 proposal 概念预建持久化；
+- Agent 来源的 `UPDATE_PRICE`、`SET_ONLINE`、`SET_OFFLINE` 必须先经人工 Review 和
+  显式授权，不得直接成为可执行 `PENDING`；
 - Agent 永远不能伪造 `SYSTEM_EMERGENCY`，该来源只属于 13.5-6 既有专用授权服务；
 - 未来正式来源应使用 `origin_type=AGENT` 与
   `origin_ref_id=agent-run:<stable-run-id>`，并记录版本化审批策略；
 - 当前 Schema 尚不支持 `AGENT`。13.5-7 不得把 Agent 冒充为 `MANUAL` 或
   `AUTOMATION`；未来接入必须用独立评审和必要的最小 Schema 迁移完成。
+
+这里的“Task Application Service”只是现有 `RuntimeTaskService`、任务生成、规则校验及
+其他权威 Application/Domain Service 的逻辑统称，不授权新增万能服务。任何实际 Agent
+接入都是未来独立 R4，不属于 13.5-7B～7F，也不属于任务 14。
 
 该约束同时写入根级 `AGENTS.md`、项目总实施计划、项目当前状态和文档索引，后续开发
 不得另建 Agent 直连数据库、Web、CLI、队列或平台的平行路径。
@@ -107,8 +116,9 @@ Automation Service 继续负责：
 
 Agent Gateway 只负责把未来 Agent 的结构化查询和任务意图适配到权威 Query/Application
 Service。它与 Web、Automation 共享领域服务，但不共享 Web Session，不复用 Mobile
-Review Token，也不形成第二套任务状态机、授权服务或执行队列。当前阶段只冻结边界，
-不实现该模块。
+Review Token，也不形成第二套任务状态机、授权服务或执行队列。Agent 只提交
+`AgentIntent`；Review、Runtime Task 和 Outbox/通知由既有确定性服务派生。当前阶段只
+冻结边界，不实现该模块。
 
 ### 3.5 系统维护和开发控制面：CLI
 
@@ -387,8 +397,8 @@ checkpoint/pre-task13-5-7-web-rewrite-20260807
 ### 9.1 任务来源最小参数化
 
 现有 `task_generation.py` 多个创建分支把来源固定为 `AUTOMATION`，构造入口只接收
-`origin_ref_id`。13.5-7D 只在既有 Task Application Service 上补充最小来源参数，不
-复制任务生成器：
+`origin_ref_id`。13.5-7D 只在承担相关职责的既有权威服务上补充最小来源参数，不复制
+任务生成器，也不新增名为 `TaskApplicationService` 的万能服务：
 
 | 调用来源 | `origin_type` | `origin_ref_id` |
 | --- | --- | --- |
@@ -399,6 +409,7 @@ checkpoint/pre-task13-5-7-web-rewrite-20260807
 
 `SYSTEM_EMERGENCY` 继续只能由 13.5-6 专用授权服务创建；Web、Automation 普通 Handler、
 CLI 和未来 Agent 均不能传入该来源。不得为来源对齐新增表、状态或通用万能 Service。
+未来 Agent 的真实平台写任务仍必须先经人工 Review；本来源预留不构成 Agent 实现授权。
 
 ## 10. 实施工作包
 
@@ -593,5 +604,5 @@ Incident/RECONCILE 发现，不在本任务重构全部控制面。
 9. 文档、通知链接、运行手册和测试已切换到新 Web；
 10. `/health` 与 Mobile Review 外部协议已按受控顺序切换，无活动通知引用旧端点；
 11. 根级规则、项目总览、文档索引和父 Issue 都冻结 Agent Gateway 唯一通道，且本任务
-    没有实现或伪造 `AGENT` 来源；
+    没有实现或伪造 `AGENT` 来源，没有批准 proposal 表或 Agent 真实平台自主写权限；
 12. 父 Issue 的阶段描述已与本计划同步。

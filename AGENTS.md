@@ -31,7 +31,7 @@
 ### 任务 13.5 计划权威
 
 - [GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20) 合并截至
-  2026-07-29 已采纳评论后的正文，是任务 13.5 的宏观范围、业务语义、阶段划分和
+  2026-08-08 已采纳评论后的正文，是任务 13.5 的宏观范围、业务语义、阶段划分和
   任务 14 边界权威；历史评论仅用于追溯。
 - `docs/plans/task13_5_0_kickoff_baseline.md` 负责 13.5-0 的黄金基线、脚本盘点、
   禁止重写资产、合同草案、子 PR 顺序和开工门禁。
@@ -66,19 +66,31 @@ Agent Gateway，平台执行走 Queue/Worker/Importer，开发测试、诊断和
 
 - 读取经营数据只能走 `Agent Query Adapter → 权威 Query Service / Read Model`；不得抓取
   Web HTML，不得直接读取 SQLite、Excel、Queue 文件或平台页面作为业务接口。
-- 发布任务只能走 `Agent Task Adapter → Task Application Service → 必要的 Review/授权 →
-  Runtime Task`；执行继续走既有 v4/v5 Queue、Worker 和 Importer。
-- Agent 可以提交候选任务或需要复核的正式任务，但不得直接调用 CLI、Web Route、平台
-  Adapter、ShadowBot 或 COMMIT，不得拼 Queue JSON，不得绕过任务中心和审批策略。
+- Agent 唯一写入口是 `Agent Task Adapter`，且只接收结构化 `AgentIntent`。这里的
+  “Task Application Service”只是既有 `RuntimeTaskService`、任务生成、规则校验及其他权威
+  Application/Domain Service 的逻辑统称，不授权新增万能服务或平行控制面。
+- 既有确定性服务负责决定 `AgentIntent` 被拒绝、形成 Review、生成 Runtime Task 或产生
+  Outbox/通知；Agent 不得直接调用 Review 或 Notification 写服务，也不得直接调用 CLI、
+  Web Route、平台 Adapter、ShadowBot 或 COMMIT，不得拼 Queue JSON。
+- `AgentIntent` / `AgentProposal` 只是 Adapter 边界的逻辑载荷，不是已批准的 Runtime 表。
+  未形成 Task 或 Review 的建议直接返回；若未来需要长期保存未物化建议，必须另开 R4，
+  依据真实需求评审最小 Schema。
+- 任何 Agent 来源的 `UPDATE_PRICE`、`SET_ONLINE`、`SET_OFFLINE` 都不得直接进入可执行
+  `PENDING`，必须先有人工 Review 和显式授权。“低风险直接 PENDING”只适用于对真实平台
+  零副作用的任务；未来 Agent 自主改价等能力必须另开 R4 并补齐版本化授权策略和 v4/v5
+  来源门禁。
 - Agent 永远不得伪造 `SYSTEM_EMERGENCY`；该来源只能由 13.5-6 的专用授权服务创建。
 - 未来正式身份预留为 `origin_type=AGENT`、
   `origin_ref_id=agent-run:<stable-run-id>` 和版本化审批策略。当前 Schema 尚未支持
   `AGENT`，在独立评审和最小迁移完成前，不得冒充 `MANUAL` 或 `AUTOMATION` 落库。
 - 若 Agent 由 Automation 触发，必须同时保留父 `automation-run:<run_id>` 关联，但业务
   来源仍为 `AGENT`，不能因此改写为普通自动任务。
+- Agent 审计优先复用 `origin_type/origin_ref_id`、`changed_by`、`resolved_by`、结构化
+  metadata/event payload 和现有审计链；不得预先要求每张表新增 Agent 专属字段。
 
 任务 13.5-7 只冻结上述合同，不实现 Agent，也不新增 Agent Schema、状态、队列或平台动作。
-任何后续 Agent 功能必须先复用本边界；不得再次开发直连 Web、CLI、数据库、Queue 或平台
+任何实际 Agent 接入均是未来独立 R4，不属于 13.5-7B～7F，也不属于只负责综合验收的
+任务 14。后续功能必须先复用本边界；不得再次开发直连 Web、CLI、数据库、Queue 或平台
 执行器的替代通道。
 
 最终希望实现：
