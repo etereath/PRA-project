@@ -81,7 +81,9 @@
 
 ## Web 后台
 
-- [plans/task13_5_web_rewrite_plan.md](plans/task13_5_web_rewrite_plan.md)：在 Issue #20 八个一级入口下，基于独立浏览器审计形成的 Web 实施计划，包含页面方案、`app/webapp/` 拆分、性能门禁和验收标准。
+- [plans/task13_5_web_rewrite_plan.md](plans/task13_5_web_rewrite_plan.md)：2026-08-07
+  重新冻结的 13.5-7 实施权威；直接替代旧 Web，不保留兼容层，并将 CLI 残留正式业务
+  迁移到 Web、Automation 和 Queue，同时保留测试、验收、诊断和恢复 CLI。
 - [web_frontend_refresh_plan.md](web_frontend_refresh_plan.md)：Web 运行态运营后台刷新计划和当前进度。
 - [web_localization_display_spec.md](web_localization_display_spec.md)：Web 与飞书通知的运营中文展示术语表。
 - [product_inventory_input_spec.md](product_inventory_input_spec.md)：商品资料与库存补充录入规则，说明 `products.xlsx` 兼容、公共库存、SKU 生成、新增品种弹窗和旧 `/tables` 入口边界。
@@ -156,8 +158,12 @@ Code Review 后高中低风险问题已完成修复，系统冒烟测试、全�
 
 1. 任务12审查修复已通过 PR #18 合并；其 v4 改价链路继续作为任务13和后续任务的稳定基线。
 2. 任务13计划中的实现、受控实机验收、最终本地回归、PR #19 审查修复和双平台 CI 均已覆盖；后续合并与任务状态由审查方处理。
-3. 以 [GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20) 合并后的正文为宏观权威，先评审[13.5-0开工基线](plans/task13_5_0_kickoff_baseline.md)和[本地实施计划](plans/task13_5_operational_closed_loop_and_web_rewrite.md)；六级质量矩阵与日结状态机冻结后才提交v14。
-4. 任务13.5完成双时间轴、自动化服务、商品/订单观察、销售日结、S0–S4、紧急保护、控制服务和Web产品化后，任务14只进行多品种/多动作/异常恢复、正式授权和观察版本冻结的综合验收。
+3. 以 [GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20) 的业务语义和
+   八个一级入口为宏观权威，按[13.5-7 Web 替代重写计划](plans/task13_5_web_rewrite_plan.md)
+   直接建设唯一运营 Web；恢复点为
+   `checkpoint/pre-task13-5-7-web-rewrite-20260807`。
+4. 任务13.5完成双时间轴、自动化服务、商品/订单观察、销售日结、S0–S4、紧急保护和
+   Web产品化后，任务14只进行多品种/多动作/异常恢复、正式授权和观察版本冻结的综合验收。
 5. 为元素版本漂移和白屏建立可重复的专用测试夹具；登录、网络和证据上传失败的实机故障注入已经完成。
 6. 持续运行系统冒烟和 ShadowBot 成功基线测试，避免任务13.5或后续任务重写已验证 COMMIT 链路。
 7. 13.5-0 的黄金基线卡、脚本盘点、禁止重写清单和Web审计已形成；进入ShadowBot工作前仍须收敛生命周期记录与心跳不一致并完成部署hash对齐。普通写动作保持明确任务与授权，唯一自动写特例是在13.5-6完成正式策略后的版本化 `SYSTEM_EMERGENCY` 紧急下架。

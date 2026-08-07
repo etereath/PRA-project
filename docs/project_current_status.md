@@ -302,7 +302,7 @@ v14 Runtime DB 中通过，平台写操作为 0。批次 `PARTIAL` 仅源于验�
 
 ### 2.7 Web 运行态运营后台
 
-当前 Web 后台已从早期 Excel 原型页升级为运行态运营后台，包含：
+当前 Web 后台是尚未正式投入使用的运行态 MVP，包含：
 
 - `Dashboard`：运营总览。
 - `Tasks`：运行态任务追踪。
@@ -311,6 +311,11 @@ v14 Runtime DB 中通过，平台写操作为 0。批次 `PARTIAL` 仅源于验�
 - `Execution Logs`：执行日志入口。
 - `Business Inputs`：Excel 业务输入入口。
 - `System`：配置检查、schema 检查、运行态计数、飞书测试通知。
+
+2026-08-07 已决定不再兼容或渐进维护该页面架构。重写前 `main` 已标记为
+`checkpoint/pre-task13-5-7-web-rewrite-20260807`；13.5-7 将建设唯一的新运营 Web，
+并把 CLI 中残留的日常正式业务职责迁移到 Web、Automation 和 Queue。开发测试、Mock、
+验收、诊断、备份和恢复 CLI 继续保留。
 
 ### 2.8 自动规则评估框架 MVP
 

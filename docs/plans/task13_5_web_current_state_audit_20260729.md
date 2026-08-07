@@ -104,10 +104,9 @@ Runtime DB 同一快照中的相关计数为：`tasks=146`、`review_tasks=53`�
    只读补跑入口；自动规则 apply 仍依赖 CLI。
 5. 业务资料 URL 和页面中出现本地路径；重写后 URL 只能携带业务筛选和稳定记录 ID。
 6. `Review` 与 `Incident` 必须在“待处理”中协作展示，但不能合并为一个状态机。
-7. 服务端渲染继续保留；13.5-8 将 `app/web.py` 渐进拆分到
-   `app/webapp/application.py`、`auth.py`、`csrf.py`、`routes/`、`presenters/`、
-   `templates/` 和 `static/`，业务服务继续留在 `app/services/`。
-8. 13.5-9 再切换八个一级入口和运营 UI；在相应后端合同落地前，页面不得用假数据
+7. 本文仍是 2026-07-29 的现状证据，不再决定迁移方式。2026-08-07 已改为新建
+   `app/operations_web/` 并直接替代旧 Web，不保留渐进兼容层。
+8. 八个一级入口和运营 UI 直接纳入 13.5-7；在相应后端合同落地前，页面不得用假数据
    占位并冒充真实经营事实。
 
 ## 5. Web 开工门禁
@@ -115,8 +114,9 @@ Runtime DB 同一快照中的相关计数为：`tasks=146`、`review_tasks=53`�
 - [x] 已记录精确审计时间、main SHA、Runtime DB 脱敏快照、浏览器、视口和测试角色。
 - [x] 已记录现行路由、桌面/移动端规模和 DOM 摘要 hash。
 - [x] 已区分数据库顶层执行日志与页面递归后代行，避免错误数据口径。
-- [ ] 13.5-8 开始前冻结旧路由兼容测试、登录/Session/CSRF 行为快照和 wheel 资源清单。
-- [ ] 13.5-9 开始前具备双时间轴、自动化、观察事实、销售质量和 Incident 的正式
-  Presenter 输入合同。
+- [x] 当前 `main` 已建立
+  `checkpoint/pre-task13-5-7-web-rewrite-20260807`，不再冻结旧路由兼容合同。
+- [ ] 13.5-7 编码前冻结登录/Session/CSRF 安全属性、wheel 资源清单和正式 Presenter
+  输入；不要求旧 HTML 或路由行为一致。
 - [ ] Web 写操作继续只调用应用服务；不得直接写 SQL、拼 ShadowBot 队列或提供
   `SYSTEM_EMERGENCY` 手工旁路。

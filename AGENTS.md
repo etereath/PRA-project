@@ -36,12 +36,19 @@
 - `docs/plans/task13_5_0_kickoff_baseline.md` 负责 13.5-0 的黄金基线、脚本盘点、
   禁止重写资产、合同草案、子 PR 顺序和开工门禁。
 - `docs/plans/task13_5_operational_closed_loop_and_web_rewrite.md` 负责本仓库的模块、数据库、迁移和测试细节。
-- `docs/plans/task13_5_web_rewrite_plan.md` 负责基于内置浏览器实测的 Web 页面、路由、性能和可用性细节。
+- `docs/plans/task13_5_web_rewrite_plan.md` 负责 2026-08-07 重新冻结的 13.5-7
+  运营 Web 替代重写、CLI 残留业务迁移、八个一级入口、性能和可用性细节。当前项目
+  尚未正式投入使用，不保留旧 Web 路由或双 Web；开发测试、Mock、验收、诊断、备份
+  和恢复 CLI 必须继续保留。
 - `docs/plans/task13_5_web_current_state_audit_20260729.md` 是 13.5-0 的独立 Web
   现状证据；其中数量和页面尺寸仅代表带 main/DB/视口标识的审计快照。
 - 本地实现可以细化 Issue #20，但不得改写其双时间轴、扫描父子合同、六级质量矩阵、
   唯一 `FINAL` 日结终态、S0–S4、`SYSTEM_EMERGENCY`、八个 Web 一级入口和任务
   14 边界。
+- 13.5-7 的当前恢复点为 Git Tag
+  `checkpoint/pre-task13-5-7-web-rewrite-20260807`。新 Web 直接替代当前
+  `app/web.py` 页面架构；后台只复用既有领域 Service，不得恢复“先统一所有 CLI、
+  脚本和 Automation 入口再开始 Web”的扩大化前置门禁。
 - S4 不在 13.5-1 或核心 v14 中冻结最终策略，但不得移出任务 13.5：必须在
   13.5-6 先完成 Incident 人工闭环，再依据真实数据冻结策略、迁移正式结构并实现
   受控自动紧急下架。
