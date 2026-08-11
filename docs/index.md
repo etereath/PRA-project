@@ -37,6 +37,11 @@ Query Adapter 读取，并通过 Task Adapter 提交结构化 `AgentIntent`；Re
 - [reports/task13_5_4_order_observation.md](reports/task13_5_4_order_observation.md)：任务13.5-4 实施、测试、迁移纠正和实机验收报告。
 - [plans/task13_5_operational_closed_loop_and_web_rewrite.md](plans/task13_5_operational_closed_loop_and_web_rewrite.md)：任务13.5双时间轴、自动扫描、历史订单观察、销售日结、S0–S4、受控紧急保护、任务来源对齐和Web主控重写实施计划。
 - [plans/task13_5_web_current_state_audit_20260729.md](plans/task13_5_web_current_state_audit_20260729.md)：带精确时间、main SHA、Runtime DB脱敏快照、浏览器/视口/角色、路由、页面规模和DOM hash的独立Web现状审计。
+- [plans/task13_5_7_web_rewrite_construction_plan.md](plans/task13_5_7_web_rewrite_construction_plan.md)：13.5-7 实际业务重基线施工顺序；冻结 7B～7F 的四入口、真实库存、人工任务与执行授权、Automation 配置、安全、CLI 迁移、切换和验收门禁。
+- [prototypes/task13_5_7_operations_web_sample.html](prototypes/task13_5_7_operations_web_sample.html)：四入口“今日”静态样板，展示销售、数据库真实库存、待办、时间轴和业务健康摘要。
+- [prototypes/task13_5_7_database_sample.html](prototypes/task13_5_7_database_sample.html)：只读数据库与销售分析静态样板。
+- [prototypes/task13_5_7_business_management_sample.html](prototypes/task13_5_7_business_management_sample.html)：任务创建/授权、人工复核、固定 Automation 方案和真实库存业务静态样板。
+- [prototypes/task13_5_7_system_sample.html](prototypes/task13_5_7_system_sample.html)：组件当前状态、通知、数据维护和权限边界静态样板。
 - [reports/task12_review_remediation_20260723.md](reports/task12_review_remediation_20260723.md)：针对任务12审查问题的接续修复记录；以该文档说明 v12 合同、原子导入和待补实机证据，不覆盖原交接报告。
 - [evidence/task12/index.md](evidence/task12/index.md)：任务12正常 COMMIT 与 UNKNOWN→RECONCILE 的 PR 内脱敏原始证据及自动复算入口。
 - [evidence/task13/index.md](evidence/task13/index.md)：任务13 独立 SYNC_STATUS、单/多商品上下架、批次预检零写、严格串行 UNKNOWN 和唯一 RECONCILE 的脱敏证据及 CI 复算入口。
@@ -91,10 +96,10 @@ Query Adapter 读取，并通过 Task Adapter 提交结构化 `AgentIntent`；Re
 
 ## Web 后台
 
-- [plans/task13_5_web_rewrite_plan.md](plans/task13_5_web_rewrite_plan.md)：2026-08-07
-  重新冻结的 13.5-7 实施权威；直接替代旧 Web，不保留兼容层，并将 CLI 残留正式业务
-  迁移到 Web、Automation 和 Queue，同时保留测试、验收、诊断和恢复 CLI；并按 R4
-  冻结安全、外部协议、来源、复用矩阵及项目级 Agent Gateway 预留。
+- [plans/task13_5_web_rewrite_plan.md](plans/task13_5_web_rewrite_plan.md)：2026-08-12
+  依据实际运营路径重基线的 13.5-7 产品权威；直接替代旧 Web，不保留兼容层，以“今日、
+  数据库、业务管理、系统”四入口组织真实库存、人工任务/执行授权、Automation 和系统维护，
+  同时保留测试、验收、诊断和恢复 CLI 以及未来 Agent Gateway 唯一通道。
 - [web_frontend_refresh_plan.md](web_frontend_refresh_plan.md)：Web 运行态运营后台刷新计划和当前进度。
 - [web_localization_display_spec.md](web_localization_display_spec.md)：Web 与飞书通知的运营中文展示术语表。
 - [product_inventory_input_spec.md](product_inventory_input_spec.md)：商品资料与库存补充录入规则，说明 `products.xlsx` 兼容、公共库存、SKU 生成、新增品种弹窗和旧 `/tables` 入口边界。
@@ -170,7 +175,7 @@ Code Review 后高中低风险问题已完成修复，系统冒烟测试、全�
 1. 任务12审查修复已通过 PR #18 合并；其 v4 改价链路继续作为任务13和后续任务的稳定基线。
 2. 任务13计划中的实现、受控实机验收、最终本地回归、PR #19 审查修复和双平台 CI 均已覆盖；后续合并与任务状态由审查方处理。
 3. 以 [GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20) 的业务语义和
-   八个一级入口为宏观权威，按[13.5-7 Web 替代重写计划](plans/task13_5_web_rewrite_plan.md)
+   四个一级入口为宏观权威，按[13.5-7 Web 实际业务重基线计划](plans/task13_5_web_rewrite_plan.md)
    直接建设唯一运营 Web；恢复点为
    `checkpoint/pre-task13-5-7-web-rewrite-20260807`。
 4. 任务13.5完成双时间轴、自动化服务、商品/订单观察、销售日结、S0–S4、紧急保护和

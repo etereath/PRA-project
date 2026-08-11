@@ -36,15 +36,20 @@
 - `docs/plans/task13_5_0_kickoff_baseline.md` 负责 13.5-0 的黄金基线、脚本盘点、
   禁止重写资产、合同草案、子 PR 顺序和开工门禁。
 - `docs/plans/task13_5_operational_closed_loop_and_web_rewrite.md` 负责本仓库的模块、数据库、迁移和测试细节。
-- `docs/plans/task13_5_web_rewrite_plan.md` 负责 2026-08-07 重新冻结的 13.5-7
-  运营 Web 替代重写、CLI 残留业务迁移、八个一级入口、性能和可用性细节。当前项目
+- `docs/plans/task13_5_web_rewrite_plan.md` 负责 2026-08-12 依据实际运营路径重新冻结的
+  13.5-7 运营 Web 替代重写、CLI 残留业务迁移、四个一级入口、性能和可用性细节。当前项目
   尚未正式投入使用，不保留旧 Web 路由或双 Web；开发测试、Mock、验收、诊断、备份
   和恢复 CLI 必须继续保留。
 - `docs/plans/task13_5_web_current_state_audit_20260729.md` 是 13.5-0 的独立 Web
   现状证据；其中数量和页面尺寸仅代表带 main/DB/视口标识的审计快照。
 - 本地实现可以细化 Issue #20，但不得改写其双时间轴、扫描父子合同、六级质量矩阵、
-  唯一 `FINAL` 日结终态、S0–S4、`SYSTEM_EMERGENCY`、八个 Web 一级入口和任务
-  14 边界。
+  唯一 `FINAL` 日结终态、S0–S4、`SYSTEM_EMERGENCY` 和任务 14 边界。Web 信息架构以
+  用户确认的实际运营路径为准，当前固定为“今日、数据库、业务管理、系统”四个一级
+  入口；Issue #20 和历史计划中的八入口文字必须随本轮重基线同步，不得反向约束新 Web。
+- Web 计划的权威顺序固定为：用户确认的实际运营流程 → 当前四入口样板及业务合同 →
+  已验证的领域、安全和执行门禁 → 当前施工计划 → 旧 Web 与历史页面清单。旧计划中
+  仅为兼容旧 Web、重复展示同一事实或缺少实际使用场景的页面必须删除，不得因历史
+  文档存在而继续承担开发和维护成本。
 - 13.5-7 的当前恢复点为 Git Tag
   `checkpoint/pre-task13-5-7-web-rewrite-20260807`。新 Web 直接替代当前
   `app/web.py` 页面架构；后台只复用既有领域 Service，不得恢复“先统一所有 CLI、
@@ -85,6 +90,9 @@ Agent Gateway，平台执行走 Queue/Worker/Importer，开发测试、诊断和
   `AGENT`，在独立评审和最小迁移完成前，不得冒充 `MANUAL` 或 `AUTOMATION` 落库。
 - 若 Agent 由 Automation 触发，必须同时保留父 `automation-run:<run_id>` 关联，但业务
   来源仍为 `AGENT`，不能因此改写为普通自动任务。
+- 买家页面可见的“第 N 次购买”、每日人工花材质量评价、买家客户端实时售价和外部市场
+  指数均只作为未来 Agent 销售分析的数据来源规划。13.5-7 不补采、不推断、不扩 Schema，
+  当前 Web 不展示虚构值；Agent 阶段必须先完成各自合同、最小迁移和真实来源验收。
 - Agent 审计优先复用 `origin_type/origin_ref_id`、`changed_by`、`resolved_by`、结构化
   metadata/event payload 和现有审计链；不得预先要求每张表新增 Agent 专属字段。
 

@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>PRA 数据库 · 静态视觉样板</title>
+  <link rel="stylesheet" href="task13_5_7_hub_sample.css?v=database8">
+</head>
+<body data-default-section="business-data">
+  <!-- Static prototype only. No database, API, queue, automation, or platform integration. -->
+  <aside class="sidebar" aria-label="主导航">
+    <a class="brand" href="task13_5_7_operations_web_sample.html">
+      <span class="brand-mark">PRA</span>
+      <span class="brand-copy"><strong>销售运营工作台</strong><small>静态入口样板</small></span>
+    </a>
+    <nav class="nav">
+      <span class="nav-label">主要入口</span>
+      <a class="nav-item" href="task13_5_7_operations_web_sample.html"><span class="nav-symbol">今</span><span>今日运营</span></a>
+      <a class="nav-item active" href="task13_5_7_database_sample.html" aria-current="page"><span class="nav-symbol">库</span><span>数据库</span></a>
+      <a class="nav-item" href="task13_5_7_business_management_sample.html"><span class="nav-symbol">管</span><span>业务管理</span></a>
+      <a class="nav-item" href="task13_5_7_system_sample.html"><span class="nav-symbol">系</span><span>系统</span></a>
+      <span class="nav-label">数据库分区</span>
+      <a class="nav-item" href="#business-data" data-section-link="business-data"><span class="nav-symbol">销</span><span>业务数据</span></a>
+      <a class="nav-item" href="#system-data" data-section-link="system-data"><span class="nav-symbol">运</span><span>项目运行数据</span></a>
+      <a class="nav-item" href="#sales-analysis" data-section-link="sales-analysis"><span class="nav-symbol">析</span><span>销售分析</span></a>
+    </nav>
+    <div class="sidebar-note">数据库入口保持只读，不提供直接改表、删除记录或执行 SQL 的功能。</div>
+  </aside>
+
+  <div class="shell">
+    <header class="topbar database-topbar">
+      <div class="breadcrumb"><span>运营中心</span><span>/</span><strong>数据库</strong></div>
+      <div class="topbar-facts" aria-label="当前数据状态">
+        <span class="topbar-fact"><small>当前交易日</small><strong>2026-08-08 · 开放中</strong></span>
+        <span class="topbar-fact"><small>数据质量</small><strong>开放快照 · 正常</strong></span>
+      </div>
+      <div class="top-actions">
+        <span class="readonly-badge">只读数据中心</span>
+        <button class="icon-button" type="button" aria-label="消息展示">●</button>
+        <span class="avatar">DEMO</span>
+      </div>
+    </header>
+
+    <main class="main">
+      <div class="prototype-banner" role="note">
+        <span><strong>静态 HTML 样板</strong>　所有记录均为示例；页面不连接 Runtime DB、工作簿或任何真实数据源。</span>
+        <span class="prototype-tag">仅供入口评审</span>
+      </div>
+
+      <section class="page-heading" aria-labelledby="page-title">
+        <div>
+          <span class="eyebrow">只读数据中心</span>
+          <h1 id="page-title">数据库</h1>
+          <p>统一查看鲜花销售、商品库存等业务数据，以及任务、复核、自动化、异常和执行记录等项目运行数据。</p>
+        </div>
+      </section>
+
+      <nav class="hub-tabs" aria-label="数据库视图">
+        <a class="hub-tab active" href="#business-data" data-section-link="business-data">业务数据</a>
+        <a class="hub-tab" href="#system-data" data-section-link="system-data">项目运行数据</a>
+        <a class="hub-tab" href="#sales-analysis" data-section-link="sales-analysis">销售分析</a>
+        <a class="hub-tab" href="#data-dictionary" data-section-link="data-dictionary">字段说明</a>
+        <a class="hub-tab" href="#quality" data-section-link="quality">质量与新鲜度</a>
+      </nav>
+
+      <section class="panel" id="business-data" aria-labelledby="business-title">
+        <div class="panel-header">
+          <div><h2 id="business-title">业务数据</h2><p>鲜花销售过程中的经营事实与库存事实</p></div>
+          <span class="status info">开放快照</span>
+        </div>
+        <div class="filterbar">
+          <div class="dataset-pager" aria-label="业务数据集分页">
+            <button class="pager-button" type="button" aria-label="上一个业务数据集" data-dataset-prev="business">‹</button>
+            <span class="dataset-page-name" data-dataset-name="business">销售与订单</span>
+            <span class="pager-position" data-dataset-position="business" aria-live="polite">1 / 8</span>
+            <button class="pager-button" type="button" aria-label="下一个业务数据集" data-dataset-next="business">›</button>
+          </div>
+          <select class="select" aria-label="交易日"><option>交易日 2026-08-08</option></select>
+          <input class="search" type="search" value="" placeholder="搜索当前数据集" aria-label="搜索业务数据" data-dataset-search="business">
+          <button class="chip active" type="button" data-dataset-filter="business" data-filter="all">全部</button><button class="chip" type="button" data-dataset-filter="business" data-filter="sales">销售</button><button class="chip" type="button" data-dataset-filter="business" data-filter="inventory">库存</button><button class="chip" type="button" data-dataset-filter="business" data-filter="price">价格</button><button class="chip" type="button" data-dataset-filter="business" data-filter="settlement">结算</button>
+        </div>
+        <div class="dataset-current" aria-live="polite">
+          <div><span>当前数据集</span><strong data-dataset-title="business">销售与订单</strong><small data-dataset-description="business">销量、成交金额、均价与下单时段</small></div>
+          <span class="status success" data-dataset-status="business">可用 · 截至 09:42</span>
+        </div>
+        <div class="data-table-wrap">
+          <table data-dataset-table="business">
+            <thead><tr><th>品种 / 等级</th><th>今日已售</th><th>成交均价</th><th>销售额</th><th>当前库存</th><th>观察时间</th><th>质量</th></tr></thead>
+            <tbody>
+              <tr><td><span class="table-title"><strong>艾莎 · A级</strong><small>示例经营记录</small></span></td><td>38 扎</td><td>¥12.00</td><td>¥456</td><td>72 扎</td><td>09:42</td><td><span class="status success">完整</span></td></tr>
+              <tr><td><span class="table-title"><strong>艾莎 · B级</strong><small>示例经营记录</small></span></td><td>41 扎</td><td>¥9.00</td><td>¥369</td><td>96 扎</td><td>09:42</td><td><span class="status success">完整</span></td></tr>
+              <tr><td><span class="table-title"><strong>卡罗拉 · A级</strong><small>示例经营记录</small></span></td><td>27 扎</td><td>¥10.00</td><td>¥270</td><td>54 扎</td><td>09:42</td><td><span class="status warning">库存偏低</span></td></tr>
+              <tr><td><span class="table-title"><strong>蜜桃雪山 · B级</strong><small>示例经营记录</small></span></td><td>22 扎</td><td>¥7.00</td><td>¥154</td><td>63 扎</td><td>09:42</td><td><span class="status success">完整</span></td></tr>
+              <tr><td><span class="table-title"><strong>其他 · C级</strong><small>示例经营记录</small></span></td><td>14 扎</td><td>¥8.00</td><td>¥112</td><td>33 扎</td><td>09:42</td><td><span class="status warning">库存偏低</span></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel section-gap" id="sales-analysis" aria-labelledby="sales-analysis-title">
+        <div class="panel-header">
+          <div><h2 id="sales-analysis-title">销售分析</h2><p>当前只展示已有确定性统计；未来 Agent 分析继续使用本入口</p></div>
+          <span class="status info">开放快照</span>
+        </div>
+        <div class="summary-grid">
+          <article class="summary-card"><small>当前交易日销量</small><strong>142 扎</strong><span>订单事实 · 截至 09:42</span></article>
+          <article class="summary-card"><small>成交均价</small><strong>¥9.58</strong><span>成交金额 ÷ 已售数量</span></article>
+          <article class="summary-card"><small>销售高峰</small><strong>09:00–12:00</strong><span>当前开放快照</span></article>
+          <article class="summary-card"><small>库存偏低</small><strong>2 个品种</strong><span>使用数据库真实库存判断</span></article>
+        </div>
+        <div class="callout"><strong>未来 Agent 能力边界</strong>预测、趋势解释和经营建议尚未接入；当前页面不展示虚构建议，也不允许从分析结果直接执行平台动作。</div>
+      </section>
+
+      <section class="panel section-gap" id="system-data" aria-labelledby="system-title">
+        <div class="panel-header">
+          <div><h2 id="system-title">项目运行数据</h2><p>项目自身的控制、运行、反馈与审计事实</p></div>
+          <span class="status success">运行正常</span>
+        </div>
+        <div class="filterbar">
+          <div class="dataset-pager" aria-label="项目数据集分页">
+            <button class="pager-button" type="button" aria-label="上一个项目数据集" data-dataset-prev="system">‹</button>
+            <span class="dataset-page-name" data-dataset-name="system">项目运行概览</span>
+            <span class="pager-position" data-dataset-position="system" aria-live="polite">1 / 6</span>
+            <button class="pager-button" type="button" aria-label="下一个项目数据集" data-dataset-next="system">›</button>
+          </div>
+          <button class="chip active" type="button" data-dataset-filter="system" data-filter="all">全部</button><button class="chip" type="button" data-dataset-filter="system" data-filter="task">任务</button><button class="chip" type="button" data-dataset-filter="system" data-filter="review">复核</button><button class="chip" type="button" data-dataset-filter="system" data-filter="automation">自动化</button><button class="chip" type="button" data-dataset-filter="system" data-filter="incident">异常</button><button class="chip" type="button" data-dataset-filter="system" data-filter="execution">执行记录</button>
+        </div>
+        <div class="dataset-current" aria-live="polite">
+          <div><span>当前数据集</span><strong data-dataset-title="system">项目运行概览</strong><small data-dataset-description="system">任务、复核、自动化、异常与执行记录</small></div>
+          <span class="status success" data-dataset-status="system">运行正常</span>
+        </div>
+        <div class="data-table-wrap">
+          <table data-dataset-table="system">
+            <thead><tr><th>数据对象</th><th>类别</th><th>当前状态</th><th>来源</th><th>最近更新</th><th>关联事实</th><th>查看</th></tr></thead>
+            <tbody>
+              <tr><td><span class="table-title"><strong>销售数据例行读取</strong><small>不展示技术 ID</small></span></td><td>自动化运行</td><td><span class="status info">进行中</span></td><td>计划运行</td><td>09:40</td><td>3 个子步骤</td><td><button class="link-button" type="button">打开详情</button></td></tr>
+              <tr><td><span class="table-title"><strong>库存偏低确认</strong><small>卡罗拉 · A级</small></span></td><td>复核</td><td><span class="status warning">等待人工</span></td><td>经营规则</td><td>09:34</td><td>1 项待处理</td><td><button class="link-button" type="button">打开详情</button></td></tr>
+              <tr><td><span class="table-title"><strong>平台商品只读观察</strong><small>示例运行记录</small></span></td><td>执行记录</td><td><span class="status success">已完成</span></td><td>自动化</td><td>09:18</td><td>18 条观察</td><td><button class="link-button" type="button">打开详情</button></td></tr>
+              <tr><td><span class="table-title"><strong>消息发送记录</strong><small>运营摘要</small></span></td><td>通知</td><td><span class="status success">已送达</span></td><td>Outbox</td><td>09:12</td><td>1 条消息</td><td><button class="link-button" type="button">打开详情</button></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="two-column section-gap">
+        <article class="panel" id="data-dictionary">
+          <div class="panel-header"><div><h2>字段说明</h2><p>业务名称优先，技术字段仅用于高级追溯</p></div></div>
+          <div class="ledger-list">
+            <div class="ledger-item"><span class="item-copy"><strong>今日已售数量</strong><small>当前 PRA 交易日内页面展示的订单数量合计。</small></span><span class="status success">业务字段</span></div>
+            <div class="ledger-item"><span class="item-copy"><strong>成交均价</strong><small>成交金额合计 ÷ 已售数量，不代表卖家实收。</small></span><span class="status success">业务字段</span></div>
+            <div class="ledger-item"><span class="item-copy"><strong>当前库存</strong><small>最近一次已接受观察或人工调整后的库存事实。</small></span><span class="status success">业务字段</span></div>
+          </div>
+        </article>
+        <article class="panel" id="quality">
+          <div class="panel-header"><div><h2>质量与新鲜度</h2><p>不把缺失、失败或不完整显示成 0</p></div></div>
+          <div class="review-list">
+            <div class="review-item"><span class="item-copy"><strong>经营数据</strong><small>开放快照，最近更新于 09:42</small></span><span class="status info">开放中</span></div>
+            <div class="review-item"><span class="item-copy"><strong>项目运行数据</strong><small>任务、复核和运行记录均可读取</small></span><span class="status success">正常</span></div>
+            <div class="review-item"><span class="item-copy"><strong>商品映射</strong><small>1 项记录需要人工确认</small></span><span class="status warning">需关注</span></div>
+          </div>
+        </article>
+      </section>
+
+      <section class="dataset-directory section-gap" id="dataset-directory" aria-label="数据集目录">
+        <strong>业务数据集（8）</strong>
+        <strong>项目数据集（6）</strong>
+      </section>
+    </main>
+  </div>
+
+  <nav class="mobile-nav" aria-label="手机导航">
+    <a href="task13_5_7_operations_web_sample.html"><span class="nav-symbol">今</span><span>今日</span></a>
+    <a class="active" href="task13_5_7_database_sample.html" aria-current="page"><span class="nav-symbol">库</span><span>数据库</span></a>
+    <a href="task13_5_7_business_management_sample.html"><span class="nav-symbol">管</span><span>业务管理</span></a>
+    <a href="task13_5_7_system_sample.html"><span class="nav-symbol">系</span><span>系统</span></a>
+  </nav>
+  <script src="task13_5_7_prototype_nav.js"></script>
+  <script src="task13_5_7_database_sample.js"></script>
+</body>
+</html>
