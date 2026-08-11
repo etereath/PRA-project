@@ -178,15 +178,67 @@
 服务端回读提示。现有 v14 若不能表达不可变库存流水和已应用销量基准，允许最小 Schema
 迁移；不得把该事实塞进备注、Review 文本或平台库存字段。
 
-销量应用规则：
+#### 6.1.1 唯一权威切换
 
-1. 只接受同一 PRA 交易日和商品的有效事实；
-2. 完整订单事实优先，合格估算只在订单不可用时使用；
-3. 记录已应用基准，重放只返回原结果；
-4. 估算被订单替换时撤销旧基准并只应用净差；
-5. 已验证取消恢复对应 `order_qty`；
-6. 不完整、失败、日期错位和能力失败零写；
-7. 余额不足进入 Review/Incident，不能静默截断或写负数。
+切换合同固定为：
+
+```text
+7D cutover 前
+products.xlsx.current_stock = 历史业务库存来源
+
+7D cutover 时
+products.xlsx.current_stock 的冻结快照
+→ 每个 internal_sku 仅一次 bootstrap
+→ DB 期初余额 + 不可变 BOOTSTRAP 流水
+→ 校验每 SKU、总量、幂等键和回读
+
+7D cutover 后
+DB inventory balance / ledger = 唯一真实库存权威
+products.xlsx.current_stock = 只读历史快照，不再参与业务判断或写入
+```
+
+切换必须在受控维护窗口执行：先备份工作簿与 Runtime DB，冻结产品写入，验证 SKU 唯一、
+数量非负且目标 DB 尚未 bootstrap，再以确定性幂等键写入每 SKU 期初流水。全部回读一致后
+才切换库存 Provider；任一项失败整体保持切换前权威，不能留下部分 SKU 已切、部分仍读
+Excel 的状态。`product_inventory_input.py` 必须拆开商品资料/成本/是否销售与库存调整：
+补货、盘点、损耗和对账只调用 DB Inventory Application Service，不再修改工作簿库存。
+新 SKU 先建立商品资料和零 DB 余额，再以独立、可重放的“新花入库”事务增加库存；第二步
+失败不得把工作簿 `current_stock` 当补偿权威。
+
+TaskGeneration、ListingDecision、`SET_ONLINE.target_inventory` 上限、库存预警、今日页和
+销售计划统一依赖同一库存 Provider/Service。切换后禁止 Excel/DB 双写；普通代码回滚也
+不能把已经过期的工作簿库存恢复成业务权威。只有在尚无任何切换后流水时，管理员才可在
+备份/回读门禁下整体恢复切换前的工作簿与 DB；已有切换后流水时只能前向修复。
+
+#### 6.1.2 销售事实写库存准入
+
+数据库可展示的事实不自动等于允许改变库存。首版固定矩阵为：
+
+| SalesFactSelection 结果 | 自动库存写入 | 规则 |
+| --- | --- | --- |
+| `ORDER_COMPLETE` | 允许正/负净差 | 必须是目标范围最新完整 `CLOSED` 批次，SKU 映射 `VERIFIED` 且版本一致 |
+| `ORDER_PARTIAL` / `OPEN` | 禁止 | 只展示和进入对账，不以部分订单补扣库存 |
+| `SCAN_ESTIMATED_HIGH` | 只允许正向销量差额扣减 | 仅在没有可接受订单事实、segment `estimation_eligible=true` 且证据/映射完整时；估算减少不得自动加回库存 |
+| `SCAN_ESTIMATED_MEDIUM` | 禁止 | 可展示或进入销售计划的降权输入，不能写真实库存 |
+| `SCAN_ESTIMATED_LOW` | 禁止 | 只作方向性附注 |
+| `UNAVAILABLE` | 禁止 | 不伪造零销量或零库存变化 |
+| 完整订单替换已应用估算 | 允许净差 | 先核对同 SKU/交易日的已应用基准，只应用订单累计销量与既有基准之差 |
+| 取消导致完整订单累计销量下降 | 允许负净差恢复 | 恢复来自新权威累计销量的负差，不单独应用 `cancelled_qty` |
+
+所有允许写入的范围仍必须属于同一 PRA 交易日和商品；记录选择来源、质量、映射版本、
+支撑输入和已应用累计销量。统一公式为：
+
+```text
+inventory_sales_delta =
+  canonical_selected_sold_qty - previously_applied_sold_qty
+
+inventory_delta = -inventory_sales_delta
+```
+
+重放只返回原结果；同 ID 异内容冲突拒绝。`cancelled_qty` 只解释相邻完整快照的多重集合
+减少，正式销量始终来自当前所选完整 CLOSED 快照，因此不得再额外
+`inventory += cancelled_qty`。不完整、失败、日期错位、能力失败、映射不唯一和余额不足
+均零写并进入 Review/Incident；不能静默截断或写负库存。
 
 ### 6.2 平台库存
 
@@ -208,10 +260,67 @@
 - 任一 Task 失效、冲突或进入 UNKNOWN 时整批预检停止；
 - Queue/Importer 失败沿用现有恢复和唯一 RECONCILE。
 
+`SUBMIT_EXECUTION` 必须由薄的 Execution Authorization Application Service 强制，不是
+Route 内的 `if capability`。服务固定为两个调用：
+
+```text
+prepare_execution(
+  authenticated_principal,
+  exact_task_ids,
+  idempotency_key
+)
+→ latest-fact revalidation
+→ existing v4 prepare / v5 propose
+→ confirmation_digest + exact manifest + expires_at
+
+submit_execution(
+  authenticated_principal,
+  exact_task_ids,
+  confirmation_digest,
+  idempotency_key
+)
+→ capability + identity + digest + latest-fact revalidation
+→ existing publisher
+```
+
+两次调用都从认证上下文取得 principal 并检查 `SUBMIT_EXECUTION`；`confirmed_by` 只能由
+该 principal 派生，表单中的 actor/用户名一律不可信。digest 必须绑定排序后的精确
+`task_ids`、逐项动作/目标值、来源 Task 版本和重检事实版本，不能表达“执行所有 pending”。
+提交前必须重新验证 Task 仍为可执行状态，以及价格、Mapping、基础成本、真实库存、
+Review、优先级、共享写锁、活动 Automation UI 租约、`UNKNOWN` 和唯一 RECONCILE；任一
+变化使整批 digest 失效并要求重新预览。
+
+Route 只解析请求、调用上述 Service 并 PRG，不得直接调用 Queue、Runner 或拼 manifest。
+Service 只编排既有 v4/v5 prepare/propose/publish，不新增 Operation、Attempt、授权、写锁或
+审批状态机。CLI/验收/恢复保留的 publisher 入口必须标为管理员或受控验收边界；日常运营
+CLI 必须调用同一授权 Service，不能成为绕过 `SUBMIT_EXECUTION` 的旁路。
+
 ### 6.4 固定 Automation 方案
 
-只允许 allowlist 中的 Job 类型。配置至少包含启用状态、频率/时间、业务范围、阈值、版本、
-修改人和生效时间。Scheduler 只读取已生效版本；Web 请求不持有长期租约或运行循环。
+只允许 allowlist 中的 Job 类型。配置至少包含启用状态、允许的频率/offset、业务范围、
+阈值、版本、修改人和生效时间。Scheduler 只读取已生效版本；Web 请求不持有长期租约或
+运行循环。13.5-3 已冻结 `job_id + schedule` 静态身份，因此频率变化必须创建确定性的新版
+Job 并在同一配置切换中停用前版，不能原地改 schedule，也不能依赖
+`ensure_default_automation_jobs()` 覆盖运营配置。
+
+首版可配置矩阵固定为：
+
+| Job/能力 | 默认 | Web 允许修改 | 安全范围与禁止项 |
+| --- | --- | --- | --- |
+| `ONLINE_PULSE` | 10 分钟 | 启停、间隔 | 10～30 分钟且为 5 的倍数；平台和“仅上架中”范围固定 |
+| `FULL_MARKET_SCAN` | 60 分钟、`:10` 对齐 | 启停、间隔 | 60～180 分钟且为 30 的倍数；分钟 offset 固定为 10，父子范围固定 |
+| `PRE_CUTOFF_FULL_SCAN` | 18:00 前 5 分钟 | 启停 | 绝对时间和 -5 分钟 offset 只读，从 `OperationalTimePolicy` 派生 |
+| `POST_CUTOFF_PULSE` | 18:00 后 5 分钟 | 启停 | 绝对时间和 +5 分钟 offset 只读，从 `OperationalTimePolicy` 派生 |
+| `PLATFORM_TRADE_DAY_SETTLEMENT` | 卖家 20:00 cutoff | 启停、明确交易日幂等补跑 | 不允许编辑绝对时间；只从时间策略计算目标交易日 |
+| `SALES_PLAN_INPUT_BUILD` | Settlement 后 5 分钟 | 启停、后置 offset | 5～30 分钟；必须依赖同交易日 Settlement，不接受绝对时间 |
+| `LISTING_STATUS_SCAN` / `ORDER_SCAN` | `CHILD_ONLY` | 无 | 不显示独立 schedule/启停；只继承合法父 Run |
+| Review 超时维护 | 薄 Handler | 启停、扫描间隔 | 5～30 分钟且为 5 的倍数；Review deadline/Token TTL 只读，不能由 Job 配置改写 |
+| 每日任务生成 | 薄 Handler | 启停、Plan Input 后置 offset、来源 allowlist | offset 0～30 分钟；只在同作业日 Plan Input 成功后运行，不接受任意绝对时间/脚本 |
+| 真实库存预警 | 库存事务后事件驱动 | 启停、默认阈值、每 SKU 覆盖、重复提醒间隔 | 阈值为 0～9999 的整数；提醒间隔 30～1440 分钟；不开放 Cron，也不创建平台动作 |
+
+若未来修改 18:00/20:00 本身，只能新增并生效版本化 `OperationalTimePolicy`，由所有相关
+Job 一起派生，不能在 Automation 页面单改一个 Job。任何超出上述范围、增加 Job 类型、
+开放任意 Cron/脚本或改变父子关系的需求都必须另开 R4。
 
 库存预警使用真实库存，支持默认阈值和商品覆盖。第一次从阈值上方降到阈值或以下产生
 提醒，持续低库存使用既有重复提醒，恢复到阈值上方解除；不直接创建平台下架动作。
@@ -330,20 +439,25 @@ Outbox。
 ### 9.4 7D：数据库真实库存与预警
 
 编码前先合并独立 R4 合同或在同一 PR 首个可审查提交冻结：Schema、余额/流水、销售基准、
-取消恢复、并发、迁移、回滚和现有库存回填来源。
+取消恢复、并发、迁移、回滚和现有库存回填来源；合同必须逐项实现 6.1 的 Excel→DB
+唯一权威切换和销售事实写入准入矩阵，不得在编码时重新选择权威。
 
 范围：
 
 1. 最小不可变库存流水和权威余额；
-2. 人工有符号调整，默认新花入库；
-3. 订单/估算选择后的幂等差额扣减；
-4. 订单事实替换估算、取消恢复和跨日隔离；
-5. 真实库存/平台库存严格字段和 Presenter；
-6. 阈值配置、越界提醒、重复提醒和恢复；
-7. 数据库库存流水、今日库存和销售计划回读。
+2. 工作簿库存冻结、逐 SKU 幂等 bootstrap、回读和单一 Provider 切换；
+3. `product_inventory_input.py` 拆分商品资料与 DB 库存调整，删除 Excel 库存业务写入；
+4. 人工有符号调整，默认新花入库；
+5. 订单/估算选择后的幂等差额扣减；
+6. 订单事实替换估算、取消净差恢复和跨日隔离；
+7. 真实库存/平台库存严格字段和 Presenter；
+8. 阈值配置、越界提醒、重复提醒和恢复；
+9. 数据库库存流水、今日库存和销售计划回读。
 
 门禁：精确重放、同 ID 异内容、并发调整、负库存、部分事实、日期错位、数据库失败整体
-回滚；不能为了满足预算把流水写入备注或现有无关字段。
+回滚；逐项覆盖 6.1.2 的全部质量、估算替换和取消负差分支；证明切换后 Excel 不再写、
+所有消费者只读 DB，且 rollback 不恢复过期工作簿权威。不能为了满足预算把流水写入备注
+或现有无关字段。
 
 ### 9.5 7E：人工任务、执行授权、复核与 Automation 配置
 
@@ -353,22 +467,24 @@ Outbox。
 2. 调整价格到、加/降价、下架、上架+平台目标库存；
 3. 逐项预览、排除、最低成本、价格新鲜度、映射和冲突校验；
 4. 创建 Task 与提交执行两个后台阶段；
-5. `SUBMIT_EXECUTION` capability、批次重检、优先队列和既有 v4/v5 提交；
+5. 6.3 的 Execution Authorization Application Service、`SUBMIT_EXECUTION`、精确 task IDs、
+   digest、批次重检、优先队列和既有 v4/v5 提交；
 6. Review/Incident Web 与手机原子处置；
-7. 固定 Automation 方案版本化配置和 READ_ONLY 补跑；
+7. 按 6.4 逐 Job allowlist/上下限实现版本化配置和 READ_ONLY 补跑；
 8. `start_shadowbot_reconcile`、`confirm_shadowbot_manual_handled` 迁到正式服务；
 9. 删除 `save_listing_status` 直写投影；
 10. 完成逐 CLI 正式归宿矩阵。
 
 门禁：创建任务零平台副作用；普通 `PENDING` 不自动执行；提交执行只处理明确批次；预览后
-价格/库存/映射变化必须拒绝；Queue/DB 失败整体回滚；人工复核优先于自动紧急任务；无新
-平台动作类型或第二执行链。
+价格/库存/映射变化必须拒绝；伪造 form actor、digest 重放/换批、Route 直调 publisher 和
+CLI 日常旁路全部拒绝；关键 Job 时间不能独立漂移，child job 不可编辑；Queue/DB 失败整体
+回滚；人工复核优先于自动紧急任务；无新平台动作类型或第二执行链。
 
 ### 9.6 7F：系统维护、切换删除与运营验收
 
 范围：
 
-1. Worker 检查并恢复、飞书测试、备份和显式维护 Service；
+1. Worker 检查并恢复、飞书测试、备份和显式类型化 Maintenance Service；
 2. 完成权限隔离和管理员高级诊断；
 3. 拆分 `start_local.ps1`，Web 重启不影响后台；
 4. 新 Web 切换为唯一入口；
@@ -378,6 +494,9 @@ Outbox。
 8. 更新实施报告、项目状态、索引和任务 14 交接。
 
 真实平台写验收必须由用户明确商品和批次授权；7F 计划本身不授权 COMMIT。
+Route 不得接受脚本名、路径或参数，不得直接 `subprocess.run(...)` 或同步等待长耗时动作；
+页面只提交类型化意图并查询既有 heartbeat、生命周期、备份 manifest 或维护状态。没有可
+复用异步承载的动作必须停工另开窄 R4，不能顺手建设通用脚本/后台任务 Runner。
 
 ## 10. CLI 正式归宿矩阵
 
@@ -408,12 +527,12 @@ Outbox。
 | Query/Presenter | OPEN/CLOSED、质量六级、可信零、部分/失败、分页边界 |
 | 安全 | 认证、capability、CSRF、Header、Cookie 环境冲突、路径注入 |
 | GET 零写 | DB/工作簿/Queue/Outbox/事实表前后比较 |
-| 库存 | 人工调整、差额扣减、估算替换、取消、重放、并发、负库存 |
+| 库存 | Excel→DB bootstrap/单一权威、准入质量矩阵、人工调整、差额扣减、估算替换、取消净差、重放、并发、负库存 |
 | 任务 | 多选展开、delta 价格、最低成本、映射、冲突、创建零副作用 |
-| 执行授权 | 批次重检、优先级、Queue/Importer、UNKNOWN/RECONCILE |
-| Automation | 配置版本、租约、补跑、库存阈值、重复提醒和恢复 |
+| 执行授权 | principal、防伪 form actor、精确 task IDs/digest、双重检、优先级、Queue/Importer、UNKNOWN/RECONCILE |
+| Automation | 逐 Job 字段/上下限、版本替换、时间策略派生、child 禁配、租约、补跑、库存阈值、重复提醒和恢复 |
 | 通知/手机 | 有效、失效、过期、已完成、重复点击、处理完毕反馈 |
-| 系统 | Worker 恢复状态机、备份/回读、显式维护、Web 独立重启 |
+| 系统 | Worker 恢复状态机、备份/回读、类型化维护、Route 无脚本/无长等待、Web 独立重启 |
 | 视觉 | 桌面、手机、横向表格、弹窗焦点、通知抽屉、中文错误 |
 | 真实只读 | 固定 Runtime DB、零写、已知违规只报告、平台副作用为 0 |
 | 真实写 | 仅独立授权批次，完整 Queue→Worker→Importer→Archive |

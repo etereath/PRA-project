@@ -31,7 +31,7 @@
 ### 任务 13.5 计划权威
 
 - [GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20) 合并截至
-  2026-08-08 已采纳评论后的正文，是任务 13.5 的宏观范围、业务语义、阶段划分和
+  2026-08-12 已采纳评论后的正文，是任务 13.5 的宏观范围、业务语义、阶段划分和
   任务 14 边界权威；历史评论仅用于追溯。
 - `docs/plans/task13_5_0_kickoff_baseline.md` 负责 13.5-0 的黄金基线、脚本盘点、
   禁止重写资产、合同草案、子 PR 顺序和开工门禁。
@@ -54,6 +54,17 @@
   `checkpoint/pre-task13-5-7-web-rewrite-20260807`。新 Web 直接替代当前
   `app/web.py` 页面架构；后台只复用既有领域 Service，不得恢复“先统一所有 CLI、
   脚本和 Automation 入口再开始 Web”的扩大化前置门禁。
+- 13.5-7D 切换完成后，Runtime DB 库存余额和不可变流水是唯一真实库存权威；
+  `products.xlsx.current_stock` 只允许作为一次性 bootstrap 输入和历史快照，不得继续
+  作为可编辑业务库存，也不得与 DB 双写。TaskGeneration、ListingDecision、上架库存
+  上限和库存预警必须读取同一个库存 Provider/Application Service。
+- Web 的普通平台执行必须经过 Service 层 `SUBMIT_EXECUTION` 授权，绑定已认证主体、明确
+  `task_ids` 和本轮重检 digest；Route 不得直接调用 Queue/Runner，也不得扫描全部
+  `PENDING`。系统维护 Route 同样不得成为通用脚本 Runner，长耗时动作必须调用受控的
+  类型化维护 Service，并从既有生命周期、备份或运行事实查询结果。
+- Automation Web 配置只能修改每类 allowlist Job 明确开放的字段和安全范围；18:00/20:00
+  及其关键扫描只能从版本化 `OperationalTimePolicy` 派生，子 Job 不得独立改 schedule，
+  页面不得开放任意 Cron、脚本或 Job 编辑器。
 - S4 不在 13.5-1 或核心 v14 中冻结最终策略，但不得移出任务 13.5：必须在
   13.5-6 先完成 Incident 人工闭环，再依据真实数据冻结策略、迁移正式结构并实现
   受控自动紧急下架。

@@ -1,6 +1,12 @@
 # 商品资料与库存补充录入说明
 
-## 当前定位
+> 状态说明（2026-08-12）：本文主体记录 13.5-7D 权威切换前的历史工作簿行为，仅用于
+> 迁移盘点和回归。7D 切换完成后，Runtime DB 库存余额与不可变流水是唯一真实库存权威；
+> `products.xlsx.current_stock` 只作为一次性 bootstrap 输入和历史只读快照，不再是日常
+> 编辑字段。正式切换合同见
+> [13.5-7 施工计划 6.1](plans/task13_5_7_web_rewrite_construction_plan.md#61-数据库真实库存)。
+
+## 切换前定位
 
 `/business-inputs` 的“商品资料与库存录入”是日常运营入口，用于维护商品资料并录入当天可销售库存。
 
@@ -13,7 +19,21 @@
 - 不迁移 Excel 主数据。
 - 不删除旧 `/tables` 表格编辑入口。
 
-旧 `/tables` 继续作为高级兼容入口，适合批量维护、排障或直接编辑原始表格。
+这些边界只描述切换前历史实现，不能作为 7D 后保留 Excel 库存写入口或旧 Web 兼容页的
+依据。
+
+## 13.5-7D 切换后的职责
+
+- `product_inventory_input.py` 拆分商品资料/成本/是否销售与库存调整；
+- 新花入库、盘点、损耗、人工修正和对账只创建 DB inventory transaction；
+- 新 SKU 先保存商品资料并获得零 DB 余额，再以独立幂等“新花入库”事务增加库存；
+- TaskGeneration、ListingDecision、`SET_ONLINE` 上限和库存预警只读统一 Inventory
+  Provider/Application Service；
+- 禁止同时写 `products.xlsx.current_stock` 与 DB 库存；
+- 切换后的代码回滚不得把过期工作簿库存恢复成权威。
+
+切换前，旧 `/tables` 继续作为高级兼容入口，适合批量维护、排障或直接编辑原始表格；
+7D 新 Web 切换后该兼容入口按施工计划删除，不能继续编辑库存。
 
 ## 页面录入方式
 

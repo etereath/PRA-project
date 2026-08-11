@@ -102,7 +102,7 @@ Query Adapter 读取，并通过 Task Adapter 提交结构化 `AgentIntent`；Re
   同时保留测试、验收、诊断和恢复 CLI 以及未来 Agent Gateway 唯一通道。
 - [web_frontend_refresh_plan.md](web_frontend_refresh_plan.md)：Web 运行态运营后台刷新计划和当前进度。
 - [web_localization_display_spec.md](web_localization_display_spec.md)：Web 与飞书通知的运营中文展示术语表。
-- [product_inventory_input_spec.md](product_inventory_input_spec.md)：商品资料与库存补充录入规则，说明 `products.xlsx` 兼容、公共库存、SKU 生成、新增品种弹窗和旧 `/tables` 入口边界。
+- [product_inventory_input_spec.md](product_inventory_input_spec.md)：13.5-7D 切换前的商品资料与工作簿库存历史规则，以及切换后 DB 唯一库存权威、一次性 bootstrap、禁止双写和旧入口删除边界。
 - [price_rule_input_spec.md](price_rule_input_spec.md)：价格规则输入表单化规则，说明 `price_rules.xlsx` 兼容、定价字段、低价边界和旧 `/tables` 入口策略。
 - [listing_rule_input_spec.md](listing_rule_input_spec.md)：上下架规则输入表单化规则，说明 `listing_rules.xlsx` 新字段、三维筛选、策略枚举和 ListingRuleEvaluator 边界。
 - [capacity_plan_input_spec.md](capacity_plan_input_spec.md)：包装产能计划输入表单化规则，说明 `capacity_plans.xlsx` 字段、确认包装能力和 CapacityRuleEvaluator 判断口径。

@@ -330,6 +330,14 @@ v14 Runtime DB 中通过，平台写操作为 0。批次 `PARTIAL` 仅源于验�
 与真实平台执行授权保持两个可审计阶段，Web 将提供连续操作，但普通 `PENDING` 仍不得
 无人值守执行。
 
+7A 评审进一步冻结了实施边界：7D 把 `products.xlsx.current_stock` 按 SKU 仅一次 bootstrap
+到 Runtime DB，之后 DB 余额/流水成为唯一真实库存权威，所有库存消费者改读同一 Provider，
+不保留 Excel/DB 双写。库存自动变化只接受完整 CLOSED 订单的累计销量净差，以及订单不可用
+时合格 `SCAN_ESTIMATED_HIGH` 的正向扣减；部分/OPEN、中低质量估算和不可用事实零写，
+取消只通过最新完整订单累计销量的负差恢复，不能额外加回取消量。Web 提交执行必须由
+Service 层把认证主体、明确 task IDs 和重检 digest 绑定到既有 v4/v5 发布链；Automation
+每类 Job 只开放明确字段和范围，18:00/20:00 不得单独漂移；系统 Route 不作为脚本 Runner。
+
 项目级控制面已经同时冻结：人工运营走 Web，定时业务走 Automation，未来智能调用走
 Agent Gateway，平台执行走 Queue/Worker/Importer，开发测试与恢复走 CLI。未来 Agent
 读取只能经 Agent Query Adapter 调用权威 Query Service/Read Model；唯一写入口是 Agent
