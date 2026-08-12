@@ -39,6 +39,7 @@ Query Adapter 读取，并通过 Task Adapter 提交结构化 `AgentIntent`；Re
 - [plans/task13_5_web_current_state_audit_20260729.md](plans/task13_5_web_current_state_audit_20260729.md)：带精确时间、main SHA、Runtime DB脱敏快照、浏览器/视口/角色、路由、页面规模和DOM hash的独立Web现状审计。
 - [plans/task13_5_7_web_rewrite_construction_plan.md](plans/task13_5_7_web_rewrite_construction_plan.md)：13.5-7 实际业务重基线施工顺序；冻结 7B～7F 的四入口、真实库存、人工任务与执行授权、Automation 配置、安全、CLI 迁移、切换和验收门禁。
 - [reports/task13_5_7b_web_foundation.md](reports/task13_5_7b_web_foundation.md)：13.5-7B 新运营 Web 应用骨架、固定 Composition Root、环境/Cookie、Session/CSRF/capability、安全 Header、GET 零写、Mobile Review 外壳、后台生命周期拆分和打包门禁实施报告。
+- [reports/task13_5_7c_read_only_facts.md](reports/task13_5_7c_read_only_facts.md)：13.5-7C 四入口只读事实、后端分页、质量/空值状态、唯一详情归属、Mobile Review 只读状态、真实 Runtime DB 零写和视觉/回归验收报告。
 - [prototypes/task13_5_7_operations_web_sample.html](prototypes/task13_5_7_operations_web_sample.html)：四入口“今日”静态样板，展示销售、数据库真实库存、待办、时间轴和业务健康摘要。
 - [prototypes/task13_5_7_database_sample.html](prototypes/task13_5_7_database_sample.html)：只读数据库与销售分析静态样板。
 - [prototypes/task13_5_7_business_management_sample.html](prototypes/task13_5_7_business_management_sample.html)：任务创建/授权、人工复核、固定 Automation 方案和真实库存业务静态样板。

@@ -3628,14 +3628,26 @@ class SQLiteRuntimeRepository:
         return _listing_status_from_row(row) if row is not None else None
 
     def list_listing_statuses(
-        self, *, platform_name: str | None = None
+        self,
+        *,
+        platform_name: str | None = None,
+        internal_sku: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[ListingStatus]:
         query = "SELECT * FROM listing_status"
-        params: tuple[object, ...] = ()
+        clauses: list[str] = []
+        params: list[object] = []
         if platform_name:
-            query += " WHERE platform_name = ?"
-            params = (normalize_listing_text(platform_name),)
+            clauses.append("platform_name = ?")
+            params.append(normalize_listing_text(platform_name))
+        if internal_sku:
+            clauses.append("internal_sku = ?")
+            params.append(str(internal_sku).strip())
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY platform_name, variety, grade"
+        query, params = _with_limit_offset(query, params, limit=limit, offset=offset)
         with closing(self.connection_factory.connect_read()) as connection:
             rows = connection.execute(query, params).fetchall()
         return [_listing_status_from_row(row) for row in rows]
@@ -3942,6 +3954,8 @@ class SQLiteRuntimeRepository:
         action_type: TaskActionType | None = None,
         scope_type: str | None = None,
         scope_key: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[Task]:
         query = "SELECT * FROM tasks"
         clauses: list[str] = []
@@ -3972,16 +3986,43 @@ class SQLiteRuntimeRepository:
             END ASC,
             priority ASC, created_at ASC, task_id ASC
         """
-        with closing(self.connect()) as connection:
+        query, params = _with_limit_offset(query, params, limit=limit, offset=offset)
+        with closing(self.connect_read()) as connection:
             rows = connection.execute(query, params).fetchall()
         return [_row_to_task(row) for row in rows]
 
     def get_task(self, task_id: str) -> Task | None:
-        with closing(self.connect()) as connection:
+        with closing(self.connect_read()) as connection:
             row = connection.execute(
                 "SELECT * FROM tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
         return _row_to_task(row) if row is not None else None
+
+    def list_task_history_page(
+        self,
+        *,
+        trade_date: date | None = None,
+        status: TaskStatus | None = None,
+        limit: int = 25,
+        offset: int = 0,
+    ) -> list[Task]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date is not None:
+            clauses.append("trade_date = ?")
+            params.append(trade_date.isoformat())
+        if status is not None:
+            clauses.append("task_status = ?")
+            params.append(status.value)
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        query = f"""
+            SELECT * FROM tasks {where}
+            ORDER BY created_at DESC, task_id DESC
+        """
+        query, params = _with_limit_offset(query, params, limit=limit, offset=offset)
+        with closing(self.connect_read()) as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [_row_to_task(row) for row in rows]
 
     def get_open_task_by_dedupe_key(self, dedupe_key: str) -> Task | None:
         if not dedupe_key:
@@ -4115,6 +4156,8 @@ class SQLiteRuntimeRepository:
         *,
         trade_date: date | None = None,
         status: ReviewTaskStatus | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[ReviewTask]:
         query = "SELECT * FROM review_tasks"
         clauses: list[str] = []
@@ -4128,24 +4171,61 @@ class SQLiteRuntimeRepository:
         if clauses:
             query = f"{query} WHERE {' AND '.join(clauses)}"
         query = f"{query} ORDER BY required_by IS NULL, required_by ASC, created_at ASC"
-        with closing(self.connect()) as connection:
+        query, params = _with_limit_offset(query, params, limit=limit, offset=offset)
+        with closing(self.connect_read()) as connection:
             rows = connection.execute(query, params).fetchall()
         return [_row_to_review_task(row) for row in rows]
 
     def get_review_task(self, review_task_id: str) -> ReviewTask | None:
-        with closing(self.connect()) as connection:
+        with closing(self.connect_read()) as connection:
             row = connection.execute(
                 "SELECT * FROM review_tasks WHERE review_task_id = ?",
                 (review_task_id,),
             ).fetchone()
         return _row_to_review_task(row) if row is not None else None
 
+    def list_review_history_page(
+        self,
+        *,
+        trade_date: date | None = None,
+        status: ReviewTaskStatus | None = None,
+        limit: int = 25,
+        offset: int = 0,
+    ) -> list[ReviewTask]:
+        clauses: list[str] = []
+        params: list[object] = []
+        if trade_date is not None:
+            clauses.append("trade_date = ?")
+            params.append(trade_date.isoformat())
+        if status is not None:
+            clauses.append("review_status = ?")
+            params.append(status.value)
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        query = f"""
+            SELECT * FROM review_tasks {where}
+            ORDER BY created_at DESC, review_task_id DESC
+        """
+        query, params = _with_limit_offset(query, params, limit=limit, offset=offset)
+        with closing(self.connect_read()) as connection:
+            rows = connection.execute(query, params).fetchall()
+        return [_row_to_review_task(row) for row in rows]
+
+    def count_review_tasks(self, *, status: ReviewTaskStatus | None = None) -> int:
+        query = "SELECT COUNT(*) AS item_count FROM review_tasks"
+        params: tuple[object, ...] = ()
+        if status is not None:
+            query += " WHERE review_status = ?"
+            params = (status.value,)
+        with closing(self.connect_read()) as connection:
+            row = connection.execute(query, params).fetchone()
+        return int(row["item_count"] if row is not None else 0)
+
     def get_pending_review_task_by_dedupe_key(
         self, dedupe_key: str
     ) -> ReviewTask | None:
         if not dedupe_key:
             return None
-        with closing(self.connect()) as connection:
+        with closing(self.connect_read()) as connection:
             row = connection.execute(
                 """
                 SELECT * FROM review_tasks
@@ -5513,7 +5593,7 @@ class SQLiteRuntimeRepository:
             return connection.total_changes - before
 
     def get_review_token(self, token_id: str) -> ReviewToken | None:
-        with closing(self.connect()) as connection:
+        with closing(self.connect_read()) as connection:
             row = connection.execute(
                 "SELECT * FROM review_tokens WHERE token_id = ?",
                 (token_id,),
@@ -5521,7 +5601,7 @@ class SQLiteRuntimeRepository:
         return _row_to_review_token(row) if row is not None else None
 
     def get_review_token_by_hash(self, token_hash: str) -> ReviewToken | None:
-        with closing(self.connect()) as connection:
+        with closing(self.connect_read()) as connection:
             row = connection.execute(
                 "SELECT * FROM review_tokens WHERE token_hash = ?",
                 (token_hash,),
@@ -5531,7 +5611,7 @@ class SQLiteRuntimeRepository:
     def list_review_tokens_by_review_task_id(
         self, review_task_id: str
     ) -> list[ReviewToken]:
-        with closing(self.connect()) as connection:
+        with closing(self.connect_read()) as connection:
             rows = connection.execute(
                 """
                 SELECT * FROM review_tokens
@@ -5610,7 +5690,11 @@ class SQLiteRuntimeRepository:
             return connection.total_changes - before
 
     def list_execution_logs(
-        self, *, task_id: str | None = None, limit: int | None = None
+        self,
+        *,
+        task_id: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[ExecutionLog]:
         query = "SELECT * FROM execution_logs"
         params: list[object] = []
@@ -5618,12 +5702,18 @@ class SQLiteRuntimeRepository:
             query = f"{query} WHERE task_id = ?"
             params.append(task_id)
         query = f"{query} ORDER BY created_at DESC, log_id ASC"
-        if limit is not None:
-            query = f"{query} LIMIT ?"
-            params.append(limit)
-        with closing(self.connect()) as connection:
+        query, params = _with_limit_offset(query, params, limit=limit, offset=offset)
+        with closing(self.connect_read()) as connection:
             rows = connection.execute(query, params).fetchall()
         return [_row_to_execution_log(row) for row in rows]
+
+    def get_execution_log(self, log_id: str) -> ExecutionLog | None:
+        with closing(self.connect_read()) as connection:
+            row = connection.execute(
+                "SELECT * FROM execution_logs WHERE log_id = ?",
+                (str(log_id).strip(),),
+            ).fetchone()
+        return _row_to_execution_log(row) if row is not None else None
 
     def insert_shadowbot_operation(self, operation: ShadowBotOperationLedger) -> int:
         row = _shadowbot_operation_to_row(operation)
@@ -7166,6 +7256,8 @@ class SQLiteRuntimeRepository:
         related_review_task_id: str | None = None,
         send_status: str | None = None,
         channel: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[NotificationLog]:
         query = "SELECT * FROM notification_logs"
         clauses: list[str] = []
@@ -7181,11 +7273,10 @@ class SQLiteRuntimeRepository:
             params.append(channel)
         if clauses:
             query = f"{query} WHERE {' AND '.join(clauses)}"
-        with closing(self.connect()) as connection:
-            rows = connection.execute(
-                f"{query} ORDER BY created_at DESC, notification_id ASC",
-                params,
-            ).fetchall()
+        query = f"{query} ORDER BY created_at DESC, notification_id ASC"
+        query, params = _with_limit_offset(query, params, limit=limit, offset=offset)
+        with closing(self.connect_read()) as connection:
+            rows = connection.execute(query, params).fetchall()
         return [_row_to_notification_log(row) for row in rows]
 
     def get_notification_log(self, notification_id: str) -> NotificationLog | None:
@@ -7827,6 +7918,7 @@ class SQLiteRuntimeRepository:
         related_task_id: str | None = None,
         related_review_task_id: str | None = None,
         limit: int | None = None,
+        offset: int = 0,
     ) -> list[NotificationOutbox]:
         query = "SELECT * FROM notification_outbox"
         clauses: list[str] = []
@@ -7843,12 +7935,8 @@ class SQLiteRuntimeRepository:
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY priority DESC, deadline_at IS NULL, deadline_at ASC, created_at ASC, notification_id ASC"
-        if limit is not None:
-            if limit <= 0:
-                return []
-            query += " LIMIT ?"
-            params.append(int(limit))
-        with closing(self.connect()) as connection:
+        query, params = _with_limit_offset(query, params, limit=limit, offset=offset)
+        with closing(self.connect_read()) as connection:
             rows = connection.execute(query, params).fetchall()
         return [_row_to_notification_outbox(row) for row in rows]
 
@@ -9323,6 +9411,31 @@ def _text_to_date(value: str | None) -> date | None:
     if value in ("", None):
         return None
     return date.fromisoformat(str(value))
+
+
+def _with_limit_offset(
+    query: str,
+    params: list[object],
+    *,
+    limit: int | None,
+    offset: int,
+) -> tuple[str, list[object]]:
+    """Append validated SQLite pagination without changing legacy list defaults."""
+
+    normalized_offset = int(offset)
+    if normalized_offset < 0:
+        raise ValueError("offset must be greater than or equal to zero")
+    if limit is None:
+        if normalized_offset:
+            query += " LIMIT -1 OFFSET ?"
+            params.append(normalized_offset)
+        return query, params
+    normalized_limit = int(limit)
+    if normalized_limit < 1:
+        return f"SELECT * FROM ({query}) WHERE 0", params
+    query += " LIMIT ? OFFSET ?"
+    params.extend((normalized_limit, normalized_offset))
+    return query, params
 
 
 def _text_to_datetime(value: str | None) -> datetime | None:

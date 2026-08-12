@@ -408,6 +408,7 @@ class AutomationRepository:
         job_id: str | None = None,
         statuses: Iterable[AutomationRunStatus] | None = None,
         limit: int | None = None,
+        offset: int = 0,
     ) -> list[AutomationRun]:
         clauses: list[str] = []
         values: list[object] = []
@@ -420,12 +421,18 @@ class AutomationRepository:
             clauses.append(f"run_status IN ({placeholders})")
             values.extend(status.value for status in status_values)
         where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        normalized_offset = int(offset)
+        if normalized_offset < 0:
+            raise ValueError("offset must be greater than or equal to zero")
         limit_sql = ""
         if limit is not None:
             if limit < 1:
                 return []
-            limit_sql = "LIMIT ?"
-            values.append(limit)
+            limit_sql = "LIMIT ? OFFSET ?"
+            values.extend((limit, normalized_offset))
+        elif normalized_offset:
+            limit_sql = "LIMIT -1 OFFSET ?"
+            values.append(normalized_offset)
         with closing(self.runtime_repository.connect_read()) as connection:
             rows = connection.execute(
                 f"""

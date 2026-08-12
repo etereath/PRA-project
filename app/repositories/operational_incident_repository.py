@@ -471,23 +471,72 @@ class OperationalIncidentRepository:
         *,
         category: IncidentCategory | None = None,
         platform_name: str | None = None,
+        limit: int | None = None,
+        offset: int = 0,
     ) -> list[OperationalIncident]:
         clauses = ["incident_status IN ('OPEN', 'WAITING_HUMAN', 'AUTO_PROTECTING')"]
-        params: list[str] = []
+        params: list[object] = []
         if category is not None:
             clauses.append("category = ?")
             params.append(category.value)
         if platform_name is not None:
             clauses.append("platform_name = ?")
             params.append(platform_name)
+        normalized_offset = int(offset)
+        if normalized_offset < 0:
+            raise ValueError("offset must be greater than or equal to zero")
+        limit_sql = ""
+        if limit is not None:
+            if limit < 1:
+                return []
+            limit_sql = "LIMIT ? OFFSET ?"
+            params.extend((int(limit), normalized_offset))
+        elif normalized_offset:
+            limit_sql = "LIMIT -1 OFFSET ?"
+            params.append(normalized_offset)
         with closing(self.runtime_repository.connect_read()) as connection:
             rows = connection.execute(
                 f"""
                 SELECT * FROM operational_incidents
                 WHERE {" AND ".join(clauses)}
                 ORDER BY severity DESC, first_detected_at ASC, incident_id ASC
+                {limit_sql}
                 """,
                 params,
+            ).fetchall()
+        return [_row_to_incident(row) for row in rows]
+
+    def count_active(self) -> int:
+        with closing(self.runtime_repository.connect_read()) as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS item_count
+                FROM operational_incidents
+                WHERE incident_status IN ('OPEN', 'WAITING_HUMAN', 'AUTO_PROTECTING')
+                """
+            ).fetchone()
+        return int(row["item_count"] if row is not None else 0)
+
+    def list_history_page(
+        self,
+        *,
+        limit: int = 25,
+        offset: int = 0,
+    ) -> list[OperationalIncident]:
+        normalized_limit = int(limit)
+        normalized_offset = int(offset)
+        if normalized_limit < 1:
+            return []
+        if normalized_offset < 0:
+            raise ValueError("offset must be greater than or equal to zero")
+        with closing(self.runtime_repository.connect_read()) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM operational_incidents
+                ORDER BY last_detected_at DESC, incident_id DESC
+                LIMIT ? OFFSET ?
+                """,
+                (normalized_limit, normalized_offset),
             ).fetchall()
         return [_row_to_incident(row) for row in rows]
 

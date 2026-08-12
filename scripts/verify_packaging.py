@@ -20,7 +20,9 @@ REQUIRED_WHEEL_MEMBERS = {
     "app/services/runtime.py",
     "app/operations_web/app.py",
     "app/operations_web/templates/login.html",
+    "app/operations_web/templates/page.html",
     "app/operations_web/templates/shell.html",
+    "app/operations_web/templates/mobile_review.html",
     "app/operations_web/templates/mobile_review_shell.html",
     "app/operations_web/static/app.css",
 }
