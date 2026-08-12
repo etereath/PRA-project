@@ -38,6 +38,9 @@ from app.operations_web.queries import (
 from app.repositories.operational_summary_repository import OperationalSummaryRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import PRODUCT_HEADERS
+from app.repositories.workbook_repository import load_products
+from app.repositories.inventory_repository import InventoryRepository
+from app.services.authoritative_inventory import InventoryApplicationService
 from app.services.runtime import ReviewTokenService
 from app.services.operational_time import OperationalTimePolicy
 
@@ -99,7 +102,7 @@ def test_today_uses_trade_day_summary_and_distinguishes_trustworthy_zero(read_on
     assert "当前确认无销量" in body
     assert "0 扎" in body
     assert "¥0.00" in body
-    assert "当前产品库存资料" in body
+    assert "当前真实库存权威" in body
     assert "完整度百分比" not in body
     assert "复购" not in body
     assert "买家端" not in body
@@ -672,6 +675,87 @@ def test_operator_labels_do_not_fall_back_to_developer_identifiers() -> None:
     assert _review_type_label("unknown_internal_review") == "人工复核"
     assert _notification_type_label("mobile_review_required") == "价格异常，请立即处理"
     assert _notification_type_label("unknown_internal_notice") == "其他通知"
+
+
+def test_management_inventory_adjustment_is_csrf_fenced_prg_and_db_only(
+    read_only_web,
+) -> None:
+    app, container, repository, tmp_path = read_only_web
+    workbook_path = tmp_path / "products.xlsx"
+    products = load_products(workbook_path)
+    InventoryApplicationService(repository, clock=lambda: FIXED_NOW).bootstrap(
+        products,
+        snapshot_sha256="sha256:" + "a" * 64,
+        idempotency_key="bootstrap:web-inventory",
+        actor="admin",
+    )
+    cookie = _login(app, container)
+    session = container.sessions.get(cookie)
+    assert session is not None
+
+    status, _, body = _call_app(
+        app,
+        path="/management",
+        cookie=cookie,
+    )
+    assert status == "200 OK"
+    assert "人工库存调整" in body
+    assert "当前 72 扎" in body
+    key = re.search(r'name="idempotency_key" value="([^"]+)"', body)
+    assert key is not None
+
+    form = {
+        "csrf_token": "invalid",
+        "idempotency_key": key.group(1),
+        "internal_sku": "AISHA-A-50-Z",
+        "inventory_delta": "8",
+        "expected_version": "1",
+        "source_type": "NEW_FLOWER_INBOUND",
+        "reason": "新花入库",
+    }
+    status, _, _ = _call_app(
+        app,
+        path="/management/inventory-adjustments",
+        method="POST",
+        cookie=cookie,
+        form=form,
+    )
+    assert status == "403 Forbidden"
+    assert InventoryRepository(repository).get_balance("AISHA-A-50-Z").current_qty == 72
+
+    form["csrf_token"] = session.csrf_token
+    status, headers, _ = _call_app(
+        app,
+        path="/management/inventory-adjustments",
+        method="POST",
+        cookie=cookie,
+        form=form,
+    )
+    assert status == "303 See Other"
+    location = _header(headers, "Location")
+    assert location.startswith("/management?inventory_transaction=")
+    assert InventoryRepository(repository).get_balance("AISHA-A-50-Z").current_qty == 80
+    assert load_products(workbook_path)[0].current_stock == 72
+
+    status, _, body = _call_app(
+        app,
+        path="/management",
+        query=location.split("?", 1)[1],
+        cookie=cookie,
+    )
+    assert status == "200 OK"
+    assert "库存调整已记录" in body
+    assert "72 扎" in body and "+8 扎" in body and "80 扎" in body
+
+    status, _, body = _call_app(
+        app,
+        path="/database",
+        query="dataset=inventory-adjustments",
+        cookie=cookie,
+    )
+    assert status == "200 OK"
+    assert "新花入库" in body
+    assert "+8 扎" in body
 
 
 def _write_products(path: Path) -> None:

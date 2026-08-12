@@ -19,9 +19,17 @@ def _repository(tmp_path: Path) -> SQLiteRuntimeRepository:
 
 def _downgrade_to_v15(repository: SQLiteRuntimeRepository) -> None:
     with closing(repository.connect_write()) as connection, connection:
+        for table_name in (
+            "inventory_alert_policies",
+            "inventory_sales_baselines",
+            "inventory_transactions",
+            "inventory_balances",
+            "inventory_authority_state",
+        ):
+            connection.execute(f"DROP TABLE {table_name}")
         connection.execute("DROP TABLE emergency_offline_policies")
         connection.execute(
-            "DELETE FROM runtime_schema_migrations WHERE schema_version = 16"
+            "DELETE FROM runtime_schema_migrations WHERE schema_version >= 16"
         )
 
 
@@ -30,8 +38,10 @@ def test_v16_new_database_has_only_the_minimal_policy_table(
 ) -> None:
     repository = _repository(tmp_path)
 
-    assert LATEST_RUNTIME_SCHEMA_VERSION == 16
-    assert repository.schema_versions() == list(range(1, 17))
+    assert LATEST_RUNTIME_SCHEMA_VERSION >= 16
+    assert repository.schema_versions() == list(
+        range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1)
+    )
     health = repository.check_schema_health()
     assert health.ok, health.summary
 
@@ -82,7 +92,9 @@ def test_v15_to_v16_migration_is_repeatable_and_preserves_v15_facts(
     repository.init_schema()
     repository.init_schema()
 
-    assert repository.schema_versions() == list(range(1, 17))
+    assert repository.schema_versions() == list(
+        range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1)
+    )
     assert repository.check_schema_health().ok
     with closing(repository.connect_read()) as connection:
         incident_count = int(

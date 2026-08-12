@@ -74,6 +74,7 @@ from app.runtime_schema import (
     LATEST_RUNTIME_SCHEMA_VERSION,
     V14_APPEND_ONLY_TABLES,
     V15_APPEND_ONLY_TABLES,
+    V17_APPEND_ONLY_TABLES,
     RuntimeSchemaHealth,
     inspect_runtime_schema,
 )
@@ -2056,6 +2057,174 @@ SCHEMA_V16_SQL = [
 ]
 
 
+SCHEMA_V17_SQL = [
+    """
+    CREATE TABLE IF NOT EXISTS inventory_authority_state (
+        authority_key TEXT PRIMARY KEY CHECK (
+            authority_key = 'REAL_INVENTORY'
+        ),
+        authority_mode TEXT NOT NULL CHECK (
+            authority_mode IN ('PRE_CUTOVER', 'DB_AUTHORITY')
+        ),
+        bootstrap_snapshot_sha256 TEXT,
+        bootstrap_idempotency_key TEXT,
+        bootstrap_completed_at TEXT,
+        bootstrap_completed_by TEXT,
+        version INTEGER NOT NULL CHECK (version >= 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK (
+            (
+                authority_mode = 'PRE_CUTOVER'
+                AND bootstrap_snapshot_sha256 IS NULL
+                AND bootstrap_idempotency_key IS NULL
+                AND bootstrap_completed_at IS NULL
+                AND bootstrap_completed_by IS NULL
+            )
+            OR (
+                authority_mode = 'DB_AUTHORITY'
+                AND bootstrap_snapshot_sha256 IS NOT NULL
+                AND bootstrap_idempotency_key IS NOT NULL
+                AND bootstrap_completed_at IS NOT NULL
+                AND bootstrap_completed_by IS NOT NULL
+            )
+        )
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS inventory_balances (
+        internal_sku TEXT PRIMARY KEY CHECK (trim(internal_sku) <> ''),
+        current_qty INTEGER NOT NULL CHECK (current_qty >= 0),
+        version INTEGER NOT NULL CHECK (version >= 1),
+        last_transaction_id TEXT NOT NULL CHECK (
+            trim(last_transaction_id) <> ''
+        ),
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS inventory_transactions (
+        transaction_id TEXT PRIMARY KEY CHECK (trim(transaction_id) <> ''),
+        internal_sku TEXT NOT NULL CHECK (trim(internal_sku) <> ''),
+        inventory_before INTEGER NOT NULL CHECK (inventory_before >= 0),
+        inventory_delta INTEGER NOT NULL,
+        inventory_after INTEGER NOT NULL CHECK (inventory_after >= 0),
+        transaction_type TEXT NOT NULL CHECK (transaction_type IN (
+            'BOOTSTRAP', 'SKU_INITIALIZATION',
+            'MANUAL_INBOUND', 'MANUAL_ADJUSTMENT',
+            'SALES_DEDUCTION', 'SALES_RESTORE', 'RECONCILIATION'
+        )),
+        source_type TEXT NOT NULL CHECK (trim(source_type) <> ''),
+        source_ref_id TEXT NOT NULL CHECK (trim(source_ref_id) <> ''),
+        reason TEXT NOT NULL CHECK (trim(reason) <> ''),
+        actor TEXT NOT NULL CHECK (trim(actor) <> ''),
+        seller_operation_date TEXT,
+        platform_name TEXT,
+        platform_trade_date TEXT,
+        supporting_refs_json TEXT NOT NULL DEFAULT '[]' CHECK (
+            json_valid(supporting_refs_json)
+        ),
+        idempotency_key TEXT NOT NULL UNIQUE CHECK (
+            trim(idempotency_key) <> ''
+        ),
+        request_sha256 TEXT NOT NULL CHECK (
+            request_sha256 GLOB 'sha256:*'
+        ),
+        balance_version_after INTEGER NOT NULL CHECK (
+            balance_version_after >= 1
+        ),
+        occurred_at TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        CHECK (inventory_after = inventory_before + inventory_delta)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_inventory_transactions_sku_recorded
+    ON inventory_transactions(internal_sku, recorded_at, transaction_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_inventory_transactions_trade_date
+    ON inventory_transactions(platform_name, platform_trade_date, internal_sku)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS inventory_sales_baselines (
+        platform_name TEXT NOT NULL CHECK (trim(platform_name) <> ''),
+        platform_trade_date TEXT NOT NULL,
+        internal_sku TEXT NOT NULL CHECK (trim(internal_sku) <> ''),
+        selected_fact_source TEXT NOT NULL CHECK (
+            selected_fact_source IN ('ORDER_OBSERVED', 'SCAN_ESTIMATED')
+        ),
+        quality_level TEXT NOT NULL CHECK (quality_level IN (
+            'ORDER_COMPLETE', 'SCAN_ESTIMATED_HIGH'
+        )),
+        selected_sold_qty INTEGER NOT NULL CHECK (selected_sold_qty >= 0),
+        source_ref_id TEXT NOT NULL CHECK (trim(source_ref_id) <> ''),
+        source_sha256 TEXT NOT NULL CHECK (source_sha256 GLOB 'sha256:*'),
+        mapping_version TEXT NOT NULL,
+        supporting_refs_json TEXT NOT NULL DEFAULT '[]' CHECK (
+            json_valid(supporting_refs_json)
+        ),
+        inventory_transaction_id TEXT NOT NULL,
+        version INTEGER NOT NULL CHECK (version >= 1),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(platform_name, platform_trade_date, internal_sku),
+        FOREIGN KEY(inventory_transaction_id)
+            REFERENCES inventory_transactions(transaction_id)
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS inventory_alert_policies (
+        policy_key TEXT PRIMARY KEY CHECK (trim(policy_key) <> ''),
+        scope_type TEXT NOT NULL CHECK (scope_type IN ('DEFAULT', 'SKU')),
+        scope_key TEXT NOT NULL,
+        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        threshold_qty INTEGER NOT NULL CHECK (
+            threshold_qty BETWEEN 0 AND 9999
+        ),
+        repeat_interval_minutes INTEGER NOT NULL CHECK (
+            repeat_interval_minutes BETWEEN 30 AND 1440
+        ),
+        version INTEGER NOT NULL CHECK (version >= 1),
+        updated_by TEXT NOT NULL CHECK (trim(updated_by) <> ''),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK (
+            (scope_type = 'DEFAULT' AND scope_key = '*')
+            OR (scope_type = 'SKU' AND trim(scope_key) <> '' AND scope_key <> '*')
+        )
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS ux_inventory_alert_policies_scope
+    ON inventory_alert_policies(scope_type, scope_key)
+    """,
+]
+
+for _append_only_table in V17_APPEND_ONLY_TABLES:
+    SCHEMA_V17_SQL.extend(
+        (
+            f"""
+            CREATE TRIGGER IF NOT EXISTS
+                trg_{_append_only_table}_append_only_update
+            BEFORE UPDATE ON {_append_only_table}
+            FOR EACH ROW
+            BEGIN
+                SELECT RAISE(ABORT, '{_append_only_table} is append-only');
+            END
+            """,
+            f"""
+            CREATE TRIGGER IF NOT EXISTS
+                trg_{_append_only_table}_append_only_delete
+            BEFORE DELETE ON {_append_only_table}
+            FOR EACH ROW
+            BEGIN
+                SELECT RAISE(ABORT, '{_append_only_table} is append-only');
+            END
+            """,
+        )
+    )
+
+
 def _backfill_shadowbot_batch_registry(
     connection: sqlite3.Connection,
 ) -> None:
@@ -2799,6 +2968,32 @@ def _requires_runtime_schema_v16_migration(
     )
 
 
+def _requires_runtime_schema_v17_migration(
+    connection: sqlite3.Connection,
+) -> bool:
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if "runtime_schema_migrations" not in tables:
+        return True
+    version_row = connection.execute(
+        "SELECT 1 FROM runtime_schema_migrations WHERE schema_version = 17"
+    ).fetchone()
+    return version_row is None or any(
+        table_name not in tables
+        for table_name in (
+            "inventory_authority_state",
+            "inventory_balances",
+            "inventory_transactions",
+            "inventory_sales_baselines",
+            "inventory_alert_policies",
+        )
+    )
+
+
 def _migrate_operational_incidents_to_v15(
     connection: sqlite3.Connection,
 ) -> None:
@@ -3101,11 +3296,13 @@ class SQLiteRuntimeRepository:
             requires_v14_migration = _requires_runtime_schema_v14_migration(connection)
             requires_v15_migration = _requires_runtime_schema_v15_migration(connection)
             requires_v16_migration = _requires_runtime_schema_v16_migration(connection)
+            requires_v17_migration = _requires_runtime_schema_v17_migration(connection)
             requires_runtime_migration = (
                 requires_v13_migration
                 or requires_v14_migration
                 or requires_v15_migration
                 or requires_v16_migration
+                or requires_v17_migration
             )
             if requires_v13_migration or requires_v15_migration:
                 connection.execute("PRAGMA foreign_keys = OFF")
@@ -3197,6 +3394,7 @@ class SQLiteRuntimeRepository:
                     14: "operational time, automation, immutable observations, sales summaries, and incidents",
                     15: "incident occurrence counts and append-only incident events",
                     16: "versioned emergency offline policies for shadow evaluation",
+                    17: "authoritative real inventory balances, immutable ledger, sales baselines, and alert policies",
                 }
                 for statement in SCHEMA_V6_SQL:
                     connection.execute(statement)
@@ -3298,6 +3496,47 @@ class SQLiteRuntimeRepository:
                     connection.execute(statement)
                 for statement in SCHEMA_V16_SQL:
                     connection.execute(statement)
+                for statement in SCHEMA_V17_SQL:
+                    connection.execute(statement)
+                now_text = _datetime_to_text(datetime.now())
+                connection.execute(
+                    """
+                    INSERT INTO inventory_authority_state(
+                        authority_key, authority_mode,
+                        bootstrap_snapshot_sha256,
+                        bootstrap_idempotency_key,
+                        bootstrap_completed_at, bootstrap_completed_by,
+                        version, created_at, updated_at
+                    )
+                    SELECT 'REAL_INVENTORY', 'PRE_CUTOVER',
+                           NULL, NULL, NULL, NULL,
+                           0, ?, ?
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM inventory_authority_state
+                        WHERE authority_key = 'REAL_INVENTORY'
+                    )
+                    """,
+                    (now_text, now_text),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO inventory_alert_policies(
+                        policy_key, scope_type, scope_key,
+                        enabled, threshold_qty, repeat_interval_minutes,
+                        version, updated_by, created_at, updated_at
+                    )
+                    SELECT 'INVENTORY-ALERT-DEFAULT', 'DEFAULT', '*',
+                           0, 0, 60, 1,
+                           'runtime_schema_v17', ?, ?
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM inventory_alert_policies
+                        WHERE scope_type = 'DEFAULT' AND scope_key = '*'
+                    )
+                    """,
+                    (now_text, now_text),
+                )
                 connection.execute(
                     """
                 INSERT INTO operational_time_policies(

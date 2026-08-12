@@ -11,6 +11,7 @@ from app.enums import TaskActionType, TaskOriginType, TaskStatus
 from app.exceptions import ValidationError
 from app.models import ColdStorageStatus, HarvestForecast, ListingRule, PackingCapacityPlan, Product, ScriptRun, ScriptRunItem, Task
 from app.repositories.mock_platform_repository import DEFAULT_MOCK_PLATFORM_DB, MockPlatformRepository
+from app.repositories.inventory_repository import InventoryRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import (
     load_capacity_plans,
@@ -20,6 +21,7 @@ from app.repositories.workbook_repository import (
     load_products,
 )
 from app.services.capacity_planning import CapacityPlanningService
+from app.services.authoritative_inventory import InventoryProvider
 from app.services.listing import ListingService
 from app.services.runtime import ReviewTaskService, RuntimeTaskService
 from app.utils import utc_now
@@ -684,7 +686,9 @@ class BusinessRuleRunner:
             if len(active_plans) == 1:
                 capacity_plan = active_plans[0]
         if context.products_path.exists():
-            products = load_products(context.products_path)
+            products = InventoryProvider(
+                InventoryRepository(self.repository)
+            ).hydrate_products(load_products(context.products_path))
         if context.listing_rules_path.exists():
             listing_rules = load_listing_rules(context.listing_rules_path)
         if context.cold_storage_status_path.exists():

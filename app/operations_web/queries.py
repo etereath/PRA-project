@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import secrets
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
@@ -39,6 +40,7 @@ from app.operations_web.read_models import (
     TodayReadModel,
 )
 from app.repositories.automation_repository import AutomationRepository
+from app.repositories.inventory_repository import InventoryRepository
 from app.repositories.operational_incident_repository import (
     OperationalIncidentRepository,
 )
@@ -49,6 +51,7 @@ from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import load_products
 from app.review_policy import allowed_review_statuses, review_action_label
 from app.services.operational_time import OperationalTimeContext, OperationalTimeService
+from app.services.authoritative_inventory import InventoryProvider
 from app.services.notification_outbox import (
     NOTIFICATION_TYPE_TITLES,
     REVIEW_TYPE_LABELS,
@@ -166,6 +169,8 @@ class OperationsQueryService:
         self.automation = AutomationRepository(runtime_repository)
         self.incidents = OperationalIncidentRepository(runtime_repository)
         self.summaries = OperationalSummaryRepository(runtime_repository)
+        self.inventory = InventoryRepository(runtime_repository)
+        self.inventory_provider = InventoryProvider(self.inventory)
         self.now_provider = now_provider or (lambda: datetime.now(timezone.utc))
 
     def notification_drawer(self) -> NotificationDrawerReadModel:
@@ -254,7 +259,7 @@ class OperationsQueryService:
                     MetricReadModel(
                         "当前可售库存",
                         _qty(inventory_value),
-                        "仅汇总允许销售的当前产品库存资料",
+                        "来自当前真实库存权威；仅汇总允许销售的商品",
                         inventory_state,
                     ),
                 ),
@@ -309,7 +314,7 @@ class OperationsQueryService:
             MetricReadModel(
                 "当前可售库存",
                 _qty(inventory_value),
-                "仅汇总允许销售的当前产品库存资料",
+                "来自当前真实库存权威；仅汇总允许销售的商品",
                 inventory_state,
             ),
         )
@@ -454,14 +459,68 @@ class OperationsQueryService:
             notice=notice,
         )
 
-    def management(self) -> ManagementReadModel:
+    def management(self, *, inventory_transaction_id: str = "") -> ManagementReadModel:
         pending_tasks = self._task_table(page=1, pending_only=True, page_size=6)
         pending_reviews = self._review_table(page=1, pending_only=True, page_size=6)
         runs = self._run_table(page=1, page_size=6)
+        inventory_options: tuple[tuple[str, str, int, int], ...] = ()
+        inventory_receipt = None
+        try:
+            authority = self.inventory.get_authority_state()
+            if authority.authority_mode != "DB_AUTHORITY":
+                inventory_state = StateReadModel(
+                    ReadState.UNAVAILABLE,
+                    "库存尚未切换",
+                    "完成受控 bootstrap 与回读前，Web 不接受数据库库存调整。",
+                )
+            else:
+                products, product_error = self._load_products()
+                if product_error:
+                    raise RuntimeError(product_error)
+                product_by_sku = {item.internal_sku: item for item in products}
+                balances = self.inventory.list_balances()
+                inventory_options = tuple(
+                    (
+                        item.internal_sku,
+                        _inventory_product_label(product_by_sku.get(item.internal_sku)),
+                        item.current_qty,
+                        item.version,
+                    )
+                    for item in balances
+                    if item.internal_sku in product_by_sku
+                )
+                inventory_state = StateReadModel(
+                    ReadState.READY,
+                    "数据库库存为唯一权威",
+                    "人工调整会同时写入当前余额和不可变流水。",
+                )
+                if inventory_transaction_id:
+                    transaction = self.inventory.get_transaction(
+                        inventory_transaction_id
+                    )
+                    if transaction is not None:
+                        inventory_receipt = (
+                            transaction.internal_sku,
+                            _qty(transaction.inventory_before),
+                            _signed_qty(transaction.inventory_delta),
+                            _qty(transaction.inventory_after),
+                        )
+        except Exception:
+            inventory_state = StateReadModel(
+                ReadState.FAILED,
+                "库存服务暂不可用",
+                "页面未修改库存，请联系管理员检查 Runtime Schema。",
+            )
         return ManagementReadModel(
             pending_tasks=pending_tasks,
             pending_reviews=pending_reviews,
             automation_runs=runs,
+            inventory_state=inventory_state,
+            inventory_options=inventory_options,
+            inventory_receipt=inventory_receipt,
+            inventory_idempotency_key=(
+                "web-inventory:" + secrets.token_urlsafe(18)
+            ),
         )
 
     def system(self) -> SystemReadModel:
@@ -698,11 +757,7 @@ class OperationsQueryService:
                 detail_kind="settlement",
             )
         if dataset == "inventory-adjustments":
-            return _unavailable_table(
-                dataset,
-                "库存调整流水",
-                "库存调整流水尚未接入数据库；为避免形成错误记录，本页暂不展示。",
-            )
+            return self._inventory_transactions_table(page)
         if dataset == "mappings":
             return _unavailable_table(
                 dataset,
@@ -770,7 +825,7 @@ class OperationsQueryService:
     def _products_table(self, page: int) -> TableReadModel:
         products, error = self._load_products()
         if error:
-            return _failed_table("products", "商品与库存")
+            return _failed_table("products", "商品与真实库存")
         start = (page - 1) * DEFAULT_PAGE_SIZE
         selected = products[start : start + DEFAULT_PAGE_SIZE + 1]
         visible, has_next = _visible(selected, DEFAULT_PAGE_SIZE)
@@ -790,8 +845,8 @@ class OperationsQueryService:
         )
         return self._table(
             dataset="products",
-            title="商品与库存",
-            columns=("商品", "等级", "规格", "当前库存", "销售状态"),
+            title="商品与真实库存",
+            columns=("商品", "等级", "规格", "真实库存", "销售状态"),
             rows=rows,
             row_urls=urls,
             page=page,
@@ -799,6 +854,39 @@ class OperationsQueryService:
             base_path="/database",
             query={"dataset": "products"},
             state=_rows_state(rows, "产品工作簿中没有商品"),
+        )
+
+    def _inventory_transactions_table(self, page: int) -> TableReadModel:
+        try:
+            values = self.inventory.list_transactions(
+                limit=DEFAULT_PAGE_SIZE + 1,
+                offset=(page - 1) * DEFAULT_PAGE_SIZE,
+            )
+        except Exception:
+            return _failed_table("inventory-adjustments", "库存调整流水")
+        visible, has_next = _visible(values, DEFAULT_PAGE_SIZE)
+        rows = tuple(
+            (
+                item.internal_sku,
+                _inventory_transaction_label(item.transaction_type),
+                _signed_qty(item.inventory_delta),
+                _qty(item.inventory_before),
+                _qty(item.inventory_after),
+                item.reason,
+                _datetime(item.recorded_at),
+            )
+            for item in visible
+        )
+        return self._table(
+            dataset="inventory-adjustments",
+            title="库存调整流水",
+            columns=("商品编码", "类型", "调整值", "调整前", "调整后", "原因", "记录时间"),
+            rows=rows,
+            page=page,
+            has_next=has_next,
+            base_path="/database",
+            query={"dataset": "inventory-adjustments"},
+            state=_rows_state(rows, "当前没有库存调整记录"),
         )
 
     def _prices_table(self, page: int, platform_name: str) -> TableReadModel:
@@ -817,6 +905,7 @@ class OperationsQueryService:
                 item.grade,
                 item.platform_name,
                 _money(item.current_price),
+                _qty(item.platform_stock_qty),
                 _datetime(item.price_observed_at or item.updated_at),
                 _listing_status_label(item.online_status),
             )
@@ -825,7 +914,15 @@ class OperationsQueryService:
         return self._table(
             dataset="prices",
             title="平台价格",
-            columns=("品种", "等级", "平台", "当前售价", "观察时间", "上架状态"),
+            columns=(
+                "品种",
+                "等级",
+                "平台",
+                "当前售价",
+                "平台可购上限",
+                "观察时间",
+                "上架状态",
+            ),
             rows=rows,
             page=page,
             has_next=has_next,
@@ -1269,7 +1366,7 @@ class OperationsQueryService:
         return TableReadModel(
             dataset="today-products",
             title="品种销售与库存",
-            columns=("商品", "等级", "今日已售", "成交均价", "销售额", "当前库存", "数据状态"),
+            columns=("商品", "等级", "今日已售", "成交均价", "销售额", "真实库存", "数据状态"),
             rows=tuple(rows),
             row_urls=tuple(urls),
             state=_rows_state(tuple(rows), "产品工作簿中没有商品"),
@@ -1318,10 +1415,10 @@ class OperationsQueryService:
             DetailFieldReadModel("商品", product.product_name),
             DetailFieldReadModel("等级", product.grade),
             DetailFieldReadModel("规格", product.stem_length),
-            DetailFieldReadModel("当前库存", _qty(product.current_stock)),
+            DetailFieldReadModel("真实库存", _qty(product.current_stock)),
             DetailFieldReadModel("基础成本", _money(product.base_cost)),
             DetailFieldReadModel("销售状态", "可销售" if product.sale_enabled else "停止销售"),
-            DetailFieldReadModel("库存来源", "当前产品库存资料"),
+            DetailFieldReadModel("库存来源", "当前真实库存权威"),
         ]
         related = tuple(
             (
@@ -1577,7 +1674,8 @@ class OperationsQueryService:
 
     def _load_products(self) -> tuple[list[Product], str]:
         try:
-            return load_products(self.paths.products_workbook), ""
+            products = load_products(self.paths.products_workbook)
+            return self.inventory_provider.hydrate_products(products), ""
         except Exception as exc:
             return [], type(exc).__name__
 
@@ -1786,6 +1884,32 @@ def _failed_table(
 
 def _qty(value: int | None) -> str:
     return "—" if value is None else f"{value} 扎"
+
+
+def _signed_qty(value: int) -> str:
+    return f"{value:+d} 扎"
+
+
+def _inventory_transaction_label(value: str) -> str:
+    return {
+        "BOOTSTRAP": "期初库存",
+        "SKU_INITIALIZATION": "新增商品初始化",
+        "MANUAL_INBOUND": "新花入库",
+        "MANUAL_ADJUSTMENT": "人工修正",
+        "SALES_DEDUCTION": "销售扣减",
+        "SALES_RESTORE": "销售恢复",
+        "RECONCILIATION": "对账修正",
+    }.get(value, "库存变动")
+
+
+def _inventory_product_label(product: Product | None) -> str:
+    if product is None:
+        return "商品资料缺失"
+    return " · ".join(
+        item
+        for item in (product.product_name, product.grade, product.stem_length)
+        if item
+    )
 
 
 def _money(value: Decimal | None) -> str:

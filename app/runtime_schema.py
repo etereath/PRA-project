@@ -13,7 +13,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-LATEST_RUNTIME_SCHEMA_VERSION = 16
+LATEST_RUNTIME_SCHEMA_VERSION = 17
 RUNTIME_SCHEMA_VERSIONS = tuple(range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1))
 
 REQUIRED_RUNTIME_TABLES = frozenset(
@@ -62,6 +62,11 @@ REQUIRED_RUNTIME_TABLES = frozenset(
         "operational_incident_events",
         "incident_notification_state",
         "emergency_offline_policies",
+        "inventory_authority_state",
+        "inventory_balances",
+        "inventory_transactions",
+        "inventory_sales_baselines",
+        "inventory_alert_policies",
     }
 )
 
@@ -76,6 +81,7 @@ V14_APPEND_ONLY_TABLES = (
 )
 
 V15_APPEND_ONLY_TABLES = ("operational_incident_events",)
+V17_APPEND_ONLY_TABLES = ("inventory_transactions",)
 
 V7_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "listing_status": (
@@ -658,6 +664,75 @@ V16_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
     ),
 }
 
+V17_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
+    "inventory_authority_state": (
+        "authority_key",
+        "authority_mode",
+        "bootstrap_snapshot_sha256",
+        "bootstrap_idempotency_key",
+        "bootstrap_completed_at",
+        "bootstrap_completed_by",
+        "version",
+        "created_at",
+        "updated_at",
+    ),
+    "inventory_balances": (
+        "internal_sku",
+        "current_qty",
+        "version",
+        "last_transaction_id",
+        "updated_at",
+    ),
+    "inventory_transactions": (
+        "transaction_id",
+        "internal_sku",
+        "inventory_before",
+        "inventory_delta",
+        "inventory_after",
+        "transaction_type",
+        "source_type",
+        "source_ref_id",
+        "reason",
+        "actor",
+        "seller_operation_date",
+        "platform_name",
+        "platform_trade_date",
+        "supporting_refs_json",
+        "idempotency_key",
+        "request_sha256",
+        "balance_version_after",
+        "occurred_at",
+        "recorded_at",
+    ),
+    "inventory_sales_baselines": (
+        "platform_name",
+        "platform_trade_date",
+        "internal_sku",
+        "selected_fact_source",
+        "quality_level",
+        "selected_sold_qty",
+        "source_ref_id",
+        "source_sha256",
+        "mapping_version",
+        "supporting_refs_json",
+        "inventory_transaction_id",
+        "version",
+        "updated_at",
+    ),
+    "inventory_alert_policies": (
+        "policy_key",
+        "scope_type",
+        "scope_key",
+        "enabled",
+        "threshold_qty",
+        "repeat_interval_minutes",
+        "version",
+        "updated_by",
+        "created_at",
+        "updated_at",
+    ),
+}
+
 V14_INDEX_SPECS: Mapping[str, tuple[str, ...]] = {
     "ux_operational_time_policies_current": ("timezone_name",),
     "ix_automation_jobs_type_enabled": ("job_type", "enabled"),
@@ -718,6 +793,20 @@ V15_INDEX_SPECS: Mapping[str, tuple[str, ...]] = {
 
 V16_INDEX_SPECS: Mapping[str, tuple[str, ...]] = {
     "ux_emergency_offline_policies_active": ("platform_name",),
+}
+
+V17_INDEX_SPECS: Mapping[str, tuple[str, ...]] = {
+    "ix_inventory_transactions_sku_recorded": (
+        "internal_sku",
+        "recorded_at",
+        "transaction_id",
+    ),
+    "ix_inventory_transactions_trade_date": (
+        "platform_name",
+        "platform_trade_date",
+        "internal_sku",
+    ),
+    "ux_inventory_alert_policies_scope": ("scope_type", "scope_key"),
 }
 
 V14_TASK_ORIGIN_VALUES = frozenset(
@@ -1025,6 +1114,7 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
             **V14_REQUIRED_COLUMNS,
             **V15_REQUIRED_COLUMNS,
             **V16_REQUIRED_COLUMNS,
+            **V17_REQUIRED_COLUMNS,
         }.items():
             if table not in tables:
                 continue
@@ -1091,6 +1181,9 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
             )
             missing_index_names.update(
                 _check_v16_constraints(connection, constraint_errors)
+            )
+            missing_index_names.update(
+                _check_v17_constraints(connection, constraint_errors)
             )
         missing_indexes = tuple(sorted(missing_index_names))
 
@@ -2034,6 +2127,95 @@ def _check_v16_constraints(
         if row is None or "emergency policy" not in str(row[0] or "").lower():
             errors.append(f"missing trigger {trigger_name}")
 
+    return tuple(sorted(missing_indexes))
+
+
+def _check_v17_constraints(
+    connection: sqlite3.Connection,
+    errors: list[str],
+) -> tuple[str, ...]:
+    missing_indexes: list[str] = []
+    for index_name, expected_columns in V17_INDEX_SPECS.items():
+        row = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index_name,),
+        ).fetchone()
+        if row is None:
+            missing_indexes.append(index_name)
+            continue
+        actual_columns = tuple(
+            str(index_row[2])
+            for index_row in connection.execute(
+                f"PRAGMA index_info('{index_name}')"
+            ).fetchall()
+        )
+        if actual_columns != expected_columns:
+            errors.append(
+                f"{index_name} columns expected {expected_columns}, "
+                f"actual {actual_columns}"
+            )
+
+    authority = connection.execute(
+        "SELECT authority_mode, version FROM inventory_authority_state "
+        "WHERE authority_key = 'REAL_INVENTORY'"
+    ).fetchone()
+    authority_count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM inventory_authority_state"
+        ).fetchone()[0]
+    )
+    if authority is None or authority_count != 1:
+        errors.append(
+            "inventory_authority_state must contain exactly REAL_INVENTORY"
+        )
+    elif str(authority[0]) not in {"PRE_CUTOVER", "DB_AUTHORITY"}:
+        errors.append("inventory_authority_state has invalid authority_mode")
+
+    transaction_sql = re.sub(
+        r"\s+",
+        " ",
+        _table_sql(connection, "inventory_transactions"),
+    ).lower()
+    if "inventory_after = inventory_before + inventory_delta" not in transaction_sql:
+        errors.append("inventory transaction arithmetic constraint is missing")
+    if "inventory_after >= 0" not in transaction_sql:
+        errors.append("inventory transaction non-negative constraint is missing")
+    for table_name in V17_APPEND_ONLY_TABLES:
+        for suffix in ("update", "delete"):
+            trigger_name = f"trg_{table_name}_append_only_{suffix}"
+            row = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+                (trigger_name,),
+            ).fetchone()
+            if row is None or "append-only" not in str(row[0] or "").lower():
+                errors.append(f"missing trigger {trigger_name}")
+
+    actual_foreign_keys = {
+        (str(row[3]), str(row[2]), str(row[4]))
+        for row in connection.execute(
+            "PRAGMA foreign_key_list('inventory_sales_baselines')"
+        ).fetchall()
+    }
+    required_foreign_key = (
+        "inventory_transaction_id",
+        "inventory_transactions",
+        "transaction_id",
+    )
+    if required_foreign_key not in actual_foreign_keys:
+        errors.append(
+            "missing foreign key inventory_sales_baselines."
+            "inventory_transaction_id -> inventory_transactions(transaction_id)"
+        )
+    default_policy_count = int(
+        connection.execute(
+            "SELECT COUNT(*) FROM inventory_alert_policies "
+            "WHERE scope_type = 'DEFAULT' AND scope_key = '*'"
+        ).fetchone()[0]
+    )
+    if default_policy_count != 1:
+        errors.append(
+            "inventory_alert_policies must contain exactly one default policy"
+        )
     return tuple(sorted(missing_indexes))
 
 

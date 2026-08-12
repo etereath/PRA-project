@@ -25,6 +25,7 @@ REQUIRED_WHEEL_MEMBERS = {
     "app/operations_web/templates/mobile_review.html",
     "app/operations_web/templates/mobile_review_shell.html",
     "app/operations_web/static/app.css",
+    "app/operations_web/static/app.js",
 }
 ALLOWED_WHEEL_METADATA = frozenset(
     {"METADATA", "WHEEL", "RECORD", "entry_points.txt", "top_level.txt"}
@@ -35,7 +36,7 @@ ALLOWED_SDIST_ROOT_FILES = frozenset(
 )
 ALLOWED_SDIST_EGG_INFO_FILES = frozenset({"SOURCES.txt"})
 OPERATIONS_WEB_RESOURCE_PATTERN = re.compile(
-    r"^app/operations_web/(?:templates/[^/]+\.html|static/[^/]+\.css)$"
+    r"^app/operations_web/(?:templates/[^/]+\.html|static/[^/]+\.(?:css|js))$"
 )
 SKIPPED_SCAN_DIRECTORIES = frozenset({".git", ".hg", ".svn", "__pycache__"})
 SENSITIVE_MARKER_PATTERNS = (

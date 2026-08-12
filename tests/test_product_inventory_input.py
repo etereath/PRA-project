@@ -196,6 +196,47 @@ class ProductInventoryInputTests(unittest.TestCase):
                 }
             )
 
+    def test_db_authority_rejects_legacy_workbook_inventory_input(self) -> None:
+        form = validate_inventory_form(
+            {
+                "product_name": "艾莎",
+                "grade": "A",
+                "stem_length": "跟随等级",
+                "unit": "扎",
+                "base_cost": "10",
+                "quantity": "8",
+                "sale_enabled": "true",
+            }
+        )
+        with self.assertRaises(ProductInventoryInputError) as context:
+            apply_inventory_input(
+                [_product_row("SKU-1", name="艾莎", grade="A")],
+                form,
+                inventory_authoritative=True,
+            )
+        self.assertIn("唯一权威", str(context.exception))
+
+    def test_db_authority_product_edit_cannot_change_workbook_stock(self) -> None:
+        form = validate_product_edit_form(
+            {
+                "internal_sku": "SKU-1",
+                "product_name": "艾莎",
+                "grade": "A",
+                "stem_length": "跟随等级",
+                "unit": "扎",
+                "base_cost": "10",
+                "current_stock": "99",
+                "sale_enabled": "true",
+            }
+        )
+        with self.assertRaises(ProductInventoryInputError) as context:
+            apply_product_edit(
+                [_product_row("SKU-1", name="艾莎", grade="A")],
+                form,
+                inventory_authoritative=True,
+            )
+        self.assertIn("不能修改", str(context.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

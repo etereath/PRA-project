@@ -167,7 +167,16 @@ def validate_product_edit_form(values: dict[str, str]) -> ProductEditForm:
     )
 
 
-def apply_inventory_input(rows: list[dict[str, object]], form: ProductInventoryForm) -> ProductInventorySaveResult:
+def apply_inventory_input(
+    rows: list[dict[str, object]],
+    form: ProductInventoryForm,
+    *,
+    inventory_authoritative: bool = False,
+) -> ProductInventorySaveResult:
+    if inventory_authoritative:
+        raise ProductInventoryInputError(
+            "数据库库存已成为唯一权威，请使用业务管理中的人工库存调整。"
+        )
     rows = [_ensure_product_row_defaults(row) for row in rows]
     matches = _find_same_type_indexes(rows, form.product_name, form.grade, form.stem_length, form.unit)
 
@@ -228,7 +237,12 @@ def apply_inventory_input(rows: list[dict[str, object]], form: ProductInventoryF
     )
 
 
-def apply_product_edit(rows: list[dict[str, object]], form: ProductEditForm) -> ProductInventorySaveResult:
+def apply_product_edit(
+    rows: list[dict[str, object]],
+    form: ProductEditForm,
+    *,
+    inventory_authoritative: bool = False,
+) -> ProductInventorySaveResult:
     rows = [_ensure_product_row_defaults(row) for row in rows]
     target_index = next(
         (index for index, row in enumerate(rows) if str(row.get("internal_sku") or "").strip() == form.internal_sku),
@@ -249,12 +263,18 @@ def apply_product_edit(rows: list[dict[str, object]], form: ProductEditForm) -> 
         raise ProductInventoryInputError("修改后会与已有商品资料重复，请检查品种、等级、规格和单位。")
 
     row = rows[target_index]
+    stored_stock = _safe_int(row.get("current_stock"), default=0)
+    if inventory_authoritative and form.current_stock != stored_stock:
+        raise ProductInventoryInputError(
+            "数据库库存已成为唯一权威，商品资料编辑不能修改工作簿库存。"
+        )
     row["product_name"] = form.product_name
     row["grade"] = form.grade
     row["stem_length"] = form.stem_length
     row["unit"] = form.unit
     row["base_cost"] = _format_decimal(form.base_cost)
-    row["current_stock"] = str(form.current_stock)
+    if not inventory_authoritative:
+        row["current_stock"] = str(form.current_stock)
     row["sale_enabled"] = "True" if form.sale_enabled else "False"
     return ProductInventorySaveResult(
         rows=rows,

@@ -83,6 +83,8 @@ NOTIFICATION_TYPE_TITLES = {
     "incident_task_success": "处置任务已完成",
     "incident_task_failed": "处置任务失败",
     "incident_task_unknown": "处置结果待确认",
+    "inventory_low": "库存偏低",
+    "inventory_recovered": "库存已恢复",
 }
 
 

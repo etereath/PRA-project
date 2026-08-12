@@ -20,7 +20,7 @@ pra = "app.cli:main"
 include-package-data = false
 
 [tool.setuptools.package-data]
-"app.operations_web" = ["templates/*.html", "static/*.css"]
+"app.operations_web" = ["templates/*.html", "static/*.css", "static/*.js"]
 
 [tool.setuptools.packages.find]
 where = ["."]

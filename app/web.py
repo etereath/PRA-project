@@ -46,6 +46,7 @@ from app.repositories.sqlite_connection import (
     SQLiteConnectionFactory,
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.repositories.inventory_repository import InventoryRepository
 from app.repositories.workbook_repository import (
     get_table_headers,
     load_table_records,
@@ -2545,14 +2546,26 @@ def _handle_business_inputs_page(method: str, environ) -> str | tuple[str, str, 
                 path = Path(products_path)
                 rows = load_product_input_rows(path)
                 form = validate_inventory_form({key: _first(parsed, key, "") for key in parsed})
-                result = apply_inventory_input(rows, form)
+                result = apply_inventory_input(
+                    rows,
+                    form,
+                    inventory_authoritative=_inventory_db_is_authoritative(
+                        Path(runtime_db)
+                    ),
+                )
                 persist_product_rows(path, result.rows)
             elif action == "edit_product":
                 active_input_tab = "inventory"
                 path = Path(products_path)
                 rows = load_product_input_rows(path)
                 form = validate_product_edit_form({key: _first(parsed, key, "") for key in parsed})
-                result = apply_product_edit(rows, form)
+                result = apply_product_edit(
+                    rows,
+                    form,
+                    inventory_authoritative=_inventory_db_is_authoritative(
+                        Path(runtime_db)
+                    ),
+                )
                 persist_product_rows(path, result.rows)
             elif action == "add_price_rule":
                 active_input_tab = "price_rules"
@@ -8318,6 +8331,26 @@ def _get_runtime_session_user(environ) -> str | None:
         return None
     user = session.get("user")
     return str(user) if user else None
+
+
+def _inventory_db_is_authoritative(runtime_db: Path) -> bool:
+    try:
+        return (
+            InventoryRepository(
+                SQLiteRuntimeRepository(runtime_db)
+            ).get_authority_state().authority_mode
+            == "DB_AUTHORITY"
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table: inventory_authority_state" in str(exc).lower():
+            return False
+        raise ProductInventoryInputError(
+            "无法确认库存权威状态，已拒绝修改工作簿库存。"
+        ) from exc
+    except (sqlite3.Error, SQLiteConnectionError, RuntimeError) as exc:
+        raise ProductInventoryInputError(
+            "无法确认库存权威状态，已拒绝修改工作簿库存。"
+        ) from exc
 
 
 def _runtime_db_for_request(environ) -> str:
