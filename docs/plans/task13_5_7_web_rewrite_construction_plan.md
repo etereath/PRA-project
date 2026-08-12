@@ -2,9 +2,9 @@
 
 - 计划日期：2026-08-12
 - Review Profile：R4
-- 当前状态：7A 计划与静态样板重基线；7B 生产代码尚未开始
-- 基线：`origin/main` 当前仍为 `418c605`；旧 Draft PR #30 尚未合并
-- 新分支：`codex/task13-5-7-operations-web-rebaseline`
+- 当前状态：7A 已由 PR #31 合并；7B 已完成本地实现与统一回归，待 Draft PR/CI 评审
+- 基线：`origin/main` 合并提交 `08ea0d2`
+- 7B 分支：`codex/task13-5-7b-web-foundation`
 - 恢复检查点：`checkpoint/pre-task13-5-7-web-rewrite-20260807`
 - 产品权威：[运营 Web 实际业务重基线计划](task13_5_web_rewrite_plan.md)
 - 宏观权威：[GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20)
@@ -486,7 +486,7 @@ CLI 日常旁路全部拒绝；关键 Job 时间不能独立漂移，child job �
 
 1. Worker 检查并恢复、飞书测试、备份和显式类型化 Maintenance Service；
 2. 完成权限隔离和管理员高级诊断；
-3. 拆分 `start_local.ps1`，Web 重启不影响后台；
+3. 复核 7B 已拆分的 `start_local.ps1` 和独立后台入口，证明 Web 重启不影响后台；
 4. 新 Web 切换为唯一入口；
 5. 删除旧页面、旧路由、旧 HTML 拼接、兼容层和重复测试；
 6. 保留测试/Mock/验收/诊断/备份/恢复 CLI；

@@ -182,8 +182,32 @@ $env:PRA_ALLOWED_DATA_DIRS = "D:\PRA_Runtime\data;D:\PRA_Runtime\imports"
 
 用途：开发环境本地 HTTP 的 Session Cookie 安全属性显式开关。
 
-- production 或未配置环境默认始终设置 `Secure`、`HttpOnly`、`SameSite=Lax`。
-- development 只有显式设置 `PRA_COOKIE_SECURE=false`（或 `0`/`no`/`off`）才允许本地 HTTP 不带 `Secure`；不得通过任意 `X-Forwarded-Proto` 头降级。
+- 新运营 Web 要求显式设置，不能依赖默认值。
+- development 必须为 `false`，对应本地 HTTP；production 必须为 `true`，对应 HTTPS。
+- Session 始终设置 `HttpOnly`、`SameSite=Lax`；不得通过任意请求头或
+  `X-Forwarded-Proto` 降级 Cookie。
+
+### `PRA_WEB_PUBLIC_SCHEME`
+
+用途：声明运营人员实际访问新 Web 使用的协议。该值只允许来自启动环境，不能由请求覆盖。
+
+- development 必须显式设为 `http`，并同时设置 `PRA_COOKIE_SECURE=false`；
+- production 必须显式设为 `https`，并同时设置 `PRA_COOKIE_SECURE=true`；
+- 协议、环境和 Cookie 任一冲突时，新运营 Web 在启动阶段失败并给出中文原因；
+- 生产环境的 TLS 终止和反向代理仍属于部署门禁，不能只凭请求转发头宣称已使用 HTTPS。
+
+### 新运营 Web 固定依赖路径
+
+7B Composition Root 在启动时一次性解析以下可选变量；未提供时使用仓库既有默认路径：
+
+- `PRA_RUNTIME_DB`：Runtime DB；
+- `PRA_PRODUCTS_WORKBOOK`：商品工作簿；
+- `PRA_PRICE_RULES_WORKBOOK`：价格规则工作簿；
+- `PRA_LISTING_RULES_WORKBOOK`：上下架规则工作簿；
+- `SHADOWBOT_QUEUE_DIR`：Queue 根目录。
+
+这些值不能出现在 query、form、JSON 或 Session 中。修改后必须重启 Web；GET 不会初始化、
+迁移或修复 Runtime DB。
 
 ### 登录限流变量
 
@@ -227,6 +251,15 @@ $env:PRA_ALLOWED_DATA_DIRS = "D:\PRA_Runtime\data;D:\PRA_Runtime\imports"
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts/start_local.ps1
 ```
+
+该脚本只启动 Web，不再随 Web 启停 Queue Service、Worker 或 Automation。需要独立运行 Queue
+Service 时，另开终端执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/start_local_services.ps1
+```
+
+停止或重启 Web 不会结束由该脚本启动的后台服务；后台进程仍按各自生命周期和恢复手册管理。
 
 默认启动地址：
 

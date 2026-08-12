@@ -18,6 +18,11 @@ REQUIRED_WHEEL_MEMBERS = {
     "app/runtime_schema.py",
     "app/repositories/sqlite_runtime_repository.py",
     "app/services/runtime.py",
+    "app/operations_web/app.py",
+    "app/operations_web/templates/login.html",
+    "app/operations_web/templates/shell.html",
+    "app/operations_web/templates/mobile_review_shell.html",
+    "app/operations_web/static/app.css",
 }
 ALLOWED_WHEEL_METADATA = frozenset(
     {"METADATA", "WHEEL", "RECORD", "entry_points.txt", "top_level.txt"}
@@ -27,6 +32,9 @@ ALLOWED_SDIST_ROOT_FILES = frozenset(
     {"MANIFEST.in", "PKG-INFO", "README.md", "pyproject.toml", "setup.cfg"}
 )
 ALLOWED_SDIST_EGG_INFO_FILES = frozenset({"SOURCES.txt"})
+OPERATIONS_WEB_RESOURCE_PATTERN = re.compile(
+    r"^app/operations_web/(?:templates/[^/]+\.html|static/[^/]+\.css)$"
+)
 SKIPPED_SCAN_DIRECTORIES = frozenset({".git", ".hg", ".svn", "__pycache__"})
 SENSITIVE_MARKER_PATTERNS = (
     re.compile(rb"(?:ghp_|github_pat_|AKIA[0-9A-Z]{16})"),
@@ -207,7 +215,7 @@ def _verify_wheel(path: Path) -> list[str]:
                     issues.append(f"wheel member outside strict allowlist: {name}")
                 continue
             if name.startswith("app/"):
-                if not name.endswith(".py"):
+                if not name.endswith(".py") and not OPERATIONS_WEB_RESOURCE_PATTERN.fullmatch(name):
                     issues.append(f"wheel app member is not declared Python package data: {name}")
                 continue
             if dist_info_root is not None and name.startswith(f"{dist_info_root}/"):
@@ -263,7 +271,7 @@ def _verify_sdist(path: Path) -> list[str]:
             if relative in ALLOWED_SDIST_ROOT_FILES:
                 pass
             elif relative.startswith("app/"):
-                if not relative.endswith(".py"):
+                if not relative.endswith(".py") and not OPERATIONS_WEB_RESOURCE_PATTERN.fullmatch(relative):
                     issues.append(f"sdist app member is not declared Python package data: {name}")
             elif relative.startswith(f"{PACKAGE_NAME}.egg-info/"):
                 metadata_name = relative.split("/", 1)[1]
