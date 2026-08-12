@@ -113,7 +113,8 @@
 | `/health` | 外部健康协议 | 只读 |
 | `/login` | 登录 | 认证写 |
 | `/logout` | 退出 | POST |
-| `/mobile/reviews/{token}` | 飞书手机复核 | Token 限定原子写 |
+| GET `/mobile/review/{review_task_id}?token=...` | 飞书手机复核 | Token 限定只读 |
+| POST `/mobile/review/{review_task_id}/resolve` | 提交复核结果 | Token 限定原子写 |
 
 详情统一使用一个稳定页面：商品/销售/结算/Run/执行事实属于数据库，当前任务/Review/方案
 属于业务管理，系统故障属于系统。URL 可携带 PRA 交易日、品种、等级、平台、商品、状态和

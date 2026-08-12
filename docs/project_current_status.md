@@ -355,7 +355,10 @@ agent-run:<stable-run-id>`；当前 Schema 尚未支持，本阶段只冻结合�
 
 13.5-7A 已由 PR #31 合并到 `main`，7B 已从该合并提交建立独立分支并开始生产代码。当前
 新增 `app/operations_web` 应用骨架、单一 Composition Root、有界内存 Session、登录后轮换、
-POST 退出、CSRF、集中 capability、安全 Header、统一错误边界和本地打包资源。Runtime DB、
+POST 退出、CSRF、集中 capability、安全 Header、统一错误边界和本地打包资源。认证 Session
+不会被匿名登录页请求替换或因 preauth 容量回收而淘汰；无可安全回收项时 fail closed。
+公共路由固定为 `/ → /today`、`/today`、`/login`、POST `/logout`，不在新 Web 复制旧
+`/runtime/login|logout` 别名；登录失败和限流继续进入既有有界安全审计。Runtime DB、
 三类工作簿和 Queue 根目录只在启动时固定；请求中的路径覆盖会被拒绝。`/health`、受保护的
 四入口骨架和错误提示只使用只读连接，绝不调用 `init_schema()` 或迁移；Runtime 健康异常只
 提示另走显式维护，不推断或修复真实数据。Mobile Review 保留

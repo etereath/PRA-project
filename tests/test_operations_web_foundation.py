@@ -10,7 +10,12 @@ from urllib.parse import urlencode
 import pytest
 
 from app.operations_web.app import create_application
-from app.operations_web.auth import Capability, Principal
+from app.operations_web.auth import (
+    Capability,
+    Principal,
+    SessionCapacityError,
+    SessionManager,
+)
 from app.operations_web.composition import (
     OperationsWebConfigurationError,
     OperationsWebContainer,
@@ -19,6 +24,11 @@ from app.operations_web.composition import (
     build_container,
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.services.security import (
+    LoginRateLimiter,
+    clear_security_audit_events,
+    list_security_audit_events,
+)
 
 
 class DenySystemAuthorization:
@@ -122,6 +132,7 @@ def login(app, container) -> tuple[str, str]:
         },
     )
     assert status == "303 See Other"
+    assert header_values(headers, "Location") == ["/today"]
     authenticated_cookie = cookie_pair(header_values(headers, "Set-Cookie")[0])
     return preauth_cookie, authenticated_cookie
 
@@ -219,6 +230,11 @@ def test_composition_root_resolves_fixed_paths_once(tmp_path: Path) -> None:
     assert settings.paths.runtime_db.is_absolute()
 
 
+def test_settings_repr_never_contains_admin_password(operations_web) -> None:
+    _, container, _ = operations_web
+    assert "synthetic-password" not in repr(container.settings)
+
+
 def test_all_get_routes_are_zero_write_and_never_initialize_schema(operations_web, monkeypatch) -> None:
     app, container, root = operations_web
     _, authenticated_cookie = login(app, container)
@@ -232,23 +248,24 @@ def test_all_get_routes_are_zero_write_and_never_initialize_schema(operations_we
 
     monkeypatch.setattr(SQLiteRuntimeRepository, "init_schema", forbidden_init_schema)
     requests = [
-        ("/health", ""),
-        ("/login", ""),
-        ("/", authenticated_cookie),
-        ("/database", authenticated_cookie),
-        ("/management", authenticated_cookie),
-        ("/system", authenticated_cookie),
-        ("/mobile/review/REVIEW-SYNTHETIC", ""),
-        ("/static/app.css", ""),
+        ("/health", "", {"200"}),
+        ("/login", "", {"200"}),
+        ("/", authenticated_cookie, {"303"}),
+        ("/today", authenticated_cookie, {"200"}),
+        ("/database", authenticated_cookie, {"200"}),
+        ("/management", authenticated_cookie, {"200"}),
+        ("/system", authenticated_cookie, {"200"}),
+        ("/mobile/review/REVIEW-SYNTHETIC", "", {"503"}),
+        ("/static/app.css", "", {"200"}),
     ]
-    for path, cookie in requests:
+    for path, cookie, expected_statuses in requests:
         status, _, _ = call_app(
             app,
             path=path,
             query="token=synthetic-secret" if path.startswith("/mobile/") else "",
             cookie=cookie,
         )
-        assert status.split()[0] in {"200", "503"}
+        assert status.split()[0] in expected_statuses
     assert snapshot_tree(root, ignore_sqlite_sidecar_mtime=True) == before
 
 
@@ -338,6 +355,111 @@ def test_login_rotates_session_and_cookie_mode_is_explicit(operations_web) -> No
     assert container.sessions.get(authenticated_cookie).principal.subject == "admin"
 
 
+def test_authenticated_get_login_preserves_session_and_redirects_to_today(operations_web) -> None:
+    app, container, _ = operations_web
+    _, authenticated_cookie = login(app, container)
+    original = container.sessions.get(authenticated_cookie)
+
+    status, headers, _ = call_app(app, path="/login", cookie=authenticated_cookie)
+
+    assert status == "303 See Other"
+    assert header_values(headers, "Location") == ["/today"]
+    assert header_values(headers, "Set-Cookie") == []
+    assert container.sessions.get(authenticated_cookie) is original
+    assert call_app(app, path="/today", cookie=authenticated_cookie)[0] == "200 OK"
+
+
+def test_preauth_capacity_never_evicts_authenticated_session() -> None:
+    principal = Principal(subject="admin", capabilities=frozenset({Capability.VIEW_TODAY}))
+    sessions = SessionManager(cookie_secure=False, max_sessions=2)
+    _, authenticated_header = sessions.rotate_authenticated(
+        principal=principal,
+        replace_session_id=None,
+    )
+    authenticated_cookie = cookie_pair(authenticated_header)
+    preauth_cookies: list[str] = []
+
+    for _ in range(6):
+        _, preauth_header = sessions.issue_preauth()
+        preauth_cookies.append(cookie_pair(preauth_header))
+
+    authenticated = sessions.get(authenticated_cookie)
+    assert authenticated is not None
+    assert authenticated.principal == principal
+    assert [cookie for cookie in preauth_cookies if sessions.get(cookie) is not None] == [
+        preauth_cookies[-1]
+    ]
+
+    authenticated_only = SessionManager(cookie_secure=False, max_sessions=1)
+    authenticated_only.rotate_authenticated(principal=principal, replace_session_id=None)
+    with pytest.raises(SessionCapacityError, match="容量"):
+        authenticated_only.issue_preauth()
+
+
+def test_public_route_contract_and_legacy_runtime_aliases_are_absent(operations_web) -> None:
+    app, container, _ = operations_web
+    status, headers, _ = call_app(app, path="/")
+    assert status == "303 See Other"
+    assert header_values(headers, "Location") == ["/today"]
+
+    status, headers, _ = call_app(app, path="/today")
+    assert status == "303 See Other"
+    assert header_values(headers, "Location") == ["/login"]
+
+    _, authenticated_cookie = login(app, container)
+    status, _, body = call_app(app, path="/today", cookie=authenticated_cookie)
+    assert status == "200 OK"
+    assert 'href="/today"' in body
+
+    for path, method in (
+        ("/runtime/login", "GET"),
+        ("/runtime/login", "POST"),
+        ("/runtime/logout", "POST"),
+    ):
+        assert call_app(app, path=path, method=method)[0] == "404 Not Found"
+
+
+def test_login_failures_and_triggering_attempt_enter_bounded_security_audit(
+    operations_web,
+    monkeypatch,
+) -> None:
+    app, _, _ = operations_web
+    clear_security_audit_events()
+    monkeypatch.setenv("RUNTIME_LOGIN_RATE_LIMIT_MAX_ATTEMPTS", "2")
+    monkeypatch.setattr("app.operations_web.app.LOGIN_RATE_LIMITER", LoginRateLimiter())
+
+    def fail_login() -> str:
+        status, headers, body = call_app(app, path="/login")
+        assert status == "200 OK"
+        preauth_cookie = cookie_pair(header_values(headers, "Set-Cookie")[0])
+        token = re.search(r'name="csrf_token" value="([^"]+)"', body).group(1)
+        status, _, _ = call_app(
+            app,
+            path="/login",
+            method="POST",
+            cookie=preauth_cookie,
+            form={
+                "username": "admin",
+                "password": "wrong-password",
+                "csrf_token": token,
+            },
+        )
+        return status
+
+    try:
+        assert fail_login() == "401 Unauthorized"
+        assert fail_login() == "429 Too Many Requests"
+        events = list_security_audit_events()
+        event_types = [str(event["event_type"]) for event in events]
+        assert event_types.count("LOGIN_FAILED") == 2
+        assert "LOGIN_RATE_LIMITED" in event_types
+        serialized = repr(events)
+        assert "wrong-password" not in serialized
+        assert "admin" not in serialized
+    finally:
+        clear_security_audit_events()
+
+
 def test_production_session_cookie_is_secure(tmp_path: Path) -> None:
     settings = OperationsWebSettings.from_environment(
         {
@@ -377,6 +499,7 @@ def test_csrf_and_logout_are_fail_closed(operations_web) -> None:
     )
     assert status == "303 See Other"
     assert "Max-Age=0" in header_values(headers, "Set-Cookie")[0]
+    assert header_values(headers, "Cache-Control") == ["no-store"]
     assert container.sessions.get(authenticated) is None
 
 
@@ -433,7 +556,7 @@ def test_mobile_review_protocol_shell_is_read_only_and_does_not_echo_secrets(ope
 def test_business_posts_are_not_available_in_7b(operations_web) -> None:
     app, container, _ = operations_web
     _, authenticated = login(app, container)
-    for path in ("/", "/database", "/management", "/system"):
+    for path in ("/", "/today", "/database", "/management", "/system"):
         status, headers, _ = call_app(app, path=path, method="POST", cookie=authenticated)
         assert status == "405 Method Not Allowed"
         assert header_values(headers, "Allow") == ["GET"]

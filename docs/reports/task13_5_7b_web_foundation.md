@@ -16,7 +16,7 @@ HTML 拼接、业务 Route 或隐式数据库初始化；只复用已验证的 S
 
 - 启动时固定的 Runtime DB、商品/价格/上下架工作簿和 Queue 根目录；
 - development/production 与 HTTP/HTTPS、Secure Cookie 的显式一致性校验；
-- 有界内存 Session、登录后轮换、POST 退出和 CSRF；
+- 有界内存 Session、认证会话保护、登录后轮换、POST 退出和 CSRF；
 - 后端集中 capability 判定，模板不决定权限；
 - CSP、`X-Content-Type-Options`、frame、Referrer 和 Permissions Policy；
 - `/health`、登录/退出、四入口安全骨架和 Mobile Review 无写入外壳；
@@ -84,8 +84,15 @@ SQLite 在打开 WAL 数据库的只读连接时可能更新 `-shm` 协调文件
 ## 6. 认证、授权和错误边界
 
 - GET 登录页签发一次性预认证 Session；登录成功轮换 Session ID；
+- 已认证用户 GET `/login` 固定 `303 /today`，不会替换、删除或降级当前认证 Session；
+- Session 容量回收只允许清理过期会话和旧 preauth，匿名请求绝不淘汰有效 authenticated
+  Session；全为认证会话且无可安全回收项时返回有界 `503`；
+- 公共路由固定为 `/ → 303 /today`、`/today` 今日 shell、`/login` 和 POST `/logout`；
+  新 Web 不提供 `/runtime/login`、`/runtime/logout` 兼容别名；
 - Session Cookie 固定 `HttpOnly`、`SameSite=Lax`，`Secure` 只由启动组合决定；
 - 退出只接受 POST 且必须携带当前 Session CSRF；
+- `LOGIN_FAILED` 和 `LOGIN_RATE_LIMITED` 直接复用既有有界安全审计，只保存 hash 后的主体
+  元数据；触发封禁的当次失败立即返回 `429`；
 - `PrincipalCapabilityBackend` 在 Route 调用前判定 `VIEW_TODAY`、`VIEW_DATABASE`、
   `MANAGE_BUSINESS`、`VIEW_SYSTEM` 等 capability；测试替身拒绝后稳定返回 `403`；
 - 所有响应，包括静态资源、404、健康失败和异常，统一附加安全 Header；
@@ -118,15 +125,17 @@ wheel 成员；没有扩大到任意静态文件或真实数据。
 
 ## 9. 测试结果
 
-开发阶段专项：
+首轮评审整改后的 7B 与打包专项：
 
 ```text
-28 passed, 3 subtests passed
+33 passed, 3 subtests passed
 ```
 
 覆盖环境冲突、固定路径、GET 零写、缺失 DB 不创建、请求路径覆盖拒绝、Session 轮换、
-Secure/非 Secure Cookie、CSRF、POST 退出、capability 拒绝、安全 Header、Mobile Review
-零写、7B 无业务 POST、本地资源和严格打包单测。
+认证 GET `/login` 不降级、preauth 容量回收不淘汰认证会话、无可安全回收项时 fail closed、
+`/today` 路由合同、旧 runtime 登录别名删除、登录失败/限流审计、Secure/非 Secure Cookie、
+CSRF、POST 退出、capability 拒绝、安全 Header、Mobile Review 零写、7B 无业务 POST、本地
+资源和严格打包单测。评审直接专项为 `24 passed`。
 
 首次完整回归另暴露既有 `archive_attempt_artifacts()` 的并发竞态：两个线程都通过
 `source.exists()` 后，其中一方先完成 `os.replace()`，另一方会泄露 Windows
@@ -135,16 +144,16 @@ Secure/非 Secure Cookie、CSRF、POST 退出、capability 拒绝、安全 Heade
 `OLD_QUEUE_ARTIFACT_CONFLICT`；其他异常缺失返回 `OLD_QUEUE_ARTIFACT_MISSING` 并继续
 fail closed。该用例修复后将重复运行并纳入完整回归。
 
-受影响组合：
+评审整改后的旧 Web、安全和 Runtime 受影响组合：
 
 ```text
-144 passed, 23 subtests passed
+116 passed, 20 subtests passed
 ```
 
 并发恢复竞态用例修复后连续运行 20 次均通过。完整回归：
 
 ```text
-1147 passed, 3 skipped, 97 subtests passed
+1152 passed, 3 skipped, 97 subtests passed
 ```
 
 系统冒烟：`16 passed, 0 failed`。Windows Core fixture 通过。实际 wheel/sdist 构建、严格
@@ -154,8 +163,8 @@ fail closed。该用例修复后将重复运行并纳入完整回归。
 最终本地发行物摘要：
 
 ```text
-wheel sha256=885067a4d7e8637a09d26272d2e5eedf9503eba5a21588d4209353d5cb9f610c
-sdist sha256=2b23d9b938daecf6b945c026efafa3a6fd3f09506cb3e8365f1364ce0300c2cd
+wheel sha256=c66f52cc9837775f76164d9c817cc0a97a7e3a528b84dddb278e4a9a6789ee25
+sdist sha256=1e420394ddfa5aa4af10285c0ca42001423e2ae454151748378193fc0c0c23ca
 ```
 
 ## 10. 明确未实现

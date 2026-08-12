@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
@@ -40,7 +40,7 @@ class OperationsWebSettings:
     public_scheme: str
     cookie_secure: bool
     admin_username: str
-    admin_password: str
+    admin_password: str = field(repr=False)
     paths: OperationsWebPaths
 
     @classmethod

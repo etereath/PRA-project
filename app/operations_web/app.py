@@ -9,7 +9,7 @@ from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, unquote
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
-from app.operations_web.auth import Capability
+from app.operations_web.auth import Capability, SessionCapacityError
 from app.operations_web.composition import OperationsWebContainer, build_container
 from app.operations_web.rendering import html, render_template, static_text
 from app.operations_web.security import Response, internal_error_response
@@ -33,7 +33,7 @@ DEPENDENCY_OVERRIDE_FIELDS = frozenset(
 )
 
 PROTECTED_ROUTES: dict[str, tuple[str, Capability]] = {
-    "/": ("今日", Capability.VIEW_TODAY),
+    "/today": ("今日", Capability.VIEW_TODAY),
     "/database": ("数据库", Capability.VIEW_DATABASE),
     "/management": ("业务管理", Capability.MANAGE_BUSINESS),
     "/system": ("系统", Capability.VIEW_SYSTEM),
@@ -101,14 +101,23 @@ class OperationsWebApplication:
                 return self._method_not_allowed("GET")
             return self._health()
 
-        if path in {"/login", "/runtime/login"}:
+        if path == "/":
+            if method != "GET":
+                return self._method_not_allowed("GET")
+            return Response.text(
+                "303 See Other",
+                "",
+                headers=[("Location", "/today"), ("Cache-Control", "no-store")],
+            )
+
+        if path == "/login":
             if method == "GET":
                 return self._login_page(environ)
             if method == "POST":
                 return self._login(environ)
             return self._method_not_allowed("GET, POST")
 
-        if path in {"/logout", "/runtime/logout"}:
+        if path == "/logout":
             if method != "POST":
                 return self._method_not_allowed("POST")
             return self._logout(environ)
@@ -140,9 +149,22 @@ class OperationsWebApplication:
 
     def _login_page(self, environ, *, message: str = "", status: str = "200 OK") -> Response:
         previous = self.container.sessions.get(str(environ.get("HTTP_COOKIE", "")))
-        state, cookie = self.container.sessions.issue_preauth(
-            replace_session_id=previous.session_id if previous else None
-        )
+        if previous is not None and previous.principal is not None:
+            return Response.text(
+                "303 See Other",
+                "",
+                headers=[("Location", "/today"), ("Cache-Control", "no-store")],
+            )
+        try:
+            state, cookie = self.container.sessions.issue_preauth(
+                replace_session_id=previous.session_id if previous else None
+            )
+        except SessionCapacityError:
+            return Response.text(
+                "503 Service Unavailable",
+                "登录会话容量已满，请稍后重试。",
+                headers=[("Cache-Control", "no-store"), ("Retry-After", "30")],
+            )
         body = render_template(
             "login.html",
             message=html(message),
@@ -172,23 +194,59 @@ class OperationsWebApplication:
         password = self._first(body, "password")
         remote_addr = str(environ.get("REMOTE_ADDR", ""))
         if LOGIN_RATE_LIMITER.is_blocked(username, remote_addr):
+            record_security_event(
+                "LOGIN_RATE_LIMITED",
+                route="/login",
+                outcome="rejected",
+                reason_code="RATE_LIMITED",
+                subject=username,
+            )
             return Response.text("429 Too Many Requests", "登录尝试过于频繁，请稍后再试。")
 
         principal = self.container.credentials.authenticate(username, password)
         if principal is None:
-            LOGIN_RATE_LIMITER.record_failure(username, remote_addr)
+            blocked = LOGIN_RATE_LIMITER.record_failure(username, remote_addr)
+            record_security_event(
+                "LOGIN_FAILED",
+                route="/login",
+                outcome="rejected",
+                reason_code=(
+                    "PASSWORD_NOT_CONFIGURED"
+                    if not self.container.credentials.configured
+                    else "INVALID_CREDENTIALS"
+                ),
+                subject=username,
+            )
             reason = (
                 "尚未配置后台登录密码。"
                 if not self.container.credentials.configured
                 else "账号或密码不正确。"
             )
-            return self._login_page(environ, message=reason, status="401 Unauthorized")
+            status = "401 Unauthorized"
+            if blocked:
+                record_security_event(
+                    "LOGIN_RATE_LIMITED",
+                    route="/login",
+                    outcome="rejected",
+                    reason_code="RATE_LIMITED",
+                    subject=username,
+                )
+                reason = "登录尝试过于频繁，请稍后再试。"
+                status = "429 Too Many Requests"
+            return self._login_page(environ, message=reason, status=status)
 
+        try:
+            _, cookie = self.container.sessions.rotate_authenticated(
+                principal=principal,
+                replace_session_id=session.session_id if session else None,
+            )
+        except SessionCapacityError:
+            return Response.text(
+                "503 Service Unavailable",
+                "登录会话容量已满，请稍后重试。",
+                headers=[("Cache-Control", "no-store"), ("Retry-After", "30")],
+            )
         LOGIN_RATE_LIMITER.record_success(username, remote_addr)
-        _, cookie = self.container.sessions.rotate_authenticated(
-            principal=principal,
-            replace_session_id=session.session_id if session else None,
-        )
         record_security_event(
             "LOGIN_SUCCESS",
             route="/login",
@@ -200,7 +258,7 @@ class OperationsWebApplication:
             "303 See Other",
             "",
             headers=[
-                ("Location", "/"),
+                ("Location", "/today"),
                 ("Set-Cookie", cookie),
                 ("Cache-Control", "no-store"),
             ],
@@ -225,7 +283,11 @@ class OperationsWebApplication:
         return Response.text(
             "303 See Other",
             "",
-            headers=[("Location", "/login"), ("Set-Cookie", expired_cookie)],
+            headers=[
+                ("Location", "/login"),
+                ("Set-Cookie", expired_cookie),
+                ("Cache-Control", "no-store"),
+            ],
         )
 
     def _protected_page(self, environ, path: str) -> Response:
@@ -251,7 +313,7 @@ class OperationsWebApplication:
         body = render_template(
             "shell.html",
             page_title=html(title),
-            active_today="active" if path == "/" else "",
+            active_today="active" if path == "/today" else "",
             active_database="active" if path == "/database" else "",
             active_management="active" if path == "/management" else "",
             active_system="active" if path == "/system" else "",

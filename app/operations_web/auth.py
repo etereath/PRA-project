@@ -17,6 +17,10 @@ SESSION_TTL_SECONDS = 3600
 MAX_SESSIONS = 4096
 
 
+class SessionCapacityError(RuntimeError):
+    """会话池已满，且没有可安全回收的预登录会话。"""
+
+
 class Capability(StrEnum):
     VIEW_TODAY = "VIEW_TODAY"
     VIEW_DATABASE = "VIEW_DATABASE"
@@ -79,9 +83,18 @@ class SessionState:
 class SessionManager:
     """有界内存 Session；不会写 Runtime DB、工作簿或队列。"""
 
-    def __init__(self, *, cookie_secure: bool, ttl_seconds: int = SESSION_TTL_SECONDS) -> None:
+    def __init__(
+        self,
+        *,
+        cookie_secure: bool,
+        ttl_seconds: int = SESSION_TTL_SECONDS,
+        max_sessions: int = MAX_SESSIONS,
+    ) -> None:
+        if max_sessions <= 0:
+            raise ValueError("max_sessions 必须大于 0。")
         self._cookie_secure = cookie_secure
         self._ttl_seconds = ttl_seconds
+        self._max_sessions = max_sessions
         self._sessions: dict[str, SessionState] = {}
         self._lock = Lock()
 
@@ -148,10 +161,22 @@ class SessionManager:
         with self._lock:
             self._cleanup_locked(now)
             if replace_session_id:
-                self._sessions.pop(replace_session_id, None)
-            while len(self._sessions) >= MAX_SESSIONS:
-                oldest = min(self._sessions, key=lambda key: self._sessions[key].expires_at)
-                self._sessions.pop(oldest, None)
+                replaced = self._sessions.get(replace_session_id)
+                if principal is not None or (replaced is not None and replaced.principal is None):
+                    self._sessions.pop(replace_session_id, None)
+            while len(self._sessions) >= self._max_sessions:
+                preauth_sessions = {
+                    session_id: current
+                    for session_id, current in self._sessions.items()
+                    if current.principal is None
+                }
+                if not preauth_sessions:
+                    raise SessionCapacityError("会话容量已满，请稍后重试。")
+                oldest_preauth = min(
+                    preauth_sessions,
+                    key=lambda key: preauth_sessions[key].expires_at,
+                )
+                self._sessions.pop(oldest_preauth, None)
             self._sessions[state.session_id] = state
         return state, self._cookie_header(state.session_id, max_age=self._ttl_seconds)
 
