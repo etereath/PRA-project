@@ -98,7 +98,7 @@ def render_database(model: DatabaseReadModel) -> str:
     return f"""
     <section class="hero compact-hero">
       <div><p class="eyebrow">只读数据中心</p><h1>数据库</h1><p>{html(model.section_title)} · 一次只展示一个数据集</p></div>
-      <span class="status-pill">交易日 {html(model.trade_date)}</span>
+      <span class="status-pill">交易日 {html(model.trade_date or "不可用")}</span>
     </section>
     <nav class="section-tabs" aria-label="数据库分页">{tabs}</nav>
     {notice}

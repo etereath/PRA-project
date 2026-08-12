@@ -118,4 +118,9 @@ def review_action_label(
         return "重试任务"
     if decision == CANCEL_TASK_DECISION:
         return "取消任务"
-    return ""
+    return {
+        ReviewTaskStatus.APPROVED: "通过",
+        ReviewTaskStatus.REJECTED: "拒绝",
+        ReviewTaskStatus.ADJUSTED: "调整",
+        ReviewTaskStatus.CANCELLED: "取消",
+    }.get(status, "")

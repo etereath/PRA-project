@@ -3,13 +3,14 @@ from __future__ import annotations
 import hashlib
 import io
 import re
+from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import urlencode
 
 import pytest
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 from app.enums import (
     DataQualityLevel,
@@ -38,6 +39,7 @@ from app.repositories.operational_summary_repository import OperationalSummaryRe
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import PRODUCT_HEADERS
 from app.services.runtime import ReviewTokenService
+from app.services.operational_time import OperationalTimePolicy
 
 
 FIXED_NOW = datetime(2026, 8, 12, 1, 0, tzinfo=timezone.utc)
@@ -117,7 +119,7 @@ def test_today_uses_trade_day_summary_and_distinguishes_trustworthy_zero(read_on
             DataQualityLevel.ORDER_COMPLETE,
             3,
             FIXED_NOW - timedelta(minutes=31),
-            "销售事实已过期",
+            "销售事实可用",
         ),
     ],
 )
@@ -145,8 +147,140 @@ def test_today_presents_all_frozen_quality_and_freshness_branches(
 
     assert status == "200 OK"
     assert expected_title in body
+    if updated_at < FIXED_NOW:
+        assert "2026-08-12 08:29" in body
     if quality is DataQualityLevel.UNAVAILABLE:
         assert "—" in body
+
+
+def test_today_sellable_inventory_excludes_disabled_products(read_only_web) -> None:
+    app, _, _, tmp_path = read_only_web
+    workbook_path = tmp_path / "products.xlsx"
+    workbook = load_workbook(workbook_path)
+    sheet = workbook["data"]
+    sheet.append(
+        [
+            "CLOSED-B-50-Z",
+            "停售商品",
+            "B级",
+            "50cm",
+            "扎",
+            8,
+            999,
+            False,
+            12,
+            12,
+            "合成测试",
+            "",
+            "",
+        ]
+    )
+    workbook.save(workbook_path)
+
+    model = app.queries.today()
+    sellable_inventory = next(
+        metric for metric in model.metrics if metric.label == "当前可售库存"
+    )
+
+    assert sellable_inventory.value == "72 扎"
+    assert "允许销售" in sellable_inventory.note
+
+
+@pytest.mark.parametrize("failure_mode", ["read-failed", "no-effective-policy"])
+def test_today_does_not_query_a_guessed_trade_day_when_time_policy_is_unavailable(
+    read_only_web,
+    monkeypatch,
+    failure_mode: str,
+) -> None:
+    app, container, _, _ = read_only_web
+    summary_queries: list[dict[str, object]] = []
+
+    if failure_mode == "read-failed":
+        def fail_policy_read():
+            raise RuntimeError("synthetic policy read failure")
+
+        monkeypatch.setattr(
+            app.queries.automation,
+            "load_operational_time_policies",
+            fail_policy_read,
+        )
+        expected_title = "交易日时间策略读取失败"
+    else:
+        monkeypatch.setattr(
+            app.queries.automation,
+            "load_operational_time_policies",
+            lambda: (
+                OperationalTimePolicy(
+                    policy_version="CN_SINGLE_PLATFORM_2026_V2",
+                    effective_from=FIXED_NOW + timedelta(days=1),
+                ),
+            ),
+        )
+        expected_title = "当前没有唯一有效的交易日时间策略"
+
+    def record_summary_query(**kwargs):
+        summary_queries.append(kwargs)
+        return []
+
+    monkeypatch.setattr(
+        app.queries.summaries,
+        "list_summaries_page",
+        record_summary_query,
+    )
+    cookie = _login(app, container)
+
+    status, _, body = _call_app(app, path="/today", cookie=cookie)
+    model = app.queries.today()
+
+    assert status == "200 OK"
+    assert expected_title in body
+    assert model.platform_trade_date == "不可用"
+    assert summary_queries == []
+
+
+def test_explicit_historical_trade_date_remains_readable_when_current_policy_fails(
+    read_only_web,
+    monkeypatch,
+) -> None:
+    app, _, repository, _ = read_only_web
+    _insert_summary(
+        repository,
+        summary_id="SUMMARY-HISTORICAL",
+        scope_type="PLATFORM",
+        scope_key="蚂蚁花团",
+        sold_qty=3,
+        amount=Decimal("30"),
+        quality=DataQualityLevel.ORDER_COMPLETE,
+    )
+
+    def fail_policy_read():
+        raise RuntimeError("synthetic policy read failure")
+
+    monkeypatch.setattr(
+        app.queries.automation,
+        "load_operational_time_policies",
+        fail_policy_read,
+    )
+
+    implicit = app.queries.database(
+        section="business",
+        dataset="settlements",
+        page=1,
+        trade_date=None,
+        platform_name="",
+    )
+    explicit = app.queries.database(
+        section="business",
+        dataset="settlements",
+        page=1,
+        trade_date=TRADE_DATE,
+        platform_name="",
+    )
+
+    assert implicit.table.state.state.value == "failed"
+    assert implicit.table.rows == ()
+    assert len(explicit.table.rows) == 1
+    assert explicit.trade_date == TRADE_DATE.isoformat()
 
 
 def test_database_task_history_uses_default_25_server_page(read_only_web) -> None:
@@ -253,6 +387,80 @@ def test_detail_ownership_is_unique_and_cross_owner_routes_are_absent(read_only_
     assert _call_app(app, path="/management/product/AISHA-A-50-Z", cookie=cookie)[0] == "404 Not Found"
 
 
+def test_settlement_list_shows_only_current_version_and_marks_historical_detail(
+    read_only_web,
+) -> None:
+    app, _, repository, _ = read_only_web
+    previous = _insert_summary(
+        repository,
+        summary_id="SUMMARY-V1",
+        scope_type="PLATFORM",
+        scope_key="蚂蚁花团",
+        sold_qty=3,
+        amount=Decimal("30"),
+        quality=DataQualityLevel.ORDER_COMPLETE,
+    )
+    revision = replace(
+        previous,
+        summary_id="SUMMARY-V2",
+        version_no=2,
+        supersedes_summary_id=previous.summary_id,
+        sold_qty=4,
+        transaction_amount_total=Decimal("40"),
+        summary_status=SummaryStatus.OBSERVED,
+        input_manifest_sha256="b" * 64,
+        updated_at=FIXED_NOW + timedelta(minutes=5),
+    )
+    event = TradeDaySummaryEvent(
+        event_id="EVENT-SUMMARY-V2",
+        summary_id=revision.summary_id,
+        from_status=SummaryStatus.PROVISIONAL,
+        to_status=SummaryStatus.OBSERVED,
+        trigger_type="SYNTHETIC_REVISION",
+        trigger_ref_id="fixture-v2",
+        fact_source_before=previous.fact_source,
+        fact_source_after=revision.fact_source,
+        quality_level_before=previous.quality_level,
+        quality_level_after=revision.quality_level,
+        input_manifest_sha256=revision.input_manifest_sha256,
+        changed_at=revision.updated_at,
+        changed_by="test",
+    )
+    inserted = OperationalSummaryRepository(repository).insert_revision(
+        previous=previous,
+        revision=revision,
+        event=event,
+        inputs=(),
+    )
+
+    model = app.queries.database(
+        section="business",
+        dataset="settlements",
+        page=1,
+        trade_date=TRADE_DATE,
+        platform_name="",
+    )
+    old_detail = app.queries.detail("settlement", previous.summary_id)
+    current_detail = app.queries.detail("settlement", revision.summary_id)
+
+    assert inserted is True
+    assert len(model.table.rows) == 1
+    assert len(model.table.row_urls) == 1
+    assert "SUMMARY-V2" in model.table.row_urls[0]
+    assert "SUMMARY-V1" not in model.table.row_urls[0]
+    assert old_detail is not None
+    assert old_detail.state.title == "历史版本 · 已被取代"
+    assert any(
+        field.label == "版本身份" and field.value == "历史版本，已被取代"
+        for field in old_detail.fields
+    )
+    assert current_detail is not None
+    assert any(
+        field.label == "版本身份" and field.value == "当前权威版本"
+        for field in current_detail.fields
+    )
+
+
 def test_mobile_review_valid_invalid_expired_and_processed_states_are_zero_write(
     read_only_web,
     monkeypatch,
@@ -297,7 +505,7 @@ def test_mobile_review_valid_invalid_expired_and_processed_states_are_zero_write
 
     assert valid_status == "200 OK"
     assert "等待处理" in valid_body
-    assert "改价到指定值" in valid_body
+    assert "改价到" in valid_body
     assert "立即下架" in valid_body
     assert created.raw_token not in valid_body
     assert invalid_status == "404 Not Found"
@@ -308,9 +516,13 @@ def test_mobile_review_valid_invalid_expired_and_processed_states_are_zero_write
     assert hashlib.sha256(repository.db_path.read_bytes()).hexdigest() == before
 
     app.queries.now_provider = lambda: FIXED_NOW + timedelta(hours=2)
-    expired = app.queries.mobile_review("REVIEW-MOBILE", created.raw_token)
-    assert expired.http_status == "410 Gone"
-    assert expired.state.title == "链接已过期"
+    expired_status, _, expired_body = _call_app(
+        app,
+        path="/mobile/review/REVIEW-MOBILE",
+        query=urlencode({"token": created.raw_token}),
+    )
+    assert expired_status == "410 Gone"
+    assert "链接已过期" in expired_body
 
     app.queries.now_provider = lambda: FIXED_NOW
     review.review_status = ReviewTaskStatus.APPROVED
@@ -318,9 +530,123 @@ def test_mobile_review_valid_invalid_expired_and_processed_states_are_zero_write
     review.resolved_at = FIXED_NOW + timedelta(minutes=5)
     review.updated_at = review.resolved_at
     repository.update_review_task(review)
-    processed = app.queries.mobile_review("REVIEW-MOBILE", created.raw_token)
-    assert processed.http_status == "200 OK"
-    assert processed.state.title == "已经处理"
+    processed_status, _, processed_body = _call_app(
+        app,
+        path="/mobile/review/REVIEW-MOBILE",
+        query=urlencode({"token": created.raw_token}),
+    )
+    assert processed_status == "200 OK"
+    assert "已经处理" in processed_body
+
+
+@pytest.mark.parametrize(
+    ("review_type", "with_failed_task", "requested_actions", "expected_actions"),
+    [
+        (
+            "emergency_protection",
+            False,
+            ["adjusted", "approved", "rejected", "cancelled"],
+            ("改价到", "立即下架", "我来处理"),
+        ),
+        (
+            "manual_review",
+            True,
+            ["approved", "cancelled", "rejected"],
+            ("重试任务", "取消任务"),
+        ),
+        (
+            "manual_price_review",
+            False,
+            ["approved", "rejected", "adjusted", "cancelled"],
+            ("通过", "拒绝", "调整", "取消"),
+        ),
+    ],
+)
+def test_mobile_review_action_labels_reuse_formal_review_policy(
+    read_only_web,
+    monkeypatch,
+    review_type: str,
+    with_failed_task: bool,
+    requested_actions: list[str],
+    expected_actions: tuple[str, ...],
+) -> None:
+    app, _, repository, _ = read_only_web
+    monkeypatch.setenv("REVIEW_TOKEN_SECRET", "synthetic-review-token-secret")
+    source_task_id = None
+    if with_failed_task:
+        source_task_id = "TASK-EXECUTION-FAILURE"
+        repository.insert_task(
+            Task(
+                task_id=source_task_id,
+                internal_sku="AISHA-A-50-Z",
+                platform_name="蚂蚁花团",
+                action_type=TaskActionType.UPDATE_PRICE,
+                priority=10,
+                task_status=TaskStatus.MANUAL_REVIEW,
+                created_at=FIXED_NOW,
+                origin_type=TaskOriginType.MANUAL,
+                origin_ref_id="synthetic:execution-failure",
+            )
+        )
+    review = _make_review(
+        review_task_id=f"REVIEW-{review_type}",
+        review_type=review_type,
+        source_task_id=source_task_id,
+    )
+    repository.insert_review_tasks([review])
+    created = ReviewTokenService(repository).create_token(
+        review.review_task_id,
+        allowed_actions=requested_actions,
+        expires_at=FIXED_NOW + timedelta(hours=1),
+    )
+
+    model = app.queries.mobile_review(review.review_task_id, created.raw_token)
+
+    assert model.http_status == "200 OK"
+    assert model.allowed_actions == expected_actions
+
+
+def test_mobile_review_revoked_and_mismatched_tokens_use_stable_get_statuses(
+    read_only_web,
+    monkeypatch,
+) -> None:
+    app, _, repository, _ = read_only_web
+    monkeypatch.setenv("REVIEW_TOKEN_SECRET", "synthetic-review-token-secret")
+    first = _make_review(
+        review_task_id="REVIEW-TOKEN-FIRST",
+        review_type="manual_price_review",
+    )
+    second = _make_review(
+        review_task_id="REVIEW-TOKEN-SECOND",
+        review_type="manual_price_review",
+    )
+    repository.insert_review_tasks([first, second])
+    created = ReviewTokenService(repository).create_token(
+        first.review_task_id,
+        expires_at=FIXED_NOW + timedelta(hours=1),
+    )
+
+    mismatch_status, _, mismatch_body = _call_app(
+        app,
+        path=f"/mobile/review/{second.review_task_id}",
+        query=urlencode({"token": created.raw_token}),
+    )
+
+    assert mismatch_status == "404 Not Found"
+    assert "链接无效" in mismatch_body
+
+    ReviewTokenService(repository).revoke_token(
+        created.review_token.token_id,
+        revoked_at=FIXED_NOW,
+    )
+    revoked_status, _, revoked_body = _call_app(
+        app,
+        path=f"/mobile/review/{first.review_task_id}",
+        query=urlencode({"token": created.raw_token}),
+    )
+
+    assert revoked_status == "410 Gone"
+    assert "链接已失效" in revoked_body
 
 
 def test_system_page_only_reports_current_component_state(read_only_web) -> None:
@@ -373,6 +699,30 @@ def _write_products(path: Path) -> None:
     workbook.save(path)
 
 
+def _make_review(
+    *,
+    review_task_id: str,
+    review_type: str,
+    source_task_id: str | None = None,
+) -> ReviewTask:
+    return ReviewTask(
+        review_task_id=review_task_id,
+        trade_date=TRADE_DATE,
+        scope_type="sku",
+        scope_key="AISHA-A-50-Z",
+        dedupe_key=f"synthetic:{review_task_id}",
+        source_task_id=source_task_id,
+        review_type=review_type,
+        review_status=ReviewTaskStatus.PENDING,
+        internal_sku="AISHA-A-50-Z",
+        platform_name="蚂蚁花团",
+        reason="需要人工确认",
+        required_by=FIXED_NOW + timedelta(minutes=30),
+        created_at=FIXED_NOW,
+        updated_at=FIXED_NOW,
+    )
+
+
 def _insert_summary(
     repository: SQLiteRuntimeRepository,
     *,
@@ -383,7 +733,7 @@ def _insert_summary(
     amount: Decimal | None,
     quality: DataQualityLevel,
     updated_at: datetime = FIXED_NOW,
-) -> None:
+) -> PlatformTradeDaySummary:
     fact_source = (
         None
         if quality is DataQualityLevel.UNAVAILABLE
@@ -437,6 +787,7 @@ def _insert_summary(
         changed_by="test",
     )
     OperationalSummaryRepository(repository).insert_initial(summary, event, ())
+    return summary
 
 
 def _call_app(

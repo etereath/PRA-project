@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable, Iterable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -47,8 +47,8 @@ from app.repositories.operational_summary_repository import (
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import load_products
-from app.review_policy import allowed_review_statuses
-from app.services.operational_time import OperationalTimeService
+from app.review_policy import allowed_review_statuses, review_action_label
+from app.services.operational_time import OperationalTimeContext, OperationalTimeService
 from app.services.notification_outbox import (
     NOTIFICATION_TYPE_TITLES,
     REVIEW_TYPE_LABELS,
@@ -58,7 +58,6 @@ from app.services.runtime import ReviewTokenService
 
 DEFAULT_PAGE_SIZE = 25
 MAX_PAGE_SIZE = 25
-STALE_AFTER = timedelta(minutes=30)
 
 QUALITY_LABELS = {
     "ORDER_COMPLETE": "完整订单事实",
@@ -93,9 +92,6 @@ ACTION_LABELS = {
     "set_online": "上架",
     "set_offline": "下架",
     "sync_status": "同步状态",
-    "approved": "立即下架",
-    "rejected": "我来处理",
-    "adjusted": "改价到指定值",
 }
 REVIEW_STATUS_LABELS = {
     "pending": "待复核",
@@ -147,6 +143,12 @@ ANALYSIS_DATASETS = (
     ("grade", "按等级"),
     ("time", "按销售时段"),
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _TimeContextReadResult:
+    context: OperationalTimeContext | None
+    state: StateReadModel
 
 
 class OperationsQueryService:
@@ -218,7 +220,54 @@ class OperationsQueryService:
 
     def today(self) -> TodayReadModel:
         now = self._now()
-        context = self._time_context(now)
+        time_result = self._time_context(now)
+        products, products_error = self._load_products()
+        inventory_value = (
+            sum(item.current_stock for item in products if item.sale_enabled)
+            if products
+            else None
+        )
+        inventory_state = (
+            ReadState.FAILED
+            if products_error
+            else (ReadState.READY if products else ReadState.UNAVAILABLE)
+        )
+        drawer = self.notification_drawer()
+        if time_result.context is None:
+            unavailable_metrics = tuple(
+                MetricReadModel(
+                    label,
+                    "—",
+                    time_result.state.detail,
+                    time_result.state.state,
+                )
+                for label in ("今日已售", "成交金额", "成交均价")
+            )
+            return TodayReadModel(
+                platform_trade_date="不可用",
+                observed_at=_datetime(now),
+                trade_day_status="UNAVAILABLE",
+                phase_label="销售时段不可用",
+                state=time_result.state,
+                metrics=unavailable_metrics
+                + (
+                    MetricReadModel(
+                        "当前可售库存",
+                        _qty(inventory_value),
+                        "仅汇总允许销售的当前产品库存资料",
+                        inventory_state,
+                    ),
+                ),
+                products=_state_table(
+                    "today-products",
+                    "品种销售与库存",
+                    time_result.state,
+                ),
+                todo_items=drawer.items,
+                timeline=(),
+            )
+
+        context = time_result.context
         platform_summaries = ()
         summary_error = ""
         if self._schema_is_ready():
@@ -234,7 +283,7 @@ class OperationsQueryService:
         else:
             summary_error = "RUNTIME_SCHEMA_UNAVAILABLE"
 
-        sales_state = self._summary_state(platform_summaries, now, summary_error)
+        sales_state = self._summary_state(platform_summaries, summary_error)
         valid_sold = [item.sold_qty for item in platform_summaries if item.sold_qty is not None]
         valid_amount = [
             item.transaction_amount_total
@@ -253,9 +302,6 @@ class OperationsQueryService:
             for item in platform_summaries
             if item.fact_source is not None
         )
-        products, products_error = self._load_products()
-        inventory_value = sum(item.current_stock for item in products) if products else None
-
         metrics = (
             MetricReadModel("今日已售", _qty(sold_qty), source_note, sales_state.state),
             MetricReadModel("成交金额", _money(amount), source_note, sales_state.state),
@@ -263,8 +309,8 @@ class OperationsQueryService:
             MetricReadModel(
                 "当前可售库存",
                 _qty(inventory_value),
-                "来源：当前产品库存资料",
-                ReadState.READY if inventory_value is not None else ReadState.UNAVAILABLE,
+                "仅汇总允许销售的当前产品库存资料",
+                inventory_state,
             ),
         )
         product_table = self._today_product_table(
@@ -272,7 +318,6 @@ class OperationsQueryService:
             products,
             products_error,
         )
-        drawer = self.notification_drawer()
         timeline = self._today_timeline(context.platform_trade_date)
         observed = max(
             (item.updated_at for item in platform_summaries),
@@ -299,8 +344,12 @@ class OperationsQueryService:
         trade_date: date | None,
         platform_name: str,
     ) -> DatabaseReadModel:
-        context = self._time_context(self._now())
-        selected_date = trade_date or context.platform_trade_date
+        time_result = self._time_context(self._now())
+        selected_date = trade_date or (
+            time_result.context.platform_trade_date
+            if time_result.context is not None
+            else None
+        )
         normalized_page = max(1, int(page))
         if section == "project":
             options = PROJECT_DATASETS
@@ -311,11 +360,15 @@ class OperationsQueryService:
         elif section == "sales-analysis":
             options = ANALYSIS_DATASETS
             selected = dataset if dataset in dict(options) else "overview"
-            table = self._analysis_table(
-                selected,
-                normalized_page,
-                selected_date,
-                platform_name,
+            table = (
+                self._analysis_table(
+                    selected,
+                    normalized_page,
+                    selected_date,
+                    platform_name,
+                )
+                if selected_date is not None
+                else _state_table(selected, dict(options)[selected], time_result.state)
             )
             title = "销售分析"
             route = "/database/sales-analysis"
@@ -328,21 +381,30 @@ class OperationsQueryService:
         elif section == "quality":
             options = (("freshness", "质量与新鲜度"),)
             selected = "freshness"
-            table = self._quality_table(
-                normalized_page,
-                selected_date,
-                platform_name,
+            table = (
+                self._quality_table(
+                    normalized_page,
+                    selected_date,
+                    platform_name,
+                )
+                if selected_date is not None
+                else _state_table("freshness", "质量与新鲜度", time_result.state)
             )
             title = "质量与新鲜度"
             route = "/database/quality"
         else:
             options = BUSINESS_DATASETS
             selected = dataset if dataset in dict(options) else "sales"
-            table = self._business_table(
-                selected,
-                normalized_page,
-                selected_date,
-                platform_name,
+            table = (
+                self._business_table(
+                    selected,
+                    normalized_page,
+                    selected_date,
+                    platform_name,
+                )
+                if selected_date is not None
+                or selected not in {"sales", "settlements", "varieties"}
+                else _state_table(selected, dict(options)[selected], time_result.state)
             )
             title = "业务数据"
             route = "/database"
@@ -352,13 +414,15 @@ class OperationsQueryService:
                 label,
                 route
                 + "?"
-                + urlencode(
-                    {
-                        "dataset": key,
-                        "trade_date": selected_date.isoformat(),
-                        "platform": platform_name,
-                    }
-                ),
+                + urlencode({
+                    "dataset": key,
+                    **(
+                        {"trade_date": selected_date.isoformat()}
+                        if selected_date is not None
+                        else {}
+                    ),
+                    "platform": platform_name,
+                }),
             )
             for key, label in options
         )
@@ -373,12 +437,15 @@ class OperationsQueryService:
             if section == "sales-analysis"
             else ""
         )
+        if selected_date is None:
+            time_notice = f"{time_result.state.title}：{time_result.state.detail}"
+            notice = f"{notice} {time_notice}".strip()
         return DatabaseReadModel(
             section=section,
             section_title=title,
             dataset_options=option_models,
             selected_dataset=selected,
-            trade_date=selected_date.isoformat(),
+            trade_date=selected_date.isoformat() if selected_date is not None else "",
             platform_name=platform_name,
             platform_options=platform_options,
             filter_action=route,
@@ -532,11 +599,17 @@ class OperationsQueryService:
             policy = {
                 item.value for item in allowed_review_statuses(review, source_task)
             }
-            actions = tuple(
-                ACTION_LABELS.get(item, item)
-                for item in token.allowed_actions
-                if item in policy
-            )
+            actions = []
+            for item in token.allowed_actions:
+                if item not in policy:
+                    continue
+                try:
+                    status = ReviewTaskStatus(item)
+                except ValueError:
+                    continue
+                label = review_action_label(review, source_task, status)
+                if label:
+                    actions.append(label)
             return MobileReviewReadModel(
                 state=StateReadModel(
                     ReadState.READY,
@@ -547,7 +620,7 @@ class OperationsQueryService:
                 reason=review.reason or "需要人工确认",
                 scope=_review_scope(review),
                 deadline=_datetime(review.required_by),
-                allowed_actions=actions,
+                allowed_actions=tuple(actions),
                 http_status="200 OK",
             )
         if review is not None and (
@@ -591,7 +664,7 @@ class OperationsQueryService:
         self,
         dataset: str,
         page: int,
-        trade_date: date,
+        trade_date: date | None,
         platform_name: str,
     ) -> TableReadModel:
         if dataset == "products":
@@ -599,6 +672,8 @@ class OperationsQueryService:
         if dataset == "prices":
             return self._prices_table(page, platform_name)
         if dataset == "settlements":
+            if trade_date is None:
+                return _unavailable_table(dataset, "交易日结算", "当前交易日不可用，请显式选择历史交易日。")
             return self._summary_table(
                 dataset,
                 "交易日结算",
@@ -606,10 +681,12 @@ class OperationsQueryService:
                 trade_date,
                 platform_name,
                 scope_type="PLATFORM",
-                current_only=None,
+                current_only=True,
                 detail_kind="settlement",
             )
         if dataset == "varieties":
+            if trade_date is None:
+                return _unavailable_table(dataset, "品种销售结构", "当前交易日不可用，请显式选择历史交易日。")
             return self._summary_table(
                 dataset,
                 "品种销售结构",
@@ -643,9 +720,16 @@ class OperationsQueryService:
                 current_only=True,
                 detail_kind="settlement",
             )
+        if trade_date is None:
+            return _unavailable_table(dataset, "销售与订单", "当前交易日不可用，请显式选择历史交易日。")
         return self._sales_table(page, trade_date, platform_name)
 
-    def _project_table(self, dataset: str, page: int, trade_date: date) -> TableReadModel:
+    def _project_table(
+        self,
+        dataset: str,
+        page: int,
+        trade_date: date | None,
+    ) -> TableReadModel:
         if dataset == "reviews":
             return self._review_table(page=page)
         if dataset == "runs":
@@ -865,7 +949,7 @@ class OperationsQueryService:
             has_next=has_next,
             base_path=base_path,
             query=query,
-            state=self._summary_state(visible, self._now(), ""),
+            state=self._summary_state(visible, ""),
         )
 
     def _task_table(
@@ -1279,11 +1363,39 @@ class OperationsQueryService:
         summary = self.summaries.get_summary(summary_id)
         if summary is None:
             return None
+        current = (
+            summary
+            if summary.is_current
+            else self.summaries.get_current_summary(summary.summary_series_id)
+        )
+        if summary.is_current:
+            state = self._summary_state((summary,), "")
+            version_identity = "当前权威版本"
+        else:
+            current_version = (
+                f"当前权威版本为 v{current.version_no}。"
+                if current is not None
+                else "当前权威版本暂不可读。"
+            )
+            state = StateReadModel(
+                ReadState.STALE,
+                "历史版本 · 已被取代",
+                current_version,
+            )
+            version_identity = "历史版本，已被取代"
         return DetailReadModel(
             title=f"{summary.platform_trade_date.isoformat()} 交易日结算",
             subtitle=f"{summary.platform_name} · {_scope_label(summary.scope_type, summary.scope_key)}",
-            state=self._summary_state((summary,), self._now(), ""),
+            state=state,
             fields=(
+                DetailFieldReadModel("版本", f"v{summary.version_no}"),
+                DetailFieldReadModel("版本身份", version_identity),
+                DetailFieldReadModel(
+                    "版本关系",
+                    "基于上一版本重新结算"
+                    if summary.supersedes_summary_id
+                    else "首个版本",
+                ),
                 DetailFieldReadModel("销量", _qty(summary.sold_qty)),
                 DetailFieldReadModel("成交金额", _money(summary.transaction_amount_total)),
                 DetailFieldReadModel("事实来源", SOURCE_LABELS.get(summary.fact_source.value, "来源未知") if summary.fact_source else "不可用"),
@@ -1385,7 +1497,6 @@ class OperationsQueryService:
     def _summary_state(
         self,
         values: Iterable,
-        now: datetime,
         error: str,
     ) -> StateReadModel:
         summaries = tuple(values)
@@ -1412,15 +1523,21 @@ class OperationsQueryService:
         ):
             return StateReadModel(ReadState.INCOMPLETE, "部分销售事实可用", "页面保留质量差异，不与完整事实混算")
         latest = max(item.updated_at for item in available)
-        if _age(now, latest) > STALE_AFTER:
-            return StateReadModel(ReadState.STALE, "销售事实已过期", f"最近更新于 {_datetime(latest)}")
         if sum(item.sold_qty or 0 for item in available) == 0:
-            return StateReadModel(ReadState.TRUSTWORTHY_ZERO, "当前确认无销量", "来源完整，0 是可信事实")
+            return StateReadModel(
+                ReadState.TRUSTWORTHY_ZERO,
+                "当前确认无销量",
+                f"来源完整，0 是可信事实；最近更新于 {_datetime(latest)}",
+            )
         quality = _joined_labels(
             QUALITY_LABELS.get(item.quality_level.value, "质量未知")
             for item in available
         )
-        return StateReadModel(ReadState.READY, "销售事实可用", quality)
+        return StateReadModel(
+            ReadState.READY,
+            "销售事实可用",
+            f"{quality}；最近更新于 {_datetime(latest)}",
+        )
 
     def _table(
         self,
@@ -1464,7 +1581,7 @@ class OperationsQueryService:
         except Exception as exc:
             return [], type(exc).__name__
 
-    def _platform_options(self, trade_date: date) -> tuple[str, ...]:
+    def _platform_options(self, trade_date: date | None) -> tuple[str, ...]:
         names: list[str] = []
         try:
             names.extend(
@@ -1474,18 +1591,19 @@ class OperationsQueryService:
             )
         except Exception:
             pass
-        try:
-            names.extend(
-                item.platform_name
-                for item in self.summaries.list_summaries_page(
-                    platform_trade_date=trade_date,
-                    current_only=True,
-                    limit=101,
+        if trade_date is not None:
+            try:
+                names.extend(
+                    item.platform_name
+                    for item in self.summaries.list_summaries_page(
+                        platform_trade_date=trade_date,
+                        current_only=True,
+                        limit=101,
+                    )
+                    if item.platform_name
                 )
-                if item.platform_name
-            )
-        except Exception:
-            pass
+            except Exception:
+                pass
         return tuple(dict.fromkeys(names))
 
     def _schema_is_ready(self) -> bool:
@@ -1494,14 +1612,66 @@ class OperationsQueryService:
         except Exception:
             return False
 
-    def _time_context(self, now: datetime):
+    def _time_context(self, now: datetime) -> _TimeContextReadResult:
         try:
             policies = self.automation.load_operational_time_policies()
-            if policies:
-                return OperationalTimeService(policies=policies).classify(now)
         except Exception:
-            pass
-        return OperationalTimeService().classify(now)
+            return _TimeContextReadResult(
+                context=None,
+                state=StateReadModel(
+                    ReadState.FAILED,
+                    "交易日时间策略读取失败",
+                    "未使用代码默认时间推断交易日，也未查询当前交易日事实。",
+                ),
+            )
+        if not policies:
+            return _TimeContextReadResult(
+                context=None,
+                state=StateReadModel(
+                    ReadState.UNAVAILABLE,
+                    "交易日时间策略不可用",
+                    "Runtime 中没有版本化时间策略，未推断默认交易日。",
+                ),
+            )
+        try:
+            service = OperationalTimeService(policies=policies)
+        except ValueError:
+            return _TimeContextReadResult(
+                context=None,
+                state=StateReadModel(
+                    ReadState.FAILED,
+                    "交易日时间策略配置无效",
+                    "Runtime 时间策略无法建立唯一版本序列，未查询当前交易日事实。",
+                ),
+            )
+        try:
+            context = service.classify(now)
+        except ValueError:
+            return _TimeContextReadResult(
+                context=None,
+                state=StateReadModel(
+                    ReadState.UNAVAILABLE,
+                    "当前没有唯一有效的交易日时间策略",
+                    "未使用代码默认时间推断交易日，也未查询当前交易日事实。",
+                ),
+            )
+        except Exception:
+            return _TimeContextReadResult(
+                context=None,
+                state=StateReadModel(
+                    ReadState.FAILED,
+                    "交易日时间策略计算失败",
+                    "未使用代码默认时间推断交易日，也未查询当前交易日事实。",
+                ),
+            )
+        return _TimeContextReadResult(
+            context=context,
+            state=StateReadModel(
+                ReadState.READY,
+                "交易日时间策略可用",
+                f"使用版本 {context.time_policy_version}",
+            ),
+        )
 
     def _queue_state(self) -> StateReadModel:
         root = self.paths.queue_root
@@ -1581,6 +1751,20 @@ def _unavailable_table(dataset: str, title: str, detail: str) -> TableReadModel:
         columns=(),
         rows=(),
         state=StateReadModel(ReadState.UNAVAILABLE, "尚未建立权威数据源", detail),
+    )
+
+
+def _state_table(
+    dataset: str,
+    title: str,
+    state: StateReadModel,
+) -> TableReadModel:
+    return TableReadModel(
+        dataset=dataset,
+        title=title,
+        columns=(),
+        rows=(),
+        state=state,
     )
 
 
