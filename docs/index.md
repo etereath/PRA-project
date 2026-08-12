@@ -4,6 +4,14 @@
 
 运行态业务数据以 SQLite 为中心，当前代码结构版本为 v16。v9 使用“平台 + 品种 + 等级”作为 `listing_status` 业务身份，v10 将任务旧价结构化，v11 增加单次请求的 ShadowBot 多商品 COMMIT 批次账本，v12 增加逐商品操作/尝试身份、活动写锁、观察时间和技术回执，v13 增加公共批次注册表、通用上下架 operation、两页快照、页面异常和 v5 动作账本；v14 增加双时间轴、Automation 账本、不可变观察、销售日结、Incident 和任务来源字段；v15 增加 Incident 出现次数与 append-only 事件流水；v16 增加版本化极简紧急下架策略。真实 Runtime DB 需按迁移手册另行升级。Excel 继续承担商品、规则等主数据输入，不是运行态任务数据库。
 
+项目长期控制面固定为：人工运营走 Web，定时业务走 Automation，未来智能调用走 Agent
+Gateway，平台执行走 Queue/Worker/Importer，开发测试与恢复走 CLI。Agent 只能通过
+Query Adapter 读取，并通过 Task Adapter 提交结构化 `AgentIntent`；Review、Runtime Task
+和 Outbox/通知只能由既有确定性服务派生。Agent 来源的真实平台写任务必须先经人工复核，
+且当前不批准 proposal 表或实际 Agent 实现。禁止抓取 Web、调用 CLI、直读 SQLite/Excel、
+拼 Queue JSON、直连平台或伪造 `SYSTEM_EMERGENCY`。这是根级
+`AGENTS.md` 的强制约束，不因具体任务文档是否被阅读而失效。
+
 ## 当前状态与入口
 
 - [project_current_status.md](project_current_status.md)：当前项目定位、已完成能力、主控流程、安全边界和下一步优先级。
@@ -29,6 +37,11 @@
 - [reports/task13_5_4_order_observation.md](reports/task13_5_4_order_observation.md)：任务13.5-4 实施、测试、迁移纠正和实机验收报告。
 - [plans/task13_5_operational_closed_loop_and_web_rewrite.md](plans/task13_5_operational_closed_loop_and_web_rewrite.md)：任务13.5双时间轴、自动扫描、历史订单观察、销售日结、S0–S4、受控紧急保护、任务来源对齐和Web主控重写实施计划。
 - [plans/task13_5_web_current_state_audit_20260729.md](plans/task13_5_web_current_state_audit_20260729.md)：带精确时间、main SHA、Runtime DB脱敏快照、浏览器/视口/角色、路由、页面规模和DOM hash的独立Web现状审计。
+- [plans/task13_5_7_web_rewrite_construction_plan.md](plans/task13_5_7_web_rewrite_construction_plan.md)：13.5-7 实际业务重基线施工顺序；冻结 7B～7F 的四入口、真实库存、人工任务与执行授权、Automation 配置、安全、CLI 迁移、切换和验收门禁。
+- [prototypes/task13_5_7_operations_web_sample.html](prototypes/task13_5_7_operations_web_sample.html)：四入口“今日”静态样板，展示销售、数据库真实库存、待办、时间轴和业务健康摘要。
+- [prototypes/task13_5_7_database_sample.html](prototypes/task13_5_7_database_sample.html)：只读数据库与销售分析静态样板。
+- [prototypes/task13_5_7_business_management_sample.html](prototypes/task13_5_7_business_management_sample.html)：任务创建/授权、人工复核、固定 Automation 方案和真实库存业务静态样板。
+- [prototypes/task13_5_7_system_sample.html](prototypes/task13_5_7_system_sample.html)：组件当前状态、通知、数据维护和权限边界静态样板。
 - [reports/task12_review_remediation_20260723.md](reports/task12_review_remediation_20260723.md)：针对任务12审查问题的接续修复记录；以该文档说明 v12 合同、原子导入和待补实机证据，不覆盖原交接报告。
 - [evidence/task12/index.md](evidence/task12/index.md)：任务12正常 COMMIT 与 UNKNOWN→RECONCILE 的 PR 内脱敏原始证据及自动复算入口。
 - [evidence/task13/index.md](evidence/task13/index.md)：任务13 独立 SYNC_STATUS、单/多商品上下架、批次预检零写、严格串行 UNKNOWN 和唯一 RECONCILE 的脱敏证据及 CI 复算入口。
@@ -61,7 +74,9 @@
 
 - [business_decision_spec.md](business_decision_spec.md)：鲜切花预测性销售业务决策规则。
 - [project_overview.md](project_overview.md)：项目背景和早期架构说明。当前真实进度以 `project_current_status.md` 为准。
-- [ai_agent_integration_spec.md](ai_agent_integration_spec.md)：AI Agent 接入治理规范。当前不接 AI Agent 自动决策。
+- [ai_agent_integration_spec.md](ai_agent_integration_spec.md)：未来 Agent Gateway 的唯一
+  Query/Task Adapter 通道、`AgentIntent` 逻辑载荷、真实平台写任务人工复核、来源身份与
+  审计边界；当前不接 AI Agent，也不批准早期候选表、平行 Service 或自主平台写权限。
 
 ## 运行态与 SQLite
 
@@ -81,10 +96,13 @@
 
 ## Web 后台
 
-- [plans/task13_5_web_rewrite_plan.md](plans/task13_5_web_rewrite_plan.md)：在 Issue #20 八个一级入口下，基于独立浏览器审计形成的 Web 实施计划，包含页面方案、`app/webapp/` 拆分、性能门禁和验收标准。
+- [plans/task13_5_web_rewrite_plan.md](plans/task13_5_web_rewrite_plan.md)：2026-08-12
+  依据实际运营路径重基线的 13.5-7 产品权威；直接替代旧 Web，不保留兼容层，以“今日、
+  数据库、业务管理、系统”四入口组织真实库存、人工任务/执行授权、Automation 和系统维护，
+  同时保留测试、验收、诊断和恢复 CLI 以及未来 Agent Gateway 唯一通道。
 - [web_frontend_refresh_plan.md](web_frontend_refresh_plan.md)：Web 运行态运营后台刷新计划和当前进度。
 - [web_localization_display_spec.md](web_localization_display_spec.md)：Web 与飞书通知的运营中文展示术语表。
-- [product_inventory_input_spec.md](product_inventory_input_spec.md)：商品资料与库存补充录入规则，说明 `products.xlsx` 兼容、公共库存、SKU 生成、新增品种弹窗和旧 `/tables` 入口边界。
+- [product_inventory_input_spec.md](product_inventory_input_spec.md)：13.5-7D 切换前的商品资料与工作簿库存历史规则，以及切换后 DB 唯一库存权威、一次性 bootstrap、禁止双写和旧入口删除边界。
 - [price_rule_input_spec.md](price_rule_input_spec.md)：价格规则输入表单化规则，说明 `price_rules.xlsx` 兼容、定价字段、低价边界和旧 `/tables` 入口策略。
 - [listing_rule_input_spec.md](listing_rule_input_spec.md)：上下架规则输入表单化规则，说明 `listing_rules.xlsx` 新字段、三维筛选、策略枚举和 ListingRuleEvaluator 边界。
 - [capacity_plan_input_spec.md](capacity_plan_input_spec.md)：包装产能计划输入表单化规则，说明 `capacity_plans.xlsx` 字段、确认包装能力和 CapacityRuleEvaluator 判断口径。
@@ -156,8 +174,12 @@ Code Review 后高中低风险问题已完成修复，系统冒烟测试、全�
 
 1. 任务12审查修复已通过 PR #18 合并；其 v4 改价链路继续作为任务13和后续任务的稳定基线。
 2. 任务13计划中的实现、受控实机验收、最终本地回归、PR #19 审查修复和双平台 CI 均已覆盖；后续合并与任务状态由审查方处理。
-3. 以 [GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20) 合并后的正文为宏观权威，先评审[13.5-0开工基线](plans/task13_5_0_kickoff_baseline.md)和[本地实施计划](plans/task13_5_operational_closed_loop_and_web_rewrite.md)；六级质量矩阵与日结状态机冻结后才提交v14。
-4. 任务13.5完成双时间轴、自动化服务、商品/订单观察、销售日结、S0–S4、紧急保护、控制服务和Web产品化后，任务14只进行多品种/多动作/异常恢复、正式授权和观察版本冻结的综合验收。
+3. 以 [GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20) 的业务语义和
+   四个一级入口为宏观权威，按[13.5-7 Web 实际业务重基线计划](plans/task13_5_web_rewrite_plan.md)
+   直接建设唯一运营 Web；恢复点为
+   `checkpoint/pre-task13-5-7-web-rewrite-20260807`。
+4. 任务13.5完成双时间轴、自动化服务、商品/订单观察、销售日结、S0–S4、紧急保护和
+   Web产品化后，任务14只进行多品种/多动作/异常恢复、正式授权和观察版本冻结的综合验收。
 5. 为元素版本漂移和白屏建立可重复的专用测试夹具；登录、网络和证据上传失败的实机故障注入已经完成。
 6. 持续运行系统冒烟和 ShadowBot 成功基线测试，避免任务13.5或后续任务重写已验证 COMMIT 链路。
 7. 13.5-0 的黄金基线卡、脚本盘点、禁止重写清单和Web审计已形成；进入ShadowBot工作前仍须收敛生命周期记录与心跳不一致并完成部署hash对齐。普通写动作保持明确任务与授权，唯一自动写特例是在13.5-6完成正式策略后的版本化 `SYSTEM_EMERGENCY` 紧急下架。

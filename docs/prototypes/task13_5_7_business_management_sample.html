@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>PRA 业务管理 · 静态视觉样板</title>
+  <link rel="stylesheet" href="task13_5_7_hub_sample.css?v=management7">
+</head>
+<body data-default-section="create-task">
+  <!-- Static prototype only. Controls are demo-only and write nothing. -->
+  <aside class="sidebar" aria-label="主导航">
+    <a class="brand" href="task13_5_7_operations_web_sample.html">
+      <span class="brand-mark">PRA</span>
+      <span class="brand-copy"><strong>销售运营工作台</strong><small>静态入口样板</small></span>
+    </a>
+    <nav class="nav">
+      <span class="nav-label">主要入口</span>
+      <a class="nav-item" href="task13_5_7_operations_web_sample.html"><span class="nav-symbol">今</span><span>今日运营</span></a>
+      <a class="nav-item" href="task13_5_7_database_sample.html"><span class="nav-symbol">库</span><span>数据库</span></a>
+      <a class="nav-item active" href="task13_5_7_business_management_sample.html" aria-current="page"><span class="nav-symbol">管</span><span>业务管理</span></a>
+      <a class="nav-item" href="task13_5_7_system_sample.html"><span class="nav-symbol">系</span><span>系统</span></a>
+      <span class="nav-label">业务管理分区</span>
+      <a class="nav-item" href="#create-task" data-section-link="create-task"><span class="nav-symbol">任</span><span>创建任务</span></a>
+      <a class="nav-item" href="#reviews" data-section-link="reviews"><span class="nav-symbol">核</span><span>人工复核</span></a>
+      <a class="nav-item" href="#automation" data-section-link="automation"><span class="nav-symbol">自</span><span>自动化方案</span></a>
+    </nav>
+    <div class="sidebar-note">所有动作都应先校验、预览和确认，再调用既有正式服务；页面不能直接改数据库。</div>
+  </aside>
+
+  <div class="shell">
+    <header class="topbar">
+      <div class="breadcrumb"><span>运营中心</span><span>/</span><strong>业务管理</strong></div>
+      <div class="top-actions">
+        <button class="button" type="button">查看操作记录</button>
+        <button class="icon-button" type="button" aria-label="消息展示">●</button>
+        <span class="avatar">DEMO</span>
+      </div>
+    </header>
+
+    <main class="main">
+      <div class="prototype-banner" role="note">
+        <span><strong>静态 HTML 样板</strong>　所有按钮和表单均无写入能力，不创建任务、复核、Automation Run 或库存记录。</span>
+        <span class="prototype-tag">仅供入口评审</span>
+      </div>
+
+      <section class="page-heading" aria-labelledby="page-title">
+        <div>
+          <span class="eyebrow">受控业务操作</span>
+          <h1 id="page-title">业务管理</h1>
+          <p>集中完成任务创建、人工复核、自动化方案管理和人工库存调整；所有动作复用正式服务与审计链。</p>
+        </div>
+        <span class="readonly-badge">演示模式 · 零写入</span>
+      </section>
+
+      <nav class="hub-tabs" aria-label="业务管理视图">
+        <button class="hub-tab active" type="button" data-open-task-dialog data-section-link="create-task">创建任务</button>
+        <a class="hub-tab" href="#reviews" data-section-link="reviews">人工复核</a>
+        <a class="hub-tab" href="#automation" data-section-link="automation">自动化方案</a>
+      </nav>
+
+      <section class="management-stack">
+        <article class="panel" id="create-task">
+          <div class="panel-header">
+            <div><h2>创建任务</h2><p>任务创建与真实平台执行授权分成两个连续步骤</p></div>
+            <div class="form-actions"><button class="button" type="button" data-open-inventory-adjustment>新花入库 / 调整库存</button><button class="button primary" type="button" data-open-task-dialog>新建任务</button></div>
+          </div>
+          <div class="callout"><strong>受控执行</strong>先保存正式任务，再重新校验当前价格、数据库真实库存、平台状态和冲突事项；只有运营者确认“提交执行”后才进入 Queue → Worker → Importer。</div>
+        </article>
+      </section>
+
+      <section class="panel section-gap" id="reviews">
+          <div class="panel-header"><div><h2>人工复核</h2><p>当前有 3 项需要人工决定</p></div><span class="status warning">3 项</span></div>
+          <div class="review-list">
+            <div class="review-item"><span class="item-copy"><strong>确认卡罗拉 A级库存偏低</strong><small>影响当前销售 · 已等待 8 分钟</small></span><button class="item-action" type="button">查看并处理</button></div>
+            <div class="review-item"><span class="item-copy"><strong>确认一项商品映射</strong><small>影响销售分析 · 已等待 17 分钟</small></span><button class="item-action" type="button">查看并处理</button></div>
+            <div class="review-item"><span class="item-copy"><strong>确认自动化补跑</strong><small>只读销售数据 · 已等待 24 分钟</small></span><button class="item-action" type="button">查看并处理</button></div>
+          </div>
+          <div class="callout"><strong>确认处理方式</strong>选择“改价到指定值、立即下架、我来处理”等动作后，系统会创建对应任务并记录处理结果。</div>
+      </section>
+
+      <section class="panel section-gap" id="automation">
+        <div class="panel-header"><div><h2>自动化方案</h2><p>管理固定方案的运行频率、阈值、启停状态和最近结果</p></div><button class="button" type="button">管理默认方案</button></div>
+        <div class="filterbar"><button class="chip active" type="button" data-automation-filter="all">全部方案</button><button class="chip" type="button" data-automation-filter="running">运行中</button><button class="chip" type="button" data-automation-filter="paused">已暂停</button><button class="chip" type="button" data-automation-filter="failed">最近失败</button></div>
+        <div class="automation-list">
+          <div class="automation-item" data-automation-state="running"><span class="item-copy"><strong>上架中商品小扫描</strong><small>每 10 分钟 · 只读 · 最近成功 09:40</small></span><span class="status success">运行中</span><button class="item-action" type="button">管理方案</button></div>
+          <div class="automation-item" data-automation-state="running"><span class="item-copy"><strong>完整市场扫描</strong><small>每 1 小时 · 商品与订单只读 · 最近成功 09:00</small></span><span class="status success">运行中</span><button class="item-action" type="button">管理方案</button></div>
+          <div class="automation-item" data-automation-state="running"><span class="item-copy"><strong>交易日销售结算</strong><small>20:00 首次结算 · 最近成功 昨日 20:05</small></span><span class="status success">运行中</span><button class="item-action" type="button">管理方案</button></div>
+          <div class="automation-item" data-automation-state="running"><span class="item-copy"><strong>数据库真实库存预警</strong><small>默认阈值 40 扎 · 可按商品覆盖 · 最近检查 09:42</small></span><span class="status success">运行中</span><button class="item-action" type="button">管理阈值</button></div>
+          <div class="automation-item" data-automation-state="paused"><span class="item-copy"><strong>历史数据回补示例</strong><small>人工启用 · 当前无计划</small></span><span class="status warning">已暂停</span><button class="item-action" type="button">管理方案</button></div>
+          <p class="automation-empty" data-automation-empty hidden>当前没有符合条件的自动化方案。</p>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog class="task-dialog" id="task-create-dialog" aria-labelledby="task-dialog-title">
+    <form method="dialog">
+      <div class="dialog-header">
+        <div><h2 id="task-dialog-title">创建任务</h2><p>第一步保存任务；第二步单独确认真实平台执行</p></div>
+        <button class="dialog-close" type="submit" value="cancel" aria-label="关闭创建任务弹窗">×</button>
+      </div>
+      <div class="task-dialog-body">
+        <section class="dialog-section" aria-labelledby="task-scope-title">
+          <div class="dialog-section-heading"><div><h3 id="task-scope-title">任务范围</h3><p>三个维度均可多选，任务只作用于有效组合。</p></div></div>
+          <div class="scope-grid">
+            <fieldset class="scope-field" data-multi-group data-group-label="品种">
+              <legend>品种 <small data-group-count>已选 2 项</small></legend>
+              <div class="multi-tabs">
+                <button class="multi-tab" type="button" aria-pressed="true" data-multi-option>艾莎</button>
+                <button class="multi-tab" type="button" aria-pressed="true" data-multi-option>卡罗拉</button>
+                <button class="multi-tab" type="button" aria-pressed="false" data-multi-option>蜜桃雪山</button>
+                <button class="multi-tab" type="button" aria-pressed="false" data-multi-option>果汁阳台</button>
+              </div>
+            </fieldset>
+            <fieldset class="scope-field" data-multi-group data-group-label="等级">
+              <legend>等级 <small data-group-count>已选 2 项</small></legend>
+              <div class="multi-tabs">
+                <button class="multi-tab" type="button" aria-pressed="true" data-multi-option>A级</button>
+                <button class="multi-tab" type="button" aria-pressed="true" data-multi-option>B级</button>
+                <button class="multi-tab" type="button" aria-pressed="false" data-multi-option>C级</button>
+              </div>
+            </fieldset>
+            <fieldset class="scope-field full" data-multi-group data-group-label="平台">
+              <legend>平台 <small data-group-count>已选 1 项</small></legend>
+              <div class="multi-tabs">
+                <button class="multi-tab" type="button" aria-pressed="true" data-multi-option>蚂蚁花团</button>
+              </div>
+              <p class="scope-note">当前仅显示已接入平台；新增平台后可在这里继续多选。</p>
+            </fieldset>
+          </div>
+        </section>
+
+        <section class="dialog-section" aria-labelledby="task-action-title">
+          <div class="dialog-section-heading"><div><h3 id="task-action-title">任务动作</h3><p>任务预览会展开范围内的有效商品与目标值。</p></div></div>
+          <div class="task-settings-grid">
+            <div class="field"><label for="task-type">任务类型</label><select id="task-type"><option value="set_price">调整价格到</option><option value="adjust_price">加/降价</option><option value="set_offline">下架商品</option><option value="set_online">上架商品</option></select></div>
+            <div class="field" data-task-price-field><label for="target-value" data-task-price-label>目标价格</label><input id="target-value" value="12.00" inputmode="decimal"><small data-task-price-help>把所选商品价格调整到指定金额。</small></div>
+            <div class="field" data-task-inventory-field hidden><label for="target-inventory">平台目标库存</label><input id="target-inventory" value="80" inputmode="numeric"><small>买家在该平台最多还能购买的数量；不能当作数据库真实库存。</small></div>
+            <div class="field"><label for="task-priority">处理优先级</label><select id="task-priority"><option>普通</option><option>优先</option><option>紧急人工动作</option></select></div>
+            <div class="field"><label for="task-reason">业务原因</label><input id="task-reason" value="根据今日销售与库存情况调整。"></div>
+          </div>
+        </section>
+      </div>
+      <div class="dialog-footer task-dialog-footer">
+        <span class="selection-summary" data-selection-summary>已选 2 个品种 · 2 个等级 · 1 个平台</span>
+        <button class="button" type="submit" value="cancel">取消</button>
+        <button class="button primary" type="button">预览并创建任务</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="task-dialog" id="inventory-adjustment-dialog" aria-labelledby="inventory-adjustment-title">
+    <form method="dialog">
+      <div class="dialog-header">
+        <div><h2 id="inventory-adjustment-title">新花入库 / 调整库存</h2><p>这里只修改数据库真实库存，不修改任何平台库存</p></div>
+        <button class="dialog-close" type="submit" value="cancel" aria-label="关闭库存调整弹窗">×</button>
+      </div>
+      <div class="task-dialog-body">
+        <div class="form-grid">
+          <div class="field"><label for="inventory-product">商品</label><select id="inventory-product"><option value="72">艾莎 · A级</option><option value="54">卡罗拉 · A级</option></select></div>
+          <div class="field"><label for="inventory-adjustment">调整值</label><input id="inventory-adjustment" value="20" inputmode="numeric"><small data-inventory-preview>调整前 72 扎 · 本次 +20 扎 · 调整后 92 扎</small></div>
+          <div class="field"><label for="inventory-source">调整来源</label><select id="inventory-source"><option selected>新花入库</option><option>人工盘点修正</option><option>损耗或报废</option><option>其他已知调整</option></select></div>
+          <div class="field full"><label for="inventory-reason">调整原因</label><textarea id="inventory-reason">新花入库</textarea></div>
+        </div>
+      </div>
+      <div class="dialog-footer">
+        <button class="button" type="button" data-open-inventory-table>查看数据库真实库存</button>
+        <button class="button" type="submit" value="cancel">取消</button>
+        <button class="button primary" type="button">预览调整</button>
+      </div>
+    </form>
+  </dialog>
+
+  <dialog class="inventory-dialog" id="inventory-table-dialog" aria-labelledby="inventory-table-title">
+    <form method="dialog">
+      <div class="dialog-header">
+        <div><h2 id="inventory-table-title">数据库真实库存</h2><p>代表农场当前还有多少花可以卖</p></div>
+        <button class="dialog-close" type="submit" value="cancel" aria-label="关闭库存表">×</button>
+      </div>
+      <div class="dialog-table-wrap">
+        <table>
+          <thead><tr><th>商品</th><th>等级</th><th>当前库存</th><th>今日已售</th></tr></thead>
+          <tbody>
+            <tr><td>艾莎</td><td>A级</td><td>72 扎</td><td>38 扎</td></tr>
+            <tr><td>艾莎</td><td>B级</td><td>96 扎</td><td>41 扎</td></tr>
+            <tr><td>卡罗拉</td><td>A级</td><td>54 扎</td><td>27 扎</td></tr>
+            <tr><td>蜜桃雪山</td><td>B级</td><td>63 扎</td><td>22 扎</td></tr>
+            <tr><td>其他</td><td>C级</td><td>33 扎</td><td>14 扎</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="dialog-footer"><button class="button" type="submit" value="cancel">关闭</button></div>
+    </form>
+  </dialog>
+
+  <nav class="mobile-nav" aria-label="手机导航">
+    <a href="task13_5_7_operations_web_sample.html"><span class="nav-symbol">今</span><span>今日</span></a>
+    <a href="task13_5_7_database_sample.html"><span class="nav-symbol">库</span><span>数据库</span></a>
+    <a class="active" href="task13_5_7_business_management_sample.html" aria-current="page"><span class="nav-symbol">管</span><span>业务管理</span></a>
+    <a href="task13_5_7_system_sample.html"><span class="nav-symbol">系</span><span>系统</span></a>
+  </nav>
+  <script src="task13_5_7_prototype_nav.js"></script>
+  <script>
+    (() => {
+      const inventoryDialog = document.querySelector("#inventory-table-dialog");
+      document.querySelectorAll("[data-open-inventory-table]").forEach((trigger) => {
+        trigger.addEventListener("click", () => inventoryDialog.showModal());
+      });
+
+      const inventoryAdjustmentDialog = document.querySelector("#inventory-adjustment-dialog");
+      document.querySelectorAll("[data-open-inventory-adjustment]").forEach((trigger) => {
+        trigger.addEventListener("click", () => inventoryAdjustmentDialog.showModal());
+      });
+      const inventoryProduct = inventoryAdjustmentDialog.querySelector("#inventory-product");
+      const inventoryAdjustment = inventoryAdjustmentDialog.querySelector("#inventory-adjustment");
+      const inventoryPreview = inventoryAdjustmentDialog.querySelector("[data-inventory-preview]");
+      const updateInventoryPreview = () => {
+        const before = Number(inventoryProduct.value);
+        const adjustment = Number(inventoryAdjustment.value || 0);
+        const signed = adjustment > 0 ? `+${adjustment}` : String(adjustment);
+        inventoryPreview.textContent = `调整前 ${before} 扎 · 本次 ${signed} 扎 · 调整后 ${before + adjustment} 扎`;
+      };
+      inventoryProduct.addEventListener("change", updateInventoryPreview);
+      inventoryAdjustment.addEventListener("input", updateInventoryPreview);
+      updateInventoryPreview();
+
+      const taskDialog = document.querySelector("#task-create-dialog");
+      document.querySelectorAll("[data-open-task-dialog]").forEach((trigger) => {
+        trigger.addEventListener("click", () => taskDialog.showModal());
+      });
+
+      const groups = [...taskDialog.querySelectorAll("[data-multi-group]")];
+      const summary = taskDialog.querySelector("[data-selection-summary]");
+      const updateSelection = () => {
+        const counts = groups.map((group) => {
+          const count = group.querySelectorAll('[data-multi-option][aria-pressed="true"]').length;
+          group.querySelector("[data-group-count]").textContent = `已选 ${count} 项`;
+          return `${count} 个${group.dataset.groupLabel}`;
+        });
+        summary.textContent = `已选 ${counts.join(" · ")}`;
+      };
+
+      groups.forEach((group) => {
+        group.addEventListener("click", (event) => {
+          const option = event.target.closest("[data-multi-option]");
+          if (!option) return;
+          const selected = group.querySelectorAll('[data-multi-option][aria-pressed="true"]');
+          const isSelected = option.getAttribute("aria-pressed") === "true";
+          if (isSelected && selected.length === 1) return;
+          option.setAttribute("aria-pressed", String(!isSelected));
+          updateSelection();
+        });
+      });
+      updateSelection();
+
+      const taskType = taskDialog.querySelector("#task-type");
+      const priceField = taskDialog.querySelector("[data-task-price-field]");
+      const priceLabel = taskDialog.querySelector("[data-task-price-label]");
+      const priceHelp = taskDialog.querySelector("[data-task-price-help]");
+      const priceInput = taskDialog.querySelector("#target-value");
+      const inventoryField = taskDialog.querySelector("[data-task-inventory-field]");
+      const savedPriceValues = {};
+      const priceModes = {
+        set_price: { label: "目标价格", help: "把所选商品价格调整到指定金额。", initial: "12.00" },
+        adjust_price: { label: "价格变动", help: "输入正数表示加价，输入负数表示降价。", initial: "1.00" },
+        set_online: { label: "上架价格", help: "商品重新上架时使用的销售价格。", initial: "12.00" },
+      };
+      const updateTaskFields = () => {
+        const previousMode = priceInput.dataset.mode;
+        if (previousMode) savedPriceValues[previousMode] = priceInput.value;
+        const mode = taskType.value;
+        const priceMode = priceModes[mode];
+        priceField.hidden = !priceMode;
+        inventoryField.hidden = mode !== "set_online";
+        if (priceMode) {
+          priceLabel.textContent = priceMode.label;
+          priceHelp.textContent = priceMode.help;
+          priceInput.value = savedPriceValues[mode] ?? priceMode.initial;
+          priceInput.dataset.mode = mode;
+        } else {
+          delete priceInput.dataset.mode;
+        }
+      };
+      taskType.addEventListener("change", updateTaskFields);
+      updateTaskFields();
+
+      const automationFilters = [...document.querySelectorAll("[data-automation-filter]")];
+      const automationItems = [...document.querySelectorAll("[data-automation-state]")];
+      const automationEmpty = document.querySelector("[data-automation-empty]");
+      automationFilters.forEach((button) => {
+        button.addEventListener("click", () => {
+          const filter = button.dataset.automationFilter;
+          let visibleCount = 0;
+          automationFilters.forEach((item) => item.classList.toggle("active", item === button));
+          automationItems.forEach((item) => {
+            const visible = filter === "all" || item.dataset.automationState === filter;
+            item.hidden = !visible;
+            if (visible) visibleCount += 1;
+          });
+          automationEmpty.hidden = visibleCount !== 0;
+        });
+      });
+    })();
+  </script>
+</body>
+</html>

@@ -31,23 +31,86 @@
 ### 任务 13.5 计划权威
 
 - [GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20) 合并截至
-  2026-07-29 已采纳评论后的正文，是任务 13.5 的宏观范围、业务语义、阶段划分和
+  2026-08-12 已采纳评论后的正文，是任务 13.5 的宏观范围、业务语义、阶段划分和
   任务 14 边界权威；历史评论仅用于追溯。
 - `docs/plans/task13_5_0_kickoff_baseline.md` 负责 13.5-0 的黄金基线、脚本盘点、
   禁止重写资产、合同草案、子 PR 顺序和开工门禁。
 - `docs/plans/task13_5_operational_closed_loop_and_web_rewrite.md` 负责本仓库的模块、数据库、迁移和测试细节。
-- `docs/plans/task13_5_web_rewrite_plan.md` 负责基于内置浏览器实测的 Web 页面、路由、性能和可用性细节。
+- `docs/plans/task13_5_web_rewrite_plan.md` 负责 2026-08-12 依据实际运营路径重新冻结的
+  13.5-7 运营 Web 替代重写、CLI 残留业务迁移、四个一级入口、性能和可用性细节。当前项目
+  尚未正式投入使用，不保留旧 Web 路由或双 Web；开发测试、Mock、验收、诊断、备份
+  和恢复 CLI 必须继续保留。
 - `docs/plans/task13_5_web_current_state_audit_20260729.md` 是 13.5-0 的独立 Web
   现状证据；其中数量和页面尺寸仅代表带 main/DB/视口标识的审计快照。
 - 本地实现可以细化 Issue #20，但不得改写其双时间轴、扫描父子合同、六级质量矩阵、
-  唯一 `FINAL` 日结终态、S0–S4、`SYSTEM_EMERGENCY`、八个 Web 一级入口和任务
-  14 边界。
+  唯一 `FINAL` 日结终态、S0–S4、`SYSTEM_EMERGENCY` 和任务 14 边界。Web 信息架构以
+  用户确认的实际运营路径为准，当前固定为“今日、数据库、业务管理、系统”四个一级
+  入口；Issue #20 和历史计划中的八入口文字必须随本轮重基线同步，不得反向约束新 Web。
+- Web 计划的权威顺序固定为：用户确认的实际运营流程 → 当前四入口样板及业务合同 →
+  已验证的领域、安全和执行门禁 → 当前施工计划 → 旧 Web 与历史页面清单。旧计划中
+  仅为兼容旧 Web、重复展示同一事实或缺少实际使用场景的页面必须删除，不得因历史
+  文档存在而继续承担开发和维护成本。
+- 13.5-7 的当前恢复点为 Git Tag
+  `checkpoint/pre-task13-5-7-web-rewrite-20260807`。新 Web 直接替代当前
+  `app/web.py` 页面架构；后台只复用既有领域 Service，不得恢复“先统一所有 CLI、
+  脚本和 Automation 入口再开始 Web”的扩大化前置门禁。
+- 13.5-7D 切换完成后，Runtime DB 库存余额和不可变流水是唯一真实库存权威；
+  `products.xlsx.current_stock` 只允许作为一次性 bootstrap 输入和历史快照，不得继续
+  作为可编辑业务库存，也不得与 DB 双写。TaskGeneration、ListingDecision、上架库存
+  上限和库存预警必须读取同一个库存 Provider/Application Service。
+- Web 的普通平台执行必须经过 Service 层 `SUBMIT_EXECUTION` 授权，绑定已认证主体、明确
+  `task_ids` 和本轮重检 digest；Route 不得直接调用 Queue/Runner，也不得扫描全部
+  `PENDING`。系统维护 Route 同样不得成为通用脚本 Runner，长耗时动作必须调用受控的
+  类型化维护 Service，并从既有生命周期、备份或运行事实查询结果。
+- Automation Web 配置只能修改每类 allowlist Job 明确开放的字段和安全范围；18:00/20:00
+  及其关键扫描只能从版本化 `OperationalTimePolicy` 派生，子 Job 不得独立改 schedule，
+  页面不得开放任意 Cron、脚本或 Job 编辑器。
 - S4 不在 13.5-1 或核心 v14 中冻结最终策略，但不得移出任务 13.5：必须在
   13.5-6 先完成 Incident 人工闭环，再依据真实数据冻结策略、迁移正式结构并实现
   受控自动紧急下架。
 - 当前自动紧急下架必须保持禁用：`automatic_emergency_offline=false`。在 13.5-6
   完成人工 Incident 闭环、策略评审、策略结构迁移、实机验收并由管理员显式启用前，
   任何 Agent、Web、Scheduler 或脚本都不得创建或执行 `SYSTEM_EMERGENCY` 自动下架。
+
+### 项目级业务调用通道（后续任务强制遵守）
+
+长期控制面只允许以下分工：人工运营走 Web，定时业务走 Automation，未来智能调用走
+Agent Gateway，平台执行走 Queue/Worker/Importer，开发测试、诊断和恢复走 CLI。各调用方
+共享权威 Query/Application Service，不得为同一职责另建平行状态机、数据库写入口或执行链。
+
+未来 Agent 接入必须遵守：
+
+- 读取经营数据只能走 `Agent Query Adapter → 权威 Query Service / Read Model`；不得抓取
+  Web HTML，不得直接读取 SQLite、Excel、Queue 文件或平台页面作为业务接口。
+- Agent 唯一写入口是 `Agent Task Adapter`，且只接收结构化 `AgentIntent`。这里的
+  “Task Application Service”只是既有 `RuntimeTaskService`、任务生成、规则校验及其他权威
+  Application/Domain Service 的逻辑统称，不授权新增万能服务或平行控制面。
+- 既有确定性服务负责决定 `AgentIntent` 被拒绝、形成 Review、生成 Runtime Task 或产生
+  Outbox/通知；Agent 不得直接调用 Review 或 Notification 写服务，也不得直接调用 CLI、
+  Web Route、平台 Adapter、ShadowBot 或 COMMIT，不得拼 Queue JSON。
+- `AgentIntent` / `AgentProposal` 只是 Adapter 边界的逻辑载荷，不是已批准的 Runtime 表。
+  未形成 Task 或 Review 的建议直接返回；若未来需要长期保存未物化建议，必须另开 R4，
+  依据真实需求评审最小 Schema。
+- 任何 Agent 来源的 `UPDATE_PRICE`、`SET_ONLINE`、`SET_OFFLINE` 都不得直接进入可执行
+  `PENDING`，必须先有人工 Review 和显式授权。“低风险直接 PENDING”只适用于对真实平台
+  零副作用的任务；未来 Agent 自主改价等能力必须另开 R4 并补齐版本化授权策略和 v4/v5
+  来源门禁。
+- Agent 永远不得伪造 `SYSTEM_EMERGENCY`；该来源只能由 13.5-6 的专用授权服务创建。
+- 未来正式身份预留为 `origin_type=AGENT`、
+  `origin_ref_id=agent-run:<stable-run-id>` 和版本化审批策略。当前 Schema 尚未支持
+  `AGENT`，在独立评审和最小迁移完成前，不得冒充 `MANUAL` 或 `AUTOMATION` 落库。
+- 若 Agent 由 Automation 触发，必须同时保留父 `automation-run:<run_id>` 关联，但业务
+  来源仍为 `AGENT`，不能因此改写为普通自动任务。
+- 买家页面可见的“第 N 次购买”、每日人工花材质量评价、买家客户端实时售价和外部市场
+  指数均只作为未来 Agent 销售分析的数据来源规划。13.5-7 不补采、不推断、不扩 Schema，
+  当前 Web 不展示虚构值；Agent 阶段必须先完成各自合同、最小迁移和真实来源验收。
+- Agent 审计优先复用 `origin_type/origin_ref_id`、`changed_by`、`resolved_by`、结构化
+  metadata/event payload 和现有审计链；不得预先要求每张表新增 Agent 专属字段。
+
+任务 13.5-7 只冻结上述合同，不实现 Agent，也不新增 Agent Schema、状态、队列或平台动作。
+任何实际 Agent 接入均是未来独立 R4，不属于 13.5-7B～7F，也不属于只负责综合验收的
+任务 14。后续功能必须先复用本边界；不得再次开发直连 Web、CLI、数据库、Queue 或平台
+执行器的替代通道。
 
 最终希望实现：
 - 用户只维护一份商品和规则数据。

@@ -302,7 +302,7 @@ v14 Runtime DB 中通过，平台写操作为 0。批次 `PARTIAL` 仅源于验�
 
 ### 2.7 Web 运行态运营后台
 
-当前 Web 后台已从早期 Excel 原型页升级为运行态运营后台，包含：
+当前 Web 后台是尚未正式投入使用的运行态 MVP，包含：
 
 - `Dashboard`：运营总览。
 - `Tasks`：运行态任务追踪。
@@ -311,6 +311,47 @@ v14 Runtime DB 中通过，平台写操作为 0。批次 `PARTIAL` 仅源于验�
 - `Execution Logs`：执行日志入口。
 - `Business Inputs`：Excel 业务输入入口。
 - `System`：配置检查、schema 检查、运行态计数、飞书测试通知。
+
+2026-08-07 已决定不再兼容或渐进维护该页面架构。重写前 `main` 已标记为
+`checkpoint/pre-task13-5-7-web-rewrite-20260807`；13.5-7 将建设唯一的新运营 Web，
+并把 CLI 中残留的日常正式业务职责迁移到 Web、Automation 和 Queue。开发测试、Mock、
+验收、诊断、备份和恢复 CLI 继续保留。
+
+2026-08-12 又依据实际运营使用完成产品重基线：不再把旧 Web 整理出的八个页面当作不可
+修改的产品权威，桌面和手机统一冻结为“今日、数据库、业务管理、系统”四个一级入口。
+今日承担销售/真实库存/待办/时间轴和业务健康摘要；数据库只读展示业务与项目事实并保留
+未来 Agent 销售分析位置；业务管理承担即时任务、独立执行授权、人工复核、固定 Automation
+方案、人工新花入库和库存预警；系统只展示组件当前状态、业务影响和受控恢复，详细历史仍
+在数据库。旧八入口中没有独立运营价值的 Route、Presenter、模板和测试将直接删除。
+
+本轮同时确认数据库库存代表农场真实可售库存，平台库存只代表特定平台买家可购上限。
+真实库存将由人工有符号调整和权威销售事实的幂等差额自动更新，并支持取消恢复、不可变
+流水和阈值预警；该能力在 7D 编码前必须单独完成 R4 合同和最小 Schema 评审。创建 Task
+与真实平台执行授权保持两个可审计阶段，Web 将提供连续操作，但普通 `PENDING` 仍不得
+无人值守执行。
+
+7A 评审进一步冻结了实施边界：7D 把 `products.xlsx.current_stock` 按 SKU 仅一次 bootstrap
+到 Runtime DB，之后 DB 余额/流水成为唯一真实库存权威，所有库存消费者改读同一 Provider，
+不保留 Excel/DB 双写。库存自动变化只接受完整 CLOSED 订单的累计销量净差，以及订单不可用
+时合格 `SCAN_ESTIMATED_HIGH` 的正向扣减；部分/OPEN、中低质量估算和不可用事实零写，
+取消只通过最新完整订单累计销量的负差恢复，不能额外加回取消量。Web 提交执行必须由
+Service 层把认证主体、明确 task IDs 和重检 digest 绑定到既有 v4/v5 发布链；Automation
+每类 Job 只开放明确字段和范围，18:00/20:00 不得单独漂移；系统 Route 不作为脚本 Runner。
+
+项目级控制面已经同时冻结：人工运营走 Web，定时业务走 Automation，未来智能调用走
+Agent Gateway，平台执行走 Queue/Worker/Importer，开发测试与恢复走 CLI。未来 Agent
+读取只能经 Agent Query Adapter 调用权威 Query Service/Read Model；唯一写入口是 Agent
+Task Adapter 接收结构化 `AgentIntent`，再由既有权威服务和确定性规则决定拒绝、Review、
+Runtime Task 或 Outbox/通知。Agent 不能直接写 Review/通知，不能抓取 Web、调用 CLI、
+直读 SQLite/Excel、拼 Queue JSON、直连平台 Adapter 或伪造 `SYSTEM_EMERGENCY`。
+`AgentIntent` / `AgentProposal` 只是逻辑载荷，不批准为 Runtime 表；Agent 来源的改价、
+上架、下架必须先经人工 Review 和显式授权。正式 Agent 来源预留为 `AGENT +
+agent-run:<stable-run-id>`；当前 Schema 尚未支持，本阶段只冻结合同，不提前实现，也不
+冒充 `MANUAL` 或 `AUTOMATION`。任何实际接入属于未来独立 R4，不在 13.5-7B～7F 或
+任务 14 内实施。
+
+买家页面可见“第 N 次购买”、买家客户端实时售价、每日人工花材质量“好/中/差”和外部
+市场指数继续留到 Agent 阶段；13.5-7 不补采、不推断、不扩 Schema，当前 Web 不展示假值。
 
 ### 2.8 自动规则评估框架 MVP
 
@@ -584,7 +625,8 @@ Web 复核主入口：
 
 - 不承诺真实销售平台无人值守生产改价；当前 production profile 以有效 pending 任务为执行权威，并保留单 Worker 多商品严格串行、旧价校验和人工可对账边界。
 - 不承诺生产级无人值守 RPA；本地文件队列、自动对账和审计闭环代码已完成，但常驻实机样本、告警和长期证据运维仍未达到生产级。
-- 不接 AI Agent 自动决策。
+- 当前不接 AI Agent 自动决策；未来接入必须复用已冻结的 Agent Gateway，不得另建直连
+  Web、CLI、数据库、Queue 或平台执行器的通道。
 - 不引入 React / Vue。
 - 不做前后端分离。
 - 不迁移 Excel 主数据。
@@ -697,7 +739,9 @@ Code Review 后的高中低风险问题已完成修复，系统冒烟测试、�
 5. 任务12 PR #18 已合并；任务13也已完成 T13-0 页面探索、T13-1 合同、T13-2 Runtime Schema v13、独立两页 SYNC_STATUS、单商品状态往返、正常多商品严格串行上下架、整批预检异常零写、严格串行 UNKNOWN、最终确认点击后的 `UNKNOWN → 唯一自动 RECONCILE → VERIFIED` 和 `UNKNOWN → 唯一自动 RECONCILE → NOT_APPLIED`、`ALREADY_APPLIED` 0 写点击、跨动作共享写锁、phase/result 恢复、Web 运营投影、最终回归、PR #19 COMMENT Review 修复和双平台 CI。仓库内已保存脱敏证据、自然语言报告、数据库回读及 CI 复算入口；本轮文档整理不执行合并或任务状态变更。
 6. 继续运行系统冒烟、完整单元测试和 ShadowBot 成功基线测试，任务13.5不得重写已验证 COMMIT 动作链路。
 7. 基于自动规则评估框架继续完善上下架、冷库、包装产能等 evaluator，但保持 dry-run/apply 和 service 边界。
-8. AI Agent 自动决策应放在真实平台执行和运维边界通过更长期审查后再推进。
+8. AI Agent 自动决策应放在真实平台执行和运维边界通过更长期审查后再推进；接入时只能
+   使用项目级已冻结的 Agent Query Adapter 和 `AgentIntent` 唯一写通道，并为身份、
+   来源、审批、持久化需求和任何真实平台写权限执行独立 R4；任务 14 不承担该实现。
 9. 13.5-0 已建立独立分支、黄金基线、脚本/路由盘点、禁止重写点、Web 独立审计、
    验收清单和 main 回滚点；13.5-1、13.5-2 已分别通过 PR #22、#23 合并，后续编码仍按
    [任务12—13复用路径与失败复盘](shadowbot_task12_task13_reusable_lessons.md)

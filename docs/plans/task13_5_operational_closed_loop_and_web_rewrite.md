@@ -1,6 +1,7 @@
 # 任务 13.5：单平台运营自动化闭环与 Web 主控重写实施计划
 
-- 计划日期：2026-07-28；按父 Issue 合并正文修订于 2026-07-29
+- 计划日期：2026-07-28；按父 Issue 合并正文修订于 2026-07-29；13.5-7 替代重写与
+  Agent 通道边界修订于 2026-08-07
 - 插入位置：任务 13 完成后、任务 14 开始前
 - 当前状态：13.5-0 已通过 PR #21 合并；13.5-1
   [双时间轴、质量与日结合同](task13_5_1_quality_and_settlement_contract_review.md)
@@ -170,9 +171,18 @@ Automation Scheduler ──► Automation Run Ledger
 | `shadowbot-queue-services` | 文件队列 Importer、Watchdog、唯一 RECONCILE | 仅复用既有边界 |
 | `command-executor` | 接收明确授权后的普通写任务或 `SYSTEM_EMERGENCY` | 是，必须有明确任务和授权 |
 | Web 主控端 | 配置、观察、人工处置和审计 | 不直接执行平台动作 |
+| 未来 Agent Gateway | 适配 Agent 查询和任务意图到权威 Query/Application Service | 否；不得直接入队或 COMMIT |
 
 Web 请求线程不得承担长期调度、循环扫描或 ShadowBot Worker 生命周期。CLI 保留为
 排障和手工补跑入口，但日常业务不再依赖操作人员打开终端执行脚本。
+
+项目长期调用关系固定为：人工运营走 Web，定时业务走 Automation，未来智能调用走
+Agent Gateway，平台执行走 Queue/Worker/Importer，开发测试与恢复走 CLI。Agent 不得
+抓取 Web、调用 CLI、直读 Runtime DB/Excel、拼 Queue JSON 或直连平台 Adapter；读取必须
+经 Agent Query Adapter 调用权威 Query Service/Read Model，写入只能经 Agent Task Adapter
+提交结构化 `AgentIntent`。既有权威 Application/Domain Service 与确定性规则决定拒绝、
+Review、Runtime Task 和 Outbox/通知；Agent 不得直接写 Review 或通知。这里的“Task
+Application Service”只是现有服务的逻辑统称，不授权新增万能服务。
 
 ## 5. 自动扫描与日结流程
 
@@ -433,6 +443,17 @@ supporting_observation_ids
 - `SYSTEM_EMERGENCY`
 - `LEGACY`
 
+这是当前 v14—v16 的已实现集合。未来 Agent 正式接入时必须通过独立评审和最小迁移增加
+`AGENT`，使用 `origin_ref_id=agent-run:<stable-run-id>` 与版本化审批策略；当前任务不得
+把 Agent 冒充为 `MANUAL` 或 `AUTOMATION`。由 Automation 触发时另保留父
+`automation-run:<run_id>` 关联，但 Agent 业务来源不变。
+
+`AgentIntent` / `AgentProposal` 只是在 Agent Adapter 边界传递的逻辑载荷，不是当前批准
+的 Runtime 表。Agent 来源的 `UPDATE_PRICE`、`SET_ONLINE`、`SET_OFFLINE` 必须先经人工
+Review 和显式授权，不得直接进入可执行 `PENDING`；只有对真实平台零副作用的任务才可
+讨论低风险直入。未形成 Task 或 Review 的建议直接返回，长期 proposal 持久化与任何自主
+真实平台写权限都必须在未来独立 R4 中重新评审。
+
 Issue #20 中的细分来源名称是运营语义，不扩张为第二套数据库枚举，固定映射为：
 
 | 运营语义 | 核心来源 |
@@ -465,8 +486,13 @@ Issue #20 中的细分来源名称是运营语义，不扩张为第二套数据�
 - 暂停自动化通道不得删除候选任务，也不得停止正在副作用区内执行的操作。
 - 除满足全部 S4 门禁的 `SYSTEM_EMERGENCY` 外，自动化通道的最高权限是创建
   proposal、Review 或候选任务。
-- Web、CLI 和 Scheduler 必须调用同一 application service；Web 不得通过 subprocess、
-  自定义队列 JSON 或备用 gate 绕过服务层。
+- Web、CLI、Automation 和未来 Agent Gateway 必须调用同一权威 application service；
+  Web/Agent 不得通过 subprocess、自定义队列 JSON 或备用 gate 绕过服务层。
+- Agent 只提交 `AgentIntent`，不得直接创建 Review 或通知；确定性业务服务根据结果复用
+  现有 Review、Runtime Task、Outbox 和通知链。Agent 审计优先复用现有来源、操作者、
+  metadata/event payload，不预先要求每张表增加专属字段。
+- `SYSTEM_EMERGENCY` 只能由 13.5-6 专用授权服务创建；Web、CLI、Automation 普通 Handler
+  和未来 Agent 均不得伪造该来源。
 
 ## 8. 异常分类与处理
 
@@ -591,32 +617,35 @@ Web 主控端以运营人员的工作问题组织页面：
 内部 schema、合同版本、operation/attempt、phase、hash 和本地路径默认不出现在主流程，
 仅在“高级诊断”中按需展开。
 
+2026-08-12 依据实际运营路径重新冻结：当前项目尚未正式投入使用，新 Web 不渐进兼容旧
+Web。重写前的
+`main` 已标记为 `checkpoint/pre-task13-5-7-web-rewrite-20260807`；新应用验收后直接
+删除旧路由、Renderer 和样式，恢复依靠 Git 检查点，不依靠双 Web。
+
+Web 产品决策以实际使用为主，不以旧 Web 或历史计划页面清单为主。权威顺序是用户确认的
+实际运营流程、当前四入口样板、已验证的领域/安全/执行合同、当前施工计划、旧 Web 与历史
+档案。UI 可以删除旧页面，但不能绕过 Task、Review、授权、Queue/Worker/Importer、写锁、
+UNKNOWN/RECONCILE、交易日和数据质量合同。
+
 ### 9.2 推荐导航
 
-1. **今日运营**
-   - 同时显示平台交易日、卖家作业日、当前阶段、截单倒计时和交付重叠。
-   - 展示扫描、在线商品、销售及质量、下一交易日早期销售、HIGH/CRITICAL 和人工介入。
-   - 展示 Worker、队列和自动化健康状态。
-2. **平台商品**
-   - 区分 `ONLINE_PULSE` 和 `FULL_MARKET_SCAN` 的位置事实。
-   - 展示映射、价格/库存轨迹、异常、写锁和关联任务。
-3. **销售分析**
-   - 严格区分 `ORDER_OBSERVED` 与 `SCAN_ESTIMATED`。
-   - 展示日结版本、质量等级、峰值份额、18:00–20:00 早期销售和预测输入。
-4. **自动化**
-   - 调度计划、最近运行、下一次运行、暂停/恢复、手工补跑。
-   - 运行状态使用 `SCHEDULED / RUNNING / SUCCESS / PARTIAL / FAILED / MISSED /
-     MERGED / SKIPPED / CANCELLED`。
-5. **待处理**
-   - 集中 Review、登录、映射、页面、HIGH/CRITICAL、UNKNOWN、通知失败和低置信估算。
-   - 确认不等于解决；支持指派、安全重试、处置时间线和恢复证据。
-6. **任务中心**
-   - 按人工、自动、系统紧急和全部任务分组。
-   - 展示候选、授权、执行中、异常和完成状态；扫描运行不伪装为普通任务。
-7. **业务资料**
-   - 商品资料、库存补充、平台映射、价格规则、上下架规则、包装产能和冷库状态。
-8. **系统维护**
-   - 执行审计、UNKNOWN/RECONCILE、服务健康、队列、Outbox、磁盘、备份和高级诊断。
+1. **今日**
+   - 展示 PRA 交易日、OPEN/CLOSED/结算状态、销量、金额、均价、数据库真实库存、待办、
+     当日时间轴和组件业务影响摘要。
+   - 品种、等级、销售额和真实库存使用紧凑表格；完整历史进入数据库。
+2. **数据库**
+   - 只读查看业务数据、项目运行数据、销售分析、字段说明和质量与新鲜度。
+   - 销售分析严格区分 `ORDER_OBSERVED` 与 `SCAN_ESTIMATED`，并作为未来 Agent 分析的
+     稳定展示入口；当前不显示复购、买家端价格或 Agent 假建议。
+3. **业务管理**
+   - 创建任务、独立执行授权、人工复核、固定 Automation 方案和人工真实库存业务。
+   - 品种/等级/平台多选，支持调整价格到、加/降价、下架、上架+平台目标库存。
+4. **系统**
+   - 只显示组件当前状态、业务影响和恢复动作；详细运行历史留在数据库。
+   - 提供受控 Worker 恢复、通知测试、显式数据库维护、备份、权限边界和高级诊断。
+
+旧“平台商品、自动化、待处理、任务中心、业务资料”不再默认保留为页面：唯一事实分别并入
+数据库、业务管理或系统；没有独立运营价值的 Route、Presenter、模板和测试一起删除。
 
 ### 9.3 页面和交互规则
 
@@ -631,9 +660,14 @@ Web 主控端以运营人员的工作问题组织页面：
 - 所有时间显示业务时区，并可查看原始 ISO 时间。
 - Web 不直接启动不可审查的 subprocess，不在请求线程中执行长任务。
 - 保留服务端渲染技术路线，除非在 T13.5-0 审查后另行批准前后端分离。
-- 代码渐进拆分到 `app/webapp/application.py`、`auth.py`、`csrf.py`、`routes/`、
-  `presenters/`、`templates/` 和 `static/`；业务应用服务继续保留在
-  `app/services/`，先保持兼容路由和行为测试。
+- 新建独立 `app/operations_web/`，包含 Composition Root、认证、CSRF、路由、
+  Presenter、模板和静态资源；业务应用服务继续保留在 `app/services/`。
+- Runtime DB、工作簿和 Queue 在启动时固定；URL、Session 和表单不能切换。普通 GET 永不
+  初始化、迁移或修复 Schema。
+- development 必须显式使用 `PRA_ENV=development` 和非 Secure Cookie；production 必须
+  HTTPS + Secure Cookie；冲突时拒绝启动并给出中文原因。
+- 新 Web 不承诺旧路由、query-string、HTML、Session 或书签兼容；只复用已验证的
+  安全属性和后端业务合同。
 
 ## 10. 建议的数据结构
 
@@ -819,31 +853,49 @@ Web 主控端以运营人员的工作问题组织页面：
 验收：人工闭环和支撑数据先通过评审；ACK 只是事件；同异常不刷屏；Worker 异常运行
 完整恢复程序；禁止条件逐项阻断；紧急下架后不能自动上架。
 
-### T13.5-7：控制服务、脚本和任务来源对齐
+### T13.5-7：运营 Web 替代重写与 CLI 残留业务迁移
 
-- Web、CLI、Scheduler 统一调用 application service。
-- 将人工脚本入口收口为诊断/补跑工具，不建立 Web subprocess 或第二队列。
-- 补齐 `origin_type/origin_ref_id/approval_policy/policy_version` 和人工/自动/系统任务分组。
+- 在最新 `main` 建立可推送的 Git 恢复检查点，不保留双 Web。
+- 新建唯一运营 Web，按“今日、数据库、业务管理、系统”四个一级入口组织页面。
+- 直接复用 Task、Review、Automation、Incident、日结、Queue/Importer 和唯一
+  RECONCILE，不重构已验证后台动作链。
+- 按 R4 冻结认证/Session/CSRF、Presenter 权威输入、单一可信 Runtime DB、`/health` 与
+  Mobile Review 外部协议切换、任务来源和恢复成本。
+- 将 CLI 中残留的日常任务生成、复核、超时维护和运营查询迁移到 Web、Automation 或
+  Queue；保留测试、Mock、验收、诊断、备份、恢复和进程启动 CLI。
+- 业务管理复用既有输入服务，并新增即时人工任务编排；创建 Task 和真实平台执行授权分成
+  两个可审计阶段。普通 `PENDING` 不得无人值守执行；Web 只通过 Service 层
+  `SUBMIT_EXECUTION` 授权对明确 task IDs 和重检 digest 提交，Route 不直连 Queue/Runner。
+- 冻结数据库真实库存和平台库存：真实库存代表还有多少花可卖，由人工入库和权威销售差额
+  更新；平台库存只代表单平台买家可购上限。7D 将 `products.xlsx.current_stock` 仅一次
+  bootstrap 到 DB，之后 DB 余额/流水是唯一权威，禁止双写。库存只接受完整订单净差和
+  合格 HIGH 估算正向扣减；部分/OPEN、中低估算和不可用事实零写，取消不重复恢复。
+- 固定 Automation 方案按 Job 类型开放有限字段和安全范围；18:00/20:00 由版本化时间
+  策略统一派生，child job 不可独立配置，不开放脚本或任意 Cron。
+- 在既有 Automation 框架增加“Review 超时”和“每日自动任务生成”两个薄 Handler，不
+  新建 Scheduler 或任务系统。
+- 在根级规则中预留唯一 Agent Gateway 通道；13.5-7 不实现 Agent、不扩 Schema、不批准
+  proposal 表或自主平台写权限，后续不得另建直连 Web、CLI、数据库、Queue 或平台的
+  Agent 路径。任何实际 Agent 接入均为未来独立 R4，不属于 7B～7F 或任务 14。
+- 13.5-7 当前不补采“第 N 次购买”、买家客户端价格或花材质量评价，不实现 Agent；这些
+  只在 Agent 阶段按独立合同落地。
+- 完成新应用骨架、四入口只读、真实库存、人工流程、系统维护、切换删除和桌面/手机验收。
+- 系统维护 Route 只调用类型化 Service 并查询现有状态，不直接运行或等待任意脚本；长耗时
+  Worker 恢复、备份和维护动作复用既有生命周期/维护边界。
+- 7B—7F 按“骨架安全 / 四入口只读 / 真实库存 / 人工任务与 Automation / 切换验收”顺序
+  小 PR；后一项只在前一项通过评审后开始。
+- 具体工作包、CLI 矩阵和复杂度预算见
+  [任务 13.5-7 Web 重写计划](task13_5_web_rewrite_plan.md)。
 
-验收：入口行为一致、来源可追溯、扫描不伪装为任务、自动失败不影响人工处置。
+验收：新 Web 是唯一人工运营入口；日常业务不依赖 CLI；测试与管理员 CLI 仍可用；
+旧 Web 已删除；普通 GET 零写；真实库存、平台库存和执行授权语义正确；后台唯一平台动作
+链未被重写；Agent 唯一通道已经冻结但没有提前实现。
 
-### T13.5-8：Web 架构拆分
+### T13.5-8 / T13.5-9：内容并入 T13.5-7
 
-- 建立 `app/webapp/` 目录、受控模板层、presenter/ViewModel 和兼容路由。
-- 先迁移只读页面和公共组件，再迁移表单与高风险动作。
-- 建立 HTML 行为快照、CSRF/auth、分页、性能和可访问性门禁。
-
-验收：拆分前后路由、权限、状态语义和 POST 行为一致，首屏不再加载全部大日志。
-
-### T13.5-9：Web 运营 UI 重写
-
-- 按八个权威一级入口重写导航、今日运营、平台商品、销售分析、自动化和待处理。
-- 任务中心按人工/自动/系统紧急分组，业务资料和系统维护收纳高级功能。
-- 移除开发者文案，原始合同、JSON、phase、hash 和路径默认折叠。
-- 具体浏览发现、页面地图、技术拆分和验收门禁见
-  [任务 13.5 Web 主控端重写计划](task13_5_web_rewrite_plan.md)。
-
-验收：用运营任务脚本进行桌面和移动端可用性验收，不以“路由可以打开”为完成标准。
+原“Web 架构拆分”和“Web 运营 UI 重写”不再作为要求兼容旧 Web 的独立前置阶段，其
+内容已并入 T13.5-7 的 7B—7F 工作包。Issue #20 已于 2026-08-12 同步为当前
+13.5-7 路线。
 
 ### T13.5-10：集成回归与任务 14 交接
 
@@ -915,13 +967,13 @@ Web 主控端以运营人员的工作问题组织页面：
 - [ ] 订单页能力声明、不可变批次、销售事实质量和日结修订机制通过验收。
 - [ ] S0–S4、重复提醒、S4 禁止条件和紧急下架恢复通过演练。
 - [ ] 普通写动作仍被明确任务与授权门禁阻止；`SYSTEM_EMERGENCY` 只有一个受控入口。
-- [ ] Web 八个一级入口、分页、移动端和高级诊断通过运营验收。
+- [ ] Web 四个一级入口、后端分页、移动端、通知闭环和高级诊断通过运营验收。
 - [ ] 中文文档、JSON、CSV/TSV 和 SQLite 迁移均通过编码及结构验证。
 - [ ] 实机证据、自动化测试和文档结论彼此一致。
 
 ## 16. 待冻结的实现策略
 
-18:00/20:00 双时间轴、事实来源、异常等级、紧急保护、八个 Web 入口和任务 14 边界已经
+18:00/20:00 双时间轴、事实来源、异常等级、紧急保护、四个 Web 入口和任务 14 边界已经
 由 Issue #20 冻结，不再作为开放产品问题。实施阶段仍需冻结：
 
 1. 不营业日、临时维护窗口和节假日的维护方式。

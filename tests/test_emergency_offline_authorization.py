@@ -48,6 +48,22 @@ from app.services.shadowbot_listing_sync import (
 from app.shadowbot_contract_primitives import contract_identity_key
 from app.shadowbot_listing_contract import derive_v5_batch_semantics, v5_result_counts
 NOW = datetime(2026, 8, 3, 2, tzinfo=timezone.utc)
+TEST_CURRENT = NOW + timedelta(hours=1)
+
+
+class _FixedDateTime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        if tz is None:
+            return TEST_CURRENT.replace(tzinfo=None)
+        return TEST_CURRENT.astimezone(tz)
+
+
+@pytest.fixture(autouse=True)
+def _freeze_listing_pipeline_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    from app.services import shadowbot_listing_action_pipeline
+
+    monkeypatch.setattr(shadowbot_listing_action_pipeline, "datetime", _FixedDateTime)
 
 
 class _Shadow:
@@ -224,7 +240,7 @@ def _seed_authorization_facts(repository: SQLiteRuntimeRepository) -> None:
                 ?, 'synthetic-fixture', NULL, 'synthetic'
             )
             """,
-            ((NOW + timedelta(days=7)).isoformat(), sent_at),
+            ((TEST_CURRENT + timedelta(days=7)).isoformat(), sent_at),
         )
         connection.execute(
             """
@@ -926,7 +942,7 @@ def _emergency_write_request(proposal: dict[str, object]) -> dict[str, object]:
     gate_summary = {
         "schema_version": "shadowbot-listing-action-gate-summary-1.0",
         "gate_phase": "PRE_PUBLISH",
-        "evaluated_at": datetime.now(timezone.utc).isoformat(),
+        "evaluated_at": TEST_CURRENT.isoformat(),
         "items": [
             {
                 "internal_sku": manifest["items"][0]["internal_sku"],
@@ -957,7 +973,7 @@ def _emergency_write_result(
     outcome: str,
 ) -> dict[str, object]:
     request_item = request["items"][0]
-    observed_at = datetime.now(timezone.utc).isoformat()
+    observed_at = TEST_CURRENT.isoformat()
     clicked = outcome in {"VERIFIED", "NEEDS_RECONCILIATION"}
     unknown = outcome == "NEEDS_RECONCILIATION"
     output = {
@@ -1044,7 +1060,7 @@ def _prepare_worker_won_unknown_reconcile(
     dict[str, object],
 ]:
     repository = _repository(tmp_path)
-    current = datetime.now(timezone.utc)
+    current = TEST_CURRENT
     authorized = _authorize(
         _service(repository),
         authorized_at=current,
@@ -1155,7 +1171,7 @@ def _reconcile_result(
     result_id: str,
 ) -> dict[str, object]:
     item = request["items"][0]
-    observed_at = datetime.now(timezone.utc).isoformat()
+    observed_at = TEST_CURRENT.isoformat()
     output = {
         name: item[name]
         for name in (
@@ -1228,7 +1244,7 @@ def test_shadowbot_emergency_reuses_v5_persistence_and_shared_write_lock(
     from shadowbot.test2 import shadowbot_queue_worker
 
     repository = _repository(tmp_path)
-    current = datetime.now(timezone.utc)
+    current = TEST_CURRENT
     authorized = _authorize(
         _service(repository),
         authorized_at=current,
@@ -1272,7 +1288,7 @@ def test_shadowbot_emergency_reuses_v5_persistence_and_shared_write_lock(
         ).fetchone()[0] == 1
 
     request_item = request["items"][0]
-    observed_at = datetime.now(timezone.utc).isoformat()
+    observed_at = TEST_CURRENT.isoformat()
     output = {
         "source_task_id": request_item["source_task_id"],
         "operation_id": request_item["operation_id"],
@@ -1345,7 +1361,7 @@ def test_formal_review_wins_after_emergency_request_persistence_and_import_conve
     repository = _repository(tmp_path)
     review_repository = SQLiteRuntimeRepository(repository.db_path)
     worker_repository = SQLiteRuntimeRepository(repository.db_path)
-    current = datetime.now(timezone.utc)
+    current = TEST_CURRENT
     authorized = _authorize(
         _service(repository),
         authorized_at=current,
@@ -1462,7 +1478,7 @@ def test_worker_final_fence_wins_and_late_review_creates_no_second_write_task(
 ) -> None:
     repository = _repository(tmp_path)
     review_repository = SQLiteRuntimeRepository(repository.db_path)
-    current = datetime.now(timezone.utc)
+    current = TEST_CURRENT
     authorized = _authorize(
         _service(repository),
         authorized_at=current,
@@ -1862,7 +1878,7 @@ def test_emergency_persistence_rolls_back_if_flag_changes_after_proposal(
     tmp_path: Path,
 ) -> None:
     repository = _repository(tmp_path)
-    current = datetime.now(timezone.utc)
+    current = TEST_CURRENT
     authorized = _authorize(
         _service(repository),
         authorized_at=current,
