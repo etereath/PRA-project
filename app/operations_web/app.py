@@ -7,7 +7,7 @@ import logging
 import re
 from datetime import date
 from socketserver import ThreadingMixIn
-from urllib.parse import parse_qs, unquote
+from urllib.parse import parse_qs, quote, unquote
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 from app.operations_web.auth import Capability, SessionCapacityError
@@ -24,6 +24,13 @@ from app.operations_web.presenters import (
 from app.operations_web.queries import OperationsQueryService
 from app.operations_web.rendering import html, render_template, static_text
 from app.operations_web.security import Response, internal_error_response
+from app.services.authoritative_inventory import (
+    InventoryApplicationService,
+    InventoryAuthorityError,
+    InventoryConflictError,
+    InventoryInsufficientError,
+)
+from app.services.inventory_alert import InventoryAlertService
 from app.services.security import LOGIN_RATE_LIMITER, record_security_event
 
 
@@ -93,6 +100,11 @@ class OperationsWebApplication:
             container.runtime_repository,
             container.settings.paths,
         )
+        inventory_alerts = InventoryAlertService(container.runtime_repository)
+        self.inventory_application = InventoryApplicationService(
+            container.runtime_repository,
+            alert_evaluator=inventory_alerts.evaluate_transaction,
+        )
 
     def __call__(self, environ, start_response):
         try:
@@ -131,6 +143,16 @@ class OperationsWebApplication:
                 headers=[("Cache-Control", "public, max-age=3600")],
             )
 
+        if path == "/static/app.js":
+            if method != "GET":
+                return self._method_not_allowed("GET")
+            return Response.text(
+                "200 OK",
+                static_text("app.js"),
+                content_type="application/javascript; charset=utf-8",
+                headers=[("Cache-Control", "public, max-age=3600")],
+            )
+
         if path == "/health":
             if method != "GET":
                 return self._method_not_allowed("GET")
@@ -159,6 +181,11 @@ class OperationsWebApplication:
 
         if path.startswith("/mobile/review/"):
             return self._mobile_review(environ, method, path)
+
+        if path == "/management/inventory-adjustments":
+            if method != "POST":
+                return self._method_not_allowed("POST")
+            return self._inventory_adjustment(environ)
 
         if self._is_protected_route(path):
             if method != "GET":
@@ -359,7 +386,19 @@ class OperationsWebApplication:
                 )
             )
         elif path == "/management":
-            content = render_management(self.queries.management())
+            content = render_management(
+                self.queries.management(
+                    inventory_transaction_id=self._first(
+                        query,
+                        "inventory_transaction",
+                    ),
+                    inventory_error_code=self._first(
+                        query,
+                        "inventory_error",
+                    ),
+                ),
+                csrf_token=session.csrf_token,
+            )
         elif path == "/system":
             content = render_system(self.queries.system())
         else:
@@ -395,6 +434,73 @@ class OperationsWebApplication:
             body,
             content_type="text/html; charset=utf-8",
             headers=[("Cache-Control", "no-store")],
+        )
+
+    def _inventory_adjustment(self, environ) -> Response:
+        session = self.container.sessions.get(str(environ.get("HTTP_COOKIE", "")))
+        if session is None or session.principal is None:
+            return Response.text(
+                "303 See Other",
+                "",
+                headers=[("Location", "/login"), ("Cache-Control", "no-store")],
+            )
+        if not self.container.authorization.allows(
+            session.principal,
+            Capability.MANAGE_BUSINESS,
+        ):
+            return Response.text("403 Forbidden", "当前账号没有库存调整权限。")
+        form = self._parse_form(environ)
+        if not self.container.sessions.csrf_matches(
+            session,
+            self._first(form, "csrf_token"),
+        ):
+            record_security_event(
+                "CSRF_REJECTED",
+                route="/management/inventory-adjustments",
+                outcome="rejected",
+                reason_code="SESSION_CSRF_INVALID",
+                subject=session.principal.subject,
+            )
+            return Response.text("403 Forbidden", "库存调整请求校验失败，请刷新页面后重试。")
+        try:
+            result = self.inventory_application.adjust(
+                internal_sku=self._first(form, "internal_sku"),
+                inventory_delta=int(self._first(form, "inventory_delta")),
+                source_type=self._first(form, "source_type"),
+                reason=self._first(form, "reason"),
+                actor=session.principal.subject,
+                idempotency_key=self._first(form, "idempotency_key"),
+                expected_version=int(self._first(form, "expected_version")),
+            )
+        except (ValueError, InventoryInsufficientError):
+            return self._inventory_error_redirect("INVALID_ADJUSTMENT")
+        except InventoryConflictError:
+            return self._inventory_error_redirect("INVENTORY_CONFLICT")
+        except InventoryAuthorityError:
+            return self._inventory_error_redirect("INVENTORY_UNAVAILABLE")
+        except Exception:
+            return self._inventory_error_redirect("INVENTORY_WRITE_FAILED")
+        if result.transaction is None:
+            return self._inventory_error_redirect("INVENTORY_WRITE_FAILED")
+        location = "/management?inventory_transaction=" + quote(
+            result.transaction.transaction_id,
+            safe="",
+        )
+        return Response.text(
+            "303 See Other",
+            "",
+            headers=[("Location", location), ("Cache-Control", "no-store")],
+        )
+
+    @staticmethod
+    def _inventory_error_redirect(error_code: str) -> Response:
+        return Response.text(
+            "303 See Other",
+            "",
+            headers=[
+                ("Location", "/management?inventory_error=" + quote(error_code)),
+                ("Cache-Control", "no-store"),
+            ],
         )
 
     def _mobile_review(self, environ, method: str, path: str) -> Response:

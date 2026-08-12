@@ -15,6 +15,8 @@ from app.services.automation import (
     FULL_MARKET_SCAN,
     ORDER_SCAN,
 )
+from app.services.authoritative_inventory import InventorySalesApplicationService
+from app.services.inventory_alert import InventoryAlertService
 from app.services.operational_time import OperationalTimeService
 from app.services.order_observation import OrderObservationImporter
 from app.services.order_scan_automation import (
@@ -49,6 +51,22 @@ def build_order_read_only_handlers(
     settlement_service = TradeDaySettlementService(
         OperationalSummaryRepository(runtime_repository)
     )
+    inventory_sales_service = InventorySalesApplicationService(
+        runtime_repository,
+        alert_evaluator=InventoryAlertService(
+            runtime_repository
+        ).evaluate_transaction,
+    )
+
+    def refresh_settlement_and_inventory(**kwargs):
+        results = settlement_service.refresh_after_order_import(**kwargs)
+        inventory_sales_service.apply_current_sku_summaries(
+            platform_name=kwargs["platform_name"],
+            platform_trade_date=kwargs["platform_trade_date"],
+            actor="order-history-import",
+        )
+        return results
+
     order_handler = OrderScanHandler(
         adapter=MayiHuatuanOrderReadOnlyAdapter(
             reader,
@@ -67,7 +85,7 @@ def build_order_read_only_handlers(
             if target_trade_date is not None
             else lambda run: run.platform_trade_date
         ),
-        post_import_refresh=settlement_service.refresh_after_order_import,
+        post_import_refresh=refresh_settlement_and_inventory,
     )
     return {
         FULL_MARKET_SCAN: FullMarketScanOrderDispatchHandler(),

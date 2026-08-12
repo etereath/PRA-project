@@ -2,9 +2,9 @@
 
 - 计划日期：2026-08-12
 - Review Profile：R4
-- 当前状态：7A 已由 PR #31 合并；7B 已完成本地实现与统一回归，待 Draft PR/CI 评审
-- 基线：`origin/main` 合并提交 `08ea0d2`
-- 7B 分支：`codex/task13-5-7b-web-foundation`
+- 当前状态：7A、7B、7C 已分别由 PR #31、#32、#33 合并；7D 在独立分支实现与评审
+- 7D 基线：`origin/main` 合并提交 `ca1dce5`
+- 7D 分支：`codex/task13-5-7d-authoritative-inventory`
 - 恢复检查点：`checkpoint/pre-task13-5-7-web-rewrite-20260807`
 - 产品权威：[运营 Web 实际业务重基线计划](task13_5_web_rewrite_plan.md)
 - 宏观权威：[GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20)

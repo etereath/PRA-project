@@ -353,7 +353,7 @@ agent-run:<stable-run-id>`；当前 Schema 尚未支持，本阶段只冻结合�
 买家页面可见“第 N 次购买”、买家客户端实时售价、每日人工花材质量“好/中/差”和外部
 市场指数继续留到 Agent 阶段；13.5-7 不补采、不推断、不扩 Schema，当前 Web 不展示假值。
 
-13.5-7A 已由 PR #31 合并到 `main`，7B 已由 PR #32 合并。新
+13.5-7A、7B、7C 已分别由 PR #31、#32、#33 合并到 `main`。新
 `app/operations_web` 已建立应用骨架、单一 Composition Root、有界内存 Session、登录后轮换、
 POST 退出、CSRF、集中 capability、安全 Header、统一错误边界和本地打包资源。认证 Session
 不会被匿名登录页请求替换或因 preauth 容量回收而淘汰；无可安全回收项时 fail closed。
@@ -363,7 +363,7 @@ POST 退出、CSRF、集中 capability、安全 Header、统一错误边界和�
 四入口骨架和错误提示只使用只读连接，绝不调用 `init_schema()` 或迁移；Runtime 健康异常只
 提示另走显式维护，不推断或修复真实数据。
 
-7C 已在独立分支完成四入口只读事实：今日页接入交易日、六级质量、销量/金额/均价、当前
+7C 已完成并合并四入口只读事实：今日页接入交易日、六级质量、销量/金额/均价、当前
 产品库存资料、待办和时间轴；数据库接入业务事实、项目事实、确定性销售分析、字段说明和
 质量新鲜度；业务管理接入当前 Task、Review 和 Automation Run；系统只报告 Runtime DB、
 工作簿、Queue 和 Worker 当前状态。默认 25 条后端分页已覆盖 Task、Review、Run、Incident、
@@ -390,6 +390,34 @@ Web 与后台生命周期已先行拆开：`scripts/start_local.ps1` 不再启�
 后台服务改由 `scripts/start_local_services.ps1` 独立运行。新 Web 目前仍是分阶段施工目标；
 旧 Web 默认入口、Presenter 和重复测试的最终切换删除仍严格留在 7F，不能在 7C 冒充完成。
 7B 的基础边界见[13.5-7B 实施报告](reports/task13_5_7b_web_foundation.md)。
+
+7D 当前在 `codex/task13-5-7d-authoritative-inventory` 独立分支实现。Runtime Schema v17
+新增库存权威状态、非负余额、append-only 流水、按平台/PRA 交易日/SKU 的已应用销量基准
+和默认关闭的库存预警策略；没有新增平台合同、状态机或真实平台动作。统一 Inventory
+Provider 在 `PRE_CUTOVER` 保留工作簿历史库存，在 `DB_AUTHORITY` 后只返回 DB 余额且缺
+SKU 立即失败。一次性 bootstrap、零余额新 SKU 初始化、人工有符号调整、完整 CLOSED 订单
+净差、高质量估算只减不增、订单替换估算和取消恢复均通过同一 Application Service；余额、
+流水和销售基准同一 SQLite 事务。TaskGeneration、规则评估、今日/数据库/业务管理、销售计划
+输入、20:00 结算和历史订单回补已改用该权威边界；平台观察库存只作为平台可购上限，不能
+覆盖真实库存。库存阈值继续复用现有 `INVENTORY_ANOMALY` Incident 与 Outbox，默认关闭，
+且不会创建下架或改价任务。
+
+PR #34 评审意见已统一整改：bootstrap 现在固定 canonical 路径，使用
+工作簿独占锁、包含 WAL 的 SQLite 逻辑快照、`BEGIN IMMEDIATE` 写 fence 和提交前回读；
+余额/流水/销售基准三表必须同时为空。切换水位由 Runtime 当前有效的版本化交易日策略
+计算，并必须绑定最新、十分钟内、完整且订单数为 0 的可信 OPEN 订单批次；当前交易日任一
+快照曾观察到订单，或无法证明始终为空时保持 `PRE_CUTOVER`。切换日以可审计的 0 作为
+起点，历史回补只同步基准，
+之后完整订单只应用切换后净差。新增商品已形成“工作簿库存 0
+元数据 → 经商品主数据验证的零余额 → 独立入库”正式链。人工来源方向、并发首次库存提醒
+去重、新 Web 失败 PRG 和旧 Web canonical authority 门禁也已收紧。
+
+本分支只提供受控 cutover 脚本和合成测试，没有迁移或 bootstrap 真实 Runtime DB，没有
+修改真实商品工作簿、Queue、Worker 或平台。真实库仍有 7C 记录的既有外键违规；7D 不推断
+来源也不授权修复。真实切换必须先另走 Schema 维护、备份、工作簿 Hash/Runtime 逻辑快照、逐 SKU 与
+总量回读及用户明确授权。代码回滚只适用于尚无切换后流水的环境；已有流水必须前向修复，
+不得让过期工作簿重新成为库存权威。详细见
+[13.5-7D 实施报告](reports/task13_5_7d_authoritative_inventory.md)。
 
 ### 2.8 自动规则评估框架 MVP
 

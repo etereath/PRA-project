@@ -7,6 +7,7 @@ from decimal import Decimal
 
 from app.automation_models import AutomationRun
 from app.enums import DataQualityLevel
+from app.inventory_models import InventorySalesBatchResult
 from app.operational_models import SummaryMutationResult
 from app.repositories.operational_summary_repository import (
     OperationalSummaryRepository,
@@ -16,6 +17,7 @@ from app.services.sales_plan_input import (
     PLAN_ELIGIBLE_QUALITIES,
     SalesPlanInputService,
 )
+from app.services.authoritative_inventory import InventorySalesApplicationService
 from app.services.trade_day_settlement import TradeDaySettlementService
 
 
@@ -27,6 +29,7 @@ MAX_SETTLEMENT_EVENT_PAYLOAD_BYTES = 64 * 1024
 class SettlementPipelineResult:
     mutations: tuple[SummaryMutationResult, ...]
     snapshot: SettlementSnapshot
+    inventory_result: InventorySalesBatchResult | None = None
 
 
 class SettlementPipeline:
@@ -38,6 +41,7 @@ class SettlementPipeline:
         *,
         settlement_service: TradeDaySettlementService | None = None,
         plan_input_service: SalesPlanInputService | None = None,
+        inventory_sales_service: InventorySalesApplicationService | None = None,
     ) -> None:
         self.repository = repository
         self.settlement_service = settlement_service or TradeDaySettlementService(
@@ -46,6 +50,7 @@ class SettlementPipeline:
         self.plan_input_service = plan_input_service or SalesPlanInputService(
             repository
         )
+        self.inventory_sales_service = inventory_sales_service
 
     def run(
         self,
@@ -85,6 +90,14 @@ class SettlementPipeline:
             for scope, identity in expected.items()
         ):
             raise RuntimeError("Settlement readback did not match persisted summaries")
+
+        inventory_result = None
+        if self.inventory_sales_service is not None:
+            inventory_result = self.inventory_sales_service.apply_current_sku_summaries(
+                platform_name=run.platform_name,
+                platform_trade_date=platform_trade_date,
+                actor=changed_by,
+            )
 
         plan_input = self.plan_input_service.build(
             platform_name=run.platform_name,
@@ -169,7 +182,11 @@ class SettlementPipeline:
             snapshot_sha256=snapshot_sha256,
         )
         validate_settlement_event_payload_size(snapshot_event_payload(snapshot))
-        return SettlementPipelineResult(mutations=mutations, snapshot=snapshot)
+        return SettlementPipelineResult(
+            mutations=mutations,
+            snapshot=snapshot,
+            inventory_result=inventory_result,
+        )
 
 
 def snapshot_event_payload(snapshot: SettlementSnapshot) -> dict[str, object]:

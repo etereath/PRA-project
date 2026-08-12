@@ -112,6 +112,13 @@ class ManagementReadModel:
     pending_tasks: TableReadModel
     pending_reviews: TableReadModel
     automation_runs: TableReadModel
+    inventory_state: StateReadModel
+    inventory_options: tuple[tuple[str, str, int, int], ...] = field(
+        default_factory=tuple
+    )
+    inventory_receipt: tuple[str, str, str, str] | None = None
+    inventory_error: StateReadModel | None = None
+    inventory_idempotency_key: str = ""
 
 
 @dataclass(frozen=True, slots=True)

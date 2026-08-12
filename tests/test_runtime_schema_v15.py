@@ -86,8 +86,10 @@ def test_v15_new_database_has_minimal_incident_extension(
 ) -> None:
     repository = _repository(tmp_path)
 
-    assert LATEST_RUNTIME_SCHEMA_VERSION == 16
-    assert repository.schema_versions() == list(range(1, 17))
+    assert LATEST_RUNTIME_SCHEMA_VERSION >= 15
+    assert repository.schema_versions() == list(
+        range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1)
+    )
     health = repository.check_schema_health()
     assert health.ok, health.summary
 
@@ -215,7 +217,9 @@ def test_v14_to_v15_migration_preserves_incident_and_notification(
     repository.init_schema()
     repository.init_schema()
 
-    assert repository.schema_versions() == list(range(1, 17))
+    assert repository.schema_versions() == list(
+        range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1)
+    )
     assert repository.check_schema_health().ok
     with closing(repository.connect_read()) as connection:
         incident = connection.execute(
@@ -301,6 +305,14 @@ def _downgrade_fixture_to_v14(
         connection.execute("PRAGMA foreign_keys = OFF")
         connection.execute("BEGIN IMMEDIATE")
         try:
+            for table_name in (
+                "inventory_alert_policies",
+                "inventory_sales_baselines",
+                "inventory_transactions",
+                "inventory_balances",
+                "inventory_authority_state",
+            ):
+                connection.execute(f"DROP TABLE {table_name}")
             connection.execute("DROP TABLE emergency_offline_policies")
             connection.execute("DROP TABLE operational_incident_events")
             connection.execute(

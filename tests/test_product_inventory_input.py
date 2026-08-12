@@ -2,19 +2,28 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from app.exceptions import ValidationError
 from app.repositories.workbook_repository import load_products, save_table_records
+from app.repositories.inventory_repository import InventoryRepository
+from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.services.authoritative_inventory import (
+    InventoryApplicationService,
+    sqlite_logical_snapshot_sha256,
+)
 from app.services.product_inventory_input import (
     ProductInventoryInputError,
     apply_inventory_input,
     apply_product_edit,
+    create_authoritative_product_with_inbound,
     load_product_input_rows,
     persist_product_rows,
     validate_inventory_form,
     validate_product_edit_form,
 )
+from tests.inventory_cutover_support import insert_cutover_order_snapshot
 
 
 def _save_products(path: Path, rows: list[dict[str, object]]) -> None:
@@ -195,6 +204,114 @@ class ProductInventoryInputTests(unittest.TestCase):
                     "sale_enabled": "true",
                 }
             )
+
+    def test_db_authority_rejects_legacy_workbook_inventory_input(self) -> None:
+        form = validate_inventory_form(
+            {
+                "product_name": "艾莎",
+                "grade": "A",
+                "stem_length": "跟随等级",
+                "unit": "扎",
+                "base_cost": "10",
+                "quantity": "8",
+                "sale_enabled": "true",
+            }
+        )
+        with self.assertRaises(ProductInventoryInputError) as context:
+            apply_inventory_input(
+                [_product_row("SKU-1", name="艾莎", grade="A")],
+                form,
+                inventory_authoritative=True,
+            )
+        self.assertIn("唯一权威", str(context.exception))
+
+    def test_db_authority_product_edit_cannot_change_workbook_stock(self) -> None:
+        form = validate_product_edit_form(
+            {
+                "internal_sku": "SKU-1",
+                "product_name": "艾莎",
+                "grade": "A",
+                "stem_length": "跟随等级",
+                "unit": "扎",
+                "base_cost": "10",
+                "current_stock": "99",
+                "sale_enabled": "true",
+            }
+        )
+        with self.assertRaises(ProductInventoryInputError) as context:
+            apply_product_edit(
+                [_product_row("SKU-1", name="艾莎", grade="A")],
+                form,
+                inventory_authoritative=True,
+            )
+        self.assertIn("不能修改", str(context.exception))
+
+    def test_db_authority_new_product_metadata_zero_then_inbound_db_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "products.xlsx"
+            _save_products(path, [_product_row("AISHA-A-65-Z", grade="A", stock=5)])
+            repository = SQLiteRuntimeRepository(Path(temp_dir) / "runtime.sqlite3")
+            repository.init_schema()
+            products = load_products(path)
+            cutover_at = datetime(2026, 8, 12, 1, 0, tzinfo=timezone.utc)
+            cutover_batch_id = insert_cutover_order_snapshot(
+                repository,
+                batch_id="new-product-cutover-empty",
+                observed_at=cutover_at - timedelta(minutes=1),
+                platform_trade_date=date(2026, 8, 12),
+            )
+            InventoryApplicationService(
+                repository,
+                clock=lambda: cutover_at,
+            ).bootstrap(
+                products,
+                snapshot_sha256="sha256:" + "a" * 64,
+                runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
+                cutover_order_observation_batch_id=cutover_batch_id,
+                idempotency_key="bootstrap:new-product-flow",
+                actor="admin",
+                freeze_validator=lambda: True,
+            )
+            form = validate_inventory_form(
+                {
+                    "product_name": "新品种",
+                    "variety_code": "NEWROSE",
+                    "grade": "B",
+                    "stem_length": "跟随等级",
+                    "unit": "扎",
+                    "base_cost": "8.5",
+                    "quantity": "20",
+                    "sale_enabled": "是",
+                }
+            )
+
+            result = create_authoritative_product_with_inbound(
+                path,
+                repository,
+                form,
+                actor="operator",
+                idempotency_key="new-product:1",
+            )
+            replay = create_authoritative_product_with_inbound(
+                path,
+                repository,
+                form,
+                actor="operator",
+                idempotency_key="new-product:1",
+            )
+
+            stored = {
+                item.internal_sku: item for item in load_products(path)
+            }
+            self.assertEqual(stored[result.internal_sku].current_stock, 0)
+            self.assertEqual(
+                InventoryRepository(repository)
+                .get_balance(result.internal_sku)
+                .current_qty,
+                20,
+            )
+            self.assertEqual(replay.initialization.status, "REPLAYED")
+            self.assertEqual(replay.inbound.status, "REPLAYED")
 
 
 if __name__ == "__main__":

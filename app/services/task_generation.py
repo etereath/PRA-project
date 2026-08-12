@@ -222,7 +222,10 @@ class TaskGenerationService:
                                 else None
                             ),
                             target_inventory=(
-                                observed_listing[1]
+                                min(
+                                    int(observed_listing[1]),
+                                    int(product.current_stock),
+                                )
                                 if action_type is TaskActionType.SET_ONLINE
                                 and observed_listing is not None
                                 else product.current_stock

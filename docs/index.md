@@ -2,7 +2,7 @@
 
 本文档是当前项目文档入口。项目说明文本以中文为主，英文键名和代码标识保持原样。
 
-运行态业务数据以 SQLite 为中心，当前代码结构版本为 v16。v9 使用“平台 + 品种 + 等级”作为 `listing_status` 业务身份，v10 将任务旧价结构化，v11 增加单次请求的 ShadowBot 多商品 COMMIT 批次账本，v12 增加逐商品操作/尝试身份、活动写锁、观察时间和技术回执，v13 增加公共批次注册表、通用上下架 operation、两页快照、页面异常和 v5 动作账本；v14 增加双时间轴、Automation 账本、不可变观察、销售日结、Incident 和任务来源字段；v15 增加 Incident 出现次数与 append-only 事件流水；v16 增加版本化极简紧急下架策略。真实 Runtime DB 需按迁移手册另行升级。Excel 继续承担商品、规则等主数据输入，不是运行态任务数据库。
+运行态业务数据以 SQLite 为中心，当前代码结构版本为 v17。v9 使用“平台 + 品种 + 等级”作为 `listing_status` 业务身份，v10 将任务旧价结构化，v11 增加单次请求的 ShadowBot 多商品 COMMIT 批次账本，v12 增加逐商品操作/尝试身份、活动写锁、观察时间和技术回执，v13 增加公共批次注册表、通用上下架 operation、两页快照、页面异常和 v5 动作账本；v14 增加双时间轴、Automation 账本、不可变观察、销售日结、Incident 和任务来源字段；v15 增加 Incident 出现次数与 append-only 事件流水；v16 增加版本化极简紧急下架策略；v17 增加真实库存权威状态、余额、不可变流水、切换销售水位和预警策略。真实 Runtime DB 需按独立维护、canonical 路径、工作簿独占锁、完整 SQLite 逻辑快照、最新可信空 OPEN 订单批次、备份和提交前回读门禁另行升级并执行库存 bootstrap；代码合并不等于真实库已经切换。Excel 继续承担商品和规则等主数据输入，但 cutover 后 `products.xlsx.current_stock` 只保留为历史快照，不再是业务库存权威。
 
 项目长期控制面固定为：人工运营走 Web，定时业务走 Automation，未来智能调用走 Agent
 Gateway，平台执行走 Queue/Worker/Importer，开发测试与恢复走 CLI。Agent 只能通过
@@ -38,8 +38,10 @@ Query Adapter 读取，并通过 Task Adapter 提交结构化 `AgentIntent`；Re
 - [plans/task13_5_operational_closed_loop_and_web_rewrite.md](plans/task13_5_operational_closed_loop_and_web_rewrite.md)：任务13.5双时间轴、自动扫描、历史订单观察、销售日结、S0–S4、受控紧急保护、任务来源对齐和Web主控重写实施计划。
 - [plans/task13_5_web_current_state_audit_20260729.md](plans/task13_5_web_current_state_audit_20260729.md)：带精确时间、main SHA、Runtime DB脱敏快照、浏览器/视口/角色、路由、页面规模和DOM hash的独立Web现状审计。
 - [plans/task13_5_7_web_rewrite_construction_plan.md](plans/task13_5_7_web_rewrite_construction_plan.md)：13.5-7 实际业务重基线施工顺序；冻结 7B～7F 的四入口、真实库存、人工任务与执行授权、Automation 配置、安全、CLI 迁移、切换和验收门禁。
+- [plans/task13_5_7d_authoritative_inventory_contract.md](plans/task13_5_7d_authoritative_inventory_contract.md)：13.5-7D R4 数据库真实库存合同；冻结 v17 余额/流水/销量基准、Excel→DB 唯一权威切换、销售准入、库存预警和回滚门禁。
 - [reports/task13_5_7b_web_foundation.md](reports/task13_5_7b_web_foundation.md)：13.5-7B 新运营 Web 应用骨架、固定 Composition Root、环境/Cookie、Session/CSRF/capability、安全 Header、GET 零写、Mobile Review 外壳、后台生命周期拆分和打包门禁实施报告。
 - [reports/task13_5_7c_read_only_facts.md](reports/task13_5_7c_read_only_facts.md)：13.5-7C 四入口只读事实、后端分页、质量/空值状态、唯一详情归属、Mobile Review 只读状态、真实 Runtime DB 零写和视觉/回归验收报告。
+- [reports/task13_5_7d_authoritative_inventory.md](reports/task13_5_7d_authoritative_inventory.md)：13.5-7D Runtime Schema v17、真实库存唯一权威切换、人工调整、销售净差、取消恢复、库存预警、新 Web 回读与未执行真实 cutover 边界实施报告。
 - [prototypes/task13_5_7_operations_web_sample.html](prototypes/task13_5_7_operations_web_sample.html)：四入口“今日”静态样板，展示销售、数据库真实库存、待办、时间轴和业务健康摘要。
 - [prototypes/task13_5_7_database_sample.html](prototypes/task13_5_7_database_sample.html)：只读数据库与销售分析静态样板。
 - [prototypes/task13_5_7_business_management_sample.html](prototypes/task13_5_7_business_management_sample.html)：任务创建/授权、人工复核、固定 Automation 方案和真实库存业务静态样板。

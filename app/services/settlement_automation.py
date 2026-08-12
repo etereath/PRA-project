@@ -22,6 +22,8 @@ from app.services.automation import (
     PLATFORM_TRADE_DAY_SETTLEMENT,
     SALES_PLAN_INPUT_BUILD,
 )
+from app.services.authoritative_inventory import InventorySalesApplicationService
+from app.services.inventory_alert import InventoryAlertService
 from app.services.sales_plan_input import (
     SalesPlanInputService,
     sales_plan_manifest_sha256,
@@ -201,6 +203,12 @@ def build_sales_settlement_handlers(
         repository,
         settlement_service=settlement_service,
         plan_input_service=plan_service,
+        inventory_sales_service=InventorySalesApplicationService(
+            runtime_repository,
+            alert_evaluator=InventoryAlertService(
+                runtime_repository
+            ).evaluate_transaction,
+        ),
     )
     automation_repository = AutomationRepository(runtime_repository)
     return {

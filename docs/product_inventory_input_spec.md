@@ -32,6 +32,14 @@
 - 禁止同时写 `products.xlsx.current_stock` 与 DB 库存；
 - 切换后的代码回滚不得把过期工作簿库存恢复成权威。
 
+当前实现按权威状态执行：`PRE_CUTOVER` 时保留历史工作簿行为，便于在正式维护窗口前继续
+运营；`DB_AUTHORITY` 后旧“补充库存”入口整体拒绝，商品资料编辑即使继续保存名称、等级、
+规格、成本和销售开关，也不能改变 `current_stock`。新增 SKU 必须先以历史字段 0 保存商品
+资料，再通过 `create_authoritative_product_with_inbound()` 回读证明 SKU 已存在，调用
+`InventoryApplicationService.initialize_sku()` 建立可重放的零余额和 `SKU_INITIALIZATION`
+流水，最后通过独立人工“新花入库”调整增加库存。任意字符串不能初始化孤儿余额；缺少任一步时统一
+Inventory Provider 失败并要求维护，绝不回退工作簿库存。
+
 切换前，旧 `/tables` 继续作为高级兼容入口，适合批量维护、排障或直接编辑原始表格；
 7D 新 Web 切换后该兼容入口按施工计划删除，不能继续编辑库存。
 

@@ -11,6 +11,7 @@ from app.operational_models import PlatformTradeDaySummary
 from app.repositories.operational_summary_repository import (
     OperationalSummaryRepository,
 )
+from app.repositories.inventory_repository import InventoryRepository
 from app.sales_settlement_models import (
     OrderSnapshot,
     SalesPlanInputManifest,
@@ -18,7 +19,7 @@ from app.sales_settlement_models import (
 from app.services.operational_time import OperationalTimeService
 
 
-SALES_PLAN_INPUT_VERSION = "sales-plan-input-v2"
+SALES_PLAN_INPUT_VERSION = "sales-plan-input-v3"
 EARLY_SIGNAL_MAX_STALENESS = timedelta(minutes=10)
 PLAN_ELIGIBLE_QUALITIES = frozenset(
     {
@@ -38,8 +39,15 @@ class SalesPlanInputService:
         *,
         operational_time: OperationalTimeService | None = None,
         clock=None,
+        inventory_repository: InventoryRepository | None = None,
     ) -> None:
         self.repository = repository
+        runtime_repository = getattr(repository, "runtime_repository", None)
+        self.inventory = inventory_repository or (
+            InventoryRepository(runtime_repository)
+            if runtime_repository is not None
+            else None
+        )
         self.operational_time = operational_time or OperationalTimeService()
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
@@ -191,6 +199,35 @@ class SalesPlanInputService:
             if sku
         ]
 
+        authority_mode = "UNAVAILABLE"
+        real_inventory_items = []
+        if self.inventory is not None:
+            authority_mode = self.inventory.get_authority_state().authority_mode
+        if self.inventory is not None and authority_mode == "DB_AUTHORITY":
+            for balance in self.inventory.list_balances():
+                transaction = self.inventory.get_transaction(
+                    balance.last_transaction_id
+                )
+                if transaction is None:
+                    raise RuntimeError(
+                        "Authoritative inventory balance has no ledger transaction"
+                    )
+                real_inventory_items.append(
+                    {
+                        "internal_sku": balance.internal_sku,
+                        "current_qty": balance.current_qty,
+                        "balance_version": balance.version,
+                        "source_transaction_id": transaction.transaction_id,
+                    }
+                )
+                input_refs.append(
+                    (
+                        "INVENTORY_TRANSACTION",
+                        transaction.transaction_id,
+                        transaction.request_sha256,
+                    )
+                )
+
         deduplicated_refs = _deduplicate_refs(input_refs)
         executable = (
             settlement_eligible
@@ -209,6 +246,10 @@ class SalesPlanInputService:
             "closed_trade_day_summaries": summary_payload,
             "pre_plan_early_signal": early_order_payload,
             "seller_operation_inventory_trajectory": inventory_payload,
+            "real_inventory_snapshot": {
+                "authority_mode": authority_mode,
+                "items": real_inventory_items,
+            },
             "prediction_performed": False,
             "executable_advice_generated": False,
             "platform_write_performed": False,

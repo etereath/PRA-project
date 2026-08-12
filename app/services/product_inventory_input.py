@@ -6,7 +6,16 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from app.exceptions import TableValidationError, ValidationError
-from app.repositories.workbook_repository import PRODUCT_HEADERS, load_table_records, save_table_records
+from app.inventory_models import InventoryWriteResult
+from app.repositories.inventory_repository import InventoryRepository
+from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.repositories.workbook_repository import (
+    PRODUCT_HEADERS,
+    load_products,
+    load_table_records,
+    save_table_records,
+)
+from app.services.authoritative_inventory import InventoryApplicationService
 
 
 GRADE_OPTIONS = ["A", "B", "C", "D", "E", "0"]
@@ -78,6 +87,13 @@ class ProductInventorySaveResult:
     message: str
     level: str = "success"
     updated_sku: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AuthoritativeNewProductResult:
+    internal_sku: str
+    initialization: InventoryWriteResult
+    inbound: InventoryWriteResult
 
 
 def load_product_input_rows(products_path: Path) -> list[dict[str, object]]:
@@ -167,7 +183,16 @@ def validate_product_edit_form(values: dict[str, str]) -> ProductEditForm:
     )
 
 
-def apply_inventory_input(rows: list[dict[str, object]], form: ProductInventoryForm) -> ProductInventorySaveResult:
+def apply_inventory_input(
+    rows: list[dict[str, object]],
+    form: ProductInventoryForm,
+    *,
+    inventory_authoritative: bool = False,
+) -> ProductInventorySaveResult:
+    if inventory_authoritative:
+        raise ProductInventoryInputError(
+            "数据库库存已成为唯一权威，请使用业务管理中的人工库存调整。"
+        )
     rows = [_ensure_product_row_defaults(row) for row in rows]
     matches = _find_same_type_indexes(rows, form.product_name, form.grade, form.stem_length, form.unit)
 
@@ -228,7 +253,109 @@ def apply_inventory_input(rows: list[dict[str, object]], form: ProductInventoryF
     )
 
 
-def apply_product_edit(rows: list[dict[str, object]], form: ProductEditForm) -> ProductInventorySaveResult:
+def create_authoritative_product_with_inbound(
+    products_path: Path,
+    runtime_repository: SQLiteRuntimeRepository,
+    form: ProductInventoryForm,
+    *,
+    actor: str,
+    idempotency_key: str,
+) -> AuthoritativeNewProductResult:
+    """Persist metadata at workbook stock zero, then initialize and inbound in DB."""
+
+    authority = InventoryRepository(runtime_repository).get_authority_state()
+    if authority.authority_mode != "DB_AUTHORITY":
+        raise ProductInventoryInputError("数据库库存尚未成为唯一权威。")
+    normalized_actor = str(actor).strip()
+    normalized_key = str(idempotency_key).strip()
+    if not normalized_actor or not normalized_key:
+        raise ProductInventoryInputError("新增商品缺少操作人或幂等键。")
+
+    rows = [_ensure_product_row_defaults(row) for row in load_product_input_rows(products_path)]
+    matches = _find_same_type_indexes(
+        rows,
+        form.product_name,
+        form.grade,
+        form.stem_length,
+        form.unit,
+    )
+    if len(matches) > 1:
+        raise ProductInventoryInputError("已存在多条同类型商品资料，请先检查商品主表。")
+    if matches:
+        row = rows[matches[0]]
+        internal_sku = str(row.get("internal_sku") or "").strip()
+        if (
+            _safe_int(row.get("current_stock"), default=-1) != 0
+            or str(row.get("base_cost") or "").strip()
+            != _format_decimal(form.base_cost)
+            or str(row.get("sale_enabled") or "").strip().lower()
+            != str(bool(form.sale_enabled)).lower()
+        ):
+            raise ProductInventoryInputError(
+                "同类型商品资料已存在但内容不同，不能作为新增商品请求重放。"
+            )
+    else:
+        internal_sku = generate_product_sku(
+            form.product_name,
+            form.grade,
+            form.stem_length,
+            form.unit,
+            rows,
+            variety_code=form.variety_code,
+        )
+        rows.append(
+            {
+                "internal_sku": internal_sku,
+                "product_name": form.product_name,
+                "grade": form.grade,
+                "stem_length": form.stem_length,
+                "unit": form.unit,
+                "base_cost": _format_decimal(form.base_cost),
+                "current_stock": "0",
+                "sale_enabled": "True" if form.sale_enabled else "False",
+                "last_price": "",
+                "recommended_price": "",
+                "remark": "数据库权威模式新增商品资料",
+                "feature_season": "",
+                "feature_color": "",
+            }
+        )
+        persist_product_rows(products_path, rows)
+
+    def _product_exists(sku: str) -> bool:
+        return any(item.internal_sku == sku for item in load_products(products_path))
+
+    inventory = InventoryApplicationService(
+        runtime_repository,
+        product_exists=_product_exists,
+    )
+    initialization = inventory.initialize_sku(
+        internal_sku=internal_sku,
+        actor=normalized_actor,
+        idempotency_key=f"{normalized_key}:sku-initialization",
+    )
+    inbound = inventory.adjust(
+        internal_sku=internal_sku,
+        inventory_delta=form.quantity,
+        source_type="NEW_FLOWER_INBOUND",
+        reason="新花入库",
+        actor=normalized_actor,
+        idempotency_key=f"{normalized_key}:inbound",
+        expected_version=1,
+    )
+    return AuthoritativeNewProductResult(
+        internal_sku=internal_sku,
+        initialization=initialization,
+        inbound=inbound,
+    )
+
+
+def apply_product_edit(
+    rows: list[dict[str, object]],
+    form: ProductEditForm,
+    *,
+    inventory_authoritative: bool = False,
+) -> ProductInventorySaveResult:
     rows = [_ensure_product_row_defaults(row) for row in rows]
     target_index = next(
         (index for index, row in enumerate(rows) if str(row.get("internal_sku") or "").strip() == form.internal_sku),
@@ -249,12 +376,18 @@ def apply_product_edit(rows: list[dict[str, object]], form: ProductEditForm) -> 
         raise ProductInventoryInputError("修改后会与已有商品资料重复，请检查品种、等级、规格和单位。")
 
     row = rows[target_index]
+    stored_stock = _safe_int(row.get("current_stock"), default=0)
+    if inventory_authoritative and form.current_stock != stored_stock:
+        raise ProductInventoryInputError(
+            "数据库库存已成为唯一权威，商品资料编辑不能修改工作簿库存。"
+        )
     row["product_name"] = form.product_name
     row["grade"] = form.grade
     row["stem_length"] = form.stem_length
     row["unit"] = form.unit
     row["base_cost"] = _format_decimal(form.base_cost)
-    row["current_stock"] = str(form.current_stock)
+    if not inventory_authoritative:
+        row["current_stock"] = str(form.current_stock)
     row["sale_enabled"] = "True" if form.sale_enabled else "False"
     return ProductInventorySaveResult(
         rows=rows,

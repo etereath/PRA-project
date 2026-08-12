@@ -41,6 +41,11 @@ V14_TABLES = {
 }
 
 V14_DROP_ORDER = (
+    "inventory_alert_policies",
+    "inventory_sales_baselines",
+    "inventory_transactions",
+    "inventory_balances",
+    "inventory_authority_state",
     "emergency_offline_policies",
     "operational_incident_events",
     "incident_notification_state",
@@ -83,8 +88,10 @@ def test_v14_new_database_has_frozen_tables_policy_and_task_origin(
 ) -> None:
     repository = _repository(tmp_path)
 
-    assert LATEST_RUNTIME_SCHEMA_VERSION == 16
-    assert repository.schema_versions() == list(range(1, 17))
+    assert LATEST_RUNTIME_SCHEMA_VERSION >= 14
+    assert repository.schema_versions() == list(
+        range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1)
+    )
     health = repository.check_schema_health()
     assert health.ok, health.summary
 
@@ -1066,7 +1073,9 @@ def test_v13_to_v14_migration_backfills_legacy_without_guessing_dates(
 
     repository.init_schema()
 
-    assert repository.schema_versions() == list(range(1, 17))
+    assert repository.schema_versions() == list(
+        range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1)
+    )
     assert repository.check_schema_health().ok
     with closing(repository.connect_read()) as connection:
         row = connection.execute(

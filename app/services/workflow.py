@@ -39,6 +39,7 @@ from app.platform_identity import (
     platform_names_match,
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.repositories.inventory_repository import InventoryRepository
 from app.repositories.workbook_repository import (
     export_execution_logs,
     export_tasks,
@@ -55,6 +56,7 @@ from app.repositories.workbook_repository import (
 )
 from app.review_policy import allowed_review_statuses
 from app.services.ai import MockAISuggestionProvider, NullAISuggestionProvider
+from app.services.authoritative_inventory import InventoryProvider
 from app.services.execution import ExecutionSimulationService
 from app.services.listing import ListingService
 from app.services.manual_intervention import (
@@ -230,6 +232,12 @@ def init_runtime_database(inputs: RuntimeDatabaseInputs) -> list[int]:
 def generate_runtime_tasks_from_sources(
     inputs: WorkflowInputs, *, db_path: Path = DEFAULT_RUNTIME_DB
 ) -> RuntimeTaskGenerationSummary:
+    # This is an explicit command/write workflow.  Initialise the target Runtime DB
+    # before inventory-aware rule evaluation so a brand-new database has a
+    # PRE_CUTOVER authority row to read.  Read-only Web queries must never call this
+    # path and continue to fail closed instead of initialising or migrating schemas.
+    repository = SQLiteRuntimeRepository(db_path)
+    RuntimeTaskService(repository).init_schema()
     preview_inputs = WorkflowInputs(
         products_path=inputs.products_path,
         price_rules_path=inputs.price_rules_path,
@@ -590,7 +598,10 @@ def list_runtime_execution_logs(
 
 
 def validate_sources(inputs: WorkflowInputs) -> ValidationSummary:
-    products = load_products(inputs.products_path)
+    products = _load_inventory_aware_products(
+        inputs.products_path,
+        inputs.runtime_db_path,
+    )
     price_rules = load_price_rules(inputs.price_rules_path)
     listing_rules = load_listing_rules(inputs.listing_rules_path)
     harvest_forecasts = (
@@ -630,7 +641,10 @@ def generate_tasks_from_sources(
     listing_task_overrides: dict[tuple[str, str, str], tuple[object, object]]
     | None = None,
 ) -> TaskGenerationSummary:
-    products = load_products(inputs.products_path)
+    products = _load_inventory_aware_products(
+        inputs.products_path,
+        inputs.runtime_db_path,
+    )
     price_rules = load_price_rules(inputs.price_rules_path)
     listing_rules = load_listing_rules(inputs.listing_rules_path)
     harvest_forecasts = (
@@ -735,7 +749,10 @@ def generate_tasks_from_selected_rule(
     if not selected_id:
         raise ValidationError("请选择要生成任务的规则")
 
-    products = load_products(inputs.products_path)
+    products = _load_inventory_aware_products(
+        inputs.products_path,
+        inputs.runtime_db_path,
+    )
     price_rules = (
         [load_price_rule(inputs.price_rules_path, selected_id)]
         if normalized_type == "price"
@@ -996,6 +1013,17 @@ def _resolve_selected_rule_platforms(
             )
         raise ValidationError("全平台规则未找到有效平台配置")
     return candidates
+
+
+def _load_inventory_aware_products(
+    products_path: Path,
+    runtime_db_path: Path | None,
+) -> list[Product]:
+    products = load_products(products_path)
+    if runtime_db_path is None:
+        return products
+    runtime = SQLiteRuntimeRepository(runtime_db_path)
+    return InventoryProvider(InventoryRepository(runtime)).hydrate_products(products)
 
 
 def _load_current_platform_prices(

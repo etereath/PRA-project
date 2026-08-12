@@ -41,6 +41,7 @@ def _write_fake_wheel(path: Path, *, extra_member: str | None = None, extra_payl
         archive.writestr("app/operations_web/templates/mobile_review.html", b"<!doctype html>\n")
         archive.writestr("app/operations_web/templates/mobile_review_shell.html", b"<!doctype html>\n")
         archive.writestr("app/operations_web/static/app.css", b":root {}\n")
+        archive.writestr("app/operations_web/static/app.js", b'"use strict";\n')
         archive.writestr(f"{dist_info}/METADATA", b"Metadata-Version: 2.1\n")
         archive.writestr(f"{dist_info}/WHEEL", b"Wheel-Version: 1.0\n")
         archive.writestr(f"{dist_info}/RECORD", b"")
@@ -102,7 +103,7 @@ class PackagingTests(unittest.TestCase):
         package_data = config["tool"]["setuptools"]["package-data"]
         self.assertEqual(
             package_data["app.operations_web"],
-            ["templates/*.html", "static/*.css"],
+            ["templates/*.html", "static/*.css", "static/*.js"],
         )
 
     def test_shadowbot_deployment_inputs_are_separate_and_tracked(self) -> None:

@@ -52,7 +52,7 @@ def render_today(model: TodayReadModel) -> str:
     {render_state(model.state)}
     <section class="metric-grid">{metrics}</section>
     <section class="panel">
-      <header class="panel-header"><div><h2>品种销售与库存</h2><p>今日已售、成交均价、销售额与当前可售库存</p></div><a href="/database/sales-analysis">查看销售分析</a></header>
+      <header class="panel-header"><div><h2>品种销售与库存</h2><p>今日已售、成交均价、销售额与数据库真实库存</p></div><a href="/database/sales-analysis">查看销售分析</a></header>
       {render_table(model.products)}
     </section>
     <div class="two-column">
@@ -111,11 +111,48 @@ def render_database(model: DatabaseReadModel) -> str:
     """
 
 
-def render_management(model: ManagementReadModel) -> str:
+def render_management(model: ManagementReadModel, *, csrf_token: str) -> str:
+    inventory_options = "".join(
+        f'<option value="{html(sku)}" data-qty="{qty}" data-version="{version}">'
+        f'{html(label)} · 当前 {qty} 扎</option>'
+        for sku, label, qty, version in model.inventory_options
+    )
+    first_qty = model.inventory_options[0][2] if model.inventory_options else 0
+    first_version = model.inventory_options[0][3] if model.inventory_options else 0
+    inventory_form = (
+        f"""
+        <form class="inventory-form" method="post" action="/management/inventory-adjustments" data-inventory-form>
+          <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
+          <input type="hidden" name="idempotency_key" value="{html(model.inventory_idempotency_key)}">
+          <input type="hidden" name="expected_version" value="{first_version}" data-inventory-version>
+          <label>商品<select name="internal_sku" data-inventory-product>{inventory_options}</select></label>
+          <label>调整值<input name="inventory_delta" type="number" step="1" required placeholder="正数入库，负数减少"></label>
+          <p class="form-hint">调整前 <strong data-inventory-before>{first_qty} 扎</strong> · 调整后 <strong data-inventory-after>填写调整值后显示</strong></p>
+          <label>调整来源<select name="source_type"><option value="NEW_FLOWER_INBOUND" selected>新花入库</option><option value="MANUAL_STOCKTAKE">人工盘点修正</option><option value="LOSS_ADJUSTMENT">损耗修正</option><option value="RECONCILIATION_CORRECTION">对账修正</option></select></label>
+          <label>调整原因<input name="reason" value="新花入库" required></label>
+          <button type="submit">确认并记录</button>
+        </form>
+        """
+        if model.inventory_options and model.inventory_state.state.value == "ready"
+        else ""
+    )
+    receipt = ""
+    if model.inventory_receipt is not None:
+        sku, before, delta, after = model.inventory_receipt
+        receipt = (
+            '<div class="state-banner state-ready"><strong>库存调整已记录</strong>'
+            f'<p>{html(sku)}：{html(before)} {html(delta)} → {html(after)}</p></div>'
+        )
+    inventory_error = (
+        render_state(model.inventory_error)
+        if model.inventory_error is not None
+        else ""
+    )
     return f"""
     <section class="hero compact-hero">
       <div><p class="eyebrow">业务管理</p><h1>当前业务状态</h1><p>当前版本只读展示正式任务、人工复核和自动化运行；创建、授权与处置入口将在后续上线。</p></div>
     </section>
+    <section class="panel"><header class="panel-header"><div><h2>人工库存调整</h2><p>只输入有符号调整值；平台库存不会覆盖真实库存</p></div></header><div class="form-shell">{render_state(model.inventory_state)}{inventory_error}{receipt}{inventory_form}</div></section>
     <section class="panel"><header class="panel-header"><div><h2>当前任务</h2><p>创建任务不等于真实平台执行授权</p></div></header>{render_table(model.pending_tasks)}</section>
     <section class="panel"><header class="panel-header"><div><h2>人工复核</h2><p>只显示正式复核事实</p></div></header>{render_table(model.pending_reviews)}</section>
     <section class="panel"><header class="panel-header"><div><h2>自动化运行</h2><p>后台生命周期独立于 Web</p></div></header>{render_table(model.automation_runs)}</section>
