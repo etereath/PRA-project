@@ -391,7 +391,7 @@ Web 与后台生命周期已先行拆开：`scripts/start_local.ps1` 不再启�
 旧 Web 默认入口、Presenter 和重复测试的最终切换删除仍严格留在 7F，不能在 7C 冒充完成。
 7B 的基础边界见[13.5-7B 实施报告](reports/task13_5_7b_web_foundation.md)。
 
-7D 当前在 `codex/task13-5-7d-authoritative-inventory` 独立分支实现。Runtime Schema v17
+7D 已由 PR #34 合并到 `main`。Runtime Schema v17
 新增库存权威状态、非负余额、append-only 流水、按平台/PRA 交易日/SKU 的已应用销量基准
 和默认关闭的库存预警策略；没有新增平台合同、状态机或真实平台动作。统一 Inventory
 Provider 在 `PRE_CUTOVER` 保留工作簿历史库存，在 `DB_AUTHORITY` 后只返回 DB 余额且缺
@@ -412,12 +412,34 @@ PR #34 评审意见已统一整改：bootstrap 现在固定 canonical 路径，�
 元数据 → 经商品主数据验证的零余额 → 独立入库”正式链。人工来源方向、并发首次库存提醒
 去重、新 Web 失败 PRG 和旧 Web canonical authority 门禁也已收紧。
 
-本分支只提供受控 cutover 脚本和合成测试，没有迁移或 bootstrap 真实 Runtime DB，没有
+7D 分支只提供受控 cutover 脚本和合成测试，没有迁移或 bootstrap 真实 Runtime DB，没有
 修改真实商品工作簿、Queue、Worker 或平台。真实库仍有 7C 记录的既有外键违规；7D 不推断
 来源也不授权修复。真实切换必须先另走 Schema 维护、备份、工作簿 Hash/Runtime 逻辑快照、逐 SKU 与
 总量回读及用户明确授权。代码回滚只适用于尚无切换后流水的环境；已有流水必须前向修复，
 不得让过期工作簿重新成为库存权威。详细见
 [13.5-7D 实施报告](reports/task13_5_7d_authoritative_inventory.md)。
+
+7E 当前在 `codex/task13-5-7e-control-plane` 独立分支完成运营控制面实现。人工任务按品种、
+等级和平台多选展开，支持调整价格到、加/降价、下架和带平台目标库存的上架；预览与创建
+重新校验基础成本、映射、平台事实、真实库存和开放任务冲突，创建事务只写 MANUAL Runtime
+Task，零 Queue/Worker/平台副作用。真实执行授权独立要求 `SUBMIT_EXECUTION`、明确 Task ID、
+短期 digest 和提交前二次校验，并原样复用 v4 改价与 v5 上下架发布链，不新增 Queue 协议。
+
+桌面与手机复核现已共享同一 Application Service 和既有原子事务；有效手机 Token 只进入
+Review 专用 HttpOnly/SameSite=Strict Cookie，不再渲染到 HTML。Automation 页面只开放固定
+方案的允许字段和范围，排程变更通过确定性新版 Job 原子停旧启新；child job 不能独立配置，
+18:00/20:00 相关时间由运营时间策略派生。库存预警继续复用 v17 策略；受控补跑只创建既有
+Automation Run，由独立服务执行，Web 不持有租约或运行 Handler。复核超时和每日任务生成
+已接入薄 Handler；后者只允许商品、价格规则和上下架规则，包装、冷库和 Mock 平台 evaluator
+不进入生产 Automation。
+
+`serve-web` 已切换到新运营 Web；旧 Excel 生成和 Runtime/Review 写入 CLI 现在要求明确的
+测试或管理员恢复开关，不能作为日常旁路。7E 没有迁移或修复真实 Runtime DB，没有启动
+Worker、写 Queue、发送通知或执行真实平台动作。完整实现与验收边界见
+[13.5-7E 实施报告](reports/task13_5_7e_control_plane.md)。本地专项回归为
+`133 passed, 3 subtests passed`，完整 pytest 为
+`1259 passed, 3 skipped, 97 subtests passed`，隔离系统冒烟为 `16 passed, 0 failed`；构建、
+严格制品审计、secret scan、wheel 隔离安装和 Windows 临时 ShadowBot fixture 均通过。
 
 ### 2.8 自动规则评估框架 MVP
 

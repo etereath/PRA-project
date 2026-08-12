@@ -5040,7 +5040,7 @@ class SQLiteRuntimeRepository:
 
                 review_model = _row_to_review_task(review_row)
                 if review_model.review_type == "emergency_protection":
-                    result = self._resolve_incident_mobile_review_on_connection(
+                    resolved_review, resolved_task = self._resolve_incident_review_on_connection(
                         connection,
                         review_model=review_model,
                         token_row=token_row,
@@ -5056,6 +5056,25 @@ class SQLiteRuntimeRepository:
                             emergency_product_snapshot_verifier
                         ),
                         inject=inject,
+                    )
+                    committed_token_row = connection.execute(
+                        "SELECT * FROM review_tokens WHERE token_id = ?",
+                        (token_row["token_id"],),
+                    ).fetchone()
+                    if committed_token_row is None:
+                        raise MobileReviewTransactionError(
+                            MobileReviewErrorCode.CONCURRENT_UPDATE,
+                            "复核结果提交前读取失败",
+                        )
+                    result = MobileReviewAtomicResult(
+                        review_task=resolved_review,
+                        review_token=_row_to_review_token(committed_token_row),
+                        source_task=resolved_task,
+                        source_task_status=(
+                            resolved_task.task_status
+                            if resolved_task is not None
+                            else None
+                        ),
                     )
                     connection.commit()
                     return result
@@ -5355,12 +5374,108 @@ class SQLiteRuntimeRepository:
                 connection.rollback()
                 raise
 
-    def _resolve_incident_mobile_review_on_connection(
+    def resolve_authenticated_incident_review_atomic(
+        self,
+        *,
+        review_task_id: str,
+        status: ReviewTaskStatus,
+        actor_source: str,
+        actor: str,
+        note: str = "",
+        resolution_payload: dict[str, object] | None = None,
+        emergency_base_cost: Decimal | None = None,
+        emergency_base_cost_source_ref: str = "",
+        emergency_product_snapshot_verifier: (
+            Callable[[], tuple[Decimal, str]] | None
+        ) = None,
+        now: datetime | None = None,
+        failure_injector: Callable[[str], None] | None = None,
+    ) -> tuple[ReviewTask, Task | None]:
+        """Resolve an authenticated emergency Review in one transaction.
+
+        Authentication and capability checks belong to the application service.
+        This entry point intentionally reuses the same incident/task/outbox path
+        as Mobile Review without manufacturing or consuming a bearer token.
+        """
+
+        if not actor.strip():
+            raise MobileReviewTransactionError(
+                MobileReviewErrorCode.CONCURRENT_UPDATE,
+                "复核操作者身份不可用，未提交任何变更",
+            )
+        payload = normalize_mobile_review_resolution_payload(status, resolution_payload)
+
+        def inject(point: str) -> None:
+            if failure_injector is not None:
+                failure_injector(point)
+
+        with closing(self.connect()) as connection:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                review_row = connection.execute(
+                    "SELECT * FROM review_tasks WHERE review_task_id = ?",
+                    (review_task_id,),
+                ).fetchone()
+                if review_row is None:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.REVIEW_NOT_FOUND,
+                        "复核任务不存在或已失效",
+                    )
+                if str(review_row["review_status"]) != ReviewTaskStatus.PENDING.value:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.REVIEW_ALREADY_RESOLVED,
+                        "复核任务已被处理",
+                    )
+                review_model = _row_to_review_task(review_row)
+                if review_model.review_type != "emergency_protection":
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.ACTION_NOT_ALLOWED_FOR_REVIEW_TYPE,
+                        "该复核类型不能走紧急保护处理路径",
+                    )
+                timestamp = _timestamp_for_deadline(
+                    provided=now,
+                    deadline=review_model.required_by,
+                )
+                result = self._resolve_incident_review_on_connection(
+                    connection,
+                    review_model=review_model,
+                    token_row=None,
+                    status=status,
+                    actor_source=actor_source,
+                    actor=actor,
+                    note=note,
+                    payload=payload,
+                    timestamp=timestamp,
+                    emergency_base_cost=emergency_base_cost,
+                    emergency_base_cost_source_ref=emergency_base_cost_source_ref,
+                    emergency_product_snapshot_verifier=(
+                        emergency_product_snapshot_verifier
+                    ),
+                    inject=inject,
+                )
+                connection.commit()
+                return result
+            except MobileReviewTransactionError:
+                connection.rollback()
+                raise
+            except sqlite3.OperationalError as exc:
+                connection.rollback()
+                if _is_sqlite_concurrency_error(exc):
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.CONCURRENT_UPDATE,
+                        "复核请求发生并发更新，请重试",
+                    ) from exc
+                raise
+            except Exception:
+                connection.rollback()
+                raise
+
+    def _resolve_incident_review_on_connection(
         self,
         connection: sqlite3.Connection,
         *,
         review_model: ReviewTask,
-        token_row: sqlite3.Row,
+        token_row: sqlite3.Row | None,
         status: ReviewTaskStatus,
         actor_source: str,
         actor: str | None,
@@ -5373,7 +5488,7 @@ class SQLiteRuntimeRepository:
             Callable[[], tuple[Decimal, str]] | None
         ),
         inject: Callable[[str], None],
-    ) -> MobileReviewAtomicResult:
+    ) -> tuple[ReviewTask, Task | None]:
         if status not in {
             ReviewTaskStatus.ADJUSTED,
             ReviewTaskStatus.APPROVED,
@@ -5619,28 +5734,31 @@ class SQLiteRuntimeRepository:
         payload["incident_id"] = incident_id
         if task is not None:
             payload["created_task_id"] = task.task_id
-        resolved_actor = actor or str(token_row["token_subject"])
-        token_updated = connection.execute(
-            """
-            UPDATE review_tokens
-            SET used_at = ?, last_used_at = ?
-            WHERE token_id = ? AND review_task_id = ? AND used_at IS NULL
-              AND revoked_at IS NULL AND expires_at > ?
-            """,
-            (
-                _datetime_to_text(timestamp),
-                _datetime_to_text(timestamp),
-                token_row["token_id"],
-                review_model.review_task_id,
-                _datetime_to_text(timestamp),
-            ),
-        ).rowcount
-        if token_updated != 1:
-            raise MobileReviewTransactionError(
-                MobileReviewErrorCode.CONCURRENT_UPDATE,
-                "复核请求发生并发更新，请重试",
-            )
-        inject("after_token_update")
+        resolved_actor = actor or (
+            str(token_row["token_subject"]) if token_row is not None else ""
+        )
+        if token_row is not None:
+            token_updated = connection.execute(
+                """
+                UPDATE review_tokens
+                SET used_at = ?, last_used_at = ?
+                WHERE token_id = ? AND review_task_id = ? AND used_at IS NULL
+                  AND revoked_at IS NULL AND expires_at > ?
+                """,
+                (
+                    _datetime_to_text(timestamp),
+                    _datetime_to_text(timestamp),
+                    token_row["token_id"],
+                    review_model.review_task_id,
+                    _datetime_to_text(timestamp),
+                ),
+            ).rowcount
+            if token_updated != 1:
+                raise MobileReviewTransactionError(
+                    MobileReviewErrorCode.CONCURRENT_UPDATE,
+                    "复核请求发生并发更新，请重试",
+                )
+            inject("after_token_update")
         review_updated = connection.execute(
             """
             UPDATE review_tasks
@@ -5798,10 +5916,6 @@ class SQLiteRuntimeRepository:
             "SELECT * FROM review_tasks WHERE review_task_id = ?",
             (review_model.review_task_id,),
         ).fetchone()
-        committed_token_row = connection.execute(
-            "SELECT * FROM review_tokens WHERE token_id = ?",
-            (token_row["token_id"],),
-        ).fetchone()
         committed_task_row = (
             connection.execute(
                 "SELECT * FROM tasks WHERE task_id = ?",
@@ -5810,15 +5924,13 @@ class SQLiteRuntimeRepository:
             if task is not None
             else None
         )
-        return MobileReviewAtomicResult(
-            review_task=_row_to_review_task(committed_review_row),
-            review_token=_row_to_review_token(committed_token_row),
-            source_task=(
+        return (
+            _row_to_review_task(committed_review_row),
+            (
                 _row_to_task(committed_task_row)
                 if committed_task_row is not None
                 else None
             ),
-            source_task_status=task.task_status if task is not None else None,
         )
 
     def insert_review_token(self, review_token: ReviewToken) -> int:

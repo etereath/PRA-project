@@ -2,16 +2,26 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
-from datetime import date
+import secrets
+from http.cookies import SimpleCookie
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from socketserver import ThreadingMixIn
+from threading import Lock
 from urllib.parse import parse_qs, quote, unquote
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 from app.operations_web.auth import Capability, SessionCapacityError
-from app.operations_web.composition import OperationsWebContainer, build_container
+from app.operations_web.composition import (
+    PROJECT_ROOT,
+    OperationsWebContainer,
+    build_container,
+)
 from app.operations_web.presenters import (
     render_database,
     render_detail,
@@ -31,7 +41,28 @@ from app.services.authoritative_inventory import (
     InventoryInsufficientError,
 )
 from app.services.inventory_alert import InventoryAlertService
+from app.services.execution_authorization import (
+    ExecutionAuthorizationApplicationService,
+    ExecutionAuthorizationError,
+)
+from app.repositories.automation_repository import AutomationRepository
+from app.repositories.inventory_repository import InventoryRepository
+from app.services.automation_configuration import (
+    AutomationConfigurationApplicationService,
+    AutomationConfigurationError,
+)
+from app.services.manual_task_orchestration import (
+    ManualTaskApplicationService,
+    ManualTaskError,
+    ManualTaskRequest,
+)
+from app.services.review_resolution import (
+    ReviewResolutionApplicationService,
+    ReviewResolutionError,
+)
 from app.services.security import LOGIN_RATE_LIMITER, record_security_event
+from app.exceptions import MobileReviewTransactionError
+from app.services.workflow import resolve_mobile_review
 
 
 LOGGER = logging.getLogger("app.operations_web")
@@ -47,6 +78,11 @@ DEPENDENCY_OVERRIDE_FIELDS = frozenset(
         "listing_rules_workbook",
         "queue_dir",
         "queue_root",
+        "platform_mappings",
+        "platform_mappings_path",
+        "platform_mappings_workbook",
+        "shadowbot_identity_mapping",
+        "identity_mapping_path",
     }
 )
 
@@ -56,6 +92,54 @@ PROTECTED_ROUTES: dict[str, tuple[str, Capability]] = {
     "/management": ("业务管理", Capability.MANAGE_BUSINESS),
     "/system": ("系统", Capability.VIEW_SYSTEM),
 }
+
+EPHEMERAL_CONTROL_TTL = timedelta(minutes=15)
+MAX_EPHEMERAL_CONTROL_ITEMS = 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _EphemeralControlItem:
+    subject: str
+    value: object
+    expires_at: datetime
+
+
+class _EphemeralControlStore:
+    """Bounded PRG handoff only; it is never a business authority."""
+
+    def __init__(self) -> None:
+        self._items: dict[str, _EphemeralControlItem] = {}
+        self._lock = Lock()
+
+    def put(self, subject: str, value: object) -> str:
+        now = datetime.now(UTC)
+        token = secrets.token_urlsafe(24)
+        with self._lock:
+            self._purge(now)
+            if len(self._items) >= MAX_EPHEMERAL_CONTROL_ITEMS:
+                oldest = min(self._items, key=lambda key: self._items[key].expires_at)
+                self._items.pop(oldest, None)
+            self._items[token] = _EphemeralControlItem(
+                subject=subject,
+                value=value,
+                expires_at=now + EPHEMERAL_CONTROL_TTL,
+            )
+        return token
+
+    def get(self, token: str, subject: str) -> object | None:
+        now = datetime.now(UTC)
+        with self._lock:
+            self._purge(now)
+            item = self._items.get(str(token or ""))
+            if item is None or item.subject != subject:
+                return None
+            return item.value
+
+    def _purge(self, now: datetime) -> None:
+        for token in [
+            key for key, item in self._items.items() if item.expires_at <= now
+        ]:
+            self._items.pop(token, None)
 
 DATABASE_SECTION_ROUTES = {
     "/database": "business",
@@ -105,6 +189,40 @@ class OperationsWebApplication:
             container.runtime_repository,
             alert_evaluator=inventory_alerts.evaluate_transaction,
         )
+        platform_mappings = (
+            container.settings.paths.platform_mappings_workbook
+            or (PROJECT_ROOT / "data/samples/platform_mappings.xlsx")
+        )
+        identity_mapping = (
+            container.settings.paths.shadowbot_identity_mapping
+            or (PROJECT_ROOT / "shadowbot/test2/product_identity_mapping.json")
+        )
+        self.manual_tasks = ManualTaskApplicationService(
+            container.runtime_repository,
+            products_workbook=container.settings.paths.products_workbook,
+            platform_mappings_workbook=platform_mappings,
+        )
+        self.execution_authorization = ExecutionAuthorizationApplicationService(
+            container.runtime_repository,
+            authorization=container.authorization,
+            products_workbook=container.settings.paths.products_workbook,
+            platform_mappings_workbook=platform_mappings,
+            shadowbot_identity_mapping=identity_mapping,
+            queue_root=container.settings.paths.queue_root,
+            applet_uri=container.settings.shadowbot_applet_uri,
+            execution_profile=container.settings.environment,
+        )
+        self.review_resolution = ReviewResolutionApplicationService(
+            container.runtime_repository,
+            container.authorization,
+            products_path=container.settings.paths.products_workbook,
+        )
+        self.automation_configuration = AutomationConfigurationApplicationService(
+            AutomationRepository(container.runtime_repository),
+            InventoryRepository(container.runtime_repository),
+            container.authorization,
+        )
+        self.control_store = _EphemeralControlStore()
 
     def __call__(self, environ, start_response):
         try:
@@ -186,6 +304,46 @@ class OperationsWebApplication:
             if method != "POST":
                 return self._method_not_allowed("POST")
             return self._inventory_adjustment(environ)
+
+        if path == "/management/tasks/preview":
+            if method != "POST":
+                return self._method_not_allowed("POST")
+            return self._manual_task_preview(environ)
+
+        if path == "/management/tasks/create":
+            if method != "POST":
+                return self._method_not_allowed("POST")
+            return self._manual_task_create(environ)
+
+        if path == "/management/executions/prepare":
+            if method != "POST":
+                return self._method_not_allowed("POST")
+            return self._execution_prepare(environ)
+
+        if path == "/management/executions/submit":
+            if method != "POST":
+                return self._method_not_allowed("POST")
+            return self._execution_submit(environ)
+
+        if path == "/management/reviews/resolve":
+            if method != "POST":
+                return self._method_not_allowed("POST")
+            return self._review_resolve(environ)
+
+        if path == "/management/automation/configure":
+            if method != "POST":
+                return self._method_not_allowed("POST")
+            return self._automation_configure(environ)
+
+        if path == "/management/automation/inventory-alert":
+            if method != "POST":
+                return self._method_not_allowed("POST")
+            return self._inventory_alert_configure(environ)
+
+        if path == "/management/automation/rerun":
+            if method != "POST":
+                return self._method_not_allowed("POST")
+            return self._automation_rerun(environ)
 
         if self._is_protected_route(path):
             if method != "GET":
@@ -386,6 +544,41 @@ class OperationsWebApplication:
                 )
             )
         elif path == "/management":
+            subject = session.principal.subject
+            task_preview_token = self._first(query, "task_preview")
+            task_preview_value = self.control_store.get(
+                task_preview_token,
+                subject,
+            )
+            task_preview = (
+                task_preview_value
+                if hasattr(task_preview_value, "preview_digest")
+                else None
+            )
+            task_receipt_value = self.control_store.get(
+                self._first(query, "task_receipt"),
+                subject,
+            )
+            execution_preparation_value = self.control_store.get(
+                self._first(query, "execution_preview"),
+                subject,
+            )
+            execution_receipt_value = self.control_store.get(
+                self._first(query, "execution_receipt"),
+                subject,
+            )
+            review_receipt_value = self.control_store.get(
+                self._first(query, "review_receipt"),
+                subject,
+            )
+            automation_receipt_value = self.control_store.get(
+                self._first(query, "automation_receipt"),
+                subject,
+            )
+            try:
+                task_scope_options = self.manual_tasks.scope_options()
+            except Exception:
+                task_scope_options = None
             content = render_management(
                 self.queries.management(
                     inventory_transaction_id=self._first(
@@ -398,6 +591,52 @@ class OperationsWebApplication:
                     ),
                 ),
                 csrf_token=session.csrf_token,
+                task_scope_options=task_scope_options,
+                task_preview=task_preview,
+                task_preview_token=task_preview_token if task_preview is not None else "",
+                task_receipt=(
+                    task_receipt_value
+                    if isinstance(task_receipt_value, tuple)
+                    else ()
+                ),
+                task_error=self._control_message(query, "task_error", subject),
+                execution_preparation=(
+                    execution_preparation_value
+                    if hasattr(execution_preparation_value, "confirmation_digest")
+                    else None
+                ),
+                execution_receipt=(
+                    execution_receipt_value
+                    if isinstance(execution_receipt_value, tuple)
+                    and len(execution_receipt_value) == 2
+                    else None
+                ),
+                execution_error=self._control_message(
+                    query,
+                    "execution_error",
+                    subject,
+                ),
+                review_receipt=(
+                    review_receipt_value
+                    if isinstance(review_receipt_value, tuple)
+                    and len(review_receipt_value) == 3
+                    else None
+                ),
+                review_error=self._control_message(
+                    query,
+                    "review_error",
+                    subject,
+                ),
+                automation_receipt=(
+                    automation_receipt_value
+                    if isinstance(automation_receipt_value, str)
+                    else ""
+                ),
+                automation_error=self._control_message(
+                    query,
+                    "automation_error",
+                    subject,
+                ),
             )
         elif path == "/system":
             content = render_system(self.queries.system())
@@ -492,6 +731,377 @@ class OperationsWebApplication:
             headers=[("Location", location), ("Cache-Control", "no-store")],
         )
 
+    def _manual_task_preview(self, environ) -> Response:
+        session, form, denied = self._management_write_context(
+            environ,
+            route="/management/tasks/preview",
+            capability=Capability.MANAGE_BUSINESS,
+        )
+        if denied is not None:
+            return denied
+        assert session is not None and session.principal is not None
+        try:
+            request = self._manual_task_request(form)
+            preview = self.manual_tasks.preview(request)
+            token = self.control_store.put(session.principal.subject, preview)
+            return self._management_redirect("task_preview", token)
+        except (ManualTaskError, InvalidOperation, ValueError) as exc:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "task_error",
+                str(exc) or "任务预览失败。",
+            )
+        except Exception:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "task_error",
+                "任务资料暂不可用，未创建任何任务。",
+            )
+
+    def _manual_task_create(self, environ) -> Response:
+        session, form, denied = self._management_write_context(
+            environ,
+            route="/management/tasks/create",
+            capability=Capability.MANAGE_BUSINESS,
+        )
+        if denied is not None:
+            return denied
+        assert session is not None and session.principal is not None
+        preview_token = self._first(form, "preview_token")
+        preview = self.control_store.get(preview_token, session.principal.subject)
+        if preview is None or not hasattr(preview, "request"):
+            return self._control_error_redirect(
+                session.principal.subject,
+                "task_error",
+                "任务预览已失效，请重新预览。",
+            )
+        try:
+            result = self.manual_tasks.create(
+                preview.request,
+                expected_preview_digest=self._first(form, "preview_digest"),
+                authenticated_subject=session.principal.subject,
+            )
+        except ManualTaskError as exc:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "task_error",
+                str(exc),
+            )
+        except Exception:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "task_error",
+                "任务创建失败，数据库未保留部分结果。",
+            )
+        token = self.control_store.put(
+            session.principal.subject,
+            result.task_ids,
+        )
+        return self._management_redirect("task_receipt", token)
+
+    def _execution_prepare(self, environ) -> Response:
+        session, form, denied = self._management_write_context(
+            environ,
+            route="/management/executions/prepare",
+            capability=Capability.SUBMIT_EXECUTION,
+        )
+        if denied is not None:
+            return denied
+        assert session is not None and session.principal is not None
+        try:
+            preparation = self.execution_authorization.prepare_execution(
+                session.principal,
+                self._many(form, "task_ids"),
+                self._first(form, "idempotency_key"),
+            )
+        except ExecutionAuthorizationError as exc:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "execution_error",
+                str(exc),
+            )
+        except Exception:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "execution_error",
+                "执行预览失败；未投递队列。",
+            )
+        token = self.control_store.put(session.principal.subject, preparation)
+        return self._management_redirect("execution_preview", token)
+
+    def _execution_submit(self, environ) -> Response:
+        session, form, denied = self._management_write_context(
+            environ,
+            route="/management/executions/submit",
+            capability=Capability.SUBMIT_EXECUTION,
+        )
+        if denied is not None:
+            return denied
+        assert session is not None and session.principal is not None
+        try:
+            result = self.execution_authorization.submit_execution(
+                session.principal,
+                self._many(form, "task_ids"),
+                self._first(form, "confirmation_digest"),
+                self._first(form, "idempotency_key"),
+            )
+        except ExecutionAuthorizationError as exc:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "execution_error",
+                str(exc),
+            )
+        except Exception:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "execution_error",
+                "执行提交失败；请检查队列状态后重新预览，不能直接重试。",
+            )
+        token = self.control_store.put(
+            session.principal.subject,
+            (result.batch_id, result.execution_attempt_id),
+        )
+        return self._management_redirect("execution_receipt", token)
+
+    def _review_resolve(self, environ) -> Response:
+        session, form, denied = self._management_write_context(
+            environ,
+            route="/management/reviews/resolve",
+            capability=Capability.HANDLE_REVIEW,
+        )
+        if denied is not None:
+            return denied
+        assert session is not None and session.principal is not None
+        try:
+            result = self.review_resolution.resolve(
+                session.principal,
+                review_task_id=self._first(form, "review_task_id"),
+                action=self._first(form, "action"),
+                target_price=self._first(form, "target_price"),
+                note=self._first(form, "note"),
+            )
+        except ReviewResolutionError as exc:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "review_error",
+                str(exc),
+            )
+        except Exception:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "review_error",
+                "复核提交失败，未执行任何业务操作，也未保存部分结果。",
+            )
+        token = self.control_store.put(
+            session.principal.subject,
+            (
+                result.review_task_id,
+                result.review_status,
+                result.created_task_id,
+            ),
+        )
+        return self._management_redirect("review_receipt", token)
+
+    def _automation_configure(self, environ) -> Response:
+        session, form, denied = self._management_write_context(
+            environ,
+            route="/management/automation/configure",
+            capability=Capability.MANAGE_BUSINESS,
+        )
+        if denied is not None:
+            return denied
+        assert session is not None and session.principal is not None
+        interval_raw = self._first(form, "interval_minutes").strip()
+        offset_raw = self._first(form, "offset_minutes").strip()
+        try:
+            job = self.automation_configuration.configure_job(
+                session.principal,
+                job_id=self._first(form, "job_id"),
+                enabled=self._first(form, "enabled").lower() == "true",
+                interval_minutes=int(interval_raw) if interval_raw else None,
+                offset_minutes=int(offset_raw) if offset_raw else None,
+                source_allowlist=tuple(self._many(form, "source_allowlist")),
+            )
+        except (AutomationConfigurationError, ValueError) as exc:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "automation_error",
+                str(exc),
+            )
+        except Exception:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "automation_error",
+                "自动化方案保存失败，旧方案保持不变。",
+            )
+        token = self.control_store.put(
+            session.principal.subject,
+            f"{job.display_name}：{'已启用' if job.enabled else '已停用'}，排程 {job.schedule_expression}",
+        )
+        return self._management_redirect("automation_receipt", token)
+
+    def _inventory_alert_configure(self, environ) -> Response:
+        session, form, denied = self._management_write_context(
+            environ,
+            route="/management/automation/inventory-alert",
+            capability=Capability.MANAGE_BUSINESS,
+        )
+        if denied is not None:
+            return denied
+        assert session is not None and session.principal is not None
+        try:
+            policy = self.automation_configuration.configure_inventory_alert(
+                session.principal,
+                scope_type=self._first(form, "scope_type"),
+                scope_key=self._first(form, "scope_key"),
+                enabled=self._first(form, "enabled").lower() == "true",
+                threshold_qty=int(self._first(form, "threshold_qty")),
+                repeat_interval_minutes=int(
+                    self._first(form, "repeat_interval_minutes")
+                ),
+                expected_version=int(self._first(form, "expected_version")),
+            )
+        except (AutomationConfigurationError, ValueError) as exc:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "automation_error",
+                str(exc),
+            )
+        except Exception:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "automation_error",
+                "库存预警保存失败，原方案保持不变。",
+            )
+        scope = "全部商品" if policy.scope_type == "DEFAULT" else policy.scope_key
+        token = self.control_store.put(
+            session.principal.subject,
+            f"{scope}库存预警已保存：阈值 {policy.threshold_qty} 扎",
+        )
+        return self._management_redirect("automation_receipt", token)
+
+    def _automation_rerun(self, environ) -> Response:
+        session, form, denied = self._management_write_context(
+            environ,
+            route="/management/automation/rerun",
+            capability=Capability.MANAGE_BUSINESS,
+        )
+        if denied is not None:
+            return denied
+        assert session is not None and session.principal is not None
+        try:
+            run, created = self.automation_configuration.schedule_rerun(
+                session.principal,
+                job_id=self._first(form, "job_id"),
+                target_trade_date=date.fromisoformat(
+                    self._first(form, "target_trade_date")
+                ),
+                idempotency_key=self._first(form, "idempotency_key"),
+            )
+        except (AutomationConfigurationError, ValueError) as exc:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "automation_error",
+                str(exc),
+            )
+        except Exception:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "automation_error",
+                "补跑创建失败，没有启动 Web 内执行循环。",
+            )
+        token = self.control_store.put(
+            session.principal.subject,
+            (
+                "补跑已创建，等待独立 Automation Service 执行"
+                if created
+                else "相同补跑已存在，未重复创建"
+            ),
+        )
+        return self._management_redirect("automation_receipt", token)
+
+    def _management_write_context(
+        self,
+        environ,
+        *,
+        route: str,
+        capability: Capability,
+    ):
+        session = self.container.sessions.get(str(environ.get("HTTP_COOKIE", "")))
+        if session is None or session.principal is None:
+            return None, {}, Response.text(
+                "303 See Other",
+                "",
+                headers=[("Location", "/login"), ("Cache-Control", "no-store")],
+            )
+        if not self.container.authorization.allows(session.principal, capability):
+            return session, {}, Response.text(
+                "403 Forbidden",
+                "当前账号没有执行该操作的权限。",
+            )
+        form = self._parse_form(environ)
+        if not self.container.sessions.csrf_matches(
+            session,
+            self._first(form, "csrf_token"),
+        ):
+            record_security_event(
+                "CSRF_REJECTED",
+                route=route,
+                outcome="rejected",
+                reason_code="SESSION_CSRF_INVALID",
+                subject=session.principal.subject,
+            )
+            return session, form, Response.text(
+                "403 Forbidden",
+                "请求校验失败，请刷新页面后重试。",
+            )
+        return session, form, None
+
+    def _manual_task_request(self, form: dict[str, list[str]]) -> ManualTaskRequest:
+        price_raw = self._first(form, "price_value").strip()
+        inventory_raw = self._first(form, "target_inventory").strip()
+        return ManualTaskRequest(
+            varieties=tuple(self._many(form, "varieties")),
+            grades=tuple(self._many(form, "grades")),
+            platforms=tuple(self._many(form, "platforms")),
+            action=self._first(form, "action"),
+            price_value=(Decimal(price_raw) if price_raw else None),
+            target_inventory=(int(inventory_raw) if inventory_raw else None),
+            excluded_item_keys=tuple(
+                self._many(form, "excluded_item_keys")
+            ),
+            idempotency_key=self._first(form, "idempotency_key"),
+        )
+
+    def _control_error_redirect(
+        self,
+        subject: str,
+        field: str,
+        message: str,
+    ) -> Response:
+        token = self.control_store.put(subject, str(message)[:500])
+        return self._management_redirect(field, token)
+
+    def _control_message(
+        self,
+        query: dict[str, list[str]],
+        field: str,
+        subject: str,
+    ) -> str:
+        value = self.control_store.get(self._first(query, field), subject)
+        return value if isinstance(value, str) else ""
+
+    @staticmethod
+    def _management_redirect(field: str, token: str) -> Response:
+        return Response.text(
+            "303 See Other",
+            "",
+            headers=[
+                ("Location", "/management?" + field + "=" + quote(token, safe="")),
+                ("Cache-Control", "no-store"),
+            ],
+        )
+
     @staticmethod
     def _inventory_error_redirect(error_code: str) -> Response:
         return Response.text(
@@ -510,27 +1120,116 @@ class OperationsWebApplication:
         valid_post = method == "POST" and len(parts) == 2 and parts[1] == "resolve"
         if valid_get:
             query = parse_qs(str(environ.get("QUERY_STRING", "")), keep_blank_values=True)
+            review_task_id = unquote(parts[0]).strip()
+            raw_token = self._first(query, "token") or self._mobile_review_cookie(
+                environ, review_task_id
+            )
             model = self.queries.mobile_review(
-                unquote(parts[0]).strip(),
-                self._first(query, "token"),
+                review_task_id,
+                raw_token,
             )
             body = render_template(
                 "mobile_review.html",
                 content=render_mobile_review(model),
             )
+            headers = [("Cache-Control", "no-store")]
+            if raw_token and model.action_options:
+                headers.append(
+                    (
+                        "Set-Cookie",
+                        self._mobile_review_cookie_header(review_task_id, raw_token),
+                    )
+                )
             return Response.text(
                 model.http_status,
                 body,
                 content_type="text/html; charset=utf-8",
-                headers=[("Cache-Control", "no-store")],
+                headers=headers,
             )
         if valid_post:
+            review_task_id = unquote(parts[0]).strip()
+            form = self._parse_form(environ)
+            query = parse_qs(str(environ.get("QUERY_STRING", "")), keep_blank_values=True)
+            raw_token = (
+                self._first(query, "token")
+                or self._mobile_review_cookie(environ, review_task_id)
+                or self._first(form, "token")
+            )
+            action = self._first(form, "action").strip()
+            target_price = self._first(form, "target_price").strip()
+            resolution_payload = None
+            if action == "adjusted":
+                resolution_payload = {
+                    "adjustment": {"target_price": target_price}
+                }
+            try:
+                resolve_mobile_review(
+                    self.container.settings.paths.runtime_db,
+                    review_task_id,
+                    raw_token,
+                    action,
+                    note=self._first(form, "note"),
+                    resolution_payload=resolution_payload,
+                    products_path=self.container.settings.paths.products_workbook,
+                )
+            except MobileReviewTransactionError as exc:
+                status = (
+                    "410 Gone"
+                    if exc.code
+                    in {
+                        "TOKEN_EXPIRED",
+                        "TOKEN_REVOKED",
+                        "TOKEN_ALREADY_USED",
+                        "REVIEW_ALREADY_RESOLVED",
+                    }
+                    else "409 Conflict"
+                )
+                return Response.text(
+                    status,
+                    "复核未提交：" + str(exc),
+                    headers=[("Cache-Control", "no-store")],
+                )
+            except Exception:
+                return Response.text(
+                    "503 Service Unavailable",
+                    "复核提交失败，未执行任何业务操作，也未保存部分结果，请稍后重试。",
+                    headers=[("Cache-Control", "no-store")],
+                )
+            location = "/mobile/review/" + quote(review_task_id, safe="") + "?result=completed"
             return Response.text(
-                "503 Service Unavailable",
-                "当前复核入口只提供查看，未执行任何业务操作。",
-                headers=[("Cache-Control", "no-store"), ("Retry-After", "300")],
+                "303 See Other",
+                "",
+                headers=[("Location", location), ("Cache-Control", "no-store")],
             )
         return Response.text("404 Not Found", "复核链接无效或已失效。")
+
+    @staticmethod
+    def _mobile_review_cookie_name(review_task_id: str) -> str:
+        digest = hashlib.sha256(review_task_id.encode("utf-8")).hexdigest()[:16]
+        return "pra_mobile_review_" + digest
+
+    def _mobile_review_cookie(self, environ, review_task_id: str) -> str:
+        cookie = SimpleCookie()
+        try:
+            cookie.load(str(environ.get("HTTP_COOKIE", "")))
+        except Exception:
+            return ""
+        morsel = cookie.get(self._mobile_review_cookie_name(review_task_id))
+        return "" if morsel is None else morsel.value
+
+    def _mobile_review_cookie_header(self, review_task_id: str, raw_token: str) -> str:
+        name = self._mobile_review_cookie_name(review_task_id)
+        path = "/mobile/review/" + quote(review_task_id, safe="")
+        attributes = [
+            f"{name}={raw_token}",
+            f"Path={path}",
+            "Max-Age=3600",
+            "HttpOnly",
+            "SameSite=Strict",
+        ]
+        if self.container.settings.cookie_secure:
+            attributes.append("Secure")
+        return "; ".join(attributes)
 
     @staticmethod
     def _is_protected_route(path: str) -> bool:
@@ -613,6 +1312,10 @@ class OperationsWebApplication:
     @staticmethod
     def _first(values: dict[str, list[str]], name: str) -> str:
         return values.get(name, [""])[0]
+
+    @staticmethod
+    def _many(values: dict[str, list[str]], name: str) -> list[str]:
+        return [str(value) for value in values.get(name, [])]
 
     @staticmethod
     def _method_not_allowed(allow: str) -> Response:

@@ -39,6 +39,8 @@ PRE_CUTOFF_FULL_SCAN = "PRE_CUTOFF_FULL_SCAN"
 POST_CUTOFF_PULSE = "POST_CUTOFF_PULSE"
 PLATFORM_TRADE_DAY_SETTLEMENT = "PLATFORM_TRADE_DAY_SETTLEMENT"
 SALES_PLAN_INPUT_BUILD = "SALES_PLAN_INPUT_BUILD"
+REVIEW_TIMEOUT_MAINTENANCE = "REVIEW_TIMEOUT_MAINTENANCE"
+DAILY_TASK_GENERATION = "DAILY_TASK_GENERATION"
 
 UI_JOB_TYPES = UI_AUTOMATION_JOB_TYPES
 
@@ -620,6 +622,42 @@ def default_automation_jobs(
                 "catchup_policy": "IDEMPOTENT",
                 "max_catchup_runs": 2,
                 "requires_ui_channel": False,
+            },
+        ),
+        AutomationJob(
+            job_id="AUTOMATION-REVIEW-TIMEOUT-MAINTENANCE",
+            job_type=REVIEW_TIMEOUT_MAINTENANCE,
+            display_name="人工复核超时维护",
+            enabled=True,
+            schedule_kind=INTERVAL_MINUTES,
+            schedule_expression="5",
+            priority=25,
+            config={
+                **common,
+                "catchup_policy": "LATEST_ONLY",
+                "max_lateness_seconds": 300,
+                "requires_ui_channel": False,
+            },
+        ),
+        AutomationJob(
+            job_id="AUTOMATION-DAILY-TASK-GENERATION",
+            job_type=DAILY_TASK_GENERATION,
+            display_name="每日任务生成",
+            enabled=True,
+            schedule_kind=DAILY_LOCAL_TIME,
+            schedule_expression="20:10",
+            priority=56,
+            config={
+                **common,
+                "catchup_policy": "IDEMPOTENT",
+                "max_catchup_runs": 2,
+                "requires_ui_channel": False,
+                "plan_input_offset_minutes": 5,
+                "source_allowlist": [
+                    "PRODUCTS",
+                    "PRICE_RULES",
+                    "LISTING_RULES",
+                ],
             },
         ),
         AutomationJob(

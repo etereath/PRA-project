@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import re
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -23,7 +24,15 @@ from app.operations_web.composition import (
     OperationsWebSettings,
     build_container,
 )
+from app.enums import AutomationRunStatus, ReviewTaskStatus
+from app.models import ReviewTask
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.repositories.automation_repository import AutomationRepository
+from app.services.automation import (
+    ONLINE_PULSE,
+    PLATFORM_TRADE_DAY_SETTLEMENT,
+    ensure_default_automation_jobs,
+)
 from app.services.security import (
     LoginRateLimiter,
     clear_security_audit_events,
@@ -158,6 +167,147 @@ def snapshot_tree(
             hashlib.sha256(payload).hexdigest(),
         )
     return snapshot
+
+
+def test_authenticated_review_resolution_uses_csrf_prg_and_zero_queue_side_effect(
+    operations_web,
+) -> None:
+    app, container, root = operations_web
+    now = datetime(2026, 8, 13, 9, 0, tzinfo=timezone.utc)
+    review = ReviewTask(
+        review_task_id="REVIEW-WEB-GENERIC",
+        trade_date=date(2026, 8, 13),
+        scope_type="internal_sku",
+        scope_key="SKU-SYNTHETIC",
+        dedupe_key="web-review-generic",
+        source_task_id=None,
+        review_type="product_mapping",
+        review_status=ReviewTaskStatus.PENDING,
+        internal_sku="SKU-SYNTHETIC",
+        platform_name="synthetic-platform",
+        reason="需要确认商品映射",
+        required_by=now + timedelta(hours=1),
+        created_at=now,
+        updated_at=now,
+    )
+    assert container.runtime_repository.insert_review_tasks([review]) == 1
+    _, authenticated = login(app, container)
+    session = container.sessions.get(authenticated)
+    assert session is not None
+    queue_before = snapshot_tree(root / "queue")
+
+    status, _, body = call_app(
+        app,
+        path="/management",
+        cookie=authenticated,
+    )
+    assert status == "200 OK"
+    assert "需要确认商品映射" in body
+    assert "通过" in body
+
+    rejected_status, _, _ = call_app(
+        app,
+        path="/management/reviews/resolve",
+        method="POST",
+        cookie=authenticated,
+        form={
+            "csrf_token": "invalid",
+            "review_task_id": review.review_task_id,
+            "action": ReviewTaskStatus.APPROVED.value,
+        },
+    )
+    assert rejected_status == "403 Forbidden"
+    assert container.runtime_repository.get_review_task(
+        review.review_task_id
+    ).review_status is ReviewTaskStatus.PENDING
+
+    status, headers, _ = call_app(
+        app,
+        path="/management/reviews/resolve",
+        method="POST",
+        cookie=authenticated,
+        form={
+            "csrf_token": session.csrf_token,
+            "review_task_id": review.review_task_id,
+            "action": ReviewTaskStatus.APPROVED.value,
+            "note": "映射已人工确认",
+        },
+    )
+    assert status == "303 See Other"
+    assert header_values(headers, "Location")[0].startswith(
+        "/management?review_receipt="
+    )
+    stored = container.runtime_repository.get_review_task(review.review_task_id)
+    assert stored is not None
+    assert stored.review_status is ReviewTaskStatus.APPROVED
+    assert stored.resolved_by == "admin"
+    assert snapshot_tree(root / "queue") == queue_before
+
+
+def test_automation_configuration_and_rerun_are_prg_without_web_execution(
+    operations_web,
+) -> None:
+    app, container, root = operations_web
+    automation = AutomationRepository(container.runtime_repository)
+    jobs = ensure_default_automation_jobs(
+        automation,
+        platform_name="synthetic-platform",
+        now=datetime(2026, 8, 13, 1, 0, tzinfo=timezone.utc),
+    )
+    pulse = next(job for job in jobs if job.job_type == ONLINE_PULSE)
+    settlement = next(
+        job for job in jobs if job.job_type == PLATFORM_TRADE_DAY_SETTLEMENT
+    )
+    _, authenticated = login(app, container)
+    session = container.sessions.get(authenticated)
+    assert session is not None
+    queue_before = snapshot_tree(root / "queue")
+
+    status, _, body = call_app(app, path="/management", cookie=authenticated)
+    assert status == "200 OK"
+    assert "上架商品快速扫描" in body
+
+    status, headers, _ = call_app(
+        app,
+        path="/management/automation/configure",
+        method="POST",
+        cookie=authenticated,
+        form={
+            "csrf_token": session.csrf_token,
+            "job_id": pulse.job_id,
+            "enabled": "true",
+            "interval_minutes": "15",
+        },
+    )
+    assert status == "303 See Other"
+    assert header_values(headers, "Location")[0].startswith(
+        "/management?automation_receipt="
+    )
+    current_pulse = [
+        job
+        for job in automation.list_jobs(enabled_only=True)
+        if job.job_type == ONLINE_PULSE
+    ]
+    assert len(current_pulse) == 1
+    assert current_pulse[0].schedule_expression == "15"
+
+    status, _, _ = call_app(
+        app,
+        path="/management/automation/rerun",
+        method="POST",
+        cookie=authenticated,
+        form={
+            "csrf_token": session.csrf_token,
+            "job_id": settlement.job_id,
+            "target_trade_date": "2026-08-10",
+            "idempotency_key": "web-rerun-foundation-001",
+        },
+    )
+    assert status == "303 See Other"
+    reruns = automation.list_runs(job_id=settlement.job_id)
+    assert len(reruns) == 1
+    assert reruns[0].run_status is AutomationRunStatus.SCHEDULED
+    assert snapshot_tree(root / "queue") == queue_before
 
 
 @pytest.mark.parametrize(

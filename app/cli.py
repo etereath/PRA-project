@@ -58,6 +58,11 @@ def build_parser() -> argparse.ArgumentParser:
     generate_parser.add_argument("--output", required=True, type=Path)
     generate_parser.add_argument("--platform", default="default_platform")
     generate_parser.add_argument("--use-mock-ai", action="store_true")
+    generate_parser.add_argument(
+        "--test-only",
+        action="store_true",
+        help="明确作为隔离测试生成 Excel，不作为日常业务入口",
+    )
 
     ai_parser = subparsers.add_parser("mock-ai-decision", help="预览单个 SKU 的 Mock AI 定价决策")
     _add_source_args(ai_parser)
@@ -96,6 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
     generate_runtime_parser.add_argument("--runtime-db", type=Path, default=DEFAULT_RUNTIME_DB)
     generate_runtime_parser.add_argument("--platform", default="default_platform")
     generate_runtime_parser.add_argument("--use-mock-ai", action="store_true")
+    generate_runtime_parser.add_argument(
+        "--admin-recovery",
+        action="store_true",
+        help="仅管理员恢复或隔离验收；日常任务由 Automation/Web 创建",
+    )
 
     list_tasks_parser = subparsers.add_parser("list-tasks", help="列出 SQLite 运行态任务")
     list_tasks_parser.add_argument("--runtime-db", type=Path, default=DEFAULT_RUNTIME_DB)
@@ -119,12 +129,22 @@ def build_parser() -> argparse.ArgumentParser:
     resolve_review_parser.add_argument("--actor", default="manual_operator")
     resolve_review_parser.add_argument("--note", default="")
     resolve_review_parser.add_argument("--source-task-status")
+    resolve_review_parser.add_argument(
+        "--admin-recovery",
+        action="store_true",
+        help="仅管理员恢复或隔离验收；日常复核使用 Web/Mobile Review",
+    )
 
     expire_reviews_parser = subparsers.add_parser("expire-review-tasks", help="处理超时的 SQLite pending 复核任务")
     expire_reviews_parser.add_argument("--runtime-db", type=Path, default=DEFAULT_RUNTIME_DB)
     expire_reviews_parser.add_argument("--apply", action="store_true")
     expire_reviews_parser.add_argument("--now")
     expire_reviews_parser.add_argument("--enable-notification", action="store_true")
+    expire_reviews_parser.add_argument(
+        "--admin-recovery",
+        action="store_true",
+        help="只允许显式管理员恢复写入；日常超时由 Automation 维护",
+    )
 
     notification_worker_parser = subparsers.add_parser(
         "notification-worker",
@@ -141,7 +161,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="只执行过期 lease/deadline Watchdog，不调用渠道",
     )
 
-    web_parser = subparsers.add_parser("serve-web", help="启动简单 Web 管理页")
+    web_parser = subparsers.add_parser("serve-web", help="启动新运营 Web")
     web_parser.add_argument("--host", default="127.0.0.1")
     web_parser.add_argument("--port", default=8765, type=int)
 
@@ -190,7 +210,7 @@ def main() -> int:
             return 0
 
         if args.command == "serve-web":
-            from app.web import serve
+            from app.operations_web.app import serve
 
             serve(args.host, args.port)
             return 0
@@ -236,6 +256,9 @@ def main() -> int:
             return 0
 
         if args.command == "generate-tasks":
+            if not args.test_only:
+                print("generate-tasks 仅保留为隔离测试入口；请显式传入 --test-only。")
+                return 1
             summary = generate_tasks_from_sources(_workflow_inputs(args, include_output=True))
             print(f"已生成 {len(summary.tasks)} 条任务 -> {args.output}")
             return 0
@@ -275,6 +298,12 @@ def main() -> int:
             return 0
 
         if args.command == "generate-runtime-tasks":
+            if not args.admin_recovery:
+                print(
+                    "日常 Runtime 任务生成已迁入 Automation/Web；"
+                    "仅管理员恢复或隔离验收可显式传入 --admin-recovery。"
+                )
+                return 1
             summary = generate_runtime_tasks_from_sources(_workflow_inputs(args), db_path=args.runtime_db)
             print(
                 f"运行态任务生成完成：planned={len(summary.tasks)} "
@@ -320,6 +349,12 @@ def main() -> int:
             return 0
 
         if args.command == "resolve-review-task":
+            if not args.admin_recovery:
+                print(
+                    "日常人工复核已迁入 Web/Mobile Review；"
+                    "仅管理员恢复或隔离验收可显式传入 --admin-recovery。"
+                )
+                return 1
             source_status = TaskStatus(args.source_task_status) if args.source_task_status else None
             review = resolve_runtime_review_task(
                 RuntimeReviewResolutionInputs(
@@ -335,6 +370,12 @@ def main() -> int:
             return 0
 
         if args.command == "expire-review-tasks":
+            if args.apply and not args.admin_recovery:
+                print(
+                    "日常复核超时已迁入 Automation；"
+                    "CLI 写入仅允许显式传入 --admin-recovery。"
+                )
+                return 1
             summary = expire_runtime_review_tasks(
                 ExpireReviewTasksInputs(
                     db_path=args.runtime_db,

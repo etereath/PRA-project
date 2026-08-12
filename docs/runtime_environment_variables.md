@@ -204,10 +204,27 @@ $env:PRA_ALLOWED_DATA_DIRS = "D:\PRA_Runtime\data;D:\PRA_Runtime\imports"
 - `PRA_PRODUCTS_WORKBOOK`：商品工作簿；
 - `PRA_PRICE_RULES_WORKBOOK`：价格规则工作簿；
 - `PRA_LISTING_RULES_WORKBOOK`：上下架规则工作簿；
+- `PRA_PLATFORM_MAPPINGS_WORKBOOK`：平台商品映射工作簿；
+- `PRA_SHADOWBOT_IDENTITY_MAPPING`：ShadowBot 商品身份映射 JSON；
 - `SHADOWBOT_QUEUE_DIR`：Queue 根目录。
+
+真实平台执行准备还可通过 `SHADOWBOT_APPLET_URI` 固定小程序 URI。该值同样只在启动时
+读取，不能由 Web 请求覆盖。未配置时，人工任务创建和只读页面仍可使用；需要准备真实
+执行批次时服务端会明确拒绝，而不是猜测平台入口。
 
 这些值不能出现在 query、form、JSON 或 Session 中。修改后必须重启 Web；GET 不会初始化、
 迁移或修复 Runtime DB。
+
+### 7E CLI 控制面边界
+
+- `serve-web` 启动 `app.operations_web` 新运营 Web，不再进入旧 `app.web`。
+- `generate-tasks` 仅用于隔离测试，必须显式传入 `--test-only`。
+- `generate-runtime-tasks` 与 `resolve-review-task` 仅用于管理员恢复或隔离验收，必须显式传入
+  `--admin-recovery`。
+- `expire-review-tasks` 的只读预览仍可直接使用；执行 `--apply` 时必须同时传入
+  `--admin-recovery`。日常超时处理由 Automation Service 承担。
+
+这些开关不会提升权限，也不会绕过既有 Runtime、Review、Task 或执行发布门禁。
 
 ### 登录限流变量
 
