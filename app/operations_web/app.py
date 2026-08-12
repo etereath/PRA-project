@@ -5,12 +5,23 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import date
 from socketserver import ThreadingMixIn
 from urllib.parse import parse_qs, unquote
 from wsgiref.simple_server import WSGIRequestHandler, WSGIServer, make_server
 
 from app.operations_web.auth import Capability, SessionCapacityError
 from app.operations_web.composition import OperationsWebContainer, build_container
+from app.operations_web.presenters import (
+    render_database,
+    render_detail,
+    render_management,
+    render_mobile_review,
+    render_notification_drawer,
+    render_system,
+    render_today,
+)
+from app.operations_web.queries import OperationsQueryService
 from app.operations_web.rendering import html, render_template, static_text
 from app.operations_web.security import Response, internal_error_response
 from app.services.security import LOGIN_RATE_LIMITER, record_security_event
@@ -39,6 +50,26 @@ PROTECTED_ROUTES: dict[str, tuple[str, Capability]] = {
     "/system": ("系统", Capability.VIEW_SYSTEM),
 }
 
+DATABASE_SECTION_ROUTES = {
+    "/database": "business",
+    "/database/project": "project",
+    "/database/sales-analysis": "sales-analysis",
+    "/database/dictionary": "dictionary",
+    "/database/quality": "quality",
+}
+DETAIL_ROUTE_PATTERN = re.compile(
+    r"^/(database|management)/(product|sales|settlement|task|review|run|execution)/([^/]+)$"
+)
+DETAIL_ROUTE_OWNERS = {
+    "product": "database",
+    "sales": "database",
+    "settlement": "database",
+    "run": "database",
+    "execution": "database",
+    "task": "management",
+    "review": "management",
+}
+
 
 class ThreadedWSGIServer(ThreadingMixIn, WSGIServer):
     daemon_threads = True
@@ -58,6 +89,10 @@ class RedactingRequestHandler(WSGIRequestHandler):
 class OperationsWebApplication:
     def __init__(self, container: OperationsWebContainer) -> None:
         self.container = container
+        self.queries = OperationsQueryService(
+            container.runtime_repository,
+            container.settings.paths,
+        )
 
     def __call__(self, environ, start_response):
         try:
@@ -123,9 +158,9 @@ class OperationsWebApplication:
             return self._logout(environ)
 
         if path.startswith("/mobile/review/"):
-            return self._mobile_review_shell(method, path)
+            return self._mobile_review(environ, method, path)
 
-        if path in PROTECTED_ROUTES:
+        if self._is_protected_route(path):
             if method != "GET":
                 return self._method_not_allowed("GET")
             return self._protected_page(environ, path)
@@ -298,7 +333,7 @@ class OperationsWebApplication:
                 "",
                 headers=[("Location", "/login"), ("Cache-Control", "no-store")],
             )
-        title, capability = PROTECTED_ROUTES[path]
+        title, capability = self._protected_route_contract(path)
         if not self.container.authorization.allows(session.principal, capability):
             record_security_event(
                 "AUTHORIZATION_REJECTED",
@@ -309,15 +344,49 @@ class OperationsWebApplication:
             )
             return Response.text("403 Forbidden", "当前账号没有访问该页面的权限。")
 
-        readiness = self._runtime_readiness_message()
+        query = parse_qs(str(environ.get("QUERY_STRING", "")), keep_blank_values=True)
+        content: str
+        if path == "/today":
+            content = render_today(self.queries.today())
+        elif path in DATABASE_SECTION_ROUTES:
+            content = render_database(
+                self.queries.database(
+                    section=DATABASE_SECTION_ROUTES[path],
+                    dataset=self._first(query, "dataset"),
+                    page=self._page_number(self._first(query, "page")),
+                    trade_date=self._optional_date(self._first(query, "trade_date")),
+                    platform_name=self._first(query, "platform").strip(),
+                )
+            )
+        elif path == "/management":
+            content = render_management(self.queries.management())
+        elif path == "/system":
+            content = render_system(self.queries.system())
+        else:
+            match = DETAIL_ROUTE_PATTERN.fullmatch(path)
+            if match is None or DETAIL_ROUTE_OWNERS.get(match.group(2)) != match.group(1):
+                return Response.text("404 Not Found", "未找到该页面。")
+            detail = self.queries.detail(
+                match.group(2),
+                unquote(match.group(3)),
+                context={
+                    key: self._first(query, key)
+                    for key in ("source", "dataset", "trade_date", "platform")
+                },
+            )
+            if detail is None:
+                return Response.text("404 Not Found", "未找到该业务事实。")
+            content = render_detail(detail)
+        drawer = render_notification_drawer(self.queries.notification_drawer())
         body = render_template(
-            "shell.html",
+            "page.html",
             page_title=html(title),
             active_today="active" if path == "/today" else "",
-            active_database="active" if path == "/database" else "",
-            active_management="active" if path == "/management" else "",
+            active_database="active" if path.startswith("/database") else "",
+            active_management="active" if path.startswith("/management") else "",
             active_system="active" if path == "/system" else "",
-            readiness=html(readiness),
+            content=content,
+            notification_drawer=drawer,
             csrf_token=html(session.csrf_token),
             username=html(session.principal.subject),
         )
@@ -328,35 +397,71 @@ class OperationsWebApplication:
             headers=[("Cache-Control", "no-store")],
         )
 
-    def _runtime_readiness_message(self) -> str:
-        try:
-            schema = self.container.runtime_repository.check_schema_health()
-            if schema.ok:
-                return "运行数据只读检查正常。业务页面将在后续阶段接入。"
-        except Exception:
-            pass
-        return "运行数据当前需要维护。Web 未执行初始化、迁移或真实数据修复。"
-
-    def _mobile_review_shell(self, method: str, path: str) -> Response:
+    def _mobile_review(self, environ, method: str, path: str) -> Response:
         tail = path.removeprefix("/mobile/review/").strip("/")
         parts = tail.split("/") if tail else []
         valid_get = method == "GET" and len(parts) == 1 and bool(unquote(parts[0]).strip())
         valid_post = method == "POST" and len(parts) == 2 and parts[1] == "resolve"
         if valid_get:
-            body = render_template("mobile_review_shell.html")
+            query = parse_qs(str(environ.get("QUERY_STRING", "")), keep_blank_values=True)
+            model = self.queries.mobile_review(
+                unquote(parts[0]).strip(),
+                self._first(query, "token"),
+            )
+            body = render_template(
+                "mobile_review.html",
+                content=render_mobile_review(model),
+            )
             return Response.text(
-                "503 Service Unavailable",
+                model.http_status,
                 body,
                 content_type="text/html; charset=utf-8",
-                headers=[("Cache-Control", "no-store"), ("Retry-After", "300")],
+                headers=[("Cache-Control", "no-store")],
             )
         if valid_post:
             return Response.text(
                 "503 Service Unavailable",
-                "手机复核写入尚未切换到新 Web，本阶段未执行任何业务操作。",
+                "当前复核入口只提供查看，未执行任何业务操作。",
                 headers=[("Cache-Control", "no-store"), ("Retry-After", "300")],
             )
         return Response.text("404 Not Found", "复核链接无效或已失效。")
+
+    @staticmethod
+    def _is_protected_route(path: str) -> bool:
+        if path in PROTECTED_ROUTES or path in DATABASE_SECTION_ROUTES:
+            return True
+        match = DETAIL_ROUTE_PATTERN.fullmatch(path)
+        return bool(
+            match is not None
+            and DETAIL_ROUTE_OWNERS.get(match.group(2)) == match.group(1)
+        )
+
+    @staticmethod
+    def _protected_route_contract(path: str) -> tuple[str, Capability]:
+        if path in PROTECTED_ROUTES:
+            return PROTECTED_ROUTES[path]
+        if path in DATABASE_SECTION_ROUTES or path.startswith("/database/"):
+            return "数据库", Capability.VIEW_DATABASE
+        if path.startswith("/management/"):
+            return "业务管理", Capability.MANAGE_BUSINESS
+        return "系统", Capability.VIEW_SYSTEM
+
+    @staticmethod
+    def _page_number(raw: str) -> int:
+        try:
+            value = int(raw or "1")
+        except ValueError:
+            return 1
+        return min(max(value, 1), 100000)
+
+    @staticmethod
+    def _optional_date(raw: str) -> date | None:
+        if not raw:
+            return None
+        try:
+            return date.fromisoformat(raw)
+        except ValueError:
+            return None
 
     def _contains_dependency_override(self, environ, method: str) -> bool:
         query = parse_qs(str(environ.get("QUERY_STRING", "")), keep_blank_values=True)

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>$page_title · PRA 运营中心</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <strong>$page_title</strong>
+    <div class="user-actions">
+      $notification_drawer
+      <span>$username</span>
+      <form method="post" action="/logout">
+        <input type="hidden" name="csrf_token" value="$csrf_token">
+        <button class="secondary" type="submit">退出</button>
+      </form>
+    </div>
+  </header>
+  <main class="page-shell">$content</main>
+  <nav class="primary-nav" aria-label="一级导航">
+    <a class="$active_today" href="/today">今日</a>
+    <a class="$active_database" href="/database">数据库</a>
+    <a class="$active_management" href="/management">业务管理</a>
+    <a class="$active_system" href="/system">系统</a>
+  </nav>
+</body>
+</html>

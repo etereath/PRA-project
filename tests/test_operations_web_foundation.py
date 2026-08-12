@@ -253,9 +253,16 @@ def test_all_get_routes_are_zero_write_and_never_initialize_schema(operations_we
         ("/", authenticated_cookie, {"303"}),
         ("/today", authenticated_cookie, {"200"}),
         ("/database", authenticated_cookie, {"200"}),
+        ("/database/project", authenticated_cookie, {"200"}),
+        ("/database/sales-analysis", authenticated_cookie, {"200"}),
+        ("/database/dictionary", authenticated_cookie, {"200"}),
+        ("/database/quality", authenticated_cookie, {"200"}),
+        ("/database/product/NO-SUCH-PRODUCT", authenticated_cookie, {"200"}),
         ("/management", authenticated_cookie, {"200"}),
+        ("/management/task/NO-SUCH-TASK", authenticated_cookie, {"404"}),
+        ("/management/review/NO-SUCH-REVIEW", authenticated_cookie, {"404"}),
         ("/system", authenticated_cookie, {"200"}),
-        ("/mobile/review/REVIEW-SYNTHETIC", "", {"503"}),
+        ("/mobile/review/REVIEW-SYNTHETIC", "", {"404"}),
         ("/static/app.css", "", {"200"}),
     ]
     for path, cookie, expected_statuses in requests:
@@ -265,7 +272,7 @@ def test_all_get_routes_are_zero_write_and_never_initialize_schema(operations_we
             query="token=synthetic-secret" if path.startswith("/mobile/") else "",
             cookie=cookie,
         )
-        assert status.split()[0] in expected_statuses
+        assert status.split()[0] in expected_statuses, (path, status)
     assert snapshot_tree(root, ignore_sqlite_sidecar_mtime=True) == before
 
 
@@ -530,7 +537,7 @@ def test_security_headers_are_applied_to_html_health_errors_and_static(operation
         assert header_map["Referrer-Policy"] == "no-referrer"
 
 
-def test_mobile_review_protocol_shell_is_read_only_and_does_not_echo_secrets(operations_web) -> None:
+def test_mobile_review_invalid_state_is_read_only_and_does_not_echo_secrets(operations_web) -> None:
     app, _, root = operations_web
     before = snapshot_tree(root)
     status, _, body = call_app(
@@ -538,8 +545,8 @@ def test_mobile_review_protocol_shell_is_read_only_and_does_not_echo_secrets(ope
         path="/mobile/review/REVIEW-SENSITIVE-ID",
         query="token=never-echo-this-token",
     )
-    assert status == "503 Service Unavailable"
-    assert "原手机复核链接协议" in body
+    assert status == "404 Not Found"
+    assert "链接无效" in body
     assert "REVIEW-SENSITIVE-ID" not in body
     assert "never-echo-this-token" not in body
     status, _, body = call_app(

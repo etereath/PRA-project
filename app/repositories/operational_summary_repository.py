@@ -30,6 +30,16 @@ from app.sales_settlement_models import (
 )
 
 
+def _validate_page(limit: int, offset: int) -> tuple[int, int]:
+    normalized_limit = int(limit)
+    normalized_offset = int(offset)
+    if normalized_limit < 1:
+        raise ValueError("limit must be greater than zero")
+    if normalized_offset < 0:
+        raise ValueError("offset must be greater than or equal to zero")
+    return normalized_limit, normalized_offset
+
+
 class OperationalSummaryRepository:
     """Transactional persistence for versioned platform trade-day summaries."""
 
@@ -441,6 +451,50 @@ class OperationalSummaryRepository:
                 platform_trade_date=platform_trade_date,
             )
 
+    def list_order_snapshots_page(
+        self,
+        *,
+        platform_name: str | None = None,
+        platform_trade_date: date | None = None,
+        limit: int = 25,
+        offset: int = 0,
+    ) -> tuple[OrderSnapshot, ...]:
+        normalized_limit, normalized_offset = _validate_page(limit, offset)
+        clauses: list[str] = []
+        values: list[object] = []
+        if platform_name:
+            clauses.append("platform_name = ?")
+            values.append(platform_name)
+        if platform_trade_date is not None:
+            clauses.append("requested_platform_trade_date = ?")
+            values.append(platform_trade_date.isoformat())
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        values.extend((normalized_limit, normalized_offset))
+        with closing(self.runtime_repository.connect_read()) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT observation_batch_id
+                FROM order_observation_batches
+                {where}
+                ORDER BY requested_platform_trade_date DESC,
+                         scan_completed_at DESC,
+                         observation_batch_id DESC
+                LIMIT ? OFFSET ?
+                """,
+                tuple(values),
+            ).fetchall()
+            return tuple(
+                snapshot
+                for row in rows
+                if (
+                    snapshot := _get_order_snapshot_in_connection(
+                        connection,
+                        str(row["observation_batch_id"]),
+                    )
+                )
+                is not None
+            )
+
     def get_order_snapshot(
         self,
         observation_batch_id: str,
@@ -479,6 +533,49 @@ class OperationalSummaryRepository:
         else:
             with closing(self.runtime_repository.connect_read()) as read_connection:
                 rows = read_connection.execute(query, values).fetchall()
+        return tuple(_row_to_summary(row) for row in rows)
+
+    def list_summaries_page(
+        self,
+        *,
+        platform_name: str | None = None,
+        platform_trade_date: date | None = None,
+        scope_type: str | None = None,
+        current_only: bool | None = None,
+        limit: int = 25,
+        offset: int = 0,
+    ) -> tuple[PlatformTradeDaySummary, ...]:
+        """Return a bounded read-only page without changing settlement semantics."""
+
+        normalized_limit, normalized_offset = _validate_page(limit, offset)
+        clauses: list[str] = []
+        values: list[object] = []
+        if platform_name:
+            clauses.append("platform_name = ?")
+            values.append(platform_name)
+        if platform_trade_date is not None:
+            clauses.append("platform_trade_date = ?")
+            values.append(platform_trade_date.isoformat())
+        if scope_type:
+            clauses.append("scope_type = ?")
+            values.append(str(scope_type).strip().upper())
+        if current_only is not None:
+            clauses.append("is_current = ?")
+            values.append(1 if current_only else 0)
+        where = "WHERE " + " AND ".join(clauses) if clauses else ""
+        values.extend((normalized_limit, normalized_offset))
+        with closing(self.runtime_repository.connect_read()) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT *
+                FROM platform_trade_day_summaries
+                {where}
+                ORDER BY platform_trade_date DESC, platform_name ASC,
+                         scope_type ASC, scope_key ASC, version_no DESC
+                LIMIT ? OFFSET ?
+                """,
+                tuple(values),
+            ).fetchall()
         return tuple(_row_to_summary(row) for row in rows)
 
     def list_sku_dimensions(
