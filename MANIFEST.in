@@ -1,6 +1,8 @@
 include README.md
 include pyproject.toml
 recursive-include app *.py
+recursive-include app/operations_web/templates *.html
+recursive-include app/operations_web/static *.css
 
 prune .agents
 prune build

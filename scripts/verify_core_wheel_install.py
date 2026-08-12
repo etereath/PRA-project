@@ -122,6 +122,21 @@ def verify_core_wheel(wheel: Path) -> None:
             isolated_root=isolated_root,
         )
         _run_checked(
+            "operations_web_resources",
+            [
+                str(python),
+                "-c",
+                (
+                    "from app.operations_web.rendering import render_template, static_text; "
+                    "assert '<!doctype html>' in render_template('mobile_review_shell.html'); "
+                    "assert '.primary-nav' in static_text('app.css')"
+                ),
+            ],
+            cwd=isolated_root,
+            env=env,
+            isolated_root=isolated_root,
+        )
+        _run_checked(
             "repository_path_isolation",
             [
                 str(python),

@@ -34,6 +34,11 @@ def _write_fake_wheel(path: Path, *, extra_member: str | None = None, extra_payl
         archive.writestr("app/runtime_schema.py", b"LATEST_RUNTIME_SCHEMA_VERSION = 5\n")
         archive.writestr("app/repositories/sqlite_runtime_repository.py", b"class Repo: pass\n")
         archive.writestr("app/services/runtime.py", b"class Runtime: pass\n")
+        archive.writestr("app/operations_web/app.py", b"def create_application(): pass\n")
+        archive.writestr("app/operations_web/templates/login.html", b"<!doctype html>\n")
+        archive.writestr("app/operations_web/templates/shell.html", b"<!doctype html>\n")
+        archive.writestr("app/operations_web/templates/mobile_review_shell.html", b"<!doctype html>\n")
+        archive.writestr("app/operations_web/static/app.css", b":root {}\n")
         archive.writestr(f"{dist_info}/METADATA", b"Metadata-Version: 2.1\n")
         archive.writestr(f"{dist_info}/WHEEL", b"Wheel-Version: 1.0\n")
         archive.writestr(f"{dist_info}/RECORD", b"")
@@ -88,6 +93,15 @@ class PackagingTests(unittest.TestCase):
         scripts = config["project"]["scripts"]
         self.assertEqual(scripts["pra"], "app.cli:main")
         self.assertEqual(scripts["pra-mvp"], "app.cli:main")
+
+    def test_operations_web_resources_are_declared_as_package_data(self) -> None:
+        with (ROOT / "pyproject.toml").open("rb") as handle:
+            config = tomllib.load(handle)
+        package_data = config["tool"]["setuptools"]["package-data"]
+        self.assertEqual(
+            package_data["app.operations_web"],
+            ["templates/*.html", "static/*.css"],
+        )
 
     def test_shadowbot_deployment_inputs_are_separate_and_tracked(self) -> None:
         shadowbot_dir = ROOT / "shadowbot" / "test2"

@@ -338,7 +338,16 @@ class ShadowBotFileQueueRunner:
             destination = archive_dir / source.name
             if destination.exists():
                 raise ValidationError("OLD_QUEUE_ARTIFACT_CONFLICT")
-            os.replace(source, destination)
+            try:
+                os.replace(source, destination)
+            except FileNotFoundError as exc:
+                # A concurrent retry can move the same artifact after the
+                # source.exists() check.  Preserve the existing fail-closed
+                # conflict contract instead of leaking a platform-specific
+                # filesystem exception from the authorization boundary.
+                if not source.exists() and destination.exists():
+                    raise ValidationError("OLD_QUEUE_ARTIFACT_CONFLICT") from exc
+                raise ValidationError("OLD_QUEUE_ARTIFACT_MISSING") from exc
 
 
 class FileDropShadowBotTaskRunner(ShadowBotFileQueueRunner):

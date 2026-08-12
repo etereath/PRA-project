@@ -66,6 +66,12 @@ notepad scripts/local_env.ps1
 powershell -ExecutionPolicy Bypass -File scripts/start_local.ps1
 ```
 
+该脚本只启动 Web。Queue Service 需要独立终端和独立生命周期：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/start_local_services.ps1
+```
+
 默认地址：
 
 ```text
@@ -84,6 +90,9 @@ start_web.bat
 
 - `RUNTIME_ADMIN_USER`：Web 后台账号，默认 `admin`。
 - `RUNTIME_ADMIN_PASSWORD`：Web 后台密码，必须本地配置。
+- `PRA_ENV`：新运营 Web 必须显式为 `development` 或 `production`。
+- `PRA_WEB_PUBLIC_SCHEME`：development 使用 `http`，production 使用 `https`。
+- `PRA_COOKIE_SECURE`：development 使用 `false`，production 使用 `true`；冲突时启动失败。
 - `REVIEW_TOKEN_SECRET`：Mobile Review token HMAC 密钥，必须本地配置。
 
 飞书与手机端复核：

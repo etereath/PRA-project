@@ -353,6 +353,25 @@ agent-run:<stable-run-id>`；当前 Schema 尚未支持，本阶段只冻结合�
 买家页面可见“第 N 次购买”、买家客户端实时售价、每日人工花材质量“好/中/差”和外部
 市场指数继续留到 Agent 阶段；13.5-7 不补采、不推断、不扩 Schema，当前 Web 不展示假值。
 
+13.5-7A 已由 PR #31 合并到 `main`，7B 已从该合并提交建立独立分支并开始生产代码。当前
+新增 `app/operations_web` 应用骨架、单一 Composition Root、有界内存 Session、登录后轮换、
+POST 退出、CSRF、集中 capability、安全 Header、统一错误边界和本地打包资源。认证 Session
+不会被匿名登录页请求替换或因 preauth 容量回收而淘汰；无可安全回收项时 fail closed。
+公共路由固定为 `/ → /today`、`/today`、`/login`、POST `/logout`，不在新 Web 复制旧
+`/runtime/login|logout` 别名；登录失败和限流继续进入既有有界安全审计。Runtime DB、
+三类工作簿和 Queue 根目录只在启动时固定；请求中的路径覆盖会被拒绝。`/health`、受保护的
+四入口骨架和错误提示只使用只读连接，绝不调用 `init_schema()` 或迁移；Runtime 健康异常只
+提示另走显式维护，不推断或修复真实数据。Mobile Review 保留
+`/mobile/review/{review_task_id}` 与 `/resolve` 的路径形状，但 7B 只返回无写入维护外壳，
+有效/过期/已处理事实和业务写入留到后续批准阶段。
+
+Web 与后台生命周期已先行拆开：`scripts/start_local.ps1` 不再启动或停止 Queue Service，
+后台服务改由 `scripts/start_local_services.ps1` 独立运行。新 Web 目前仍是分阶段施工目标；
+旧 Web 默认入口、Presenter 和重复测试的最终切换删除仍严格留在 7F，不能在 7B 冒充完成。
+7B 只使用合成 Runtime DB 测试，没有连接真实库、修改 Schema、创建业务 Task 或执行平台
+动作。详细复用和门禁见
+[13.5-7B 实施报告](reports/task13_5_7b_web_foundation.md)。
+
 ### 2.8 自动规则评估框架 MVP
 
 已完成轻量自动规则评估框架第一版：
