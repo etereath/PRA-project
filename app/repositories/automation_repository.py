@@ -238,19 +238,23 @@ class AutomationRepository:
 
     def load_operational_time_policies(
         self,
+        *,
+        connection=None,
     ) -> tuple[OperationalTimePolicy, ...]:
-        with closing(self.runtime_repository.connect_read()) as connection:
-            rows = connection.execute(
-                """
-                SELECT policy_version, timezone_name,
-                       platform_cutoff_local_time,
-                       seller_cutoff_local_time,
-                       peak_start_local_time,
-                       effective_from, effective_to
-                FROM operational_time_policies
-                ORDER BY julianday(effective_from), policy_version
-                """
-            ).fetchall()
+        query = """
+            SELECT policy_version, timezone_name,
+                   platform_cutoff_local_time,
+                   seller_cutoff_local_time,
+                   peak_start_local_time,
+                   effective_from, effective_to
+            FROM operational_time_policies
+            ORDER BY julianday(effective_from), policy_version
+        """
+        if connection is not None:
+            rows = connection.execute(query).fetchall()
+        else:
+            with closing(self.runtime_repository.connect_read()) as read_connection:
+                rows = read_connection.execute(query).fetchall()
         return tuple(
             OperationalTimePolicy(
                 policy_version=str(row["policy_version"]),

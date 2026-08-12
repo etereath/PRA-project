@@ -48,6 +48,9 @@ def main() -> int:
         "products_sha256": products_sha256,
         "runtime_db": str(runtime_db),
         "runtime_logical_snapshot_sha256_before": runtime_snapshot_sha256,
+        "cutover_order_observation_batch_id": (
+            args.cutover_order_observation_batch_id
+        ),
         "authority_mode_before": authority.authority_mode,
         "sku_count": len(products),
         "inventory_total": sum(item.current_stock for item in products),
@@ -90,6 +93,9 @@ def main() -> int:
             products,
             snapshot_sha256=products_sha256,
             runtime_snapshot_sha256=runtime_snapshot_sha256,
+            cutover_order_observation_batch_id=(
+                args.cutover_order_observation_batch_id
+            ),
             idempotency_key=f"inventory-bootstrap:{products_sha256}",
             actor=args.actor,
             freeze_validator=(
@@ -142,6 +148,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--expected-products-sha256", default="")
     parser.add_argument("--expected-runtime-snapshot-sha256", default="")
+    parser.add_argument(
+        "--cutover-order-observation-batch-id",
+        required=True,
+        help="切换时绑定的最新可信空 OPEN 订单观察批次",
+    )
     parser.add_argument("--backup-dir", type=Path)
     parser.add_argument("--actor", default="admin:inventory-cutover")
     return parser

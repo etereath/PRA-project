@@ -46,6 +46,7 @@ from app.services.authoritative_inventory import (
 )
 from app.services.runtime import ReviewTokenService
 from app.services.operational_time import OperationalTimePolicy
+from tests.inventory_cutover_support import insert_cutover_order_snapshot
 
 
 FIXED_NOW = datetime(2026, 8, 12, 1, 0, tzinfo=timezone.utc)
@@ -686,10 +687,17 @@ def test_management_inventory_adjustment_is_csrf_fenced_prg_and_db_only(
     app, container, repository, tmp_path = read_only_web
     workbook_path = tmp_path / "products.xlsx"
     products = load_products(workbook_path)
+    cutover_batch_id = insert_cutover_order_snapshot(
+        repository,
+        batch_id="web-inventory-cutover-empty",
+        observed_at=FIXED_NOW - timedelta(minutes=1),
+        platform_trade_date=TRADE_DATE,
+    )
     InventoryApplicationService(repository, clock=lambda: FIXED_NOW).bootstrap(
         products,
         snapshot_sha256="sha256:" + "a" * 64,
         runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
+        cutover_order_observation_batch_id=cutover_batch_id,
         idempotency_key="bootstrap:web-inventory",
         actor="admin",
         freeze_validator=lambda: True,

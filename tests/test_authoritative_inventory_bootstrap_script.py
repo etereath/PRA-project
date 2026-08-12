@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import subprocess
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from app.repositories.inventory_repository import InventoryRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import save_table_records
 from app.services.authoritative_inventory import sqlite_logical_snapshot_sha256
+from app.services.operational_time import OperationalTimeService
+from tests.inventory_cutover_support import insert_cutover_order_snapshot
 
 
 def test_cutover_script_applies_only_canonical_frozen_snapshots(
@@ -41,6 +45,15 @@ def test_cutover_script_applies_only_canonical_frozen_snapshots(
     )
     runtime = SQLiteRuntimeRepository(runtime_path)
     runtime.init_schema()
+    cutover_at = datetime.now(timezone.utc)
+    cutover_context = OperationalTimeService().classify(cutover_at)
+    cutover_batch_id = insert_cutover_order_snapshot(
+        runtime,
+        batch_id="script-cutover-empty-open",
+        observed_at=cutover_at - timedelta(seconds=5),
+        platform_trade_date=cutover_context.platform_trade_date,
+        time_policy_version=cutover_context.time_policy_version,
+    )
     products_sha256 = "sha256:" + hashlib.sha256(
         products_path.read_bytes()
     ).hexdigest()
@@ -68,6 +81,8 @@ def test_cutover_script_applies_only_canonical_frozen_snapshots(
             products_sha256,
             "--expected-runtime-snapshot-sha256",
             runtime_snapshot_sha256,
+            "--cutover-order-observation-batch-id",
+            cutover_batch_id,
             "--backup-dir",
             str(backup_dir),
             "--actor",
@@ -90,4 +105,7 @@ def test_cutover_script_applies_only_canonical_frozen_snapshots(
     assert inventory.get_balance("AISHA-A-65-Z").current_qty == 12
     assert len(tuple(backup_dir.glob("*.xlsx"))) == 1
     assert len(tuple(backup_dir.glob("*.sqlite3"))) == 1
-    assert len(tuple(backup_dir.glob("*.json"))) == 1
+    reports = tuple(backup_dir.glob("*.json"))
+    assert len(reports) == 1
+    report = json.loads(reports[0].read_text(encoding="utf-8"))
+    assert report["cutover_order_observation_batch_id"] == cutover_batch_id

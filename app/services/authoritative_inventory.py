@@ -4,7 +4,7 @@ import hashlib
 import json
 from contextlib import closing
 from dataclasses import replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import Callable, Iterable, Mapping
 from uuid import uuid4
 
@@ -18,6 +18,7 @@ from app.inventory_models import (
     InventoryWriteResult,
 )
 from app.models import Product
+from app.repositories.automation_repository import AutomationRepository
 from app.repositories.inventory_repository import InventoryRepository
 from app.repositories.operational_summary_repository import OperationalSummaryRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
@@ -46,6 +47,7 @@ MANUAL_INVENTORY_SOURCE_TYPES = frozenset(
         "RECONCILIATION_CORRECTION",
     }
 )
+CUTOVER_ORDER_SNAPSHOT_MAX_AGE = timedelta(minutes=10)
 
 
 def sqlite_logical_snapshot_sha256(
@@ -132,6 +134,7 @@ class InventoryApplicationService:
         *,
         snapshot_sha256: str,
         runtime_snapshot_sha256: str,
+        cutover_order_observation_batch_id: str,
         idempotency_key: str,
         actor: str,
         freeze_validator: Callable[[], bool] | None = None,
@@ -150,6 +153,10 @@ class InventoryApplicationService:
         )
         if freeze_validator is None:
             raise ValueError("库存切换必须提供工作簿冻结校验器")
+        cutover_batch_id = _required_text(
+            cutover_order_observation_batch_id,
+            "cutover_order_observation_batch_id",
+        )
         key = _required_text(idempotency_key, "idempotency_key")
         normalized_actor = _required_text(actor, "actor")
         payload = {
@@ -160,10 +167,10 @@ class InventoryApplicationService:
             ],
             "snapshot_sha256": snapshot_sha256,
             "runtime_snapshot_sha256": runtime_snapshot_sha256,
+            "cutover_order_observation_batch_id": cutover_batch_id,
         }
         request_sha256 = _sha256_payload(payload)
         now = self.clock()
-        watermark_date = OperationalTimeService().classify(now).platform_trade_date
         with closing(self.runtime_repository.connect_write()) as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
@@ -237,6 +244,26 @@ class InventoryApplicationService:
                     )
                 if not freeze_validator():
                     raise InventoryConflictError("商品工作簿冻结校验失败")
+                policies = AutomationRepository(
+                    self.runtime_repository
+                ).load_operational_time_policies(connection=connection)
+                time_context = OperationalTimeService(
+                    policies=policies
+                ).classify(now)
+                watermark_date = time_context.platform_trade_date
+                cutover_snapshot = _require_trusted_empty_cutover_snapshot(
+                    self.summaries,
+                    connection=connection,
+                    observation_batch_id=cutover_batch_id,
+                    platform_trade_date=watermark_date,
+                    time_policy_version=time_context.time_policy_version,
+                    cutover_at=now,
+                )
+                cutover_order_ref = (
+                    "ORDER_OBSERVATION_BATCH:"
+                    f"{cutover_snapshot.observation_batch_id}:"
+                    f"{cutover_snapshot.content_sha256}"
+                )
                 nonempty_tables = tuple(
                     table_name
                     for table_name in (
@@ -278,7 +305,7 @@ class InventoryApplicationService:
                         ) VALUES (
                             ?, ?, 0, ?, ?, 'BOOTSTRAP',
                             'WORKBOOK_SNAPSHOT', ?, ?, ?,
-                            NULL, NULL, NULL, '[]', ?, ?, 1, ?, ?
+                            NULL, NULL, NULL, ?, ?, ?, 1, ?, ?
                         )
                         """,
                         (
@@ -289,6 +316,11 @@ class InventoryApplicationService:
                             snapshot_sha256,
                             "从经哈希确认的商品主数据一次性切换",
                             normalized_actor,
+                            json.dumps(
+                                [cutover_order_ref],
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            ),
                             transaction_key,
                             request_sha256,
                             _datetime_to_text(now),
@@ -314,6 +346,16 @@ class InventoryApplicationService:
                 for summary in self.summaries.list_all_current_sku_summaries(
                     connection=connection
                 ):
+                    if summary.platform_trade_date > watermark_date:
+                        raise InventoryAuthorityError(
+                            "切换快照中存在未来交易日销售事实"
+                        )
+                    if summary.platform_trade_date == watermark_date:
+                        if summary.platform_name != cutover_snapshot.platform_name:
+                            raise InventoryAuthorityError(
+                                "当前交易日存在未被切换订单快照覆盖的平台"
+                            )
+                        continue
                     selection = self.settlement.select_evidence(
                         platform_name=summary.platform_name,
                         platform_trade_date=summary.platform_trade_date,
@@ -819,6 +861,92 @@ class InventorySalesApplicationService:
             transaction_ids=tuple(applied),
             reasons=tuple(skipped),
         )
+
+
+def _require_trusted_empty_cutover_snapshot(
+    repository: OperationalSummaryRepository,
+    *,
+    connection,
+    observation_batch_id: str,
+    platform_trade_date: date,
+    time_policy_version: str,
+    cutover_at: datetime,
+):
+    snapshot = repository.get_order_snapshot(
+        observation_batch_id,
+        connection=connection,
+    )
+    if snapshot is None:
+        raise InventoryConflictError("库存切换绑定的订单观察批次不存在")
+    if snapshot.platform_trade_date != platform_trade_date:
+        raise InventoryConflictError("库存切换订单快照与当前 PRA 交易日不一致")
+    if snapshot.time_policy_version != time_policy_version:
+        raise InventoryConflictError("库存切换订单快照与当前交易日策略版本不一致")
+    if (
+        snapshot.trade_day_status != "OPEN"
+        or snapshot.capability_result != "SUCCEEDED"
+        or snapshot.batch_status != "ACCEPTED"
+        or snapshot.source_batch_status != "ACCEPTED"
+        or not snapshot.scope_complete
+        or not snapshot.end_marker_verified
+    ):
+        raise InventoryConflictError("库存切换必须绑定可信完整的 OPEN 订单空快照")
+    if snapshot.items:
+        raise InventoryConflictError(
+            "当前 PRA 交易日已经出现订单，保守库存切换门禁拒绝执行"
+        )
+    observed_order_count = int(
+        connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM order_observation_items AS item
+            INNER JOIN order_observation_batches AS batch
+                ON batch.observation_batch_id = item.observation_batch_id
+            WHERE batch.platform_name = ?
+              AND batch.requested_platform_trade_date = ?
+            """,
+            (
+                snapshot.platform_name,
+                platform_trade_date.isoformat(),
+            ),
+        ).fetchone()[0]
+    )
+    if observed_order_count:
+        raise InventoryConflictError(
+            "当前 PRA 交易日曾经观察到订单，保守库存切换门禁拒绝执行"
+        )
+    age = cutover_at - snapshot.scan_completed_at
+    if age < timedelta(0) or age > CUTOVER_ORDER_SNAPSHOT_MAX_AGE:
+        raise InventoryConflictError("库存切换订单空快照已过期或时间晚于切换时刻")
+    snapshots = repository.list_order_snapshots(
+        platform_name=snapshot.platform_name,
+        platform_trade_date=platform_trade_date,
+        connection=connection,
+    )
+    latest = max(
+        snapshots,
+        key=lambda item: (
+            item.scan_completed_at,
+            item.observation_batch_id,
+        ),
+        default=None,
+    )
+    if latest is None or latest.observation_batch_id != observation_batch_id:
+        raise InventoryConflictError("库存切换必须绑定当前交易日最新订单快照")
+    platforms = {
+        str(row[0])
+        for row in connection.execute(
+            """
+            SELECT DISTINCT platform_name
+            FROM order_observation_batches
+            WHERE requested_platform_trade_date = ?
+            """,
+            (platform_trade_date.isoformat(),),
+        ).fetchall()
+    }
+    if platforms != {snapshot.platform_name}:
+        raise InventoryConflictError("库存切换窗口只允许一个已完整覆盖的平台")
+    return snapshot
 
 
 def _eligible_inventory_fact(summary, selection) -> bool:

@@ -25,15 +25,23 @@ from app.services.authoritative_inventory import (
 )
 from app.services.inventory_alert import InventoryAlertService
 from app.enums import IncidentCategory
+from tests.inventory_cutover_support import insert_cutover_order_snapshot
 
 
 NOW = datetime(2026, 8, 12, 12, 0, tzinfo=UTC)
 SNAPSHOT_SHA256 = "sha256:" + "a" * 64
+CUTOVER_BATCH_ID = "cutover-empty-open"
 
 
 def _repository(tmp_path: Path) -> SQLiteRuntimeRepository:
     repository = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
     repository.init_schema()
+    insert_cutover_order_snapshot(
+        repository,
+        batch_id=CUTOVER_BATCH_ID,
+        observed_at=NOW - timedelta(minutes=1),
+        platform_trade_date=date(2026, 8, 13),
+    )
     return repository
 
 
@@ -73,6 +81,7 @@ def _bootstrap(repository: SQLiteRuntimeRepository) -> InventoryApplicationServi
         _products(),
         snapshot_sha256=SNAPSHOT_SHA256,
         runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
+        cutover_order_observation_batch_id=CUTOVER_BATCH_ID,
         idempotency_key="bootstrap:2026-08-12",
         actor="admin",
         freeze_validator=lambda: True,
@@ -105,6 +114,7 @@ def test_bootstrap_is_atomic_switch_with_immutable_ledger_and_exact_replay(
         _products(),
         snapshot_sha256=SNAPSHOT_SHA256,
         runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
+        cutover_order_observation_batch_id=CUTOVER_BATCH_ID,
         idempotency_key="bootstrap:2026-08-12",
         actor="admin",
         freeze_validator=lambda: True,
@@ -120,6 +130,15 @@ def test_bootstrap_is_atomic_switch_with_immutable_ledger_and_exact_replay(
     transactions = inventory.list_transactions()
     assert len(transactions) == 2
     assert {item.transaction_type for item in transactions} == {"BOOTSTRAP"}
+    assert all(
+        any(
+            ref.startswith(
+                f"ORDER_OBSERVATION_BATCH:{CUTOVER_BATCH_ID}:sha256:"
+            )
+            for ref in item.supporting_refs
+        )
+        for item in transactions
+    )
     with closing(repository.connect_write()) as connection, pytest.raises(
         Exception,
         match="append-only",
@@ -146,6 +165,7 @@ def test_bootstrap_conflict_does_not_replace_authoritative_balances(
                 .get_authority_state()
                 .bootstrap_runtime_snapshot_sha256
             ),
+            cutover_order_observation_batch_id=CUTOVER_BATCH_ID,
             idempotency_key="bootstrap:other",
             actor="admin",
             freeze_validator=lambda: True,
@@ -171,6 +191,7 @@ def test_bootstrap_same_key_and_hash_with_different_content_is_not_a_replay(
                 .get_authority_state()
                 .bootstrap_runtime_snapshot_sha256
             ),
+            cutover_order_observation_batch_id=CUTOVER_BATCH_ID,
             idempotency_key="bootstrap:2026-08-12",
             actor="admin",
             freeze_validator=lambda: True,
@@ -231,6 +252,7 @@ def test_bootstrap_rejects_nonempty_inventory_tables_and_stays_pre_cutover(
             _products(),
             snapshot_sha256=SNAPSHOT_SHA256,
             runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
+            cutover_order_observation_batch_id=CUTOVER_BATCH_ID,
             idempotency_key=f"bootstrap:nonempty:{with_baseline}",
             actor="admin",
             freeze_validator=lambda: True,
@@ -253,6 +275,7 @@ def test_bootstrap_freeze_failure_rolls_back_and_stays_pre_cutover(
             _products(),
             snapshot_sha256=SNAPSHOT_SHA256,
             runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
+            cutover_order_observation_batch_id=CUTOVER_BATCH_ID,
             idempotency_key="bootstrap:freeze-failed",
             actor="admin",
             freeze_validator=lambda: next(freeze_checks),
@@ -287,6 +310,7 @@ def test_bootstrap_rejects_runtime_change_after_logical_snapshot(
             _products(),
             snapshot_sha256=SNAPSHOT_SHA256,
             runtime_snapshot_sha256=frozen_snapshot,
+            cutover_order_observation_batch_id=CUTOVER_BATCH_ID,
             idempotency_key="bootstrap:stale-runtime-snapshot",
             actor="admin",
             freeze_validator=lambda: True,
@@ -304,6 +328,7 @@ def test_bootstrap_requires_workbook_freeze_validator(tmp_path: Path) -> None:
             _products(),
             snapshot_sha256=SNAPSHOT_SHA256,
             runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
+            cutover_order_observation_batch_id=CUTOVER_BATCH_ID,
             idempotency_key="bootstrap:missing-freeze-validator",
             actor="admin",
         )
@@ -312,6 +337,83 @@ def test_bootstrap_requires_workbook_freeze_validator(tmp_path: Path) -> None:
     assert inventory.get_authority_state().authority_mode == "PRE_CUTOVER"
     assert inventory.list_balances() == ()
     assert inventory.list_transactions() == ()
+
+
+def test_bootstrap_rejects_nonempty_open_cutover_snapshot(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    insert_cutover_order_snapshot(
+        repository,
+        batch_id="cutover-open-with-orders",
+        observed_at=NOW - timedelta(seconds=30),
+        platform_trade_date=date(2026, 8, 13),
+        order_quantities=(6,),
+    )
+    batch_id = insert_cutover_order_snapshot(
+        repository,
+        batch_id="cutover-latest-empty-after-orders",
+        observed_at=NOW,
+        platform_trade_date=date(2026, 8, 13),
+    )
+
+    with pytest.raises(InventoryConflictError, match="曾经观察到订单"):
+        InventoryApplicationService(repository, clock=lambda: NOW).bootstrap(
+            _products(),
+            snapshot_sha256=SNAPSHOT_SHA256,
+            runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
+            cutover_order_observation_batch_id=batch_id,
+            idempotency_key="bootstrap:open-orders-refused",
+            actor="admin",
+            freeze_validator=lambda: True,
+        )
+
+    inventory = InventoryRepository(repository)
+    assert inventory.get_authority_state().authority_mode == "PRE_CUTOVER"
+    assert inventory.list_balances() == ()
+    assert inventory.list_transactions() == ()
+
+
+def test_bootstrap_uses_runtime_operational_time_policy_version(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    repository.replace_current_operational_time_policy(
+        expected_current_policy_version="CN_SINGLE_PLATFORM_2026_V1",
+        successor_policy_version="CN_SINGLE_PLATFORM_2026_V2",
+        effective_from=NOW - timedelta(hours=1),
+        platform_cutoff_local_time="21:00:00",
+        seller_cutoff_local_time="22:00:00",
+        peak_start_local_time="20:00:00",
+        created_by="test",
+    )
+    batch_id = insert_cutover_order_snapshot(
+        repository,
+        batch_id="cutover-empty-open-v2",
+        observed_at=NOW - timedelta(minutes=1),
+        platform_trade_date=date(2026, 8, 12),
+        time_policy_version="CN_SINGLE_PLATFORM_2026_V2",
+    )
+
+    result = InventoryApplicationService(
+        repository,
+        clock=lambda: NOW,
+    ).bootstrap(
+        _products(),
+        snapshot_sha256=SNAPSHOT_SHA256,
+        runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
+        cutover_order_observation_batch_id=batch_id,
+        idempotency_key="bootstrap:runtime-policy-v2",
+        actor="admin",
+        freeze_validator=lambda: True,
+    )
+
+    assert result.authority_state.bootstrap_sales_watermark_date == date(
+        2026,
+        8,
+        12,
+    )
+    assert result.status == "APPLIED"
 
 
 def test_manual_signed_delta_has_defaults_and_optimistic_lock(
@@ -548,6 +650,7 @@ def test_inventory_alert_reuses_incident_outbox_repeat_and_recovery(
         [replace_product(_products()[0], current_stock=12)],
         snapshot_sha256=SNAPSHOT_SHA256,
         runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
+        cutover_order_observation_batch_id=CUTOVER_BATCH_ID,
         idempotency_key="bootstrap:alert",
         actor="admin",
         freeze_validator=lambda: True,

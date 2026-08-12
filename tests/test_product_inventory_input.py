@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from app.exceptions import ValidationError
@@ -22,6 +23,7 @@ from app.services.product_inventory_input import (
     validate_inventory_form,
     validate_product_edit_form,
 )
+from tests.inventory_cutover_support import insert_cutover_order_snapshot
 
 
 def _save_products(path: Path, rows: list[dict[str, object]]) -> None:
@@ -251,10 +253,21 @@ class ProductInventoryInputTests(unittest.TestCase):
             repository = SQLiteRuntimeRepository(Path(temp_dir) / "runtime.sqlite3")
             repository.init_schema()
             products = load_products(path)
-            InventoryApplicationService(repository).bootstrap(
+            cutover_at = datetime(2026, 8, 12, 1, 0, tzinfo=timezone.utc)
+            cutover_batch_id = insert_cutover_order_snapshot(
+                repository,
+                batch_id="new-product-cutover-empty",
+                observed_at=cutover_at - timedelta(minutes=1),
+                platform_trade_date=date(2026, 8, 12),
+            )
+            InventoryApplicationService(
+                repository,
+                clock=lambda: cutover_at,
+            ).bootstrap(
                 products,
                 snapshot_sha256="sha256:" + "a" * 64,
                 runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
+                cutover_order_observation_batch_id=cutover_batch_id,
                 idempotency_key="bootstrap:new-product-flow",
                 actor="admin",
                 freeze_validator=lambda: True,

@@ -53,6 +53,7 @@ from app.services.authoritative_inventory import (
     sqlite_logical_snapshot_sha256,
 )
 from app.services.shadowbot_executor import FileDropShadowBotTaskRunner
+from tests.inventory_cutover_support import insert_cutover_order_snapshot
 from app.web import (
     DISPLAY_TIMEZONE,
     TABLE_OPTIONS,
@@ -1551,10 +1552,21 @@ class WebTests(unittest.TestCase):
                 ],
             )
             canonical = SQLiteRuntimeRepository(canonical_db)
-            InventoryApplicationService(canonical).bootstrap(
+            cutover_at = datetime(2026, 8, 12, 1, 0, tzinfo=timezone.utc)
+            cutover_batch_id = insert_cutover_order_snapshot(
+                canonical,
+                batch_id="legacy-web-cutover-empty",
+                observed_at=cutover_at - timedelta(minutes=1),
+                platform_trade_date=date(2026, 8, 12),
+            )
+            InventoryApplicationService(
+                canonical,
+                clock=lambda: cutover_at,
+            ).bootstrap(
                 load_products(products_path),
                 snapshot_sha256="sha256:" + "a" * 64,
                 runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(canonical),
+                cutover_order_observation_batch_id=cutover_batch_id,
                 idempotency_key="bootstrap:canonical-web-guard",
                 actor="admin",
                 freeze_validator=lambda: True,
