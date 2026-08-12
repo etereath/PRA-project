@@ -3,10 +3,11 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import sys
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -17,7 +18,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from app.repositories.inventory_repository import InventoryRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import load_products
-from app.services.authoritative_inventory import InventoryApplicationService
+from app.services.authoritative_inventory import (
+    InventoryApplicationService,
+    sqlite_logical_snapshot_sha256,
+)
 
 
 def main() -> int:
@@ -25,11 +29,12 @@ def main() -> int:
     args = _parser().parse_args()
     products_path = args.products.resolve(strict=True)
     runtime_db = args.runtime_db.resolve(strict=True)
+    _require_canonical_paths(products_path, runtime_db)
     products_sha256 = _file_sha256(products_path)
-    runtime_sha256 = _file_sha256(runtime_db)
     products = load_products(products_path)
     _validate_products(products)
     repository = SQLiteRuntimeRepository(runtime_db)
+    runtime_snapshot_sha256 = sqlite_logical_snapshot_sha256(repository)
     health = repository.check_schema_health()
     if not health.ok:
         raise RuntimeError(
@@ -42,7 +47,7 @@ def main() -> int:
         "products_path": str(products_path),
         "products_sha256": products_sha256,
         "runtime_db": str(runtime_db),
-        "runtime_db_sha256_before": runtime_sha256,
+        "runtime_logical_snapshot_sha256_before": runtime_snapshot_sha256,
         "authority_mode_before": authority.authority_mode,
         "sku_count": len(products),
         "inventory_total": sum(item.current_stock for item in products),
@@ -57,9 +62,9 @@ def main() -> int:
         "商品工作簿",
     )
     _require_expected_hash(
-        args.expected_runtime_db_sha256,
-        runtime_sha256,
-        "Runtime DB",
+        args.expected_runtime_snapshot_sha256,
+        runtime_snapshot_sha256,
+        "Runtime DB 逻辑快照",
     )
     if args.backup_dir is None:
         raise ValueError("--apply 必须同时提供 --backup-dir")
@@ -68,20 +73,29 @@ def main() -> int:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     products_backup = backup_dir / f"products.before-inventory-cutover.{timestamp}.xlsx"
     runtime_backup = backup_dir / f"runtime.before-inventory-cutover.{timestamp}.sqlite3"
-    shutil.copy2(products_path, products_backup)
-    _backup_sqlite(runtime_db, runtime_backup)
-    if _file_sha256(products_backup) != products_sha256:
-        raise RuntimeError("商品工作簿备份哈希不一致，已停止切换")
-    _verify_sqlite_backup(runtime_backup)
-    if _file_sha256(products_path) != products_sha256:
-        raise RuntimeError("商品工作簿在切换前发生变化，已停止切换")
-
-    result = InventoryApplicationService(repository).bootstrap(
-        products,
-        snapshot_sha256=products_sha256,
-        idempotency_key=f"inventory-bootstrap:{products_sha256}",
-        actor=args.actor,
-    )
+    with _exclusive_file_lock(products_path) as products_handle:
+        if _locked_file_sha256(products_handle) != products_sha256:
+            raise RuntimeError("商品工作簿在冻结前发生变化，已停止切换")
+        _copy_locked_file(products_handle, products_backup)
+        _backup_sqlite(runtime_db, runtime_backup)
+        if _file_sha256(products_backup) != products_sha256:
+            raise RuntimeError("商品工作簿备份哈希不一致，已停止切换")
+        _verify_sqlite_backup(runtime_backup)
+        backup_snapshot_sha256 = sqlite_logical_snapshot_sha256(
+            SQLiteRuntimeRepository(runtime_backup)
+        )
+        if backup_snapshot_sha256 != runtime_snapshot_sha256:
+            raise RuntimeError("Runtime DB 备份逻辑快照不一致，已停止切换")
+        result = InventoryApplicationService(repository).bootstrap(
+            products,
+            snapshot_sha256=products_sha256,
+            runtime_snapshot_sha256=runtime_snapshot_sha256,
+            idempotency_key=f"inventory-bootstrap:{products_sha256}",
+            actor=args.actor,
+            freeze_validator=(
+                lambda: _locked_file_sha256(products_handle) == products_sha256
+            ),
+        )
     balances = InventoryRepository(repository).list_balances()
     expected = {
         item.internal_sku: item.current_stock
@@ -93,8 +107,6 @@ def main() -> int:
     }
     if actual != expected or sum(actual.values()) != sum(expected.values()):
         raise RuntimeError("库存切换回读与工作簿冻结快照不一致")
-    if _file_sha256(products_path) != products_sha256:
-        raise RuntimeError("切换期间商品工作簿发生变化，必须人工复核")
     report = {
         **preview,
         "result_status": result.status,
@@ -103,7 +115,13 @@ def main() -> int:
         "inventory_total_after": sum(actual.values()),
         "products_backup": str(products_backup),
         "runtime_db_backup": str(runtime_backup),
-        "runtime_db_sha256_after": _file_sha256(runtime_db),
+        "runtime_logical_snapshot_sha256_after": (
+            sqlite_logical_snapshot_sha256(repository)
+        ),
+        "bootstrap_sales_watermark_date": (
+            result.authority_state.bootstrap_sales_watermark_date.isoformat()
+        ),
+        "sales_baseline_count_after": result.sales_baseline_count,
         "verified": True,
     }
     report_path = backup_dir / f"inventory-cutover-report.{timestamp}.json"
@@ -123,7 +141,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime-db", required=True, type=Path)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--expected-products-sha256", default="")
-    parser.add_argument("--expected-runtime-db-sha256", default="")
+    parser.add_argument("--expected-runtime-snapshot-sha256", default="")
     parser.add_argument("--backup-dir", type=Path)
     parser.add_argument("--actor", default="admin:inventory-cutover")
     return parser
@@ -152,11 +170,90 @@ def _file_sha256(path: Path) -> str:
     return "sha256:" + digest
 
 
+def _locked_file_sha256(handle) -> str:
+    digest = hashlib.sha256()
+    handle.seek(0)
+    while True:
+        chunk = handle.read(1024 * 1024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    return "sha256:" + digest.hexdigest()
+
+
+def _copy_locked_file(handle, destination: Path) -> None:
+    handle.seek(0)
+    with destination.open("wb") as destination_handle:
+        shutil.copyfileobj(handle, destination_handle, length=1024 * 1024)
+
+
 def _backup_sqlite(source: Path, destination: Path) -> None:
     with closing(sqlite3.connect(source)) as source_connection, closing(
         sqlite3.connect(destination)
     ) as destination_connection:
         source_connection.backup(destination_connection, pages=1000, sleep=0.05)
+
+
+def _require_canonical_paths(products_path: Path, runtime_db: Path) -> None:
+    canonical_products = _canonical_path(
+        "PRA_PRODUCTS_WORKBOOK",
+        Path("data/samples/products.xlsx"),
+    )
+    canonical_runtime = _canonical_path(
+        "PRA_RUNTIME_DB",
+        Path("data/runtime/pra_runtime.sqlite3"),
+    )
+    if products_path != canonical_products:
+        raise ValueError("库存切换只允许固定 PRA_PRODUCTS_WORKBOOK 商品工作簿")
+    if runtime_db != canonical_runtime:
+        raise ValueError("库存切换只允许固定 PRA_RUNTIME_DB Runtime DB")
+
+
+def _canonical_path(environment_name: str, default: Path) -> Path:
+    configured = Path(os.getenv(environment_name, str(default)).strip())
+    if not configured.is_absolute():
+        configured = PROJECT_ROOT / configured
+    return configured.resolve(strict=False)
+
+
+@contextmanager
+def _exclusive_file_lock(path: Path):
+    """Hold a non-blocking OS lock for the complete workbook freeze window."""
+
+    handle = path.open("rb")
+    locked = False
+    try:
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+        except OSError as exc:
+            raise RuntimeError(
+                "商品工作簿正在被占用，无法建立切换冻结窗口"
+            ) from exc
+        yield handle
+    finally:
+        if locked:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        handle.close()
 
 
 def _verify_sqlite_backup(path: Path) -> None:

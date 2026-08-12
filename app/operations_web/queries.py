@@ -459,12 +459,18 @@ class OperationsQueryService:
             notice=notice,
         )
 
-    def management(self, *, inventory_transaction_id: str = "") -> ManagementReadModel:
+    def management(
+        self,
+        *,
+        inventory_transaction_id: str = "",
+        inventory_error_code: str = "",
+    ) -> ManagementReadModel:
         pending_tasks = self._task_table(page=1, pending_only=True, page_size=6)
         pending_reviews = self._review_table(page=1, pending_only=True, page_size=6)
         runs = self._run_table(page=1, page_size=6)
         inventory_options: tuple[tuple[str, str, int, int], ...] = ()
         inventory_receipt = None
+        inventory_error = _inventory_error_state(inventory_error_code)
         try:
             authority = self.inventory.get_authority_state()
             if authority.authority_mode != "DB_AUTHORITY":
@@ -518,6 +524,7 @@ class OperationsQueryService:
             inventory_state=inventory_state,
             inventory_options=inventory_options,
             inventory_receipt=inventory_receipt,
+            inventory_error=inventory_error,
             inventory_idempotency_key=(
                 "web-inventory:" + secrets.token_urlsafe(18)
             ),
@@ -2115,6 +2122,19 @@ def _execution_result_detail(success_flag: bool | None) -> str:
     if success_flag is False:
         return "执行失败，技术原因请由管理员在系统诊断中查看。"
     return "执行结果尚未确认"
+
+
+def _inventory_error_state(error_code: str) -> StateReadModel | None:
+    messages = {
+        "INVALID_ADJUSTMENT": "调整值、来源或调整后库存不符合要求，请检查后重试。",
+        "INVENTORY_CONFLICT": "库存已变化，请刷新页面后重新确认。",
+        "INVENTORY_UNAVAILABLE": "数据库库存服务暂不可用，本次没有修改库存。",
+        "INVENTORY_WRITE_FAILED": "库存流水回读失败，本次结果未确认，请联系管理员。",
+    }
+    message = messages.get(str(error_code).strip().upper())
+    if message is None:
+        return None
+    return StateReadModel(ReadState.FAILED, "库存调整未完成", message)
 
 
 def _detail_back_link(kind: str, context: dict[str, str]) -> tuple[str, str]:

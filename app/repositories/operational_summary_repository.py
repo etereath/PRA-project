@@ -535,6 +535,26 @@ class OperationalSummaryRepository:
                 rows = read_connection.execute(query, values).fetchall()
         return tuple(_row_to_summary(row) for row in rows)
 
+    def list_all_current_sku_summaries(
+        self,
+        *,
+        connection=None,
+    ) -> tuple[PlatformTradeDaySummary, ...]:
+        """Return every current SKU summary inside the caller's snapshot."""
+
+        query = """
+            SELECT *
+            FROM platform_trade_day_summaries
+            WHERE scope_type = 'SKU' AND is_current = 1
+            ORDER BY platform_trade_date, platform_name, scope_key
+        """
+        if connection is not None:
+            rows = connection.execute(query).fetchall()
+        else:
+            with closing(self.runtime_repository.connect_read()) as read_connection:
+                rows = read_connection.execute(query).fetchall()
+        return tuple(_row_to_summary(row) for row in rows)
+
     def list_summaries_page(
         self,
         *,

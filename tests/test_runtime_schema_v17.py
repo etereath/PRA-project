@@ -58,11 +58,19 @@ def test_v17_new_database_has_explicit_pre_cutover_authority(
             )
         }
         authority = connection.execute(
-            "SELECT authority_key, authority_mode, version "
+            "SELECT authority_key, authority_mode, "
+            "bootstrap_runtime_snapshot_sha256, "
+            "bootstrap_sales_watermark_date, version "
             "FROM inventory_authority_state"
         ).fetchone()
     assert V17_TABLES <= tables
-    assert tuple(authority) == ("REAL_INVENTORY", "PRE_CUTOVER", 0)
+    assert tuple(authority) == (
+        "REAL_INVENTORY",
+        "PRE_CUTOVER",
+        None,
+        None,
+        0,
+    )
 
 
 def test_v16_to_v17_migration_is_repeatable_and_preserves_v16_policy(

@@ -391,7 +391,11 @@ class OperationsWebApplication:
                     inventory_transaction_id=self._first(
                         query,
                         "inventory_transaction",
-                    )
+                    ),
+                    inventory_error_code=self._first(
+                        query,
+                        "inventory_error",
+                    ),
                 ),
                 csrf_token=session.csrf_token,
             )
@@ -468,14 +472,16 @@ class OperationsWebApplication:
                 idempotency_key=self._first(form, "idempotency_key"),
                 expected_version=int(self._first(form, "expected_version")),
             )
-        except (ValueError, InventoryInsufficientError) as exc:
-            return Response.text("422 Unprocessable Content", str(exc))
-        except InventoryConflictError as exc:
-            return Response.text("409 Conflict", str(exc))
-        except InventoryAuthorityError as exc:
-            return Response.text("503 Service Unavailable", str(exc))
+        except (ValueError, InventoryInsufficientError):
+            return self._inventory_error_redirect("INVALID_ADJUSTMENT")
+        except InventoryConflictError:
+            return self._inventory_error_redirect("INVENTORY_CONFLICT")
+        except InventoryAuthorityError:
+            return self._inventory_error_redirect("INVENTORY_UNAVAILABLE")
+        except Exception:
+            return self._inventory_error_redirect("INVENTORY_WRITE_FAILED")
         if result.transaction is None:
-            return Response.text("500 Internal Server Error", "库存调整未产生可回读流水。")
+            return self._inventory_error_redirect("INVENTORY_WRITE_FAILED")
         location = "/management?inventory_transaction=" + quote(
             result.transaction.transaction_id,
             safe="",
@@ -484,6 +490,17 @@ class OperationsWebApplication:
             "303 See Other",
             "",
             headers=[("Location", location), ("Cache-Control", "no-store")],
+        )
+
+    @staticmethod
+    def _inventory_error_redirect(error_code: str) -> Response:
+        return Response.text(
+            "303 See Other",
+            "",
+            headers=[
+                ("Location", "/management?inventory_error=" + quote(error_code)),
+                ("Cache-Control", "no-store"),
+            ],
         )
 
     def _mobile_review(self, environ, method: str, path: str) -> Response:

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime
 from datetime import timedelta
 from decimal import Decimal
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 
@@ -19,6 +21,7 @@ from app.services.authoritative_inventory import (
     InventoryConflictError,
     InventoryInsufficientError,
     InventoryProvider,
+    sqlite_logical_snapshot_sha256,
 )
 from app.services.inventory_alert import InventoryAlertService
 from app.enums import IncidentCategory
@@ -60,12 +63,19 @@ def _products() -> list[Product]:
 
 
 def _bootstrap(repository: SQLiteRuntimeRepository) -> InventoryApplicationService:
-    service = InventoryApplicationService(repository, clock=lambda: NOW)
+    known_skus = {item.internal_sku for item in _products()} | {"NEW-SKU"}
+    service = InventoryApplicationService(
+        repository,
+        clock=lambda: NOW,
+        product_exists=lambda sku: sku in known_skus,
+    )
     result = service.bootstrap(
         _products(),
         snapshot_sha256=SNAPSHOT_SHA256,
+        runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
         idempotency_key="bootstrap:2026-08-12",
         actor="admin",
+        freeze_validator=lambda: True,
     )
     assert result.status == "APPLIED"
     return service
@@ -94,8 +104,10 @@ def test_bootstrap_is_atomic_switch_with_immutable_ledger_and_exact_replay(
     replay = service.bootstrap(
         _products(),
         snapshot_sha256=SNAPSHOT_SHA256,
+        runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
         idempotency_key="bootstrap:2026-08-12",
         actor="admin",
+        freeze_validator=lambda: True,
     )
     inventory = InventoryRepository(repository)
 
@@ -129,8 +141,14 @@ def test_bootstrap_conflict_does_not_replace_authoritative_balances(
         service.bootstrap(
             changed,
             snapshot_sha256="sha256:" + "b" * 64,
+            runtime_snapshot_sha256=(
+                InventoryRepository(repository)
+                .get_authority_state()
+                .bootstrap_runtime_snapshot_sha256
+            ),
             idempotency_key="bootstrap:other",
             actor="admin",
+            freeze_validator=lambda: True,
         )
 
     assert InventoryRepository(repository).get_balance("AISHA-A-50-Z").current_qty == 72
@@ -148,13 +166,152 @@ def test_bootstrap_same_key_and_hash_with_different_content_is_not_a_replay(
         service.bootstrap(
             changed,
             snapshot_sha256=SNAPSHOT_SHA256,
+            runtime_snapshot_sha256=(
+                InventoryRepository(repository)
+                .get_authority_state()
+                .bootstrap_runtime_snapshot_sha256
+            ),
             idempotency_key="bootstrap:2026-08-12",
             actor="admin",
+            freeze_validator=lambda: True,
         )
 
     assert InventoryRepository(repository).get_balance(
         "AISHA-A-50-Z"
     ).current_qty == 72
+
+
+@pytest.mark.parametrize("with_baseline", [False, True])
+def test_bootstrap_rejects_nonempty_inventory_tables_and_stays_pre_cutover(
+    tmp_path: Path,
+    with_baseline: bool,
+) -> None:
+    repository = _repository(tmp_path)
+    with closing(repository.connect_write()) as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO inventory_transactions(
+                transaction_id, internal_sku,
+                inventory_before, inventory_delta, inventory_after,
+                transaction_type, source_type, source_ref_id,
+                reason, actor, supporting_refs_json,
+                idempotency_key, request_sha256,
+                balance_version_after, occurred_at, recorded_at
+            ) VALUES (
+                'ORPHAN-TX', 'AISHA-A-50-Z', 0, 0, 0,
+                'SALES_BASELINE_SYNC', 'TEST', 'TEST-1',
+                '切换前残留', 'test', '[]',
+                'orphan:1', ?, 1, ?, ?
+            )
+            """,
+            ("sha256:" + "e" * 64, NOW.isoformat(), NOW.isoformat()),
+        )
+        if with_baseline:
+            connection.execute(
+                """
+                INSERT INTO inventory_sales_baselines(
+                    platform_name, platform_trade_date, internal_sku,
+                    selected_fact_source, quality_level, selected_sold_qty,
+                    source_ref_id, source_sha256, mapping_version,
+                    supporting_refs_json, inventory_transaction_id,
+                    version, updated_at
+                ) VALUES (
+                    'platform', '2026-08-11', 'AISHA-A-50-Z',
+                    'ORDER_OBSERVED', 'ORDER_COMPLETE', 3,
+                    'SUMMARY-OLD', ?, 'mapping-v1', '[]',
+                    'ORPHAN-TX', 1, ?
+                )
+                """,
+                ("sha256:" + "d" * 64, NOW.isoformat()),
+            )
+    service = InventoryApplicationService(repository, clock=lambda: NOW)
+
+    with pytest.raises(InventoryConflictError, match="三表"):
+        service.bootstrap(
+            _products(),
+            snapshot_sha256=SNAPSHOT_SHA256,
+            runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
+            idempotency_key=f"bootstrap:nonempty:{with_baseline}",
+            actor="admin",
+            freeze_validator=lambda: True,
+        )
+
+    assert (
+        InventoryRepository(repository).get_authority_state().authority_mode
+        == "PRE_CUTOVER"
+    )
+
+
+def test_bootstrap_freeze_failure_rolls_back_and_stays_pre_cutover(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    freeze_checks = iter((True, False))
+
+    with pytest.raises(InventoryConflictError, match="发生变化"):
+        InventoryApplicationService(repository, clock=lambda: NOW).bootstrap(
+            _products(),
+            snapshot_sha256=SNAPSHOT_SHA256,
+            runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
+            idempotency_key="bootstrap:freeze-failed",
+            actor="admin",
+            freeze_validator=lambda: next(freeze_checks),
+        )
+
+    inventory = InventoryRepository(repository)
+    assert inventory.get_authority_state().authority_mode == "PRE_CUTOVER"
+    assert inventory.list_balances() == ()
+    assert inventory.list_transactions() == ()
+
+
+def test_bootstrap_rejects_runtime_change_after_logical_snapshot(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    frozen_snapshot = sqlite_logical_snapshot_sha256(repository)
+    inventory = InventoryRepository(repository)
+    policy = inventory.get_alert_policy(internal_sku="AISHA-A-50-Z")
+    inventory.save_alert_policy(
+        scope_type="DEFAULT",
+        scope_key="*",
+        enabled=True,
+        threshold_qty=10,
+        repeat_interval_minutes=60,
+        updated_by="admin",
+        expected_version=policy.version,
+        updated_at=NOW,
+    )
+
+    with pytest.raises(InventoryConflictError, match="逻辑快照"):
+        InventoryApplicationService(repository, clock=lambda: NOW).bootstrap(
+            _products(),
+            snapshot_sha256=SNAPSHOT_SHA256,
+            runtime_snapshot_sha256=frozen_snapshot,
+            idempotency_key="bootstrap:stale-runtime-snapshot",
+            actor="admin",
+            freeze_validator=lambda: True,
+        )
+
+    assert inventory.get_authority_state().authority_mode == "PRE_CUTOVER"
+    assert inventory.list_balances() == ()
+
+
+def test_bootstrap_requires_workbook_freeze_validator(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+
+    with pytest.raises(ValueError, match="冻结校验器"):
+        InventoryApplicationService(repository, clock=lambda: NOW).bootstrap(
+            _products(),
+            snapshot_sha256=SNAPSHOT_SHA256,
+            runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
+            idempotency_key="bootstrap:missing-freeze-validator",
+            actor="admin",
+        )
+
+    inventory = InventoryRepository(repository)
+    assert inventory.get_authority_state().authority_mode == "PRE_CUTOVER"
+    assert inventory.list_balances() == ()
+    assert inventory.list_transactions() == ()
 
 
 def test_manual_signed_delta_has_defaults_and_optimistic_lock(
@@ -188,6 +345,8 @@ def test_manual_signed_delta_has_defaults_and_optimistic_lock(
         service.adjust(
             internal_sku="AISHA-A-50-Z",
             inventory_delta=-1,
+            source_type="MANUAL_STOCKTAKE",
+            reason="人工盘点修正",
             actor="operator",
             idempotency_key="manual:2",
             expected_version=1,
@@ -229,6 +388,38 @@ def test_manual_adjustment_rejects_unstructured_source(
             reason="客户端伪造来源",
             actor="operator",
             idempotency_key="manual:bad-source",
+        )
+
+    assert InventoryRepository(repository).get_balance(
+        "AISHA-A-50-Z"
+    ).current_qty == 72
+
+
+@pytest.mark.parametrize(
+    ("source_type", "inventory_delta"),
+    [
+        ("NEW_FLOWER_INBOUND", -1),
+        ("NEW_FLOWER_INBOUND", 0),
+        ("LOSS_ADJUSTMENT", 1),
+        ("LOSS_ADJUSTMENT", 0),
+    ],
+)
+def test_manual_adjustment_rejects_source_direction_mismatch(
+    tmp_path: Path,
+    source_type: str,
+    inventory_delta: int,
+) -> None:
+    repository = _repository(tmp_path)
+    service = _bootstrap(repository)
+
+    with pytest.raises(ValueError, match="必须|不能为 0"):
+        service.adjust(
+            internal_sku="AISHA-A-50-Z",
+            inventory_delta=inventory_delta,
+            source_type=source_type,
+            reason="方向不一致",
+            actor="operator",
+            idempotency_key=f"manual:direction:{source_type}",
         )
 
     assert InventoryRepository(repository).get_balance(
@@ -289,6 +480,20 @@ def test_new_sku_requires_explicit_zero_balance_before_inbound(
     assert inbound.balance.current_qty == 20
 
 
+def test_new_sku_initialization_rejects_orphan_metadata(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    service = _bootstrap(repository)
+
+    with pytest.raises(InventoryAuthorityError, match="商品主数据"):
+        service.initialize_sku(
+            internal_sku="ORPHAN-SKU",
+            actor="admin",
+            idempotency_key="sku-init:orphan",
+        )
+
+    assert InventoryRepository(repository).get_balance("ORPHAN-SKU") is None
+
+
 def test_inventory_transaction_model_keeps_trade_day_dimensions() -> None:
     transaction = InventoryTransaction(
         transaction_id="INV-TXN-1",
@@ -342,8 +547,10 @@ def test_inventory_alert_reuses_incident_outbox_repeat_and_recovery(
     service.bootstrap(
         [replace_product(_products()[0], current_stock=12)],
         snapshot_sha256=SNAPSHOT_SHA256,
+        runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
         idempotency_key="bootstrap:alert",
         actor="admin",
+        freeze_validator=lambda: True,
     )
 
     detected = service.adjust(
@@ -398,6 +605,66 @@ def test_inventory_alert_reuses_incident_outbox_repeat_and_recovery(
         category=IncidentCategory.INVENTORY_ANOMALY
     ) == []
     assert len(repository.list_notification_outbox()) == 3
+
+
+def test_concurrent_first_low_inventory_alert_enqueues_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = _repository(tmp_path)
+    inventory = InventoryRepository(repository)
+    policy = inventory.get_alert_policy(internal_sku="AISHA-A-50-Z")
+    inventory.save_alert_policy(
+        scope_type="DEFAULT",
+        scope_key="*",
+        enabled=True,
+        threshold_qty=10,
+        repeat_interval_minutes=30,
+        updated_by="admin",
+        expected_version=policy.version,
+        updated_at=NOW,
+    )
+    alerts = InventoryAlertService(repository)
+    original_list_active = alerts.incidents.list_active
+    barrier = Barrier(2)
+
+    def _concurrent_empty_read(*, category):
+        rows = original_list_active(category=category)
+        barrier.wait(timeout=5)
+        return rows
+
+    monkeypatch.setattr(alerts.incidents, "list_active", _concurrent_empty_read)
+    transactions = tuple(
+        InventoryTransaction(
+            transaction_id=f"INV-CONCURRENT-{index}",
+            internal_sku="AISHA-A-50-Z",
+            inventory_before=11,
+            inventory_delta=-2,
+            inventory_after=9,
+            transaction_type="MANUAL_ADJUSTMENT",
+            source_type="MANUAL_STOCKTAKE",
+            source_ref_id=f"concurrent:{index}",
+            reason="并发首次越界",
+            actor="operator",
+            seller_operation_date=None,
+            platform_name=None,
+            platform_trade_date=None,
+            supporting_refs=(),
+            idempotency_key=f"concurrent:{index}",
+            request_sha256="sha256:" + str(index) * 64,
+            balance_version_after=index + 2,
+            occurred_at=NOW,
+            recorded_at=NOW,
+        )
+        for index in (1, 2)
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = tuple(executor.map(alerts.evaluate_transaction, transactions))
+
+    assert {item.status for item in results} == {"DETECTED", "REPEATED"}
+    assert len({item.incident_id for item in results}) == 1
+    assert len(repository.list_notification_outbox()) == 1
 
 
 @pytest.mark.parametrize(

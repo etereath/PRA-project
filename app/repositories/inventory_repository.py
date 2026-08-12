@@ -262,6 +262,12 @@ def _row_to_authority_state(row) -> InventoryAuthorityState:
     return InventoryAuthorityState(
         authority_mode=str(row["authority_mode"]),
         bootstrap_snapshot_sha256=_optional_text(row["bootstrap_snapshot_sha256"]),
+        bootstrap_runtime_snapshot_sha256=_optional_text(
+            row["bootstrap_runtime_snapshot_sha256"]
+        ),
+        bootstrap_sales_watermark_date=_optional_date(
+            row["bootstrap_sales_watermark_date"]
+        ),
         bootstrap_idempotency_key=_optional_text(row["bootstrap_idempotency_key"]),
         bootstrap_completed_at=_optional_datetime(row["bootstrap_completed_at"]),
         bootstrap_completed_by=_optional_text(row["bootstrap_completed_by"]),

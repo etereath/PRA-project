@@ -48,6 +48,10 @@ from app.repositories.workbook_repository import (
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.mock_platform_repository import MockPlatformRepository
 from app.services.runtime import ReviewTaskService, ReviewTokenService, RuntimeTaskService
+from app.services.authoritative_inventory import (
+    InventoryApplicationService,
+    sqlite_logical_snapshot_sha256,
+)
 from app.services.shadowbot_executor import FileDropShadowBotTaskRunner
 from app.web import (
     DISPLAY_TIMEZONE,
@@ -1455,7 +1459,11 @@ class WebTests(unittest.TestCase):
 
             with patch.dict(
                 "os.environ",
-                {"RUNTIME_ADMIN_USER": "admin", "RUNTIME_ADMIN_PASSWORD": "secret"},
+                {
+                    "RUNTIME_ADMIN_USER": "admin",
+                    "RUNTIME_ADMIN_PASSWORD": "secret",
+                    "PRA_RUNTIME_DB": str(db_path),
+                },
                 clear=False,
             ):
                 cookie = self._runtime_login(db_path)
@@ -1512,6 +1520,84 @@ class WebTests(unittest.TestCase):
             self.assertEqual(products[0].current_stock, 9)
             self.assertEqual(products[0].base_cost, 12)
             self.assertFalse(products[0].sale_enabled)
+
+    def test_business_inputs_inventory_guard_uses_canonical_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            canonical_db = root / "canonical.sqlite3"
+            session_db = root / "session.sqlite3"
+            products_path = root / "products.xlsx"
+            for db_path in (canonical_db, session_db):
+                RuntimeTaskService(SQLiteRuntimeRepository(db_path)).init_schema()
+            save_table_records(
+                "products",
+                products_path,
+                [
+                    {
+                        "internal_sku": "AISHA-B-60-Z",
+                        "product_name": "艾莎",
+                        "grade": "B",
+                        "stem_length": "60",
+                        "unit": "扎",
+                        "base_cost": "10",
+                        "current_stock": "5",
+                        "sale_enabled": "True",
+                        "last_price": "",
+                        "recommended_price": "",
+                        "remark": "",
+                        "feature_season": "",
+                        "feature_color": "",
+                    }
+                ],
+            )
+            canonical = SQLiteRuntimeRepository(canonical_db)
+            InventoryApplicationService(canonical).bootstrap(
+                load_products(products_path),
+                snapshot_sha256="sha256:" + "a" * 64,
+                runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(canonical),
+                idempotency_key="bootstrap:canonical-web-guard",
+                actor="admin",
+                freeze_validator=lambda: True,
+            )
+
+            with patch.dict(
+                "os.environ",
+                {
+                    "RUNTIME_ADMIN_USER": "admin",
+                    "RUNTIME_ADMIN_PASSWORD": "secret",
+                    "PRA_RUNTIME_DB": str(canonical_db),
+                },
+                clear=False,
+            ):
+                cookie = self._runtime_login(session_db)
+                status, _, body = self._call_app(
+                    path="/business-inputs",
+                    method="POST",
+                    query=urlencode(
+                        {
+                            "runtime_db": str(session_db),
+                            "products_path": str(products_path),
+                        }
+                    ),
+                    body=urlencode(
+                        {
+                            "products_path": str(products_path),
+                            "action": "add_inventory",
+                            "product_name": "艾莎",
+                            "grade": "B",
+                            "stem_length": "60",
+                            "unit": "扎",
+                            "base_cost": "10",
+                            "quantity": "4",
+                            "sale_enabled": "true",
+                        }
+                    ),
+                    cookie=cookie,
+                )
+
+            self.assertEqual(status, "200 OK")
+            self.assertIn("数据库库存已成为唯一权威", body)
+            self.assertEqual(load_products(products_path)[0].current_stock, 5)
 
     def test_business_inputs_adds_price_rule_to_workbook(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

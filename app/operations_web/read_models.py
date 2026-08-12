@@ -117,6 +117,7 @@ class ManagementReadModel:
         default_factory=tuple
     )
     inventory_receipt: tuple[str, str, str, str] | None = None
+    inventory_error: StateReadModel | None = None
     inventory_idempotency_key: str = ""
 
 

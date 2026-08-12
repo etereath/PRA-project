@@ -2549,9 +2549,7 @@ def _handle_business_inputs_page(method: str, environ) -> str | tuple[str, str, 
                 result = apply_inventory_input(
                     rows,
                     form,
-                    inventory_authoritative=_inventory_db_is_authoritative(
-                        Path(runtime_db)
-                    ),
+                    inventory_authoritative=_inventory_db_is_authoritative(),
                 )
                 persist_product_rows(path, result.rows)
             elif action == "edit_product":
@@ -2562,9 +2560,7 @@ def _handle_business_inputs_page(method: str, environ) -> str | tuple[str, str, 
                 result = apply_product_edit(
                     rows,
                     form,
-                    inventory_authoritative=_inventory_db_is_authoritative(
-                        Path(runtime_db)
-                    ),
+                    inventory_authoritative=_inventory_db_is_authoritative(),
                 )
                 persist_product_rows(path, result.rows)
             elif action == "add_price_rule":
@@ -8333,7 +8329,10 @@ def _get_runtime_session_user(environ) -> str | None:
     return str(user) if user else None
 
 
-def _inventory_db_is_authoritative(runtime_db: Path) -> bool:
+def _inventory_db_is_authoritative() -> bool:
+    """Fence workbook stock writes against the fixed canonical Runtime DB."""
+
+    runtime_db = _trusted_default_runtime_db()
     try:
         return (
             InventoryRepository(
@@ -8374,7 +8373,8 @@ def _runtime_db_for_request(environ) -> str:
 
 
 def _trusted_default_runtime_db() -> Path:
-    configured = Path(DEFAULT_RUNTIME_DB)
+    configured_value = os.getenv("PRA_RUNTIME_DB", "").strip()
+    configured = Path(configured_value) if configured_value else Path(DEFAULT_RUNTIME_DB)
     if configured.is_absolute():
         return configured.resolve(strict=False)
     return (ROOT / configured).resolve(strict=False)

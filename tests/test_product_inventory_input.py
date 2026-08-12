@@ -6,10 +6,17 @@ from pathlib import Path
 
 from app.exceptions import ValidationError
 from app.repositories.workbook_repository import load_products, save_table_records
+from app.repositories.inventory_repository import InventoryRepository
+from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.services.authoritative_inventory import (
+    InventoryApplicationService,
+    sqlite_logical_snapshot_sha256,
+)
 from app.services.product_inventory_input import (
     ProductInventoryInputError,
     apply_inventory_input,
     apply_product_edit,
+    create_authoritative_product_with_inbound,
     load_product_input_rows,
     persist_product_rows,
     validate_inventory_form,
@@ -236,6 +243,62 @@ class ProductInventoryInputTests(unittest.TestCase):
                 inventory_authoritative=True,
             )
         self.assertIn("不能修改", str(context.exception))
+
+    def test_db_authority_new_product_metadata_zero_then_inbound_db_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "products.xlsx"
+            _save_products(path, [_product_row("AISHA-A-65-Z", grade="A", stock=5)])
+            repository = SQLiteRuntimeRepository(Path(temp_dir) / "runtime.sqlite3")
+            repository.init_schema()
+            products = load_products(path)
+            InventoryApplicationService(repository).bootstrap(
+                products,
+                snapshot_sha256="sha256:" + "a" * 64,
+                runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
+                idempotency_key="bootstrap:new-product-flow",
+                actor="admin",
+                freeze_validator=lambda: True,
+            )
+            form = validate_inventory_form(
+                {
+                    "product_name": "新品种",
+                    "variety_code": "NEWROSE",
+                    "grade": "B",
+                    "stem_length": "跟随等级",
+                    "unit": "扎",
+                    "base_cost": "8.5",
+                    "quantity": "20",
+                    "sale_enabled": "是",
+                }
+            )
+
+            result = create_authoritative_product_with_inbound(
+                path,
+                repository,
+                form,
+                actor="operator",
+                idempotency_key="new-product:1",
+            )
+            replay = create_authoritative_product_with_inbound(
+                path,
+                repository,
+                form,
+                actor="operator",
+                idempotency_key="new-product:1",
+            )
+
+            stored = {
+                item.internal_sku: item for item in load_products(path)
+            }
+            self.assertEqual(stored[result.internal_sku].current_stock, 0)
+            self.assertEqual(
+                InventoryRepository(repository)
+                .get_balance(result.internal_sku)
+                .current_qty,
+                20,
+            )
+            self.assertEqual(replay.initialization.status, "REPLAYED")
+            self.assertEqual(replay.inbound.status, "REPLAYED")
 
 
 if __name__ == "__main__":

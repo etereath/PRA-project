@@ -125,14 +125,19 @@ class InventoryAlertService:
         notification = self._enqueue(
             notification_type="inventory_low",
             incident_id=result.incident.incident_id,
-            event_key=event_key,
+            event_key=_notification_window_key(
+                result.incident.incident_id,
+                result.incident.first_detected_at,
+                transaction.recorded_at,
+                policy.repeat_interval_minutes,
+            ),
             message=(
                 f"库存偏低：{transaction.internal_sku} 当前 "
                 f"{transaction.inventory_after} 扎，阈值 {policy.threshold_qty} 扎。"
             ),
         )
         return InventoryAlertResult(
-            "REPEATED" if active is not None else "DETECTED",
+            "REPEATED" if result.incident.occurrence_count > 1 else "DETECTED",
             transaction.internal_sku,
             transaction.inventory_after,
             policy.threshold_qty,
@@ -194,6 +199,21 @@ def _repeat_is_due(
     return current_aware - previous_aware >= timedelta(
         minutes=repeat_interval_minutes
     )
+
+
+def _notification_window_key(
+    incident_id: str,
+    first_detected_at: datetime,
+    current: datetime,
+    repeat_interval_minutes: int,
+) -> str:
+    elapsed = max(
+        _as_aware(current) - _as_aware(first_detected_at),
+        timedelta(0),
+    )
+    interval_seconds = repeat_interval_minutes * 60
+    window = int(elapsed.total_seconds() // interval_seconds)
+    return f"inventory-alert-notification:{incident_id}:{window}"
 
 
 def _as_aware(value: datetime) -> datetime:

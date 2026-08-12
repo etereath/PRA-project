@@ -402,9 +402,16 @@ SKU 立即失败。一次性 bootstrap、零余额新 SKU 初始化、人工有�
 覆盖真实库存。库存阈值继续复用现有 `INVENTORY_ANOMALY` Incident 与 Outbox，默认关闭，
 且不会创建下架或改价任务。
 
+PR #34 首轮评审的四项 P1 与三项 P2 已统一整改：bootstrap 现在固定 canonical 路径，使用
+工作簿独占锁、包含 WAL 的 SQLite 逻辑快照、`BEGIN IMMEDIATE` 写 fence 和提交前回读；
+余额/流水/销售基准三表必须同时为空。切换瞬间已有 eligible SKU 销量原子成为水位，历史
+回补只同步基准，订单替换估算和后续新增销售只应用净差。新增商品已形成“工作簿库存 0
+元数据 → 经商品主数据验证的零余额 → 独立入库”正式链。人工来源方向、并发首次库存提醒
+去重、新 Web 失败 PRG 和旧 Web canonical authority 门禁也已收紧。
+
 本分支只提供受控 cutover 脚本和合成测试，没有迁移或 bootstrap 真实 Runtime DB，没有
 修改真实商品工作簿、Queue、Worker 或平台。真实库仍有 7C 记录的既有外键违规；7D 不推断
-来源也不授权修复。真实切换必须先另走 Schema 维护、备份、工作簿/数据库 Hash、逐 SKU 与
+来源也不授权修复。真实切换必须先另走 Schema 维护、备份、工作簿 Hash/Runtime 逻辑快照、逐 SKU 与
 总量回读及用户明确授权。代码回滚只适用于尚无切换后流水的环境；已有流水必须前向修复，
 不得让过期工作簿重新成为库存权威。详细见
 [13.5-7D 实施报告](reports/task13_5_7d_authoritative_inventory.md)。

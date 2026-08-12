@@ -2,7 +2,7 @@
 
 本文档是当前项目文档入口。项目说明文本以中文为主，英文键名和代码标识保持原样。
 
-运行态业务数据以 SQLite 为中心，当前代码结构版本为 v17。v9 使用“平台 + 品种 + 等级”作为 `listing_status` 业务身份，v10 将任务旧价结构化，v11 增加单次请求的 ShadowBot 多商品 COMMIT 批次账本，v12 增加逐商品操作/尝试身份、活动写锁、观察时间和技术回执，v13 增加公共批次注册表、通用上下架 operation、两页快照、页面异常和 v5 动作账本；v14 增加双时间轴、Automation 账本、不可变观察、销售日结、Incident 和任务来源字段；v15 增加 Incident 出现次数与 append-only 事件流水；v16 增加版本化极简紧急下架策略；v17 增加真实库存权威状态、余额、不可变流水、销售基准和预警策略。真实 Runtime DB 需按独立维护、备份和回读门禁另行升级并执行库存 bootstrap；代码合并不等于真实库已经切换。Excel 继续承担商品和规则等主数据输入，但 cutover 后 `products.xlsx.current_stock` 只保留为历史快照，不再是业务库存权威。
+运行态业务数据以 SQLite 为中心，当前代码结构版本为 v17。v9 使用“平台 + 品种 + 等级”作为 `listing_status` 业务身份，v10 将任务旧价结构化，v11 增加单次请求的 ShadowBot 多商品 COMMIT 批次账本，v12 增加逐商品操作/尝试身份、活动写锁、观察时间和技术回执，v13 增加公共批次注册表、通用上下架 operation、两页快照、页面异常和 v5 动作账本；v14 增加双时间轴、Automation 账本、不可变观察、销售日结、Incident 和任务来源字段；v15 增加 Incident 出现次数与 append-only 事件流水；v16 增加版本化极简紧急下架策略；v17 增加真实库存权威状态、余额、不可变流水、切换销售水位和预警策略。真实 Runtime DB 需按独立维护、canonical 路径、工作簿独占锁、完整 SQLite 逻辑快照、备份和提交前回读门禁另行升级并执行库存 bootstrap；代码合并不等于真实库已经切换。Excel 继续承担商品和规则等主数据输入，但 cutover 后 `products.xlsx.current_stock` 只保留为历史快照，不再是业务库存权威。
 
 项目长期控制面固定为：人工运营走 Web，定时业务走 Automation，未来智能调用走 Agent
 Gateway，平台执行走 Queue/Worker/Importer，开发测试与恢复走 CLI。Agent 只能通过

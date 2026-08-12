@@ -669,6 +669,8 @@ V17_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
         "authority_key",
         "authority_mode",
         "bootstrap_snapshot_sha256",
+        "bootstrap_runtime_snapshot_sha256",
+        "bootstrap_sales_watermark_date",
         "bootstrap_idempotency_key",
         "bootstrap_completed_at",
         "bootstrap_completed_by",

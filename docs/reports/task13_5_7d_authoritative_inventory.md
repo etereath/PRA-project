@@ -40,19 +40,26 @@ v17 新增：
 库存流水由触发器禁止 UPDATE/DELETE，并约束 `after = before + delta`、after 非负和幂等键
 唯一。Schema 初始化只建立 `PRE_CUTOVER`，不会读取工作簿或自动切换权威。
 
-`scripts/bootstrap_authoritative_inventory.py` 默认只读预览；`--apply` 同时要求工作簿与
-Runtime DB 的预期 SHA-256、备份目录和 actor。脚本使用 SQLite Backup API、完整性检查、
-逐 SKU/总量/工作簿 Hash 回读后才报告成功。服务端精确重放会比较原始 BOOTSTRAP 流水、
-SKU 数量和请求 Hash；同键异内容拒绝。
+`scripts/bootstrap_authoritative_inventory.py` 默认只读预览；`--apply` 只接受环境配置的
+canonical 工作簿与 Runtime DB，同时要求工作簿 SHA-256、完整 SQLite 逻辑快照 SHA-256、
+备份目录和 actor。脚本在工作簿独占锁内使用 SQLite Backup API；服务在
+`BEGIN IMMEDIATE` 后重验包含 WAL 内容的逻辑快照，确认余额/流水/销售基准三表同时为空，
+并在提交前完成逐 SKU、总量、流水、销售水位和工作簿冻结回读。任一失败保持
+`PRE_CUTOVER`。服务端精确重放会比较原始 BOOTSTRAP 流水、SKU 数量和请求 Hash；同键异
+内容拒绝。
 
-新增商品使用 `SKU_INITIALIZATION` 零变化流水建立零 DB 余额，再通过独立“新花入库”流水
-增加库存。DB 已成为权威后，缺余额不回退 Excel。
+bootstrap 同事务为切换瞬间已有 eligible SKU 销量建立基准并保存 PRA 交易日水位，避免
+工作簿快照已反映的销量再次扣减；水位以前的历史回补只写 `SALES_BASELINE_SYNC`，不改变
+当前余额或余额版本。新增商品正式链先保存工作簿库存 0 的元数据，验证商品确实存在，再用
+`SKU_INITIALIZATION` 建立零 DB 余额并通过独立“新花入库”流水增加库存。孤儿 SKU 拒绝；
+DB 已成为权威后，缺余额不回退 Excel。
 
 ## 4. 人工调整、销售净差与预警
 
 新 Web `/management` 使用认证主体、CSRF、并发版本和一次性幂等键提交有符号调整值。
 before/after 由服务端计算；来源限于新花入库、人工盘点、损耗和对账修正；零值、负余额、
 过期版本、同键异内容和非权威状态均拒绝。数据库“库存调整流水”只读回看不可变记录。
+新花入库只接受正数，损耗只接受负数；人工盘点和对账修正允许双向。
 
 销售库存统一使用：
 
@@ -66,7 +73,8 @@ OPEN/部分订单和不可用事实零写。完整订单替换估算和取消均
 `cancelled_qty`。日期、平台、SKU、映射版本和支撑输入继续由既有选择服务验证。
 
 库存阈值默认关闭；启用后首次越界、到期重复和恢复复用 Incident/Outbox。它不产生改价、
-下架或任何平台写任务。预警发送失败不回滚已经提交的库存事实，但会在结果中明确报告。
+下架或任何平台写任务。并发首次越界使用同一 Incident 时间窗通知键去重，不会生成两条
+首次 Outbox。预警发送失败不回滚已经提交的库存事实，但会在结果中明确报告。
 
 ## 5. 消费者与 Web
 
@@ -77,27 +85,31 @@ OPEN/部分订单和不可用事实零写。完整订单替换估算和取消均
 - 今日页、商品详情、数据库商品/库存流水和业务管理人工调整回读 DB；
 - 平台价格表单独展示“平台可购上限”，不把它命名为真实库存；
 - 旧 Web 在 `DB_AUTHORITY` 后拒绝工作簿补库存和库存字段修改。
+- 旧 Web 的拒绝门禁固定读取 canonical Runtime，不再信任 request/session Runtime；
+- 新 Web 库存失败路径也使用 PRG 和 allowlist 错误码，URL 不包含异常正文或用户输入。
 
 7D 不实现 7E 的任务创建、真实平台执行授权、Review POST 或 Automation 配置。
 
 ## 6. 测试与回滚
 
-已覆盖 v17 新库/升级/健康检查/append-only、bootstrap 重放与冲突、新 SKU 零余额、人工
-正负调整、版本冲突、负库存、来源 allowlist、完整订单扣减、取消恢复、估算替换、估算
-回落、中低质量/不可用/跨日零写、数据库失败整体回滚、阈值边界/重复/恢复、Web CSRF/PRG
-和切换后 Excel 零写。
+已覆盖 v17 新库/升级/健康检查/append-only、bootstrap 重放、三表非空、freeze/逻辑快照
+冲突、当前日已有销量水位、历史订单回补零余额影响、订单替换估算、新 SKU 元数据→零余额
+→入库与孤儿拒绝、人工正负调整、来源方向、版本冲突、负库存、完整订单扣减、取消恢复、
+估算回落、中低质量/不可用/跨日零写、数据库失败整体回滚、阈值并发首次越界/重复/恢复、
+Web CSRF/成功与失败 PRG、canonical 旧 Web 门禁和切换后 Excel 零写。
 
 本地验收结果：
 
-- 7D 库存、结算、Web 与直接依赖专项：`89 passed`；
-- 完整 pytest：`1210 passed, 3 skipped, 97 subtests passed`；
+- 7D 库存、结算、Web、维护脚本与直接依赖专项：`97 passed, 6 subtests passed`；
+- 完整 pytest：`1227 passed, 3 skipped, 97 subtests passed`；
 - 隔离系统冒烟：`16 passed, 0 failed`，确认 Schema exact v17；
 - wheel/sdist 构建：成功；严格包边界、secret scan、wheel 隔离安装、Windows fixture：通过；
 - 静态编译与 `git diff --check`：通过。
 
 长 worktree 路径下首轮完整测试有 4 个既有 ShadowBot 队列用例因 Windows 路径长度创建
-临时文件失败；同一用例在短工作目录原样复跑 `4 passed`，随后把相同 worktree 临时映射为
-短盘符完成整套全绿回归，映射已解除。未修改队列代码来规避环境证据。
+临时文件失败；另有一个旧 Web 用例因未声明 canonical 临时 Runtime 而正确触发新门禁，已
+补齐测试隔离。随后把相同 worktree 临时映射为短盘符完成整套全绿回归，映射已解除。未修改
+队列代码来规避环境证据。
 
 Windows/Linux CI 结论以 Draft PR 检查为准。
 

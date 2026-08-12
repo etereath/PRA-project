@@ -2067,6 +2067,8 @@ SCHEMA_V17_SQL = [
             authority_mode IN ('PRE_CUTOVER', 'DB_AUTHORITY')
         ),
         bootstrap_snapshot_sha256 TEXT,
+        bootstrap_runtime_snapshot_sha256 TEXT,
+        bootstrap_sales_watermark_date TEXT,
         bootstrap_idempotency_key TEXT,
         bootstrap_completed_at TEXT,
         bootstrap_completed_by TEXT,
@@ -2077,6 +2079,8 @@ SCHEMA_V17_SQL = [
             (
                 authority_mode = 'PRE_CUTOVER'
                 AND bootstrap_snapshot_sha256 IS NULL
+                AND bootstrap_runtime_snapshot_sha256 IS NULL
+                AND bootstrap_sales_watermark_date IS NULL
                 AND bootstrap_idempotency_key IS NULL
                 AND bootstrap_completed_at IS NULL
                 AND bootstrap_completed_by IS NULL
@@ -2084,6 +2088,8 @@ SCHEMA_V17_SQL = [
             OR (
                 authority_mode = 'DB_AUTHORITY'
                 AND bootstrap_snapshot_sha256 IS NOT NULL
+                AND bootstrap_runtime_snapshot_sha256 IS NOT NULL
+                AND bootstrap_sales_watermark_date IS NOT NULL
                 AND bootstrap_idempotency_key IS NOT NULL
                 AND bootstrap_completed_at IS NOT NULL
                 AND bootstrap_completed_by IS NOT NULL
@@ -2112,7 +2118,8 @@ SCHEMA_V17_SQL = [
         transaction_type TEXT NOT NULL CHECK (transaction_type IN (
             'BOOTSTRAP', 'SKU_INITIALIZATION',
             'MANUAL_INBOUND', 'MANUAL_ADJUSTMENT',
-            'SALES_DEDUCTION', 'SALES_RESTORE', 'RECONCILIATION'
+            'SALES_DEDUCTION', 'SALES_RESTORE',
+            'SALES_BASELINE_SYNC', 'RECONCILIATION'
         )),
         source_type TEXT NOT NULL CHECK (trim(source_type) <> ''),
         source_ref_id TEXT NOT NULL CHECK (trim(source_ref_id) <> ''),
@@ -3504,12 +3511,14 @@ class SQLiteRuntimeRepository:
                     INSERT INTO inventory_authority_state(
                         authority_key, authority_mode,
                         bootstrap_snapshot_sha256,
+                        bootstrap_runtime_snapshot_sha256,
+                        bootstrap_sales_watermark_date,
                         bootstrap_idempotency_key,
                         bootstrap_completed_at, bootstrap_completed_by,
                         version, created_at, updated_at
                     )
                     SELECT 'REAL_INVENTORY', 'PRE_CUTOVER',
-                           NULL, NULL, NULL, NULL,
+                           NULL, NULL, NULL, NULL, NULL, NULL,
                            0, ?, ?
                     WHERE NOT EXISTS (
                         SELECT 1

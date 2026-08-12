@@ -143,11 +143,16 @@ def render_management(model: ManagementReadModel, *, csrf_token: str) -> str:
             '<div class="state-banner state-ready"><strong>库存调整已记录</strong>'
             f'<p>{html(sku)}：{html(before)} {html(delta)} → {html(after)}</p></div>'
         )
+    inventory_error = (
+        render_state(model.inventory_error)
+        if model.inventory_error is not None
+        else ""
+    )
     return f"""
     <section class="hero compact-hero">
       <div><p class="eyebrow">业务管理</p><h1>当前业务状态</h1><p>当前版本只读展示正式任务、人工复核和自动化运行；创建、授权与处置入口将在后续上线。</p></div>
     </section>
-    <section class="panel"><header class="panel-header"><div><h2>人工库存调整</h2><p>只输入有符号调整值；平台库存不会覆盖真实库存</p></div></header><div class="form-shell">{render_state(model.inventory_state)}{receipt}{inventory_form}</div></section>
+    <section class="panel"><header class="panel-header"><div><h2>人工库存调整</h2><p>只输入有符号调整值；平台库存不会覆盖真实库存</p></div></header><div class="form-shell">{render_state(model.inventory_state)}{inventory_error}{receipt}{inventory_form}</div></section>
     <section class="panel"><header class="panel-header"><div><h2>当前任务</h2><p>创建任务不等于真实平台执行授权</p></div></header>{render_table(model.pending_tasks)}</section>
     <section class="panel"><header class="panel-header"><div><h2>人工复核</h2><p>只显示正式复核事实</p></div></header>{render_table(model.pending_reviews)}</section>
     <section class="panel"><header class="panel-header"><div><h2>自动化运行</h2><p>后台生命周期独立于 Web</p></div></header>{render_table(model.automation_runs)}</section>

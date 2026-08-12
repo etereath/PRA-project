@@ -30,6 +30,7 @@ from app.services.sales_estimate import (
 from app.services.authoritative_inventory import (
     InventoryApplicationService,
     InventorySalesApplicationService,
+    sqlite_logical_snapshot_sha256,
 )
 from app.services.operational_time import (
     DEFAULT_OPERATIONAL_TIME_POLICY_VERSION,
@@ -67,6 +68,7 @@ def _insert_order_snapshot(
     source_batch_status: str = "ACCEPTED",
     scope_complete: bool = True,
     end_marker_verified: bool = True,
+    platform_trade_date: date = TRADE_DATE,
 ) -> None:
     job_id = f"job-{batch_id}"
     run_id = f"run-{batch_id}"
@@ -109,8 +111,8 @@ def _insert_order_snapshot(
                 job_id,
                 f"logical-{batch_id}",
                 PLATFORM,
-                TRADE_DATE.isoformat(),
-                TRADE_DATE.isoformat(),
+                platform_trade_date.isoformat(),
+                platform_trade_date.isoformat(),
                 DEFAULT_OPERATIONAL_TIME_POLICY_VERSION,
                 now,
                 now,
@@ -134,7 +136,7 @@ def _insert_order_snapshot(
                 batch_id,
                 run_id,
                 PLATFORM,
-                TRADE_DATE.isoformat(),
+                platform_trade_date.isoformat(),
                 trade_day_status,
                 stored_batch_status,
                 (completed_at - timedelta(minutes=1)).isoformat(),
@@ -174,7 +176,7 @@ def _insert_order_snapshot(
                     f"item-{batch_id}-{occurrence_no}",
                     batch_id,
                     PLATFORM,
-                    TRADE_DATE.isoformat(),
+                    platform_trade_date.isoformat(),
                     trade_day_status,
                     fingerprint,
                     occurrence_no,
@@ -184,7 +186,7 @@ def _insert_order_snapshot(
                     qty,
                     amount,
                     now,
-                    TRADE_DATE.isoformat(),
+                    platform_trade_date.isoformat(),
                     hashlib_for(f"raw-{batch_id}-{occurrence_no}"),
                 ),
             )
@@ -821,21 +823,145 @@ def _bootstrap_inventory(runtime: SQLiteRuntimeRepository) -> None:
             )
         ],
         snapshot_sha256="sha256:" + "f" * 64,
+        runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(runtime),
         idempotency_key="bootstrap:trade-day-settlement",
         actor="test",
+        freeze_validator=lambda: True,
     )
 
 
-def _create_sku_provisional(service: TradeDaySettlementService):
+def _create_sku_provisional(
+    service: TradeDaySettlementService,
+    *,
+    platform_trade_date: date = TRADE_DATE,
+):
     return service.create_provisional(
         platform_name=PLATFORM,
-        platform_trade_date=TRADE_DATE,
+        platform_trade_date=platform_trade_date,
         seller_operation_date=date(2026, 8, 1),
         seller_phase=SellerPhase.NORMAL_SALES,
         time_policy_version=DEFAULT_OPERATIONAL_TIME_POLICY_VERSION,
         scope_type="SKU",
         scope_key="SKU-1",
         changed_by="test",
+    )
+
+
+def test_cutover_seeds_current_sales_watermark_and_only_applies_new_delta(
+    settlement,
+) -> None:
+    service, _, runtime = settlement
+    _insert_order_snapshot(
+        runtime,
+        "inventory-cutover-order-1",
+        completed_at=BASE + timedelta(hours=1),
+        rows=(("fingerprint-a", 3, "36", "SKU-1", "VERIFIED"),),
+    )
+    _create_sku_provisional(service)
+
+    _bootstrap_inventory(runtime)
+    inventory = InventoryRepository(runtime)
+    state = inventory.get_authority_state()
+    baseline = inventory.get_sales_baseline(
+        platform_name=PLATFORM,
+        platform_trade_date=TRADE_DATE,
+        internal_sku="SKU-1",
+    )
+    assert state.bootstrap_sales_watermark_date == TRADE_DATE
+    assert baseline is not None and baseline.selected_sold_qty == 3
+    assert inventory.get_balance("SKU-1").current_qty == 100
+    assert inventory.get_balance("SKU-1").version == 1
+
+    no_change = InventorySalesApplicationService(
+        runtime,
+        clock=lambda: BASE,
+    ).apply_current_sku_summaries(
+        platform_name=PLATFORM,
+        platform_trade_date=TRADE_DATE,
+    )
+    assert no_change.applied_sku_count == 0
+    assert inventory.get_balance("SKU-1").current_qty == 100
+
+    _insert_order_snapshot(
+        runtime,
+        "inventory-cutover-order-2",
+        completed_at=BASE + timedelta(hours=2),
+        rows=(("fingerprint-a", 5, "60", "SKU-1", "VERIFIED"),),
+    )
+    _create_sku_provisional(service)
+    applied = InventorySalesApplicationService(
+        runtime,
+        clock=lambda: BASE,
+    ).apply_current_sku_summaries(
+        platform_name=PLATFORM,
+        platform_trade_date=TRADE_DATE,
+    )
+    assert applied.applied_sku_count == 1
+    assert inventory.get_balance("SKU-1").current_qty == 98
+
+
+def test_cutover_order_replaces_seeded_estimate_by_net_difference(
+    settlement,
+) -> None:
+    service, repository, runtime = settlement
+    _append_complete_estimate_day(repository, sold_qty=5)
+    _create_sku_provisional(service)
+    _bootstrap_inventory(runtime)
+
+    _insert_order_snapshot(
+        runtime,
+        "inventory-cutover-order-replacement",
+        completed_at=BASE + timedelta(hours=3),
+        rows=(("fingerprint-a", 3, "36", "SKU-1", "VERIFIED"),),
+    )
+    _create_sku_provisional(service)
+    result = InventorySalesApplicationService(
+        runtime,
+        clock=lambda: BASE,
+    ).apply_current_sku_summaries(
+        platform_name=PLATFORM,
+        platform_trade_date=TRADE_DATE,
+    )
+
+    assert result.applied_sku_count == 1
+    assert InventoryRepository(runtime).get_balance("SKU-1").current_qty == 102
+
+
+def test_historical_order_backfill_after_cutover_updates_baseline_only(
+    settlement,
+) -> None:
+    service, _, runtime = settlement
+    _bootstrap_inventory(runtime)
+    historical_date = TRADE_DATE - timedelta(days=1)
+    _insert_order_snapshot(
+        runtime,
+        "inventory-historical-backfill",
+        completed_at=BASE + timedelta(hours=1),
+        rows=(("fingerprint-a", 4, "48", "SKU-1", "VERIFIED"),),
+        platform_trade_date=historical_date,
+    )
+    _create_sku_provisional(service, platform_trade_date=historical_date)
+
+    result = InventorySalesApplicationService(
+        runtime,
+        clock=lambda: BASE,
+    ).apply_current_sku_summaries(
+        platform_name=PLATFORM,
+        platform_trade_date=historical_date,
+    )
+    inventory = InventoryRepository(runtime)
+    baseline = inventory.get_sales_baseline(
+        platform_name=PLATFORM,
+        platform_trade_date=historical_date,
+        internal_sku="SKU-1",
+    )
+
+    assert result.applied_sku_count == 1
+    assert inventory.get_balance("SKU-1").current_qty == 100
+    assert inventory.get_balance("SKU-1").version == 1
+    assert baseline is not None and baseline.selected_sold_qty == 4
+    assert inventory.list_transactions(internal_sku="SKU-1")[0].transaction_type == (
+        "SALES_BASELINE_SYNC"
     )
 
 

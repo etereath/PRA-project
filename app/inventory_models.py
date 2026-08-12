@@ -8,6 +8,8 @@ from datetime import date, datetime
 class InventoryAuthorityState:
     authority_mode: str
     bootstrap_snapshot_sha256: str | None
+    bootstrap_runtime_snapshot_sha256: str | None
+    bootstrap_sales_watermark_date: date | None
     bootstrap_idempotency_key: str | None
     bootstrap_completed_at: datetime | None
     bootstrap_completed_by: str | None
@@ -91,6 +93,7 @@ class InventoryBootstrapResult:
     status: str
     authority_state: InventoryAuthorityState
     balance_count: int
+    sales_baseline_count: int
     transaction_ids: tuple[str, ...]
 
 

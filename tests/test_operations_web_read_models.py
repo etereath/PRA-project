@@ -40,7 +40,10 @@ from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import PRODUCT_HEADERS
 from app.repositories.workbook_repository import load_products
 from app.repositories.inventory_repository import InventoryRepository
-from app.services.authoritative_inventory import InventoryApplicationService
+from app.services.authoritative_inventory import (
+    InventoryApplicationService,
+    sqlite_logical_snapshot_sha256,
+)
 from app.services.runtime import ReviewTokenService
 from app.services.operational_time import OperationalTimePolicy
 
@@ -686,8 +689,10 @@ def test_management_inventory_adjustment_is_csrf_fenced_prg_and_db_only(
     InventoryApplicationService(repository, clock=lambda: FIXED_NOW).bootstrap(
         products,
         snapshot_sha256="sha256:" + "a" * 64,
+        runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
         idempotency_key="bootstrap:web-inventory",
         actor="admin",
+        freeze_validator=lambda: True,
     )
     cookie = _login(app, container)
     session = container.sessions.get(cookie)
@@ -756,6 +761,39 @@ def test_management_inventory_adjustment_is_csrf_fenced_prg_and_db_only(
     assert status == "200 OK"
     assert "新花入库" in body
     assert "+8 扎" in body
+
+    invalid_form = {
+        "csrf_token": session.csrf_token,
+        "idempotency_key": "web-inventory:invalid-sign",
+        "internal_sku": "AISHA-A-50-Z",
+        "inventory_delta": "-1",
+        "expected_version": "2",
+        "source_type": "NEW_FLOWER_INBOUND",
+        "reason": "不应进入 URL 的原始输入",
+    }
+    status, headers, response_body = _call_app(
+        app,
+        path="/management/inventory-adjustments",
+        method="POST",
+        cookie=cookie,
+        form=invalid_form,
+    )
+    assert status == "303 See Other"
+    assert response_body == ""
+    error_location = _header(headers, "Location")
+    assert error_location == "/management?inventory_error=INVALID_ADJUSTMENT"
+    assert "原始输入" not in error_location
+    assert InventoryRepository(repository).get_balance("AISHA-A-50-Z").current_qty == 80
+
+    status, _, body = _call_app(
+        app,
+        path="/management",
+        query=error_location.split("?", 1)[1],
+        cookie=cookie,
+    )
+    assert status == "200 OK"
+    assert "库存调整未完成" in body
+    assert "调整值、来源或调整后库存不符合要求" in body
 
 
 def _write_products(path: Path) -> None:

@@ -22,6 +22,7 @@ from app.repositories.inventory_repository import InventoryRepository
 from app.repositories.operational_summary_repository import OperationalSummaryRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.trade_day_settlement import TradeDaySettlementService
+from app.services.operational_time import OperationalTimeService
 from app.utils import utc_now
 
 
@@ -45,6 +46,31 @@ MANUAL_INVENTORY_SOURCE_TYPES = frozenset(
         "RECONCILIATION_CORRECTION",
     }
 )
+
+
+def sqlite_logical_snapshot_sha256(
+    runtime_repository: SQLiteRuntimeRepository,
+    *,
+    connection=None,
+) -> str:
+    """Hash a complete logical SQLite snapshot, including committed WAL state."""
+
+    def _digest(active_connection) -> str:
+        digest = hashlib.sha256()
+        for statement in active_connection.iterdump():
+            digest.update(statement.encode("utf-8"))
+            digest.update(b"\n")
+        return "sha256:" + digest.hexdigest()
+
+    if connection is not None:
+        return _digest(connection)
+    with closing(runtime_repository.connect_read()) as read_connection:
+        try:
+            read_connection.execute("BEGIN")
+            return _digest(read_connection)
+        finally:
+            if read_connection.in_transaction:
+                read_connection.rollback()
 
 
 class InventoryProvider:
@@ -90,19 +116,25 @@ class InventoryApplicationService:
         *,
         clock: Callable[[], datetime] | None = None,
         alert_evaluator: Callable[[InventoryTransaction], object] | None = None,
+        product_exists: Callable[[str], bool] | None = None,
     ) -> None:
         self.runtime_repository = runtime_repository
         self.repository = InventoryRepository(runtime_repository)
         self.clock = clock or utc_now
         self.alert_evaluator = alert_evaluator
+        self.product_exists = product_exists
+        self.summaries = OperationalSummaryRepository(runtime_repository)
+        self.settlement = TradeDaySettlementService(self.summaries)
 
     def bootstrap(
         self,
         products: Iterable[Product],
         *,
         snapshot_sha256: str,
+        runtime_snapshot_sha256: str,
         idempotency_key: str,
         actor: str,
+        freeze_validator: Callable[[], bool] | None = None,
     ) -> InventoryBootstrapResult:
         normalized_products = tuple(sorted(products, key=lambda item: item.internal_sku))
         if not normalized_products:
@@ -112,6 +144,12 @@ class InventoryApplicationService:
         ):
             raise ValueError("库存切换商品编码不能重复")
         _require_prefixed_sha256(snapshot_sha256, "snapshot_sha256")
+        _require_prefixed_sha256(
+            runtime_snapshot_sha256,
+            "runtime_snapshot_sha256",
+        )
+        if freeze_validator is None:
+            raise ValueError("库存切换必须提供工作簿冻结校验器")
         key = _required_text(idempotency_key, "idempotency_key")
         normalized_actor = _required_text(actor, "actor")
         payload = {
@@ -121,9 +159,11 @@ class InventoryApplicationService:
                 for item in normalized_products
             ],
             "snapshot_sha256": snapshot_sha256,
+            "runtime_snapshot_sha256": runtime_snapshot_sha256,
         }
         request_sha256 = _sha256_payload(payload)
         now = self.clock()
+        watermark_date = OperationalTimeService().classify(now).platform_trade_date
         with closing(self.runtime_repository.connect_write()) as connection:
             try:
                 connection.execute("BEGIN IMMEDIATE")
@@ -154,9 +194,17 @@ class InventoryApplicationService:
                             str(row["request_sha256"])
                             for row in bootstrap_rows
                         }
+                        replay_request_sha256 = _sha256_payload(
+                            {
+                                **payload,
+                                "runtime_snapshot_sha256": (
+                                    state.bootstrap_runtime_snapshot_sha256
+                                ),
+                            }
+                        )
                         if (
                             stored_products != requested_products
-                            or stored_request_hashes != {request_sha256}
+                            or stored_request_hashes != {replay_request_sha256}
                         ):
                             raise InventoryConflictError(
                                 "库存权威切换重放内容与原始请求不一致"
@@ -166,20 +214,55 @@ class InventoryApplicationService:
                             status="REPLAYED",
                             authority_state=state,
                             balance_count=len(bootstrap_rows),
+                            sales_baseline_count=int(
+                                connection.execute(
+                                    "SELECT COUNT(*) FROM inventory_sales_baselines"
+                                ).fetchone()[0]
+                            ),
                             transaction_ids=tuple(
                                 str(row["transaction_id"])
                                 for row in bootstrap_rows
                             ),
                         )
                     raise InventoryConflictError("真实库存权威切换只能成功执行一次")
-                if self.repository.list_balances(connection=connection):
-                    raise InventoryConflictError("切换前库存余额表必须为空")
+                if (
+                    sqlite_logical_snapshot_sha256(
+                        self.runtime_repository,
+                        connection=connection,
+                    )
+                    != runtime_snapshot_sha256
+                ):
+                    raise InventoryConflictError(
+                        "Runtime DB 逻辑快照在切换前发生变化"
+                    )
+                if not freeze_validator():
+                    raise InventoryConflictError("商品工作簿冻结校验失败")
+                nonempty_tables = tuple(
+                    table_name
+                    for table_name in (
+                        "inventory_balances",
+                        "inventory_transactions",
+                        "inventory_sales_baselines",
+                    )
+                    if int(
+                        connection.execute(
+                            f"SELECT COUNT(*) FROM {table_name}"
+                        ).fetchone()[0]
+                    )
+                    > 0
+                )
+                if nonempty_tables:
+                    raise InventoryConflictError(
+                        "切换前库存三表必须同时为空：" + "、".join(nonempty_tables)
+                    )
                 transaction_ids: list[str] = []
-                for index, product in enumerate(normalized_products, start=1):
+                transaction_by_sku: dict[str, str] = {}
+                for product in normalized_products:
                     if product.current_stock < 0:
                         raise ValueError("初始库存不能为负数")
                     transaction_id = f"INV-BOOT-{uuid4().hex}"
                     transaction_ids.append(transaction_id)
+                    transaction_by_sku[product.internal_sku] = transaction_id
                     transaction_key = f"{key}:sku:{product.internal_sku}"
                     connection.execute(
                         """
@@ -226,11 +309,71 @@ class InventoryApplicationService:
                             _datetime_to_text(now),
                         ),
                     )
+                baseline_count = 0
+                known_skus = set(transaction_by_sku)
+                for summary in self.summaries.list_all_current_sku_summaries(
+                    connection=connection
+                ):
+                    selection = self.settlement.select_evidence(
+                        platform_name=summary.platform_name,
+                        platform_trade_date=summary.platform_trade_date,
+                        scope_type="SKU",
+                        scope_key=summary.scope_key,
+                        time_policy_version=summary.time_policy_version,
+                        connection=connection,
+                    ).selection
+                    if not _eligible_inventory_fact(summary, selection):
+                        continue
+                    if summary.scope_key not in known_skus:
+                        raise InventoryAuthorityError(
+                            f"切换水位中的商品 {summary.scope_key} 不在商品冻结快照"
+                        )
+                    _upsert_sales_baseline(
+                        connection,
+                        summary=summary,
+                        selection=selection,
+                        inventory_transaction_id=transaction_by_sku[
+                            summary.scope_key
+                        ],
+                        updated_at=now,
+                        existing_version=None,
+                    )
+                    baseline_count += 1
+                if not freeze_validator():
+                    raise InventoryConflictError("商品工作簿在切换事务内发生变化")
+                expected_balances = tuple(
+                    (item.internal_sku, int(item.current_stock))
+                    for item in normalized_products
+                )
+                actual_balances = tuple(
+                    (str(row[0]), int(row[1]))
+                    for row in connection.execute(
+                        "SELECT internal_sku, current_qty FROM inventory_balances "
+                        "ORDER BY internal_sku"
+                    ).fetchall()
+                )
+                if actual_balances != expected_balances:
+                    raise InventoryConflictError("库存切换事务内余额回读不一致")
+                if int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM inventory_transactions "
+                        "WHERE transaction_type = 'BOOTSTRAP'"
+                    ).fetchone()[0]
+                ) != len(normalized_products):
+                    raise InventoryConflictError("库存切换事务内流水回读不一致")
+                if int(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM inventory_sales_baselines"
+                    ).fetchone()[0]
+                ) != baseline_count:
+                    raise InventoryConflictError("库存切换事务内销售水位回读不一致")
                 updated = connection.execute(
                     """
                     UPDATE inventory_authority_state
                     SET authority_mode = 'DB_AUTHORITY',
                         bootstrap_snapshot_sha256 = ?,
+                        bootstrap_runtime_snapshot_sha256 = ?,
+                        bootstrap_sales_watermark_date = ?,
                         bootstrap_idempotency_key = ?,
                         bootstrap_completed_at = ?,
                         bootstrap_completed_by = ?,
@@ -242,6 +385,8 @@ class InventoryApplicationService:
                     """,
                     (
                         snapshot_sha256,
+                        runtime_snapshot_sha256,
+                        watermark_date.isoformat(),
                         key,
                         _datetime_to_text(now),
                         normalized_actor,
@@ -250,6 +395,14 @@ class InventoryApplicationService:
                 ).rowcount
                 if updated != 1:
                     raise InventoryConflictError("库存权威状态在切换时发生并发变化")
+                stored_state = self.repository.get_authority_state(connection=connection)
+                if (
+                    stored_state.authority_mode != "DB_AUTHORITY"
+                    or stored_state.bootstrap_runtime_snapshot_sha256
+                    != runtime_snapshot_sha256
+                    or stored_state.bootstrap_sales_watermark_date != watermark_date
+                ):
+                    raise InventoryConflictError("库存权威状态事务内回读不一致")
                 connection.commit()
             except Exception:
                 if connection.in_transaction:
@@ -259,6 +412,7 @@ class InventoryApplicationService:
             status="APPLIED",
             authority_state=self.repository.get_authority_state(),
             balance_count=len(normalized_products),
+            sales_baseline_count=baseline_count,
             transaction_ids=tuple(transaction_ids),
         )
 
@@ -290,6 +444,10 @@ class InventoryApplicationService:
                 state = self.repository.get_authority_state(connection=connection)
                 if state.authority_mode != "DB_AUTHORITY":
                     raise InventoryAuthorityError("库存尚未切换为数据库权威")
+                if self.product_exists is None or not self.product_exists(sku):
+                    raise InventoryAuthorityError(
+                        f"商品 {sku} 尚未保存到固定商品主数据"
+                    )
                 existing = self.repository.get_transaction_by_idempotency_key(
                     key,
                     connection=connection,
@@ -360,6 +518,10 @@ class InventoryApplicationService:
         normalized_source = _required_text(source_type, "source_type")
         if normalized_source not in MANUAL_INVENTORY_SOURCE_TYPES:
             raise ValueError("库存调整来源不在允许范围内")
+        if normalized_source == "NEW_FLOWER_INBOUND" and delta <= 0:
+            raise ValueError("新花入库的库存调整值必须大于 0")
+        if normalized_source == "LOSS_ADJUSTMENT" and delta >= 0:
+            raise ValueError("损耗修正的库存调整值必须小于 0")
         normalized_reason = _required_text(reason, "reason")
         normalized_actor = _required_text(actor, "actor")
         key = _required_text(idempotency_key, "idempotency_key")
@@ -499,26 +661,7 @@ class InventorySalesApplicationService:
                         time_policy_version=summary.time_policy_version,
                         connection=connection,
                     ).selection
-                    eligible = (
-                        summary.sold_qty is not None
-                        and selection.sold_qty == summary.sold_qty
-                        and selection.fact_source is summary.fact_source
-                        and selection.quality_level is summary.quality_level
-                        and selection.mapping_version == summary.mapping_version
-                        and (
-                            (
-                                summary.fact_source is FactSource.ORDER_OBSERVED
-                                and summary.quality_level
-                                is DataQualityLevel.ORDER_COMPLETE
-                            )
-                            or (
-                                summary.fact_source is FactSource.SCAN_ESTIMATED
-                                and summary.quality_level
-                                is DataQualityLevel.SCAN_ESTIMATED_HIGH
-                            )
-                        )
-                    )
-                    if not eligible:
+                    if not _eligible_inventory_fact(summary, selection):
                         skipped.append(
                             f"{summary.scope_key}:结算事实不满足库存扣减资格"
                         )
@@ -541,6 +684,13 @@ class InventorySalesApplicationService:
                         skipped.append(
                             f"{summary.scope_key}:估算回落不自动回补库存"
                         )
+                        continue
+                    if (
+                        baseline is not None
+                        and delta_sold == 0
+                        and _baseline_matches_summary(baseline, summary)
+                    ):
+                        replayed += 1
                         continue
                     idempotency_key = (
                         "inventory-sales:"
@@ -577,7 +727,13 @@ class InventorySalesApplicationService:
                         raise InventoryAuthorityError(
                             f"商品 {summary.scope_key} 缺少权威库存余额"
                         )
-                    inventory_delta = -delta_sold
+                    historical_baseline_only = (
+                        state.bootstrap_sales_watermark_date is not None
+                        and platform_trade_date
+                        < state.bootstrap_sales_watermark_date
+                    )
+                    baseline_only = historical_baseline_only or delta_sold == 0
+                    inventory_delta = 0 if baseline_only else -delta_sold
                     if balance.current_qty + inventory_delta < 0:
                         raise InventoryInsufficientError(
                             f"商品 {summary.scope_key} 的销售扣减超过真实库存"
@@ -592,63 +748,48 @@ class InventorySalesApplicationService:
                         inventory_before=balance.current_qty,
                         inventory_delta=inventory_delta,
                         transaction_type=(
-                            "SALES_DEDUCTION" if inventory_delta <= 0 else "SALES_RESTORE"
+                            "SALES_BASELINE_SYNC"
+                            if baseline_only
+                            else (
+                                "SALES_DEDUCTION"
+                                if inventory_delta <= 0
+                                else "SALES_RESTORE"
+                            )
                         ),
                         source_type="PLATFORM_TRADE_DAY_SUMMARY",
                         source_ref_id=summary.summary_id,
-                        reason="按当前权威销售事实与已应用基准的差额更新真实库存",
+                        reason=(
+                            (
+                                "回补切换水位前销售基准，不改变当前真实库存"
+                                if historical_baseline_only
+                                else "销售权威来源更新但累计销量不变，只同步基准"
+                            )
+                            if baseline_only
+                            else "按当前权威销售事实与已应用基准的差额更新真实库存"
+                        ),
                         actor=normalized_actor,
                         supporting_refs=supporting_refs,
                         idempotency_key=idempotency_key,
                         request_sha256=request_sha256,
-                        balance_version_after=balance.version + 1,
+                        balance_version_after=(
+                            balance.version
+                            if baseline_only
+                            else balance.version + 1
+                        ),
                         occurred_at=now,
                         seller_operation_date=summary.seller_operation_date,
                         platform_name=platform,
                         platform_trade_date=platform_trade_date,
                     )
-                    _update_balance(connection, transaction)
-                    connection.execute(
-                        """
-                        INSERT INTO inventory_sales_baselines(
-                            platform_name, platform_trade_date, internal_sku,
-                            selected_fact_source, quality_level, selected_sold_qty,
-                            source_ref_id, source_sha256, mapping_version,
-                            supporting_refs_json, inventory_transaction_id,
-                            version, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT(platform_name, platform_trade_date, internal_sku)
-                        DO UPDATE SET
-                            selected_fact_source = excluded.selected_fact_source,
-                            quality_level = excluded.quality_level,
-                            selected_sold_qty = excluded.selected_sold_qty,
-                            source_ref_id = excluded.source_ref_id,
-                            source_sha256 = excluded.source_sha256,
-                            mapping_version = excluded.mapping_version,
-                            supporting_refs_json = excluded.supporting_refs_json,
-                            inventory_transaction_id = excluded.inventory_transaction_id,
-                            version = inventory_sales_baselines.version + 1,
-                            updated_at = excluded.updated_at
-                        """,
-                        (
-                            platform,
-                            platform_trade_date.isoformat(),
-                            summary.scope_key,
-                            summary.fact_source.value,
-                            summary.quality_level.value,
-                            selected_sold,
-                            summary.summary_id,
-                            summary.input_manifest_sha256,
-                            summary.mapping_version,
-                            json.dumps(
-                                supporting_refs,
-                                ensure_ascii=False,
-                                separators=(",", ":"),
-                            ),
-                            transaction.transaction_id,
-                            1 if baseline is None else baseline.version + 1,
-                            _datetime_to_text(now),
-                        ),
+                    if not baseline_only:
+                        _update_balance(connection, transaction)
+                    _upsert_sales_baseline(
+                        connection,
+                        summary=summary,
+                        selection=selection,
+                        inventory_transaction_id=transaction.transaction_id,
+                        updated_at=now,
+                        existing_version=(baseline.version if baseline else None),
                     )
                     applied.append(transaction.transaction_id)
                 connection.commit()
@@ -678,6 +819,95 @@ class InventorySalesApplicationService:
             transaction_ids=tuple(applied),
             reasons=tuple(skipped),
         )
+
+
+def _eligible_inventory_fact(summary, selection) -> bool:
+    return bool(
+        summary.sold_qty is not None
+        and selection.sold_qty == summary.sold_qty
+        and selection.fact_source is summary.fact_source
+        and selection.quality_level is summary.quality_level
+        and selection.mapping_version == summary.mapping_version
+        and (
+            (
+                summary.fact_source is FactSource.ORDER_OBSERVED
+                and summary.quality_level is DataQualityLevel.ORDER_COMPLETE
+            )
+            or (
+                summary.fact_source is FactSource.SCAN_ESTIMATED
+                and summary.quality_level
+                is DataQualityLevel.SCAN_ESTIMATED_HIGH
+            )
+        )
+    )
+
+
+def _baseline_matches_summary(baseline, summary) -> bool:
+    return bool(
+        baseline.selected_fact_source == summary.fact_source.value
+        and baseline.quality_level == summary.quality_level.value
+        and baseline.selected_sold_qty == int(summary.sold_qty)
+        and baseline.source_ref_id == summary.summary_id
+        and baseline.source_sha256 == summary.input_manifest_sha256
+        and baseline.mapping_version == summary.mapping_version
+    )
+
+
+def _upsert_sales_baseline(
+    connection,
+    *,
+    summary,
+    selection,
+    inventory_transaction_id: str,
+    updated_at: datetime,
+    existing_version: int | None,
+) -> None:
+    supporting_refs = tuple(
+        f"{input_type}:{input_ref_id}:{input_sha256}"
+        for input_type, input_ref_id, input_sha256 in selection.input_refs
+    )
+    connection.execute(
+        """
+        INSERT INTO inventory_sales_baselines(
+            platform_name, platform_trade_date, internal_sku,
+            selected_fact_source, quality_level, selected_sold_qty,
+            source_ref_id, source_sha256, mapping_version,
+            supporting_refs_json, inventory_transaction_id,
+            version, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(platform_name, platform_trade_date, internal_sku)
+        DO UPDATE SET
+            selected_fact_source = excluded.selected_fact_source,
+            quality_level = excluded.quality_level,
+            selected_sold_qty = excluded.selected_sold_qty,
+            source_ref_id = excluded.source_ref_id,
+            source_sha256 = excluded.source_sha256,
+            mapping_version = excluded.mapping_version,
+            supporting_refs_json = excluded.supporting_refs_json,
+            inventory_transaction_id = excluded.inventory_transaction_id,
+            version = inventory_sales_baselines.version + 1,
+            updated_at = excluded.updated_at
+        """,
+        (
+            summary.platform_name,
+            summary.platform_trade_date.isoformat(),
+            summary.scope_key,
+            summary.fact_source.value,
+            summary.quality_level.value,
+            int(summary.sold_qty),
+            summary.summary_id,
+            summary.input_manifest_sha256,
+            summary.mapping_version,
+            json.dumps(
+                supporting_refs,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            inventory_transaction_id,
+            1 if existing_version is None else existing_version + 1,
+            _datetime_to_text(updated_at),
+        ),
+    )
 
 
 def _append_transaction(
