@@ -89,7 +89,7 @@ jobs:
       - name: Verify Windows paths, Chinese paths, and UTF-8 handling
         run: >-
           python -m pytest -q
-          tests/test_web_security.py
+          tests/test_operations_web_foundation.py
           tests/test_workbook_repository.py
           tests/test_workflow.py
 

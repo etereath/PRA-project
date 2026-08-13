@@ -16,6 +16,10 @@
 没有发送真实飞书，也没有执行真实平台读写动作。真实飞书验收需要独立通知后台服务具有
 新鲜心跳；真实平台写验收仍需用户另行明确商品和批次授权。
 
+旧库数据已确认为测试时期数据，不再要求完整迁移。7F 收尾新增受控干净重建入口：完整
+归档旧库以便追溯，只从正式商品和映射工作簿保留 SKU、商品资料、库存与映射状态；候选
+v17 库仍必须通过真实空 `OPEN` 订单快照和既有库存 bootstrap，不能由脚本伪造经营事实。
+
 ## 2. 复用与新增矩阵
 
 | 能力 | 分类 | 7F 处理 |
@@ -27,6 +31,9 @@
 | 系统状态 | 公共抽取 | 聚合 Web、Runtime、工作簿、Automation、Queue、Worker、Importer、Outbox 和备份状态 |
 | 旧 Web | 删除 | 删除旧 Route、HTML 拼接、样式与重复测试；打包门禁禁止其回流 |
 | CLI | 保留 | 继续承担测试、Mock、诊断、备份和恢复，不恢复日常运营旁路 |
+| 旧测试 Runtime 归档 | 参数化复用 | SQLite 在线备份和逻辑快照回读；允许归档不健康旧库但不称为发布备份 |
+| 干净 v17 候选库 | 原样复用 | 复用 v17 Schema、真实订单空快照、库存 bootstrap 与逐 SKU 回读 |
+| 激活/紧急回滚 | 确需新增 | 只编排固定路径、双哈希、确认文本、同盘替换和失败恢复，不复制库存逻辑 |
 
 ## 3. 类型化维护与权限
 
@@ -69,14 +76,27 @@ wheel/sdist 审计会显式拒绝重新包含旧模块。系统页不显示 secr
 
 SQLite 只读连接第一次建立 WAL 共享内存时可能更新 `-shm` 锁元数据，因此验收先预热再比较
 侧车内容；这不等于业务数据库写入。真实库既有健康问题仍使 `/health` 返回 `503`，页面只
-报告不可用。本任务不推断违规来源，也不授权初始化、迁移或修复真实数据。
+报告不可用。当次 GET 验收没有推断违规来源，也没有初始化、迁移或修复真实数据。
+
+后续只读追溯已查明该外键违规来源：2026-07-31 的历史验收清理直接删除了
+`T1354-ACCEPT-FULL` Run/Job，却遗漏其 `automation_run_events`，且直接 SQLite 连接没有启用
+外键约束，因而遗留事件 `AUTO-EVENT-1205ba4fd0464ad08d629529081a42f6`。这是测试清理缺陷，
+不是正常 Automation 事务或平台错误；旧库保持原样归档，新库不迁入该事件。
+
+2026-08-13 又使用新增维护入口对 canonical 真实库执行了一次不带 `--apply` 的只读预览：
+识别到 12 个正式 SKU、库存合计 148 扎、12 条平台映射均为 `DISABLED`；SQLite 完整性为
+`ok`、Schema 为 v14、外键违规为 1 条。预览没有创建切换工作目录，主库和 WAL 的 SHA-256、
+大小及修改时间在调用前后完全一致。没有准备候选库、bootstrap、替换或回滚真实库。
 
 ## 6. 测试与制品
 
 - 最终直接专项：`77 passed, 3 subtests passed`；
-- 完整 pytest：`1215 passed, 3 skipped, 82 subtests passed`，耗时 269.13 秒；
+- 干净 v17 准备、命令行 UTF-8、激活失败恢复与紧急回滚专项：`5 passed`；
+- Windows 陈旧路径修复后的对应测试组：`51 passed`；
+- 完整 pytest：`1220 passed, 3 skipped, 82 subtests passed`，耗时 286.15 秒；
 - 系统冒烟：`16 passed, 0 failed`，使用临时数据库和 mock 通知；
-- Ruff、`git diff --check`、`compileall`：通过；
+- 本次新增 Python 文件 Ruff/格式检查、`git diff --check`、`compileall`：通过；全仓 Ruff
+  仍报告 67 项既有告警，本轮没有借机改动无关核心代码；
 - wheel/sdist 构建、allowlist、secret scan、仓库外 wheel 安装：通过；
 - Windows ShadowBot fixture 与失败退出码：通过；
 - wheel/sdist 均不包含旧 Web 模块。
@@ -92,3 +112,7 @@ Linux/Windows CI 由 Draft PR 执行；本地 Windows 结果不能替代 GitHub 
 2. 真实平台写：本轮没有用户指定商品和批次授权，未执行 COMMIT。后续授权后必须完整通过
    Queue → Worker → Importer → Archive 和既有 UNKNOWN/RECONCILE 门禁。
 3. 真实 Runtime 健康：既有外键违规另走显式维护、备份与回读流程；7F 不修复真实数据。
+
+上述第 3 项现已有 `scripts/clean_runtime_cutover.py` 和
+`docs/clean_runtime_v17_rebuild.md` 的受控实施路径，但本分支仍未对 canonical 真实库执行
+准备、bootstrap 或激活。真实执行必须另取维护窗口和用户明确授权。
