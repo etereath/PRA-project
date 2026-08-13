@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import sqlite3
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
@@ -28,6 +27,10 @@ from app.services.automation import (
     PRE_CUTOFF_FULL_SCAN,
     SALES_PLAN_INPUT_BUILD,
     REVIEW_TIMEOUT_MAINTENANCE,
+)
+from app.services.automation_job_versioning import (
+    automation_configuration_version,
+    versioned_automation_job_id,
 )
 from app.services.operational_time import (
     OperationalTimeContext,
@@ -239,11 +242,9 @@ class AutomationConfigurationApplicationService:
         )
         successor_id = current.job_id
         if schedule_changed:
-            successor_id = (
-                "AUTOMATION-"
-                + current.job_type.replace("_", "-")
-                + "-V-"
-                + version.removeprefix("sha256:")[:12].upper()
+            successor_id = versioned_automation_job_id(
+                current.job_type,
+                version,
             )
         successor = replace(
             current,
@@ -334,11 +335,9 @@ class AutomationConfigurationApplicationService:
                 "effective_at": now.isoformat(),
             }
         )
-        successor_id = (
-            "AUTOMATION-"
-            + current.job_type.replace("_", "-")
-            + "-V-"
-            + version.removeprefix("sha256:")[:12].upper()
+        successor_id = versioned_automation_job_id(
+            current.job_type,
+            version,
         )
         return current, replace(
             current,
@@ -358,35 +357,12 @@ class AutomationConfigurationApplicationService:
         schedule_expression: str,
         config: dict[str, object],
     ) -> str:
-        normalized = {
-            "job_type": job_type,
-            "platform_name": str(config.get("platform_name") or ""),
-            "schedule_kind": schedule_kind,
-            "schedule_expression": schedule_expression,
-            "interval_offset_minutes": config.get("interval_offset_minutes"),
-            "settlement_offset_minutes": config.get(
-                "settlement_offset_minutes"
-            ),
-            "plan_input_offset_minutes": config.get(
-                "plan_input_offset_minutes"
-            ),
-            "sales_plan_input_offset_minutes": config.get(
-                "sales_plan_input_offset_minutes"
-            ),
-            "source_allowlist": config.get("source_allowlist"),
-            "time_policy_version": config.get("time_policy_version"),
-            "upstream_configuration_version": config.get(
-                "upstream_configuration_version"
-            ),
-        }
-        return "sha256:" + hashlib.sha256(
-            json.dumps(
-                normalized,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+        return automation_configuration_version(
+            job_type=job_type,
+            schedule_kind=schedule_kind,
+            schedule_expression=schedule_expression,
+            config=config,
+        )
 
     def configure_inventory_alert(
         self,

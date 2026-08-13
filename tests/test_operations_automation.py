@@ -195,6 +195,24 @@ def test_daily_generation_reuses_rule_workflow_after_plan_input(tmp_path):
     stored_tasks = runtime.list_tasks()
     assert stored_tasks
     assert {task.origin_ref_id for task in stored_tasks} == {run.run_id}
+    assert {task.platform_trade_date for task in stored_tasks} == {
+        run.platform_trade_date
+    }
+    assert {task.seller_operation_date for task in stored_tasks} == {
+        run.seller_operation_date
+    }
+    assert {task.time_policy_version for task in stored_tasks} == {
+        run.time_policy_version
+    }
+    assert outcome.event_payload["platform_trade_date"] == (
+        run.platform_trade_date.isoformat()
+    )
+    assert outcome.event_payload["seller_operation_date"] == (
+        run.seller_operation_date.isoformat()
+    )
+    assert outcome.event_payload["time_policy_version"] == (
+        run.time_policy_version
+    )
     assert any(
         any(
             str(step).startswith("matched:LIST-1")

@@ -123,6 +123,8 @@ class DailyTaskGenerationAutomationHandler:
             "plan_input_run_id": plan_input.run_id,
             "plan_input_manifest_sha256": plan_input.output_manifest_sha256,
             "platform_trade_date": run.platform_trade_date.isoformat(),
+            "seller_operation_date": run.seller_operation_date.isoformat(),
+            "time_policy_version": run.time_policy_version,
             "source_allowlist": sorted(sources),
             "files": {
                 path.name: "sha256:" + hashlib.sha256(content).hexdigest()
@@ -153,7 +155,16 @@ class DailyTaskGenerationAutomationHandler:
             )
         filtered = replace(
             summary,
-            tasks=[task for task in summary.tasks if task.action_type in allowed_actions],
+            tasks=[
+                replace(
+                    task,
+                    platform_trade_date=run.platform_trade_date,
+                    seller_operation_date=run.seller_operation_date,
+                    time_policy_version=run.time_policy_version,
+                )
+                for task in summary.tasks
+                if task.action_type in allowed_actions
+            ],
         )
         input_manifest = _manifest(input_payload)
         context.bind_input_manifest(input_manifest)
@@ -171,6 +182,9 @@ class DailyTaskGenerationAutomationHandler:
             "inserted_task_count": stored.inserted_tasks_count,
             "inserted_review_task_count": stored.inserted_review_tasks_count,
             "notification_log_count": stored.inserted_notification_logs_count,
+            "platform_trade_date": run.platform_trade_date.isoformat(),
+            "seller_operation_date": run.seller_operation_date.isoformat(),
+            "time_policy_version": run.time_policy_version,
             "source_allowlist": sorted(sources),
             "platform_write_performed": False,
         }

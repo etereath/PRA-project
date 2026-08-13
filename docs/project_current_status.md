@@ -432,8 +432,15 @@ Task，零 Queue/Worker/平台副作用。真实执行授权独立要求 `SUBMIT
 选择历史策略。销售计划输入偏移和下游每日任务生成在同一事务重版本。库存预警继续复用 v17
 策略；受控补跑只创建既有 Automation Run，由独立服务执行，Web 不持有租约或运行 Handler。
 复核超时和每日任务生成已接入薄 Handler；后者只读取启用的商品、价格规则和上下架规则，
-明确走冻结规则路径并将 Task 绑定 Automation Run，包装、冷库和 Mock 平台 evaluator 不进入
-生产 Automation。
+明确走冻结规则路径并将 Task 绑定 Automation Run，同时持久化 Run 冻结的交易日、卖家作业日
+和时间策略版本；包装、冷库和 Mock 平台 evaluator 不进入生产 Automation。
+
+2026-08-14 合并后维护补丁新增唯一的时间策略协调维护服务和管理员脚本。未来修改 18:00/20:00
+时，必须先生成并校验 SQLite 逻辑备份，再在同一事务替换 Policy 与五个相关定时 Job 版本；
+旧启停状态、后置偏移和来源 allowlist 保留，任一步失败整体回滚。新策略只允许在维护事务时刻
+生效，Web 仍不开放策略编辑。当前没有对真实 Runtime DB 执行该维护动作。
+维护补丁专项为 `23 passed`，完整 pytest 为
+`1227 passed, 3 skipped, 82 subtests passed`，隔离系统冒烟为 `16 passed, 0 failed`。
 
 正式 production 执行不再携带开发确认文本或确认人，认证操作者改由既有 Task 历史审计面
 持久化；development 保留原固定确认合同。新旧 Web 的 Mobile Review 继续使用同一组稳定

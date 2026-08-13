@@ -4006,6 +4006,53 @@ class SQLiteRuntimeRepository:
     ) -> None:
         """Atomically close the current policy and install its successor."""
 
+        def replace_policy() -> None:
+            connection = self.connect_write()
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+                self.replace_current_operational_time_policy_on_connection(
+                    connection,
+                    expected_current_policy_version=(
+                        expected_current_policy_version
+                    ),
+                    successor_policy_version=successor_policy_version,
+                    effective_from=effective_from,
+                    platform_cutoff_local_time=platform_cutoff_local_time,
+                    seller_cutoff_local_time=seller_cutoff_local_time,
+                    peak_start_local_time=peak_start_local_time,
+                    created_by=created_by,
+                    timezone_name=timezone_name,
+                    created_at=self._clock(),
+                )
+                connection.commit()
+            except Exception:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+            finally:
+                connection.close()
+
+        self._run_sqlite_retry(
+            replace_policy,
+            operation_name="operational time policy replacement",
+        )
+
+    @staticmethod
+    def replace_current_operational_time_policy_on_connection(
+        connection: sqlite3.Connection,
+        *,
+        expected_current_policy_version: str,
+        successor_policy_version: str,
+        effective_from: datetime,
+        platform_cutoff_local_time: str,
+        seller_cutoff_local_time: str,
+        peak_start_local_time: str,
+        created_by: str,
+        timezone_name: str = "Asia/Shanghai",
+        created_at: datetime,
+    ) -> None:
+        """Replace one policy inside a caller-owned write transaction."""
+
         expected_version = str(expected_current_policy_version).strip()
         successor_version = str(successor_policy_version).strip()
         normalized_created_by = str(created_by).strip()
@@ -4018,6 +4065,10 @@ class SQLiteRuntimeRepository:
                 peak_start_local_time,
             )
         )
+        if not connection.in_transaction:
+            raise RuntimeError(
+                "operational time policy replacement requires an active transaction"
+            )
         if not expected_version:
             raise ValueError("expected_current_policy_version must not be blank")
         if not successor_version:
@@ -4032,101 +4083,85 @@ class SQLiteRuntimeRepository:
             raise ValueError("operational cutoff times must not be blank")
         if effective_from.tzinfo is None or effective_from.utcoffset() is None:
             raise ValueError("effective_from must be timezone-aware")
-        effective_from_utc = effective_from.astimezone(timezone.utc)
-        effective_from_text = effective_from_utc.isoformat()
+        if created_at.tzinfo is None or created_at.utcoffset() is None:
+            raise ValueError("created_at must be timezone-aware")
+        effective_from_text = effective_from.astimezone(timezone.utc).isoformat()
 
-        def replace_policy() -> None:
-            connection = self.connect_write()
-            try:
-                connection.execute("BEGIN IMMEDIATE")
-                current_rows = connection.execute(
-                    """
-                    SELECT policy_version, timezone_name
-                    FROM operational_time_policies
-                    WHERE effective_to IS NULL
-                    ORDER BY policy_version
-                    """
-                ).fetchall()
-                if len(current_rows) != 1:
-                    raise RuntimeError(
-                        "operational time policy replacement requires "
-                        "exactly one current policy"
-                    )
-                current_version = str(current_rows[0]["policy_version"])
-                current_timezone = str(current_rows[0]["timezone_name"])
-                if current_version != expected_version:
-                    raise ValueError(
-                        "current operational time policy changed: "
-                        f"expected {expected_version}, found {current_version}"
-                    )
-                if current_timezone != normalized_timezone:
-                    raise ValueError("successor timezone must match the current policy")
+        current_rows = connection.execute(
+            """
+            SELECT policy_version, timezone_name
+            FROM operational_time_policies
+            WHERE effective_to IS NULL
+            ORDER BY policy_version
+            """
+        ).fetchall()
+        if len(current_rows) != 1:
+            raise RuntimeError(
+                "operational time policy replacement requires exactly one current policy"
+            )
+        current_version = str(current_rows[0]["policy_version"])
+        current_timezone = str(current_rows[0]["timezone_name"])
+        if current_version != expected_version:
+            raise ValueError(
+                "current operational time policy changed: "
+                f"expected {expected_version}, found {current_version}"
+            )
+        if current_timezone != normalized_timezone:
+            raise ValueError("successor timezone must match the current policy")
 
-                updated = connection.execute(
-                    """
-                    UPDATE operational_time_policies
-                    SET effective_to = ?
-                    WHERE policy_version = ?
-                      AND effective_to IS NULL
-                    """,
-                    (effective_from_text, expected_version),
-                )
-                if updated.rowcount != 1:
-                    raise RuntimeError(
-                        "current operational time policy could not be closed"
-                    )
-
-                connection.execute(
-                    """
-                    INSERT INTO operational_time_policies(
-                        policy_version, timezone_name,
-                        platform_cutoff_local_time,
-                        seller_cutoff_local_time,
-                        peak_start_local_time,
-                        effective_from, effective_to,
-                        created_at, created_by,
-                        supersedes_policy_version
-                    ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
-                    """,
-                    (
-                        successor_version,
-                        normalized_timezone,
-                        cutoff_values[0],
-                        cutoff_values[1],
-                        cutoff_values[2],
-                        effective_from_text,
-                        _datetime_to_text(self._clock()),
-                        normalized_created_by,
-                        expected_version,
-                    ),
-                )
-                current_after = connection.execute(
-                    """
-                    SELECT policy_version
-                    FROM operational_time_policies
-                    WHERE effective_to IS NULL
-                    """
-                ).fetchall()
-                if (
-                    len(current_after) != 1
-                    or str(current_after[0]["policy_version"]) != successor_version
-                ):
-                    raise RuntimeError(
-                        "operational time policy replacement did not leave "
-                        "exactly one expected current policy"
-                    )
-                connection.commit()
-            except Exception:
-                if connection.in_transaction:
-                    connection.rollback()
-                raise
-            finally:
-                connection.close()
-
-        self._run_sqlite_retry(
-            replace_policy,
-            operation_name="operational time policy replacement",
+        updated = connection.execute(
+            """
+            UPDATE operational_time_policies
+            SET effective_to = ?
+            WHERE policy_version = ?
+              AND effective_to IS NULL
+            """,
+            (effective_from_text, expected_version),
         )
+        if updated.rowcount != 1:
+            raise RuntimeError(
+                "current operational time policy could not be closed"
+            )
+
+        connection.execute(
+            """
+            INSERT INTO operational_time_policies(
+                policy_version, timezone_name,
+                platform_cutoff_local_time,
+                seller_cutoff_local_time,
+                peak_start_local_time,
+                effective_from, effective_to,
+                created_at, created_by,
+                supersedes_policy_version
+            ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+            """,
+            (
+                successor_version,
+                normalized_timezone,
+                cutoff_values[0],
+                cutoff_values[1],
+                cutoff_values[2],
+                effective_from_text,
+                _datetime_to_text(created_at),
+                normalized_created_by,
+                expected_version,
+            ),
+        )
+        current_after = connection.execute(
+            """
+            SELECT policy_version
+            FROM operational_time_policies
+            WHERE effective_to IS NULL
+            """
+        ).fetchall()
+        if (
+            len(current_after) != 1
+            or str(current_after[0]["policy_version"]) != successor_version
+        ):
+            raise RuntimeError(
+                "operational time policy replacement did not leave exactly one "
+                "expected current policy"
+            )
 
     def insert_tasks(self, tasks: Iterable[Task]) -> int:
         task_rows = list(tasks)
