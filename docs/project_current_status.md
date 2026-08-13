@@ -419,7 +419,7 @@ PR #34 评审意见已统一整改：bootstrap 现在固定 canonical 路径，�
 不得让过期工作簿重新成为库存权威。详细见
 [13.5-7D 实施报告](reports/task13_5_7d_authoritative_inventory.md)。
 
-7E 当前在 `codex/task13-5-7e-control-plane` 独立分支完成运营控制面实现。人工任务按品种、
+7E 已通过 PR #35 合并到 `main`。人工任务按品种、
 等级和平台多选展开，支持调整价格到、加/降价、下架和带平台目标库存的上架；预览与创建
 重新校验基础成本、映射、平台事实、真实库存和开放任务冲突，创建事务只写 MANUAL Runtime
 Task，零 Queue/Worker/平台副作用。真实执行授权独立要求 `SUBMIT_EXECUTION`、明确 Task ID、
@@ -446,6 +446,21 @@ Worker、写 Queue、发送通知或执行真实平台动作。完整实现与�
 `130 passed, 21 subtests passed`，完整 pytest 为
 `1280 passed, 3 skipped, 102 subtests passed`，隔离系统冒烟为 `16 passed, 0 failed`；构建、
 严格制品审计、secret scan、wheel 隔离安装和 Windows 临时 ShadowBot fixture 均通过。
+
+7F 当前在 `codex/task13-5-7f-cutover-acceptance` 独立分支完成唯一 Web 切换和本地验收。
+旧 `app.web`、旧样式和重复测试已删除，制品审计禁止旧模块回流；`serve-web` 只启动新运营
+Web。系统入口已分成运行状态、通知通路、数据与备份和高级诊断，`SYSTEM_ADMIN` 与只读
+查看权限分离。Worker 恢复、通知测试和备份只提交固定类型化意图，分别复用既有 Incident /
+Automation、Notification Outbox 和 release backup；Web Route 不接受脚本、命令或路径，
+也不直接启停 Worker 或等待后台执行。
+
+真实 Runtime DB 六个主要 GET 页面已再次验证主库和 WAL 内容零写，既有健康问题仍只使
+`/health` 返回 503，7F 没有初始化、迁移或修复真实数据。桌面和 390×844 手机验收通过，
+任务动作字段显隐、无平台映射阻断和静态资源发布重验证已修复。完整 pytest 为
+`1215 passed, 3 skipped, 82 subtests passed`，系统冒烟为 `16 passed, 0 failed`，制品构建、
+审计、隔离安装和 Windows fixture 均通过。真实飞书仍等待独立通知后台新鲜心跳；真实平台
+写仍等待用户另行指定商品和批次授权，因此两项不能在本分支冒充已验收。详见
+[13.5-7F 实施与验收报告](reports/task13_5_7f_cutover_acceptance.md)。
 
 ### 2.8 自动规则评估框架 MVP
 

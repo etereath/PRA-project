@@ -90,7 +90,7 @@ class AutomationConfigurationApplicationService:
         if current.job_type in CHILD_JOB_TYPES or current.schedule_kind == CHILD_ONLY:
             raise AutomationConfigurationError("子扫描只能继承父任务，不能独立配置。")
         if current.job_type not in CONFIGURABLE_JOB_TYPES:
-            raise AutomationConfigurationError("该自动化方案不在 Web 配置白名单中。")
+            raise AutomationConfigurationError("该自动化方案暂不支持在此页面修改。")
 
         now = self._now()
         policy = OperationalTimePolicyRegistry(
@@ -158,7 +158,7 @@ class AutomationConfigurationApplicationService:
                 raise AutomationConfigurationError("销售计划输入不接受运行间隔。")
             offset = 5 if offset_minutes is None else int(offset_minutes)
             if not 5 <= offset <= 30:
-                raise AutomationConfigurationError("销售计划输入后置偏移必须在 5 到 30 分钟之间。")
+                raise AutomationConfigurationError("销售计划数据应在日结后 5 到 30 分钟生成。")
             schedule_kind = DAILY_LOCAL_TIME
             schedule_expression = self._time_expression(
                 policy.seller_cutoff_local_time,
@@ -184,7 +184,7 @@ class AutomationConfigurationApplicationService:
                 raise AutomationConfigurationError("每日任务生成不接受运行间隔。")
             offset = 5 if offset_minutes is None else int(offset_minutes)
             if not 0 <= offset <= 30:
-                raise AutomationConfigurationError("每日任务生成后置偏移必须在 0 到 30 分钟之间。")
+                raise AutomationConfigurationError("每日任务应在销售计划数据生成后 0 到 30 分钟创建。")
             plan_input_offset = 5
             plan_jobs = [
                 item
@@ -215,7 +215,7 @@ class AutomationConfigurationApplicationService:
             if not sources:
                 sources = {"PRICE_RULES", "LISTING_RULES"}
             if not sources.issubset({"PRICE_RULES", "LISTING_RULES"}):
-                raise AutomationConfigurationError("每日任务生成来源不在固定白名单中。")
+                raise AutomationConfigurationError("每日任务目前只支持价格规则和上下架规则。")
             config["source_allowlist"] = ["PRODUCTS", *sorted(sources)]
             config["time_policy_version"] = policy.policy_version
 
@@ -425,12 +425,12 @@ class AutomationConfigurationApplicationService:
         self._authorize(principal)
         job = self.automation.get_job(job_id.strip())
         if job is None or job.job_type not in RERUN_JOB_TYPES:
-            raise AutomationConfigurationError("该方案不允许从 Web 补跑。")
+            raise AutomationConfigurationError("该方案不支持人工补跑。")
         if not job.enabled:
             raise AutomationConfigurationError("自动化方案已停用，不能创建补跑。")
         key = idempotency_key.strip()
         if not 8 <= len(key) <= 200:
-            raise AutomationConfigurationError("补跑幂等键无效，请刷新页面后重试。")
+            raise AutomationConfigurationError("本次补跑请求已失效，请刷新页面后重试。")
         now = self._now()
         policies = self.automation.load_operational_time_policies()
         registry = OperationalTimePolicyRegistry(policies)
@@ -464,7 +464,7 @@ class AutomationConfigurationApplicationService:
             ):
                 candidates.append((candidate, candidate_context))
         if len(candidates) != 1:
-            raise AutomationConfigurationError("目标交易日无法由当前时间策略唯一派生。")
+            raise AutomationConfigurationError("无法确定所选销售日的补跑时间，请联系管理员检查销售日设置。")
         scheduled_for, context = candidates[0]
         logical_run_key = "web-rerun:" + hashlib.sha256(
             key.encode("utf-8")

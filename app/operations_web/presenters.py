@@ -16,6 +16,43 @@ from app.operations_web.read_models import (
 from app.operations_web.rendering import html
 
 
+MANUAL_ACTION_LABELS = {
+    "SET_PRICE": "调整价格到",
+    "CHANGE_PRICE": "加/降价",
+    "SET_OFFLINE": "下架",
+    "SET_ONLINE": "上架",
+    "update_price": "调整价格",
+    "set_offline": "下架",
+    "set_online": "上架",
+}
+
+
+def _manual_action_label(value: object) -> str:
+    raw = getattr(value, "value", value)
+    return MANUAL_ACTION_LABELS.get(str(raw), "平台操作")
+
+
+def _trade_day_status_label(value: str) -> str:
+    return {
+        "OPEN": "营业中",
+        "CLOSED": "已截单",
+        "UNAVAILABLE": "暂不可用",
+    }.get(str(value).upper(), str(value))
+
+
+def _automation_schedule_label(job) -> str:
+    if job.interval_minutes is not None:
+        suffix = "检查一次" if job.job_type == "REVIEW_TIMEOUT_MAINTENANCE" else "运行一次"
+        return f"每 {job.interval_minutes} 分钟{suffix}"
+    if job.offset_minutes is not None:
+        anchor = "销售计划数据准备后" if job.job_type == "DAILY_TASK_GENERATION" else "日结后"
+        return f"{anchor} {job.offset_minutes} 分钟运行"
+    schedule = str(job.schedule or "").strip()
+    if len(schedule) == 5 and schedule[2] == ":" and schedule.replace(":", "").isdigit():
+        return f"每天 {schedule} 运行"
+    return "按已设置时间运行"
+
+
 def render_today(model: TodayReadModel) -> str:
     metrics = "".join(
         f"""
@@ -39,25 +76,25 @@ def render_today(model: TodayReadModel) -> str:
     timeline = "".join(
         f"<li><time>{html(moment)}</time><strong>{html(title)}</strong><span>{html(detail)}</span></li>"
         for moment, title, detail in model.timeline
-    ) or '<li class="empty-copy">当前交易日还没有运行事件。</li>'
+    ) or '<li class="empty-copy">今天还没有新的业务动态。</li>'
     return f"""
     <section class="hero compact-hero">
       <div>
-        <p class="eyebrow">当前 PRA 交易日</p>
+        <p class="eyebrow">当前销售日</p>
         <h1>{html(model.platform_trade_date)}</h1>
         <p>{html(model.phase_label)} · 截至 {html(model.observed_at)}</p>
       </div>
-      <span class="status-pill">{html(model.trade_day_status)}</span>
+      <span class="status-pill">{html(_trade_day_status_label(model.trade_day_status))}</span>
     </section>
     {render_state(model.state)}
     <section class="metric-grid">{metrics}</section>
     <section class="panel">
-      <header class="panel-header"><div><h2>品种销售与库存</h2><p>今日已售、成交均价、销售额与数据库真实库存</p></div><a href="/database/sales-analysis">查看销售分析</a></header>
+      <header class="panel-header"><div><h2>品种销售与库存</h2><p>今日销量、成交均价、销售额与数据库库存</p></div><a href="/database/sales-analysis">查看销售分析</a></header>
       {render_table(model.products)}
     </section>
     <div class="two-column">
-      <section class="panel"><header class="panel-header"><div><h2>待处理</h2><p>复核、异常和系统影响</p></div></header>{todo}</section>
-      <section class="panel"><header class="panel-header"><div><h2>今日时间轴</h2><p>最近运行与执行结果</p></div></header><ol class="timeline">{timeline}</ol></section>
+      <section class="panel"><header class="panel-header"><div><h2>需要处理</h2><p>等待人工确认的业务事项</p></div></header>{todo}</section>
+      <section class="panel"><header class="panel-header"><div><h2>今日动态</h2><p>最近的自动任务和平台操作结果</p></div></header><ol class="timeline">{timeline}</ol></section>
     </div>
     """
 
@@ -97,13 +134,13 @@ def render_database(model: DatabaseReadModel) -> str:
     )
     return f"""
     <section class="hero compact-hero">
-      <div><p class="eyebrow">只读数据中心</p><h1>数据库</h1><p>{html(model.section_title)} · 一次只展示一个数据集</p></div>
+      <div><p class="eyebrow">经营与运行记录</p><h1>数据库</h1><p>查看{html(model.section_title)}</p></div>
       <span class="status-pill">交易日 {html(model.trade_date or "不可用")}</span>
     </section>
     <nav class="section-tabs" aria-label="数据库分页">{tabs}</nav>
     {notice}
     <section class="panel">
-      <header class="panel-header"><div><h2>{html(model.section_title)}</h2><p>默认 25 条，后端窄查询分页</p></div></header>
+      <header class="panel-header"><div><h2>{html(model.section_title)}</h2></div></header>
       {filters}
       <nav class="chip-row" aria-label="数据集">{datasets}</nav>
       {render_table(model.table)}
@@ -195,14 +232,14 @@ def render_management(
     )
     return f"""
     <section class="hero compact-hero">
-      <div><p class="eyebrow">业务管理</p><h1>任务、复核与自动化</h1><p>人工任务创建和真实平台执行授权严格分为两个阶段。</p></div>
+      <div><p class="eyebrow">业务管理</p><h1>任务、复核与自动化</h1><p>先创建任务，确认无误后再授权平台执行。</p></div>
     </section>
     <nav class="section-tabs" aria-label="业务管理分页"><a class="active" href="#tasks">创建任务</a><a href="#reviews">人工复核</a><a href="#automation">自动化方案</a></nav>
     {task_controls}
-    <section class="panel"><header class="panel-header"><div><h2>人工库存调整</h2><p>只输入有符号调整值；平台库存不会覆盖真实库存</p></div></header><div class="form-shell">{render_state(model.inventory_state)}{inventory_error}{receipt}{inventory_form}</div></section>
-    <section class="panel" id="tasks"><header class="panel-header"><div><h2>当前任务</h2><p>创建任务不等于真实平台执行授权</p></div></header>{execution_controls}{render_table(model.pending_tasks)}</section>
-    <section class="panel" id="reviews"><header class="panel-header"><div><h2>人工复核</h2><p>桌面端与手机端复用同一原子处置路径</p></div></header>{review_controls}{render_table(model.pending_reviews)}</section>
-    <section class="panel" id="automation"><header class="panel-header"><div><h2>自动化方案</h2><p>只允许固定字段；保存配置和后台运行相互独立</p></div></header>{automation_controls}{render_table(model.automation_runs)}</section>
+    <section class="panel"><header class="panel-header"><div><h2>人工库存调整</h2><p>输入本次增加或减少的数量，并记录来源和原因</p></div></header><div class="form-shell">{render_state(model.inventory_state)}{inventory_error}{receipt}{inventory_form}</div></section>
+    <section class="panel" id="tasks"><header class="panel-header"><div><h2>当前任务</h2><p>选择待执行任务并再次确认后，才会发送到平台</p></div></header>{execution_controls}{render_table(model.pending_tasks)}</section>
+    <section class="panel" id="reviews"><header class="panel-header"><div><h2>人工复核</h2><p>查看原因并选择处理结果</p></div></header>{review_controls}{render_table(model.pending_reviews)}</section>
+    <section class="panel" id="automation"><header class="panel-header"><div><h2>自动化方案</h2><p>设置定时扫描、日结、任务生成和库存预警</p></div></header>{automation_controls}{render_table(model.automation_runs)}</section>
     """
 
 
@@ -215,15 +252,15 @@ def _render_review_controls(
 ) -> str:
     feedback = ""
     if receipt is not None:
-        review_id, status, created_task_id = receipt
+        _, status, created_task_id = receipt
         task_note = (
-            f"；已创建任务 {html(created_task_id)}"
+            "；已生成后续任务"
             if created_task_id
             else ""
         )
         feedback += (
             '<div class="state-banner state-ready"><strong>复核已提交</strong>'
-            f'<p>{html(review_id)} → {html(status)}{task_note}</p></div>'
+            f'<p>处理结果：{html(status)}{task_note}</p></div>'
         )
     if error:
         feedback += (
@@ -324,15 +361,15 @@ def _render_automation_controls(
               <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
               <input type="hidden" name="job_id" value="{html(job.job_id)}">
               <input type="hidden" name="idempotency_key" value="{html(model.automation_rerun_idempotency_key)}:{html(job.job_type)}">
-              <label>目标 PRA 交易日<input name="target_trade_date" type="date" required></label>
-              <button type="submit" class="secondary-button">创建受控补跑</button>
+              <label>补跑日期<input name="target_trade_date" type="date" required></label>
+              <button type="submit" class="secondary-button">补跑一次</button>
             </form>
             """
         checked = " checked" if job.enabled else ""
         job_cards.append(
             f"""
             <article class="automation-control-card">
-              <div><h3>{html(job.title)}</h3><p>当前排程 {html(job.schedule)}</p></div>
+              <div><h3>{html(job.title)}</h3><p>{html(_automation_schedule_label(job))}</p></div>
               <form method="post" action="/management/automation/configure" class="automation-config-form">
                 <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
                 <input type="hidden" name="job_id" value="{html(job.job_id)}">
@@ -393,14 +430,14 @@ def _render_automation_controls(
             </form>
             """
         )
-    jobs = "".join(job_cards) or '<p class="empty-copy">自动化配置暂不可用；未修改任何方案。</p>'
+    jobs = "".join(job_cards) or '<p class="empty-copy">自动化方案暂不可用。</p>'
     policies = "".join(policy_cards) or '<p class="empty-copy">库存预警配置暂不可用。</p>'
     return (
         '<div class="form-shell">'
         + feedback
         + '<h3>定时方案</h3><div class="automation-control-grid">'
         + jobs
-        + '</div><h3>真实库存预警</h3><div class="alert-policy-grid">'
+        + '</div><h3>数据库库存预警</h3><div class="alert-policy-grid">'
         + policies
         + "</div></div>"
     )
@@ -417,7 +454,7 @@ def _render_manual_task_controls(
     idempotency_key: str,
 ) -> str:
     if options is None:
-        return '<section class="panel"><header class="panel-header"><h2>创建任务</h2></header><div class="state-banner state-unavailable"><strong>任务范围暂不可用</strong><p>请检查商品和平台映射工作簿。</p></div></section>'
+        return '<section class="panel"><header class="panel-header"><h2>创建任务</h2></header><div class="state-banner state-unavailable"><strong>任务范围暂不可用</strong><p>请联系管理员检查商品资料和平台对应关系。</p></div></section>'
 
     def checks(name: str, values: tuple[str, ...]) -> str:
         return "".join(
@@ -427,7 +464,7 @@ def _render_manual_task_controls(
 
     receipt_html = (
         '<div class="state-banner state-ready"><strong>任务已创建</strong><p>'
-        + html(f"共 {len(receipt)} 项；创建不会触发平台执行。")
+        + html(f"已创建 {len(receipt)} 个任务；如需执行，请在下方单独确认。")
         + "</p></div>"
         if receipt
         else ""
@@ -437,6 +474,16 @@ def _render_manual_task_controls(
         if error
         else ""
     )
+    platform_choices = checks("platforms", options.platforms)
+    platform_ready = bool(options.platforms)
+    if not platform_ready:
+        platform_choices = (
+            '<p class="empty-copy">当前没有可操作的平台商品。</p>'
+        )
+        error_html += (
+            '<div class="state-banner state-unavailable"><strong>暂无可用平台</strong>'
+            '<p>请联系管理员维护商品与平台的对应关系。</p></div>'
+        )
     preview_html = ""
     if preview is not None:
         rows = "".join(
@@ -445,7 +492,7 @@ def _render_manual_task_controls(
             f"<td>{html(item.variety)} · {html(item.grade)}</td>"
             f"<td>{html(item.platform_name)}</td>"
             f"<td>{html(item.current_status or '不可用')} / {html(str(item.current_price) if item.current_price is not None else '—')}</td>"
-            f"<td>{html(str(item.target_price) if item.target_price is not None else item.action_type.value)}</td>"
+            f"<td>{html(str(item.target_price) if item.target_price is not None else _manual_action_label(item.action_type))}</td>"
             f"<td>{html('；'.join(item.blockers) or '可创建')}</td>"
             "</tr>"
             for item in preview.items
@@ -475,14 +522,14 @@ def _render_manual_task_controls(
             </form>
             """
             if preview.creatable
-            else '<p class="form-hint">当前包含项目有阻断项，不能创建任务。</p>'
+            else '<p class="form-hint">部分项目未通过检查，暂时不能创建任务。</p>'
         )
         preview_html = f"""
         <div class="form-shell"><h3>任务预览</h3>
           <form method="post" action="/management/tasks/preview">
             <input type="hidden" name="csrf_token" value="{html(csrf_token)}">{hidden_scope}{hidden_values}
-            <div class="table-scroll"><table><thead><tr><th>排除</th><th>商品</th><th>平台</th><th>当前事实</th><th>目标</th><th>校验</th></tr></thead><tbody>{rows}</tbody></table></div>
-            <button class="secondary" type="submit">更新排除项</button>
+            <div class="table-scroll"><table><thead><tr><th>排除</th><th>商品</th><th>平台</th><th>当前状态</th><th>目标</th><th>检查结果</th></tr></thead><tbody>{rows}</tbody></table></div>
+            <button class="secondary" type="submit">重新预览</button>
           </form>{create_button}
         </div>
         """
@@ -498,11 +545,11 @@ def _render_manual_task_controls(
         <header class="dialog-header"><div><p class="eyebrow">创建任务</p><h2>选择任务范围</h2></div><button type="button" class="icon-button" data-dialog-close aria-label="关闭">×</button></header>
         <fieldset><legend>品种（可多选）</legend><div class="chip-row">{checks('varieties', options.varieties)}</div></fieldset>
         <fieldset><legend>等级（可多选）</legend><div class="chip-row">{checks('grades', options.grades)}</div></fieldset>
-        <fieldset><legend>平台（可多选）</legend><div class="chip-row">{checks('platforms', options.platforms)}</div></fieldset>
+        <fieldset><legend>平台（可多选）</legend><div class="chip-row">{platform_choices}</div></fieldset>
         <label>任务类型<select name="action" data-task-action><option value="SET_PRICE">调整价格到</option><option value="CHANGE_PRICE">加/降价</option><option value="SET_OFFLINE">下架</option><option value="SET_ONLINE">上架</option></select></label>
         <label data-price-field><span data-price-label>目标价格</span><input name="price_value" inputmode="decimal" placeholder="请输入目标价格"></label>
         <label data-inventory-field hidden>平台目标库存<input name="target_inventory" type="number" min="0" step="1"></label>
-        <footer class="dialog-actions"><button type="button" class="secondary" data-dialog-close>取消</button><button type="submit">预览任务</button></footer>
+        <footer class="dialog-actions"><button type="button" class="secondary" data-dialog-close>取消</button><button type="submit"{' disabled' if not platform_ready else ''}>预览任务</button></footer>
       </form>
     </dialog>
     """
@@ -527,7 +574,7 @@ def _render_execution_controls(
         else ""
     )
     receipt_html = (
-        f'<div class="state-banner state-ready"><strong>执行请求已投递</strong><p>批次 {html(receipt[0])} · 尝试 {html(receipt[1])}</p></div>'
+        '<div class="state-banner state-ready"><strong>执行请求已发送</strong><p>可在当前任务和执行记录中查看进度。</p></div>'
         if receipt
         else ""
     )
@@ -538,16 +585,16 @@ def _render_execution_controls(
             for task_id in preparation.task_ids
         )
         confirmation = f"""
-        <div class="state-banner state-incomplete"><strong>请二次确认</strong><p>{html(preparation.platform_name)} · {preparation.item_count} 项 · {html(preparation.action_type.value)}；确认有效至 {html(preparation.expires_at.isoformat())}</p></div>
+        <div class="state-banner state-incomplete"><strong>请二次确认</strong><p>{html(preparation.platform_name)} · {preparation.item_count} 项 · {html(_manual_action_label(preparation.action_type))}；请在 {html(preparation.expires_at.strftime('%H:%M'))} 前确认</p></div>
         <form method="post" action="/management/executions/submit" class="inline-actions">
           <input type="hidden" name="csrf_token" value="{html(csrf_token)}">{ids}
           <input type="hidden" name="confirmation_digest" value="{html(preparation.confirmation_digest)}">
           <input type="hidden" name="idempotency_key" value="{html(preparation.idempotency_key)}">
-          <button type="submit">确认提交到执行队列</button>
+          <button type="submit">确认并发送执行</button>
         </form>
         """
     return f"""
-    <div class="form-shell"><h3>真实平台执行授权</h3><p class="form-hint">只处理本次明确勾选的任务；不会扫描全部待执行任务。</p>{error_html}{receipt_html}{confirmation}
+    <div class="form-shell"><h3>授权平台执行</h3><p class="form-hint">仅执行本次选择的任务。</p>{error_html}{receipt_html}{confirmation}
       <form method="post" action="/management/executions/prepare">
         <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
         <input type="hidden" name="idempotency_key" value="{html(idempotency_key)}">
@@ -557,21 +604,171 @@ def _render_execution_controls(
     """
 
 
-def render_system(model: SystemReadModel) -> str:
-    cards = "".join(
-        f"""
-        <article class="component-card state-{html(item.state.state.value)}">
-          <header><h2>{html(item.name)}</h2><span>{html(item.state.title)}</span></header>
-          <p>{html(item.state.detail)}</p><small>检查于 {html(item.checked_at)}</small>
-        </article>
+def render_system(
+    model: SystemReadModel,
+    *,
+    csrf_token: str,
+    section: str,
+    can_admin: bool,
+    maintenance_receipt=None,
+    maintenance_error: str = "",
+    idempotency_keys: dict[str, str] | None = None,
+) -> str:
+    keys = idempotency_keys or {}
+    tabs = [("status", "/system", "运行状态")]
+    if can_admin:
+        tabs.extend(
+            [
+                ("notifications", "/system/notifications", "通知通路"),
+                ("data", "/system/data", "数据与备份"),
+                ("diagnostics", "/system/diagnostics", "高级诊断"),
+            ]
+        )
+    tab_html = "".join(
+        f'<a class="section-tab {"active" if name == section else ""}" href="{url}">{label}</a>'
+        for name, url, label in tabs
+    )
+    feedback = ""
+    if maintenance_receipt is not None:
+        replay = "（重复请求已复用原结果）" if maintenance_receipt.replayed else ""
+        feedback = (
+            '<div class="state-banner state-ready"><strong>请求已受理</strong>'
+            f'<p>{html(maintenance_receipt.message + replay)}</p></div>'
+        )
+    elif maintenance_error:
+        feedback = (
+            '<div class="state-banner state-failed"><strong>请求未受理</strong>'
+            f'<p>{html(maintenance_error)}</p></div>'
+        )
+
+    section_body = {
+        "status": _render_system_status(
+            model,
+            csrf_token=csrf_token,
+            can_admin=can_admin,
+            idempotency_key=keys.get("worker", ""),
+        ),
+        "notifications": _render_system_notifications(
+            model,
+            csrf_token=csrf_token,
+            idempotency_key=keys.get("notification", ""),
+        ),
+        "data": _render_system_data(
+            model,
+            csrf_token=csrf_token,
+            idempotency_key=keys.get("backup", ""),
+        ),
+        "diagnostics": _render_system_diagnostics(model),
+    }.get(section, "")
+    return f"""
+    <section class="hero compact-hero"><div><p class="eyebrow">状态与维护</p><h1>系统</h1><p>查看各项服务是否正常，以及需要采取的处理措施。</p></div></section>
+    {feedback}
+    <nav class="section-tabs" aria-label="系统分区">{tab_html}</nav>
+    {section_body}
+    """
+
+
+def _render_system_status(
+    model: SystemReadModel,
+    *,
+    csrf_token: str,
+    can_admin: bool,
+    idempotency_key: str,
+) -> str:
+    rows = "".join(
+        "<tr>"
+        f"<td><strong>{html(item.name)}</strong></td>"
+        f"<td>{html(item.state.title)}</td>"
+        f"<td>{html(item.state.detail)}</td>"
+        f"<td>{html(item.checked_at)}</td>"
+        "</tr>"
+        for item in model.components
+    )
+    recovery = ""
+    if can_admin:
+        recovery = f"""
+        <form method="post" action="/system/worker-recovery" class="inline-form">
+          <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
+          <input type="hidden" name="idempotency_key" value="{html(idempotency_key)}">
+          <button type="submit">检查并恢复影刀执行端</button>
+        </form>
         """
+    return f"""
+    {render_state(model.overall)}
+    <section class="panel">
+      <header class="panel-header"><div><h2>当前运行状态</h2><p>异常服务会同时说明业务影响和处理方式。</p></div>{recovery}</header>
+      <div class="table-scroll"><table><thead><tr><th>服务</th><th>当前状态</th><th>业务影响或处理方式</th><th>检查时间</th></tr></thead><tbody>{rows}</tbody></table></div>
+    </section>
+    """
+
+
+def _render_system_notifications(
+    model: SystemReadModel,
+    *,
+    csrf_token: str,
+    idempotency_key: str,
+) -> str:
+    state = next(
+        (item.state for item in model.components if item.name == "通知发送"),
+        model.overall,
+    )
+    return f"""
+    <section class="panel">
+      <header class="panel-header"><div><h2>通知通路</h2><p>发送一条测试通知，确认手机端可以正常收到。</p></div></header>
+      {render_state(state)}
+      <form method="post" action="/system/notifications/test" class="control-form">
+        <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
+        <input type="hidden" name="idempotency_key" value="{html(idempotency_key)}">
+        <p>测试通知不会创建任务，也不会触发平台操作。</p>
+        <button type="submit">发送测试通知</button>
+      </form>
+    </section>
+    """
+
+
+def _render_system_data(
+    model: SystemReadModel,
+    *,
+    csrf_token: str,
+    idempotency_key: str,
+) -> str:
+    database = next(
+        (item.state for item in model.components if item.name == "业务数据库"),
+        model.overall,
+    )
+    backup = next(
+        (item.state for item in model.components if item.name == "数据备份"),
+        model.overall,
+    )
+    return f"""
+    <section class="two-column">
+      <article class="panel"><header class="panel-header"><h2>业务数据库</h2></header>{render_state(database)}<p>此处仅检查数据是否可以正常读取；修复操作需要由管理员单独执行。</p></article>
+      <article class="panel"><header class="panel-header"><h2>最近备份</h2></header>{render_state(backup)}<p>备份完成后会在这里显示最近一次可用记录。</p></article>
+    </section>
+    <section class="panel">
+      <header class="panel-header"><div><h2>创建数据备份</h2><p>提交后将在后台创建，不影响当前页面使用。</p></div></header>
+      <form method="post" action="/system/backups" class="control-form">
+        <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
+        <input type="hidden" name="idempotency_key" value="{html(idempotency_key)}">
+        <label class="checkbox-row"><input type="checkbox" name="confirmation" value="CREATE_BACKUP" required> 我确认创建一份新的数据备份</label>
+        <button type="submit">创建备份</button>
+      </form>
+    </section>
+    """
+
+
+def _render_system_diagnostics(model: SystemReadModel) -> str:
+    rows = "".join(
+        f"<tr><td>{html(item.name)}</td><td>{html(item.state.title)}</td><td>{html(item.state.detail)}</td></tr>"
         for item in model.components
     )
     return f"""
-    <section class="hero compact-hero"><div><p class="eyebrow">当前状态</p><h1>系统</h1><p>只展示组件当前状态；历史业务事实留在数据库。</p></div></section>
-    {render_state(model.overall)}
-    <section class="component-grid">{cards}</section>
-    <p class="notice">本页不会启动 Worker、创建队列目录、迁移 Runtime DB 或修改平台。</p>
+    <section class="panel">
+      <header class="panel-header"><div><h2>高级诊断</h2><p>查看各项服务的检查结果和处理建议。</p></div></header>
+      <div class="table-scroll"><table><thead><tr><th>服务</th><th>检查结果</th><th>业务影响或处理方式</th></tr></thead><tbody>{rows}</tbody></table></div>
+      <a class="back-link" href="/database/project">查看项目运行历史</a>
+      <details><summary>技术说明</summary><p>此页面不提供数据库编辑、脚本执行或本机路径修改功能。</p></details>
+    </section>
     """
 
 
@@ -585,7 +782,7 @@ def render_detail(model: DetailReadModel) -> str:
         for label, url in model.related
     )
     related_panel = (
-        f'<section class="panel"><header class="panel-header"><h2>相关事实</h2></header>{related}</section>'
+        f'<section class="panel"><header class="panel-header"><h2>相关记录</h2></header>{related}</section>'
         if related
         else ""
     )

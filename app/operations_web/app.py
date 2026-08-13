@@ -60,6 +60,11 @@ from app.services.review_resolution import (
     ReviewResolutionApplicationService,
     ReviewResolutionError,
 )
+from app.services.operations_maintenance import (
+    MaintenanceReceipt,
+    OperationsMaintenanceApplicationService,
+    OperationsMaintenanceError,
+)
 from app.services.security import LOGIN_RATE_LIMITER, record_security_event
 from app.exceptions import MobileReviewTransactionError
 from app.mobile_review_http import mobile_review_http_status
@@ -84,6 +89,9 @@ DEPENDENCY_OVERRIDE_FIELDS = frozenset(
         "platform_mappings_workbook",
         "shadowbot_identity_mapping",
         "identity_mapping_path",
+        "backup_dir",
+        "backup_root",
+        "automation_heartbeat",
     }
 )
 
@@ -92,6 +100,9 @@ PROTECTED_ROUTES: dict[str, tuple[str, Capability]] = {
     "/database": ("数据库", Capability.VIEW_DATABASE),
     "/management": ("业务管理", Capability.MANAGE_BUSINESS),
     "/system": ("系统", Capability.VIEW_SYSTEM),
+    "/system/notifications": ("通知通路", Capability.SYSTEM_ADMIN),
+    "/system/data": ("数据与备份", Capability.SYSTEM_ADMIN),
+    "/system/diagnostics": ("高级诊断", Capability.SYSTEM_ADMIN),
 }
 
 EPHEMERAL_CONTROL_TTL = timedelta(minutes=15)
@@ -223,6 +234,14 @@ class OperationsWebApplication:
             InventoryRepository(container.runtime_repository),
             container.authorization,
         )
+        self.maintenance = OperationsMaintenanceApplicationService(
+            container.runtime_repository,
+            container.authorization,
+            queue_root=container.settings.paths.queue_root,
+            platform_name=container.settings.platform_name,
+            notification_channel=container.settings.notification_channel,
+            automation_heartbeat=container.settings.paths.automation_heartbeat,
+        )
         self.control_store = _EphemeralControlStore()
 
     def __call__(self, environ, start_response):
@@ -248,7 +267,7 @@ class OperationsWebApplication:
         if self._contains_dependency_override(environ, method):
             return Response.text(
                 "400 Bad Request",
-                "数据库、工作簿和队列位置由服务启动配置固定，不能由请求覆盖。",
+                "该请求包含不允许修改的系统设置。",
                 headers=[("Cache-Control", "no-store")],
             )
 
@@ -259,7 +278,7 @@ class OperationsWebApplication:
                 "200 OK",
                 static_text("app.css"),
                 content_type="text/css; charset=utf-8",
-                headers=[("Cache-Control", "public, max-age=3600")],
+                headers=[("Cache-Control", "no-cache")],
             )
 
         if path == "/static/app.js":
@@ -269,7 +288,7 @@ class OperationsWebApplication:
                 "200 OK",
                 static_text("app.js"),
                 content_type="application/javascript; charset=utf-8",
-                headers=[("Cache-Control", "public, max-age=3600")],
+                headers=[("Cache-Control", "no-cache")],
             )
 
         if path == "/health":
@@ -345,6 +364,21 @@ class OperationsWebApplication:
             if method != "POST":
                 return self._method_not_allowed("POST")
             return self._automation_rerun(environ)
+
+        if path == "/system/worker-recovery":
+            if method != "POST":
+                return self._method_not_allowed("POST")
+            return self._maintenance_request(environ, "WORKER_RECOVERY")
+
+        if path == "/system/notifications/test":
+            if method != "POST":
+                return self._method_not_allowed("POST")
+            return self._maintenance_request(environ, "NOTIFICATION_TEST")
+
+        if path == "/system/backups":
+            if method != "POST":
+                return self._method_not_allowed("POST")
+            return self._maintenance_request(environ, "RELEASE_BACKUP")
 
         if self._is_protected_route(path):
             if method != "GET":
@@ -639,8 +673,42 @@ class OperationsWebApplication:
                     subject,
                 ),
             )
-        elif path == "/system":
-            content = render_system(self.queries.system())
+        elif path.startswith("/system"):
+            receipt_value = self.control_store.get(
+                self._first(query, "maintenance_receipt"),
+                session.principal.subject,
+            )
+            error_value = self.control_store.get(
+                self._first(query, "maintenance_error"),
+                session.principal.subject,
+            )
+            content = render_system(
+                self.queries.system(),
+                csrf_token=session.csrf_token,
+                section={
+                    "/system": "status",
+                    "/system/notifications": "notifications",
+                    "/system/data": "data",
+                    "/system/diagnostics": "diagnostics",
+                }.get(path, "status"),
+                can_admin=self.container.authorization.allows(
+                    session.principal,
+                    Capability.SYSTEM_ADMIN,
+                ),
+                maintenance_receipt=(
+                    receipt_value
+                    if isinstance(receipt_value, MaintenanceReceipt)
+                    else None
+                ),
+                maintenance_error=(
+                    error_value if isinstance(error_value, str) else ""
+                ),
+                idempotency_keys={
+                    "worker": secrets.token_urlsafe(18),
+                    "notification": secrets.token_urlsafe(18),
+                    "backup": secrets.token_urlsafe(18),
+                },
+            )
         else:
             match = DETAIL_ROUTE_PATTERN.fullmatch(path)
             if match is None or DETAIL_ROUTE_OWNERS.get(match.group(2)) != match.group(1):
@@ -654,7 +722,7 @@ class OperationsWebApplication:
                 },
             )
             if detail is None:
-                return Response.text("404 Not Found", "未找到该业务事实。")
+                return Response.text("404 Not Found", "未找到该记录。")
             content = render_detail(detail)
         drawer = render_notification_drawer(self.queries.notification_drawer())
         body = render_template(
@@ -663,7 +731,7 @@ class OperationsWebApplication:
             active_today="active" if path == "/today" else "",
             active_database="active" if path.startswith("/database") else "",
             active_management="active" if path.startswith("/management") else "",
-            active_system="active" if path == "/system" else "",
+            active_system="active" if path.startswith("/system") else "",
             content=content,
             notification_drawer=drawer,
             csrf_token=html(session.csrf_token),
@@ -674,6 +742,86 @@ class OperationsWebApplication:
             body,
             content_type="text/html; charset=utf-8",
             headers=[("Cache-Control", "no-store")],
+        )
+
+    def _maintenance_request(self, environ, intent_type: str) -> Response:
+        session = self.container.sessions.get(str(environ.get("HTTP_COOKIE", "")))
+        if session is None or session.principal is None:
+            return Response.text(
+                "303 See Other",
+                "",
+                headers=[("Location", "/login"), ("Cache-Control", "no-store")],
+            )
+        if not self.container.authorization.allows(
+            session.principal,
+            Capability.SYSTEM_ADMIN,
+        ):
+            record_security_event(
+                "AUTHORIZATION_REJECTED",
+                route=str(environ.get("PATH_INFO", "")),
+                outcome="rejected",
+                reason_code="SYSTEM_ADMIN_REQUIRED",
+                subject=session.principal.subject,
+            )
+            return Response.text("403 Forbidden", "当前账号没有系统维护权限。")
+        form = self._parse_form(environ)
+        if not self.container.sessions.csrf_matches(
+            session,
+            self._first(form, "csrf_token"),
+        ):
+            record_security_event(
+                "CSRF_REJECTED",
+                route=str(environ.get("PATH_INFO", "")),
+                outcome="rejected",
+                reason_code="SESSION_CSRF_INVALID",
+                subject=session.principal.subject,
+            )
+            return Response.text("403 Forbidden", "系统维护请求校验失败，请刷新页面后重试。")
+
+        redirect_path = {
+            "WORKER_RECOVERY": "/system",
+            "NOTIFICATION_TEST": "/system/notifications",
+            "RELEASE_BACKUP": "/system/data",
+        }.get(intent_type, "/system")
+        try:
+            idempotency_key = self._first(form, "idempotency_key")
+            if intent_type == "WORKER_RECOVERY":
+                receipt = self.maintenance.request_worker_recovery(
+                    session.principal,
+                    idempotency_key=idempotency_key,
+                )
+            elif intent_type == "NOTIFICATION_TEST":
+                receipt = self.maintenance.request_notification_test(
+                    session.principal,
+                    idempotency_key=idempotency_key,
+                )
+            elif intent_type == "RELEASE_BACKUP":
+                if self._first(form, "confirmation") != "CREATE_BACKUP":
+                    raise OperationsMaintenanceError("请确认后再创建数据备份。")
+                receipt = self.maintenance.request_backup(
+                    session.principal,
+                    idempotency_key=idempotency_key,
+                )
+            else:
+                return Response.text("404 Not Found", "未知的系统维护操作。")
+            token = self.control_store.put(session.principal.subject, receipt)
+            location = f"{redirect_path}?maintenance_receipt={quote(token, safe='')}"
+        except (OperationsMaintenanceError, ValueError) as exc:
+            token = self.control_store.put(
+                session.principal.subject,
+                str(exc) or "系统维护请求未受理。",
+            )
+            location = f"{redirect_path}?maintenance_error={quote(token, safe='')}"
+        except Exception:
+            token = self.control_store.put(
+                session.principal.subject,
+                "系统维护请求失败，本次没有执行任何维护操作。",
+            )
+            location = f"{redirect_path}?maintenance_error={quote(token, safe='')}"
+        return Response.text(
+            "303 See Other",
+            "",
+            headers=[("Location", location), ("Cache-Control", "no-store")],
         )
 
     def _inventory_adjustment(self, environ) -> Response:
@@ -792,7 +940,7 @@ class OperationsWebApplication:
             return self._control_error_redirect(
                 session.principal.subject,
                 "task_error",
-                "任务创建失败，数据库未保留部分结果。",
+                "任务创建失败，本次没有创建任何任务。",
             )
         token = self.control_store.put(
             session.principal.subject,
@@ -825,7 +973,7 @@ class OperationsWebApplication:
             return self._control_error_redirect(
                 session.principal.subject,
                 "execution_error",
-                "执行预览失败；未投递队列。",
+                "执行预览失败，本次没有发送任何平台任务。",
             )
         token = self.control_store.put(session.principal.subject, preparation)
         return self._management_redirect("execution_preview", token)
@@ -856,7 +1004,7 @@ class OperationsWebApplication:
             return self._control_error_redirect(
                 session.principal.subject,
                 "execution_error",
-                "执行提交失败；请检查队列状态后重新预览，不能直接重试。",
+                "执行提交失败；请先检查系统状态，再重新预览后提交。",
             )
         token = self.control_store.put(
             session.principal.subject,
@@ -937,7 +1085,7 @@ class OperationsWebApplication:
             )
         token = self.control_store.put(
             session.principal.subject,
-            f"{job.display_name}：{'已启用' if job.enabled else '已停用'}，排程 {job.schedule_expression}",
+            f"{job.display_name}已{'启用' if job.enabled else '停用'}。",
         )
         return self._management_redirect("automation_receipt", token)
 
@@ -1009,12 +1157,12 @@ class OperationsWebApplication:
             return self._control_error_redirect(
                 session.principal.subject,
                 "automation_error",
-                "补跑创建失败，没有启动 Web 内执行循环。",
+                "补跑任务创建失败，本次没有开始运行。",
             )
         token = self.control_store.put(
             session.principal.subject,
             (
-                "补跑已创建，等待独立 Automation Service 执行"
+                "补跑任务已创建，等待后台执行"
                 if created
                 else "相同补跑已存在，未重复创建"
             ),

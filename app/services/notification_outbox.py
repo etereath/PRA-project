@@ -71,6 +71,7 @@ REVIEW_TYPE_LABELS = {
     "emergency_protection": "价格异常处理",
 }
 NOTIFICATION_TYPE_TITLES = {
+    "system_test": "通知通路测试",
     "mobile_review_required": "价格异常，请立即处理",
     "review_expired": "复核已超时",
     VERIFICATION_NOTIFICATION_TYPE: "需要验证码，请立即处理",

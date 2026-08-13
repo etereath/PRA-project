@@ -44,6 +44,7 @@ Query Adapter 读取，并通过 Task Adapter 提交结构化 `AgentIntent`；Re
 - [reports/task13_5_7c_read_only_facts.md](reports/task13_5_7c_read_only_facts.md)：13.5-7C 四入口只读事实、后端分页、质量/空值状态、唯一详情归属、Mobile Review 只读状态、真实 Runtime DB 零写和视觉/回归验收报告。
 - [reports/task13_5_7d_authoritative_inventory.md](reports/task13_5_7d_authoritative_inventory.md)：13.5-7D Runtime Schema v17、真实库存唯一权威切换、人工调整、销售净差、取消恢复、库存预警、新 Web 回读与未执行真实 cutover 边界实施报告。
 - [reports/task13_5_7e_control_plane.md](reports/task13_5_7e_control_plane.md)：13.5-7E 人工任务、精确执行授权、桌面/手机原子复核、固定 Automation 配置、薄 Handler、CLI 正式归宿和零真实平台副作用实施报告。
+- [reports/task13_5_7f_cutover_acceptance.md](reports/task13_5_7f_cutover_acceptance.md)：13.5-7F 类型化系统维护、唯一 Web 切换删除、真实库 GET 零写、桌面/手机、完整回归与仍待外部飞书/平台授权的验收边界报告。
 - [prototypes/task13_5_7_operations_web_sample.html](prototypes/task13_5_7_operations_web_sample.html)：四入口“今日”静态样板，展示销售、数据库真实库存、待办、时间轴和业务健康摘要。
 - [prototypes/task13_5_7_database_sample.html](prototypes/task13_5_7_database_sample.html)：只读数据库与销售分析静态样板。
 - [prototypes/task13_5_7_business_management_sample.html](prototypes/task13_5_7_business_management_sample.html)：任务创建/授权、人工复核、固定 Automation 方案和真实库存业务静态样板。
@@ -109,6 +110,7 @@ Query Adapter 读取，并通过 Task Adapter 提交结构化 `AgentIntent`；Re
 - [web_frontend_refresh_plan.md](web_frontend_refresh_plan.md)：Web 运行态运营后台刷新计划和当前进度。
 - [web_localization_display_spec.md](web_localization_display_spec.md)：Web 与飞书通知的运营中文展示术语表。
 - [product_inventory_input_spec.md](product_inventory_input_spec.md)：13.5-7D 切换前的商品资料与工作簿库存历史规则，以及切换后 DB 唯一库存权威、一次性 bootstrap、禁止双写和旧入口删除边界。
+- [clean_runtime_v17_rebuild.md](clean_runtime_v17_rebuild.md)：旧测试 Runtime 完整归档、正式 SKU/库存保留、干净 v17 候选库、真实空 OPEN 订单门禁、激活回读和紧急回滚流程。
 - [price_rule_input_spec.md](price_rule_input_spec.md)：价格规则输入表单化规则，说明 `price_rules.xlsx` 兼容、定价字段、低价边界和旧 `/tables` 入口策略。
 - [listing_rule_input_spec.md](listing_rule_input_spec.md)：上下架规则输入表单化规则，说明 `listing_rules.xlsx` 新字段、三维筛选、策略枚举和 ListingRuleEvaluator 边界。
 - [capacity_plan_input_spec.md](capacity_plan_input_spec.md)：包装产能计划输入表单化规则，说明 `capacity_plans.xlsx` 字段、确认包装能力和 CapacityRuleEvaluator 判断口径。

@@ -181,7 +181,7 @@ def test_review_timeout_and_daily_generation_use_bounded_fields(configured):
         "PRODUCTS",
         "LISTING_RULES",
     ]
-    with pytest.raises(AutomationConfigurationError, match="固定白名单"):
+    with pytest.raises(AutomationConfigurationError, match="只支持价格规则和上下架规则"):
         service.configure_job(
             principal,
             job_id=daily_changed.job_id,

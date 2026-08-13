@@ -418,7 +418,7 @@ def test_prepare_idempotency_replays_same_batch_and_rejects_other_tasks(
     replay = service.prepare_execution(admin, ["TASK-PRICE-A"], "same-auth")
     assert replay == first
 
-    with pytest.raises(ExecutionAuthorizationConflict, match="其他任务"):
+    with pytest.raises(ExecutionAuthorizationConflict, match="与之前的任务不同"):
         service.prepare_execution(admin, ["TASK-OFFLINE-B"], "same-auth")
 
 

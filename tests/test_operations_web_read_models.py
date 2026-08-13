@@ -103,10 +103,10 @@ def test_today_uses_trade_day_summary_and_distinguishes_trustworthy_zero(read_on
     status, _, body = _call_app(app, path="/today", cookie=cookie)
 
     assert status == "200 OK"
-    assert "当前确认无销量" in body
+    assert "已确认暂无销量" in body
     assert "0 扎" in body
     assert "¥0.00" in body
-    assert "当前真实库存权威" in body
+    assert "仅统计当前允许销售的商品" in body
     assert "完整度百分比" not in body
     assert "复购" not in body
     assert "买家端" not in body
@@ -116,17 +116,17 @@ def test_today_uses_trade_day_summary_and_distinguishes_trustworthy_zero(read_on
 @pytest.mark.parametrize(
     ("quality", "sold_qty", "updated_at", "expected_title"),
     [
-        (DataQualityLevel.ORDER_COMPLETE, 3, FIXED_NOW, "销售事实可用"),
-        (DataQualityLevel.ORDER_PARTIAL, 3, FIXED_NOW, "部分销售事实可用"),
-        (DataQualityLevel.SCAN_ESTIMATED_HIGH, 3, FIXED_NOW, "销售事实可用"),
-        (DataQualityLevel.SCAN_ESTIMATED_MEDIUM, 3, FIXED_NOW, "部分销售事实可用"),
-        (DataQualityLevel.SCAN_ESTIMATED_LOW, 3, FIXED_NOW, "部分销售事实可用"),
-        (DataQualityLevel.UNAVAILABLE, None, FIXED_NOW, "销售事实不可用"),
+        (DataQualityLevel.ORDER_COMPLETE, 3, FIXED_NOW, "销售数据已更新"),
+        (DataQualityLevel.ORDER_PARTIAL, 3, FIXED_NOW, "部分销售数据可用"),
+        (DataQualityLevel.SCAN_ESTIMATED_HIGH, 3, FIXED_NOW, "销售数据已更新"),
+        (DataQualityLevel.SCAN_ESTIMATED_MEDIUM, 3, FIXED_NOW, "部分销售数据可用"),
+        (DataQualityLevel.SCAN_ESTIMATED_LOW, 3, FIXED_NOW, "部分销售数据可用"),
+        (DataQualityLevel.UNAVAILABLE, None, FIXED_NOW, "销售数据暂不可用"),
         (
             DataQualityLevel.ORDER_COMPLETE,
             3,
             FIXED_NOW - timedelta(minutes=31),
-            "销售事实可用",
+            "销售数据已更新",
         ),
     ],
 )
@@ -211,7 +211,7 @@ def test_today_does_not_query_a_guessed_trade_day_when_time_policy_is_unavailabl
             "load_operational_time_policies",
             fail_policy_read,
         )
-        expected_title = "交易日时间策略读取失败"
+        expected_title = "销售日期读取失败"
     else:
         monkeypatch.setattr(
             app.queries.automation,
@@ -223,7 +223,7 @@ def test_today_does_not_query_a_guessed_trade_day_when_time_policy_is_unavailabl
                 ),
             ),
         )
-        expected_title = "当前没有唯一有效的交易日时间策略"
+        expected_title = "当前销售日期暂不可用"
 
     def record_summary_query(**kwargs):
         summary_queries.append(kwargs)
@@ -456,14 +456,14 @@ def test_settlement_list_shows_only_current_version_and_marks_historical_detail(
     assert "SUMMARY-V2" in model.table.row_urls[0]
     assert "SUMMARY-V1" not in model.table.row_urls[0]
     assert old_detail is not None
-    assert old_detail.state.title == "历史版本 · 已被取代"
+    assert old_detail.state.title == "历史版本 · 已更新"
     assert any(
-        field.label == "版本身份" and field.value == "历史版本，已被取代"
+        field.label == "版本状态" and field.value == "历史版本，已更新"
         for field in old_detail.fields
     )
     assert current_detail is not None
     assert any(
-        field.label == "版本身份" and field.value == "当前权威版本"
+        field.label == "版本状态" and field.value == "当前版本"
         for field in current_detail.fields
     )
 
@@ -663,13 +663,52 @@ def test_system_page_only_reports_current_component_state(read_only_web) -> None
     status, _, body = _call_app(app, path="/system", cookie=cookie)
 
     assert status == "200 OK"
-    assert "Runtime 数据库" in body
-    assert "业务工作簿" in body
-    assert "执行队列" in body
-    assert "ShadowBot Worker" in body
+    assert "业务数据库" in body
+    assert "商品与规则资料" in body
+    assert "平台任务传递" in body
+    assert "影刀执行端" in body
     assert "历史任务" not in body
     assert "订单历史" not in body
-    assert "不会启动 Worker" in body
+    assert "平台任务暂时不会执行" in body
+
+
+def test_operator_pages_do_not_expose_internal_implementation_language(
+    read_only_web,
+) -> None:
+    app, container, _, _ = read_only_web
+    cookie = _login(app, container)
+    paths = (
+        "/today",
+        "/database",
+        "/database/sales-analysis",
+        "/database/dictionary",
+        "/management",
+        "/system",
+        "/system/notifications",
+        "/system/data",
+        "/system/diagnostics",
+    )
+    forbidden = (
+        "当前 PRA",
+        "后端窄查询",
+        "Runtime 数据库",
+        "ShadowBot Worker",
+        "Importer / Archive",
+        "Outbox / 通知",
+        "Web Route",
+        "bootstrap",
+        "原子事务",
+        "Agent 预测",
+        "当前真实库存权威",
+        "缺失不显示为 0",
+        "可信空页",
+    )
+
+    for path in paths:
+        status, _, body = _call_app(app, path=path, cookie=cookie)
+        assert status == "200 OK"
+        for phrase in forbidden:
+            assert phrase not in body, (path, phrase)
 
 
 def test_operator_labels_do_not_fall_back_to_developer_identifiers() -> None:

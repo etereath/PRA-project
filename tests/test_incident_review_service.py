@@ -26,6 +26,9 @@ from app.operations_web.auth import (
     Principal,
     PrincipalCapabilityBackend,
 )
+from app.operations_web.composition import OperationsWebPaths
+from app.operations_web.presenters import render_mobile_review
+from app.operations_web.queries import OperationsQueryService
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import PRODUCT_HEADERS
 from app.services.incident_management import (
@@ -42,10 +45,8 @@ from app.services.runtime import ReviewTokenService
 from app.services.review_resolution import ReviewResolutionApplicationService
 from app.services.workflow import (
     _read_authoritative_product_cost_snapshot,
-    get_mobile_review_detail,
     resolve_mobile_review,
 )
-from app.web import render_mobile_review_page
 from tests.test_incident_management import detection
 
 NOW = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
@@ -414,14 +415,19 @@ def test_mobile_review_page_shows_three_business_actions_and_price_input(
         required_by=NOW + timedelta(hours=2),
         created_at=NOW + timedelta(minutes=1),
     )
-    detail = get_mobile_review_detail(
-        runtime_repository.db_path,
-        review.review_task.review_task_id,
-        review.raw_token,
-        now=NOW + timedelta(minutes=2),
-    )
+    model = OperationsQueryService(
+        runtime_repository,
+        OperationsWebPaths(
+            runtime_db=runtime_repository.db_path,
+            products_workbook=runtime_repository.db_path.parent / "products.xlsx",
+            price_rules_workbook=runtime_repository.db_path.parent / "price_rules.xlsx",
+            listing_rules_workbook=runtime_repository.db_path.parent / "listing_rules.xlsx",
+            queue_root=runtime_repository.db_path.parent / "queue",
+        ),
+        now_provider=lambda: NOW + timedelta(minutes=2),
+    ).mobile_review(review.review_task.review_task_id, review.raw_token)
 
-    html = render_mobile_review_page(detail=detail, raw_token=review.raw_token)
+    html = render_mobile_review(model)
 
     assert "改价到" in html
     assert "立即下架" in html

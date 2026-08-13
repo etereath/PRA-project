@@ -27,6 +27,10 @@ REQUIRED_WHEEL_MEMBERS = {
     "app/operations_web/static/app.css",
     "app/operations_web/static/app.js",
 }
+FORBIDDEN_LEGACY_WEB_MEMBERS = {
+    "app/web.py",
+    "app/web_styles.py",
+}
 ALLOWED_WHEEL_METADATA = frozenset(
     {"METADATA", "WHEEL", "RECORD", "entry_points.txt", "top_level.txt"}
 )
@@ -232,6 +236,11 @@ def _verify_wheel(path: Path) -> list[str]:
 
         missing = sorted(REQUIRED_WHEEL_MEMBERS - set(names))
         issues.extend(f"missing required core file: {name}" for name in missing)
+        present_legacy_web = sorted(FORBIDDEN_LEGACY_WEB_MEMBERS & set(names))
+        issues.extend(
+            f"legacy Web member must not be packaged: {name}"
+            for name in present_legacy_web
+        )
         if dist_info_root is not None:
             metadata_members = {
                 name.split("/", 1)[1]
@@ -276,6 +285,8 @@ def _verify_sdist(path: Path) -> list[str]:
             elif relative.startswith("app/"):
                 if not relative.endswith(".py") and not OPERATIONS_WEB_RESOURCE_PATTERN.fullmatch(relative):
                     issues.append(f"sdist app member is not declared Python package data: {name}")
+                if relative in FORBIDDEN_LEGACY_WEB_MEMBERS:
+                    issues.append(f"legacy Web member must not be packaged: {name}")
             elif relative.startswith(f"{PACKAGE_NAME}.egg-info/"):
                 metadata_name = relative.split("/", 1)[1]
                 if metadata_name not in ALLOWED_SDIST_EGG_INFO_FILES:
