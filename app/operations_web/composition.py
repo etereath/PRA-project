@@ -34,6 +34,8 @@ class OperationsWebPaths:
     queue_root: Path
     platform_mappings_workbook: Path | None = None
     shadowbot_identity_mapping: Path | None = None
+    backup_root: Path | None = None
+    automation_heartbeat: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +47,8 @@ class OperationsWebSettings:
     admin_password: str = field(repr=False)
     paths: OperationsWebPaths
     shadowbot_applet_uri: str = ""
+    platform_name: str = "蚂蚁花团供应商"
+    notification_channel: str = "feishu"
 
     @classmethod
     def from_environment(
@@ -105,6 +109,18 @@ class OperationsWebSettings:
                 Path("shadowbot/test2/product_identity_mapping.json"),
                 root,
             ),
+            backup_root=_fixed_path(
+                source,
+                "PRA_BACKUP_DIR",
+                Path("data/runtime/backups"),
+                root,
+            ),
+            automation_heartbeat=_fixed_path(
+                source,
+                "PRA_AUTOMATION_HEARTBEAT",
+                Path("data/runtime/automation_service/heartbeat.json"),
+                root,
+            ),
         )
         return cls(
             environment=environment,
@@ -114,6 +130,14 @@ class OperationsWebSettings:
             admin_password=source.get("RUNTIME_ADMIN_PASSWORD", ""),
             paths=paths,
             shadowbot_applet_uri=source.get("SHADOWBOT_APPLET_URI", "").strip(),
+            platform_name=(
+                source.get("PRA_PLATFORM_NAME", "蚂蚁花团供应商").strip()
+                or "蚂蚁花团供应商"
+            ),
+            notification_channel=(
+                source.get("DEFAULT_NOTIFICATION_CHANNEL", "feishu").strip().lower()
+                or "feishu"
+            ),
         )
 
 

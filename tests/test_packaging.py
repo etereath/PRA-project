@@ -154,6 +154,29 @@ class PackagingTests(unittest.TestCase):
             self.assertTrue(any("evidence" in issue for issue in _verify_wheel(empty_wheel)))
             self.assertTrue(any("evidence" in issue for issue in _verify_sdist(empty_sdist)))
 
+    def test_release_artifacts_reject_deleted_legacy_web_modules(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            wheel = root / "legacy-web.whl"
+            sdist = root / "legacy-web.tar.gz"
+            _write_fake_wheel(
+                wheel,
+                extra_member="app/web.py",
+                extra_payload=b"def legacy_web(): pass\n",
+            )
+            _write_fake_sdist(
+                sdist,
+                extra_member="app/web_styles.py",
+                extra_payload=b"def legacy_styles(): pass\n",
+            )
+
+            self.assertTrue(
+                any("legacy Web member" in issue for issue in _verify_wheel(wheel))
+            )
+            self.assertTrue(
+                any("legacy Web member" in issue for issue in _verify_sdist(sdist))
+            )
+
     def test_secret_scan_distinguishes_safe_provider_fields_from_values(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

@@ -32,6 +32,7 @@ from app.services.operational_time import (
 INTERVAL_MINUTES = "INTERVAL_MINUTES"
 DAILY_LOCAL_TIME = "DAILY_LOCAL_TIME"
 CHILD_ONLY = "CHILD_ONLY"
+MANUAL_ONLY = "MANUAL_ONLY"
 
 ONLINE_PULSE = "ONLINE_PULSE"
 FULL_MARKET_SCAN = "FULL_MARKET_SCAN"
@@ -168,7 +169,7 @@ class AutomationSchedulePlanner:
         truncated_total = 0
 
         for job in self.repository.list_jobs(enabled_only=True):
-            if job.schedule_kind == CHILD_ONLY:
+            if job.schedule_kind in {CHILD_ONLY, MANUAL_ONLY}:
                 continue
             last_scheduled_for = self.repository.latest_scheduled_for(
                 job.job_id
@@ -728,6 +729,8 @@ def _due_windows(
     now: datetime,
     max_windows: int,
 ) -> tuple[tuple[datetime, ...], int]:
+    if job.schedule_kind == MANUAL_ONLY:
+        return (), 0
     if job.schedule_kind == INTERVAL_MINUTES:
         minutes = _parse_interval_minutes(job.schedule_expression)
         default_offset = 10 if job.job_type == FULL_MARKET_SCAN else 0

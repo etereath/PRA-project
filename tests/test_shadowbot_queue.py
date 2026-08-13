@@ -619,6 +619,19 @@ class ShadowBotQueueTests(unittest.TestCase):
             self.assertEqual(os.environ["SHADOWBOT_REQUEST_DIR"], str(self.queue_dir))
             self.assertEqual(result, 0)
             build_runner.assert_called_once()
+            heartbeat = json.loads(
+                (
+                    self.queue_dir
+                    / "control"
+                    / "pra_queue_services_heartbeat.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(heartbeat["schema_version"], "queue-services-heartbeat-1.0")
+            self.assertEqual(heartbeat["service"], "shadowbot_queue_services")
+            self.assertEqual(heartbeat["status"], "STOPPED")
+            self.assertEqual(heartbeat["cycle_count"], 1)
+            self.assertFalse(heartbeat["notification_worker_enabled"])
+            self.assertEqual(heartbeat["notification_channel"], "")
 
     def test_unknown_result_creates_one_executor_owned_reconcile_attempt(self) -> None:
         prepared, repository, runner, request, request_path = self._prepare_attempt("UNKNOWN")

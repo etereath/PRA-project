@@ -33,6 +33,10 @@ from app.services.incident_automation import (  # noqa: E402
     build_incident_notification_handlers,
     ensure_incident_notification_automation_job,
 )
+from app.services.maintenance_automation import (  # noqa: E402
+    build_maintenance_handlers,
+    ensure_release_backup_automation_job,
+)
 from app.services.operational_time import (  # noqa: E402
     OperationalTimeService,
 )
@@ -49,6 +53,7 @@ from app.services.settlement_automation import (  # noqa: E402
 from app.services.shadowbot_worker_recovery import (  # noqa: E402
     build_worker_recovery_coordinator_from_environment,
 )
+from scripts.release_backup import create_backup, verify_backup  # noqa: E402
 
 DEFAULT_HEARTBEAT_PATH = Path("data/runtime/automation_service/heartbeat.json")
 DEFAULT_SHADOWBOT_QUEUE_DIR = Path(
@@ -118,6 +123,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_SHADOWBOT_QUEUE_DIR,
     )
+    parser.add_argument(
+        "--enable-release-backup",
+        action="store_true",
+        help=(
+            "Register the fixed manual-only release backup handler. "
+            "It never accepts a script, path, or command from a Web request."
+        ),
+    )
+    parser.add_argument("--release-wheel", type=Path)
+    parser.add_argument("--backup-dir", type=Path)
     parser.add_argument(
         "--platform-mappings",
         type=Path,
@@ -217,6 +232,12 @@ def main() -> int:
         raise ValueError(
             "--enable-worker-recovery 要求同时启用 --enable-incident-monitoring。"
         )
+    if args.enable_release_backup and (
+        args.release_wheel is None or args.backup_dir is None
+    ):
+        raise ValueError(
+            "--enable-release-backup 要求同时提供 --release-wheel 和 --backup-dir。"
+        )
 
     heartbeat = AutomationHeartbeatStore(args.heartbeat)
     lock_path = automation_service_lock_path(args.runtime_db)
@@ -249,6 +270,12 @@ def main() -> int:
             )
             if args.enable_incident_monitoring:
                 ensure_incident_notification_automation_job(
+                    repository,
+                    platform_name=args.platform_name,
+                    now=datetime.now(timezone.utc),
+                )
+            if args.enable_release_backup:
+                ensure_release_backup_automation_job(
                     repository,
                     platform_name=args.platform_name,
                     now=datetime.now(timezone.utc),
@@ -295,6 +322,42 @@ def main() -> int:
                         worker_recovery=worker_recovery,
                     )
                 )
+            if args.enable_release_backup:
+                release_wheel = args.release_wheel.resolve(strict=True)
+                backup_dir = args.backup_dir.resolve(strict=False)
+
+                def execute_release_backup(backup_id: str) -> dict[str, object]:
+                    target = backup_dir / backup_id
+                    created = False
+                    if target.is_dir():
+                        manifest = verify_backup(target)
+                    else:
+                        created_path = create_backup(
+                            runtime_db=args.runtime_db,
+                            backup_dir=backup_dir,
+                            wheel_path=release_wheel,
+                            input_specs=(
+                                ("products.xlsx", args.products),
+                                ("price_rules.xlsx", args.price_rules),
+                                ("listing_rules.xlsx", args.listing_rules),
+                                ("platform_mappings.xlsx", args.platform_mappings),
+                            ),
+                            git_root=PROJECT_ROOT,
+                            backup_id=backup_id,
+                        )
+                        manifest = verify_backup(created_path)
+                        created = True
+                    return {
+                        "backup_id": str(manifest.get("backup_id") or ""),
+                        "verified": True,
+                        "created": created,
+                    }
+
+                handlers.update(
+                    build_maintenance_handlers(
+                        release_backup_executor=execute_release_backup,
+                    )
+                )
             service = AutomationService(
                 repository,
                 handlers=handlers,
@@ -328,6 +391,9 @@ def main() -> int:
                     "platform_write_handlers_registered": False,
                     "worker_recovery_handler_registered": bool(
                         args.enable_worker_recovery
+                    ),
+                    "release_backup_handler_registered": bool(
+                        args.enable_release_backup
                     ),
                     "shadowbot_host_recovery_enabled": (
                         os.environ.get(

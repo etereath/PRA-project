@@ -38,7 +38,12 @@ from app.services.runtime import (  # noqa: E402
     ReviewTokenService,
     RuntimeTaskService,
 )
-from app.web import _RUNTIME_SESSIONS, application  # noqa: E402
+from app.operations_web.app import create_application  # noqa: E402
+from app.operations_web.composition import (  # noqa: E402
+    OperationsWebPaths,
+    OperationsWebSettings,
+    build_container,
+)
 
 
 TEST_DB = ROOT / "data" / "runtime" / "test_runtime_smoke.sqlite3"
@@ -47,6 +52,7 @@ REQUIRED_TABLES = set(REQUIRED_RUNTIME_TABLES)
 SMOKE_SECRET = "smoke-review-token-secret-32-chars-minimum"
 SMOKE_ADMIN_PASSWORD = "smoke-admin-password-only-for-local-smoke"
 SMOKE_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/smoke-placeholder"
+application = None
 
 
 class SmokeContext:
@@ -92,8 +98,8 @@ class SmokeRunner:
             ("非 pending review 重复处理失败", "ReviewTaskService.resolve_review_task", self.check_repeat_review_rejected),
             ("review token 创建、校验、使用后失效", "ReviewTokenService", self.check_review_token_lifecycle),
             ("expired token 或重复 token 使用失败", "ReviewTokenService.validate_token", self.check_expired_or_reused_token_invalid),
-            ("运行态 Web 页面登录保护不泄露数据", "app.web session guard", self.check_web_login_protection),
-            ("/system 不展示敏感信息", "app.web render_system_page", self.check_system_page_safe),
+            ("运营 Web 页面登录保护不泄露数据", "app.operations_web session guard", self.check_web_login_protection),
+            ("/system 不展示敏感信息", "app.operations_web system presenter", self.check_system_page_safe),
         ]
         for name, module, check in checks:
             self._run_check(name, module, check)
@@ -304,34 +310,35 @@ class SmokeRunner:
             self.context.review_task_id,
             self.context.notification_id,
         ]
+        for path in ["/today", "/database", "/management", "/system"]:
+            status, _, body = call_app(path=path)
+            if status != "303 See Other":
+                raise AssertionError(f"{path} 未登录访问未跳转登录：{status}")
+            if "token=" in body:
+                raise AssertionError(f"{path} 未登录页面泄露 token= 痕迹")
+            leaked = [marker for marker in sensitive_markers if marker and marker in body]
+            if leaked:
+                raise AssertionError(f"{path} 未登录页面泄露运行态数据：{', '.join(leaked)}")
         for path in [
             "/dashboard",
             "/tasks",
             "/reviews",
             "/notifications",
             "/task-generator",
-            "/system",
+            "/tables",
+            "/execution",
+            "/manual-intervention",
+            "/runtime/login",
         ]:
-            status, _, body = call_app(path=path, query=urlencode({"runtime_db": str(TEST_DB)}))
-            if not status.startswith("200"):
-                raise AssertionError(f"{path} 未登录访问未返回 200：{status}")
-            if "token=" in body:
-                raise AssertionError(f"{path} 未登录页面泄露 token= 痕迹")
-            leaked = [marker for marker in sensitive_markers if marker and marker in body]
-            if leaked:
-                raise AssertionError(f"{path} 未登录页面泄露运行态数据：{', '.join(leaked)}")
-        for path in ["/", "/tables", "/execution", "/manual-intervention"]:
             status, _, body = call_app(path=path)
-            if status != "403 Forbidden":
-                raise AssertionError(f"{path} 旧路由默认未安全关闭：{status}")
-            if "旧版 Web 路由当前已安全关闭" not in body:
-                raise AssertionError(f"{path} 旧路由关闭提示缺失")
+            if status != "404 Not Found":
+                raise AssertionError(f"{path} 旧路由仍然存在：{status}")
+            if any(marker and marker in body for marker in sensitive_markers):
+                raise AssertionError(f"{path} 旧路由响应泄露运行态数据")
 
     def check_system_page_safe(self) -> None:
-        _RUNTIME_SESSIONS.clear()
         _, login_headers, login_page = call_app(
-            path="/runtime/login",
-            query=urlencode({"runtime_db": str(TEST_DB)}),
+            path="/login",
         )
         login_csrf_match = re.search(r'name="csrf_token" value="([^"]+)"', login_page)
         if login_csrf_match is None:
@@ -339,15 +346,13 @@ class SmokeRunner:
         preauth_cookie = login_headers.get("Set-Cookie", "").split(";", 1)[0]
         login_body = urlencode(
             {
-                "runtime_db": str(TEST_DB),
                 "username": os.environ["RUNTIME_ADMIN_USER"],
                 "password": os.environ["RUNTIME_ADMIN_PASSWORD"],
-                "next": "/system",
                 "csrf_token": login_csrf_match.group(1),
             }
         )
         status, headers, _ = call_app(
-            path="/runtime/login",
+            path="/login",
             method="POST",
             cookie=preauth_cookie,
             body=login_body,
@@ -355,7 +360,7 @@ class SmokeRunner:
         if status != "303 See Other":
             raise AssertionError(f"登录失败：{status}")
         cookie = headers.get("Set-Cookie", "").split(";", 1)[0]
-        status, _, body = call_app(path="/system", query=urlencode({"runtime_db": str(TEST_DB)}), cookie=cookie)
+        status, _, body = call_app(path="/system", cookie=cookie)
         if not status.startswith("200"):
             raise AssertionError(f"/system 登录后访问失败：{status}")
         forbidden_values = [
@@ -426,6 +431,8 @@ def call_app(
     body: str = "",
     cookie: str = "",
 ) -> tuple[str, dict[str, str], str]:
+    if application is None:
+        raise RuntimeError("运营 Web 冒烟应用尚未初始化")
     captured: dict[str, object] = {}
 
     def start_response(status, headers):
@@ -478,6 +485,7 @@ def sanitize_text(text: str) -> str:
 
 @contextmanager
 def smoke_environment():
+    global application
     keys = [
         "DEFAULT_NOTIFICATION_CHANNEL",
         "DEFAULT_NOTIFICATION_RECIPIENT_TYPE",
@@ -519,11 +527,37 @@ def smoke_environment():
             "PRA_ALLOWED_DATA_DIRS": str(TEST_DB.parent),
         }
     )
-    _RUNTIME_SESSIONS.clear()
+    settings = OperationsWebSettings(
+        environment="development",
+        public_scheme="http",
+        cookie_secure=False,
+        admin_username="admin",
+        admin_password=SMOKE_ADMIN_PASSWORD,
+        paths=OperationsWebPaths(
+            runtime_db=TEST_DB,
+            products_workbook=ROOT / "data" / "samples" / "products.xlsx",
+            price_rules_workbook=ROOT / "data" / "samples" / "price_rules.xlsx",
+            listing_rules_workbook=ROOT / "data" / "samples" / "listing_rules.xlsx",
+            platform_mappings_workbook=(
+                ROOT / "data" / "samples" / "platform_mappings.xlsx"
+            ),
+            shadowbot_identity_mapping=(
+                ROOT / "shadowbot" / "test2" / "product_identity_mapping.json"
+            ),
+            queue_root=TEST_DB.parent / "test_runtime_smoke_queue",
+            backup_root=TEST_DB.parent / "test_runtime_smoke_backups",
+            automation_heartbeat=(
+                TEST_DB.parent / "test_runtime_smoke_automation_heartbeat.json"
+            ),
+        ),
+        platform_name="synthetic-platform",
+        notification_channel="mock",
+    )
+    application = create_application(build_container(settings))
     try:
         yield
     finally:
-        _RUNTIME_SESSIONS.clear()
+        application = None
         for key, value in original.items():
             if value is None:
                 os.environ.pop(key, None)

@@ -71,6 +71,9 @@ from app.services.notification_outbox import (
     REVIEW_TYPE_LABELS,
 )
 from app.services.runtime import ReviewTokenService
+from app.services.shadowbot_worker_health import (
+    build_shadowbot_worker_health_report,
+)
 
 
 DEFAULT_PAGE_SIZE = 25
@@ -719,7 +722,13 @@ class OperationsQueryService:
     def system(self) -> SystemReadModel:
         now = self._now()
         checked_at = _datetime(now)
-        components: list[ComponentReadModel] = []
+        components: list[ComponentReadModel] = [
+            ComponentReadModel(
+                "运营 Web",
+                StateReadModel(ReadState.READY, "运行中", "当前请求已由新运营 Web 响应"),
+                checked_at,
+            )
+        ]
         try:
             schema = self.runtime.check_schema_health()
             operational = self.runtime.check_operational_health()
@@ -756,10 +765,39 @@ class OperationsQueryService:
         )
         components.append(ComponentReadModel("业务工作簿", workbook_state, checked_at))
 
+        components.append(
+            ComponentReadModel(
+                "Automation Service",
+                self._automation_state(now),
+                checked_at,
+            )
+        )
+
         queue_state = self._queue_state()
         components.append(ComponentReadModel("执行队列", queue_state, checked_at))
         worker_state = self._worker_state(now)
         components.append(ComponentReadModel("ShadowBot Worker", worker_state, checked_at))
+        components.append(
+            ComponentReadModel(
+                "Importer / Archive",
+                self._importer_state(now),
+                checked_at,
+            )
+        )
+        components.append(
+            ComponentReadModel(
+                "Outbox / 通知",
+                self._notification_state(now),
+                checked_at,
+            )
+        )
+        components.append(
+            ComponentReadModel(
+                "受控备份",
+                self._backup_state(),
+                checked_at,
+            )
+        )
 
         states = {item.state.state for item in components}
         if ReadState.FAILED in states:
@@ -870,7 +908,7 @@ class OperationsQueryService:
                     "等待处理",
                     "请选择处理方式；提交后会通过既有原子事务保存结果。",
                 ),
-                review_title=_review_type_label(review.review_type),
+                review_title=_mobile_review_title(review),
                 reason=review.reason or "需要人工确认",
                 scope=_review_scope(review),
                 deadline=_datetime(review.required_by),
@@ -890,7 +928,7 @@ class OperationsQueryService:
                     "已经处理",
                     "该复核已有正式结果，重复打开不会再次执行操作。",
                 ),
-                review_title=_review_type_label(review.review_type),
+                review_title=_mobile_review_title(review),
                 reason=review.resolution_note or review.reason,
                 scope=_review_scope(review),
                 deadline=_datetime(review.resolved_at),
@@ -1985,27 +2023,161 @@ class OperationsQueryService:
         return StateReadModel(ReadState.READY, "可读取", f"当前待处理/处理中/待导入共 {active} 项")
 
     def _worker_state(self, now: datetime) -> StateReadModel:
-        heartbeat = self.paths.queue_root / "heartbeat.json"
-        if not heartbeat.is_file():
-            return StateReadModel(ReadState.UNAVAILABLE, "没有 Worker 心跳", "状态页不会启动 Worker")
+        try:
+            report = build_shadowbot_worker_health_report(
+                self.paths.queue_root,
+                expected_status="RUNNING",
+                max_age_seconds=30,
+                now=now,
+            )
+        except Exception:
+            return StateReadModel(ReadState.FAILED, "心跳无法读取", "请按既有 Worker 恢复程序处理。")
+        if report.get("ok") is True:
+            return StateReadModel(
+                ReadState.READY,
+                "运行中",
+                f"最近心跳 {str(report.get('updated_at') or '刚刚')}",
+            )
+        error_code = str(report.get("error_code") or "")
+        if error_code == "WORKER_HEARTBEAT_MISSING":
+            return StateReadModel(
+                ReadState.UNAVAILABLE,
+                "没有 Worker 心跳",
+                "可由系统管理员提交检查与恢复请求",
+            )
+        status = str(report.get("status") or "UNKNOWN").upper()
+        checks = report.get("checks") if isinstance(report.get("checks"), dict) else {}
+        if not checks.get("heartbeat_fresh", False):
+            return StateReadModel(
+                ReadState.STALE,
+                "心跳已过期",
+                "可由系统管理员提交检查与恢复请求",
+            )
+        if status == "RUNNING":
+            return StateReadModel(ReadState.INCOMPLETE, "运行状态需复核", "Worker 心跳存在但检查未全部通过")
+        if status == "STOPPED":
+            return StateReadModel(ReadState.UNAVAILABLE, "已停止", "可由系统管理员提交检查与恢复请求")
+        return StateReadModel(ReadState.INCOMPLETE, "状态未知", "请先检查生命周期与队列事实")
+
+    def _automation_state(self, now: datetime) -> StateReadModel:
+        heartbeat = self.paths.automation_heartbeat
+        if heartbeat is None or not heartbeat.is_file():
+            return StateReadModel(ReadState.UNAVAILABLE, "没有服务心跳", "Web 不负责启动 Automation Service")
         try:
             payload = json.loads(heartbeat.read_text(encoding="utf-8-sig"))
             status = str(payload.get("status") or "UNKNOWN").upper()
-            updated_raw = payload.get("updated_at") or payload.get("heartbeat_at")
-            updated = (
-                datetime.fromisoformat(str(updated_raw).replace("Z", "+00:00"))
-                if updated_raw
-                else None
+            updated_raw = payload.get("last_cycle_at") or payload.get("updated_at")
+            updated = datetime.fromisoformat(str(updated_raw).replace("Z", "+00:00"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return StateReadModel(ReadState.FAILED, "心跳无法读取", "请使用独立服务诊断入口检查。")
+        if _age(now, updated) > timedelta(seconds=30):
+            return StateReadModel(ReadState.STALE, "心跳已过期", f"最近周期 {_datetime(updated)}")
+        if status != "RUNNING":
+            return StateReadModel(ReadState.UNAVAILABLE, "已停止", f"最近周期 {_datetime(updated)}")
+        return StateReadModel(ReadState.READY, "运行中", f"最近周期 {_datetime(updated)}")
+
+    def _queue_services_state(self, now: datetime) -> StateReadModel:
+        heartbeat = (
+            self.paths.queue_root
+            / "control"
+            / "pra_queue_services_heartbeat.json"
+        )
+        if not heartbeat.is_file():
+            return StateReadModel(
+                ReadState.UNAVAILABLE,
+                "没有后台服务心跳",
+                "Web 不负责启动 Importer、Watchdog 或通知服务",
+            )
+        try:
+            payload = json.loads(heartbeat.read_text(encoding="utf-8-sig"))
+            if payload.get("schema_version") != "queue-services-heartbeat-1.0":
+                raise ValueError("unsupported queue service heartbeat")
+            if payload.get("service") != "shadowbot_queue_services":
+                raise ValueError("unexpected queue service identity")
+            status = str(payload.get("status") or "UNKNOWN").upper()
+            updated = datetime.fromisoformat(
+                str(payload.get("updated_at") or "").replace("Z", "+00:00")
             )
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return StateReadModel(ReadState.FAILED, "心跳无法读取", "请按既有 Worker 恢复程序处理。")
-        if updated is None or _age(now, updated) > timedelta(seconds=30):
-            return StateReadModel(ReadState.STALE, "心跳已过期", "需要按既有 Worker 恢复程序处理")
-        if status == "RUNNING":
-            return StateReadModel(ReadState.READY, "运行中", f"最近心跳 {_datetime(updated)}")
-        if status == "STOPPED":
-            return StateReadModel(ReadState.UNAVAILABLE, "已停止", f"最近心跳 {_datetime(updated)}")
-        return StateReadModel(ReadState.INCOMPLETE, "状态未知", f"最近心跳 {_datetime(updated)}")
+            return StateReadModel(
+                ReadState.FAILED,
+                "后台服务心跳无法读取",
+                "请使用独立服务诊断入口检查。",
+            )
+        if _age(now, updated) > timedelta(seconds=30):
+            return StateReadModel(
+                ReadState.STALE,
+                "后台服务心跳已过期",
+                f"最近周期 {_datetime(updated)}",
+            )
+        if status != "RUNNING":
+            return StateReadModel(
+                ReadState.UNAVAILABLE,
+                "后台服务已停止",
+                f"最近周期 {_datetime(updated)}",
+            )
+        return StateReadModel(
+            ReadState.READY,
+            "后台服务运行中",
+            f"最近周期 {_datetime(updated)}",
+        )
+
+    def _importer_state(self, now: datetime) -> StateReadModel:
+        service_state = self._queue_services_state(now)
+        if service_state.state is not ReadState.READY:
+            return service_state
+        results = self.paths.queue_root / "results"
+        if not results.is_dir():
+            return StateReadModel(ReadState.UNAVAILABLE, "结果目录不可用", "Web 不会创建队列目录")
+        try:
+            pending = sum(1 for item in results.iterdir() if item.is_file())
+        except OSError:
+            return StateReadModel(ReadState.FAILED, "结果目录读取失败", "请使用独立服务诊断入口检查。")
+        if pending:
+            return StateReadModel(ReadState.INCOMPLETE, "等待导入", f"当前有 {pending} 项结果待导入")
+        return StateReadModel(ReadState.READY, "当前无积压", "结果目录没有待导入文件")
+
+    def _notification_state(self, now: datetime) -> StateReadModel:
+        service_state = self._queue_services_state(now)
+        if service_state.state is not ReadState.READY:
+            return service_state
+        try:
+            values = self.runtime.list_notification_outbox(limit=100, offset=0)
+        except Exception:
+            return StateReadModel(ReadState.FAILED, "通知状态读取失败", "请使用独立服务诊断入口检查。")
+        failed = sum(str(item.status).upper() == "FAILED" for item in values)
+        pending = sum(str(item.status).upper() in {"PENDING", "IN_FLIGHT"} for item in values)
+        if failed:
+            return StateReadModel(ReadState.FAILED, "存在发送失败", f"最近记录中有 {failed} 项失败")
+        if pending:
+            return StateReadModel(ReadState.INCOMPLETE, "等待发送", f"当前有 {pending} 项待发送")
+        return StateReadModel(ReadState.READY, "当前无积压", "通知测试通过 Outbox 异步发送")
+
+    def _backup_state(self) -> StateReadModel:
+        root = self.paths.backup_root
+        latest = root / "latest.json" if root is not None else None
+        if latest is None or not latest.is_file():
+            return StateReadModel(ReadState.UNAVAILABLE, "没有可用备份记录", "受控备份由独立 Automation Service 执行")
+        try:
+            pointer = json.loads(latest.read_text(encoding="utf-8-sig"))
+            backup_id = str(pointer.get("backup_id") or "").strip()
+            manifest_path = root / backup_id / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
+            verified = (
+                backup_id
+                and str(manifest.get("backup_id") or "") == backup_id
+                and manifest.get("secret_values_included") is False
+                and manifest.get("database_validation", {}).get(
+                    "logical_table_counts_match"
+                )
+                is True
+            )
+            created_at = str(manifest.get("created_at_utc") or "")
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return StateReadModel(ReadState.FAILED, "备份清单无法回读", "请使用备份验证 CLI 检查。")
+        if not verified:
+            return StateReadModel(ReadState.FAILED, "备份清单未通过", "请使用备份验证 CLI 检查。")
+        return StateReadModel(ReadState.READY, "最近备份已回读", created_at or "清单验证通过")
 
     def _now(self) -> datetime:
         value = self.now_provider()
@@ -2271,6 +2443,15 @@ def _review_type_label(value: str) -> str:
         "execution_failure": "执行失败复核",
     }
     return labels.get(str(value).lower(), "人工复核")
+
+
+def _mobile_review_title(item: ReviewTask) -> str:
+    if (
+        item.review_type == "emergency_protection"
+        and str(item.review_payload.get("severity") or "").upper() == "S4"
+    ):
+        return "极端低价处理"
+    return _review_type_label(item.review_type)
 
 
 def _review_scope(item: ReviewTask) -> str:

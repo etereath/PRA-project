@@ -437,6 +437,16 @@ def _render_manual_task_controls(
         if error
         else ""
     )
+    platform_choices = checks("platforms", options.platforms)
+    platform_ready = bool(options.platforms)
+    if not platform_ready:
+        platform_choices = (
+            '<p class="empty-copy">当前没有启用的平台商品映射，不能创建任务。</p>'
+        )
+        error_html += (
+            '<div class="state-banner state-unavailable"><strong>暂无可用平台</strong>'
+            '<p>请先在商品映射维护流程中启用至少一个平台映射。</p></div>'
+        )
     preview_html = ""
     if preview is not None:
         rows = "".join(
@@ -498,11 +508,11 @@ def _render_manual_task_controls(
         <header class="dialog-header"><div><p class="eyebrow">创建任务</p><h2>选择任务范围</h2></div><button type="button" class="icon-button" data-dialog-close aria-label="关闭">×</button></header>
         <fieldset><legend>品种（可多选）</legend><div class="chip-row">{checks('varieties', options.varieties)}</div></fieldset>
         <fieldset><legend>等级（可多选）</legend><div class="chip-row">{checks('grades', options.grades)}</div></fieldset>
-        <fieldset><legend>平台（可多选）</legend><div class="chip-row">{checks('platforms', options.platforms)}</div></fieldset>
+        <fieldset><legend>平台（可多选）</legend><div class="chip-row">{platform_choices}</div></fieldset>
         <label>任务类型<select name="action" data-task-action><option value="SET_PRICE">调整价格到</option><option value="CHANGE_PRICE">加/降价</option><option value="SET_OFFLINE">下架</option><option value="SET_ONLINE">上架</option></select></label>
         <label data-price-field><span data-price-label>目标价格</span><input name="price_value" inputmode="decimal" placeholder="请输入目标价格"></label>
         <label data-inventory-field hidden>平台目标库存<input name="target_inventory" type="number" min="0" step="1"></label>
-        <footer class="dialog-actions"><button type="button" class="secondary" data-dialog-close>取消</button><button type="submit">预览任务</button></footer>
+        <footer class="dialog-actions"><button type="button" class="secondary" data-dialog-close>取消</button><button type="submit"{' disabled' if not platform_ready else ''}>预览任务</button></footer>
       </form>
     </dialog>
     """
@@ -557,21 +567,171 @@ def _render_execution_controls(
     """
 
 
-def render_system(model: SystemReadModel) -> str:
-    cards = "".join(
-        f"""
-        <article class="component-card state-{html(item.state.state.value)}">
-          <header><h2>{html(item.name)}</h2><span>{html(item.state.title)}</span></header>
-          <p>{html(item.state.detail)}</p><small>检查于 {html(item.checked_at)}</small>
-        </article>
+def render_system(
+    model: SystemReadModel,
+    *,
+    csrf_token: str,
+    section: str,
+    can_admin: bool,
+    maintenance_receipt=None,
+    maintenance_error: str = "",
+    idempotency_keys: dict[str, str] | None = None,
+) -> str:
+    keys = idempotency_keys or {}
+    tabs = [("status", "/system", "运行状态")]
+    if can_admin:
+        tabs.extend(
+            [
+                ("notifications", "/system/notifications", "通知通路"),
+                ("data", "/system/data", "数据与备份"),
+                ("diagnostics", "/system/diagnostics", "高级诊断"),
+            ]
+        )
+    tab_html = "".join(
+        f'<a class="section-tab {"active" if name == section else ""}" href="{url}">{label}</a>'
+        for name, url, label in tabs
+    )
+    feedback = ""
+    if maintenance_receipt is not None:
+        replay = "（重复请求已复用原结果）" if maintenance_receipt.replayed else ""
+        feedback = (
+            '<div class="state-banner state-ready"><strong>请求已受理</strong>'
+            f'<p>{html(maintenance_receipt.message + replay)}</p></div>'
+        )
+    elif maintenance_error:
+        feedback = (
+            '<div class="state-banner state-failed"><strong>请求未受理</strong>'
+            f'<p>{html(maintenance_error)}</p></div>'
+        )
+
+    section_body = {
+        "status": _render_system_status(
+            model,
+            csrf_token=csrf_token,
+            can_admin=can_admin,
+            idempotency_key=keys.get("worker", ""),
+        ),
+        "notifications": _render_system_notifications(
+            model,
+            csrf_token=csrf_token,
+            idempotency_key=keys.get("notification", ""),
+        ),
+        "data": _render_system_data(
+            model,
+            csrf_token=csrf_token,
+            idempotency_key=keys.get("backup", ""),
+        ),
+        "diagnostics": _render_system_diagnostics(model),
+    }.get(section, "")
+    return f"""
+    <section class="hero compact-hero"><div><p class="eyebrow">受控系统维护</p><h1>系统</h1><p>只判断组件当前状态、业务影响和恢复入口；历史事实留在数据库。</p></div></section>
+    {feedback}
+    <nav class="section-tabs" aria-label="系统分区">{tab_html}</nav>
+    {section_body}
+    <p class="notice">Web Route 不运行脚本、不接受路径或命令，也不会启动 Worker；维护意图交给既有 Outbox 或 Automation Service。</p>
+    """
+
+
+def _render_system_status(
+    model: SystemReadModel,
+    *,
+    csrf_token: str,
+    can_admin: bool,
+    idempotency_key: str,
+) -> str:
+    rows = "".join(
+        "<tr>"
+        f"<td><strong>{html(item.name)}</strong></td>"
+        f"<td>{html(item.state.title)}</td>"
+        f"<td>{html(item.state.detail)}</td>"
+        f"<td>{html(item.checked_at)}</td>"
+        "</tr>"
+        for item in model.components
+    )
+    recovery = ""
+    if can_admin:
+        recovery = f"""
+        <form method="post" action="/system/worker-recovery" class="inline-form">
+          <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
+          <input type="hidden" name="idempotency_key" value="{html(idempotency_key)}">
+          <button type="submit">检查并恢复 Worker</button>
+        </form>
         """
+    return f"""
+    {render_state(model.overall)}
+    <section class="panel">
+      <header class="panel-header"><div><h2>当前运行状态</h2><p>这里只展示状态，不复制 Run、Task 或 Queue 文件历史。</p></div>{recovery}</header>
+      <div class="table-scroll"><table><thead><tr><th>组件</th><th>当前状态</th><th>状态依据</th><th>检查时间</th></tr></thead><tbody>{rows}</tbody></table></div>
+    </section>
+    """
+
+
+def _render_system_notifications(
+    model: SystemReadModel,
+    *,
+    csrf_token: str,
+    idempotency_key: str,
+) -> str:
+    state = next(
+        (item.state for item in model.components if item.name == "Outbox / 通知"),
+        model.overall,
+    )
+    return f"""
+    <section class="panel">
+      <header class="panel-header"><div><h2>通知通路</h2><p>测试消息不关联 Review、Incident 或平台动作。</p></div></header>
+      {render_state(state)}
+      <form method="post" action="/system/notifications/test" class="control-form">
+        <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
+        <input type="hidden" name="idempotency_key" value="{html(idempotency_key)}">
+        <p>提交后只创建一条类型化 Outbox 通知，由独立通知 Worker 完成实际发送。</p>
+        <button type="submit">发送通知通路测试</button>
+      </form>
+    </section>
+    """
+
+
+def _render_system_data(
+    model: SystemReadModel,
+    *,
+    csrf_token: str,
+    idempotency_key: str,
+) -> str:
+    database = next(
+        (item.state for item in model.components if item.name == "Runtime 数据库"),
+        model.overall,
+    )
+    backup = next(
+        (item.state for item in model.components if item.name == "受控备份"),
+        model.overall,
+    )
+    return f"""
+    <section class="two-column">
+      <article class="panel"><header class="panel-header"><h2>Runtime 数据库</h2></header>{render_state(database)}<p>普通 GET 永不初始化、迁移或修复数据库。已知问题另走管理员 CLI 与备份/回读门禁。</p></article>
+      <article class="panel"><header class="panel-header"><h2>最近备份</h2></header>{render_state(backup)}<p>页面不显示本机路径；详细校验和恢复继续使用既有管理员 CLI。</p></article>
+    </section>
+    <section class="panel">
+      <header class="panel-header"><div><h2>创建受控备份</h2><p>备份由独立 Automation Service 调用既有 release backup，不在 Web 请求内执行。</p></div></header>
+      <form method="post" action="/system/backups" class="control-form">
+        <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
+        <input type="hidden" name="idempotency_key" value="{html(idempotency_key)}">
+        <label class="checkbox-row"><input type="checkbox" name="confirmation" value="CREATE_BACKUP" required> 我确认创建一份新的受控备份</label>
+        <button type="submit">提交备份请求</button>
+      </form>
+    </section>
+    """
+
+
+def _render_system_diagnostics(model: SystemReadModel) -> str:
+    rows = "".join(
+        f"<tr><td>{html(item.name)}</td><td>{html(item.state.title)}</td><td>{html(item.state.detail)}</td></tr>"
         for item in model.components
     )
     return f"""
-    <section class="hero compact-hero"><div><p class="eyebrow">当前状态</p><h1>系统</h1><p>只展示组件当前状态；历史业务事实留在数据库。</p></div></section>
-    {render_state(model.overall)}
-    <section class="component-grid">{cards}</section>
-    <p class="notice">本页不会启动 Worker、创建队列目录、迁移 Runtime DB 或修改平台。</p>
+    <section class="panel">
+      <header class="panel-header"><div><h2>高级诊断</h2><p>仅展示已脱敏状态；不提供 SQL、脚本、Cron、路径或 Queue 编辑器。</p></div></header>
+      <div class="table-scroll"><table><thead><tr><th>组件</th><th>诊断结论</th><th>依据</th></tr></thead><tbody>{rows}</tbody></table></div>
+      <a class="back-link" href="/database/project">查看项目运行历史</a>
+    </section>
     """
 
 

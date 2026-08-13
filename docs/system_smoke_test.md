@@ -104,8 +104,8 @@ data/runtime/pra_runtime.sqlite3
 - `OutboxReviewNotificationService / FakeSender`：检查 `DEFAULT_NOTIFICATION_CHANNEL=mock`、Outbox 入队和兼容日志投影。
 - `ReviewTaskService / RuntimeTaskService`：检查复核状态流转、source task 推动和历史记录。
 - `ReviewTokenService`：检查 `REVIEW_TOKEN_SECRET`、token hash、过期、撤销和 `used_at` 逻辑。
-- `app.web session guard`：检查 Web Session 登录保护，避免公网未登录暴露运行态数据。
-- `app.web render_system_page`：检查 `/system` 的脱敏展示，避免泄露 secret、webhook、raw token 或本地完整路径。
+- `app.operations_web session guard`：检查运营 Web Session 登录保护，避免公网未登录暴露运行态数据。
+- `app.operations_web render_system`：检查 `/system` 的脱敏展示，避免泄露 secret、webhook、raw token 或本地完整路径。
 
 如果冒烟测试失败，建议先修复并重新运行脚本，再进入更深入的 Code Review、发布验收或下一轮功能开发。
 

@@ -6,11 +6,13 @@ import json
 import re
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 from urllib.parse import urlencode
+from wsgiref.simple_server import WSGIRequestHandler
 
 import pytest
 
-from app.operations_web.app import create_application
+from app.operations_web.app import RedactingRequestHandler, create_application
 from app.operations_web.auth import (
     Capability,
     Principal,
@@ -24,15 +26,20 @@ from app.operations_web.composition import (
     OperationsWebSettings,
     build_container,
 )
+from app.operations_web.presenters import _render_manual_task_controls
 from app.enums import AutomationRunStatus, ReviewTaskStatus
 from app.models import ReviewTask
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.automation_repository import AutomationRepository
+from app.repositories.operational_incident_repository import (
+    OperationalIncidentRepository,
+)
 from app.services.automation import (
     ONLINE_PULSE,
     PLATFORM_TRADE_DAY_SETTLEMENT,
     ensure_default_automation_jobs,
 )
+from app.services.manual_task_orchestration import ManualTaskScopeOptions
 from app.services.security import (
     LoginRateLimiter,
     clear_security_audit_events,
@@ -43,6 +50,11 @@ from app.services.security import (
 class DenySystemAuthorization:
     def allows(self, principal: Principal, capability: Capability) -> bool:
         return capability != Capability.VIEW_SYSTEM
+
+
+class DenySystemAdminAuthorization:
+    def allows(self, principal: Principal, capability: Capability) -> bool:
+        return capability != Capability.SYSTEM_ADMIN
 
 
 @pytest.fixture()
@@ -58,6 +70,36 @@ def operations_web(tmp_path: Path):
     queue_root = tmp_path / "queue"
     for name in ("inbox", "working", "results", "archive"):
         (queue_root / name).mkdir(parents=True, exist_ok=True)
+    (queue_root / "control").mkdir(parents=True, exist_ok=True)
+    current = datetime.now(timezone.utc)
+    (queue_root / "control" / "pra_queue_services_heartbeat.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "queue-services-heartbeat-1.0",
+                "service": "shadowbot_queue_services",
+                "status": "RUNNING",
+                "updated_at": current.isoformat(),
+                "notification_worker_enabled": True,
+                "notification_channel": "feishu",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    automation_heartbeat = tmp_path / "automation-heartbeat.json"
+    automation_heartbeat.write_text(
+        json.dumps(
+            {
+                "schema_version": "automation-heartbeat-1.0",
+                "status": "RUNNING",
+                "last_cycle_at": current.isoformat(),
+                "worker_recovery_handler_registered": True,
+                "release_backup_handler_registered": True,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     settings = OperationsWebSettings(
         environment="development",
         public_scheme="http",
@@ -70,6 +112,7 @@ def operations_web(tmp_path: Path):
             price_rules_workbook=price_rules,
             listing_rules_workbook=listing_rules,
             queue_root=queue_root,
+            automation_heartbeat=automation_heartbeat,
         ),
     )
     container = build_container(settings)
@@ -412,6 +455,9 @@ def test_all_get_routes_are_zero_write_and_never_initialize_schema(operations_we
         ("/management/task/NO-SUCH-TASK", authenticated_cookie, {"404"}),
         ("/management/review/NO-SUCH-REVIEW", authenticated_cookie, {"404"}),
         ("/system", authenticated_cookie, {"200"}),
+        ("/system/notifications", authenticated_cookie, {"200"}),
+        ("/system/data", authenticated_cookie, {"200"}),
+        ("/system/diagnostics", authenticated_cookie, {"200"}),
         ("/mobile/review/REVIEW-SYNTHETIC", "", {"404"}),
         ("/static/app.css", "", {"200"}),
     ]
@@ -676,6 +722,162 @@ def test_capability_backend_denial_is_enforced_by_route(operations_web) -> None:
     assert "没有访问" in body
 
 
+def test_system_admin_is_separate_from_status_view(operations_web) -> None:
+    _, original, _ = operations_web
+    restricted = OperationsWebContainer(
+        settings=original.settings,
+        runtime_repository=original.runtime_repository,
+        credentials=original.credentials,
+        authorization=DenySystemAdminAuthorization(),
+        sessions=original.sessions,
+    )
+    app = create_application(restricted)
+    _, authenticated = login(app, restricted)
+
+    assert call_app(app, path="/system", cookie=authenticated)[0] == "200 OK"
+    for path in (
+        "/system/notifications",
+        "/system/data",
+        "/system/diagnostics",
+    ):
+        assert call_app(app, path=path, cookie=authenticated)[0] == "403 Forbidden"
+    session = restricted.sessions.get(authenticated)
+    assert session is not None
+    status, _, body = call_app(
+        app,
+        path="/system/notifications/test",
+        method="POST",
+        cookie=authenticated,
+        form={
+            "csrf_token": session.csrf_token,
+            "idempotency_key": "denied-notification-test",
+        },
+    )
+    assert status == "403 Forbidden"
+    assert "系统维护权限" in body
+    assert restricted.runtime_repository.list_notification_outbox() == []
+
+
+def test_system_reads_independent_queue_service_heartbeat(operations_web) -> None:
+    app, container, _ = operations_web
+    heartbeat = (
+        container.settings.paths.queue_root
+        / "control"
+        / "pra_queue_services_heartbeat.json"
+    )
+    heartbeat.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    heartbeat.write_text(
+        json.dumps(
+            {
+                "schema_version": "queue-services-heartbeat-1.0",
+                "service": "shadowbot_queue_services",
+                "status": "RUNNING",
+                "updated_at": now.isoformat(),
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    components = {item.name: item.state for item in app.queries.system().components}
+
+    assert components["Importer / Archive"].state.value == "ready"
+    assert components["Outbox / 通知"].state.value == "ready"
+    assert "后台服务" in components["Importer / Archive"].detail or (
+        components["Importer / Archive"].title == "当前无积压"
+    )
+
+
+def test_system_maintenance_posts_are_typed_csrf_protected_and_async(
+    operations_web,
+) -> None:
+    app, container, _ = operations_web
+    _, authenticated = login(app, container)
+    session = container.sessions.get(authenticated)
+    assert session is not None
+
+    status, _, _ = call_app(
+        app,
+        path="/system/notifications/test",
+        method="POST",
+        cookie=authenticated,
+        form={
+            "csrf_token": "invalid",
+            "idempotency_key": "notification-test-invalid",
+        },
+    )
+    assert status == "403 Forbidden"
+
+    status, headers, _ = call_app(
+        app,
+        path="/system/notifications/test",
+        method="POST",
+        cookie=authenticated,
+        form={
+            "csrf_token": session.csrf_token,
+            "idempotency_key": "notification-test-valid",
+        },
+    )
+    assert status == "303 See Other"
+    assert header_values(headers, "Location")[0].startswith(
+        "/system/notifications?maintenance_receipt="
+    )
+    notifications = container.runtime_repository.list_notification_outbox()
+    assert len(notifications) == 1
+    assert notifications[0].status == "PENDING"
+
+    status, _, _ = call_app(
+        app,
+        path="/system/backups",
+        method="POST",
+        cookie=authenticated,
+        form={
+            "csrf_token": session.csrf_token,
+            "idempotency_key": "backup-without-confirmation",
+        },
+    )
+    assert status == "303 See Other"
+    assert AutomationRepository(container.runtime_repository).list_runs() == []
+
+    status, headers, _ = call_app(
+        app,
+        path="/system/backups",
+        method="POST",
+        cookie=authenticated,
+        form={
+            "csrf_token": session.csrf_token,
+            "idempotency_key": "backup-with-confirmation",
+            "confirmation": "CREATE_BACKUP",
+        },
+    )
+    assert status == "303 See Other"
+    assert header_values(headers, "Location")[0].startswith(
+        "/system/data?maintenance_receipt="
+    )
+    runs = AutomationRepository(container.runtime_repository).list_runs()
+    assert len(runs) == 1
+    assert runs[0].job_type == "RELEASE_BACKUP_MAINTENANCE"
+    assert runs[0].run_status is AutomationRunStatus.SCHEDULED
+
+    status, headers, _ = call_app(
+        app,
+        path="/system/worker-recovery",
+        method="POST",
+        cookie=authenticated,
+        form={
+            "csrf_token": session.csrf_token,
+            "idempotency_key": "worker-recovery-valid",
+        },
+    )
+    assert status == "303 See Other"
+    assert header_values(headers, "Location")[0].startswith(
+        "/system?maintenance_receipt="
+    )
+    assert len(OperationalIncidentRepository(container.runtime_repository).list_active()) == 1
+    assert len(AutomationRepository(container.runtime_repository).list_runs()) == 2
+
+
 def test_security_headers_are_applied_to_html_health_errors_and_static(operations_web) -> None:
     app, _, _ = operations_web
     for path in ("/login", "/health", "/not-found", "/static/app.css"):
@@ -726,3 +928,74 @@ def test_templates_and_styles_use_only_local_assets() -> None:
         assert "http://" not in text
         assert "https://" not in text
         assert "cdn" not in text.lower()
+
+
+def test_manual_task_dialog_hides_conditional_fields_and_blocks_empty_platforms() -> None:
+    content = _render_manual_task_controls(
+        csrf_token="csrf",
+        options=ManualTaskScopeOptions(
+            varieties=("艾莎",),
+            grades=("A",),
+            platforms=(),
+        ),
+        preview=None,
+        preview_token="",
+        receipt=(),
+        error="",
+        idempotency_key="manual-task-test",
+    )
+    styles = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "operations_web"
+        / "static"
+        / "app.css"
+    ).read_text(encoding="utf-8")
+
+    assert "当前没有启用的平台商品映射" in content
+    assert '<button type="submit" disabled>预览任务</button>' in content
+    assert "data-inventory-field hidden" in content
+    assert "[hidden] { display: none !important; }" in styles
+
+
+def test_static_assets_must_revalidate_after_deployment(operations_web) -> None:
+    app, container, _ = operations_web
+    for path in ("/static/app.css", "/static/app.js"):
+        status, headers, _ = call_app(app, path=path)
+        assert status == "200 OK"
+        assert header_values(headers, "Cache-Control") == ["no-cache"]
+
+    _, _, login_body = call_app(app, path="/login")
+    assert '/static/app.css?v=7f' in login_body
+    _, authenticated = login(app, container)
+    _, _, page_body = call_app(app, path="/management", cookie=authenticated)
+    assert '/static/app.css?v=7f' in page_body
+    assert '/static/app.js?v=7f' in page_body
+
+
+def test_web_and_background_service_startup_scripts_are_independent() -> None:
+    scripts = Path(__file__).resolve().parents[1] / "scripts"
+    web_start = (scripts / "start_local.ps1").read_text(encoding="utf-8")
+    services_start = (scripts / "start_local_services.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert "serve-web" in web_start
+    assert "run_shadowbot_queue_services.py" not in web_start
+    assert "start_local_services.ps1" not in web_start
+    assert "Stop-Process" not in web_start
+    assert "run_shadowbot_queue_services.py" in services_start
+    assert "serve-web" not in services_start
+
+
+def test_request_log_redacts_the_entire_mobile_review_query() -> None:
+    handler = object.__new__(RedactingRequestHandler)
+    with patch.object(WSGIRequestHandler, "log_message") as parent:
+        handler.log_message(
+            "%s",
+            "GET /mobile/review/REVIEW-1?token=secret-token&next=1 HTTP/1.1",
+        )
+
+    rendered = repr(parent.call_args)
+    assert "secret-token" not in rendered
+    assert "[query-redacted]" in rendered
