@@ -144,7 +144,7 @@ class ExecutionAuthorizationApplicationService:
         task_ids = _exact_task_ids(exact_task_ids)
         key = str(idempotency_key or "").strip()
         if not key or len(key) > 160:
-            raise ExecutionAuthorizationError("执行预览缺少有效幂等键。")
+            raise ExecutionAuthorizationError("本次执行预览已失效，请刷新页面后重试。")
         semantic_key = (authenticated_principal.subject, key)
         with self._lock:
             self._purge(current)
@@ -154,7 +154,7 @@ class ExecutionAuthorizationApplicationService:
                 if existing is not None and existing.public.task_ids == task_ids:
                     return existing.public
                 raise ExecutionAuthorizationConflict(
-                    "该执行幂等键已绑定其他任务批次。"
+                    "本次执行请求与之前的任务不同，请刷新页面后重新预览。"
                 )
 
         facts = self._revalidate(task_ids, current)
@@ -425,7 +425,7 @@ class ExecutionAuthorizationApplicationService:
             or str(existing["manifest_sha256"]) != str(built["manifest_sha256"])
         ):
             raise ExecutionAuthorizationConflict(
-                "该执行幂等键对应的 v4 批次已变化或已使用。"
+                "这批任务已经发生变化或已提交，请重新预览。"
             )
         return built
 
@@ -437,12 +437,12 @@ class ExecutionAuthorizationApplicationService:
         products_bytes = self.products_workbook.read_bytes()
         products = load_products(self.products_workbook)
         if self.products_workbook.read_bytes() != products_bytes:
-            raise ExecutionAuthorizationConflict("商品主数据读取期间发生变化。")
+            raise ExecutionAuthorizationConflict("商品资料刚刚发生变化，请重新预览。")
         product_by_sku = {product.internal_sku.upper(): product for product in products}
         mapping_bytes = self.platform_mappings_workbook.read_bytes()
         mappings = compile_product_mapping_workbook(self.platform_mappings_workbook)
         if self.platform_mappings_workbook.read_bytes() != mapping_bytes:
-            raise ExecutionAuthorizationConflict("平台映射读取期间发生变化。")
+            raise ExecutionAuthorizationConflict("商品与平台的对应关系刚刚发生变化，请重新预览。")
         shadowbot_mapping_bytes = self.shadowbot_identity_mapping.read_bytes()
         identity_mapping = load_identity_mapping(self.shadowbot_identity_mapping)
         inventory = self.inventory
@@ -450,11 +450,11 @@ class ExecutionAuthorizationApplicationService:
         with closing(self.runtime.connect_read()) as connection:
             if has_active_automation_ui_run(connection, now=current):
                 raise ExecutionAuthorizationConflict(
-                    "Automation UI 扫描正在运行，暂不能提交平台执行。"
+                    "平台状态正在更新，暂不能提交执行，请稍后重试。"
                 )
             authority = inventory.get_authority_state(connection=connection)
             if authority.authority_mode != "DB_AUTHORITY":
-                raise ExecutionAuthorizationConflict("数据库真实库存尚未完成权威切换。")
+                raise ExecutionAuthorizationConflict("库存资料正在维护，暂不能提交执行。")
             rows = connection.execute(
                 "SELECT * FROM tasks WHERE task_id IN ("
                 + ",".join("?" for _ in task_ids)
@@ -474,23 +474,23 @@ class ExecutionAuthorizationApplicationService:
                 TaskActionType.SET_ONLINE,
                 TaskActionType.SET_OFFLINE,
             }:
-                raise ExecutionAuthorizationConflict("任务动作不属于平台执行 allowlist。")
+                raise ExecutionAuthorizationConflict("所选任务类型不能发送到销售平台。")
 
             item_facts: list[dict[str, object]] = []
             for task_id in task_ids:
                 row = rows_by_id[task_id]
                 if str(row["task_status"]) != TaskStatus.PENDING.value:
-                    raise ExecutionAuthorizationConflict(f"任务不是 pending：{task_id}")
+                    raise ExecutionAuthorizationConflict("所选任务已不在待执行状态，请刷新列表。")
                 expires_at = _parse_datetime(row["expires_at"])
                 if expires_at is not None and expires_at <= current:
                     raise ExecutionAuthorizationConflict(f"任务已过期：{task_id}")
                 sku = str(row["internal_sku"] or "").strip().upper()
                 product = product_by_sku.get(sku)
                 if product is None:
-                    raise ExecutionAuthorizationConflict(f"商品主数据缺少 SKU：{sku}")
+                    raise ExecutionAuthorizationConflict(f"商品资料中缺少商品编码：{sku}")
                 balance = inventory.get_balance(sku, connection=connection)
                 if balance is None:
-                    raise ExecutionAuthorizationConflict(f"真实库存缺少 SKU：{sku}")
+                    raise ExecutionAuthorizationConflict(f"数据库库存中缺少商品：{sku}")
                 target_price = _optional_decimal(row["target_price"])
                 if target_price is not None and target_price < product.base_cost:
                     raise ExecutionAuthorizationConflict(f"任务价格低于基础成本：{task_id}")
@@ -498,7 +498,7 @@ class ExecutionAuthorizationApplicationService:
                     target_inventory = int(row["target_inventory"])
                     if target_inventory > balance.current_qty:
                         raise ExecutionAuthorizationConflict(
-                            f"上架目标库存超过真实库存：{task_id}"
+                            "上架目标库存超过数据库库存，请重新设置。"
                         )
                 pending_review = connection.execute(
                     """
@@ -535,25 +535,25 @@ class ExecutionAuthorizationApplicationService:
                     for row in active_locks
                 )
                 if active_lock:
-                    raise ExecutionAuthorizationConflict(f"商品存在平台写锁：{sku}")
+                    raise ExecutionAuthorizationConflict(f"商品 {sku} 正在执行其他平台操作，请稍后重试。")
 
                 identity = identity_mapping.get(sku)
                 if identity is None:
-                    raise ExecutionAuthorizationConflict(f"执行映射缺少 SKU：{sku}")
+                    raise ExecutionAuthorizationConflict(f"影刀执行端缺少商品：{sku}")
                 listing = self.runtime.get_listing_status(
                     next(iter(platforms)),
                     identity["expected_product_name"],
                     identity["expected_grade"],
                 )
                 if listing is None:
-                    raise ExecutionAuthorizationConflict(f"平台事实缺少 SKU：{sku}")
+                    raise ExecutionAuthorizationConflict(f"缺少商品 {sku} 的最新平台状态。")
                 expected_old = _optional_decimal(row["expected_old_price"])
                 if (
                     action_type is TaskActionType.UPDATE_PRICE
                     and expected_old != listing.current_price
                 ):
                     raise ExecutionAuthorizationConflict(
-                        f"任务旧价与最新平台事实不一致：{task_id}"
+                        "任务中的原价格与平台最新价格不一致，请重新预览。"
                     )
                 trace = json.loads(str(row["decision_trace_json"] or "{}"))
                 frozen_mapping_version = str(trace.get("mapping_version") or "")
@@ -561,7 +561,7 @@ class ExecutionAuthorizationApplicationService:
                     frozen_mapping_version
                     and frozen_mapping_version != mappings.mapping_version
                 ):
-                    raise ExecutionAuthorizationConflict(f"平台映射版本已变化：{task_id}")
+                    raise ExecutionAuthorizationConflict("商品与平台的对应关系发生变化，请重新预览。")
                 resolution = mappings.resolve(
                     platform_name=next(iter(platforms)),
                     platform_product_name=identity["expected_product_name"],
@@ -572,7 +572,7 @@ class ExecutionAuthorizationApplicationService:
                     resolution.mapping_status is not ProductMappingStatus.VERIFIED
                     or str(resolution.internal_sku or "").upper() != sku
                 ):
-                    raise ExecutionAuthorizationConflict(f"平台映射不再唯一：{task_id}")
+                    raise ExecutionAuthorizationConflict("商品与平台的对应关系未确认或存在重复。")
                 item_facts.append(
                     {
                         "task_id": task_id,
@@ -593,7 +593,7 @@ class ExecutionAuthorizationApplicationService:
                 )
 
         if self.shadowbot_identity_mapping.read_bytes() != shadowbot_mapping_bytes:
-            raise ExecutionAuthorizationConflict("执行身份映射读取期间发生变化。")
+            raise ExecutionAuthorizationConflict("影刀执行端的商品资料刚刚发生变化，请重新预览。")
         return {
             "action_type": action_type.value,
             "platform_name": next(iter(platforms)),
@@ -628,7 +628,7 @@ def _exact_task_ids(values: Iterable[str]) -> tuple[str, ...]:
     if not original or any(not value for value in original):
         raise ExecutionAuthorizationError("必须明确选择至少一个任务。")
     if len(original) != len(set(original)):
-        raise ExecutionAuthorizationError("任务 ID 不能重复。")
+        raise ExecutionAuthorizationError("不能重复选择同一个任务。")
     if len(original) > 50:
         raise ExecutionAuthorizationError("一次最多提交 50 个任务。")
     return tuple(sorted(original))

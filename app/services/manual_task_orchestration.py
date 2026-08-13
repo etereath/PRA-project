@@ -215,7 +215,7 @@ class ManualTaskApplicationService:
                 }
                 if stored_digests != {request_sha256}:
                     raise ManualTaskConflictError(
-                        "该幂等键已用于不同的任务请求，请使用新的幂等键。"
+                        "本次提交内容与之前不同，请刷新页面后重新创建任务。"
                     )
                 connection.rollback()
                 return ManualTaskCreationResult(
@@ -291,7 +291,7 @@ class ManualTaskApplicationService:
         authority = self.inventory.get_authority_state(connection=connection)
         errors: list[str] = []
         if authority.authority_mode != "DB_AUTHORITY":
-            errors.append("数据库真实库存尚未完成权威切换。")
+            errors.append("库存资料正在维护，暂不能创建任务。")
 
         wanted_varieties = {normalize_mapping_text(value) for value in request.varieties}
         wanted_grades = {normalize_mapping_text(value) for value in request.grades}
@@ -395,7 +395,7 @@ class ManualTaskApplicationService:
             and str(record.internal_sku or "").upper() == product.internal_sku.upper()
         )
         if len(verified) != 1:
-            blockers.append("平台商品映射不是唯一 VERIFIED。")
+            blockers.append("商品与平台的对应关系未确认或存在重复。")
         mapping_record = verified[0] if len(verified) == 1 else None
         platform_product_name = (
             mapping_record.platform_product_name if mapping_record else product.product_name
@@ -406,13 +406,13 @@ class ManualTaskApplicationService:
             product.grade,
         )
         if listing is None:
-            blockers.append("缺少当前平台商品事实。")
+            blockers.append("缺少该商品的最新平台状态。")
         elif listing.internal_sku and listing.internal_sku.upper() != product.internal_sku.upper():
-            blockers.append("平台事实绑定了其他内部商品。")
+            blockers.append("最新平台状态与当前商品不一致。")
 
         balance = self.inventory.get_balance(product.internal_sku, connection=connection)
         if authority_mode == "DB_AUTHORITY" and balance is None:
-            blockers.append("数据库真实库存缺少该商品余额。")
+            blockers.append("数据库库存中缺少该商品。")
 
         current_price = listing.current_price if listing is not None else None
         current_status = str(listing.online_status or "").strip().lower() if listing else ""
@@ -434,7 +434,7 @@ class ManualTaskApplicationService:
             if current_status != "online":
                 blockers.append("改价只允许当前上架中的商品。")
             if not _fact_is_fresh(price_fact_at, current, self.price_fact_max_age):
-                blockers.append("当前价格事实缺失或已过期。")
+                blockers.append("当前价格记录缺失或已过期。")
             if current_price is None:
                 blockers.append("当前价格不可用。")
             elif request.action == SET_PRICE:
@@ -445,12 +445,12 @@ class ManualTaskApplicationService:
             if current_status != "online":
                 blockers.append("下架只允许当前上架中的商品。")
             if not _fact_is_fresh(status_fact_at, current, self.price_fact_max_age):
-                blockers.append("当前上下架状态事实缺失或已过期。")
+                blockers.append("当前上下架状态缺失或已过期。")
         elif request.action == SET_ONLINE:
             if current_status != "offline":
                 blockers.append("上架只允许当前待上架商品。")
             if not _fact_is_fresh(status_fact_at, current, self.price_fact_max_age):
-                blockers.append("当前上下架状态事实缺失或已过期。")
+                blockers.append("当前上下架状态缺失或已过期。")
             target_price = request.price_value
             target_inventory = request.target_inventory
 
@@ -463,7 +463,7 @@ class ManualTaskApplicationService:
             if target_inventory is None or target_inventory < 0:
                 blockers.append("上架必须填写非负平台目标库存。")
             elif balance is not None and target_inventory > balance.current_qty:
-                blockers.append("平台目标库存不能超过数据库真实库存。")
+                blockers.append("平台目标库存不能超过数据库库存。")
 
         if (
             product.internal_sku.upper(),
@@ -593,9 +593,9 @@ class ManualTaskApplicationService:
             products = load_products(self.products_workbook)
             after = self.products_workbook.read_bytes()
         except (OSError, UnicodeError, ValueError) as exc:
-            raise ManualTaskError("商品主数据不可用。") from exc
+            raise ManualTaskError("商品资料暂不可用，请稍后重试。") from exc
         if before != after:
-            raise ManualTaskConflictError("商品主数据读取期间发生变化，请重试。")
+            raise ManualTaskConflictError("商品资料刚刚发生变化，请重新预览。")
         return products, hashlib.sha256(before).hexdigest()
 
     def _load_mappings_snapshot(self) -> CompiledProductMappings:
@@ -606,9 +606,9 @@ class ManualTaskApplicationService:
             )
             after = self.platform_mappings_workbook.read_bytes()
         except (OSError, UnicodeError, ValueError, ValidationError) as exc:
-            raise ManualTaskError("平台商品映射不可用。") from exc
+            raise ManualTaskError("商品与平台的对应关系暂不可用，请稍后重试。") from exc
         if before != after:
-            raise ManualTaskConflictError("平台商品映射读取期间发生变化，请重试。")
+            raise ManualTaskConflictError("商品与平台的对应关系刚刚发生变化，请重新预览。")
         return compiled
 
     def _verify_workbook_hashes(
@@ -618,12 +618,12 @@ class ManualTaskApplicationService:
         mapping_source_sha256: str,
     ) -> None:
         if hashlib.sha256(self.products_workbook.read_bytes()).hexdigest() != products_sha256:
-            raise ManualTaskConflictError("商品主数据在任务创建期间发生变化。")
+            raise ManualTaskConflictError("商品资料在任务创建期间发生变化，请重新预览。")
         if (
             hashlib.sha256(self.platform_mappings_workbook.read_bytes()).hexdigest()
             != mapping_source_sha256
         ):
-            raise ManualTaskConflictError("平台商品映射在任务创建期间发生变化。")
+            raise ManualTaskConflictError("商品与平台的对应关系发生变化，请重新预览。")
 
 
 def _normalize_request(
@@ -640,9 +640,9 @@ def _normalize_request(
     exclusions = tuple(sorted({str(value).strip() for value in request.excluded_item_keys if str(value).strip()}))
     idempotency_key = str(request.idempotency_key or "").strip()
     if require_idempotency and not idempotency_key:
-        raise ManualTaskError("缺少幂等键。")
+        raise ManualTaskError("本次创建请求已失效，请刷新页面后重试。")
     if len(idempotency_key) > 160:
-        raise ManualTaskError("幂等键过长。")
+        raise ManualTaskError("本次创建请求无效，请刷新页面后重试。")
 
     price_value = request.price_value
     if action in {SET_PRICE, CHANGE_PRICE, SET_ONLINE}:

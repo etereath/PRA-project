@@ -216,7 +216,7 @@ def test_exact_replay_returns_same_tasks_and_same_key_different_request_rejects(
         price_value=Decimal("14"),
         idempotency_key="same-key",
     )
-    with pytest.raises(ManualTaskConflictError, match="幂等键"):
+    with pytest.raises(ManualTaskConflictError, match="本次提交内容与之前不同"):
         service.create(
             changed,
             expected_preview_digest=service.preview(changed).preview_digest,
@@ -289,7 +289,7 @@ def test_offline_has_no_price_and_online_requires_price_and_safe_inventory(
     )
     blocked = service.preview(online_request)
     assert blocked.creatable is False
-    assert "不能超过数据库真实库存" in "".join(blocked.items[0].blockers)
+    assert "不能超过数据库库存" in "".join(blocked.items[0].blockers)
 
     allowed_request = ManualTaskRequest(
         varieties=("艾莎",),
@@ -342,7 +342,7 @@ def test_low_price_mapping_failure_and_open_task_conflict_are_explicit(
             price_value=Decimal("13"),
         )
     )
-    assert "映射不是唯一 VERIFIED" in "".join(unmapped.items[0].blockers)
+    assert "对应关系未确认或存在重复" in "".join(unmapped.items[0].blockers)
 
 
 def test_exclusion_allows_valid_subset_but_unknown_exclusion_rejects(

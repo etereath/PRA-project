@@ -92,12 +92,12 @@ class OperationsMaintenanceApplicationService:
                 intent_type="WORKER_RECOVERY",
                 status="NO_ACTION",
                 reference_id="",
-                message="Worker 当前运行正常，无需恢复。",
+                message="影刀执行端当前运行正常，无需恢复。",
             )
 
         self._require_automation_capability(
             "worker_recovery_handler_registered",
-            "Automation Service 尚未启用 Worker 恢复处理器，未受理恢复请求。",
+            "影刀执行端自动恢复暂不可用，请联系管理员。",
         )
 
         context = self._time_context(now)
@@ -107,7 +107,7 @@ class OperationsMaintenanceApplicationService:
             now=now,
         )
         if not job.enabled:
-            raise OperationsMaintenanceError("Worker 恢复维护方案已停用，未受理恢复请求。")
+            raise OperationsMaintenanceError("影刀执行端自动恢复已停用，请联系管理员。")
         detection = IncidentManagementService(self.runtime).detect(
             IncidentDetection(
                 event_key=f"web-worker-recovery:{digest}",
@@ -121,8 +121,8 @@ class OperationsMaintenanceApplicationService:
                 seller_operation_date=context.seller_operation_date,
                 subject_type="worker",
                 subject_key="test2",
-                title="Worker 不可用",
-                description="系统维护检查发现 Worker 当前不可用。",
+                title="影刀执行端不可用",
+                description="系统检查发现影刀执行端当前不可用。",
                 occurred_at=now,
                 reason=str(report.get("error_code") or "heartbeat_not_running"),
                 payload={
@@ -151,7 +151,7 @@ class OperationsMaintenanceApplicationService:
             intent_type="WORKER_RECOVERY",
             status="SCHEDULED",
             reference_id=run.run_id,
-            message="Worker 检查与恢复请求已交给独立 Automation Service。",
+            message="已安排检查并恢复影刀执行端。",
             replayed=not created,
         )
 
@@ -182,8 +182,8 @@ class OperationsMaintenanceApplicationService:
             recipient_ref="operations",
             channel=self.notification_channel,
             payload={
-                "message": "PRA 通知通路测试：若收到本消息，表示通知 Worker 已完成投递。",
-                "reason": f"由系统管理员 {principal.subject} 发起；不关联复核或平台动作。",
+                "message": "通知测试：如果收到本消息，说明飞书通知可以正常送达。",
+                "reason": f"由系统管理员 {principal.subject} 发起，不会创建业务任务。",
                 "platform_name": self.platform_name,
             },
             priority=10,
@@ -192,7 +192,7 @@ class OperationsMaintenanceApplicationService:
             intent_type="NOTIFICATION_TEST",
             status="QUEUED",
             reference_id=notification.notification_id,
-            message="通知测试已进入既有 Outbox，将由独立通知 Worker 发送。",
+            message="通知测试已提交，正在等待发送。",
             replayed=replayed,
         )
 
@@ -207,7 +207,7 @@ class OperationsMaintenanceApplicationService:
         now = self._now()
         self._require_automation_capability(
             "release_backup_handler_registered",
-            "Automation Service 尚未启用受控备份处理器，未受理备份请求。",
+            "数据备份暂不可用，请联系管理员。",
             now=now,
         )
         context = self._time_context(now)
@@ -217,7 +217,7 @@ class OperationsMaintenanceApplicationService:
             now=now,
         )
         if not job.enabled:
-            raise OperationsMaintenanceError("受控备份维护方案已停用，未受理备份请求。")
+            raise OperationsMaintenanceError("数据备份已停用，请联系管理员。")
         run, created = self.automation.ensure_run(
             job=job,
             scheduled_for=now,
@@ -237,7 +237,7 @@ class OperationsMaintenanceApplicationService:
             intent_type="RELEASE_BACKUP",
             status="SCHEDULED",
             reference_id=run.run_id,
-            message="受控备份请求已交给独立 Automation Service。",
+            message="数据备份已安排。",
             replayed=not created,
         )
 
@@ -272,7 +272,7 @@ class OperationsMaintenanceApplicationService:
         payload = self._fresh_heartbeat(
             heartbeat,
             schema_version="automation-heartbeat-1.0",
-            service_name="Automation Service",
+            service_name="自动任务服务",
             now=now,
         )
         if payload.get(capability) is not True:
@@ -282,12 +282,12 @@ class OperationsMaintenanceApplicationService:
         payload = self._fresh_heartbeat(
             self.queue_root / "control" / "pra_queue_services_heartbeat.json",
             schema_version="queue-services-heartbeat-1.0",
-            service_name="通知后台服务",
+            service_name="通知服务",
         )
         if payload.get("service") != "shadowbot_queue_services":
-            raise OperationsMaintenanceError("通知后台服务身份不匹配，未创建测试通知。")
+            raise OperationsMaintenanceError("通知服务配置异常，未发送测试通知。")
         if payload.get("notification_worker_enabled") is not True:
-            raise OperationsMaintenanceError("通知 Worker 未启用，未创建测试通知。")
+            raise OperationsMaintenanceError("通知发送未启用，未发送测试通知。")
         if str(payload.get("notification_channel") or "").strip().lower() != (
             self.notification_channel
         ):
@@ -338,5 +338,5 @@ class OperationsMaintenanceApplicationService:
     def _idempotency(value: str) -> tuple[str, str]:
         key = value.strip()
         if not 8 <= len(key) <= 200:
-            raise OperationsMaintenanceError("维护请求幂等键无效，请刷新页面后重试。")
+            raise OperationsMaintenanceError("本次维护请求已失效，请刷新页面后重试。")
         return key, hashlib.sha256(key.encode("utf-8")).hexdigest()

@@ -267,7 +267,7 @@ class OperationsWebApplication:
         if self._contains_dependency_override(environ, method):
             return Response.text(
                 "400 Bad Request",
-                "数据库、工作簿和队列位置由服务启动配置固定，不能由请求覆盖。",
+                "该请求包含不允许修改的系统设置。",
                 headers=[("Cache-Control", "no-store")],
             )
 
@@ -722,7 +722,7 @@ class OperationsWebApplication:
                 },
             )
             if detail is None:
-                return Response.text("404 Not Found", "未找到该业务事实。")
+                return Response.text("404 Not Found", "未找到该记录。")
             content = render_detail(detail)
         drawer = render_notification_drawer(self.queries.notification_drawer())
         body = render_template(
@@ -797,7 +797,7 @@ class OperationsWebApplication:
                 )
             elif intent_type == "RELEASE_BACKUP":
                 if self._first(form, "confirmation") != "CREATE_BACKUP":
-                    raise OperationsMaintenanceError("请确认后再创建受控备份。")
+                    raise OperationsMaintenanceError("请确认后再创建数据备份。")
                 receipt = self.maintenance.request_backup(
                     session.principal,
                     idempotency_key=idempotency_key,
@@ -815,7 +815,7 @@ class OperationsWebApplication:
         except Exception:
             token = self.control_store.put(
                 session.principal.subject,
-                "系统维护请求失败，未直接调用脚本、Worker 或外部平台。",
+                "系统维护请求失败，本次没有执行任何维护操作。",
             )
             location = f"{redirect_path}?maintenance_error={quote(token, safe='')}"
         return Response.text(
@@ -940,7 +940,7 @@ class OperationsWebApplication:
             return self._control_error_redirect(
                 session.principal.subject,
                 "task_error",
-                "任务创建失败，数据库未保留部分结果。",
+                "任务创建失败，本次没有创建任何任务。",
             )
         token = self.control_store.put(
             session.principal.subject,
@@ -973,7 +973,7 @@ class OperationsWebApplication:
             return self._control_error_redirect(
                 session.principal.subject,
                 "execution_error",
-                "执行预览失败；未投递队列。",
+                "执行预览失败，本次没有发送任何平台任务。",
             )
         token = self.control_store.put(session.principal.subject, preparation)
         return self._management_redirect("execution_preview", token)
@@ -1004,7 +1004,7 @@ class OperationsWebApplication:
             return self._control_error_redirect(
                 session.principal.subject,
                 "execution_error",
-                "执行提交失败；请检查队列状态后重新预览，不能直接重试。",
+                "执行提交失败；请先检查系统状态，再重新预览后提交。",
             )
         token = self.control_store.put(
             session.principal.subject,
@@ -1085,7 +1085,7 @@ class OperationsWebApplication:
             )
         token = self.control_store.put(
             session.principal.subject,
-            f"{job.display_name}：{'已启用' if job.enabled else '已停用'}，排程 {job.schedule_expression}",
+            f"{job.display_name}已{'启用' if job.enabled else '停用'}。",
         )
         return self._management_redirect("automation_receipt", token)
 
@@ -1157,12 +1157,12 @@ class OperationsWebApplication:
             return self._control_error_redirect(
                 session.principal.subject,
                 "automation_error",
-                "补跑创建失败，没有启动 Web 内执行循环。",
+                "补跑任务创建失败，本次没有开始运行。",
             )
         token = self.control_store.put(
             session.principal.subject,
             (
-                "补跑已创建，等待独立 Automation Service 执行"
+                "补跑任务已创建，等待后台执行"
                 if created
                 else "相同补跑已存在，未重复创建"
             ),

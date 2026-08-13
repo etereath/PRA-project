@@ -81,22 +81,22 @@ MAX_PAGE_SIZE = 25
 LOGGER = logging.getLogger("app.operations_web.queries")
 
 QUALITY_LABELS = {
-    "ORDER_COMPLETE": "完整订单事实",
-    "ORDER_PARTIAL": "部分订单事实",
-    "SCAN_ESTIMATED_HIGH": "高可信扫描估算",
-    "SCAN_ESTIMATED_MEDIUM": "中等可信扫描估算",
-    "SCAN_ESTIMATED_LOW": "低可信扫描估算",
+    "ORDER_COMPLETE": "订单数据完整",
+    "ORDER_PARTIAL": "订单数据不完整",
+    "SCAN_ESTIMATED_HIGH": "库存变化估算（高可信）",
+    "SCAN_ESTIMATED_MEDIUM": "库存变化估算（中等可信）",
+    "SCAN_ESTIMATED_LOW": "库存变化估算（低可信）",
     "UNAVAILABLE": "不可用",
 }
 SOURCE_LABELS = {
-    "ORDER_OBSERVED": "订单事实",
-    "SCAN_ESTIMATED": "扫描估算",
+    "ORDER_OBSERVED": "订单记录",
+    "SCAN_ESTIMATED": "库存变化估算",
 }
 SUMMARY_STATUS_LABELS = {
     "PROVISIONAL": "初步结算",
-    "OBSERVED": "已观察",
+    "OBSERVED": "已记录",
     "RECONCILED": "已对账",
-    "FINAL": "最终结算",
+    "FINAL": "已确认结算",
 }
 TASK_STATUS_LABELS = {
     "pending": "待处理",
@@ -230,7 +230,7 @@ class OperationsQueryService:
                 items.append(
                     NotificationItemReadModel(
                         title="运行数据需要维护",
-                        detail="Web 只报告当前状态，不会在读取时修复数据库。",
+                        detail="业务数据暂时无法正常读取，请联系管理员处理。",
                         severity="S2",
                         url="/system",
                     )
@@ -278,7 +278,7 @@ class OperationsQueryService:
                     MetricReadModel(
                         "当前可售库存",
                         _qty(inventory_value),
-                        "来自当前真实库存权威；仅汇总允许销售的商品",
+                        "仅统计当前允许销售的商品",
                         inventory_state,
                     ),
                 ),
@@ -333,7 +333,7 @@ class OperationsQueryService:
             MetricReadModel(
                 "当前可售库存",
                 _qty(inventory_value),
-                "来自当前真实库存权威；仅汇总允许销售的商品",
+                "仅统计当前允许销售的商品",
                 inventory_state,
             ),
         )
@@ -457,7 +457,7 @@ class OperationsQueryService:
             )
         )
         notice = (
-            "销售分析只展示既有确定性事实；Agent 预测、经营建议和人工质量评价尚未接入。"
+            "销售分析功能正在完善；当前展示已经确认的销售汇总。"
             if section == "sales-analysis"
             else ""
         )
@@ -654,8 +654,8 @@ class OperationsQueryService:
             if authority.authority_mode != "DB_AUTHORITY":
                 inventory_state = StateReadModel(
                     ReadState.UNAVAILABLE,
-                    "库存尚未切换",
-                    "完成受控 bootstrap 与回读前，Web 不接受数据库库存调整。",
+                    "库存调整暂不可用",
+                    "请联系管理员完成数据库库存初始化。",
                 )
             else:
                 products, product_error = self._load_products()
@@ -675,8 +675,8 @@ class OperationsQueryService:
                 )
                 inventory_state = StateReadModel(
                     ReadState.READY,
-                    "数据库库存为唯一权威",
-                    "人工调整会同时写入当前余额和不可变流水。",
+                    "数据库库存已启用",
+                    "每次调整都会记录调整前后数量、来源和原因。",
                 )
                 if inventory_transaction_id:
                     transaction = self.inventory.get_transaction(
@@ -693,7 +693,7 @@ class OperationsQueryService:
             inventory_state = StateReadModel(
                 ReadState.FAILED,
                 "库存服务暂不可用",
-                "页面未修改库存，请联系管理员检查 Runtime Schema。",
+                "本次没有修改库存，请联系管理员检查库存数据。",
             )
         return ManagementReadModel(
             pending_tasks=pending_tasks,
@@ -724,8 +724,8 @@ class OperationsQueryService:
         checked_at = _datetime(now)
         components: list[ComponentReadModel] = [
             ComponentReadModel(
-                "运营 Web",
-                StateReadModel(ReadState.READY, "运行中", "当前请求已由新运营 Web 响应"),
+                "运营页面",
+                StateReadModel(ReadState.READY, "运行中", "页面可以正常访问"),
                 checked_at,
             )
         ]
@@ -733,12 +733,12 @@ class OperationsQueryService:
             schema = self.runtime.check_schema_health()
             operational = self.runtime.check_operational_health()
             if schema.ok and operational.ok:
-                state = StateReadModel(ReadState.READY, "正常", "只读连接与 Schema 检查通过")
+                state = StateReadModel(ReadState.READY, "正常", "业务数据可以正常读取")
             else:
                 state = StateReadModel(
                     ReadState.UNAVAILABLE,
                     "需要维护",
-                    "读取路径不会自动初始化、迁移或修复数据库",
+                    "业务数据暂时无法正常读取，请联系管理员处理",
                 )
         except Exception:
             state = StateReadModel(
@@ -746,7 +746,7 @@ class OperationsQueryService:
                 "检查失败",
                 "数据库状态暂时无法读取，请联系管理员检查。",
             )
-        components.append(ComponentReadModel("Runtime 数据库", state, checked_at))
+        components.append(ComponentReadModel("业务数据库", state, checked_at))
 
         workbook_paths = (
             self.paths.products_workbook,
@@ -755,45 +755,45 @@ class OperationsQueryService:
         )
         missing = sum(1 for item in workbook_paths if not item.is_file())
         workbook_state = (
-            StateReadModel(ReadState.READY, "可读取", "3 份固定工作簿均存在")
+            StateReadModel(ReadState.READY, "资料齐全", "商品和规则资料可以正常读取")
             if missing == 0
             else StateReadModel(
                 ReadState.UNAVAILABLE,
                 "资料不完整",
-                f"{missing} 份固定工作簿缺失",
+                f"有 {missing} 份商品或规则资料缺失，请联系管理员补充",
             )
         )
-        components.append(ComponentReadModel("业务工作簿", workbook_state, checked_at))
+        components.append(ComponentReadModel("商品与规则资料", workbook_state, checked_at))
 
         components.append(
             ComponentReadModel(
-                "Automation Service",
+                "自动任务服务",
                 self._automation_state(now),
                 checked_at,
             )
         )
 
         queue_state = self._queue_state()
-        components.append(ComponentReadModel("执行队列", queue_state, checked_at))
+        components.append(ComponentReadModel("平台任务传递", queue_state, checked_at))
         worker_state = self._worker_state(now)
-        components.append(ComponentReadModel("ShadowBot Worker", worker_state, checked_at))
+        components.append(ComponentReadModel("影刀执行端", worker_state, checked_at))
         components.append(
             ComponentReadModel(
-                "Importer / Archive",
+                "执行结果回收",
                 self._importer_state(now),
                 checked_at,
             )
         )
         components.append(
             ComponentReadModel(
-                "Outbox / 通知",
+                "通知发送",
                 self._notification_state(now),
                 checked_at,
             )
         )
         components.append(
             ComponentReadModel(
-                "受控备份",
+                "数据备份",
                 self._backup_state(),
                 checked_at,
             )
@@ -801,11 +801,11 @@ class OperationsQueryService:
 
         states = {item.state.state for item in components}
         if ReadState.FAILED in states:
-            overall = StateReadModel(ReadState.FAILED, "部分组件检查失败", "请进入后续维护流程排查")
+            overall = StateReadModel(ReadState.FAILED, "部分服务检查失败", "请根据下方提示逐项处理")
         elif ReadState.UNAVAILABLE in states or ReadState.STALE in states:
-            overall = StateReadModel(ReadState.INCOMPLETE, "部分组件需要处理", "状态页只报告事实，不执行恢复")
+            overall = StateReadModel(ReadState.INCOMPLETE, "部分服务需要处理", "请查看业务影响并按提示处理")
         else:
-            overall = StateReadModel(ReadState.READY, "运行状态正常", "后台组件生命周期与 Web 相互独立")
+            overall = StateReadModel(ReadState.READY, "运行状态正常", "各项服务均可正常使用")
         return SystemReadModel(overall=overall, components=tuple(components))
 
     def detail(
@@ -840,11 +840,11 @@ class OperationsQueryService:
         except Exception:
             return DetailReadModel(
                 title="详情暂不可用",
-                subtitle="权威事实读取失败",
+                subtitle="数据暂时无法读取",
                 state=StateReadModel(
                     ReadState.FAILED,
                     "读取失败",
-                    "页面未修改任何数据，请稍后重试或联系管理员。",
+                    "请稍后重试；如持续失败，请联系管理员。",
                 ),
                 fields=(),
             )
@@ -867,7 +867,7 @@ class OperationsQueryService:
                 state=StateReadModel(
                     ReadState.FAILED,
                     "复核入口暂不可用",
-                    "读取失败且未修改复核状态，请稍后重试。",
+                    "请稍后重试，本次没有提交任何处理结果。",
                 ),
                 review_title="人工复核",
                 reason="",
@@ -906,7 +906,7 @@ class OperationsQueryService:
                 state=StateReadModel(
                     ReadState.READY,
                     "等待处理",
-                    "请选择处理方式；提交后会通过既有原子事务保存结果。",
+                    "请选择处理方式；提交后结果会立即保存，请勿重复提交。",
                 ),
                 review_title=_mobile_review_title(review),
                 reason=review.reason or "需要人工确认",
@@ -926,7 +926,7 @@ class OperationsQueryService:
                 state=StateReadModel(
                     ReadState.EMPTY,
                     "已经处理",
-                    "该复核已有正式结果，重复打开不会再次执行操作。",
+                    "该事项已经处理，无需重复提交。",
                 ),
                 review_title=_mobile_review_title(review),
                 reason=review.resolution_note or review.reason,
@@ -997,7 +997,7 @@ class OperationsQueryService:
             return _unavailable_table(
                 dataset,
                 "商品映射",
-                "当前映射事实用于采集与日结，但尚无独立只读目录；不从观察行反推主数据。",
+                "商品映射目录暂不可用，请联系管理员维护商品与平台的对应关系。",
             )
         if dataset == "history":
             return self._summary_table(
@@ -1060,7 +1060,7 @@ class OperationsQueryService:
     def _products_table(self, page: int) -> TableReadModel:
         products, error = self._load_products()
         if error:
-            return _failed_table("products", "商品与真实库存")
+            return _failed_table("products", "商品与数据库库存")
         start = (page - 1) * DEFAULT_PAGE_SIZE
         selected = products[start : start + DEFAULT_PAGE_SIZE + 1]
         visible, has_next = _visible(selected, DEFAULT_PAGE_SIZE)
@@ -1080,15 +1080,15 @@ class OperationsQueryService:
         )
         return self._table(
             dataset="products",
-            title="商品与真实库存",
-            columns=("商品", "等级", "规格", "真实库存", "销售状态"),
+            title="商品与数据库库存",
+            columns=("商品", "等级", "规格", "数据库库存", "销售状态"),
             rows=rows,
             row_urls=urls,
             page=page,
             has_next=has_next,
             base_path="/database",
             query={"dataset": "products"},
-            state=_rows_state(rows, "产品工作簿中没有商品"),
+            state=_rows_state(rows, "当前没有商品资料"),
         )
 
     def _inventory_transactions_table(self, page: int) -> TableReadModel:
@@ -1155,7 +1155,7 @@ class OperationsQueryService:
                 "平台",
                 "当前售价",
                 "平台可购上限",
-                "观察时间",
+                "更新时间",
                 "上架状态",
             ),
             rows=rows,
@@ -1163,7 +1163,7 @@ class OperationsQueryService:
             has_next=has_next,
             base_path="/database",
             query={"dataset": "prices", "platform": platform_name},
-            state=_rows_state(rows, "当前没有平台价格观察"),
+            state=_rows_state(rows, "当前没有平台价格记录"),
         )
 
     def _sales_table(self, page: int, trade_date: date, platform_name: str) -> TableReadModel:
@@ -1206,7 +1206,7 @@ class OperationsQueryService:
         return self._table(
             dataset="sales",
             title="销售与订单",
-            columns=("交易日", "平台", "日状态", "订单数", "销量", "成交金额", "质量", "观察时间"),
+            columns=("交易日", "平台", "销售日状态", "订单数", "销量", "成交金额", "数据情况", "更新时间"),
             rows=rows,
             row_urls=urls,
             page=page,
@@ -1522,21 +1522,21 @@ class OperationsQueryService:
 
     def _dictionary_table(self, page: int) -> TableReadModel:
         values = (
-            ("交易日", "PRA 平台交易日", "18:00 至次日 18:00"),
-            ("卖家作业日", "PRA 卖家作业日", "20:00 至次日 20:00"),
-            ("销量", "页面观察到的订单数量或合格扫描估算", "订单事实与估算不得相加"),
+            ("交易日", "平台销售使用的日期", "18:00 至次日 18:00"),
+            ("卖家作业日", "日结和次日计划使用的日期", "20:00 至次日 20:00"),
+            ("销量", "订单数量或符合条件的库存变化估算", "同一笔销量只计算一次"),
             ("成交金额", "页面展示成交金额的合计", "不代表卖家实收、退款净额或财务到账"),
-            ("数据库库存", "目前还有多少花可以销售", "当前来自产品库存资料；切换库存台账后以数据库为准"),
+            ("数据库库存", "目前还有多少花可以销售", "由入库、销售扣减和人工调整共同更新"),
             ("平台库存", "客户在该平台最多可购买的数量", "不等于数据库库存"),
-            ("OPEN", "当前开放交易日快照", "不能当作完整闭市事实或 FINAL"),
-            ("FINAL", "通过质量、覆盖和对账门禁的最终结算", "不会仅因到达 20:00 自动产生"),
+            ("营业中", "当前销售日仍在进行", "显示截至最近更新时间的数据"),
+            ("已确认结算", "数据完整且核对通过后的结算", "20:00 后先生成初步结算，核对完成后确认"),
         )
         return TableReadModel(
             dataset="fields",
             title="字段说明",
             columns=("名称", "定义", "边界"),
             rows=values,
-            state=StateReadModel(ReadState.READY, "可用", "使用当前冻结业务口径"),
+            state=StateReadModel(ReadState.READY, "可用", "使用当前业务口径"),
             page=page,
             page_size=DEFAULT_PAGE_SIZE,
         )
@@ -1592,7 +1592,7 @@ class OperationsQueryService:
                     _qty(product.current_stock),
                     QUALITY_LABELS.get(summary.quality_level.value, "质量未知")
                     if summary
-                    else "尚无销售事实",
+                    else "销售数据待更新",
                 )
             )
             urls.append(
@@ -1601,10 +1601,10 @@ class OperationsQueryService:
         return TableReadModel(
             dataset="today-products",
             title="品种销售与库存",
-            columns=("商品", "等级", "今日已售", "成交均价", "销售额", "真实库存", "数据状态"),
+            columns=("商品", "等级", "今日已售", "成交均价", "销售额", "数据库库存", "更新情况"),
             rows=tuple(rows),
             row_urls=tuple(urls),
-            state=_rows_state(tuple(rows), "产品工作簿中没有商品"),
+            state=_rows_state(tuple(rows), "当前没有商品资料"),
             page_size=DEFAULT_PAGE_SIZE,
         )
 
@@ -1650,10 +1650,10 @@ class OperationsQueryService:
             DetailFieldReadModel("商品", product.product_name),
             DetailFieldReadModel("等级", product.grade),
             DetailFieldReadModel("规格", product.stem_length),
-            DetailFieldReadModel("真实库存", _qty(product.current_stock)),
+            DetailFieldReadModel("数据库库存", _qty(product.current_stock)),
             DetailFieldReadModel("基础成本", _money(product.base_cost)),
             DetailFieldReadModel("销售状态", "可销售" if product.sale_enabled else "停止销售"),
-            DetailFieldReadModel("库存来源", "当前真实库存权威"),
+            DetailFieldReadModel("库存来源", "数据库库存"),
         ]
         related = tuple(
             (
@@ -1665,7 +1665,7 @@ class OperationsQueryService:
         return DetailReadModel(
             title=f"{product.product_name} · {product.grade}",
             subtitle="商品与库存详情",
-            state=StateReadModel(ReadState.READY, "可用", "只读展示"),
+            state=StateReadModel(ReadState.READY, "可用", "商品资料已更新"),
             fields=tuple(fields),
             related=related,
         )
@@ -1678,16 +1678,16 @@ class OperationsQueryService:
         amount = sum((item.order_transaction_amount for item in snapshot.items), Decimal("0"))
         state = _snapshot_rows_state((snapshot,))
         return DetailReadModel(
-            title=f"{snapshot.platform_trade_date.isoformat()} 销售观察",
+            title=f"{snapshot.platform_trade_date.isoformat()} 销售数据",
             subtitle=f"{snapshot.platform_name} · {_trade_day_status_label(snapshot.trade_day_status)}",
             state=state,
             fields=(
                 DetailFieldReadModel("订单数", str(len(snapshot.items))),
                 DetailFieldReadModel("销量", _qty(qty)),
                 DetailFieldReadModel("成交金额", _money(amount)),
-                DetailFieldReadModel("范围完整", "是" if snapshot.scope_complete else "否"),
-                DetailFieldReadModel("尾部已确认", "是" if snapshot.end_marker_verified else "否"),
-                DetailFieldReadModel("观察时间", _datetime(snapshot.scan_completed_at)),
+                DetailFieldReadModel("采集是否完整", "是" if snapshot.scope_complete else "否"),
+                DetailFieldReadModel("是否读完全部订单", "是" if snapshot.end_marker_verified else "否"),
+                DetailFieldReadModel("更新时间", _datetime(snapshot.scan_completed_at)),
             ),
         )
 
@@ -1702,26 +1702,26 @@ class OperationsQueryService:
         )
         if summary.is_current:
             state = self._summary_state((summary,), "")
-            version_identity = "当前权威版本"
+            version_identity = "当前版本"
         else:
             current_version = (
-                f"当前权威版本为 v{current.version_no}。"
+                f"当前版本为 v{current.version_no}。"
                 if current is not None
-                else "当前权威版本暂不可读。"
+                else "当前版本暂不可读。"
             )
             state = StateReadModel(
                 ReadState.STALE,
-                "历史版本 · 已被取代",
+                "历史版本 · 已更新",
                 current_version,
             )
-            version_identity = "历史版本，已被取代"
+            version_identity = "历史版本，已更新"
         return DetailReadModel(
             title=f"{summary.platform_trade_date.isoformat()} 交易日结算",
             subtitle=f"{summary.platform_name} · {_scope_label(summary.scope_type, summary.scope_key)}",
             state=state,
             fields=(
                 DetailFieldReadModel("版本", f"v{summary.version_no}"),
-                DetailFieldReadModel("版本身份", version_identity),
+                DetailFieldReadModel("版本状态", version_identity),
                 DetailFieldReadModel(
                     "版本关系",
                     "基于上一版本重新结算"
@@ -1730,7 +1730,7 @@ class OperationsQueryService:
                 ),
                 DetailFieldReadModel("销量", _qty(summary.sold_qty)),
                 DetailFieldReadModel("成交金额", _money(summary.transaction_amount_total)),
-                DetailFieldReadModel("事实来源", SOURCE_LABELS.get(summary.fact_source.value, "来源未知") if summary.fact_source else "不可用"),
+                DetailFieldReadModel("数据来源", SOURCE_LABELS.get(summary.fact_source.value, "来源未知") if summary.fact_source else "不可用"),
                 DetailFieldReadModel("数据质量", QUALITY_LABELS.get(summary.quality_level.value, "质量未知")),
                 DetailFieldReadModel("结算状态", SUMMARY_STATUS_LABELS.get(summary.summary_status.value, "状态未知")),
                 DetailFieldReadModel("质量说明", summary.quality_reason or "—"),
@@ -1754,7 +1754,7 @@ class OperationsQueryService:
             DetailFieldReadModel("结果", _task_result_detail(item)),
         )
         state = _task_state(item)
-        return DetailReadModel("任务详情", "正式任务事实", state, fields)
+        return DetailReadModel("任务详情", "任务信息", state, fields)
 
     def _review_detail(self, review_task_id: str) -> DetailReadModel | None:
         item = self.runtime.get_review_task(review_task_id)
@@ -1766,7 +1766,7 @@ class OperationsQueryService:
             state=StateReadModel(
                 ReadState.READY if item.review_status is ReviewTaskStatus.PENDING else ReadState.EMPTY,
                 REVIEW_STATUS_LABELS.get(item.review_status.value, "状态未知"),
-                "只读展示正式复核结果",
+                "查看已保存的复核结果",
             ),
             fields=(
                 DetailFieldReadModel("范围", _review_scope(item)),
@@ -1833,9 +1833,9 @@ class OperationsQueryService:
     ) -> StateReadModel:
         summaries = tuple(values)
         if error:
-            return StateReadModel(ReadState.FAILED, "销售事实读取失败", "未将失败显示为 0")
+            return StateReadModel(ReadState.FAILED, "销售数据读取失败", "请稍后重试；如持续失败，请联系管理员。")
         if not summaries:
-            return StateReadModel(ReadState.UNAVAILABLE, "尚无可用销售事实", "缺失不显示为 0")
+            return StateReadModel(ReadState.UNAVAILABLE, "销售数据待更新", "尚未取得当前销售日的可用数据。")
         available = [
             item
             for item in summaries
@@ -1843,7 +1843,7 @@ class OperationsQueryService:
             and item.sold_qty is not None
         ]
         if not available:
-            return StateReadModel(ReadState.UNAVAILABLE, "销售事实不可用", "当前没有合格订单或扫描估算")
+            return StateReadModel(ReadState.UNAVAILABLE, "销售数据暂不可用", "当前没有完整订单或可用的库存变化估算。")
         if len(available) != len(summaries) or any(
             item.quality_level
             in {
@@ -1853,13 +1853,13 @@ class OperationsQueryService:
             }
             for item in available
         ):
-            return StateReadModel(ReadState.INCOMPLETE, "部分销售事实可用", "页面保留质量差异，不与完整事实混算")
+            return StateReadModel(ReadState.INCOMPLETE, "部分销售数据可用", "完整数据仍在补充，当前结果仅供参考。")
         latest = max(item.updated_at for item in available)
         if sum(item.sold_qty or 0 for item in available) == 0:
             return StateReadModel(
                 ReadState.TRUSTWORTHY_ZERO,
-                "当前确认无销量",
-                f"来源完整，0 是可信事实；最近更新于 {_datetime(latest)}",
+                "已确认暂无销量",
+                f"订单采集完整；最近更新于 {_datetime(latest)}",
             )
         quality = _joined_labels(
             QUALITY_LABELS.get(item.quality_level.value, "质量未知")
@@ -1867,7 +1867,7 @@ class OperationsQueryService:
         )
         return StateReadModel(
             ReadState.READY,
-            "销售事实可用",
+            "销售数据已更新",
             f"{quality}；最近更新于 {_datetime(latest)}",
         )
 
@@ -1953,8 +1953,8 @@ class OperationsQueryService:
                 context=None,
                 state=StateReadModel(
                     ReadState.FAILED,
-                    "交易日时间策略读取失败",
-                    "未使用代码默认时间推断交易日，也未查询当前交易日事实。",
+                    "销售日期读取失败",
+                    "当前无法确定销售日期，请联系管理员检查时间设置。",
                 ),
             )
         if not policies:
@@ -1962,8 +1962,8 @@ class OperationsQueryService:
                 context=None,
                 state=StateReadModel(
                     ReadState.UNAVAILABLE,
-                    "交易日时间策略不可用",
-                    "Runtime 中没有版本化时间策略，未推断默认交易日。",
+                    "销售日期暂不可用",
+                    "当前没有可用的销售日期设置，请联系管理员。",
                 ),
             )
         try:
@@ -1973,8 +1973,8 @@ class OperationsQueryService:
                 context=None,
                 state=StateReadModel(
                     ReadState.FAILED,
-                    "交易日时间策略配置无效",
-                    "Runtime 时间策略无法建立唯一版本序列，未查询当前交易日事实。",
+                    "销售日期设置有误",
+                    "当前销售日期设置存在冲突，请联系管理员。",
                 ),
             )
         try:
@@ -1984,8 +1984,8 @@ class OperationsQueryService:
                 context=None,
                 state=StateReadModel(
                     ReadState.UNAVAILABLE,
-                    "当前没有唯一有效的交易日时间策略",
-                    "未使用代码默认时间推断交易日，也未查询当前交易日事实。",
+                    "当前销售日期暂不可用",
+                    "当前无法确定唯一的销售日期，请联系管理员。",
                 ),
             )
         except Exception:
@@ -1993,34 +1993,34 @@ class OperationsQueryService:
                 context=None,
                 state=StateReadModel(
                     ReadState.FAILED,
-                    "交易日时间策略计算失败",
-                    "未使用代码默认时间推断交易日，也未查询当前交易日事实。",
+                    "销售日期计算失败",
+                    "当前无法确定销售日期，请联系管理员检查时间设置。",
                 ),
             )
         return _TimeContextReadResult(
             context=context,
             state=StateReadModel(
                 ReadState.READY,
-                "交易日时间策略可用",
-                f"使用版本 {context.time_policy_version}",
+                "销售日期已确定",
+                "已按当前营业时间设置计算。",
             ),
         )
 
     def _queue_state(self) -> StateReadModel:
         root = self.paths.queue_root
         if not root.is_dir():
-            return StateReadModel(ReadState.UNAVAILABLE, "队列目录不存在", "Web 不会自动创建队列")
+            return StateReadModel(ReadState.UNAVAILABLE, "任务传递暂不可用", "平台任务暂时不能发送，请联系管理员")
         counts: dict[str, int] = {}
         try:
             for name in ("inbox", "working", "results", "archive"):
                 path = root / name
                 if not path.is_dir():
-                    return StateReadModel(ReadState.UNAVAILABLE, "队列结构不完整", f"缺少 {name} 目录")
+                    return StateReadModel(ReadState.UNAVAILABLE, "任务传递暂不可用", "平台任务暂时不能发送，请联系管理员")
                 counts[name] = sum(1 for item in path.iterdir() if item.is_file())
         except OSError:
-            return StateReadModel(ReadState.FAILED, "队列检查失败", "请联系管理员检查队列目录。")
+            return StateReadModel(ReadState.FAILED, "任务传递检查失败", "请联系管理员检查平台任务传递服务。")
         active = counts["inbox"] + counts["working"] + counts["results"]
-        return StateReadModel(ReadState.READY, "可读取", f"当前待处理/处理中/待导入共 {active} 项")
+        return StateReadModel(ReadState.READY, "运行正常", f"当前共有 {active} 项任务正在传递或等待回收")
 
     def _worker_state(self, now: datetime) -> StateReadModel:
         try:
@@ -2031,50 +2031,50 @@ class OperationsQueryService:
                 now=now,
             )
         except Exception:
-            return StateReadModel(ReadState.FAILED, "心跳无法读取", "请按既有 Worker 恢复程序处理。")
+            return StateReadModel(ReadState.FAILED, "执行端状态无法读取", "请使用上方恢复按钮检查影刀执行端。")
         if report.get("ok") is True:
             return StateReadModel(
                 ReadState.READY,
                 "运行中",
-                f"最近心跳 {str(report.get('updated_at') or '刚刚')}",
+                f"最近更新时间 {str(report.get('updated_at') or '刚刚')}",
             )
         error_code = str(report.get("error_code") or "")
         if error_code == "WORKER_HEARTBEAT_MISSING":
             return StateReadModel(
                 ReadState.UNAVAILABLE,
-                "没有 Worker 心跳",
-                "可由系统管理员提交检查与恢复请求",
+                "执行端未运行",
+                "平台任务暂时不会执行，请使用恢复按钮检查",
             )
         status = str(report.get("status") or "UNKNOWN").upper()
         checks = report.get("checks") if isinstance(report.get("checks"), dict) else {}
         if not checks.get("heartbeat_fresh", False):
             return StateReadModel(
                 ReadState.STALE,
-                "心跳已过期",
-                "可由系统管理员提交检查与恢复请求",
+                "执行端响应超时",
+                "平台任务可能暂停，请使用恢复按钮检查",
             )
         if status == "RUNNING":
-            return StateReadModel(ReadState.INCOMPLETE, "运行状态需复核", "Worker 心跳存在但检查未全部通过")
+            return StateReadModel(ReadState.INCOMPLETE, "执行端需要检查", "平台任务可能受到影响，请使用恢复按钮检查")
         if status == "STOPPED":
-            return StateReadModel(ReadState.UNAVAILABLE, "已停止", "可由系统管理员提交检查与恢复请求")
-        return StateReadModel(ReadState.INCOMPLETE, "状态未知", "请先检查生命周期与队列事实")
+            return StateReadModel(ReadState.UNAVAILABLE, "已停止", "平台任务不会执行，请使用恢复按钮启动")
+        return StateReadModel(ReadState.INCOMPLETE, "状态未知", "请使用恢复按钮检查影刀执行端")
 
     def _automation_state(self, now: datetime) -> StateReadModel:
         heartbeat = self.paths.automation_heartbeat
         if heartbeat is None or not heartbeat.is_file():
-            return StateReadModel(ReadState.UNAVAILABLE, "没有服务心跳", "Web 不负责启动 Automation Service")
+            return StateReadModel(ReadState.UNAVAILABLE, "自动任务未运行", "定时扫描、日结和任务生成可能不会自动执行")
         try:
             payload = json.loads(heartbeat.read_text(encoding="utf-8-sig"))
             status = str(payload.get("status") or "UNKNOWN").upper()
             updated_raw = payload.get("last_cycle_at") or payload.get("updated_at")
             updated = datetime.fromisoformat(str(updated_raw).replace("Z", "+00:00"))
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return StateReadModel(ReadState.FAILED, "心跳无法读取", "请使用独立服务诊断入口检查。")
+            return StateReadModel(ReadState.FAILED, "自动任务状态无法读取", "请联系管理员检查自动任务服务。")
         if _age(now, updated) > timedelta(seconds=30):
-            return StateReadModel(ReadState.STALE, "心跳已过期", f"最近周期 {_datetime(updated)}")
+            return StateReadModel(ReadState.STALE, "自动任务响应超时", f"最近运行于 {_datetime(updated)}")
         if status != "RUNNING":
-            return StateReadModel(ReadState.UNAVAILABLE, "已停止", f"最近周期 {_datetime(updated)}")
-        return StateReadModel(ReadState.READY, "运行中", f"最近周期 {_datetime(updated)}")
+            return StateReadModel(ReadState.UNAVAILABLE, "已停止", f"最近运行于 {_datetime(updated)}")
+        return StateReadModel(ReadState.READY, "运行中", f"最近运行于 {_datetime(updated)}")
 
     def _queue_services_state(self, now: datetime) -> StateReadModel:
         heartbeat = (
@@ -2085,8 +2085,8 @@ class OperationsQueryService:
         if not heartbeat.is_file():
             return StateReadModel(
                 ReadState.UNAVAILABLE,
-                "没有后台服务心跳",
-                "Web 不负责启动 Importer、Watchdog 或通知服务",
+                "结果回收和通知发送未运行",
+                "执行结果回收和通知发送可能延迟",
             )
         try:
             payload = json.loads(heartbeat.read_text(encoding="utf-8-sig"))
@@ -2101,25 +2101,25 @@ class OperationsQueryService:
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
             return StateReadModel(
                 ReadState.FAILED,
-                "后台服务心跳无法读取",
-                "请使用独立服务诊断入口检查。",
+                "结果回收和通知状态无法读取",
+                "请联系管理员检查结果回收和通知发送服务。",
             )
         if _age(now, updated) > timedelta(seconds=30):
             return StateReadModel(
                 ReadState.STALE,
-                "后台服务心跳已过期",
-                f"最近周期 {_datetime(updated)}",
+                "结果回收和通知响应超时",
+                f"最近运行于 {_datetime(updated)}",
             )
         if status != "RUNNING":
             return StateReadModel(
                 ReadState.UNAVAILABLE,
-                "后台服务已停止",
-                f"最近周期 {_datetime(updated)}",
+                "结果回收和通知已停止",
+                f"最近运行于 {_datetime(updated)}",
             )
         return StateReadModel(
             ReadState.READY,
-            "后台服务运行中",
-            f"最近周期 {_datetime(updated)}",
+            "结果回收和通知运行中",
+            f"最近运行于 {_datetime(updated)}",
         )
 
     def _importer_state(self, now: datetime) -> StateReadModel:
@@ -2128,14 +2128,14 @@ class OperationsQueryService:
             return service_state
         results = self.paths.queue_root / "results"
         if not results.is_dir():
-            return StateReadModel(ReadState.UNAVAILABLE, "结果目录不可用", "Web 不会创建队列目录")
+            return StateReadModel(ReadState.UNAVAILABLE, "结果回收暂不可用", "平台执行结果可能无法及时更新")
         try:
             pending = sum(1 for item in results.iterdir() if item.is_file())
         except OSError:
-            return StateReadModel(ReadState.FAILED, "结果目录读取失败", "请使用独立服务诊断入口检查。")
+            return StateReadModel(ReadState.FAILED, "结果回收检查失败", "请联系管理员检查执行结果回收服务。")
         if pending:
-            return StateReadModel(ReadState.INCOMPLETE, "等待导入", f"当前有 {pending} 项结果待导入")
-        return StateReadModel(ReadState.READY, "当前无积压", "结果目录没有待导入文件")
+            return StateReadModel(ReadState.INCOMPLETE, "等待回收", f"当前有 {pending} 项执行结果等待回收")
+        return StateReadModel(ReadState.READY, "运行正常", "当前没有等待回收的执行结果")
 
     def _notification_state(self, now: datetime) -> StateReadModel:
         service_state = self._queue_services_state(now)
@@ -2144,20 +2144,20 @@ class OperationsQueryService:
         try:
             values = self.runtime.list_notification_outbox(limit=100, offset=0)
         except Exception:
-            return StateReadModel(ReadState.FAILED, "通知状态读取失败", "请使用独立服务诊断入口检查。")
+            return StateReadModel(ReadState.FAILED, "通知状态读取失败", "请联系管理员检查通知发送服务。")
         failed = sum(str(item.status).upper() == "FAILED" for item in values)
         pending = sum(str(item.status).upper() in {"PENDING", "IN_FLIGHT"} for item in values)
         if failed:
-            return StateReadModel(ReadState.FAILED, "存在发送失败", f"最近记录中有 {failed} 项失败")
+            return StateReadModel(ReadState.FAILED, "存在发送失败", f"最近记录中有 {failed} 条通知发送失败")
         if pending:
-            return StateReadModel(ReadState.INCOMPLETE, "等待发送", f"当前有 {pending} 项待发送")
-        return StateReadModel(ReadState.READY, "当前无积压", "通知测试通过 Outbox 异步发送")
+            return StateReadModel(ReadState.INCOMPLETE, "等待发送", f"当前有 {pending} 条通知等待发送")
+        return StateReadModel(ReadState.READY, "运行正常", "当前没有等待发送的通知")
 
     def _backup_state(self) -> StateReadModel:
         root = self.paths.backup_root
         latest = root / "latest.json" if root is not None else None
         if latest is None or not latest.is_file():
-            return StateReadModel(ReadState.UNAVAILABLE, "没有可用备份记录", "受控备份由独立 Automation Service 执行")
+            return StateReadModel(ReadState.UNAVAILABLE, "尚无备份", "建议创建第一份数据备份")
         try:
             pointer = json.loads(latest.read_text(encoding="utf-8-sig"))
             backup_id = str(pointer.get("backup_id") or "").strip()
@@ -2174,10 +2174,10 @@ class OperationsQueryService:
             )
             created_at = str(manifest.get("created_at_utc") or "")
         except (OSError, ValueError, TypeError, json.JSONDecodeError):
-            return StateReadModel(ReadState.FAILED, "备份清单无法回读", "请使用备份验证 CLI 检查。")
+            return StateReadModel(ReadState.FAILED, "备份记录无法读取", "请联系管理员检查最近一次备份。")
         if not verified:
-            return StateReadModel(ReadState.FAILED, "备份清单未通过", "请使用备份验证 CLI 检查。")
-        return StateReadModel(ReadState.READY, "最近备份已回读", created_at or "清单验证通过")
+            return StateReadModel(ReadState.FAILED, "最近备份不可用", "请联系管理员重新检查或创建备份。")
+        return StateReadModel(ReadState.READY, "最近备份可用", created_at or "备份检查通过")
 
     def _now(self) -> datetime:
         value = self.now_provider()
@@ -2193,22 +2193,22 @@ def _visible(values: Iterable, page_size: int):
 
 def _rows_state(rows: tuple[tuple[str, ...], ...], empty_detail: str) -> StateReadModel:
     if rows:
-        return StateReadModel(ReadState.READY, "可用", f"本页 {len(rows)} 条")
+        return StateReadModel(ReadState.READY, "可用", f"当前显示 {len(rows)} 条")
     return StateReadModel(ReadState.EMPTY, "没有记录", empty_detail)
 
 
 def _snapshot_rows_state(values: Iterable) -> StateReadModel:
     items = tuple(values)
     if not items:
-        return StateReadModel(ReadState.EMPTY, "没有销售观察", "没有把空列表解释为零销量")
+        return StateReadModel(ReadState.EMPTY, "销售数据待更新", "尚未取得当前销售日的完整订单数据")
     complete = [item for item in items if item.scope_complete and item.end_marker_verified]
     if not complete:
-        return StateReadModel(ReadState.INCOMPLETE, "观察不完整", "滚动范围或尾部确认未通过")
+        return StateReadModel(ReadState.INCOMPLETE, "订单采集未完成", "尚未读完当前销售日的全部订单")
     if any(not item.scope_complete or not item.end_marker_verified for item in items):
-        return StateReadModel(ReadState.INCOMPLETE, "部分观察可用", "完整与不完整批次分开保留")
+        return StateReadModel(ReadState.INCOMPLETE, "部分订单数据可用", "仍有部分订单数据等待补充")
     if all(len(item.items) == 0 for item in complete):
-        return StateReadModel(ReadState.TRUSTWORTHY_ZERO, "可信空页", "范围完整且尾部已确认")
-    return StateReadModel(ReadState.READY, "观察完整", "订单页面范围与尾部已确认")
+        return StateReadModel(ReadState.TRUSTWORTHY_ZERO, "已确认暂无订单", "当前销售日的订单已全部采集")
+    return StateReadModel(ReadState.READY, "订单数据完整", "当前销售日的订单已全部采集")
 
 
 def _unavailable_table(dataset: str, title: str, detail: str) -> TableReadModel:
@@ -2217,7 +2217,7 @@ def _unavailable_table(dataset: str, title: str, detail: str) -> TableReadModel:
         title=title,
         columns=(),
         rows=(),
-        state=StateReadModel(ReadState.UNAVAILABLE, "尚未建立权威数据源", detail),
+        state=StateReadModel(ReadState.UNAVAILABLE, "数据暂不可用", detail),
     )
 
 
@@ -2246,7 +2246,7 @@ def _failed_table(
         title=title,
         columns=(),
         rows=(),
-        state=StateReadModel(ReadState.FAILED, "读取失败", "页面未修改任何数据，请稍后重试或联系管理员。"),
+        state=StateReadModel(ReadState.FAILED, "读取失败", "请稍后重试；如持续失败，请联系管理员。"),
         page_size=page_size,
     )
 
@@ -2331,13 +2331,13 @@ def _scope_label(scope_type: str, scope_key: str) -> str:
 
 
 def _trade_day_status_label(value: str) -> str:
-    return {"OPEN": "开放快照", "CLOSED": "已截单"}.get(value, "状态未知")
+    return {"OPEN": "营业中", "CLOSED": "已截单"}.get(value, "状态未知")
 
 
 def _snapshot_quality(item) -> str:
     if item.scope_complete and item.end_marker_verified:
-        return "完整" if item.items else "可信空页"
-    return "不完整"
+        return "完整" if item.items else "已确认无订单"
+    return "采集未完成"
 
 
 def _listing_status_label(value: str) -> str:

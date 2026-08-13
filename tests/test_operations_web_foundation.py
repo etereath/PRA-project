@@ -26,7 +26,13 @@ from app.operations_web.composition import (
     OperationsWebSettings,
     build_container,
 )
-from app.operations_web.presenters import _render_manual_task_controls
+from app.operations_web.presenters import (
+    _automation_schedule_label,
+    _render_execution_controls,
+    _render_manual_task_controls,
+    _render_review_controls,
+)
+from app.operations_web.read_models import AutomationControlReadModel
 from app.enums import AutomationRunStatus, ReviewTaskStatus
 from app.models import ReviewTask
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
@@ -505,7 +511,7 @@ def test_dependency_paths_cannot_be_selected_by_request(operations_web) -> None:
         query=urlencode({"runtime_db": "C:/untrusted.sqlite3"}),
     )
     assert status == "400 Bad Request"
-    assert "启动配置固定" in body
+    assert "不允许修改的系统设置" in body
     status, _, body = call_app(
         app,
         path="/management",
@@ -513,7 +519,7 @@ def test_dependency_paths_cannot_be_selected_by_request(operations_web) -> None:
         json_body={"queue_root": "C:/untrusted-queue"},
     )
     assert status == "400 Bad Request"
-    assert "启动配置固定" in body
+    assert "不允许修改的系统设置" in body
 
 
 def test_request_body_has_a_fixed_upper_bound(operations_web) -> None:
@@ -782,10 +788,10 @@ def test_system_reads_independent_queue_service_heartbeat(operations_web) -> Non
 
     components = {item.name: item.state for item in app.queries.system().components}
 
-    assert components["Importer / Archive"].state.value == "ready"
-    assert components["Outbox / 通知"].state.value == "ready"
-    assert "后台服务" in components["Importer / Archive"].detail or (
-        components["Importer / Archive"].title == "当前无积压"
+    assert components["执行结果回收"].state.value == "ready"
+    assert components["通知发送"].state.value == "ready"
+    assert "运行" in components["执行结果回收"].detail or (
+        components["执行结果回收"].title == "运行正常"
     )
 
 
@@ -952,10 +958,46 @@ def test_manual_task_dialog_hides_conditional_fields_and_blocks_empty_platforms(
         / "app.css"
     ).read_text(encoding="utf-8")
 
-    assert "当前没有启用的平台商品映射" in content
+    assert "当前没有可操作的平台商品" in content
     assert '<button type="submit" disabled>预览任务</button>' in content
     assert "data-inventory-field hidden" in content
     assert "[hidden] { display: none !important; }" in styles
+
+
+def test_operator_copy_humanizes_schedules_and_hides_internal_receipt_ids() -> None:
+    interval_job = AutomationControlReadModel(
+        job_id="JOB-INTERNAL",
+        job_type="FULL_MARKET_SCAN",
+        title="完整市场扫描",
+        enabled=True,
+        schedule="*/60 * * * *",
+        interval_minutes=60,
+    )
+    schedule = _automation_schedule_label(interval_job)
+    execution = _render_execution_controls(
+        csrf_token="csrf",
+        task_options=(),
+        preparation=None,
+        receipt=("BATCH-SECRET", "ATTEMPT-SECRET"),
+        error="",
+        idempotency_key="execution-test",
+    )
+    review = _render_review_controls(
+        csrf_token="csrf",
+        reviews=(),
+        receipt=("REVIEW-SECRET", "已处理", "TASK-SECRET"),
+        error="",
+    )
+
+    assert schedule == "每 60 分钟运行一次"
+    assert "*/60" not in schedule
+    for secret in (
+        "BATCH-SECRET",
+        "ATTEMPT-SECRET",
+        "REVIEW-SECRET",
+        "TASK-SECRET",
+    ):
+        assert secret not in execution + review
 
 
 def test_static_assets_must_revalidate_after_deployment(operations_web) -> None:
