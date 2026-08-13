@@ -21,8 +21,14 @@ from app.enums import (
 )
 from app.exceptions import MobileReviewErrorCode, MobileReviewTransactionError
 from app.models import Task
+from app.operations_web.auth import (
+    Capability,
+    Principal,
+    PrincipalCapabilityBackend,
+)
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository, _is_sqlite_concurrency_error
 from app.services.runtime import ReviewTaskService, ReviewTokenService, RuntimeTaskService
+from app.services.review_resolution import ReviewResolutionApplicationService
 from app.services.workflow import resolve_mobile_review
 
 
@@ -319,6 +325,97 @@ class MobileReviewAtomicTransactionTests(unittest.TestCase):
                         task.decision_trace["mobile_review_adjustment"]["target_price"],
                         "8.8",
                     )
+
+    def test_authenticated_web_and_mobile_share_the_same_business_transaction(self) -> None:
+        mobile_path = Path(self.temp_dir.name) / "equivalent-mobile.sqlite3"
+        desktop_path = Path(self.temp_dir.name) / "equivalent-desktop.sqlite3"
+        mobile_repository, mobile_review_id, mobile_token = self._prepare(mobile_path)
+        desktop_repository, desktop_review_id, _ = self._prepare(desktop_path)
+
+        resolve_mobile_review(
+            mobile_path,
+            mobile_review_id,
+            mobile_token,
+            "adjusted",
+            note="统一复核事务",
+            resolution_payload={
+                "adjustment": {
+                    "target_price": "8.80",
+                }
+            },
+        )
+        ReviewResolutionApplicationService(
+            desktop_repository,
+            PrincipalCapabilityBackend(),
+            products_path=Path(self.temp_dir.name) / "unused-products.xlsx",
+        ).resolve(
+            Principal("desktop_operator", frozenset({Capability.HANDLE_REVIEW})),
+            review_task_id=desktop_review_id,
+            action="adjusted",
+            target_price="8.80",
+            note="统一复核事务",
+        )
+
+        mobile_task = mobile_repository.get_task("TASK-ATOMIC")
+        desktop_task = desktop_repository.get_task("TASK-ATOMIC")
+        self.assertEqual(desktop_task.task_status, mobile_task.task_status)
+        self.assertEqual(desktop_task.target_price, mobile_task.target_price)
+        self.assertEqual(desktop_task.target_status, mobile_task.target_status)
+        self.assertEqual(
+            desktop_task.decision_trace["mobile_review_adjustment"]["target_price"],
+            mobile_task.decision_trace["mobile_review_adjustment"]["target_price"],
+        )
+        self.assertEqual(
+            desktop_repository.get_review_task(desktop_review_id).review_status,
+            mobile_repository.get_review_task(mobile_review_id).review_status,
+        )
+        desktop_history = desktop_repository.list_task_status_history("TASK-ATOMIC")
+        mobile_history = mobile_repository.list_task_status_history("TASK-ATOMIC")
+        self.assertEqual(
+            [(item.from_status, item.to_status) for item in desktop_history],
+            [(item.from_status, item.to_status) for item in mobile_history],
+        )
+        self.assertEqual(
+            [item.status for item in desktop_repository.list_notification_outbox()],
+            [item.status for item in mobile_repository.list_notification_outbox()],
+        )
+
+    def test_authenticated_review_failure_rolls_back_the_shared_transaction(self) -> None:
+        for point in (
+            "after_review_update",
+            "after_task_update",
+            "before_history_insert",
+            "after_history_insert",
+            "before_result_conversion",
+        ):
+            with self.subTest(point=point):
+                point_path = Path(self.temp_dir.name) / f"desktop-{point}.sqlite3"
+                repository, review_task_id, _ = self._prepare(point_path)
+
+                def inject(current: str) -> None:
+                    if current == point:
+                        raise RuntimeError(f"injected failure at {current}")
+
+                with self.assertRaises(RuntimeError):
+                    repository.resolve_authenticated_review_atomic(
+                        review_task_id=review_task_id,
+                        status=ReviewTaskStatus.REJECTED,
+                        actor_source="authenticated_web",
+                        actor="desktop_operator",
+                        note="rollback",
+                        failure_injector=inject,
+                    )
+
+                check = SQLiteRuntimeRepository(point_path)
+                self.assertEqual(
+                    check.get_review_task(review_task_id).review_status,
+                    ReviewTaskStatus.PENDING,
+                )
+                self.assertEqual(
+                    check.get_task("TASK-ATOMIC").task_status,
+                    TaskStatus.MANUAL_REVIEW,
+                )
+                self.assertEqual(check.list_task_status_history("TASK-ATOMIC"), [])
 
     def test_faults_at_each_commit_stage_roll_back_everything(self) -> None:
         for point in (

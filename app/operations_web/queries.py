@@ -7,33 +7,38 @@
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
-from pathlib import Path
 from urllib.parse import quote, urlencode
 
 from app.enums import (
     DataQualityLevel,
     ReviewTaskStatus,
     SellerPhase,
+    TaskActionType,
     TaskStatus,
 )
 from app.models import Product, ReviewTask, Task
 from app.operations_web.composition import OperationsWebPaths
 from app.operations_web.read_models import (
+    AutomationControlReadModel,
     ComponentReadModel,
     DatabaseReadModel,
     DetailFieldReadModel,
     DetailReadModel,
+    InventoryAlertControlReadModel,
     ManagementReadModel,
     MetricReadModel,
     MobileReviewReadModel,
     NotificationDrawerReadModel,
     NotificationItemReadModel,
     ReadState,
+    ReviewActionReadModel,
+    ReviewControlReadModel,
     StateReadModel,
     SystemReadModel,
     TableReadModel,
@@ -50,6 +55,15 @@ from app.repositories.operational_summary_repository import (
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import load_products
 from app.review_policy import allowed_review_statuses, review_action_label
+from app.services.automation import (
+    DAILY_TASK_GENERATION,
+    FULL_MARKET_SCAN,
+    ONLINE_PULSE,
+    PLATFORM_TRADE_DAY_SETTLEMENT,
+    REVIEW_TIMEOUT_MAINTENANCE,
+    SALES_PLAN_INPUT_BUILD,
+)
+from app.services.automation_configuration import CONFIGURABLE_JOB_TYPES
 from app.services.operational_time import OperationalTimeContext, OperationalTimeService
 from app.services.authoritative_inventory import InventoryProvider
 from app.services.notification_outbox import (
@@ -61,6 +75,7 @@ from app.services.runtime import ReviewTokenService
 
 DEFAULT_PAGE_SIZE = 25
 MAX_PAGE_SIZE = 25
+LOGGER = logging.getLogger("app.operations_web.queries")
 
 QUALITY_LABELS = {
     "ORDER_COMPLETE": "完整订单事实",
@@ -116,10 +131,11 @@ AUTOMATION_JOB_LABELS = {
     "POST_CUTOFF_PULSE": "截单后状态扫描",
     "PLATFORM_TRADE_DAY_SETTLEMENT": "交易日结算",
     "SALES_PLAN_INPUT_BUILD": "销售计划数据整理",
+    "REVIEW_TIMEOUT_MAINTENANCE": "人工复核超时维护",
+    "DAILY_TASK_GENERATION": "每日任务生成",
     "LISTING_STATUS_SCAN": "商品状态扫描",
     "ORDER_SCAN": "订单扫描",
     "INCIDENT_NOTIFICATION_MAINTENANCE": "异常通知维护",
-    "DAILY_TASK_GENERATION": "每日任务生成",
 }
 
 BUSINESS_DATASETS = (
@@ -472,6 +488,165 @@ class OperationsQueryService:
         inventory_receipt = None
         inventory_error = _inventory_error_state(inventory_error_code)
         try:
+            pending_task_options = tuple(
+                (
+                    item.task_id,
+                    " · ".join(
+                        filter(
+                            None,
+                            (
+                                _task_action_label(item.action_type.value),
+                                item.internal_sku or "",
+                                item.platform_name or "",
+                            ),
+                        )
+                    ),
+                )
+                for item in self.runtime.list_tasks(
+                    status=TaskStatus.PENDING,
+                    limit=50,
+                )
+                if item.action_type
+                in {
+                    TaskActionType.UPDATE_PRICE,
+                    TaskActionType.SET_ONLINE,
+                    TaskActionType.SET_OFFLINE,
+                }
+            )
+        except Exception:
+            pending_task_options = ()
+        try:
+            pending_review_options = []
+            for review in self.runtime.list_review_tasks(
+                status=ReviewTaskStatus.PENDING,
+                limit=50,
+            ):
+                source_task = (
+                    self.runtime.get_task(review.source_task_id)
+                    if review.source_task_id
+                    else None
+                )
+                actions = []
+                for status in allowed_review_statuses(review, source_task):
+                    label = review_action_label(review, source_task, status)
+                    if label:
+                        actions.append(
+                            ReviewActionReadModel(
+                                value=status.value,
+                                label=label,
+                                requires_target_price=(
+                                    status is ReviewTaskStatus.ADJUSTED
+                                ),
+                            )
+                        )
+                if actions:
+                    pending_review_options.append(
+                        ReviewControlReadModel(
+                            review_task_id=review.review_task_id,
+                            title=_review_type_label(review.review_type),
+                            scope=_review_scope(review),
+                            reason=review.reason or "需要人工确认",
+                            actions=tuple(actions),
+                        )
+                    )
+            pending_review_options = tuple(pending_review_options)
+        except Exception:
+            pending_review_options = ()
+        try:
+            selected_jobs = {}
+            for job in self.automation.list_jobs():
+                if job.job_type not in CONFIGURABLE_JOB_TYPES:
+                    continue
+                previous = selected_jobs.get(job.job_type)
+                job_key = (
+                    int(job.enabled),
+                    job.updated_at or datetime.min.replace(tzinfo=timezone.utc),
+                    job.job_id,
+                )
+                previous_key = (
+                    (
+                        int(previous.enabled),
+                        previous.updated_at
+                        or datetime.min.replace(tzinfo=timezone.utc),
+                        previous.job_id,
+                    )
+                    if previous is not None
+                    else None
+                )
+                if previous_key is None or job_key > previous_key:
+                    selected_jobs[job.job_type] = job
+            automation_options = []
+            for job in sorted(
+                selected_jobs.values(),
+                key=lambda item: (item.priority, item.job_type),
+            ):
+                interval = None
+                if job.job_type in {
+                    ONLINE_PULSE,
+                    FULL_MARKET_SCAN,
+                    REVIEW_TIMEOUT_MAINTENANCE,
+                }:
+                    try:
+                        interval = int(job.schedule_expression)
+                    except ValueError:
+                        interval = None
+                offset = (
+                    int(job.config.get("settlement_offset_minutes") or 5)
+                    if job.job_type == SALES_PLAN_INPUT_BUILD
+                    else (
+                        int(job.config.get("plan_input_offset_minutes") or 5)
+                        if job.job_type == DAILY_TASK_GENERATION
+                        else None
+                    )
+                )
+                automation_options.append(
+                    AutomationControlReadModel(
+                        job_id=job.job_id,
+                        job_type=job.job_type,
+                        title=_automation_job_label(job.job_type),
+                        enabled=job.enabled,
+                        schedule=job.schedule_expression,
+                        interval_minutes=interval,
+                        offset_minutes=offset,
+                        can_edit_interval=job.job_type
+                        in {
+                            ONLINE_PULSE,
+                            FULL_MARKET_SCAN,
+                            REVIEW_TIMEOUT_MAINTENANCE,
+                        },
+                        can_edit_offset=job.job_type
+                        in {SALES_PLAN_INPUT_BUILD, DAILY_TASK_GENERATION},
+                        can_rerun=job.job_type
+                        in {
+                            PLATFORM_TRADE_DAY_SETTLEMENT,
+                            SALES_PLAN_INPUT_BUILD,
+                        },
+                        enabled_sources=tuple(
+                            str(value)
+                            for value in job.config.get("source_allowlist", ())
+                            if str(value) != "PRODUCTS"
+                        ),
+                    )
+                )
+            automation_options = tuple(automation_options)
+        except Exception:
+            LOGGER.exception("读取自动化配置失败")
+            automation_options = ()
+        try:
+            inventory_alert_options = tuple(
+                InventoryAlertControlReadModel(
+                    scope_type=item.scope_type,
+                    scope_key=item.scope_key,
+                    enabled=item.enabled,
+                    threshold_qty=item.threshold_qty,
+                    repeat_interval_minutes=item.repeat_interval_minutes,
+                    version=item.version,
+                )
+                for item in self.inventory.list_alert_policies()
+            )
+        except Exception:
+            inventory_alert_options = ()
+        try:
             authority = self.inventory.get_authority_state()
             if authority.authority_mode != "DB_AUTHORITY":
                 inventory_state = StateReadModel(
@@ -527,6 +702,17 @@ class OperationsQueryService:
             inventory_error=inventory_error,
             inventory_idempotency_key=(
                 "web-inventory:" + secrets.token_urlsafe(18)
+            ),
+            pending_task_options=pending_task_options,
+            pending_review_options=pending_review_options,
+            automation_options=automation_options,
+            inventory_alert_options=inventory_alert_options,
+            task_idempotency_key="web-task:" + secrets.token_urlsafe(18),
+            execution_idempotency_key=(
+                "web-execution:" + secrets.token_urlsafe(18)
+            ),
+            automation_rerun_idempotency_key=(
+                "web-automation-rerun:" + secrets.token_urlsafe(18)
             ),
         )
 
@@ -666,6 +852,7 @@ class OperationsQueryService:
                 item.value for item in allowed_review_statuses(review, source_task)
             }
             actions = []
+            action_options = []
             for item in token.allowed_actions:
                 if item not in policy:
                     continue
@@ -676,11 +863,12 @@ class OperationsQueryService:
                 label = review_action_label(review, source_task, status)
                 if label:
                     actions.append(label)
+                    action_options.append((status.value, label))
             return MobileReviewReadModel(
                 state=StateReadModel(
                     ReadState.READY,
                     "等待处理",
-                    "当前页面只读展示；处理按钮将在后续接入既有安全处置流程。",
+                    "请选择处理方式；提交后会通过既有原子事务保存结果。",
                 ),
                 review_title=_review_type_label(review.review_type),
                 reason=review.reason or "需要人工确认",
@@ -688,6 +876,8 @@ class OperationsQueryService:
                 deadline=_datetime(review.required_by),
                 allowed_actions=tuple(actions),
                 http_status="200 OK",
+                review_task_id=review_task_id,
+                action_options=tuple(action_options),
             )
         if review is not None and (
             review.review_status is not ReviewTaskStatus.PENDING
@@ -1907,6 +2097,14 @@ def _inventory_transaction_label(value: str) -> str:
         "SALES_RESTORE": "销售恢复",
         "RECONCILIATION": "对账修正",
     }.get(value, "库存变动")
+
+
+def _task_action_label(value: str) -> str:
+    return {
+        "update_price": "改价",
+        "set_online": "上架",
+        "set_offline": "下架",
+    }.get(str(value), str(value))
 
 
 def _inventory_product_label(product: Product | None) -> str:

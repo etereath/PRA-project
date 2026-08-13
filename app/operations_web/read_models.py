@@ -108,6 +108,47 @@ class SystemReadModel:
 
 
 @dataclass(frozen=True, slots=True)
+class ReviewActionReadModel:
+    value: str
+    label: str
+    requires_target_price: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewControlReadModel:
+    review_task_id: str
+    title: str
+    scope: str
+    reason: str
+    actions: tuple[ReviewActionReadModel, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AutomationControlReadModel:
+    job_id: str
+    job_type: str
+    title: str
+    enabled: bool
+    schedule: str
+    interval_minutes: int | None = None
+    offset_minutes: int | None = None
+    can_edit_interval: bool = False
+    can_edit_offset: bool = False
+    can_rerun: bool = False
+    enabled_sources: tuple[str, ...] = field(default_factory=tuple)
+
+
+@dataclass(frozen=True, slots=True)
+class InventoryAlertControlReadModel:
+    scope_type: str
+    scope_key: str
+    enabled: bool
+    threshold_qty: int
+    repeat_interval_minutes: int
+    version: int
+
+
+@dataclass(frozen=True, slots=True)
 class ManagementReadModel:
     pending_tasks: TableReadModel
     pending_reviews: TableReadModel
@@ -119,6 +160,19 @@ class ManagementReadModel:
     inventory_receipt: tuple[str, str, str, str] | None = None
     inventory_error: StateReadModel | None = None
     inventory_idempotency_key: str = ""
+    pending_task_options: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+    pending_review_options: tuple[ReviewControlReadModel, ...] = field(
+        default_factory=tuple
+    )
+    automation_options: tuple[AutomationControlReadModel, ...] = field(
+        default_factory=tuple
+    )
+    inventory_alert_options: tuple[InventoryAlertControlReadModel, ...] = field(
+        default_factory=tuple
+    )
+    task_idempotency_key: str = ""
+    execution_idempotency_key: str = ""
+    automation_rerun_idempotency_key: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,3 +201,5 @@ class MobileReviewReadModel:
     deadline: str
     allowed_actions: tuple[str, ...]
     http_status: str
+    review_task_id: str = ""
+    action_options: tuple[tuple[str, str], ...] = field(default_factory=tuple)

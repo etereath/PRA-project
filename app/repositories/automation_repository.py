@@ -199,6 +199,164 @@ class AutomationRepository:
             ).fetchone()
         return _row_to_job(row) if row is not None else None
 
+    def replace_job_version(
+        self,
+        *,
+        previous_job_id: str,
+        successor: AutomationJob,
+        now: datetime,
+    ) -> AutomationJob:
+        """Enable one immutable schedule version and disable its predecessors."""
+
+        return self.replace_job_versions(
+            replacements=((previous_job_id, successor),),
+            now=now,
+        )[0]
+
+    def replace_job_versions(
+        self,
+        *,
+        replacements: Iterable[tuple[str, AutomationJob]],
+        now: datetime,
+    ) -> tuple[AutomationJob, ...]:
+        """Atomically reversion one dependency group of Automation Jobs."""
+
+        current = _as_utc(now, "now")
+        pairs = tuple(replacements)
+        if not pairs:
+            raise ValueError("At least one Automation replacement is required")
+        successor_ids = [successor.job_id for _, successor in pairs]
+        if len(successor_ids) != len(set(successor_ids)):
+            raise ValueError("Automation successor job_ids must be unique")
+        for _, successor in pairs:
+            _validate_job(successor)
+        with closing(self.runtime_repository.connect_write()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                for previous_job_id, successor in pairs:
+                    config_json = _json_dump(successor.config)
+                    platform_name = str(
+                        successor.config.get("platform_name") or ""
+                    ).strip()
+                    previous = connection.execute(
+                        "SELECT * FROM automation_jobs WHERE job_id = ?",
+                        (previous_job_id,),
+                    ).fetchone()
+                    if previous is None:
+                        raise ValueError(
+                            "Automation job has changed; refresh and retry"
+                        )
+                    if str(previous["job_type"]) != successor.job_type:
+                        raise ValueError(
+                            "Automation successor job_type must not change"
+                        )
+                    previous_config = _json_load(previous["config_json"])
+                    if (
+                        str(previous_config.get("platform_name") or "")
+                        != platform_name
+                    ):
+                        raise ValueError(
+                            "Automation successor platform_name must not change"
+                        )
+
+                    existing = connection.execute(
+                        "SELECT * FROM automation_jobs WHERE job_id = ?",
+                        (successor.job_id,),
+                    ).fetchone()
+                    if existing is None:
+                        connection.execute(
+                            """
+                            INSERT INTO automation_jobs(
+                                job_id, job_type, display_name, enabled,
+                                schedule_kind, schedule_expression, priority,
+                                config_json, created_at, updated_at
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            (
+                                successor.job_id,
+                                successor.job_type,
+                                successor.display_name,
+                                int(successor.enabled),
+                                successor.schedule_kind,
+                                successor.schedule_expression,
+                                successor.priority,
+                                config_json,
+                                _datetime_text(current),
+                                _datetime_text(current),
+                            ),
+                        )
+                    else:
+                        existing_config = _json_load(existing["config_json"])
+                        if (
+                            str(existing["job_type"]) != successor.job_type
+                            or str(existing["schedule_kind"])
+                            != successor.schedule_kind
+                            or str(existing["schedule_expression"])
+                            != successor.schedule_expression
+                            or str(existing_config.get("platform_name") or "")
+                            != platform_name
+                        ):
+                            raise ValueError(
+                                "Deterministic Automation job_id collides "
+                                "with another schedule"
+                            )
+                        connection.execute(
+                            """
+                            UPDATE automation_jobs
+                            SET display_name = ?, priority = ?, config_json = ?,
+                                updated_at = ?
+                            WHERE job_id = ?
+                            """,
+                            (
+                                successor.display_name,
+                                successor.priority,
+                                config_json,
+                                _datetime_text(current),
+                                successor.job_id,
+                            ),
+                        )
+                    rows = connection.execute(
+                        """
+                        SELECT job_id, config_json FROM automation_jobs
+                        WHERE job_type = ?
+                        """,
+                        (successor.job_type,),
+                    ).fetchall()
+                    for row in rows:
+                        row_config = _json_load(row["config_json"])
+                        if (
+                            str(row_config.get("platform_name") or "")
+                            != platform_name
+                        ):
+                            continue
+                        connection.execute(
+                            """
+                            UPDATE automation_jobs
+                            SET enabled = ?, updated_at = ? WHERE job_id = ?
+                            """,
+                            (
+                                int(
+                                    str(row["job_id"]) == successor.job_id
+                                    and successor.enabled
+                                ),
+                                _datetime_text(current),
+                                str(row["job_id"]),
+                            ),
+                        )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+        stored_jobs: list[AutomationJob] = []
+        for _, successor in pairs:
+            stored = self.get_job(successor.job_id)
+            if stored is None or stored.enabled != successor.enabled:
+                raise RuntimeError(
+                    "Automation successor job state was not persisted"
+                )
+            stored_jobs.append(stored)
+        return tuple(stored_jobs)
+
     def list_jobs(self, *, enabled_only: bool = False) -> list[AutomationJob]:
         where = "WHERE enabled = 1" if enabled_only else ""
         with closing(self.runtime_repository.connect_read()) as connection:
@@ -449,6 +607,33 @@ class AutomationRepository:
                 tuple(values),
             ).fetchall()
         return [_row_to_run(row) for row in rows]
+
+    def latest_successful_run(
+        self,
+        *,
+        job_type: str,
+        platform_name: str,
+        platform_trade_date: date,
+    ) -> AutomationRun | None:
+        with closing(self.runtime_repository.connect_read()) as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM automation_runs
+                WHERE job_type = ?
+                  AND platform_name = ?
+                  AND platform_trade_date = ?
+                  AND run_status = 'SUCCESS'
+                ORDER BY finished_at DESC, scheduled_for DESC, run_id DESC
+                LIMIT 1
+                """,
+                (
+                    str(job_type).strip(),
+                    str(platform_name).strip(),
+                    platform_trade_date.isoformat(),
+                ),
+            ).fetchone()
+        return _row_to_run(row) if row is not None else None
 
     def reconcile_scheduled_runs_for_job(
         self,

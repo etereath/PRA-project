@@ -469,6 +469,10 @@ Runtime DB READ_ONLY 验收零写。
 
 ### 9.5 7E：人工任务、执行授权、复核与 Automation 配置
 
+实施状态（2026-08-13）：已按
+[7E 控制面合同](task13_5_7e_control_plane_contract.md) 完成编码；验收事实和真实副作用边界见
+[7E 实施报告](../reports/task13_5_7e_control_plane.md)。
+
 范围：
 
 1. 品种/等级/平台多选和有效商品展开；

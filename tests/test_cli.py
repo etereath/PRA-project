@@ -162,7 +162,7 @@ class CliTests(unittest.TestCase):
             self.assertEqual(task_service.list_tasks()[0].task_status, TaskStatus.MANUAL_REVIEW)
 
             apply_output = io.StringIO()
-            apply_args = dry_run_args + ["--apply"]
+            apply_args = dry_run_args + ["--apply", "--admin-recovery"]
             with patch.object(sys, "argv", apply_args), redirect_stdout(apply_output):
                 exit_code = main()
             self.assertEqual(exit_code, 0)

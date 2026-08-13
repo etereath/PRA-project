@@ -21,6 +21,11 @@ from app.exceptions import (
     NotificationIdempotencyConflictError,
 )
 from app.models import ListingStatus, NotificationDeliveryResult, Task
+from app.operations_web.auth import (
+    Capability,
+    Principal,
+    PrincipalCapabilityBackend,
+)
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import PRODUCT_HEADERS
 from app.services.incident_management import (
@@ -34,6 +39,7 @@ from app.services.notification_outbox import (
     NotificationOutboxService,
 )
 from app.services.runtime import ReviewTokenService
+from app.services.review_resolution import ReviewResolutionApplicationService
 from app.services.workflow import (
     _read_authoritative_product_cost_snapshot,
     get_mobile_review_detail,
@@ -979,6 +985,100 @@ def test_incident_mobile_review_creates_manual_v4_or_v5_task_atomically(
         IncidentEventType.REVIEW_RECORDED,
         IncidentEventType.TASK_RECORDED,
     }
+
+
+def test_authenticated_web_review_reuses_incident_atomic_path(
+    runtime_repository,
+    tmp_path,
+):
+    _, review = create_review_with_listing(runtime_repository)
+    products_path = tmp_path / "products.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "data"
+    sheet.append(PRODUCT_HEADERS)
+    sheet.append(
+        [
+            "SKU-SYNTHETIC-001",
+            "Synthetic flower",
+            "B",
+            "60",
+            "bundle",
+            10,
+            50,
+            True,
+            8,
+            12,
+            "",
+            "synthetic",
+            "green",
+        ]
+    )
+    workbook.save(products_path)
+    service = ReviewResolutionApplicationService(
+        runtime_repository,
+        PrincipalCapabilityBackend(),
+        products_path=products_path,
+    )
+
+    result = service.resolve(
+        Principal("operator", frozenset({Capability.HANDLE_REVIEW})),
+        review_task_id=review.review_task.review_task_id,
+        action=ReviewTaskStatus.ADJUSTED.value,
+        target_price="12.50",
+        note="raise to safe price",
+    )
+
+    assert result.review_status == ReviewTaskStatus.ADJUSTED.value
+    assert result.created_task_id
+    stored_review = runtime_repository.get_review_task(result.review_task_id)
+    assert stored_review is not None
+    assert stored_review.resolved_by == "operator"
+    created_task = runtime_repository.get_task(result.created_task_id)
+    assert created_task is not None
+    assert created_task.action_type is TaskActionType.UPDATE_PRICE
+    assert created_task.target_price == Decimal("12.50")
+    stored_token = runtime_repository.get_review_token(review.review_token.token_id)
+    assert stored_token is not None
+    assert stored_token.used_at is None
+
+
+def test_authenticated_incident_review_rolls_back_every_table_on_failure(
+    runtime_repository,
+):
+    incident, review = create_review_with_listing(runtime_repository)
+    events_before = IncidentManagementService(runtime_repository).list_events(
+        incident.incident_id
+    )
+
+    def fail_after_task(point: str) -> None:
+        if point == "after_incident_task_insert":
+            raise RuntimeError("synthetic failure")
+
+    with pytest.raises(RuntimeError, match="synthetic failure"):
+        runtime_repository.resolve_authenticated_incident_review_atomic(
+            review_task_id=review.review_task.review_task_id,
+            status=ReviewTaskStatus.ADJUSTED,
+            actor_source="authenticated_web",
+            actor="operator",
+            resolution_payload={"adjustment": {"target_price": "12.50"}},
+            emergency_base_cost=Decimal("10.00"),
+            emergency_base_cost_source_ref="products.xlsx:sha256:synthetic",
+            emergency_product_snapshot_verifier=stable_product_snapshot,
+            now=NOW + timedelta(minutes=2),
+            failure_injector=fail_after_task,
+        )
+
+    stored_review = runtime_repository.get_review_task(
+        review.review_task.review_task_id
+    )
+    assert stored_review is not None
+    assert stored_review.review_status is ReviewTaskStatus.PENDING
+    assert runtime_repository.list_tasks() == []
+    events = IncidentManagementService(runtime_repository).list_events(
+        incident.incident_id
+    )
+    assert events == events_before
 
 
 def test_incident_mobile_review_rejects_price_below_base_cost_without_consuming_token(

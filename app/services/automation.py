@@ -23,6 +23,8 @@ from app.enums import AutomationRunStatus
 from app.repositories.automation_repository import AutomationRepository
 from app.services.operational_time import (
     DEFAULT_OPERATIONAL_TIMEZONE,
+    OperationalTimePolicy,
+    OperationalTimePolicyRegistry,
     OperationalTimeService,
 )
 
@@ -39,6 +41,8 @@ PRE_CUTOFF_FULL_SCAN = "PRE_CUTOFF_FULL_SCAN"
 POST_CUTOFF_PULSE = "POST_CUTOFF_PULSE"
 PLATFORM_TRADE_DAY_SETTLEMENT = "PLATFORM_TRADE_DAY_SETTLEMENT"
 SALES_PLAN_INPUT_BUILD = "SALES_PLAN_INPUT_BUILD"
+REVIEW_TIMEOUT_MAINTENANCE = "REVIEW_TIMEOUT_MAINTENANCE"
+DAILY_TASK_GENERATION = "DAILY_TASK_GENERATION"
 
 UI_JOB_TYPES = UI_AUTOMATION_JOB_TYPES
 
@@ -512,7 +516,10 @@ def ensure_default_automation_jobs(
     """Insert the frozen 13.5 jobs without overwriting operator changes."""
 
     current = _as_utc(now, "now")
-    jobs = default_automation_jobs(platform_name=platform_name)
+    policy = OperationalTimePolicyRegistry(
+        repository.load_operational_time_policies()
+    ).select(current)
+    jobs = default_automation_jobs(platform_name=platform_name, policy=policy)
     stored: list[AutomationJob] = []
     for job in jobs:
         existing = repository.get_job(job.job_id)
@@ -527,11 +534,38 @@ def ensure_default_automation_jobs(
 def default_automation_jobs(
     *,
     platform_name: str,
+    policy: OperationalTimePolicy | None = None,
 ) -> tuple[AutomationJob, ...]:
     platform = platform_name.strip()
     if not platform:
         raise ValueError("platform_name must not be blank")
+    effective_policy = policy or OperationalTimePolicy()
+    pre_cutoff = _default_time_expression(
+        effective_policy.platform_cutoff_local_time, -5
+    )
+    post_cutoff = _default_time_expression(
+        effective_policy.platform_cutoff_local_time, 5
+    )
+    settlement = _default_time_expression(
+        effective_policy.seller_cutoff_local_time, 0
+    )
+    plan_input = _default_time_expression(
+        effective_policy.seller_cutoff_local_time, 5
+    )
+    daily_generation = _default_time_expression(
+        effective_policy.seller_cutoff_local_time, 10
+    )
+    platform_cutoff_label = effective_policy.platform_cutoff_local_time.strftime(
+        "%H:%M"
+    )
+    seller_cutoff_label = effective_policy.seller_cutoff_local_time.strftime(
+        "%H:%M"
+    )
     common = {"platform_name": platform}
+    timed_common = {
+        **common,
+        "time_policy_version": effective_policy.policy_version,
+    }
     return (
         AutomationJob(
             job_id="AUTOMATION-ONLINE-PULSE-10M",
@@ -565,13 +599,13 @@ def default_automation_jobs(
         AutomationJob(
             job_id="AUTOMATION-PRE-CUTOFF-FULL-SCAN",
             job_type=PRE_CUTOFF_FULL_SCAN,
-            display_name="18:00 截单前完整扫描",
+            display_name=f"{platform_cutoff_label} 截单前完整扫描",
             enabled=True,
             schedule_kind=DAILY_LOCAL_TIME,
-            schedule_expression="17:55",
+            schedule_expression=pre_cutoff,
             priority=UI_CHANNEL_PRIORITY[PRE_CUTOFF_FULL_SCAN],
             config={
-                **common,
+                **timed_common,
                 "catchup_policy": "LATEST_ONLY",
                 "max_lateness_seconds": 7200,
             },
@@ -579,13 +613,13 @@ def default_automation_jobs(
         AutomationJob(
             job_id="AUTOMATION-POST-CUTOFF-PULSE",
             job_type=POST_CUTOFF_PULSE,
-            display_name="18:00 截单后确认扫描",
+            display_name=f"{platform_cutoff_label} 截单后确认扫描",
             enabled=True,
             schedule_kind=DAILY_LOCAL_TIME,
-            schedule_expression="18:05",
+            schedule_expression=post_cutoff,
             priority=UI_CHANNEL_PRIORITY[POST_CUTOFF_PULSE],
             config={
-                **common,
+                **timed_common,
                 "catchup_policy": "LATEST_ONLY",
                 "max_lateness_seconds": 7200,
             },
@@ -593,15 +627,15 @@ def default_automation_jobs(
         AutomationJob(
             job_id="AUTOMATION-TRADE-DAY-SETTLEMENT",
             job_type=PLATFORM_TRADE_DAY_SETTLEMENT,
-            display_name="20:00 平台交易日结算",
+            display_name=f"{seller_cutoff_label} 平台交易日结算",
             enabled=True,
             schedule_kind=DAILY_LOCAL_TIME,
-            schedule_expression="20:00",
+            schedule_expression=settlement,
             priority=UI_CHANNEL_PRIORITY[
                 PLATFORM_TRADE_DAY_SETTLEMENT
             ],
             config={
-                **common,
+                **timed_common,
                 "catchup_policy": "IDEMPOTENT",
                 "max_catchup_runs": 2,
                 "requires_ui_channel": False,
@@ -613,13 +647,50 @@ def default_automation_jobs(
             display_name="下一销售计划输入构建",
             enabled=True,
             schedule_kind=DAILY_LOCAL_TIME,
-            schedule_expression="20:05",
+            schedule_expression=plan_input,
             priority=55,
             config={
-                **common,
+                **timed_common,
                 "catchup_policy": "IDEMPOTENT",
                 "max_catchup_runs": 2,
                 "requires_ui_channel": False,
+                "settlement_offset_minutes": 5,
+            },
+        ),
+        AutomationJob(
+            job_id="AUTOMATION-REVIEW-TIMEOUT-MAINTENANCE",
+            job_type=REVIEW_TIMEOUT_MAINTENANCE,
+            display_name="人工复核超时维护",
+            enabled=True,
+            schedule_kind=INTERVAL_MINUTES,
+            schedule_expression="5",
+            priority=25,
+            config={
+                **common,
+                "catchup_policy": "LATEST_ONLY",
+                "max_lateness_seconds": 300,
+                "requires_ui_channel": False,
+            },
+        ),
+        AutomationJob(
+            job_id="AUTOMATION-DAILY-TASK-GENERATION",
+            job_type=DAILY_TASK_GENERATION,
+            display_name="每日任务生成",
+            enabled=True,
+            schedule_kind=DAILY_LOCAL_TIME,
+            schedule_expression=daily_generation,
+            priority=56,
+            config={
+                **timed_common,
+                "catchup_policy": "IDEMPOTENT",
+                "max_catchup_runs": 2,
+                "requires_ui_channel": False,
+                "plan_input_offset_minutes": 5,
+                "source_allowlist": [
+                    "PRODUCTS",
+                    "PRICE_RULES",
+                    "LISTING_RULES",
+                ],
             },
         ),
         AutomationJob(
@@ -643,6 +714,11 @@ def default_automation_jobs(
             config={**common, "requires_ui_channel": True},
         ),
     )
+
+
+def _default_time_expression(base: time, offset_minutes: int) -> str:
+    anchor = datetime(2000, 1, 1, base.hour, base.minute)
+    return (anchor + timedelta(minutes=offset_minutes)).strftime("%H:%M")
 
 
 def _due_windows(

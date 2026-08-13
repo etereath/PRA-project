@@ -392,7 +392,7 @@ def test_scheduler_only_does_not_terminally_merge_hourly_pulse(
     first = AutomationSchedulePlanner(repository).materialize(now=now)
     second = AutomationSchedulePlanner(repository).materialize(now=now)
 
-    assert len(jobs) == 8
+    assert len(jobs) == 10
     assert first.created_run_ids
     assert first.merged_run_ids == ()
     assert second.created_run_ids == ()
@@ -2346,12 +2346,14 @@ def test_once_cli_writes_stopped_heartbeat_and_default_jobs(
     assert payload["status"] == "STOPPED"
     assert payload["mode"] == "SETTLEMENT_ONLY"
     assert payload["registered_job_types"] == [
+        "DAILY_TASK_GENERATION",
         "PLATFORM_TRADE_DAY_SETTLEMENT",
+        "REVIEW_TIMEOUT_MAINTENANCE",
         "SALES_PLAN_INPUT_BUILD",
     ]
     runtime_repository = SQLiteRuntimeRepository(runtime_db)
     stored_jobs = AutomationRepository(runtime_repository).list_jobs()
-    assert len(stored_jobs) == 8
+    assert len(stored_jobs) == 10
     assert stored_jobs[0].display_name
 
 

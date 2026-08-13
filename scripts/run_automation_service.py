@@ -36,6 +36,9 @@ from app.services.incident_automation import (  # noqa: E402
 from app.services.operational_time import (  # noqa: E402
     OperationalTimeService,
 )
+from app.services.operations_automation import (  # noqa: E402
+    build_operations_control_handlers,
+)
 from app.services.order_automation_runtime import (  # noqa: E402
     build_order_read_only_handlers,
 )
@@ -55,6 +58,9 @@ DEFAULT_SHADOWBOT_QUEUE_DIR = Path(
     )
 )
 DEFAULT_PLATFORM_MAPPINGS = PROJECT_ROOT / "data" / "samples" / "platform_mappings.xlsx"
+DEFAULT_PRODUCTS = PROJECT_ROOT / "data" / "samples" / "products.xlsx"
+DEFAULT_PRICE_RULES = PROJECT_ROOT / "data" / "samples" / "price_rules.xlsx"
+DEFAULT_LISTING_RULES = PROJECT_ROOT / "data" / "samples" / "listing_rules.xlsx"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -117,6 +123,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=DEFAULT_PLATFORM_MAPPINGS,
     )
+    parser.add_argument("--products", type=Path, default=DEFAULT_PRODUCTS)
+    parser.add_argument("--price-rules", type=Path, default=DEFAULT_PRICE_RULES)
+    parser.add_argument("--listing-rules", type=Path, default=DEFAULT_LISTING_RULES)
     parser.add_argument(
         "--order-timeout-seconds",
         type=float,
@@ -251,6 +260,14 @@ def main() -> int:
                 build_sales_settlement_handlers(
                     runtime_repository=runtime_repository,
                     platform_name=args.platform_name,
+                )
+            )
+            handlers.update(
+                build_operations_control_handlers(
+                    runtime_repository=runtime_repository,
+                    products_path=args.products,
+                    price_rules_path=args.price_rules,
+                    listing_rules_path=args.listing_rules,
                 )
             )
             if args.enable_order_read_only:

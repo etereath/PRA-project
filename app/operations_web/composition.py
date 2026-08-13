@@ -32,6 +32,8 @@ class OperationsWebPaths:
     price_rules_workbook: Path
     listing_rules_workbook: Path
     queue_root: Path
+    platform_mappings_workbook: Path | None = None
+    shadowbot_identity_mapping: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +44,7 @@ class OperationsWebSettings:
     admin_username: str
     admin_password: str = field(repr=False)
     paths: OperationsWebPaths
+    shadowbot_applet_uri: str = ""
 
     @classmethod
     def from_environment(
@@ -90,6 +93,18 @@ class OperationsWebSettings:
             queue_root=_fixed_path(
                 source, "SHADOWBOT_QUEUE_DIR", Path("data/runtime/shadowbot_queue"), root
             ),
+            platform_mappings_workbook=_fixed_path(
+                source,
+                "PRA_PLATFORM_MAPPINGS_WORKBOOK",
+                Path("data/samples/platform_mappings.xlsx"),
+                root,
+            ),
+            shadowbot_identity_mapping=_fixed_path(
+                source,
+                "PRA_SHADOWBOT_IDENTITY_MAPPING",
+                Path("shadowbot/test2/product_identity_mapping.json"),
+                root,
+            ),
         )
         return cls(
             environment=environment,
@@ -98,6 +113,7 @@ class OperationsWebSettings:
             admin_username=source.get("RUNTIME_ADMIN_USER", "admin").strip() or "admin",
             admin_password=source.get("RUNTIME_ADMIN_PASSWORD", ""),
             paths=paths,
+            shadowbot_applet_uri=source.get("SHADOWBOT_APPLET_URI", "").strip(),
         )
 
 
