@@ -192,3 +192,81 @@ def test_daily_generation_reuses_rule_workflow_after_plan_input(tmp_path):
     assert outcome.event_payload["inserted_task_count"] <= outcome.event_payload[
         "candidate_task_count"
     ]
+    stored_tasks = runtime.list_tasks()
+    assert stored_tasks
+    assert {task.origin_ref_id for task in stored_tasks} == {run.run_id}
+    assert any(
+        any(
+            str(step).startswith("matched:LIST-1")
+            for step in task.decision_trace.get("listing_trace", [])
+        )
+        for task in stored_tasks
+    )
+    assert all("forecast" not in str(task.decision_trace).lower() for task in stored_tasks)
+
+
+def test_daily_generation_does_not_read_or_evaluate_a_disabled_rule_source(
+    tmp_path,
+    monkeypatch,
+):
+    runtime, automation, jobs = _runtime(tmp_path)
+    products = tmp_path / "products.xlsx"
+    disabled_price_rules = tmp_path / "disabled-price-rules.xlsx"
+    listing_rules = tmp_path / "listing_rules.xlsx"
+    _write_workbook(
+        products,
+        PRODUCT_HEADERS,
+        [["SKU-001", "艾莎", "A", "70", "扎", 10, 50, True, 14, 15, "", "spring", "red"]],
+    )
+    disabled_price_rules.write_bytes(b"not-an-xlsx-file")
+    _write_workbook(
+        listing_rules,
+        LISTING_RULE_HEADERS,
+        [["LIST-1", "库存恢复允许上架", "*", "*", PLATFORM, 10, "stock_above_online", True, 5, ""]],
+    )
+    plan_time = NOW - timedelta(minutes=5)
+    plan_context = OperationalTimeService(
+        policies=automation.load_operational_time_policies()
+    ).classify(plan_time)
+    automation.ensure_run(
+        job=jobs[SALES_PLAN_INPUT_BUILD],
+        scheduled_for=plan_time,
+        time_context=plan_context,
+        initial_status=AutomationRunStatus.SUCCESS,
+        now=plan_time,
+    )
+    daily_job = replace(
+        jobs[DAILY_TASK_GENERATION],
+        config={
+            **jobs[DAILY_TASK_GENERATION].config,
+            "source_allowlist": ["PRODUCTS", "LISTING_RULES"],
+        },
+    )
+    automation.upsert_job(daily_job, now=NOW)
+    run = _run(automation, daily_job, NOW)
+
+    def reject_disabled_price_rules(*args, **kwargs):
+        raise AssertionError("disabled PRICE_RULES source was evaluated")
+
+    monkeypatch.setattr(
+        "app.services.workflow.PricingService.calculate",
+        reject_disabled_price_rules,
+    )
+
+    outcome = DailyTaskGenerationAutomationHandler(
+        runtime,
+        automation,
+        products,
+        disabled_price_rules,
+        listing_rules,
+    )(run, FakeContext(NOW))
+
+    assert outcome.status is AutomationRunStatus.SUCCESS
+    assert outcome.event_payload["source_allowlist"] == [
+        "LISTING_RULES",
+        "PRODUCTS",
+    ]
+    tasks = runtime.list_tasks()
+    assert tasks
+    assert {task.origin_ref_id for task in tasks} == {run.run_id}
+    assert all(task.action_type.value != "update_price" for task in tasks)

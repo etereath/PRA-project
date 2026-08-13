@@ -32,9 +32,15 @@ from app.services.execution_authorization import (
     ExecutionAuthorizationForbidden,
 )
 from app.services.product_mapping import compile_product_mapping_workbook
+from app.services.shadowbot_commit_batch import build_commit_request
+from app.services.shadowbot_listing_action_contract import (
+    V5_GATE_SUMMARY_SCHEMA_VERSION,
+    build_listing_action_manifest,
+    build_listing_action_request,
+)
 
 
-NOW = datetime(2026, 8, 13, 2, 0, tzinfo=UTC)
+NOW = datetime(2099, 8, 13, 2, 0, tzinfo=UTC)
 PLATFORM = "蚂蚁花团供应商"
 
 
@@ -162,40 +168,85 @@ def execution_setup(tmp_path: Path):
 
     def fake_v4_publish(repository, runner, **kwargs):
         calls.append(("v4", kwargs))
+        request = build_commit_request(
+            kwargs["manifest"],
+            execution_profile=kwargs["execution_profile"],
+            batch_task_id="BATCHTASK-SYNTHETIC-V4",
+            operation_id="OP-SYNTHETIC-V4",
+            execution_attempt_id="ATTEMPT-V4",
+            applet_uri=kwargs["applet_uri"],
+            confirmation_text=kwargs["confirmation_text"],
+            confirmed_by=kwargs["confirmed_by"],
+        )
         return (
-            {
-                "execution_attempt_id": "ATTEMPT-V4",
-                "batch_id": kwargs["manifest"]["batch_id"],
-            },
+            request,
             SimpleNamespace(shadowbot_run_id="RUN-V4"),
         )
 
     def fake_v5_propose(repository, *, batch_id, task_ids, **kwargs):
         task_id = task_ids[0]
-        manifest = {
-            "batch_id": batch_id,
-            "platform_name": PLATFORM,
-            "manifest_sha256": "sha256:" + "c" * 64,
-            "items": [
+        manifest = build_listing_action_manifest(
+            batch_id=batch_id,
+            action_type="set_offline",
+            task_items=[
                 {
                     "source_task_id": task_id,
-                    "item_payload_sha256": "sha256:" + "d" * 64,
+                    "internal_sku": "AISHA-B-50-Z",
+                    "expected_old_status": "online",
+                    "target_status": "offline",
+                    "expires_at": (NOW + timedelta(hours=1)).isoformat(),
                 }
             ],
-        }
+            identity_mapping={
+                "AISHA-B-50-Z": {
+                    "expected_product_name": "艾莎",
+                    "expected_grade": "B级",
+                }
+            },
+            platform_name=PLATFORM,
+            mapping_source_version="sha256:" + "c" * 64,
+        )
         return {
             "manifest": manifest,
+            "execution_profile": service.execution_profile,
             "publishable": True,
-            "required_confirmation": "确认合成上下架",
+            "required_confirmation": str(
+                manifest.get("development_confirmation_text") or ""
+            ),
         }
 
     def fake_v5_publish(repository, runner, **kwargs):
         calls.append(("v5", kwargs))
+        proposal = kwargs["proposal"]
+        item = proposal["manifest"]["items"][0]
+        gate_summary = {
+            "schema_version": V5_GATE_SUMMARY_SCHEMA_VERSION,
+            "gate_phase": "PRE_PUBLISH",
+            "evaluated_at": NOW.isoformat(),
+            "items": [
+                {
+                    "internal_sku": item["internal_sku"],
+                    "operation_id": item["operation_id"],
+                    "decision": "EXECUTE",
+                    "lock_status": "ACTIVE",
+                    "lock_operation_id": item["operation_id"],
+                    "block_reasons": [],
+                }
+            ],
+        }
+        request = build_listing_action_request(
+            proposal["manifest"],
+            execution_profile=proposal["execution_profile"],
+            execution_attempt_id="ATTEMPT-V5",
+            applet_uri=kwargs["applet_uri"],
+            gate_summary=gate_summary,
+            batch_task_id="BATCH-TASK-SYNTHETIC-V5",
+            batch_operation_id="BATCH-OP-SYNTHETIC-V5",
+            confirmation_text=kwargs["confirmation_text"],
+            confirmed_by=kwargs["confirmed_by"],
+        )
         return (
-            {
-                "execution_attempt_id": "ATTEMPT-V5",
-                "batch_id": kwargs["proposal"]["manifest"]["batch_id"],
-            },
+            request,
             SimpleNamespace(shadowbot_run_id="RUN-V5"),
         )
 
@@ -253,10 +304,10 @@ def test_v4_prepare_and_submit_bind_exact_principal_tasks_and_actor(
         )
 
 
-def test_production_publish_keeps_authenticated_principal_as_actor(
+def test_production_publish_omits_development_confirmation_and_audits_actor(
     execution_setup,
 ) -> None:
-    service, _, calls = execution_setup
+    service, repository, calls = execution_setup
     service.execution_profile = "production"
     admin = _admin()
 
@@ -268,8 +319,33 @@ def test_production_publish_keeps_authenticated_principal_as_actor(
         "auth-production",
     )
 
-    assert calls[0][1]["confirmed_by"] == "admin"
+    assert calls[0][1]["confirmed_by"] == ""
+    assert calls[0][1]["confirmation_text"] == ""
     assert calls[0][1]["execution_profile"] == "production"
+    price_audit = repository.list_task_status_history("TASK-PRICE-A")
+    assert price_audit[-1].changed_by == "admin"
+    assert price_audit[-1].reason == "execution_submission_authorized"
+    assert price_audit[-1].from_status is TaskStatus.PENDING
+    assert price_audit[-1].to_status is TaskStatus.PENDING
+
+    listing = service.prepare_execution(
+        admin,
+        ["TASK-OFFLINE-B"],
+        "auth-production-listing",
+    )
+    service.submit_execution(
+        admin,
+        ["TASK-OFFLINE-B"],
+        listing.confirmation_digest,
+        "auth-production-listing",
+    )
+    assert calls[1][0] == "v5"
+    assert calls[1][1]["confirmed_by"] == ""
+    assert calls[1][1]["confirmation_text"] == ""
+    assert calls[1][1]["proposal"]["execution_profile"] == "production"
+    listing_audit = repository.list_task_status_history("TASK-OFFLINE-B")
+    assert listing_audit[-1].changed_by == "admin"
+    assert listing_audit[-1].reason == "execution_submission_authorized"
 
 
 def test_digest_cannot_be_swapped_between_principal_or_task_batch(

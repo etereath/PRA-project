@@ -94,6 +94,8 @@ class WorkflowInputs:
     inventory_strategy: str = "conservative_v1"
     runtime_db_path: Path | None = None
     platform_names: tuple[str, ...] = ()
+    rule_source_allowlist: frozenset[str] | None = None
+    origin_ref_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -253,6 +255,8 @@ def generate_runtime_tasks_from_sources(
         now=inputs.now,
         inventory_strategy=inputs.inventory_strategy,
         runtime_db_path=inputs.runtime_db_path or db_path,
+        rule_source_allowlist=inputs.rule_source_allowlist,
+        origin_ref_id=inputs.origin_ref_id,
     )
     summary = generate_tasks_from_sources(preview_inputs)
     return persist_task_generation_summary(
@@ -602,8 +606,17 @@ def validate_sources(inputs: WorkflowInputs) -> ValidationSummary:
         inputs.products_path,
         inputs.runtime_db_path,
     )
-    price_rules = load_price_rules(inputs.price_rules_path)
-    listing_rules = load_listing_rules(inputs.listing_rules_path)
+    enabled_rule_sources = inputs.rule_source_allowlist
+    price_rules = (
+        load_price_rules(inputs.price_rules_path)
+        if enabled_rule_sources is None or "PRICE_RULES" in enabled_rule_sources
+        else []
+    )
+    listing_rules = (
+        load_listing_rules(inputs.listing_rules_path)
+        if enabled_rule_sources is None or "LISTING_RULES" in enabled_rule_sources
+        else []
+    )
     harvest_forecasts = (
         load_harvest_forecasts(inputs.harvest_forecasts_path)
         if inputs.harvest_forecasts_path
@@ -645,8 +658,17 @@ def generate_tasks_from_sources(
         inputs.products_path,
         inputs.runtime_db_path,
     )
-    price_rules = load_price_rules(inputs.price_rules_path)
-    listing_rules = load_listing_rules(inputs.listing_rules_path)
+    enabled_rule_sources = inputs.rule_source_allowlist
+    price_rules = (
+        load_price_rules(inputs.price_rules_path)
+        if enabled_rule_sources is None or "PRICE_RULES" in enabled_rule_sources
+        else []
+    )
+    listing_rules = (
+        load_listing_rules(inputs.listing_rules_path)
+        if enabled_rule_sources is None or "LISTING_RULES" in enabled_rule_sources
+        else []
+    )
     harvest_forecasts = (
         load_harvest_forecasts(inputs.harvest_forecasts_path)
         if inputs.harvest_forecasts_path
@@ -707,6 +729,15 @@ def generate_tasks_from_sources(
         platform_observations=platform_observations,
         platform_listing_states=platform_listing_states,
         ignored_candidates=ignored_candidates,
+        origin_ref_id=inputs.origin_ref_id,
+        generate_price_tasks=(
+            enabled_rule_sources is None
+            or "PRICE_RULES" in enabled_rule_sources
+        ),
+        generate_listing_tasks=(
+            enabled_rule_sources is None
+            or "LISTING_RULES" in enabled_rule_sources
+        ),
     )
     if listing_task_overrides is not None:
         apply_listing_task_overrides(tasks, listing_task_overrides)
@@ -930,6 +961,8 @@ def preview_tasks_from_selected_rule(
         inventory_strategy=inputs.inventory_strategy,
         runtime_db_path=inputs.runtime_db_path,
         platform_names=inputs.platform_names,
+        rule_source_allowlist=inputs.rule_source_allowlist,
+        origin_ref_id=inputs.origin_ref_id,
     )
     return generate_tasks_from_selected_rule(
         preview_inputs,
@@ -1144,6 +1177,8 @@ def preview_tasks_from_sources(inputs: WorkflowInputs) -> TaskGenerationSummary:
         now=inputs.now,
         inventory_strategy=inputs.inventory_strategy,
         runtime_db_path=inputs.runtime_db_path,
+        rule_source_allowlist=inputs.rule_source_allowlist,
+        origin_ref_id=inputs.origin_ref_id,
     )
     return generate_tasks_from_sources(preview_inputs)
 

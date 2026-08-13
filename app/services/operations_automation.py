@@ -112,8 +112,12 @@ class DailyTaskGenerationAutomationHandler:
         ):
             raise ValueError("Daily task generation source_allowlist is invalid")
 
-        paths = (self.products_path, self.price_rules_path, self.listing_rules_path)
-        before = tuple(path.read_bytes() for path in paths)
+        paths = [self.products_path]
+        if "PRICE_RULES" in sources:
+            paths.append(self.price_rules_path)
+        if "LISTING_RULES" in sources:
+            paths.append(self.listing_rules_path)
+        before = {path: path.read_bytes() for path in paths}
         input_payload = {
             "schema_version": "daily-task-generation-input-v1",
             "plan_input_run_id": plan_input.run_id,
@@ -122,7 +126,7 @@ class DailyTaskGenerationAutomationHandler:
             "source_allowlist": sorted(sources),
             "files": {
                 path.name: "sha256:" + hashlib.sha256(content).hexdigest()
-                for path, content in zip(paths, before)
+                for path, content in before.items()
             },
         }
         summary = generate_tasks_from_sources(
@@ -131,12 +135,13 @@ class DailyTaskGenerationAutomationHandler:
                 price_rules_path=self.price_rules_path,
                 listing_rules_path=self.listing_rules_path,
                 platform_name=run.platform_name,
-                trade_date=run.platform_trade_date,
                 now=run.scheduled_for,
                 runtime_db_path=self.runtime_repository.db_path,
+                rule_source_allowlist=sources,
+                origin_ref_id=run.run_id,
             )
         )
-        after = tuple(path.read_bytes() for path in paths)
+        after = {path: path.read_bytes() for path in paths}
         if after != before:
             raise RuntimeError("Daily task generation input changed during evaluation")
         allowed_actions = set()

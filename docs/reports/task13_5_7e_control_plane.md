@@ -49,12 +49,20 @@ principal、Task 版本、映射、最新平台事实、成本、真实库存和
 capability、principal、digest、有效期和全部事实，再进入 v4/v5 publisher。伪造表单 actor、
 换批、过期 digest、Review/锁/UI 租约变化或 Queue 失败均保持既有失败语义。
 
+正式 `production` 投递继续遵守既有 v4/v5 合同，不携带仅供开发批次验收使用的
+`confirmation_text` 或 `confirmed_by`；认证 principal 在投递前以同状态 Task 历史审计事件
+持久化，批次内任一审计写入失败都会整体阻止投递。`development` 仍按原合同传入固定确认
+文本和确认人。本次使用真实 v4/v5 请求构造器覆盖了两种 profile，没有放宽 Queue 合同。
+
 ## 4. Review 与 Automation
 
 桌面复核要求 `HANDLE_REVIEW` 和 CSRF；手机复核要求有效、未过期且未使用的 Review Token。
-两者共享同一 Application Service。Review、Token、源 Task、新 Task 和 Outbox 沿用既有原子
-事务；数据库失败整体回滚。手机 GET 不消费 Token，原始 Token 不进入 HTML，而是保存到
-Review 专用 HttpOnly、SameSite=Strict Cookie；Secure 属性继续服从启动环境。
+两者调用同一个 Repository 业务事务；手机路径只在该事务前半段增加 Token 校验与消费，
+桌面路径不制造 Token。Review、源 Task、任务组、调整投影、Task 历史和 Outbox 撤销由同一
+事务决定，数据库失败整体回滚；紧急保护仍复用既有专用原子分支。手机 GET 不消费 Token，
+原始 Token 不进入 HTML，而是保存到 Review 专用 HttpOnly、SameSite=Strict Cookie；Secure
+属性继续服从启动环境。新旧 Web 的 Mobile Review 错误统一复用既有 403/404/409/410/422
+映射，不再由新 Web 把已处理复核误报为 410。
 
 Automation 配置不提供任意 Cron、脚本、路径、SQL 或 Queue 编辑器。固定开放：快速扫描、
 完整扫描、截单前/后、日结、销售计划输入、人工复核超时维护和每日任务生成。子任务不能
@@ -62,9 +70,16 @@ Automation 配置不提供任意 Cron、脚本、路径、SQL 或 Queue 编辑�
 停用同类型/平台旧版本。受控补跑只允许日结和销售计划输入，必须明确 PRA 交易日与幂等键；
 Web 只创建 SCHEDULED Run。
 
+缺失默认 Job 按初始化时实际生效的时间策略生成并记录 `time_policy_version`；历史交易日补跑
+按目标时刻选择当时生效的策略，而不是沿用当前策略。销售计划输入偏移变化会和下游每日任务
+生成 Job 在同一事务中确定性重版本，保证下游始终晚于上游；事务任一步失败时两者都不切换。
+停用 Job 在原时间表上重新启用时使用原子 upsert，新的白名单等配置不会被旧版本静默保留。
+
 每日任务生成要求同一 PRA 交易日的销售计划输入成功完成，只允许商品、价格规则和上下架
-规则输入，再调用既有生成与持久化服务。包装产能、冷库和 Mock 平台 evaluator 保留诊断或
-延期，不接入生产 Automation。复核超时 Handler 直接调用既有 ReviewTaskService。
+规则输入，并明确走既有冻结规则路径，不再因传入交易日而进入预测任务路径。停用的规则来源
+不会被读取或参与摘要，生成 Task 的 `origin_ref_id` 精确绑定 Automation Run。包装产能、冷库
+和 Mock 平台 evaluator 保留诊断或延期，不接入生产 Automation。复核超时 Handler 直接调用
+既有 ReviewTaskService。
 
 ## 5. CLI 与界面验收
 
@@ -80,13 +95,13 @@ Runtime 任务生成和 Review 处置必须显式 `--admin-recovery`；超时复
 
 ## 6. 测试与真实副作用边界
 
-专项与受影响集成回归：`133 passed, 3 subtests passed`。覆盖人工任务四类动作、重放/冲突、
+专项与受影响集成回归：`130 passed, 21 subtests passed`。覆盖人工任务四类动作、重放/冲突、
 精确执行授权与 v4/v5 复用、桌面/手机原子 Review、Automation 配置/版本/补跑、薄 Handler、
 CLI 边界和新 Web PRG/零 Queue 副作用。
 
 完整本地验收结果：
 
-- 完整 pytest：`1259 passed, 3 skipped, 97 subtests passed`；
+- 完整 pytest：`1280 passed, 3 skipped, 102 subtests passed`；
 - 隔离系统冒烟：`16 passed, 0 failed`，Schema exact v17；
 - Ruff、`compileall` 与 `git diff --check`：通过；
 - wheel/sdist 构建、严格制品边界、源码 secret scan、wheel 隔离安装：通过；

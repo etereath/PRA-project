@@ -71,6 +71,8 @@ class TaskGenerationService:
         platform_listing_states: dict[tuple[str, str, str], str] | None = None,
         ignored_candidates: list[IgnoredTaskCandidate] | None = None,
         origin_ref_id: str | None = None,
+        generate_price_tasks: bool = True,
+        generate_listing_tasks: bool = True,
     ) -> list[Task]:
         source_run_id = (
             str(origin_ref_id).strip()
@@ -100,7 +102,15 @@ class TaskGenerationService:
         dedupe: set[tuple[str, str, str]] = set()
 
         for product in products:
-            listing_action, listing_trace = self.listing_service.evaluate(product, listing_rules, platform_name)
+            listing_action, listing_trace = (
+                self.listing_service.evaluate(
+                    product,
+                    listing_rules,
+                    platform_name,
+                )
+                if generate_listing_tasks
+                else (None, [])
+            )
             pricing_decision: FinalPricingDecision | None = None
             identity = listing_identity_key(
                 platform_name,
@@ -118,7 +128,11 @@ class TaskGenerationService:
                 else None
             )
 
-            if product.sale_enabled and product.current_stock > 0:
+            if (
+                generate_price_tasks
+                and product.sale_enabled
+                and product.current_stock > 0
+            ):
                 matched_price_rule_ids = [
                     rule.rule_id
                     for rule in price_rules

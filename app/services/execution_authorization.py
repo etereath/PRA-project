@@ -11,6 +11,7 @@ from decimal import Decimal
 from pathlib import Path
 from threading import Lock
 from typing import Callable, Iterable
+from uuid import uuid4
 
 from app.automation_ui_channel import has_active_automation_ui_run
 from app.enums import ProductMappingStatus, TaskActionType, TaskStatus
@@ -20,6 +21,7 @@ from app.operations_web.auth import (
     Capability,
     Principal,
 )
+from app.models import TaskStatusHistory
 from app.repositories.inventory_repository import InventoryRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import load_products
@@ -298,10 +300,23 @@ class ExecutionAuthorizationApplicationService:
                     "未配置 SHADOWBOT_APPLET_URI，已阻止投递。"
                 )
             runner = self.runner_factory(self.queue_root)
-            confirmed_by = authenticated_principal.subject
+            self._record_authorization_audit(
+                task_ids=task_ids,
+                principal_subject=authenticated_principal.subject,
+                batch_id=public.batch_id,
+                action_type=action_type,
+                idempotency_key=key,
+                changed_at=current,
+            )
+            development_confirmation = self.execution_profile == "development"
+            confirmed_by = (
+                authenticated_principal.subject if development_confirmation else ""
+            )
             if action_type is TaskActionType.UPDATE_PRICE:
-                confirmation_text = str(
-                    latest_payload.get("development_confirmation_text") or ""
+                confirmation_text = (
+                    str(latest_payload.get("development_confirmation_text") or "")
+                    if development_confirmation
+                    else ""
                 )
                 request, start = self.v4_publish(
                     self.runtime,
@@ -313,8 +328,10 @@ class ExecutionAuthorizationApplicationService:
                     confirmed_by=confirmed_by,
                 )
             else:
-                confirmation_text = str(
-                    latest_payload.get("required_confirmation") or ""
+                confirmation_text = (
+                    str(latest_payload.get("required_confirmation") or "")
+                    if development_confirmation
+                    else ""
                 )
                 request, start = self.v5_publish(
                     self.runtime,
@@ -336,6 +353,47 @@ class ExecutionAuthorizationApplicationService:
             shadowbot_run_id=str(start.shadowbot_run_id),
             task_ids=task_ids,
         )
+
+    def _record_authorization_audit(
+        self,
+        *,
+        task_ids: tuple[str, ...],
+        principal_subject: str,
+        batch_id: str,
+        action_type: TaskActionType,
+        idempotency_key: str,
+        changed_at: datetime,
+    ) -> None:
+        histories: list[TaskStatusHistory] = []
+        for task_id in task_ids:
+            task = self.runtime.get_task(task_id)
+            if task is None:
+                raise ExecutionAuthorizationConflict(
+                    "任务在授权记录写入前已不存在，请重新预览。"
+                )
+            histories.append(
+                TaskStatusHistory(
+                    history_id=f"AUTH-{uuid4().hex[:16]}",
+                    task_id=task_id,
+                    from_status=task.task_status,
+                    to_status=task.task_status,
+                    changed_by=principal_subject,
+                    changed_at=changed_at,
+                    reason="execution_submission_authorized",
+                    metadata={
+                        "batch_id": batch_id,
+                        "action_type": action_type.value,
+                        "execution_profile": self.execution_profile,
+                        "idempotency_key_sha256": _sha256_json(idempotency_key),
+                        "authorization_contract_version": CONTRACT_VERSION,
+                    },
+                )
+            )
+        inserted = self.runtime.insert_status_histories(histories)
+        if inserted != len(histories):
+            raise ExecutionAuthorizationConflict(
+                "执行授权审计未完整写入，已阻止投递。"
+            )
 
     def _prepare_v4(
         self,

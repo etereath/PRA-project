@@ -62,6 +62,7 @@ from app.services.review_resolution import (
 )
 from app.services.security import LOGIN_RATE_LIMITER, record_security_event
 from app.exceptions import MobileReviewTransactionError
+from app.mobile_review_http import mobile_review_http_status
 from app.services.workflow import resolve_mobile_review
 
 
@@ -1173,19 +1174,8 @@ class OperationsWebApplication:
                     products_path=self.container.settings.paths.products_workbook,
                 )
             except MobileReviewTransactionError as exc:
-                status = (
-                    "410 Gone"
-                    if exc.code
-                    in {
-                        "TOKEN_EXPIRED",
-                        "TOKEN_REVOKED",
-                        "TOKEN_ALREADY_USED",
-                        "REVIEW_ALREADY_RESOLVED",
-                    }
-                    else "409 Conflict"
-                )
                 return Response.text(
-                    status,
+                    mobile_review_http_status(exc.code),
                     "复核未提交：" + str(exc),
                     headers=[("Cache-Control", "no-store")],
                 )

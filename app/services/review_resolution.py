@@ -15,7 +15,6 @@ from app.operations_web.auth import (
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.review_policy import allowed_review_statuses
-from app.services.runtime import ReviewTaskService
 from app.services.workflow import _read_authoritative_product_cost_snapshot
 
 
@@ -126,7 +125,7 @@ class ReviewResolutionApplicationService:
                     ),
                 )
 
-            resolved = ReviewTaskService(self.repository).resolve_review_task(
+            resolved, _ = self.repository.resolve_authenticated_review_atomic(
                 review_task_id=clean_id,
                 status=status,
                 actor=principal.subject,

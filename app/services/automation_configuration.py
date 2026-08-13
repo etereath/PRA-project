@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -28,7 +29,12 @@ from app.services.automation import (
     SALES_PLAN_INPUT_BUILD,
     REVIEW_TIMEOUT_MAINTENANCE,
 )
-from app.services.operational_time import OperationalTimePolicyRegistry, OperationalTimeService
+from app.services.operational_time import (
+    OperationalTimeContext,
+    OperationalTimePolicy,
+    OperationalTimePolicyRegistry,
+    OperationalTimeService,
+)
 
 
 CONFIGURABLE_JOB_TYPES = frozenset(
@@ -213,25 +219,12 @@ class AutomationConfigurationApplicationService:
             config["source_allowlist"] = ["PRODUCTS", *sorted(sources)]
             config["time_policy_version"] = policy.policy_version
 
-        normalized = {
-            "job_type": current.job_type,
-            "platform_name": str(config.get("platform_name") or ""),
-            "schedule_kind": schedule_kind,
-            "schedule_expression": schedule_expression,
-            "interval_offset_minutes": config.get("interval_offset_minutes"),
-            "settlement_offset_minutes": config.get("settlement_offset_minutes"),
-            "plan_input_offset_minutes": config.get("plan_input_offset_minutes"),
-            "source_allowlist": config.get("source_allowlist"),
-            "time_policy_version": config.get("time_policy_version"),
-        }
-        version = "sha256:" + hashlib.sha256(
-            json.dumps(
-                normalized,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()
+        version = self._configuration_version(
+            job_type=current.job_type,
+            schedule_kind=schedule_kind,
+            schedule_expression=schedule_expression,
+            config=config,
+        )
         config.update(
             {
                 "configuration_schema": "pra-automation-config-v1",
@@ -263,15 +256,137 @@ class AutomationConfigurationApplicationService:
             updated_at=None,
         )
         try:
-            if schedule_changed or (enabled and not current.enabled):
+            if schedule_changed and current.job_type == SALES_PLAN_INPUT_BUILD:
+                daily_current, daily_successor = self._daily_successor_for_plan_change(
+                    principal=principal,
+                    policy=policy,
+                    plan_successor=successor,
+                    now=now,
+                )
+                return self.automation.replace_job_versions(
+                    replacements=(
+                        (current.job_id, successor),
+                        (daily_current.job_id, daily_successor),
+                    ),
+                    now=now,
+                )[0]
+            if schedule_changed:
                 return self.automation.replace_job_version(
                     previous_job_id=current.job_id,
                     successor=successor,
                     now=now,
                 )
             return self.automation.upsert_job(successor, now=now)
-        except (RuntimeError, ValueError) as exc:
+        except (RuntimeError, ValueError, sqlite3.DatabaseError) as exc:
             raise AutomationConfigurationError(str(exc)) from exc
+
+    def _daily_successor_for_plan_change(
+        self,
+        *,
+        principal: Principal,
+        policy: OperationalTimePolicy,
+        plan_successor: AutomationJob,
+        now: datetime,
+    ) -> tuple[AutomationJob, AutomationJob]:
+        platform_name = str(plan_successor.config.get("platform_name") or "")
+        daily_jobs = [
+            item
+            for item in self.automation.list_jobs(enabled_only=True)
+            if item.job_type == DAILY_TASK_GENERATION
+            and str(item.config.get("platform_name") or "") == platform_name
+        ]
+        if len(daily_jobs) != 1:
+            raise AutomationConfigurationError(
+                "每日任务生成依赖版本不唯一，销售计划输入未修改。"
+            )
+        current = daily_jobs[0]
+        daily_offset = int(current.config.get("plan_input_offset_minutes") or 5)
+        plan_offset = int(
+            plan_successor.config.get("settlement_offset_minutes") or 5
+        )
+        schedule_expression = self._time_expression(
+            policy.seller_cutoff_local_time,
+            plan_offset + daily_offset,
+        )
+        config = dict(current.config)
+        for key in ("updated_by", "effective_at", "configuration_version"):
+            config.pop(key, None)
+        config.update(
+            {
+                "time_policy_version": policy.policy_version,
+                "sales_plan_input_offset_minutes": plan_offset,
+                "upstream_configuration_version": plan_successor.config[
+                    "configuration_version"
+                ],
+            }
+        )
+        version = self._configuration_version(
+            job_type=current.job_type,
+            schedule_kind=DAILY_LOCAL_TIME,
+            schedule_expression=schedule_expression,
+            config=config,
+        )
+        config.update(
+            {
+                "configuration_schema": "pra-automation-config-v1",
+                "configuration_version": version,
+                "updated_by": principal.subject,
+                "effective_at": now.isoformat(),
+            }
+        )
+        successor_id = (
+            "AUTOMATION-"
+            + current.job_type.replace("_", "-")
+            + "-V-"
+            + version.removeprefix("sha256:")[:12].upper()
+        )
+        return current, replace(
+            current,
+            job_id=successor_id,
+            schedule_kind=DAILY_LOCAL_TIME,
+            schedule_expression=schedule_expression,
+            config=config,
+            created_at=None,
+            updated_at=None,
+        )
+
+    @staticmethod
+    def _configuration_version(
+        *,
+        job_type: str,
+        schedule_kind: str,
+        schedule_expression: str,
+        config: dict[str, object],
+    ) -> str:
+        normalized = {
+            "job_type": job_type,
+            "platform_name": str(config.get("platform_name") or ""),
+            "schedule_kind": schedule_kind,
+            "schedule_expression": schedule_expression,
+            "interval_offset_minutes": config.get("interval_offset_minutes"),
+            "settlement_offset_minutes": config.get(
+                "settlement_offset_minutes"
+            ),
+            "plan_input_offset_minutes": config.get(
+                "plan_input_offset_minutes"
+            ),
+            "sales_plan_input_offset_minutes": config.get(
+                "sales_plan_input_offset_minutes"
+            ),
+            "source_allowlist": config.get("source_allowlist"),
+            "time_policy_version": config.get("time_policy_version"),
+            "upstream_configuration_version": config.get(
+                "upstream_configuration_version"
+            ),
+        }
+        return "sha256:" + hashlib.sha256(
+            json.dumps(
+                normalized,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
 
     def configure_inventory_alert(
         self,
@@ -317,30 +432,40 @@ class AutomationConfigurationApplicationService:
         if not 8 <= len(key) <= 200:
             raise AutomationConfigurationError("补跑幂等键无效，请刷新页面后重试。")
         now = self._now()
-        policy = OperationalTimePolicyRegistry(
-            self.automation.load_operational_time_policies()
-        ).select(now)
+        policies = self.automation.load_operational_time_policies()
+        registry = OperationalTimePolicyRegistry(policies)
         offset = (
             int(job.config.get("settlement_offset_minutes") or 5)
             if job.job_type == SALES_PLAN_INPUT_BUILD
             else 0
         )
-        local_timezone = ZoneInfo(policy.timezone_name)
-        local_midnight = datetime.combine(
-            target_trade_date - timedelta(days=1),
-            policy.seller_cutoff_local_time,
-            tzinfo=local_timezone,
-        )
-        scheduled_for = (local_midnight + timedelta(minutes=offset)).astimezone(
-            timezone.utc
-        )
-        operational_time = OperationalTimeService(policies=(policy,))
-        context = operational_time.classify(scheduled_for)
-        if (
-            context.platform_trade_date != target_trade_date
-            or context.seller_operation_date != target_trade_date
-        ):
+        candidates: list[tuple[datetime, OperationalTimeContext]] = []
+        operational_time = OperationalTimeService(policies=policies)
+        for candidate_policy in registry.policies:
+            local_timezone = ZoneInfo(candidate_policy.timezone_name)
+            local_anchor = datetime.combine(
+                target_trade_date - timedelta(days=1),
+                candidate_policy.seller_cutoff_local_time,
+                tzinfo=local_timezone,
+            )
+            candidate = (
+                local_anchor + timedelta(minutes=offset)
+            ).astimezone(timezone.utc)
+            try:
+                effective_policy = registry.select(candidate)
+            except ValueError:
+                continue
+            if effective_policy.policy_version != candidate_policy.policy_version:
+                continue
+            candidate_context = operational_time.classify(candidate)
+            if (
+                candidate_context.platform_trade_date == target_trade_date
+                and candidate_context.seller_operation_date == target_trade_date
+            ):
+                candidates.append((candidate, candidate_context))
+        if len(candidates) != 1:
             raise AutomationConfigurationError("目标交易日无法由当前时间策略唯一派生。")
+        scheduled_for, context = candidates[0]
         logical_run_key = "web-rerun:" + hashlib.sha256(
             key.encode("utf-8")
         ).hexdigest()

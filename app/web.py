@@ -28,7 +28,6 @@ from app.enums import (
     TaskStatus,
 )
 from app.exceptions import (
-    MobileReviewErrorCode,
     MobileReviewTransactionError,
     TableValidationError,
     ValidationError,
@@ -36,6 +35,7 @@ from app.exceptions import (
 from app.field_labels import FIELD_LABELS, TABLE_LABELS
 from app.listing_status_policy import has_current_platform_stock
 from app.models import ListingStatus, NotificationLog
+from app.mobile_review_http import MOBILE_REVIEW_HTTP_STATUS
 from app.path_policy import PathAccessPolicy, PathPolicyError
 from app.repositories.mock_platform_repository import (
     DEFAULT_MOCK_PLATFORM_DB,
@@ -260,21 +260,6 @@ LEGACY_FORWARDING_HEADERS = (
     "HTTP_X_REAL_IP",
 )
 DISPLAY_TIMEZONE = timezone(timedelta(hours=8))
-
-MOBILE_REVIEW_HTTP_STATUS = {
-    MobileReviewErrorCode.TOKEN_NOT_FOUND.value: "403 Forbidden",
-    MobileReviewErrorCode.TOKEN_REVIEW_MISMATCH.value: "403 Forbidden",
-    MobileReviewErrorCode.TOKEN_EXPIRED.value: "410 Gone",
-    MobileReviewErrorCode.TOKEN_REVOKED.value: "410 Gone",
-    MobileReviewErrorCode.TOKEN_ALREADY_USED.value: "410 Gone",
-    MobileReviewErrorCode.REVIEW_NOT_FOUND.value: "404 Not Found",
-    MobileReviewErrorCode.SOURCE_TASK_NOT_FOUND.value: "404 Not Found",
-    MobileReviewErrorCode.REVIEW_ALREADY_RESOLVED.value: "409 Conflict",
-    MobileReviewErrorCode.ACTION_NOT_ALLOWED.value: "403 Forbidden",
-    MobileReviewErrorCode.ACTION_NOT_ALLOWED_FOR_REVIEW_TYPE.value: "422 Unprocessable Entity",
-    MobileReviewErrorCode.INVALID_ADJUSTMENT.value: "422 Unprocessable Entity",
-    MobileReviewErrorCode.CONCURRENT_UPDATE.value: "409 Conflict",
-}
 
 DISPLAY_ENUM_LABELS = {
     "task_status": {

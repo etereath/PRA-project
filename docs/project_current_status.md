@@ -425,20 +425,26 @@ PR #34 评审意见已统一整改：bootstrap 现在固定 canonical 路径，�
 Task，零 Queue/Worker/平台副作用。真实执行授权独立要求 `SUBMIT_EXECUTION`、明确 Task ID、
 短期 digest 和提交前二次校验，并原样复用 v4 改价与 v5 上下架发布链，不新增 Queue 协议。
 
-桌面与手机复核现已共享同一 Application Service 和既有原子事务；有效手机 Token 只进入
-Review 专用 HttpOnly/SameSite=Strict Cookie，不再渲染到 HTML。Automation 页面只开放固定
-方案的允许字段和范围，排程变更通过确定性新版 Job 原子停旧启新；child job 不能独立配置，
-18:00/20:00 相关时间由运营时间策略派生。库存预警继续复用 v17 策略；受控补跑只创建既有
-Automation Run，由独立服务执行，Web 不持有租约或运行 Handler。复核超时和每日任务生成
-已接入薄 Handler；后者只允许商品、价格规则和上下架规则，包装、冷库和 Mock 平台 evaluator
-不进入生产 Automation。
+桌面与手机复核现已共享同一 Repository 原子业务事务；手机只额外校验和消费一次性 Token，
+有效 Token 只进入 Review 专用 HttpOnly/SameSite=Strict Cookie，不再渲染到 HTML。Automation
+页面只开放固定方案的允许字段和范围，排程变更通过确定性新版 Job 原子停旧启新；child job
+不能独立配置，18:00/20:00 相关时间由实际生效的运营时间策略派生，历史补跑按目标交易日
+选择历史策略。销售计划输入偏移和下游每日任务生成在同一事务重版本。库存预警继续复用 v17
+策略；受控补跑只创建既有 Automation Run，由独立服务执行，Web 不持有租约或运行 Handler。
+复核超时和每日任务生成已接入薄 Handler；后者只读取启用的商品、价格规则和上下架规则，
+明确走冻结规则路径并将 Task 绑定 Automation Run，包装、冷库和 Mock 平台 evaluator 不进入
+生产 Automation。
+
+正式 production 执行不再携带开发确认文本或确认人，认证操作者改由既有 Task 历史审计面
+持久化；development 保留原固定确认合同。新旧 Web 的 Mobile Review 继续使用同一组稳定
+HTTP 状态映射。
 
 `serve-web` 已切换到新运营 Web；旧 Excel 生成和 Runtime/Review 写入 CLI 现在要求明确的
 测试或管理员恢复开关，不能作为日常旁路。7E 没有迁移或修复真实 Runtime DB，没有启动
 Worker、写 Queue、发送通知或执行真实平台动作。完整实现与验收边界见
 [13.5-7E 实施报告](reports/task13_5_7e_control_plane.md)。本地专项回归为
-`133 passed, 3 subtests passed`，完整 pytest 为
-`1259 passed, 3 skipped, 97 subtests passed`，隔离系统冒烟为 `16 passed, 0 failed`；构建、
+`130 passed, 21 subtests passed`，完整 pytest 为
+`1280 passed, 3 skipped, 102 subtests passed`，隔离系统冒烟为 `16 passed, 0 failed`；构建、
 严格制品审计、secret scan、wheel 隔离安装和 Windows 临时 ShadowBot fixture 均通过。
 
 ### 2.8 自动规则评估框架 MVP
