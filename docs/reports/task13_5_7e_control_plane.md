@@ -75,9 +75,17 @@ Web 只创建 SCHEDULED Run。
 生成 Job 在同一事务中确定性重版本，保证下游始终晚于上游；事务任一步失败时两者都不切换。
 停用 Job 在原时间表上重新启用时使用原子 upsert，新的白名单等配置不会被旧版本静默保留。
 
+2026-08-14 合并后维护补丁补齐了未来时间策略换版入口：
+`scripts/replace_operational_time_policy.py` 默认只读检查，只有显式 `--apply` 才会先生成并校验
+SQLite 逻辑备份，再调用 `OperationalTimeMaintenanceService`。Policy 与截单前/后、交易日结算、
+销售计划输入、每日任务生成五个定时 Job 在同一事务创建 successor 并停用 predecessor；旧启停
+状态、两个后置偏移和来源 allowlist 保留，任一步失败全部回滚。新 Policy 只允许在维护事务时刻
+立即生效，Web 仍无 Policy 编辑入口。
+
 每日任务生成要求同一 PRA 交易日的销售计划输入成功完成，只允许商品、价格规则和上下架
 规则输入，并明确走既有冻结规则路径，不再因传入交易日而进入预测任务路径。停用的规则来源
-不会被读取或参与摘要，生成 Task 的 `origin_ref_id` 精确绑定 Automation Run。包装产能、冷库
+不会被读取或参与摘要，生成 Task 的 `origin_ref_id` 精确绑定 Automation Run，并写入同一 Run
+冻结的 `platform_trade_date`、`seller_operation_date` 和 `time_policy_version`。包装产能、冷库
 和 Mock 平台 evaluator 保留诊断或延期，不接入生产 Automation。复核超时 Handler 直接调用
 既有 ReviewTaskService。
 
@@ -112,3 +120,8 @@ PR 的 GitHub 托管 CI 实际结果为准。
 
 7E 不包含真实平台写验收。任何 COMMIT、紧急下架或真实 Queue 投递都需要新的明确授权，
 不能由本报告或代码合并推定。
+
+合并后维护补丁专项：`23 passed`；完整 pytest：
+`1227 passed, 3 skipped, 82 subtests passed`；隔离系统冒烟：`16 passed, 0 failed`。使用合成
+Runtime DB 覆盖完整换版、旧配置保留、事务失败整体回滚、策略/Job 漂移 fail closed、管理员
+脚本备份与回读，以及每日 Task 三个审计字段。

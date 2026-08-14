@@ -110,6 +110,11 @@ submit_execution(principal, exact_task_ids, confirmation_digest, idempotency_key
 `CHILD_ONLY`，不得独立启停或配置排程。18:00/20:00 相关时间只从当前
 `OperationalTimePolicy` 派生。
 
+时间策略换版本不属于 Web 配置。管理员必须先建立并校验 SQLite 逻辑备份，再使用唯一协调
+维护入口，在同一事务内替换 Policy 与五个相关定时 Job successor；旧 Job 的启停状态、销售
+计划输入偏移、每日任务后置偏移和来源 allowlist 必须保留。任一步失败整体回滚，且不允许未来
+生效时间导致新 Job 提前运行。
+
 排程身份继续冻结为 `job_id + schedule`。仅切换启用状态或不影响排程的 allowlist 配置时可
 更新当前 Job；频率或 offset 改变时，必须用规范化配置 SHA-256 生成确定性新 `job_id`，在
 同一事务写入新版并停用旧版。Scheduler 只读取启用版本。
@@ -146,5 +151,7 @@ submit_execution(principal, exact_task_ids, confirmation_digest, idempotency_key
 专项测试必须覆盖：多选展开、四类动作、预览后事实漂移、排除项、低于成本、库存不足、映射
 异常、开放任务冲突、精确重放/同键异内容、创建零 Queue 副作用；授权 capability、伪造 actor、
 换批/replay、精确 Task、v4/v5 复用、Queue 失败；桌面/手机 Review 原子性；Automation allowlist、
-边界值、版本替换、child 禁配、时间策略派生及受控补跑。Ready for review 前再运行受影响集成、
+边界值、版本替换、child 禁配、时间策略派生、Policy 与五个 Job 原子换版/失败回滚及受控补跑。
+每日规则 Task 还必须回读 `platform_trade_date`、`seller_operation_date` 和
+`time_policy_version`。Ready for review 前再运行受影响集成、
 完整 pytest、系统冒烟和 Windows/Linux CI；真实平台写验收必须另获用户明确批次授权。

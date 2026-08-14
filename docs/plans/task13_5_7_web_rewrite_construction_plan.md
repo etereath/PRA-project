@@ -319,9 +319,13 @@ Job 并在同一配置切换中停用前版，不能原地改 schedule，也不�
 | 每日任务生成 | 薄 Handler | 启停、Plan Input 后置 offset、来源 allowlist | offset 0～30 分钟；只在同作业日 Plan Input 成功后运行，不接受任意绝对时间/脚本 |
 | 真实库存预警 | 库存事务后事件驱动 | 启停、默认阈值、每 SKU 覆盖、重复提醒间隔 | 阈值为 0～9999 的整数；提醒间隔 30～1440 分钟；不开放 Cron，也不创建平台动作 |
 
-若未来修改 18:00/20:00 本身，只能新增并生效版本化 `OperationalTimePolicy`，由所有相关
-Job 一起派生，不能在 Automation 页面单改一个 Job。任何超出上述范围、增加 Job 类型、
-开放任意 Cron/脚本或改变父子关系的需求都必须另开 R4。
+若未来修改 18:00/20:00 本身，只能走显式管理员维护流程：先生成并校验 SQLite 逻辑备份，
+再由唯一 `OperationalTimeMaintenanceService` 在同一个 `BEGIN IMMEDIATE` 事务内替换版本化
+`OperationalTimePolicy`，并为截单前扫描、截单后确认、交易日结算、销售计划输入和每日任务
+生成五个 Job 一起创建 successor、停用 predecessor。任一步失败必须整体回滚；新策略的
+`effective_from` 必须等于该维护事务时间，禁止提前启用新排程或追溯改写历史。Web 继续不提供
+时间策略编辑，不能在 Automation 页面单改一个 Job。任何超出上述范围、增加 Job 类型、开放
+任意 Cron/脚本或改变父子关系的需求都必须另开 R4。
 
 库存预警使用真实库存，支持默认阈值和商品覆盖。第一次从阈值上方降到阈值或以下产生
 提醒，持续低库存使用既有重复提醒，恢复到阈值上方解除；不直接创建平台下架动作。
