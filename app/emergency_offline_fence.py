@@ -5,12 +5,7 @@ import json
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
-
-from app.services.listing_automation_gate import (
-    open_review_context,
-    review_block_reasons,
-)
+from typing import Any, Iterable, Mapping
 
 EMERGENCY_BINDING_SCHEMA_VERSION = "emergency-offline-authorization-binding-1.0"
 EMERGENCY_EVENT_TYPE = "EMERGENCY_OFFLINE_AUTHORIZED"
@@ -26,6 +21,7 @@ EMERGENCY_HUMAN_PREEMPTED_TASK_MESSAGE = (
 EMERGENCY_FINAL_CLICK_FENCE_EVENT_KEY_PREFIX = "emergency-final-click-fence:"
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{7,127}")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_WRITABLE_ACTIONS = frozenset({"update_price", "set_online", "set_offline"})
 _UI_AUTOMATION_JOB_TYPES = (
     "FULL_MARKET_SCAN",
     "LISTING_STATUS_SCAN",
@@ -56,6 +52,89 @@ _BINDING_FIELDS = frozenset(
 
 class EmergencyOfflineFenceError(ValueError):
     """The emergency authorization no longer permits a platform click."""
+
+
+def review_block_reasons(
+    action: str,
+    open_reviews: Iterable[Mapping[str, Any]],
+) -> list[str]:
+    """Return write blockers without importing the Web/service package."""
+
+    reasons: list[str] = []
+    for review in open_reviews:
+        blocked_actions = review.get("blocked_actions")
+        if not isinstance(blocked_actions, (list, tuple, set, frozenset)):
+            reasons.append("REVIEW_BLOCKED_ACTIONS_INVALID")
+            continue
+        normalized = {str(value or "").strip().lower() for value in blocked_actions}
+        if not normalized or not normalized.issubset(_WRITABLE_ACTIONS):
+            reasons.append("REVIEW_BLOCKED_ACTIONS_INVALID")
+            continue
+        if action in normalized:
+            reason_code = str(review.get("reason_code") or "").strip().upper()
+            reasons.append(reason_code or "LISTING_ANOMALY_REVIEW_OPEN")
+    return reasons
+
+
+def open_review_context(
+    connection: Any,
+    *,
+    platform_name: str,
+    internal_sku: str,
+) -> list[dict[str, Any]]:
+    """Read current listing blockers using the host-safe shared gate shape."""
+
+    rows = connection.execute(
+        """
+        SELECT reason_code, diagnostic_message, blocked_actions_json
+        FROM listing_anomaly_cases
+        WHERE platform_name = ? AND internal_sku = ? AND cleared_at IS NULL
+        """,
+        (platform_name, internal_sku),
+    ).fetchall()
+    contexts: list[dict[str, Any]] = []
+    for row in rows:
+        payload = _json_value(row["blocked_actions_json"])
+        contexts.append(
+            {
+                "reason_code": str(
+                    row["reason_code"]
+                    or row["diagnostic_message"]
+                    or "LISTING_ANOMALY_REVIEW_OPEN"
+                ),
+                "blocked_actions": payload
+                if isinstance(payload, list)
+                else payload.get("blocked_actions")
+                if isinstance(payload, dict)
+                else None,
+            }
+        )
+    review_rows = connection.execute(
+        """
+        SELECT review_task_id, review_type, reason, review_payload_json
+        FROM review_tasks
+        WHERE platform_name = ?
+          AND internal_sku = ?
+          AND review_status = 'pending'
+        ORDER BY created_at, review_task_id
+        """,
+        (platform_name, internal_sku),
+    ).fetchall()
+    for row in review_rows:
+        payload = _json_object(row["review_payload_json"])
+        contexts.append(
+            {
+                "review_task_id": str(row["review_task_id"]),
+                "reason_code": str(
+                    payload.get("reason_code")
+                    or row["reason"]
+                    or row["review_type"]
+                    or "REVIEW_TASK_OPEN"
+                ),
+                "blocked_actions": payload.get("blocked_actions"),
+            }
+        )
+    return contexts
 
 
 def build_emergency_authorization_binding(connection, *, task_id: str) -> dict[str, str]:
@@ -441,11 +520,15 @@ def _aware_datetime(value: Any, field: str) -> datetime:
 
 
 def _json_object(value: Any) -> dict[str, Any]:
-    try:
-        payload = json.loads(str(value or "{}"))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return {}
+    payload = _json_value(value)
     return payload if isinstance(payload, dict) else {}
+
+
+def _json_value(value: Any) -> Any:
+    try:
+        return json.loads(str(value or "null"))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
 
 
 def _sha256_json(value: Any) -> str:

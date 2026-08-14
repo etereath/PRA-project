@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping
 
+from app.emergency_offline_fence import open_review_context, review_block_reasons
 from app.shadowbot_listing_contract import (
     V5_GATE_DECISIONS,
     V5_GATE_PHASES,
@@ -128,104 +128,6 @@ def evaluate_automation_gate(
             return _allowed("ALREADY_APPLIED", action, sku, phase)
         return _blocked(action, sku, phase, ["LISTING_DATA_MISMATCH"])
     return _blocked(action, sku, phase, ["EXPECTED_WAITING_ONLY"])
-
-
-def review_block_reasons(
-    action: str,
-    open_reviews: Iterable[Mapping[str, Any]],
-) -> list[str]:
-    reasons: list[str] = []
-    for review in open_reviews:
-        blocked_actions = review.get("blocked_actions")
-        if not isinstance(blocked_actions, (list, tuple, set, frozenset)):
-            reasons.append("REVIEW_BLOCKED_ACTIONS_INVALID")
-            continue
-        normalized = {str(value or "").strip().lower() for value in blocked_actions}
-        if not normalized or not normalized.issubset(_WRITABLE_ACTIONS):
-            reasons.append("REVIEW_BLOCKED_ACTIONS_INVALID")
-            continue
-        if action in normalized:
-            reason_code = str(review.get("reason_code") or "").strip().upper()
-            reasons.append(reason_code or "LISTING_ANOMALY_REVIEW_OPEN")
-    return reasons
-
-
-def open_review_context(
-    connection: Any,
-    *,
-    platform_name: str,
-    internal_sku: str,
-) -> list[dict[str, Any]]:
-    """Read every current listing write blocker using the shared gate shape."""
-
-    rows = connection.execute(
-        """
-        SELECT reason_code, diagnostic_message, blocked_actions_json
-        FROM listing_anomaly_cases
-        WHERE platform_name = ? AND internal_sku = ? AND cleared_at IS NULL
-        """,
-        (platform_name, internal_sku),
-    ).fetchall()
-    contexts: list[dict[str, Any]] = []
-    for row in rows:
-        payload = _json_value(row["blocked_actions_json"])
-        contexts.append(
-            {
-                "reason_code": str(
-                    row["reason_code"]
-                    or row["diagnostic_message"]
-                    or "LISTING_ANOMALY_REVIEW_OPEN"
-                ),
-                "blocked_actions": payload
-                if isinstance(payload, list)
-                else payload.get("blocked_actions")
-                if isinstance(payload, dict)
-                else None,
-            }
-        )
-    review_rows = connection.execute(
-        """
-        SELECT review_task_id, review_type, reason, review_payload_json
-        FROM review_tasks
-        WHERE platform_name = ?
-          AND internal_sku = ?
-          AND review_status = 'pending'
-        ORDER BY created_at, review_task_id
-        """,
-        (platform_name, internal_sku),
-    ).fetchall()
-    for row in review_rows:
-        payload = _json_object(row["review_payload_json"])
-        contexts.append(
-            {
-                "review_task_id": str(row["review_task_id"]),
-                "reason_code": str(
-                    payload.get("reason_code")
-                    or row["reason"]
-                    or row["review_type"]
-                    or "REVIEW_TASK_OPEN"
-                ),
-                "blocked_actions": payload.get("blocked_actions"),
-            }
-        )
-    return contexts
-
-
-# Backwards-compatible private alias for callers that imported the helper while
-# the gate module was still internal-only.
-_review_block_reasons = review_block_reasons
-
-
-def _json_value(value: Any) -> Any:
-    try:
-        return json.loads(str(value or "null"))
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return None
-
-
-def _json_object(value: Any) -> dict[str, Any]:
-    payload = _json_value(value)
-    return payload if isinstance(payload, dict) else {}
 
 
 def _write_lock_block_reasons(

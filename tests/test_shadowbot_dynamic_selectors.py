@@ -76,6 +76,31 @@ def test_order_date_values_use_global_exact_accessibility_labels():
     assert "value[\"path\"].append" not in helper_source
 
 
+def test_order_selected_date_uses_order_page_frame_texts():
+    source = FLOW_PATH.read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    page_selector = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_order_page_static_text_selector"
+    )
+    selected_date = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_order_selected_date_from_labels"
+    )
+    page_selector_source = ast.get_source_segment(source, page_selector)
+    selected_date_source = ast.get_source_segment(source, selected_date)
+
+    assert 'ORDER_ROW_SELECTOR_TEMPLATES["grade"]' in page_selector_source
+    assert "_remove_dynamic_page_id_constraints(value)" in page_selector_source
+    assert 'node.get("name") == "Document"' in page_selector_source
+    assert 'node.get("name") == "StaticText"' in page_selector_source
+    assert "_order_page_state_labels(window)" in selected_date_source
+
+
 def test_order_transaction_amount_is_calculated_from_displayed_price_and_qty():
     source = FLOW_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)

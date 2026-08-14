@@ -6845,6 +6845,57 @@ def _order_picker_value_selector(column_name, expected_text):
     )
 
 
+def _order_page_static_text_selector():
+    """Enumerate StaticText from the order Page-Frame, not the product list."""
+
+    base = package.selector(ORDER_ROW_SELECTOR_TEMPLATES["grade"])
+    value = copy.deepcopy(base.__dict__["value"])
+    _remove_dynamic_page_id_constraints(value)
+    value["id"] = str(uuid.uuid4())
+    value["name"] = "动态_订单页面文本集合"
+    value["screenshot"] = ""
+    static_nodes = [
+        node for node in value["path"] if node.get("name") == "StaticText"
+    ]
+    document_positions = [
+        position
+        for position, node in enumerate(value["path"])
+        if node.get("name") == "Document"
+    ]
+    if not static_nodes or not document_positions:
+        raise SliceError(
+            "ORDER_SELECTOR_BUILD_FAILED",
+            "订单字段模板缺少 Page-Frame 或 StaticText",
+            retryable=False,
+        )
+    target_node = copy.deepcopy(static_nodes[-1])
+    value["path"] = value["path"][: document_positions[-1] + 1]
+    target_node["selected"] = True
+    target_node["attributes"] = [
+        attribute
+        for attribute in target_node.get("attributes", [])
+        if attribute.get("name")
+        not in {"acc-name", "explicit-name", "name-from", "value"}
+    ]
+    _set_path_attribute(target_node, "role", "StaticText")
+    value["path"].append(target_node)
+    return Selector(value)
+
+
+def _order_page_state_labels(window):
+    try:
+        elements = window.find_all(
+            _order_page_static_text_selector(),
+            timeout=1,
+        )
+    except Exception:
+        elements = []
+    labels = []
+    for element in elements:
+        labels.extend(_element_label(element))
+    return labels
+
+
 def _order_click_element(element):
     try:
         element.click()
@@ -6868,7 +6919,9 @@ def _order_element_visible_in_container(container, element):
 
 
 def _order_selected_date_from_labels(window):
-    for label in _collect_ui_state_labels(window):
+    labels = _collect_ui_state_labels(window)
+    labels.extend(_order_page_state_labels(window))
+    for label in labels:
         match = re.fullmatch(
             r"\s*(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?\s*",
             str(label or ""),
