@@ -690,22 +690,6 @@ def test_mobile_review_revoked_and_mismatched_tokens_use_stable_get_statuses(
     assert "链接已失效" in revoked_body
 
 
-def test_system_page_only_reports_current_component_state(read_only_web) -> None:
-    app, container, _, _ = read_only_web
-    cookie = _login(app, container)
-
-    status, _, body = _call_app(app, path="/system", cookie=cookie)
-
-    assert status == "200 OK"
-    assert "业务数据库" in body
-    assert "规则资料" in body
-    assert "平台任务传递" in body
-    assert "影刀执行端" in body
-    assert "历史任务" not in body
-    assert "订单历史" not in body
-    assert "平台任务暂时不会执行" in body
-
-
 def test_operator_pages_do_not_expose_internal_implementation_language(
     read_only_web,
 ) -> None:
@@ -738,14 +722,23 @@ def test_operator_pages_do_not_expose_internal_implementation_language(
         "可信空页",
     )
 
+    rendered_pages: dict[str, str] = {}
     for path in paths:
         status, _, body = _call_app(app, path=path, cookie=cookie)
         assert status == "200 OK"
+        rendered_pages[path] = body
         for phrase in forbidden:
             assert phrase not in body, (path, phrase)
 
+    system_body = rendered_pages["/system"]
+    assert "业务数据库" in system_body
+    assert "规则资料" in system_body
+    assert "平台任务传递" in system_body
+    assert "影刀执行端" in system_body
+    assert "历史任务" not in system_body
+    assert "订单历史" not in system_body
+    assert "平台任务暂时不会执行" in system_body
 
-def test_operator_labels_do_not_fall_back_to_developer_identifiers() -> None:
     assert _automation_job_label("FULL_MARKET_SCAN") == "完整市场扫描"
     assert _automation_job_label("UNKNOWN_INTERNAL_JOB") == "其他自动化方案"
     assert _review_type_label("emergency_protection") == "价格异常处理"

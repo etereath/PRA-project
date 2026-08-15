@@ -443,11 +443,6 @@ def test_web_rejects_workbook_execution_identity_mapping(tmp_path: Path) -> None
         )
 
 
-def test_settings_repr_never_contains_admin_password(operations_web) -> None:
-    _, container, _ = operations_web
-    assert "synthetic-password" not in repr(container.settings)
-
-
 def test_all_get_routes_are_zero_write_and_never_initialize_schema(operations_web, monkeypatch) -> None:
     app, container, root = operations_web
     _, authenticated_cookie = login(app, container)
@@ -555,6 +550,7 @@ def test_request_body_has_a_fixed_upper_bound(operations_web) -> None:
 
 def test_login_rotates_session_and_cookie_mode_is_explicit(operations_web) -> None:
     app, container, _ = operations_web
+    assert "synthetic-password" not in repr(container.settings)
     status, headers, body = call_app(app, path="/login")
     assert status == "200 OK"
     preauth_header = header_values(headers, "Set-Cookie")[0]
@@ -574,13 +570,8 @@ def test_login_rotates_session_and_cookie_mode_is_explicit(operations_web) -> No
     authenticated_cookie = cookie_pair(header_values(headers, "Set-Cookie")[0])
     assert authenticated_cookie != preauth_cookie
     assert container.sessions.get(preauth_cookie) is None
-    assert container.sessions.get(authenticated_cookie).principal.subject == "admin"
-
-
-def test_authenticated_get_login_preserves_session_and_redirects_to_today(operations_web) -> None:
-    app, container, _ = operations_web
-    _, authenticated_cookie = login(app, container)
     original = container.sessions.get(authenticated_cookie)
+    assert original.principal.subject == "admin"
 
     status, headers, _ = call_app(app, path="/login", cookie=authenticated_cookie)
 
@@ -639,6 +630,16 @@ def test_public_route_contract_and_legacy_runtime_aliases_are_absent(operations_
         ("/runtime/logout", "POST"),
     ):
         assert call_app(app, path=path, method=method)[0] == "404 Not Found"
+
+    for path in ("/", "/today", "/database", "/management", "/system"):
+        status, headers, _ = call_app(
+            app,
+            path=path,
+            method="POST",
+            cookie=authenticated_cookie,
+        )
+        assert status == "405 Method Not Allowed"
+        assert header_values(headers, "Allow") == ["GET"]
 
 
 def test_login_failures_and_triggering_attempt_enter_bounded_security_audit(
@@ -1027,24 +1028,6 @@ def test_mobile_review_invalid_state_is_read_only_and_does_not_echo_secrets(oper
     assert snapshot_tree(root, ignore_sqlite_sidecar_mtime=True) == before
 
 
-def test_business_posts_are_not_available_in_7b(operations_web) -> None:
-    app, container, _ = operations_web
-    _, authenticated = login(app, container)
-    for path in ("/", "/today", "/database", "/management", "/system"):
-        status, headers, _ = call_app(app, path=path, method="POST", cookie=authenticated)
-        assert status == "405 Method Not Allowed"
-        assert header_values(headers, "Allow") == ["GET"]
-
-
-def test_templates_and_styles_use_only_local_assets() -> None:
-    root = Path(__file__).resolve().parents[1] / "app" / "operations_web"
-    for path in [*root.joinpath("templates").glob("*.html"), *root.joinpath("static").glob("*.css")]:
-        text = path.read_text(encoding="utf-8")
-        assert "http://" not in text
-        assert "https://" not in text
-        assert "cdn" not in text.lower()
-
-
 def test_manual_task_dialog_hides_conditional_fields_and_blocks_empty_platforms() -> None:
     content = _render_manual_task_controls(
         csrf_token="csrf",
@@ -1111,6 +1094,16 @@ def test_operator_copy_humanizes_schedules_and_hides_internal_receipt_ids() -> N
 
 def test_static_assets_must_revalidate_after_deployment(operations_web) -> None:
     app, container, _ = operations_web
+    asset_root = Path(__file__).resolve().parents[1] / "app" / "operations_web"
+    for path in [
+        *asset_root.joinpath("templates").glob("*.html"),
+        *asset_root.joinpath("static").glob("*.css"),
+    ]:
+        text = path.read_text(encoding="utf-8")
+        assert "http://" not in text
+        assert "https://" not in text
+        assert "cdn" not in text.lower()
+
     for path in ("/static/app.css", "/static/app.js"):
         status, headers, _ = call_app(app, path=path)
         assert status == "200 OK"
