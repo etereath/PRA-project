@@ -4,10 +4,22 @@ from contextlib import closing
 from datetime import datetime, timezone
 from decimal import Decimal
 
+import pytest
+
 from app.models import Product
 from app.repositories.master_data_repository import RuntimeMasterDataRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION
+
+
+def test_runtime_schema_gate_never_creates_missing_database(tmp_path) -> None:
+    database = tmp_path / "missing.sqlite3"
+    runtime = SQLiteRuntimeRepository(database)
+
+    with pytest.raises(RuntimeError, match="requires healthy Runtime Schema v18"):
+        runtime.require_current_schema(operation_name="synthetic service")
+
+    assert not database.exists()
 
 
 def test_v18_schema_has_runtime_product_and_mapping_authority(tmp_path) -> None:

@@ -5,6 +5,11 @@
 > `products.xlsx.current_stock` 只作为一次性 bootstrap 输入和历史只读快照，不再是日常
 > 编辑字段。正式切换合同见
 > [13.5-7 施工计划 6.1](plans/task13_5_7_web_rewrite_construction_plan.md#61-数据库真实库存)。
+>
+> 2026-08-15 更新：Runtime Schema v18 已同时接管商品目录和平台对应关系。下文关于
+> `product_inventory_input.py`、`products.xlsx` 商品元数据编辑和旧页面的说明全部属于历史
+> 实现；正式入口是“业务管理 → 商品资料”的 `MasterDataManagementService`。新增商品与
+> `SKU_INITIALIZATION` 零库存必须同事务提交，之后再用人工库存调整记录新花入库。
 
 ## 切换前定位
 

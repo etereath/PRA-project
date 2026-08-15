@@ -1,3 +1,11 @@
+"""Legacy workbook form helpers retained only for isolated compatibility tests.
+
+Formal product metadata writes use ``MasterDataManagementService`` and formal
+inventory writes use ``InventoryApplicationService``.  No Web, Automation,
+Queue, Worker, Importer, or execution path may call this module to mutate a
+Runtime product or its inventory.
+"""
+
 from __future__ import annotations
 
 import re

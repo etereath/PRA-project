@@ -561,7 +561,7 @@ class ShadowBotExecutor:
         self.notification_outbox_service = OutboxReviewNotificationService(repository)
 
     def start_execution(self, request: ShadowBotExecutionRequest) -> ShadowBotExecutorStartResult:
-        self.repository.init_schema()
+        self.repository.require_current_schema(operation_name="ShadowBot COMMIT")
         _validate_execution_mode(request.execution_mode)
         _reject_fault_injection(request.runner_payload)
         payload = self._validate_approval(request)
@@ -765,7 +765,7 @@ class ShadowBotExecutor:
     ) -> ShadowBotExecutorStartResult:
         """Start one v2 single-platform READ_ONLY attempt."""
 
-        self.repository.init_schema()
+        self.repository.require_current_schema(operation_name="ShadowBot READ_ONLY")
         request_payload = dict(request_payload or {})
         if not str(request_payload.get("read_batch_id") or "").strip():
             request_payload["read_batch_id"] = build_read_batch_id()
@@ -994,7 +994,7 @@ class ShadowBotExecutor:
         *,
         automatic_reconcile_payload: dict[str, Any] | None = None,
     ) -> None:
-        self.repository.init_schema()
+        self.repository.require_current_schema(operation_name="ShadowBot result import")
         normalized_side_effect, legacy_side_effect = normalize_side_effect_state(result.side_effect_state)
         normalized_status, legacy_status = normalize_result_status(result.status, normalized_side_effect)
         if legacy_status or legacy_side_effect:
@@ -1107,7 +1107,7 @@ class ShadowBotExecutor:
         request or inserts another execution log.
         """
 
-        self.repository.init_schema()
+        self.repository.require_current_schema(operation_name="ShadowBot result reprojection")
         normalized_side_effect, _ = normalize_side_effect_state(result.side_effect_state)
         normalized_status, _ = normalize_result_status(result.status, normalized_side_effect)
         if (
@@ -1329,7 +1329,7 @@ class ShadowBotExecutor:
         lock_owner: str = SHADOWBOT_EXECUTOR_NAME,
         runner_payload: dict[str, Any] | None = None,
     ) -> ShadowBotExecutorStartResult:
-        self.repository.init_schema()
+        self.repository.require_current_schema(operation_name="ShadowBot RECONCILE")
         _reject_fault_injection(runner_payload or {})
         operation = self.repository.get_shadowbot_operation(operation_id)
         if operation is None:
@@ -1472,7 +1472,7 @@ class ShadowBotExecutor:
         )
 
     def confirm_manual_handled(self, *, operation_id: str, actor: str, note: str = "") -> None:
-        self.repository.init_schema()
+        self.repository.require_current_schema(operation_name="ShadowBot manual recovery")
         operation = self.repository.get_shadowbot_operation(operation_id)
         if operation is None:
             raise ValidationError("operation_id does not exist.")

@@ -21,7 +21,8 @@ from app.services.shadowbot_executor import ShadowBotFileQueueRunner
 
 
 DEFAULT_DB = Path("data/runtime/pra_runtime.sqlite3")
-DEFAULT_MAPPING = Path("data/samples/products.xlsx")
+DEFAULT_MAPPING = Path("shadowbot/test2/product_identity_mapping.json")
+RECOVERY_CONFIRMATION = "LEGACY_EXECUTION_RECOVERY"
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -50,6 +51,7 @@ def _parser() -> argparse.ArgumentParser:
     prepare.add_argument("--profile", choices=("development", "production"), required=True)
     prepare.add_argument("--mapping", type=Path, default=DEFAULT_MAPPING)
     prepare.add_argument("--output", type=Path, required=True)
+    _add_recovery_arguments(prepare)
 
     publish = subparsers.add_parser("publish", help="将已准备清单一次性投递到文件队列")
     publish.add_argument("--manifest", type=Path, required=True)
@@ -64,15 +66,7 @@ def _parser() -> argparse.ArgumentParser:
         default="",
     )
     publish.add_argument("--request-output", type=Path)
-
-    run = subparsers.add_parser("production-run", help="正式模式：从 pending 任务创建并仅投递一次")
-    run.add_argument("--task-id", action="append", required=True)
-    run.add_argument("--batch-id", required=True)
-    run.add_argument("--mapping", type=Path, default=DEFAULT_MAPPING)
-    run.add_argument("--queue-dir", type=Path, default=Path(os.environ.get("SHADOWBOT_QUEUE_DIR", r"D:\PRA_Runtime\shadowbot_queue")))
-    run.add_argument("--applet-uri", required=True)
-    run.add_argument("--manifest-output", type=Path, required=True)
-    run.add_argument("--request-output", type=Path)
+    _add_recovery_arguments(publish)
 
     import_result = subparsers.add_parser("import-result", help="校验并原子回写一个 v4 结果")
     import_result.add_argument("--result", type=Path, required=True)
@@ -87,7 +81,8 @@ def main(argv: list[str] | None = None) -> int:
         pass
     args = _parser().parse_args(argv)
     repository = SQLiteRuntimeRepository(args.db)
-    repository.init_schema()
+    repository.require_current_schema(operation_name="ShadowBot batch CLI")
+    _require_controlled_cli_scope(args)
 
     if args.command == "prepare":
         manifest = prepare_task_commit_batch(
@@ -118,30 +113,35 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"batch_id": request["batch_id"], "execution_attempt_id": request["execution_attempt_id"], "run_id": start.shadowbot_run_id}, ensure_ascii=False))
         return 0
 
-    if args.command == "production-run":
-        manifest = prepare_task_commit_batch(
-            repository,
-            task_ids=args.task_id,
-            mapping_path=args.mapping,
-            batch_id=args.batch_id,
-            execution_profile="production",
-        )
-        _write_json(args.manifest_output, manifest)
-        request, start = publish_task_commit_batch(
-            repository,
-            ShadowBotFileQueueRunner(args.queue_dir),
-            manifest=manifest,
-            execution_profile="production",
-            applet_uri=args.applet_uri,
-        )
-        if args.request_output:
-            _write_json(args.request_output, request)
-        print(json.dumps({"batch_id": request["batch_id"], "execution_attempt_id": request["execution_attempt_id"], "run_id": start.shadowbot_run_id}, ensure_ascii=False))
-        return 0
-
     counts = import_task_commit_result(repository, _read_json(args.result))
     print(json.dumps({"status": "IMPORTED", "counts": counts}, ensure_ascii=False))
     return 0
+
+
+def _add_recovery_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--recovery-reason", default="")
+    parser.add_argument("--recovery-confirmation", default="")
+
+
+def _require_controlled_cli_scope(args: argparse.Namespace) -> None:
+    if getattr(args, "profile", "") != "production":
+        return
+    enabled = os.environ.get(
+        "PRA_ENABLE_LEGACY_EXECUTION_CLI_RECOVERY",
+        "",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        raise ValueError(
+            "正式执行必须从运营 Web 授权；旧 CLI 仅在管理员显式开启恢复开关后可用。"
+        )
+    if not str(getattr(args, "recovery_reason", "") or "").strip():
+        raise ValueError("管理员恢复操作必须填写 --recovery-reason。")
+    if getattr(args, "recovery_confirmation", "") != RECOVERY_CONFIRMATION:
+        raise ValueError(
+            "管理员恢复操作必须提供 --recovery-confirmation "
+            + RECOVERY_CONFIRMATION
+            + "。"
+        )
 
 
 if __name__ == "__main__":

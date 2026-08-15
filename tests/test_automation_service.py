@@ -2279,6 +2279,7 @@ def test_lock_conflict_does_not_overwrite_active_heartbeat(
     tmp_path: Path,
 ) -> None:
     runtime_db = tmp_path / "runtime.sqlite3"
+    SQLiteRuntimeRepository(runtime_db).init_schema()
     heartbeat = tmp_path / "heartbeat.json"
     active_payload = {"status": "RUNNING", "marker": "active-owner"}
     heartbeat.write_text(
@@ -2317,6 +2318,7 @@ def test_once_cli_writes_stopped_heartbeat_and_default_jobs(
     tmp_path: Path,
 ) -> None:
     runtime_db = tmp_path / "runtime.sqlite3"
+    SQLiteRuntimeRepository(runtime_db).init_schema()
     heartbeat = tmp_path / "heartbeat.json"
     environment = dict(os.environ)
     environment["PYTHONIOENCODING"] = "utf-8"

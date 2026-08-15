@@ -149,6 +149,33 @@ class InventoryAlertControlReadModel:
 
 
 @dataclass(frozen=True, slots=True)
+class ProductMasterControlReadModel:
+    internal_sku: str
+    product_name: str
+    grade: str
+    stem_length: str
+    unit: str
+    base_cost: str
+    sale_enabled: bool
+    remark: str
+    current_stock: int
+    version: int
+
+
+@dataclass(frozen=True, slots=True)
+class ProductMappingControlReadModel:
+    mapping_id: str
+    platform_name: str
+    platform_product_name: str
+    grade: str
+    internal_sku: str
+    search_keyword: str
+    mapping_status: str
+    remark: str
+    version: int
+
+
+@dataclass(frozen=True, slots=True)
 class ManagementReadModel:
     pending_tasks: TableReadModel
     pending_reviews: TableReadModel
@@ -170,9 +197,16 @@ class ManagementReadModel:
     inventory_alert_options: tuple[InventoryAlertControlReadModel, ...] = field(
         default_factory=tuple
     )
+    product_master_options: tuple[ProductMasterControlReadModel, ...] = field(
+        default_factory=tuple
+    )
+    product_mapping_options: tuple[ProductMappingControlReadModel, ...] = field(
+        default_factory=tuple
+    )
     task_idempotency_key: str = ""
     execution_idempotency_key: str = ""
     automation_rerun_idempotency_key: str = ""
+    master_data_idempotency_key: str = ""
 
 
 @dataclass(frozen=True, slots=True)

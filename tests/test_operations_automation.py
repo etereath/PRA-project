@@ -6,6 +6,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from openpyxl import Workbook
+import pytest
 
 from app.enums import AutomationRunStatus, ReviewTaskStatus
 from app.models import Product, ReviewTask
@@ -26,6 +27,7 @@ from app.services.operations_automation import (
     DailyTaskGenerationAutomationHandler,
     ReviewTimeoutAutomationHandler,
 )
+from app.services import operations_automation as operations_automation_module
 from app.services.operational_time import OperationalTimeService
 
 
@@ -328,3 +330,66 @@ def test_daily_generation_does_not_read_or_evaluate_a_disabled_rule_source(
     assert tasks
     assert {task.origin_ref_id for task in tasks} == {run.run_id}
     assert all(task.action_type.value != "update_price" for task in tasks)
+
+
+def test_daily_generation_rejects_inventory_change_before_persistence(
+    tmp_path,
+    monkeypatch,
+):
+    runtime, automation, jobs = _runtime(tmp_path)
+    _seed_products(runtime)
+    price_rules = tmp_path / "price_rules.xlsx"
+    listing_rules = tmp_path / "listing_rules.xlsx"
+    _write_workbook(
+        price_rules,
+        PRICE_RULE_HEADERS,
+        [["RULE-1", "固定加价", "*", "*", PLATFORM, "fixed_markup", 5, 14, "round", "", True, 10, ""]],
+    )
+    _write_workbook(
+        listing_rules,
+        LISTING_RULE_HEADERS,
+        [["LIST-1", "库存恢复允许上架", "*", "*", PLATFORM, 10, "stock_above_online", True, 5, ""]],
+    )
+    plan_time = NOW - timedelta(minutes=5)
+    plan_context = OperationalTimeService(
+        policies=automation.load_operational_time_policies()
+    ).classify(plan_time)
+    automation.ensure_run(
+        job=jobs[SALES_PLAN_INPUT_BUILD],
+        scheduled_for=plan_time,
+        time_context=plan_context,
+        initial_status=AutomationRunStatus.SUCCESS,
+        now=plan_time,
+    )
+    run = _run(automation, jobs[DAILY_TASK_GENERATION], NOW)
+    original = operations_automation_module.generate_tasks_from_sources
+
+    def mutate_inventory(inputs):
+        summary = original(inputs)
+        with runtime.connect_write() as connection, connection:
+            connection.execute(
+                """
+                UPDATE inventory_balances
+                SET current_qty = 49, version = version + 1,
+                    updated_at = ?
+                WHERE internal_sku = 'SKU-001'
+                """,
+                ((NOW + timedelta(seconds=1)).isoformat(),),
+            )
+        return summary
+
+    monkeypatch.setattr(
+        operations_automation_module,
+        "generate_tasks_from_sources",
+        mutate_inventory,
+    )
+
+    with pytest.raises(RuntimeError, match="inventory or platform facts changed"):
+        DailyTaskGenerationAutomationHandler(
+            runtime,
+            automation,
+            price_rules,
+            listing_rules,
+        )(run, FakeContext(NOW))
+
+    assert runtime.list_tasks() == []

@@ -465,8 +465,15 @@ class InventoryApplicationService:
         actor: str,
         idempotency_key: str,
         reason: str = "新增商品建立零库存余额",
+        connection=None,
     ) -> InventoryWriteResult:
-        """Create the required zero balance after new product metadata is saved."""
+        """Create the required zero balance after new product metadata is saved.
+
+        A caller that is already creating product metadata may pass its active
+        write connection.  That keeps the product row and the mandatory zero
+        inventory balance in one transaction instead of exposing a half-created
+        SKU between two commits.
+        """
 
         sku = _required_text(internal_sku, "internal_sku")
         normalized_actor = _required_text(actor, "actor")
@@ -480,30 +487,54 @@ class InventoryApplicationService:
             }
         )
         now = self.clock()
-        with closing(self.runtime_repository.connect_write()) as connection:
+        owns_connection = connection is None
+        active_connection = connection or self.runtime_repository.connect_write()
+        try:
             try:
-                connection.execute("BEGIN IMMEDIATE")
-                state = self.repository.get_authority_state(connection=connection)
+                if owns_connection:
+                    active_connection.execute("BEGIN IMMEDIATE")
+                state = self.repository.get_authority_state(
+                    connection=active_connection
+                )
                 if state.authority_mode != "DB_AUTHORITY":
                     raise InventoryAuthorityError("库存尚未切换为数据库权威")
-                if self.product_exists is None or not self.product_exists(sku):
+                product_row = active_connection.execute(
+                    "SELECT 1 FROM product_catalog WHERE internal_sku = ?",
+                    (sku,),
+                ).fetchone()
+                callback_knows_product = (
+                    owns_connection
+                    and self.product_exists is not None
+                    and self.product_exists(sku)
+                )
+                if product_row is None and not callback_knows_product:
                     raise InventoryAuthorityError(
                         f"商品 {sku} 尚未保存到固定商品主数据"
                     )
                 existing = self.repository.get_transaction_by_idempotency_key(
                     key,
-                    connection=connection,
+                    connection=active_connection,
                 )
                 if existing is not None:
                     if existing.request_sha256 != request_sha256:
                         raise InventoryConflictError("幂等键已被不同库存请求使用")
-                    balance = self.repository.get_balance(sku, connection=connection)
-                    connection.rollback()
+                    balance = self.repository.get_balance(
+                        sku,
+                        connection=active_connection,
+                    )
+                    if owns_connection:
+                        active_connection.rollback()
                     return InventoryWriteResult("REPLAYED", existing, balance)
-                if self.repository.get_balance(sku, connection=connection) is not None:
+                if (
+                    self.repository.get_balance(
+                        sku,
+                        connection=active_connection,
+                    )
+                    is not None
+                ):
                     raise InventoryConflictError(f"商品 {sku} 已存在权威库存余额")
                 transaction = _append_transaction(
-                    connection,
+                    active_connection,
                     internal_sku=sku,
                     inventory_before=0,
                     inventory_delta=0,
@@ -521,7 +552,7 @@ class InventoryApplicationService:
                     platform_name=None,
                     platform_trade_date=None,
                 )
-                connection.execute(
+                active_connection.execute(
                     """
                     INSERT INTO inventory_balances(
                         internal_sku, current_qty, version,
@@ -530,15 +561,23 @@ class InventoryApplicationService:
                     """,
                     (sku, transaction.transaction_id, _datetime_to_text(now)),
                 )
-                connection.commit()
+                balance = self.repository.get_balance(
+                    sku,
+                    connection=active_connection,
+                )
+                if owns_connection:
+                    active_connection.commit()
             except Exception:
-                if connection.in_transaction:
-                    connection.rollback()
+                if owns_connection and active_connection.in_transaction:
+                    active_connection.rollback()
                 raise
+        finally:
+            if owns_connection:
+                active_connection.close()
         return InventoryWriteResult(
             "APPLIED",
             transaction,
-            self.repository.get_balance(sku),
+            balance,
         )
 
     def adjust(

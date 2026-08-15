@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import closing
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping, Sequence
@@ -17,6 +18,32 @@ from app.services.product_mapping import (
 
 class RuntimeMasterDataError(ValueError):
     """Raised when Runtime master data cannot be trusted or seeded safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class ProductMasterRecord:
+    product: Product
+    version: int
+
+
+@dataclass(frozen=True, slots=True)
+class PlatformMappingRecord:
+    mapping_id: str
+    mapping_kind: str
+    platform_name: str
+    platform_product_id: str
+    platform_product_name: str
+    normalized_platform_product_name: str
+    grade: str
+    internal_sku: str | None
+    candidate_internal_sku: str | None
+    search_keyword: str
+    mapping_status: str
+    effective_from: str | None
+    effective_to: str | None
+    last_verified_at: str | None
+    remark: str
+    version: int
 
 
 class RuntimeMasterDataRepository:
@@ -42,6 +69,34 @@ class RuntimeMasterDataRepository:
             with closing(self.runtime.connect_read()) as opened:
                 rows = opened.execute(query).fetchall()
         return tuple(_row_to_product(row) for row in rows)
+
+    def list_product_records(
+        self,
+        *,
+        connection=None,
+    ) -> tuple[ProductMasterRecord, ...]:
+        query = """
+            SELECT product.internal_sku, product.product_name, product.grade,
+                   product.stem_length, product.unit, product.base_cost,
+                   product.sale_enabled, product.remark, product.version,
+                   COALESCE(balance.current_qty, 0) AS current_stock
+            FROM product_catalog AS product
+            LEFT JOIN inventory_balances AS balance
+              ON balance.internal_sku = product.internal_sku
+            ORDER BY product.internal_sku
+        """
+        if connection is not None:
+            rows = connection.execute(query).fetchall()
+        else:
+            with closing(self.runtime.connect_read()) as opened:
+                rows = opened.execute(query).fetchall()
+        return tuple(
+            ProductMasterRecord(
+                product=_row_to_product(row),
+                version=int(row["version"]),
+            )
+            for row in rows
+        )
 
     def get_product(self, internal_sku: str, *, connection=None) -> Product | None:
         sku = str(internal_sku or "").strip().upper()
@@ -71,7 +126,7 @@ class RuntimeMasterDataRepository:
                    platform_product_id, platform_product_name,
                    normalized_platform_product_name, grade, search_keyword,
                    mapping_status, effective_from, effective_to,
-                   last_verified_at, remark
+                   last_verified_at, remark, version
             FROM platform_product_mappings
             ORDER BY platform_name, mapping_kind, mapping_id
         """
@@ -81,6 +136,175 @@ class RuntimeMasterDataRepository:
             with closing(self.runtime.connect_read()) as opened:
                 rows = opened.execute(query).fetchall()
         return tuple({key: row[key] for key in row.keys()} for row in rows)
+
+    def list_mapping_records(
+        self,
+        *,
+        connection=None,
+    ) -> tuple[PlatformMappingRecord, ...]:
+        return tuple(
+            PlatformMappingRecord(**row)
+            for row in self.list_mapping_rows(connection=connection)
+        )
+
+    def insert_product(
+        self,
+        product: Product,
+        *,
+        source_ref: str,
+        source_sha256: str,
+        connection,
+    ) -> ProductMasterRecord:
+        normalized = _validated_products((product,))[0]
+        now_text = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        try:
+            connection.execute(
+                """
+                INSERT INTO product_catalog(
+                    internal_sku, product_name, grade, stem_length, unit,
+                    base_cost, sale_enabled, remark,
+                    source_type, source_ref, source_sha256,
+                    version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'WEB_MANAGEMENT', ?, ?, 1, ?, ?)
+                """,
+                (
+                    normalized.internal_sku.upper(),
+                    normalized.product_name,
+                    normalized.grade,
+                    normalized.stem_length,
+                    normalized.unit,
+                    _decimal_text(normalized.base_cost),
+                    int(normalized.sale_enabled),
+                    normalized.remark,
+                    _required_text(source_ref, "source_ref"),
+                    _required_sha256(source_sha256, "source_sha256"),
+                    now_text,
+                    now_text,
+                ),
+            )
+        except Exception as exc:
+            if "UNIQUE constraint failed: product_catalog.internal_sku" in str(exc):
+                raise RuntimeMasterDataError("商品 SKU 已存在。") from exc
+            raise
+        return ProductMasterRecord(product=normalized, version=1)
+
+    def update_product(
+        self,
+        product: Product,
+        *,
+        expected_version: int,
+        source_ref: str,
+        source_sha256: str,
+        connection,
+    ) -> ProductMasterRecord:
+        normalized = _validated_products((product,))[0]
+        next_version = int(expected_version) + 1
+        changed = connection.execute(
+            """
+            UPDATE product_catalog
+            SET product_name = ?, grade = ?, stem_length = ?, unit = ?,
+                base_cost = ?, sale_enabled = ?, remark = ?,
+                source_type = 'WEB_MANAGEMENT', source_ref = ?,
+                source_sha256 = ?, version = ?, updated_at = ?
+            WHERE internal_sku = ? AND version = ?
+            """,
+            (
+                normalized.product_name,
+                normalized.grade,
+                normalized.stem_length,
+                normalized.unit,
+                _decimal_text(normalized.base_cost),
+                int(normalized.sale_enabled),
+                normalized.remark,
+                _required_text(source_ref, "source_ref"),
+                _required_sha256(source_sha256, "source_sha256"),
+                next_version,
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                normalized.internal_sku.upper(),
+                int(expected_version),
+            ),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeMasterDataError("商品资料已被其他操作更新，请刷新后重试。")
+        return ProductMasterRecord(product=normalized, version=next_version)
+
+    def insert_mapping(
+        self,
+        row: Mapping[str, object],
+        *,
+        source_ref: str,
+        source_sha256: str,
+        connection,
+    ) -> PlatformMappingRecord:
+        normalized = _normalized_mapping_row(row)
+        _validate_mapping_row(normalized)
+        now_text = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        try:
+            connection.execute(
+                """
+                INSERT INTO platform_product_mappings(
+                    mapping_id, mapping_kind, platform_name,
+                    platform_product_id, platform_product_name,
+                    normalized_platform_product_name, grade,
+                    internal_sku, candidate_internal_sku, search_keyword,
+                    mapping_status, effective_from, effective_to,
+                    last_verified_at, remark,
+                    source_type, source_ref, source_sha256,
+                    version, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                          'WEB_MANAGEMENT', ?, ?, 1, ?, ?)
+                """,
+                _mapping_values(normalized)
+                + (
+                    _required_text(source_ref, "source_ref"),
+                    _required_sha256(source_sha256, "source_sha256"),
+                    now_text,
+                    now_text,
+                ),
+            )
+        except Exception as exc:
+            if "UNIQUE constraint failed: platform_product_mappings.mapping_id" in str(exc):
+                raise RuntimeMasterDataError("商品对应关系编号已存在。") from exc
+            raise
+        return PlatformMappingRecord(**normalized, version=1)
+
+    def update_mapping(
+        self,
+        row: Mapping[str, object],
+        *,
+        expected_version: int,
+        source_ref: str,
+        source_sha256: str,
+        connection,
+    ) -> PlatformMappingRecord:
+        normalized = _normalized_mapping_row(row)
+        _validate_mapping_row(normalized)
+        next_version = int(expected_version) + 1
+        changed = connection.execute(
+            """
+            UPDATE platform_product_mappings
+            SET mapping_kind = ?, platform_name = ?, platform_product_id = ?,
+                platform_product_name = ?, normalized_platform_product_name = ?,
+                grade = ?, internal_sku = ?, candidate_internal_sku = ?,
+                search_keyword = ?, mapping_status = ?, effective_from = ?,
+                effective_to = ?, last_verified_at = ?, remark = ?,
+                source_type = 'WEB_MANAGEMENT', source_ref = ?,
+                source_sha256 = ?, version = ?, updated_at = ?
+            WHERE mapping_id = ? AND version = ?
+            """,
+            _mapping_values(normalized)[1:]
+            + (
+                _required_text(source_ref, "source_ref"),
+                _required_sha256(source_sha256, "source_sha256"),
+                next_version,
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                normalized["mapping_id"],
+                int(expected_version),
+            ),
+        ).rowcount
+        if changed != 1:
+            raise RuntimeMasterDataError("商品对应关系已被其他操作更新，请刷新后重试。")
+        return PlatformMappingRecord(**normalized, version=next_version)
 
     def compiled_mappings(self, *, connection=None) -> CompiledProductMappings:
         rows = self.list_mapping_rows(connection=connection)
@@ -324,6 +548,37 @@ def _normalized_mapping_row(row: Mapping[str, object]) -> dict[str, object]:
         "last_verified_at": str(row.get("last_verified_at") or "").strip() or None,
         "remark": str(row.get("remark") or ""),
     }
+
+
+def _validate_mapping_row(row: Mapping[str, object]) -> None:
+    source_sha256 = _payload_sha256((row,)).split(":", 1)[1]
+    try:
+        compile_product_mapping_rows(
+            (row,),
+            source_workbook_sha256=source_sha256,
+        )
+    except Exception as exc:
+        raise RuntimeMasterDataError(str(exc) or "商品对应关系不完整。") from exc
+
+
+def _mapping_values(row: Mapping[str, object]) -> tuple[object, ...]:
+    return (
+        row["mapping_id"],
+        row["mapping_kind"],
+        row["platform_name"],
+        row["platform_product_id"],
+        row["platform_product_name"],
+        row["normalized_platform_product_name"],
+        row["grade"],
+        row["internal_sku"],
+        row["candidate_internal_sku"],
+        row["search_keyword"],
+        row["mapping_status"],
+        row["effective_from"],
+        row["effective_to"],
+        row["last_verified_at"],
+        row["remark"],
+    )
 
 
 def _payload_sha256(value: object) -> str:

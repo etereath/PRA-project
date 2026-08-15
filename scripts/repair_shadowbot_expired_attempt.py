@@ -31,7 +31,13 @@ def main() -> int:
     args = build_parser().parse_args()
     try:
         event = repair_expired_attempt(args.runtime_db, args.queue_dir, args.execution_attempt_id)
-    except (ValidationError, OSError, ValueError, json.JSONDecodeError) as exc:
+    except (
+        ValidationError,
+        OSError,
+        RuntimeError,
+        ValueError,
+        json.JSONDecodeError,
+    ) as exc:
         print(json.dumps({"ok": False, "error_code": "EXPIRED_ATTEMPT_REPAIR_REJECTED", "error_message": str(exc)}, ensure_ascii=False))
         return 1
     print(json.dumps({"ok": True, **event}, ensure_ascii=False, sort_keys=True))
@@ -40,7 +46,7 @@ def main() -> int:
 
 def repair_expired_attempt(runtime_db: Path, queue_dir: Path, execution_attempt_id: str) -> dict[str, object]:
     repository = SQLiteRuntimeRepository(runtime_db)
-    repository.init_schema()
+    repository.require_current_schema(operation_name="过期执行请求修复")
     attempt = repository.get_shadowbot_execution_attempt(execution_attempt_id)
     if attempt is None:
         raise ValidationError("execution attempt does not exist.")

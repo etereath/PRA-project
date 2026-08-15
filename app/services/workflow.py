@@ -239,12 +239,8 @@ def init_runtime_database(inputs: RuntimeDatabaseInputs) -> list[int]:
 def generate_runtime_tasks_from_sources(
     inputs: WorkflowInputs, *, db_path: Path = DEFAULT_RUNTIME_DB
 ) -> RuntimeTaskGenerationSummary:
-    # This is an explicit command/write workflow.  Initialise the target Runtime DB
-    # before inventory-aware rule evaluation so a brand-new database has a
-    # PRE_CUTOVER authority row to read.  Read-only Web queries must never call this
-    # path and continue to fail closed instead of initialising or migrating schemas.
     repository = SQLiteRuntimeRepository(db_path)
-    RuntimeTaskService(repository).init_schema()
+    repository.require_current_schema(operation_name="Runtime task generation")
     preview_inputs = WorkflowInputs(
         products_path=inputs.products_path,
         price_rules_path=inputs.price_rules_path,
@@ -278,7 +274,7 @@ def persist_task_generation_summary(
 ) -> RuntimeTaskGenerationSummary:
     repository = SQLiteRuntimeRepository(db_path)
     runtime_task_service = RuntimeTaskService(repository)
-    runtime_task_service.init_schema()
+    repository.require_current_schema(operation_name="Runtime task persistence")
     if summary.tasks:
         generation_time = max(task.created_at for task in summary.tasks)
         if generation_time.tzinfo is not None:
@@ -316,7 +312,7 @@ def list_runtime_tasks(
 ) -> list[Task]:
     repository = SQLiteRuntimeRepository(db_path)
     service = RuntimeTaskService(repository)
-    service.init_schema()
+    repository.require_current_schema(operation_name="Runtime task listing")
     service.expire_overdue_pending_tasks()
     return service.list_tasks(
         trade_date=trade_date,
@@ -329,13 +325,13 @@ def list_runtime_tasks(
 
 def list_runtime_task_history(db_path: Path, task_id: str) -> list[TaskStatusHistory]:
     repository = SQLiteRuntimeRepository(db_path)
-    RuntimeTaskService(repository).init_schema()
+    repository.require_current_schema(operation_name="Runtime task history")
     return RuntimeTaskService(repository).list_status_history(task_id)
 
 
 def get_runtime_task(db_path: Path, task_id: str) -> Task | None:
     repository = SQLiteRuntimeRepository(db_path)
-    RuntimeTaskService(repository).init_schema()
+    repository.require_current_schema(operation_name="Runtime task lookup")
     return RuntimeTaskService(repository).get_task(task_id)
 
 
@@ -346,7 +342,7 @@ def list_runtime_review_tasks(
     status: ReviewTaskStatus | None = None,
 ) -> list[ReviewTask]:
     repository = SQLiteRuntimeRepository(db_path)
-    RuntimeTaskService(repository).init_schema()
+    repository.require_current_schema(operation_name="Runtime review listing")
     return ReviewTaskService(repository).list_review_tasks(
         trade_date=trade_date, status=status
     )
@@ -354,14 +350,14 @@ def list_runtime_review_tasks(
 
 def get_runtime_review_task(db_path: Path, review_task_id: str) -> ReviewTask | None:
     repository = SQLiteRuntimeRepository(db_path)
-    RuntimeTaskService(repository).init_schema()
+    repository.require_current_schema(operation_name="Runtime review lookup")
     return ReviewTaskService(repository).get_review_task(review_task_id)
 
 
 def resolve_runtime_review_task(inputs: RuntimeReviewResolutionInputs) -> ReviewTask:
     repository = SQLiteRuntimeRepository(inputs.db_path)
     runtime_task_service = RuntimeTaskService(repository)
-    runtime_task_service.init_schema()
+    repository.require_current_schema(operation_name="Runtime review resolution")
     return ReviewTaskService(
         repository, runtime_task_service=runtime_task_service
     ).resolve_review_task(
@@ -384,7 +380,7 @@ def get_mobile_review_detail(
 ) -> MobileReviewDetail:
     repository = SQLiteRuntimeRepository(db_path)
     runtime_task_service = RuntimeTaskService(repository)
-    runtime_task_service.init_schema()
+    repository.require_current_schema(operation_name="Mobile review detail")
     token_service = ReviewTokenService(repository)
     validation = token_service.validate_token(
         review_task_id,
@@ -430,7 +426,7 @@ def resolve_mobile_review(
 ) -> MobileReviewResolutionSummary:
     repository = SQLiteRuntimeRepository(db_path)
     runtime_task_service = RuntimeTaskService(repository)
-    runtime_task_service.init_schema()
+    repository.require_current_schema(operation_name="Mobile review resolution")
     token_service = ReviewTokenService(repository)
     try:
         review_status = ReviewTaskStatus(action)
@@ -558,7 +554,7 @@ def expire_runtime_review_tasks(
 ) -> ExpireReviewTasksSummary:
     repository = SQLiteRuntimeRepository(inputs.db_path)
     runtime_task_service = RuntimeTaskService(repository)
-    runtime_task_service.init_schema()
+    repository.require_current_schema(operation_name="Review token creation")
     return ReviewTaskService(
         repository, runtime_task_service=runtime_task_service
     ).expire_pending_review_tasks(
@@ -577,7 +573,7 @@ def list_runtime_notification_logs(
     channel: str | None = None,
 ) -> list[NotificationLog]:
     repository = SQLiteRuntimeRepository(db_path)
-    RuntimeTaskService(repository).init_schema()
+    repository.require_current_schema(operation_name="Notification log listing")
     logs = NotificationLogService(repository).list_logs(
         related_review_task_id=related_review_task_id,
         send_status=send_status,
@@ -592,7 +588,7 @@ def get_runtime_notification_log(
     db_path: Path, notification_id: str
 ) -> NotificationLog | None:
     repository = SQLiteRuntimeRepository(db_path)
-    RuntimeTaskService(repository).init_schema()
+    repository.require_current_schema(operation_name="Notification log lookup")
     return NotificationLogService(repository).get_log(notification_id)
 
 
@@ -603,7 +599,7 @@ def list_runtime_execution_logs(
     limit: int | None = None,
 ) -> list[ExecutionLog]:
     repository = SQLiteRuntimeRepository(db_path)
-    RuntimeTaskService(repository).init_schema()
+    repository.require_current_schema(operation_name="Execution log listing")
     return repository.list_execution_logs(task_id=task_id, limit=limit)
 
 
@@ -981,7 +977,7 @@ def _resolve_selected_rule_platforms(
     if rule_platform and rule_platform != "*":
         if inputs.runtime_db_path is not None:
             repository = SQLiteRuntimeRepository(inputs.runtime_db_path)
-            repository.init_schema()
+            repository.require_current_schema(operation_name="Rule platform resolution")
             matching_platforms = list(
                 dict.fromkeys(
                     status.platform_name
@@ -1005,7 +1001,7 @@ def _resolve_selected_rule_platforms(
     )
     if inputs.runtime_db_path is not None:
         repository = SQLiteRuntimeRepository(inputs.runtime_db_path)
-        repository.init_schema()
+        repository.require_current_schema(operation_name="Rule platform resolution")
         listing_statuses = repository.list_listing_statuses()
         snapshot_platforms = list(
             dict.fromkeys(
@@ -1075,7 +1071,7 @@ def _load_current_platform_prices(
     if runtime_db_path is None:
         return None
     repository = SQLiteRuntimeRepository(runtime_db_path)
-    repository.init_schema()
+    repository.require_current_schema(operation_name="Platform price lookup")
     return {
         listing_identity_key(
             platform_name, status.variety, status.grade
@@ -1093,7 +1089,7 @@ def _load_latest_platform_observations(
     if runtime_db_path is None:
         return None
     repository = SQLiteRuntimeRepository(runtime_db_path)
-    repository.init_schema()
+    repository.require_current_schema(operation_name="Platform observation lookup")
     observations: dict[
         tuple[str, str, str],
         tuple[Decimal, int],
@@ -1130,7 +1126,7 @@ def _load_platform_listing_states(
     if runtime_db_path is None:
         return None
     repository = SQLiteRuntimeRepository(runtime_db_path)
-    repository.init_schema()
+    repository.require_current_schema(operation_name="Platform listing lookup")
     states: dict[tuple[str, str, str], str] = {}
     for status in repository.list_listing_statuses():
         if not platform_names_match(platform_name, status.platform_name):
@@ -1157,7 +1153,7 @@ def _resolve_runtime_platform_name(
     if runtime_db_path is None:
         return canonical_name
     repository = SQLiteRuntimeRepository(runtime_db_path)
-    repository.init_schema()
+    repository.require_current_schema(operation_name="Runtime platform resolution")
     matching_platforms = list(
         dict.fromkeys(
             status.platform_name

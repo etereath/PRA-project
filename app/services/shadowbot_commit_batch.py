@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any
 
 from app.exceptions import ValidationError
-from app.repositories.workbook_repository import load_products
 from app.shadowbot_contract_primitives import (
     canonical_positive_price,
     normalize_contract_grade as normalize_grade,
@@ -39,21 +38,8 @@ _FORBIDDEN_POSITION_FIELDS = frozenset(
 
 
 def load_identity_mapping(path: Path, *, expected_platform_name: str = "") -> dict[str, dict[str, str]]:
-    if Path(path).suffix.lower() in {".xlsx", ".xlsm"}:
-        try:
-            products = load_products(Path(path))
-        except (OSError, UnicodeError, ValidationError, ValueError) as exc:
-            raise ValidationError(f"无法读取库存 SKU 映射源：{path}") from exc
-        mapping = {
-            product.internal_sku.upper(): {
-                "expected_product_name": product.product_name,
-                "expected_grade": product.grade,
-            }
-            for product in products
-        }
-        if not mapping:
-            raise ValidationError("商品资料与库存录入中没有可用 SKU。")
-        return mapping
+    if Path(path).suffix.lower() != ".json":
+        raise ValidationError("正式执行的 SKU 页面身份映射只接受版本化 JSON。")
     try:
         raw = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:

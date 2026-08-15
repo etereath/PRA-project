@@ -1,3 +1,10 @@
+"""Legacy multi-domain evaluator for isolated development and regression labs.
+
+It is not the formal daily business-task control plane.  Formal price/listing
+generation runs through ``DailyTaskGenerationAutomationHandler``; capacity,
+cold-storage and mock-platform evaluators remain deferred test assets.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -559,7 +566,7 @@ class BusinessRuleRunner:
         if evaluator is None:
             raise ValidationError(f"unknown evaluator: {evaluator_id}")
 
-        self.repository.init_schema()
+        self.repository.require_current_schema(operation_name="Business rule evaluation")
         context = self._load_context_inputs(context)
         script_run = ScriptRun(
             script_run_id=self._script_run_id(evaluator_id, context),

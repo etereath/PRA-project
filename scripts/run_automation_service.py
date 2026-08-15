@@ -22,7 +22,6 @@ from app.repositories.sqlite_connection import (  # noqa: E402
 from app.repositories.sqlite_runtime_repository import (  # noqa: E402
     SQLiteRuntimeRepository,
 )
-from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION  # noqa: E402
 from app.services.automation import (  # noqa: E402
     AutomationHeartbeatStore,
     AutomationService,
@@ -42,6 +41,7 @@ from app.services.operational_time import (  # noqa: E402
 )
 from app.services.operations_automation import (  # noqa: E402
     build_operations_control_handlers,
+    validate_rule_workbooks,
 )
 from app.services.order_automation_runtime import (  # noqa: E402
     build_order_read_only_handlers,
@@ -62,8 +62,6 @@ DEFAULT_SHADOWBOT_QUEUE_DIR = Path(
         "data/runtime/shadowbot_queue",
     )
 )
-DEFAULT_PLATFORM_MAPPINGS = PROJECT_ROOT / "data" / "samples" / "platform_mappings.xlsx"
-DEFAULT_PRODUCTS = PROJECT_ROOT / "data" / "samples" / "products.xlsx"
 DEFAULT_PRICE_RULES = PROJECT_ROOT / "data" / "samples" / "price_rules.xlsx"
 DEFAULT_LISTING_RULES = PROJECT_ROOT / "data" / "samples" / "listing_rules.xlsx"
 
@@ -133,12 +131,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--release-wheel", type=Path)
     parser.add_argument("--backup-dir", type=Path)
-    parser.add_argument(
-        "--platform-mappings",
-        type=Path,
-        default=DEFAULT_PLATFORM_MAPPINGS,
-    )
-    parser.add_argument("--products", type=Path, default=DEFAULT_PRODUCTS)
     parser.add_argument("--price-rules", type=Path, default=DEFAULT_PRICE_RULES)
     parser.add_argument("--listing-rules", type=Path, default=DEFAULT_LISTING_RULES)
     parser.add_argument(
@@ -215,6 +207,24 @@ def automation_service_lock_path(runtime_db: Path) -> Path:
     return resolved.parent / f".automation-service-{digest}.lock"
 
 
+def _validate_formal_rule_configuration(args: argparse.Namespace) -> dict[str, str]:
+    price_path = Path(args.price_rules).resolve(strict=False)
+    listing_path = Path(args.listing_rules).resolve(strict=False)
+    environment = os.environ.get("PRA_ENV", "development").strip().lower()
+    samples_root = (PROJECT_ROOT / "data" / "samples").resolve(strict=False)
+    if environment == "production" and any(
+        path == samples_root or samples_root in path.parents
+        for path in (price_path, listing_path)
+    ):
+        raise ValueError(
+            "生产环境必须显式配置正式价格规则和上下架规则，不能使用 data/samples。"
+        )
+    return validate_rule_workbooks(
+        price_rules_path=price_path,
+        listing_rules_path=listing_path,
+    )
+
+
 def main() -> int:
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -252,16 +262,9 @@ def main() -> int:
                     purpose="background"
                 ),
             )
-            runtime_repository.init_schema()
-            schema_health = runtime_repository.check_schema_health()
-            if (
-                not schema_health.ok
-                or schema_health.actual_version != LATEST_RUNTIME_SCHEMA_VERSION
-            ):
-                raise RuntimeError(
-                    "Automation Service 要求健康的 Runtime Schema "
-                    f"v{LATEST_RUNTIME_SCHEMA_VERSION}。"
-                )
+            runtime_repository.require_current_schema(
+                operation_name="Automation Service"
+            )
             repository = AutomationRepository(runtime_repository)
             ensure_default_automation_jobs(
                 repository,
@@ -283,6 +286,7 @@ def main() -> int:
             operational_time = OperationalTimeService(
                 policies=repository.load_operational_time_policies()
             )
+            _validate_formal_rule_configuration(args)
             handlers = dict(
                 build_sales_settlement_handlers(
                     runtime_repository=runtime_repository,
@@ -335,10 +339,8 @@ def main() -> int:
                             backup_dir=backup_dir,
                             wheel_path=release_wheel,
                             input_specs=(
-                                ("products.xlsx", args.products),
                                 ("price_rules.xlsx", args.price_rules),
                                 ("listing_rules.xlsx", args.listing_rules),
-                                ("platform_mappings.xlsx", args.platform_mappings),
                             ),
                             git_root=PROJECT_ROOT,
                             backup_id=backup_id,

@@ -158,7 +158,7 @@ def main() -> int:
         args.heartbeat or paths.control / "pra_queue_services_heartbeat.json"
     )
     repository = SQLiteRuntimeRepository(args.runtime_db)
-    repository.init_schema()
+    repository.require_current_schema(operation_name="ShadowBot Queue Service")
     review_service = ReviewTaskService(repository)
     notification_channel = os.environ.get(
         "DEFAULT_NOTIFICATION_CHANNEL", ""

@@ -111,6 +111,24 @@ class OperationsWebSettings:
                 root,
             ),
         )
+        if (
+            paths.shadowbot_identity_mapping is None
+            or paths.shadowbot_identity_mapping.suffix.lower() != ".json"
+        ):
+            raise OperationsWebConfigurationError(
+                "PRA_SHADOWBOT_IDENTITY_MAPPING 必须指向版本化 JSON 文件。"
+            )
+        samples_root = (root / "data" / "samples").resolve(strict=False)
+        if environment == "production" and any(
+            path == samples_root or samples_root in path.parents
+            for path in (
+                paths.price_rules_workbook,
+                paths.listing_rules_workbook,
+            )
+        ):
+            raise OperationsWebConfigurationError(
+                "生产环境必须配置正式规则资料，不能使用 data/samples。"
+            )
         return cls(
             environment=environment,
             public_scheme=public_scheme,

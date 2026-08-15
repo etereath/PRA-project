@@ -7,7 +7,6 @@ import unittest
 from pathlib import Path
 
 from app.exceptions import ValidationError
-from app.repositories.workbook_repository import save_table_records
 from app.services.shadowbot_commit_batch import (
     build_commit_manifest,
     build_commit_request,
@@ -145,38 +144,15 @@ class ShadowBotCommitBatchContractTests(unittest.TestCase):
             with self.assertRaisesRegex(ValidationError, "平台"):
                 load_identity_mapping(path, expected_platform_name="其他平台")
 
-    def test_inventory_workbook_is_the_commit_identity_mapping_source(self) -> None:
+    def test_commit_identity_mapping_rejects_workbooks(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "products.xlsx"
-            save_table_records(
-                "products",
-                path,
-                [
-                    {
-                        "internal_sku": "CAPPUCCINO-E-45-Z",
-                        "product_name": "卡布奇诺",
-                        "grade": "E",
-                        "stem_length": "45",
-                        "unit": "扎",
-                        "base_cost": "10.00",
-                        "current_stock": 1,
-                        "sale_enabled": True,
-                    }
-                ],
-            )
-
-            mapping = load_identity_mapping(
-                path,
-                expected_platform_name="蚂蚁花团供应商",
-            )
-
-        self.assertEqual(
-            mapping["CAPPUCCINO-E-45-Z"],
-            {
-                "expected_product_name": "卡布奇诺",
-                "expected_grade": "E",
-            },
-        )
+            path.write_bytes(b"synthetic workbook")
+            with self.assertRaisesRegex(ValidationError, "JSON"):
+                load_identity_mapping(
+                    path,
+                    expected_platform_name="蚂蚁花团供应商",
+                )
 
     def test_formal_items_use_task_fields_and_have_no_input_ordinal(self) -> None:
         manifest = self.build_manifest()

@@ -14,14 +14,12 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 from app.exceptions import ValidationError
 from app.listing_identity import (
     listing_identity_key,
 )
-from app.repositories.workbook_repository import load_products
 from app.shadowbot_contract_primitives import (
     contract_identity_key,
     normalize_contract_grade,
@@ -43,9 +41,6 @@ DEFAULT_MAX_SECONDS = 300
 HARD_MAX_SECONDS = 900
 MAX_REQUEST_BYTES = 256 * 1024
 MAX_RESULT_BYTES = 4 * 1024 * 1024
-DEFAULT_INVENTORY_PRODUCTS_PATH = (
-    Path(__file__).resolve().parents[2] / "data" / "samples" / "products.xlsx"
-)
 
 LISTING_STATUSES = frozenset({"ONLINE", "OFFLINE", "UNKNOWN"})
 ITEM_STATUSES = frozenset({"SUCCESS", "FAILED", "SKIPPED", "MANUAL_CHECK_REQUIRED"})
@@ -133,31 +128,6 @@ def build_read_batch_id(seed: str | None = None) -> str:
     prefix = normalize_text(seed).replace(" ", "-")[:32] if seed else "READ-BATCH"
     prefix = re.sub(r"[^A-Za-z0-9._:-]", "-", prefix) or "READ-BATCH"
     return f"{prefix.upper()}-{secrets.token_urlsafe(18)}"
-
-
-def build_inventory_read_targets(
-    platform_name: str,
-    *,
-    products_path: Path = DEFAULT_INVENTORY_PRODUCTS_PATH,
-) -> list[dict[str, Any]]:
-    """Build READ_ONLY identity hints from 商品资料与库存录入."""
-
-    normalized_platform = str(platform_name or "").strip()
-    if not normalized_platform:
-        raise ProductReadContractError("INPUT_INVALID: platform_name is required.")
-    try:
-        products = load_products(Path(products_path))
-    except (OSError, UnicodeError, ValidationError, ValueError) as exc:
-        raise ProductReadContractError(
-            f"INVENTORY_MAPPING_SOURCE_INVALID: {products_path}"
-        ) from exc
-    if not products:
-        raise ProductReadContractError("INVENTORY_MAPPING_SOURCE_EMPTY")
-
-    return build_inventory_read_targets_from_products(
-        normalized_platform,
-        products,
-    )
 
 
 def build_inventory_read_targets_from_products(

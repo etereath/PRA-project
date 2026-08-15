@@ -201,8 +201,8 @@ $env:PRA_ALLOWED_DATA_DIRS = "D:\PRA_Runtime\data;D:\PRA_Runtime\imports"
 当前 Composition Root 在启动时一次性解析以下可选变量；未提供时使用仓库既有默认路径：
 
 - `PRA_RUNTIME_DB`：Runtime DB；
-- `PRA_PRICE_RULES_WORKBOOK`：价格规则工作簿；
-- `PRA_LISTING_RULES_WORKBOOK`：上下架规则工作簿；
+- `PRA_PRICE_RULES_WORKBOOK`：价格规则工作簿；生产环境必须显式配置正式文件，启动时会解析内容并拒绝 `data/samples`；
+- `PRA_LISTING_RULES_WORKBOOK`：上下架规则工作簿；生产环境必须显式配置正式文件，启动时会解析内容并拒绝 `data/samples`；
 - `PRA_SHADOWBOT_IDENTITY_MAPPING`：ShadowBot 商品身份映射 JSON；
 - `SHADOWBOT_QUEUE_DIR`：Queue 根目录。
 
@@ -225,6 +225,12 @@ Schema v18 后，商品目录和平台映射只从 `PRA_RUNTIME_DB` 读取。Web
   `--admin-recovery`。
 - `expire-review-tasks` 的只读预览仍可直接使用；执行 `--apply` 时必须同时传入
   `--admin-recovery`。日常超时处理由 Automation Service 承担。
+- `run_shadowbot_commit_batch.py` 已删除 `production-run`；production 的 prepare/publish
+  仅在 `PRA_ENABLE_LEGACY_EXECUTION_CLI_RECOVERY=true` 且提供恢复原因和固定确认串时可用。
+- `run_shadowbot_executor.py start` 必须显式声明 `development-test` 或 `admin-recovery`；
+  后者还要求同一恢复开关、原因和固定确认串。日常真实执行必须从 Web 二次授权进入。
+- `evaluate_business_rules.py --apply` 只允许隔离实验，需
+  `PRA_ENABLE_LEGACY_RULE_CLI_APPLY=true` 和固定确认串；正式每日任务由 Automation 承担。
 
 这些开关不会提升权限，也不会绕过既有 Runtime、Review、Task 或执行发布门禁。
 

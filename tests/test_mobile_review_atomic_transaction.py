@@ -507,16 +507,25 @@ class MobileReviewAtomicTransactionTests(unittest.TestCase):
                     repository.update_task_status("TASK-ATOMIC", TaskStatus.RUNNING)
 
                 token_hash = ReviewTokenService(repository)._hash_raw_token(raw_token)
-                with self.assertRaises(MobileReviewTransactionError) as context:
-                    resolve_mobile_review(
-                        point_db_path,
-                        review_task_id,
-                        raw_token,
-                        action,
-                        resolution_payload=payload,
-                    )
-
-                self.assertEqual(context.exception.code, expected_code)
+                if scenario == "missing-row":
+                    with self.assertRaisesRegex(RuntimeError, "foreign_key_check"):
+                        resolve_mobile_review(
+                            point_db_path,
+                            review_task_id,
+                            raw_token,
+                            action,
+                            resolution_payload=payload,
+                        )
+                else:
+                    with self.assertRaises(MobileReviewTransactionError) as context:
+                        resolve_mobile_review(
+                            point_db_path,
+                            review_task_id,
+                            raw_token,
+                            action,
+                            resolution_payload=payload,
+                        )
+                    self.assertEqual(context.exception.code, expected_code)
                 check = SQLiteRuntimeRepository(point_db_path)
                 self.assertIsNone(check.get_review_token_by_hash(token_hash).used_at)
                 self.assertEqual(check.get_review_task(review_task_id).review_status, ReviewTaskStatus.PENDING)

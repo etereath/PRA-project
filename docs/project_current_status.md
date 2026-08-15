@@ -137,9 +137,9 @@ Worker/fence 源码已更新但尚未同步真实影刀宿主，本轮没有执�
 
 ### 2.1 业务输入
 
-- Excel 仍是商品、规则、预测、产能、冷库等业务输入来源。
-- Web 的 `Business Inputs` 页面已经从单纯 Excel 表格入口升级为业务输入入口。
-- 商品资料与库存录入已提供日常表单：选择已有品种、通过“新增品种”弹窗维护新品种代码、补充公共库存、编辑商品基础资料，并保存回 `products.xlsx`。
+- Runtime Schema v18 的 `product_catalog` 与 `platform_product_mappings` 是运行中商品资料和平台对应关系的唯一权威；`products.xlsx` 与 `platform_mappings.xlsx` 只允许用于干净候选库的一次性切换导入。
+- 新运营 Web 的“业务管理 → 商品资料”提供新增、修改、停售商品及维护平台对应关系的正式入口；新增商品会在同一事务建立数量为 0 的数据库库存，实际入库继续走人工库存调整。
+- 价格和上下架规则暂时仍使用受控工作簿；生产环境必须显式配置正式路径并通过内容校验，不能回退到 `data/samples`。
 - 价格规则管理已提供日常表单：新增、编辑、查看价格规则，并保存回 `price_rules.xlsx`。
 - 价格规则适用范围已升级为 `variety_filter / grade_filter / platform_filter` 三维筛选；旧 `scope_type / scope_value` 已废弃。定价规则由旧的多条叠加改为单条胜出，按 `priority` 和具体度选择，冲突规则不会被静默随机选择。
 - 上下架规则管理已提供日常表单：新增、编辑、查看上下架规则，并保存回 `listing_rules.xlsx`。
@@ -148,10 +148,9 @@ Worker/fence 源码已更新但尚未同步真实影刀宿主，本轮没有执�
 - `capacity_plans.xlsx` 中的 `confirmed_packing_capacity_qty` 是 CapacityRuleEvaluator 的最终判断口径；如果为空，系统按“基础产能 + 临时工人数 × 单人临时工产能”计算。
 - 冷库状态已提供日常表单：按业务日期维护冷库总容量、当前占用、预计入库、预计出库、预计占用、剩余容量、预警阈值和启用状态，并保存回 `cold_storage_status.xlsx`。
 - `cold_storage_status.xlsx` 中的 `projected_occupied_qty` 和 `remaining_capacity_qty` 是 ColdStorageEvaluator 的判断口径；页面会按“当前占用 + 预计入库 - 预计出库”和“总容量 - 预计占用”默认计算，也允许运营人员人工确认。
-- 旧 `/tables` 仍保留为高级兼容入口，适合批量维护和排障。
-- `platform_mappings.xlsx` 现可同时保存 WEB 平台登记记录和严格的商品身份映射；
-  商品映射可编译为带源工作簿 SHA-256 的不可变 JSON。
-- 当前不迁移 Excel 主数据到 SQLite。
+- 预测、包装产能和冷库工作簿及旧规则 evaluator 只保留为隔离开发/回归实验资产，不属于当前正式鲜花销售控制面。
+- 旧 `/tables`、`Business Inputs` 和工作簿商品编辑入口已经从唯一运营 Web 删除，不作为兼容目标。
+- ShadowBot 页面身份使用版本化 JSON；正式执行链拒绝 XLSX 身份映射。
 
 ### 2.2 SQLite 运行态事实来源
 
@@ -188,7 +187,7 @@ SQLite 当前保存以下运行态表：
 - `order_observation_batches`
 - `order_observation_items`
 
-SQLite 只承接运行态任务系统，不替代 Excel 主数据。
+SQLite 同时承接运行态业务事实、商品目录、平台对应关系和真实库存权威；价格与上下架规则仍是当前仅有的正式工作簿输入。
 
 13.5-2 的商品观察导入器只向 v14 不可变观察表追加事实。`ONLINE_PULSE`
 缺席不推断下架，也不改写 `listing_status`；任务 13 的完整双页快照可以适配为
@@ -309,15 +308,12 @@ v14 Runtime DB 中通过，平台写操作为 0。批次 `PARTIAL` 仅源于验�
 
 ### 2.7 Web 运行态运营后台
 
-当前 Web 后台是尚未正式投入使用的运行态 MVP，包含：
+当前唯一运营 Web 使用四个一级入口：
 
-- `Dashboard`：运营总览。
-- `Tasks`：运行态任务追踪。
-- `Reviews`：Web 复核主入口。
-- `Notifications`：通知排障与追踪。
-- `Execution Logs`：执行日志入口。
-- `Business Inputs`：Excel 业务输入入口。
-- `System`：配置检查、schema 检查、运行态计数、飞书测试通知。
+- `今日`：销售、真实库存、待办、时间轴和业务健康摘要。
+- `数据库`：只读业务事实和项目运行事实。
+- `业务管理`：任务、独立执行授权、人工复核、自动化、库存调整和商品资料。
+- `系统`：运行状态、通知、备份和高级诊断；管理员能力与普通查看分离。
 
 2026-08-07 已决定不再兼容或渐进维护该页面架构。重写前 `main` 已标记为
 `checkpoint/pre-task13-5-7-web-rewrite-20260807`；13.5-7 将建设唯一的新运营 Web，
@@ -366,14 +362,14 @@ POST 退出、CSRF、集中 capability、安全 Header、统一错误边界和�
 不会被匿名登录页请求替换或因 preauth 容量回收而淘汰；无可安全回收项时 fail closed。
 公共路由固定为 `/ → /today`、`/today`、`/login`、POST `/logout`，不在新 Web 复制旧
 `/runtime/login|logout` 别名；登录失败和限流继续进入既有有界安全审计。Runtime DB、
-三类工作簿和 Queue 根目录只在启动时固定；请求中的路径覆盖会被拒绝。`/health`、受保护的
+两份规则工作簿、版本化执行身份 JSON 和 Queue 根目录只在启动时固定；请求中的路径覆盖会被拒绝。`/health`、受保护的
 四入口骨架和错误提示只使用只读连接，绝不调用 `init_schema()` 或迁移；Runtime 健康异常只
 提示另走显式维护，不推断或修复真实数据。
 
 7C 已完成并合并四入口只读事实：今日页接入交易日、六级质量、销量/金额/均价、当前
 产品库存资料、待办和时间轴；数据库接入业务事实、项目事实、确定性销售分析、字段说明和
 质量新鲜度；业务管理接入当前 Task、Review 和 Automation Run；系统只报告 Runtime DB、
-工作簿、Queue 和 Worker 当前状态。默认 25 条后端分页已覆盖 Task、Review、Run、Incident、
+规则资料、Queue 和 Worker 当前状态。默认 25 条后端分页已覆盖 Task、Review、Run、Incident、
 Execution、Outbox、订单观察和日结。商品、销售、结算、Run、Execution 详情归数据库，Task
 和 Review 详情归业务管理，不保留交叉详情。Mobile Review 已能只读呈现有效、无效、过期和
 撤销、错绑及已处理状态，Token 不被消费，`last_used_at` 不变化；有效/已处理 GET 返回
@@ -389,7 +385,7 @@ Web 自创的固定 30 分钟 TTL。普通结算目录只显示当前权威版�
 页面继续不展示购买次数、买家端价格、Agent 建议、人工花材质量或完整度百分比。7D 前库存
 明确标为当前产品资料来源，不冒充已经完成的 DB 真实库存账本；库存流水和映射查询未接通时
 显示不可用，不填充样板数据。真实 Runtime DB READ_ONLY 已验证：既有 1 条外键违规只使
-`/health` 返回 503，其他主要页面可读；主库/侧车、三份业务工作簿、心跳与生命周期文件前后
+`/health` 返回 503，其他主要页面可读；主库/侧车、当时参与验收的业务输入、心跳与生命周期文件前后
 大小、主文件时间和 SHA-256 不变，且没有 Queue、Worker、Importer 或平台副作用。详细见
 [13.5-7C 实施报告](reports/task13_5_7c_read_only_facts.md)。
 
@@ -490,16 +486,26 @@ pytest 为 `1229 passed, 3 skipped, 82 subtests passed`，耗时 352.52 秒；�
 因此两项不能在本分支冒充已验收。详见
 [13.5-7F 实施与验收报告](reports/task13_5_7f_cutover_acceptance.md)。
 
-### 2.8 自动规则评估框架 MVP
+2026-08-15 的 7F 后续整改继续关闭工作簿旁路：所有正式服务先以只读方式要求精确健康
+Runtime Schema v18，不再自动建库或迁移；业务管理新增版本化商品资料与平台对应关系入口，
+新增商品和零库存初始化同事务提交。旧 CLI production 一步执行已删除，管理员恢复和开发
+测试必须显式声明；正式 ShadowBot 页面身份只接受版本化 JSON。release backup 不再要求
+退役的商品/平台映射工作簿，只备份 Runtime DB、规则资料和发布制品。规则资料启动时解析
+校验，生产拒绝 sample 路径；每日任务生成把商品、真实库存、平台状态与规则文件哈希绑定为
+同一输入清单，并在持久化前复核。旧商品工作簿表单和多领域 evaluator 仅作为隔离兼容/回归
+资产，不属于正式控制面。
 
-已完成轻量自动规则评估框架第一版：
+### 2.8 旧自动规则评估实验室（非正式控制面）
+
+以下能力只保留给隔离开发和回归测试，不承担日常鲜花销售任务生成。正式日常任务由
+`DAILY_TASK_GENERATION` Automation Handler 生成：
 
 - 新增 `script_runs / script_run_items`，记录 evaluator 运行和 proposal 明细。
 - 新增 evaluator / proposal / runner 结构。
 - `dry-run` 只写脚本运行记录，不写业务 `tasks / review_tasks / notification_logs`。
 - `apply` 通过现有 `RuntimeTaskService / ReviewTaskService / NotificationSender` 链路落成业务任务、复核和通知。
 - apply 前基于 `proposal.dedupe_key` 做幂等检查，重复运行不会重复生成 `capacity_warning / labor_required` 复核。
-- 新增 CLI：`python scripts/evaluate_business_rules.py`。
+- `scripts/evaluate_business_rules.py` 默认只用于查看和 dry-run；`apply` 需要隔离实验开关与固定确认串，不得替代 Automation。
 - 任务中心新增“脚本状态”分页：`/tasks?task_tab=automation`。
 - `CapacityRuleEvaluator` 读取 `harvest_forecasts.xlsx` 和 `capacity_plans.xlsx`，按 `trade_date` 使用启用的包装产能计划，并以 `confirmed_packing_capacity_qty` 判断是否需要产能预警。语义是“预测产量超过确认包装能力”的预警，不是订单需求超过包装能力的预警。
 - 已新增保守版 `ListingRuleEvaluator`，语义是“上下架规则建议下架时生成人工复核 proposal”，不会直接生成可执行平台动作。
@@ -539,7 +545,7 @@ pytest 为 `1229 passed, 3 skipped, 82 subtests passed`，耗时 352.52 秒；�
 当前已验证能力：
 
 - 影刀应用 `test2` 控制桌面端微信小程序 `WeChatAppEx`，`vertical_slice_read_price.py` 支持 `READ_ONLY / COMMIT / RECONCILE`；FILL_PREVIEW 作为历史开发诊断能力保留，不是正式 COMMIT 前置。
-- 任务中心正式输入使用内部 SKU、`expected_old_price` 和 `target_price`；SKU 通过 `products.xlsx` 映射为页面商品名称和等级。
+- 任务中心正式输入使用内部 SKU、`expected_old_price` 和 `target_price`；Runtime v18 保存业务商品与平台对应关系，ShadowBot 使用独立版本化 JSON 保存页面定位所需的最小身份。
 - v4 合同一次投递完整多商品 `items` 队列，不包含页面位置、READ_ONLY、FILL_PREVIEW、`listing_status_id` 或快照版本依赖。
 - Worker 写操作前主动刷新并结构化读取当前“上架中”页面，按“商品名称 + 等级”匹配全部目标，确认均唯一存在并校验全部旧价。
 - 任一旧价不一致时，全批次返回 `OLD_PRICE_CHANGED/NOT_STARTED`，不提交任何商品。
@@ -612,8 +618,8 @@ pytest 为 `1229 passed, 3 skipped, 82 subtests passed`，耗时 352.52 秒；�
 
 当前主控流程如下：
 
-1. 运营维护 Excel 业务输入。
-2. 系统根据 Excel 输入生成 runtime `tasks`。
+1. 运营在 Web 维护 Runtime 商品资料、平台对应关系和真实库存；价格与上下架规则暂由受控工作簿维护。
+2. Automation 按交易日绑定商品、库存、平台事实和规则输入快照后生成 runtime `tasks`。
 3. 高风险、提醒或需要人工确认的内容进入 `review_tasks`。
 4. pending `review_task` 创建后触发 `notification_logs`。
 5. 飞书通知发送到群，消息中携带 Mobile Review 链接。
@@ -621,7 +627,7 @@ pytest 为 `1229 passed, 3 skipped, 82 subtests passed`，耗时 352.52 秒；�
 7. 复核处理结果写回 `review_tasks`。
 8. 如绑定源任务且满足条件，通过 `RuntimeTaskService` 推动 `tasks` 状态。
 9. 源任务状态变化写入 `task_status_history`。
-10. 操作人员显式传入一个或多个 `--task-id`；ShadowBot 批次管线只读取这些明确选择且发布前仍有效的 `pending update_price` 任务，并生成一个 v4 COMMIT 请求。
+10. 操作人员在 Web 选择一个或多个待执行任务并完成独立二次授权；发布服务只读取这些明确选择且发布前仍有效的任务，并生成 v4/v5 COMMIT 请求。
 11. Worker 完成全页预扫描、旧价门禁、页面顺序编排、严格串行提交和独立回读。
 12. Result Importer 校验合同后更新任务、批次账本、逐商品账本、`listing_status` 和 `execution_logs`。
 
@@ -635,8 +641,8 @@ Mock 平台测试流程在当前阶段作为本地验证链路：
 
 真实平台价格更新流程：
 
-1. 普通改价由操作人员从任务中心明确选择同一平台的一个或多个 `update_price task_id`；任何阶段都禁止自动扫描并发布全部 pending。
-2. PRA 以 `products.xlsx` 将 SKU 唯一映射为页面商品名称和等级。
+1. 普通改价由操作人员在 Web 从任务中心明确选择同一平台的一个或多个 `update_price` 任务；任何阶段都禁止自动扫描并发布全部 pending。
+2. PRA 从 Runtime v18 商品资料/平台对应关系取得业务身份，并用版本化 ShadowBot JSON 取得页面身份；正式链路拒绝 XLSX 映射。
 3. 批次管线创建一个 v4 COMMIT 合同并原子发布一次。
 4. ShadowBot 读取当前页面、匹配全部目标并校验全部旧价。
 5. 全部门禁通过后按页面实时位置严格串行提交，每项独立回读。
@@ -645,7 +651,7 @@ Mock 平台测试流程在当前阶段作为本地验证链路：
 ## 4. 数据流
 
 ```text
-Excel 业务输入
+Runtime 商品/库存/平台事实 + 受控规则输入
   -> runtime tasks
   -> review_tasks
   -> notification_logs
@@ -668,7 +674,7 @@ runtime tasks
 真实平台价格更新数据流：
 
 ```text
-products.xlsx + runtime tasks
+Runtime v18 商品资料 + 版本化页面身份 JSON + runtime tasks
   -> ShadowBot v4 commit manifest/request
   -> file queue -> test2 Worker -> 微信小程序
   -> item results + full page snapshot
@@ -678,9 +684,8 @@ products.xlsx + runtime tasks
 
 关键边界：
 
-- Excel 是业务输入来源。
-- SQLite 是运行态事实来源。
-- Web 和 Mobile 只是复核入口，不直接写 SQLite 表。
+- SQLite 是商品、平台对应关系、真实库存和运行态事实来源；价格与上下架规则工作簿是当前过渡输入。
+- Web 和 Mobile 不直接写表，所有写入都调用既有 Application Service / Repository 事务。
 - 所有复核处理必须走 `ReviewTaskService`。
 - 所有源任务状态变化必须走 `RuntimeTaskService`。
 - 通知发送必须走 `NotificationSender`。
@@ -733,18 +738,14 @@ Web 复核主入口：
 - 当前以 mock/RPA 执行日志查看为主。
 - 尚未接入生产级真实 RPA 调度闭环。
 
-### Business Inputs
+### 业务管理
 
-业务输入入口：
-
-- 承接商品资料与库存录入，保存回 `products.xlsx`。
-- 支持补充公共库存，而不是将初始库存拆分到具体平台。
-- 承接价格规则管理，保存回 `price_rules.xlsx`。
-- 价格规则按品种、等级、平台三维筛选；平台只用于规则命中，不参与库存匹配或 SKU。
-- 承接上下架规则管理，保存回 `listing_rules.xlsx`。
-- 上下架规则按品种、等级、平台三维筛选，并通过规则策略和库存阈值决定是否建议上架/下架。
-- 保留 Excel 表格管理作为高级兼容入口。
-- 承接任务生成入口。
+- 创建任务：按品种、等级、平台多选，预览后创建；创建与真实平台执行授权分成两个阶段。
+- 人工复核：复用统一 Review Policy 和原子处理服务。
+- 自动化方案：只开放冻结方案允许调整的范围，并提供库存预警。
+- 人工库存调整：通过权威库存服务记录有符号变化、来源和原因。
+- 商品资料：通过版本化服务维护 Runtime 商品目录与平台对应关系；新增 SKU 同事务建立零库存。
+- 不提供旧 Excel 表格编辑兼容入口。
 
 ### System
 
@@ -766,7 +767,7 @@ Web 复核主入口：
   Web、CLI、数据库、Queue 或平台执行器的通道。
 - 不引入 React / Vue。
 - 不做前后端分离。
-- 不迁移 Excel 主数据。
+- 不把价格和上下架规则工作簿迁入数据库；商品、平台对应关系和真实库存已经数据库化。
 - 不新增完整权限系统。
 - 不做飞书交互卡片审批。
 - 不做飞书长连接或回调。

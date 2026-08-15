@@ -24,6 +24,11 @@
 中的重复字段。预览和授权摘要绑定数据库逻辑快照；创建时在同一 SQLite 事务中重新展开，
 主数据或库存发生变化时整批拒绝。
 
+日常维护由“业务管理 → 商品资料”调用 `MasterDataManagementService`：商品和映射使用
+`expected_version` 防止覆盖并记录本次来源摘要；新增商品会在同一 SQLite 事务写入
+`product_catalog`、零余额和不可变 `SKU_INITIALIZATION` 流水。数据库页面仍保持只读，
+人工入库继续使用库存调整服务，不能通过商品编辑表单直接改余额。
+
 ## 3. 一次性导入与切换
 
 `clean_runtime_cutover.py prepare` 继续显式接收两份工作簿，原因是旧测试库没有完整的商品
@@ -41,6 +46,8 @@
 ## 4. 控制面边界
 
 - Web Composition Root 不接收商品或平台映射工作簿路径。
+- Web 业务管理可通过版本化 Application Service 新增或修改商品、停售商品，以及新增、
+  修改或停用平台商品对应关系；不得直接执行表更新。
 - `DAILY_TASK_GENERATION` 从数据库商品快照生成候选任务；商品快照在落库前发生变化时整批
   拒绝。
 - `ORDER_SCAN` 从数据库编译平台映射；Queue、Executor 和 Importer 从数据库商品目录构造、

@@ -56,6 +56,10 @@ from app.services.manual_task_orchestration import (
     ManualTaskError,
     ManualTaskRequest,
 )
+from app.services.master_data_management import (
+    MasterDataManagementError,
+    MasterDataManagementService,
+)
 from app.services.review_resolution import (
     ReviewResolutionApplicationService,
     ReviewResolutionError,
@@ -208,6 +212,9 @@ class OperationsWebApplication:
         self.manual_tasks = ManualTaskApplicationService(
             container.runtime_repository,
         )
+        self.master_data_management = MasterDataManagementService(
+            container.runtime_repository,
+        )
         self.execution_authorization = ExecutionAuthorizationApplicationService(
             container.runtime_repository,
             authorization=container.authorization,
@@ -315,6 +322,16 @@ class OperationsWebApplication:
             if method != "POST":
                 return self._method_not_allowed("POST")
             return self._inventory_adjustment(environ)
+
+        if path == "/management/master-data/products":
+            if method != "POST":
+                return self._method_not_allowed("POST")
+            return self._master_product_save(environ)
+
+        if path == "/management/master-data/mappings":
+            if method != "POST":
+                return self._method_not_allowed("POST")
+            return self._master_mapping_save(environ)
 
         if path == "/management/tasks/preview":
             if method != "POST":
@@ -601,6 +618,10 @@ class OperationsWebApplication:
                 self._first(query, "automation_receipt"),
                 subject,
             )
+            master_data_receipt_value = self.control_store.get(
+                self._first(query, "master_data_receipt"),
+                subject,
+            )
             try:
                 task_scope_options = self.manual_tasks.scope_options()
             except Exception:
@@ -661,6 +682,16 @@ class OperationsWebApplication:
                 automation_error=self._control_message(
                     query,
                     "automation_error",
+                    subject,
+                ),
+                master_data_receipt=(
+                    master_data_receipt_value
+                    if isinstance(master_data_receipt_value, str)
+                    else ""
+                ),
+                master_data_error=self._control_message(
+                    query,
+                    "master_data_error",
                     subject,
                 ),
             )
@@ -870,6 +901,90 @@ class OperationsWebApplication:
             "",
             headers=[("Location", location), ("Cache-Control", "no-store")],
         )
+
+    def _master_product_save(self, environ) -> Response:
+        session, form, denied = self._management_write_context(
+            environ,
+            route="/management/master-data/products",
+            capability=Capability.MANAGE_BUSINESS,
+        )
+        if denied is not None:
+            return denied
+        assert session is not None and session.principal is not None
+        try:
+            expected_version = int(self._first(form, "expected_version") or "0")
+            common = {
+                "internal_sku": self._first(form, "internal_sku"),
+                "product_name": self._first(form, "product_name"),
+                "grade": self._first(form, "grade"),
+                "stem_length": self._first(form, "stem_length"),
+                "unit": self._first(form, "unit"),
+                "base_cost": Decimal(self._first(form, "base_cost")),
+                "sale_enabled": self._first(form, "sale_enabled") == "true",
+                "remark": self._first(form, "remark"),
+                "actor": session.principal.subject,
+                "idempotency_key": self._first(form, "idempotency_key"),
+            }
+            receipt = (
+                self.master_data_management.create_product(**common)
+                if expected_version == 0
+                else self.master_data_management.update_product(
+                    **common,
+                    expected_version=expected_version,
+                )
+            )
+            message = (
+                f"商品 {receipt.entity_id} 已保存"
+                if receipt.status == "APPLIED"
+                else f"商品 {receipt.entity_id} 已保存，本次未重复写入"
+            )
+        except (MasterDataManagementError, InvalidOperation, ValueError) as exc:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "master_data_error",
+                str(exc) or "商品资料未保存。",
+            )
+        token = self.control_store.put(session.principal.subject, message)
+        return self._management_redirect("master_data_receipt", token)
+
+    def _master_mapping_save(self, environ) -> Response:
+        session, form, denied = self._management_write_context(
+            environ,
+            route="/management/master-data/mappings",
+            capability=Capability.MANAGE_BUSINESS,
+        )
+        if denied is not None:
+            return denied
+        assert session is not None and session.principal is not None
+        try:
+            receipt = self.master_data_management.save_product_mapping(
+                mapping_id=self._first(form, "mapping_id"),
+                platform_name=self._first(form, "platform_name"),
+                platform_product_name=self._first(form, "platform_product_name"),
+                grade=self._first(form, "grade"),
+                internal_sku=self._first(form, "internal_sku") or None,
+                search_keyword=self._first(form, "search_keyword"),
+                mapping_status=self._first(form, "mapping_status"),
+                remark=self._first(form, "remark"),
+                expected_version=int(
+                    self._first(form, "expected_version") or "0"
+                ),
+                actor=session.principal.subject,
+                idempotency_key=self._first(form, "idempotency_key"),
+            )
+            message = (
+                "商品与平台的对应关系已保存"
+                if receipt.status == "APPLIED"
+                else "商品与平台的对应关系已保存，本次未重复写入"
+            )
+        except (MasterDataManagementError, ValueError) as exc:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "master_data_error",
+                str(exc) or "商品对应关系未保存。",
+            )
+        token = self.control_store.put(session.principal.subject, message)
+        return self._management_redirect("master_data_receipt", token)
 
     def _manual_task_preview(self, environ) -> Response:
         session, form, denied = self._management_write_context(

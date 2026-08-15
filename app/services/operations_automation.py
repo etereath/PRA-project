@@ -14,6 +14,7 @@ from app.enums import AutomationRunStatus, TaskActionType
 from app.repositories.automation_repository import AutomationRepository
 from app.repositories.master_data_repository import RuntimeMasterDataRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.repositories.workbook_repository import load_listing_rules, load_price_rules
 from app.services.automation import (
     DAILY_TASK_GENERATION,
     REVIEW_TIMEOUT_MAINTENANCE,
@@ -30,6 +31,33 @@ from app.services.workflow import (
 
 
 DAILY_TASK_SOURCES = frozenset({"PRODUCTS", "PRICE_RULES", "LISTING_RULES"})
+
+
+def validate_rule_workbooks(
+    *,
+    price_rules_path: Path,
+    listing_rules_path: Path,
+) -> dict[str, str]:
+    """Parse both operator rule sources and return their bound digests."""
+
+    paths = {
+        "price_rules": Path(price_rules_path),
+        "listing_rules": Path(listing_rules_path),
+    }
+    try:
+        price_rules = load_price_rules(paths["price_rules"])
+        listing_rules = load_listing_rules(paths["listing_rules"])
+        payloads = {name: path.read_bytes() for name, path in paths.items()}
+    except Exception as exc:
+        raise ValueError("规则资料无法读取或内容不符合要求。") from exc
+    if not price_rules:
+        raise ValueError("价格规则资料中没有规则。")
+    if not listing_rules:
+        raise ValueError("上下架规则资料中没有规则。")
+    return {
+        name: "sha256:" + hashlib.sha256(content).hexdigest()
+        for name, content in payloads.items()
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -126,6 +154,10 @@ class DailyTaskGenerationAutomationHandler:
             product_catalog_snapshot_sha256 = master_data.product_snapshot_sha256(
                 connection=connection
             )
+            runtime_fact_snapshots = _runtime_generation_fact_snapshots(
+                connection,
+                platform_name=run.platform_name,
+            )
         if not runtime_products:
             raise RuntimeError("Daily task generation product catalog is empty")
         input_payload = {
@@ -137,6 +169,7 @@ class DailyTaskGenerationAutomationHandler:
             "time_policy_version": run.time_policy_version,
             "source_allowlist": sorted(sources),
             "product_catalog_snapshot_sha256": product_catalog_snapshot_sha256,
+            **runtime_fact_snapshots,
             "files": {
                 path.name: "sha256:" + hashlib.sha256(content).hexdigest()
                 for path, content in before.items()
@@ -160,6 +193,16 @@ class DailyTaskGenerationAutomationHandler:
             raise RuntimeError("Daily task generation input changed during evaluation")
         if master_data.product_snapshot_sha256() != product_catalog_snapshot_sha256:
             raise RuntimeError("Daily task generation product catalog changed during evaluation")
+        with closing(self.runtime_repository.connect_read()) as connection:
+            connection.execute("BEGIN")
+            after_fact_snapshots = _runtime_generation_fact_snapshots(
+                connection,
+                platform_name=run.platform_name,
+            )
+        if after_fact_snapshots != runtime_fact_snapshots:
+            raise RuntimeError(
+                "Daily task generation inventory or platform facts changed during evaluation"
+            )
         allowed_actions = set()
         if "PRICE_RULES" in sources:
             allowed_actions.add(TaskActionType.UPDATE_PRICE)
@@ -237,3 +280,41 @@ def _manifest(payload: object) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _runtime_generation_fact_snapshots(
+    connection,
+    *,
+    platform_name: str,
+) -> dict[str, str]:
+    inventory_rows = connection.execute(
+        """
+        SELECT internal_sku, current_qty, version,
+               last_transaction_id, updated_at
+        FROM inventory_balances
+        ORDER BY internal_sku
+        """
+    ).fetchall()
+    listing_rows = connection.execute(
+        """
+        SELECT listing_status_id, platform_name, internal_sku,
+               variety, grade, current_price, platform_stock_qty,
+               sold_qty, online_status, price_source,
+               price_observed_at, price_source_attempt_id,
+               inventory_source, inventory_observed_at,
+               inventory_source_attempt_id, last_listing_change_at,
+               updated_at
+        FROM listing_status
+        WHERE platform_name = ?
+        ORDER BY listing_status_id
+        """,
+        (platform_name,),
+    ).fetchall()
+    return {
+        "inventory_balances_snapshot_sha256": _manifest(
+            tuple(dict(row) for row in inventory_rows)
+        ),
+        "platform_listing_snapshot_sha256": _manifest(
+            tuple(dict(row) for row in listing_rows)
+        ),
+    }

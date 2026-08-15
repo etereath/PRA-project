@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -42,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--listing-rules", default=str(DEFAULT_LISTING_RULES), help="上下架规则 Excel 路径")
     parser.add_argument("--platform", default="default_platform", help="评估使用的平台名称")
     parser.add_argument("--created-by", default="cli:evaluate_business_rules", help="运行记录操作者")
+    parser.add_argument("--legacy-apply-confirmation", default="")
     return parser
 
 
@@ -49,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     repository = SQLiteRuntimeRepository(Path(args.runtime_db))
-    repository.init_schema()
+    repository.require_current_schema(operation_name="旧规则实验 CLI")
     runner = BusinessRuleRunner(repository)
 
     if args.list:
@@ -64,6 +66,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.apply and args.dry_run:
         print("错误：--dry-run 与 --apply 不能同时使用。", file=sys.stderr)
         return 2
+    if args.apply:
+        enabled = os.environ.get(
+            "PRA_ENABLE_LEGACY_RULE_CLI_APPLY",
+            "",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if not enabled or args.legacy_apply_confirmation != "LEGACY_RULE_LAB_APPLY":
+            print(
+                "错误：正式日常任务必须由 Automation 生成；旧规则 CLI apply 仅用于隔离实验。",
+                file=sys.stderr,
+            )
+            return 2
 
     try:
         trade_date = _parse_trade_date(args.trade_date)

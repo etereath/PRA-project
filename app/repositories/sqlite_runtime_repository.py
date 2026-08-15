@@ -4015,6 +4015,21 @@ class SQLiteRuntimeRepository:
         with closing(self.connection_factory.connect_read()) as connection:
             return inspect_runtime_schema(connection)
 
+    def require_current_schema(self, *, operation_name: str = "Runtime operation") -> RuntimeSchemaHealth:
+        """Fail closed unless the existing database is an exact healthy latest schema.
+
+        Runtime services must call this read-only gate.  Schema creation and migration
+        belong only to explicit maintenance commands and test/bootstrap fixtures.
+        """
+
+        health = self.check_schema_health()
+        if not health.ok or health.actual_version != LATEST_RUNTIME_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"{operation_name} requires healthy Runtime Schema "
+                f"v{LATEST_RUNTIME_SCHEMA_VERSION}: {health.summary}"
+            )
+        return health
+
     def check_operational_health(self) -> SQLiteOperationalHealth:
         """Return non-mutating WAL, PRAGMA, and local-storage health facts."""
 

@@ -1052,6 +1052,7 @@ class ShadowBotExecutorTests(unittest.TestCase):
                 request_dir=request_dir,
                 runner_command="",
                 runner_type="filedrop",
+                cli_scope="development-test",
             )
         )
 
@@ -1081,6 +1082,7 @@ class ShadowBotExecutorTests(unittest.TestCase):
                 request_dir=request_dir,
                 runner_command="",
                 runner_type="filedrop",
+                cli_scope="development-test",
             )
         )
         result_path = request_dir / "results" / "ATTEMPT-CLI-2.result.json"
@@ -1150,6 +1152,7 @@ class ShadowBotExecutorTests(unittest.TestCase):
                 request_dir=request_dir,
                 runner_command="",
                 runner_type="filedrop",
+                cli_scope="development-test",
             )
         )
         shadowbot_result = {

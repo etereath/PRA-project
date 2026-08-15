@@ -439,6 +439,7 @@ class WorkflowTests(unittest.TestCase):
         harvest_path = Path(self.temp_dir.name) / "harvest_forecasts.xlsx"
         capacity_path = Path(self.temp_dir.name) / "capacity_plans.xlsx"
         runtime_db = Path(self.temp_dir.name) / "runtime.sqlite3"
+        SQLiteRuntimeRepository(runtime_db).init_schema()
         _write_workbook(
             harvest_path,
             HARVEST_FORECAST_HEADERS,

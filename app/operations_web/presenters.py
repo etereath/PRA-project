@@ -164,6 +164,8 @@ def render_management(
     review_error: str = "",
     automation_receipt: str = "",
     automation_error: str = "",
+    master_data_receipt: str = "",
+    master_data_error: str = "",
 ) -> str:
     inventory_options = "".join(
         f'<option value="{html(sku)}" data-qty="{qty}" data-version="{version}">'
@@ -230,17 +232,140 @@ def render_management(
         receipt=automation_receipt,
         error=automation_error,
     )
+    master_data_controls = _render_master_data_controls(
+        model,
+        csrf_token=csrf_token,
+        receipt=master_data_receipt,
+        error=master_data_error,
+    )
     return f"""
     <section class="hero compact-hero">
       <div><p class="eyebrow">业务管理</p><h1>任务、复核与自动化</h1><p>先创建任务，确认无误后再授权平台执行。</p></div>
     </section>
-    <nav class="section-tabs" aria-label="业务管理分页"><a class="active" href="#tasks">创建任务</a><a href="#reviews">人工复核</a><a href="#automation">自动化方案</a></nav>
+    <nav class="section-tabs" aria-label="业务管理分页"><a class="active" href="#tasks">创建任务</a><a href="#reviews">人工复核</a><a href="#automation">自动化方案</a><a href="#master-data">商品资料</a></nav>
     {task_controls}
     <section class="panel"><header class="panel-header"><div><h2>人工库存调整</h2><p>输入本次增加或减少的数量，并记录来源和原因</p></div></header><div class="form-shell">{render_state(model.inventory_state)}{inventory_error}{receipt}{inventory_form}</div></section>
     <section class="panel" id="tasks"><header class="panel-header"><div><h2>当前任务</h2><p>选择待执行任务并再次确认后，才会发送到平台</p></div></header>{execution_controls}{render_table(model.pending_tasks)}</section>
     <section class="panel" id="reviews"><header class="panel-header"><div><h2>人工复核</h2><p>查看原因并选择处理结果</p></div></header>{review_controls}{render_table(model.pending_reviews)}</section>
     <section class="panel" id="automation"><header class="panel-header"><div><h2>自动化方案</h2><p>设置定时扫描、日结、任务生成和库存预警</p></div></header>{automation_controls}{render_table(model.automation_runs)}</section>
+    {master_data_controls}
     """
+
+
+def _render_master_data_controls(
+    model: ManagementReadModel,
+    *,
+    csrf_token: str,
+    receipt: str,
+    error: str,
+) -> str:
+    feedback = ""
+    if receipt:
+        feedback += (
+            '<div class="state-banner state-ready"><strong>商品资料已更新</strong>'
+            f'<p>{html(receipt)}</p></div>'
+        )
+    if error:
+        feedback += (
+            '<div class="state-banner state-failed"><strong>商品资料未更新</strong>'
+            f'<p>{html(error)}</p></div>'
+        )
+    key = html(model.master_data_idempotency_key)
+    product_options = "".join(
+        f'<option value="{html(item.internal_sku)}">{html(item.product_name)} · {html(item.grade)} · {html(item.internal_sku)}</option>'
+        for item in model.product_master_options
+    )
+    product_rows = "".join(
+        f"""
+        <details class="master-data-row"><summary><strong>{html(item.product_name)} · {html(item.grade)}</strong><span>{html(item.internal_sku)} · 库存 {item.current_stock} {html(item.unit)} · {'销售中' if item.sale_enabled else '暂停销售'}</span></summary>
+          <form method="post" action="/management/master-data/products" class="form-grid">
+            <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
+            <input type="hidden" name="idempotency_key" value="{key}:product:{html(item.internal_sku)}:{item.version}">
+            <input type="hidden" name="expected_version" value="{item.version}">
+            <input type="hidden" name="internal_sku" value="{html(item.internal_sku)}">
+            <label>商品名称<input name="product_name" value="{html(item.product_name)}" required></label>
+            <label>等级<input name="grade" value="{html(item.grade)}" required></label>
+            <label>规格<input name="stem_length" value="{html(item.stem_length)}" required></label>
+            <label>单位<input name="unit" value="{html(item.unit)}" required></label>
+            <label>基础成本<input name="base_cost" inputmode="decimal" value="{html(item.base_cost)}" required></label>
+            <label class="toggle-label"><input name="sale_enabled" type="checkbox" value="true"{' checked' if item.sale_enabled else ''}>允许销售</label>
+            <label>备注<input name="remark" value="{html(item.remark)}"></label>
+            <button type="submit">保存商品资料</button>
+          </form>
+        </details>
+        """
+        for item in model.product_master_options
+    ) or '<p class="empty-copy">尚未录入商品。</p>'
+    mapping_status_labels = {
+        "VERIFIED": "已确认",
+        "UNMAPPED": "待对应",
+        "AMBIGUOUS": "需确认",
+        "DISABLED": "停用",
+    }
+    mapping_rows = "".join(
+        f"""
+        <details class="master-data-row"><summary><strong>{html(item.platform_product_name)} · {html(item.grade)}</strong><span>{html(item.platform_name)} · {html(mapping_status_labels.get(item.mapping_status, item.mapping_status))}</span></summary>
+          <form method="post" action="/management/master-data/mappings" class="form-grid">
+            <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
+            <input type="hidden" name="idempotency_key" value="{key}:mapping:{html(item.mapping_id)}:{item.version}">
+            <input type="hidden" name="mapping_id" value="{html(item.mapping_id)}">
+            <input type="hidden" name="expected_version" value="{item.version}">
+            <label>平台<input name="platform_name" value="{html(item.platform_name)}" required></label>
+            <label>平台商品名称<input name="platform_product_name" value="{html(item.platform_product_name)}" required></label>
+            <label>等级<input name="grade" value="{html(item.grade)}" required></label>
+            <label>内部商品<select name="internal_sku"><option value="">暂不对应</option>{_selected_product_options(model.product_master_options, item.internal_sku)}</select></label>
+            <label>查找关键词<input name="search_keyword" value="{html(item.search_keyword)}"></label>
+            <label>状态<select name="mapping_status">{_mapping_status_options(item.mapping_status)}</select></label>
+            <label>备注<input name="remark" value="{html(item.remark)}"></label>
+            <button type="submit">保存对应关系</button>
+          </form>
+        </details>
+        """
+        for item in model.product_mapping_options
+    ) or '<p class="empty-copy">尚未录入平台商品对应关系。</p>'
+    return f"""
+    <section class="panel" id="master-data"><header class="panel-header"><div><h2>商品资料</h2><p>维护可销售商品和平台商品的对应关系</p></div><div class="inline-actions"><button type="button" data-dialog-open="new-product-dialog">新增商品</button><button type="button" class="secondary" data-dialog-open="new-mapping-dialog">新增对应关系</button></div></header>
+      <div class="form-shell">{feedback}<h3>商品</h3>{product_rows}<h3>平台商品对应关系</h3>{mapping_rows}</div>
+    </section>
+    <dialog id="new-product-dialog" class="modal-dialog"><form method="post" action="/management/master-data/products" class="form-grid">
+      <input type="hidden" name="csrf_token" value="{html(csrf_token)}"><input type="hidden" name="idempotency_key" value="{key}:new-product"><input type="hidden" name="expected_version" value="0">
+      <header class="dialog-header"><h2>新增商品</h2><button type="button" class="icon-button" data-dialog-close aria-label="关闭">×</button></header>
+      <label>商品 SKU<input name="internal_sku" required></label><label>商品名称<input name="product_name" required></label><label>等级<input name="grade" required></label><label>规格<input name="stem_length" required></label><label>单位<input name="unit" value="扎" required></label><label>基础成本<input name="base_cost" inputmode="decimal" required></label><label class="toggle-label"><input name="sale_enabled" type="checkbox" value="true" checked>允许销售</label><label>备注<input name="remark"></label>
+      <p class="form-hint">新增后会同时建立数量为 0 的数据库库存；实际入库请使用“人工库存调整”。</p><footer class="dialog-actions"><button type="button" class="secondary" data-dialog-close>取消</button><button type="submit">新增商品</button></footer>
+    </form></dialog>
+    <dialog id="new-mapping-dialog" class="modal-dialog"><form method="post" action="/management/master-data/mappings" class="form-grid">
+      <input type="hidden" name="csrf_token" value="{html(csrf_token)}"><input type="hidden" name="idempotency_key" value="{key}:new-mapping"><input type="hidden" name="expected_version" value="0"><input type="hidden" name="mapping_id" value="">
+      <header class="dialog-header"><h2>新增平台商品对应关系</h2><button type="button" class="icon-button" data-dialog-close aria-label="关闭">×</button></header>
+      <label>平台<input name="platform_name" value="蚂蚁花团供应商" required></label><label>平台商品名称<input name="platform_product_name" required></label><label>等级<input name="grade" required></label><label>内部商品<select name="internal_sku"><option value="">暂不对应</option>{product_options}</select></label><label>查找关键词<input name="search_keyword"></label><label>状态<select name="mapping_status">{_mapping_status_options('VERIFIED')}</select></label><label>备注<input name="remark"></label>
+      <footer class="dialog-actions"><button type="button" class="secondary" data-dialog-close>取消</button><button type="submit">新增对应关系</button></footer>
+    </form></dialog>
+    """
+
+
+def _selected_product_options(products, selected_sku: str) -> str:
+    options = []
+    for item in products:
+        selected = " selected" if item.internal_sku == selected_sku else ""
+        options.append(
+            f'<option value="{html(item.internal_sku)}"{selected}>'
+            f'{html(item.product_name)} · {html(item.grade)}</option>'
+        )
+    return "".join(options)
+
+
+def _mapping_status_options(selected: str) -> str:
+    options = []
+    for value, label in (
+        ("VERIFIED", "已确认"),
+        ("UNMAPPED", "待对应"),
+        ("AMBIGUOUS", "需确认"),
+        ("DISABLED", "停用"),
+    ):
+        selected_attr = " selected" if value == selected else ""
+        options.append(
+            f'<option value="{value}"{selected_attr}>{label}</option>'
+        )
+    return "".join(options)
 
 
 def _render_review_controls(

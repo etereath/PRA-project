@@ -377,6 +377,8 @@ def test_environment_and_cookie_contract_accepts_only_matching_modes(
             "PRA_ENV": environment,
             "PRA_WEB_PUBLIC_SCHEME": scheme,
             "PRA_COOKIE_SECURE": cookie_secure,
+            "PRA_PRICE_RULES_WORKBOOK": "config/price_rules.xlsx",
+            "PRA_LISTING_RULES_WORKBOOK": "config/listing_rules.xlsx",
         },
         project_root=tmp_path,
     )
@@ -426,6 +428,19 @@ def test_composition_root_resolves_fixed_paths_once(tmp_path: Path) -> None:
     assert settings.paths.runtime_db == (tmp_path / "fixed/runtime.sqlite3").resolve()
     assert settings.paths.queue_root == (tmp_path / "fixed/queue").resolve()
     assert settings.paths.runtime_db.is_absolute()
+
+
+def test_web_rejects_workbook_execution_identity_mapping(tmp_path: Path) -> None:
+    with pytest.raises(OperationsWebConfigurationError, match="JSON"):
+        OperationsWebSettings.from_environment(
+            {
+                "PRA_ENV": "development",
+                "PRA_WEB_PUBLIC_SCHEME": "http",
+                "PRA_COOKIE_SECURE": "false",
+                "PRA_SHADOWBOT_IDENTITY_MAPPING": "products.xlsx",
+            },
+            project_root=tmp_path,
+        )
 
 
 def test_settings_repr_never_contains_admin_password(operations_web) -> None:
@@ -674,6 +689,8 @@ def test_production_session_cookie_is_secure(tmp_path: Path) -> None:
             "PRA_WEB_PUBLIC_SCHEME": "https",
             "PRA_COOKIE_SECURE": "true",
             "RUNTIME_ADMIN_PASSWORD": "synthetic",
+            "PRA_PRICE_RULES_WORKBOOK": "config/price_rules.xlsx",
+            "PRA_LISTING_RULES_WORKBOOK": "config/listing_rules.xlsx",
         },
         project_root=tmp_path,
     )
@@ -882,6 +899,99 @@ def test_system_maintenance_posts_are_typed_csrf_protected_and_async(
     assert len(AutomationRepository(container.runtime_repository).list_runs()) == 2
 
 
+def test_management_master_data_posts_use_csrf_prg_and_runtime_authority(
+    operations_web,
+) -> None:
+    app, container, _ = operations_web
+    with container.runtime_repository.connect_write() as connection:
+        connection.execute(
+            """
+            UPDATE inventory_authority_state
+            SET authority_mode = 'DB_AUTHORITY',
+                bootstrap_snapshot_sha256 = ?,
+                bootstrap_runtime_snapshot_sha256 = ?,
+                bootstrap_sales_watermark_date = '2026-08-14',
+                bootstrap_idempotency_key = 'synthetic-cutover',
+                bootstrap_completed_at = '2026-08-15T00:00:00+00:00',
+                bootstrap_completed_by = 'test', version = 1,
+                updated_at = '2026-08-15T00:00:00+00:00'
+            WHERE authority_key = 'REAL_INVENTORY'
+            """,
+            ("sha256:" + "1" * 64, "sha256:" + "2" * 64),
+        )
+        connection.commit()
+    _, authenticated = login(app, container)
+    session = container.sessions.get(authenticated)
+    assert session is not None
+
+    status, _, _ = call_app(
+        app,
+        path="/management/master-data/products",
+        method="POST",
+        cookie=authenticated,
+        form={
+            "csrf_token": "invalid",
+            "idempotency_key": "web-product-invalid",
+        },
+    )
+    assert status == "403 Forbidden"
+
+    status, headers, _ = call_app(
+        app,
+        path="/management/master-data/products",
+        method="POST",
+        cookie=authenticated,
+        form={
+            "csrf_token": session.csrf_token,
+            "idempotency_key": "web-product-create",
+            "expected_version": "0",
+            "internal_sku": "ROSE-A-50-Z",
+            "product_name": "艾莎",
+            "grade": "A级",
+            "stem_length": "50cm",
+            "unit": "扎",
+            "base_cost": "8.50",
+            "sale_enabled": "true",
+            "remark": "",
+        },
+    )
+    assert status == "303 See Other"
+    assert header_values(headers, "Location")[0].startswith(
+        "/management?master_data_receipt="
+    )
+
+    status, headers, _ = call_app(
+        app,
+        path="/management/master-data/mappings",
+        method="POST",
+        cookie=authenticated,
+        form={
+            "csrf_token": session.csrf_token,
+            "idempotency_key": "web-mapping-create",
+            "expected_version": "0",
+            "platform_name": "蚂蚁花团供应商",
+            "platform_product_name": "艾莎 20枝/扎",
+            "grade": "A级",
+            "internal_sku": "ROSE-A-50-Z",
+            "search_keyword": "艾莎",
+            "mapping_status": "VERIFIED",
+            "remark": "",
+        },
+    )
+    assert status == "303 See Other"
+    location = header_values(headers, "Location")[0]
+    assert location.startswith("/management?master_data_receipt=")
+    _, _, body = call_app(
+        app,
+        path="/management",
+        query=location.partition("?")[2],
+        cookie=authenticated,
+    )
+    assert "商品资料已更新" in body
+    assert "艾莎 20枝/扎" in body
+    assert "平台商品对应关系" in body
+
+
 def test_security_headers_are_applied_to_html_health_errors_and_static(operations_web) -> None:
     app, _, _ = operations_web
     for path in ("/login", "/health", "/not-found", "/static/app.css"):
@@ -895,7 +1005,8 @@ def test_security_headers_are_applied_to_html_health_errors_and_static(operation
 
 def test_mobile_review_invalid_state_is_read_only_and_does_not_echo_secrets(operations_web) -> None:
     app, _, root = operations_web
-    before = snapshot_tree(root)
+    assert call_app(app, path="/health")[0] == "200 OK"
+    before = snapshot_tree(root, ignore_sqlite_sidecar_mtime=True)
     status, _, body = call_app(
         app,
         path="/mobile/review/REVIEW-SENSITIVE-ID",
@@ -913,7 +1024,7 @@ def test_mobile_review_invalid_state_is_read_only_and_does_not_echo_secrets(oper
     )
     assert status == "503 Service Unavailable"
     assert "未执行任何业务操作" in body
-    assert snapshot_tree(root) == before
+    assert snapshot_tree(root, ignore_sqlite_sidecar_mtime=True) == before
 
 
 def test_business_posts_are_not_available_in_7b(operations_web) -> None:

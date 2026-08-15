@@ -39,6 +39,8 @@ from app.operations_web.read_models import (
     ReadState,
     ReviewActionReadModel,
     ReviewControlReadModel,
+    ProductMappingControlReadModel,
+    ProductMasterControlReadModel,
     StateReadModel,
     SystemReadModel,
     TableReadModel,
@@ -69,6 +71,7 @@ from app.services.notification_outbox import (
     NOTIFICATION_TYPE_TITLES,
     REVIEW_TYPE_LABELS,
 )
+from app.services.operations_automation import validate_rule_workbooks
 from app.services.runtime import ReviewTokenService
 from app.services.shadowbot_worker_health import (
     build_shadowbot_worker_health_report,
@@ -649,6 +652,40 @@ class OperationsQueryService:
         except Exception:
             inventory_alert_options = ()
         try:
+            product_master_options = tuple(
+                ProductMasterControlReadModel(
+                    internal_sku=item.product.internal_sku,
+                    product_name=item.product.product_name,
+                    grade=item.product.grade,
+                    stem_length=item.product.stem_length,
+                    unit=item.product.unit,
+                    base_cost=format(item.product.base_cost, "f"),
+                    sale_enabled=item.product.sale_enabled,
+                    remark=item.product.remark,
+                    current_stock=item.product.current_stock,
+                    version=item.version,
+                )
+                for item in self.master_data.list_product_records()
+            )
+            product_mapping_options = tuple(
+                ProductMappingControlReadModel(
+                    mapping_id=item.mapping_id,
+                    platform_name=item.platform_name,
+                    platform_product_name=item.platform_product_name,
+                    grade=item.grade,
+                    internal_sku=item.internal_sku or "",
+                    search_keyword=item.search_keyword,
+                    mapping_status=item.mapping_status,
+                    remark=item.remark,
+                    version=item.version,
+                )
+                for item in self.master_data.list_mapping_records()
+                if item.mapping_kind == "PRODUCT"
+            )
+        except Exception:
+            product_master_options = ()
+            product_mapping_options = ()
+        try:
             authority = self.inventory.get_authority_state()
             if authority.authority_mode != "DB_AUTHORITY":
                 inventory_state = StateReadModel(
@@ -709,12 +746,17 @@ class OperationsQueryService:
             pending_review_options=pending_review_options,
             automation_options=automation_options,
             inventory_alert_options=inventory_alert_options,
+            product_master_options=product_master_options,
+            product_mapping_options=product_mapping_options,
             task_idempotency_key="web-task:" + secrets.token_urlsafe(18),
             execution_idempotency_key=(
                 "web-execution:" + secrets.token_urlsafe(18)
             ),
             automation_rerun_idempotency_key=(
                 "web-automation-rerun:" + secrets.token_urlsafe(18)
+            ),
+            master_data_idempotency_key=(
+                "web-master-data:" + secrets.token_urlsafe(18)
             ),
         )
 
@@ -747,20 +789,22 @@ class OperationsQueryService:
             )
         components.append(ComponentReadModel("业务数据库", state, checked_at))
 
-        workbook_paths = (
-            self.paths.price_rules_workbook,
-            self.paths.listing_rules_workbook,
-        )
-        missing = sum(1 for item in workbook_paths if not item.is_file())
-        workbook_state = (
-            StateReadModel(ReadState.READY, "资料齐全", "规则资料可以正常读取")
-            if missing == 0
-            else StateReadModel(
-                ReadState.UNAVAILABLE,
-                "资料不完整",
-                f"有 {missing} 份规则资料缺失，请联系管理员补充",
+        try:
+            validate_rule_workbooks(
+                price_rules_path=self.paths.price_rules_workbook,
+                listing_rules_path=self.paths.listing_rules_workbook,
             )
-        )
+            workbook_state = StateReadModel(
+                ReadState.READY,
+                "资料可用",
+                "价格和上下架规则均已通过检查",
+            )
+        except Exception:
+            workbook_state = StateReadModel(
+                ReadState.UNAVAILABLE,
+                "规则资料需要处理",
+                "规则文件缺失或内容不符合要求，请联系管理员处理",
+            )
         components.append(ComponentReadModel("规则资料", workbook_state, checked_at))
 
         components.append(

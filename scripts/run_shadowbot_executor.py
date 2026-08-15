@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -56,6 +57,13 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["filequeue", "filedrop", "yingdao_openapi"],
         default=None,
         help="Defaults to SHADOWBOT_RUNNER_TYPE or filedrop.",
+    )
+    start_parser.add_argument("--recovery-reason", default="")
+    start_parser.add_argument("--recovery-confirmation", default="")
+    start_parser.add_argument(
+        "--cli-scope",
+        choices=("development-test", "admin-recovery"),
+        required=True,
     )
 
     import_parser = subparsers.add_parser("import-result", help="Import a ShadowBot result JSON and update PRA runtime")
@@ -132,8 +140,9 @@ def main() -> int:
 
 
 def start_from_args(args: argparse.Namespace):
+    _require_controlled_start(args)
     repository = SQLiteRuntimeRepository(args.runtime_db)
-    RuntimeTaskService(repository).init_schema()
+    repository.require_current_schema(operation_name="ShadowBot executor CLI")
     runner = _runner_from_args(args)
     executor = ShadowBotExecutor(repository, runner)
     payload = ShadowBotApprovedPayload(
@@ -164,6 +173,31 @@ def start_from_args(args: argparse.Namespace):
             approval=approval,
         )
     )
+
+
+def _require_controlled_start(args: argparse.Namespace) -> None:
+    scope = str(getattr(args, "cli_scope", "") or "")
+    if scope == "development-test":
+        return
+    if scope != "admin-recovery":
+        raise ValidationError(
+            "CLI start 必须显式声明 development-test 或 admin-recovery。"
+        )
+    enabled = os.environ.get(
+        "PRA_ENABLE_LEGACY_EXECUTION_CLI_RECOVERY",
+        "",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        raise ValidationError(
+            "真实任务必须从运营 Web 完成二次授权；CLI start 仅用于管理员恢复。"
+        )
+    if not str(getattr(args, "recovery_reason", "") or "").strip():
+        raise ValidationError("管理员恢复操作必须填写 --recovery-reason。")
+    if getattr(args, "recovery_confirmation", "") != "LEGACY_EXECUTION_RECOVERY":
+        raise ValidationError(
+            "管理员恢复操作必须提供 --recovery-confirmation "
+            "LEGACY_EXECUTION_RECOVERY。"
+        )
 
 
 def record_result_from_file(runtime_db: Path, result_json: Path) -> None:
