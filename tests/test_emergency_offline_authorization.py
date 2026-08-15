@@ -12,7 +12,6 @@ from pathlib import Path
 from threading import Event, Thread
 
 import pytest
-from openpyxl import Workbook
 
 from app.emergency_offline_fence import (
     EMERGENCY_FINAL_CLICK_FENCE_TASK_MESSAGE,
@@ -24,9 +23,9 @@ from app.emergency_offline_fence import (
 )
 from app.enums import ReviewTaskStatus, TaskActionType, TaskOriginType, TaskStatus
 from app.exceptions import ValidationError
-from app.models import ListingStatus, Task
+from app.models import ListingStatus, Product, Task
+from app.repositories.master_data_repository import RuntimeMasterDataRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.repositories.workbook_repository import PRODUCT_HEADERS
 from app.services.emergency_offline_authorization import (
     EMERGENCY_EVENT_TYPE,
     EmergencyOfflineAuthorizationService,
@@ -319,7 +318,6 @@ def _authorize(service: EmergencyOfflineAuthorizationService, **overrides):
         "authorization_id": "AUTHORIZATION-0001",
         "incident_id": "INCIDENT-1",
         "review_task_id": "REVIEW-1",
-        "products_path": Path("unused.xlsx"),
         "feature_flag_job_id": "EMERGENCY-FLAG",
         "authorized_at": NOW + timedelta(seconds=1),
         "expires_at": NOW + timedelta(minutes=10),
@@ -329,29 +327,31 @@ def _authorize(service: EmergencyOfflineAuthorizationService, **overrides):
     return service.authorize(**values)
 
 
-def _write_products_workbook(path: Path, *, base_cost: int) -> None:
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = "data"
-    sheet.append(PRODUCT_HEADERS)
-    sheet.append(
-        [
-            "SKU-1",
-            "Synthetic flower",
-            "B",
-            "60",
-            "bundle",
-            base_cost,
-            50,
-            True,
-            8,
-            12,
-            "",
-            "synthetic",
-            "green",
-        ]
+def _seed_runtime_product(
+    repository: SQLiteRuntimeRepository,
+    *,
+    base_cost: Decimal,
+) -> None:
+    RuntimeMasterDataRepository(repository).seed(
+        (
+            Product(
+                internal_sku="SKU-1",
+                product_name="Synthetic flower",
+                grade="B",
+                stem_length="60",
+                unit="bundle",
+                base_cost=base_cost,
+                current_stock=50,
+                sale_enabled=True,
+            ),
+        ),
+        (),
+        product_source_ref="synthetic-emergency-authorization",
+        product_source_sha256=f"sha256:{'3' * 64}",
+        mapping_source_ref="synthetic-empty-mapping",
+        mapping_source_sha256=f"sha256:{'4' * 64}",
+        actor="test",
     )
-    workbook.save(path)
 
 
 def test_authorization_event_task_and_incident_transition_are_atomic(
@@ -407,10 +407,9 @@ def test_automatic_authorization_cost_snapshot_fails_closed_after_database_lock_
     tmp_path: Path,
 ) -> None:
     repository = _repository(tmp_path)
-    products_path = tmp_path / "products-lock-wait.xlsx"
-    _write_products_workbook(products_path, base_cost=10)
+    _seed_runtime_product(repository, base_cost=Decimal("10"))
     reader = EmergencyOfflineAuthorizationService(repository).product_cost_reader
-    base_cost, source_ref, error = reader(products_path, internal_sku="SKU-1")
+    base_cost, source_ref, error = reader(internal_sku="SKU-1")
     assert error == ""
     reached_database_lock = Event()
 
@@ -435,14 +434,17 @@ def test_automatic_authorization_cost_snapshot_fails_closed_after_database_lock_
 
     def authorize() -> None:
         try:
-            _authorize(service, products_path=products_path)
+            _authorize(service)
         except BaseException as exc:  # noqa: BLE001 - thread assertion capture
             errors.append(exc)
 
     thread = Thread(target=authorize)
     thread.start()
     assert reached_database_lock.wait(timeout=2)
-    _write_products_workbook(products_path, base_cost=11)
+    blocker.execute(
+        "UPDATE product_catalog SET base_cost = '11', version = version + 1 "
+        "WHERE internal_sku = 'SKU-1'"
+    )
     blocker.commit()
     blocker.close()
     thread.join(timeout=5)

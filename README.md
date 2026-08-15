@@ -1,6 +1,6 @@
 # PRA 运行态运营后台
 
-PRA 是面向鲜切花预测性销售与多平台执行任务的运行态运营系统。当前项目仍以 Excel 作为商品、规则、预测等业务输入来源，以 SQLite 作为运行态事实来源，负责生成、追踪、复核和通知运营任务。
+PRA 是面向鲜切花预测性销售与多平台执行任务的运行态运营系统。Runtime Schema v18 以 SQLite 保存商品目录、平台映射、真实库存和运行态事实；Excel 目前只保留为价格/上下架规则等尚未数据库化的输入，以及受控切换的一次性导入来源。
 
 当前已完成的主线能力包括：SQLite 运行态任务系统、人工复核闭环、Mobile Review、飞书 Webhook 真实通知、飞书 post 富文本消息、cpolar 外网访问链路，以及 Web 运行态运营后台。
 
@@ -8,21 +8,20 @@ PRA 是面向鲜切花预测性销售与多平台执行任务的运行态运营�
 
 已完成：
 
-- Excel 业务输入：商品、规则、预测、产能、冷库等输入仍保留为 Excel。
-- 商品资料与库存录入：`Business Inputs` 已支持通过运营表单补充公共库存、维护商品基础资料，并保存回 `products.xlsx`。
-- 价格规则管理：`Business Inputs` 已支持通过运营表单新增、编辑和查看价格规则，并保存回 `price_rules.xlsx`。
-- SQLite 运行态：保存 `tasks`、`review_tasks`、`notification_logs`、`execution_logs`、`task_status_history`、`review_tokens`。
-- Web 运营后台：`Dashboard`、`Tasks`、`Reviews`、`Notifications`、`Execution Logs`、`Business Inputs`、`System`。
+- Runtime 主数据：商品目录和平台映射由 v18 数据库统一提供；`products.xlsx` 与 `platform_mappings.xlsx` 只在受控干净重建时一次性导入。
+- 真实库存：数据库余额与不可变流水是唯一权威；人工调整、销售扣减和取消恢复均走同一库存服务。
+- 规则输入：价格规则和上下架规则暂时仍由受控工作簿提供，后续单独数据库化。
+- SQLite 运行态：保存任务、复核、通知、执行、Automation、观察、日结、Incident、商品映射与库存事实。
+- Web 运营后台：固定为“今日、数据库、业务管理、系统”四个一级入口。
 - 人工复核：Web Session 复核与 Mobile Review token 复核均已跑通。
 - 飞书通知：支持真实飞书 Webhook，默认使用 post 富文本消息。
 - 系统检查：`/system` 可检查配置、schema、运行态表计数，并可手动发送飞书测试通知。
 
 当前未做：
 
-- 尚未形成真实销售平台的无人值守生产改价闭环；影刀微信小程序已完成真实平台 UI 自动化实验。
-- 尚未完成生产级真实 RPA 调度闭环；当前已有 `ShadowBotExecutor` 骨架、文件投递 runner 和结果回灌脚本。
+- 普通真实平台任务仍保持“创建任务”和“执行授权”两个阶段；不得扫描全部待处理任务后自动写平台。
+- canonical 真实 Runtime DB 尚未在受控维护窗口完成 v18 重建与激活。
 - 不引入 AI Agent 自动决策。
-- 不迁移 Excel 主数据。
 - 不引入 React/Vue 或前后端分离。
 - 不做完整权限系统。
 

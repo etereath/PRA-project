@@ -20,9 +20,9 @@ from app.enums import (
     TaskStatus,
 )
 from app.exceptions import ValidationError
-from app.models import ReviewTask, Task
+from app.models import Product, ReviewTask, Task
+from app.repositories.master_data_repository import RuntimeMasterDataRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.repositories.workbook_repository import save_table_records
 from app.services.runtime import RuntimeTaskService
 from app.services.shadowbot_executor import (
     EXECUTION_MODE_COMMIT,
@@ -209,6 +209,26 @@ class ShadowBotExecutorTests(unittest.TestCase):
         self.repository = SQLiteRuntimeRepository(self.db_path)
         self.runtime_service = RuntimeTaskService(self.repository)
         self.runtime_service.init_schema()
+        RuntimeMasterDataRepository(self.repository).seed(
+            [
+                Product(
+                    internal_sku="CAPPUCCINO-E-45-Z",
+                    product_name="卡布奇诺",
+                    grade="E",
+                    stem_length="45",
+                    unit="扎",
+                    base_cost=Decimal("10.00"),
+                    current_stock=1,
+                    sale_enabled=True,
+                )
+            ],
+            [],
+            product_source_ref="synthetic-products",
+            product_source_sha256="sha256:" + "c" * 64,
+            mapping_source_ref="synthetic-mappings",
+            mapping_source_sha256="sha256:" + "d" * 64,
+            actor="test",
+        )
         self.runtime_service.create_tasks([_task()])
         self.repository.insert_review_tasks([_review_task()])
         self.runner = FakeShadowBotRunner()
@@ -255,27 +275,9 @@ class ShadowBotExecutorTests(unittest.TestCase):
         self.assertEqual(self.repository.get_task("TASK-SB-1").task_status, TaskStatus.PENDING)
 
     def test_read_only_replaces_caller_hints_with_inventory_sku_mapping(self) -> None:
-        products_path = self.temp_path / "products.xlsx"
-        save_table_records(
-            "products",
-            products_path,
-            [
-                {
-                    "internal_sku": "CAPPUCCINO-E-45-Z",
-                    "product_name": "卡布奇诺",
-                    "grade": "E",
-                    "stem_length": "45",
-                    "unit": "扎",
-                    "base_cost": "10.00",
-                    "current_stock": 1,
-                    "sale_enabled": True,
-                }
-            ],
-        )
         executor = ShadowBotExecutor(
             self.repository,
             self.runner,
-            inventory_products_path=products_path,
         )
 
         executor.start_multi_product_read(

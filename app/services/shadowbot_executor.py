@@ -18,6 +18,7 @@ from app.enums import TaskStatus
 from app.enums import ReviewTaskStatus
 from app.exceptions import ValidationError
 from app.models import ExecutionLog, ReviewTask, ShadowBotExecutionAttempt, ShadowBotOperationLedger
+from app.repositories.master_data_repository import RuntimeMasterDataRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.notification_outbox import OutboxReviewNotificationService
 from app.services.runtime import RuntimeTaskService
@@ -33,8 +34,7 @@ from app.services.shadowbot_state import (
     validate_result_state,
 )
 from app.services.shadowbot_product_read import (
-    DEFAULT_INVENTORY_PRODUCTS_PATH,
-    build_inventory_read_targets,
+    build_inventory_read_targets_from_products,
     build_read_batch_id,
     canonical_request_digest,
     compute_multi_product_instruction_hash,
@@ -553,16 +553,10 @@ class ShadowBotExecutor:
         self,
         repository: SQLiteRuntimeRepository,
         runner: ShadowBotTaskRunner,
-        *,
-        inventory_products_path: Path | None = None,
     ) -> None:
         self.repository = repository
         self.runner = runner
-        self.inventory_products_path = Path(
-            inventory_products_path
-            or os.environ.get("PRA_PRODUCTS_PATH")
-            or DEFAULT_INVENTORY_PRODUCTS_PATH
-        )
+        self.master_data = RuntimeMasterDataRepository(repository)
         self.runtime_task_service = RuntimeTaskService(repository)
         self.notification_outbox_service = OutboxReviewNotificationService(repository)
 
@@ -782,9 +776,9 @@ class ShadowBotExecutor:
             if isinstance(first_product, dict):
                 platform_name = str(first_product.get("platform") or "").strip()
         request_payload["platform_name"] = platform_name
-        request_payload["products"] = build_inventory_read_targets(
+        request_payload["products"] = build_inventory_read_targets_from_products(
             platform_name,
-            products_path=self.inventory_products_path,
+            self.master_data.list_products(),
         )
         normalized = normalize_multi_product_request(request_payload)
         if str(task_id or "").strip() == "":

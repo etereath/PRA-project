@@ -154,6 +154,24 @@ def build_inventory_read_targets(
     if not products:
         raise ProductReadContractError("INVENTORY_MAPPING_SOURCE_EMPTY")
 
+    return build_inventory_read_targets_from_products(
+        normalized_platform,
+        products,
+    )
+
+
+def build_inventory_read_targets_from_products(
+    platform_name: str,
+    products: Sequence[object],
+) -> list[dict[str, Any]]:
+    """Build the established v2 targets from an injected product snapshot."""
+
+    normalized_platform = str(platform_name or "").strip()
+    if not normalized_platform:
+        raise ProductReadContractError("INPUT_INVALID: platform_name is required.")
+    if not products:
+        raise ProductReadContractError("INVENTORY_MAPPING_SOURCE_EMPTY")
+
     targets: list[dict[str, Any]] = []
     seen_page_identities: dict[tuple[str, str, str], str] = {}
     for product in products:

@@ -170,11 +170,15 @@ Runtime Schema v18 的 `product_catalog` 与 `platform_product_mappings`，并�
 - Web Composition Root 删除商品和映射工作簿依赖；
 - 今日/数据库/业务管理商品回读改为数据库商品目录联接数据库库存；
 - 人工任务预览/创建和真实执行授权绑定同一数据库商品、映射、库存和平台事实；
+- `DAILY_TASK_GENERATION`、`ORDER_SCAN`、Queue/Executor/Importer 均改读数据库商品或映射
+  快照，不再把工作簿作为正式运行前提；
 - 桌面与手机紧急复核的基础成本改为数据库版本快照；
 - 干净重建只在 `prepare` 一次性导入 XLSX，`verify/activate` 只回读候选库和切换清单。
 
 库存未复制到商品目录，仍只有 `inventory_balances` 是真实库存权威；ShadowBot 身份 JSON
-仍是既有平台定位配置，不属于业务 XLSX。专项与受影响组合通过；最终完整 pytest 为
-`1231 passed, 3 skipped, 82 subtests passed`，耗时 373.06 秒；系统冒烟为
-`16 passed, 0 failed`。本次未迁移 canonical 真实库、未启动 Worker、未投递 Queue、未执行
-平台读写；真实 v18 切换和后续 Web 写验收仍需新的维护窗口与单独商品/动作/批次授权。
+仍是既有平台定位配置，不属于业务 XLSX。旧工作簿读取代码仅保留给一次性导入、测试、
+诊断和明确隔离的旧 CLI，不属于正式 Runtime 控制面。订单/Automation/Queue/紧急保护专项
+组合通过；最终完整 pytest 为 `1231 passed, 3 skipped, 82 subtests passed`，耗时 325.96 秒；
+隔离系统冒烟为 `16 passed, 0 failed`。
+本次未迁移 canonical 真实库、未启动 Worker、未投递 Queue、未执行平台读写；真实 v18
+切换和后续 Web 写验收仍需新的维护窗口与单独商品/动作/批次授权。

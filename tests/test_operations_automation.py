@@ -2,18 +2,19 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 from openpyxl import Workbook
 
 from app.enums import AutomationRunStatus, ReviewTaskStatus
-from app.models import ReviewTask
+from app.models import Product, ReviewTask
 from app.repositories.automation_repository import AutomationRepository
+from app.repositories.master_data_repository import RuntimeMasterDataRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import (
     LISTING_RULE_HEADERS,
     PRICE_RULE_HEADERS,
-    PRODUCT_HEADERS,
 )
 from app.services.automation import (
     DAILY_TASK_GENERATION,
@@ -83,6 +84,58 @@ def _run(automation, job, scheduled_for):
     )[0]
 
 
+def _seed_products(runtime: SQLiteRuntimeRepository) -> None:
+    RuntimeMasterDataRepository(runtime).seed(
+        [
+            Product(
+                internal_sku="SKU-001",
+                product_name="艾莎",
+                grade="A",
+                stem_length="70",
+                unit="扎",
+                base_cost=Decimal("10"),
+                current_stock=50,
+                sale_enabled=True,
+            )
+        ],
+        [],
+        product_source_ref="synthetic-products",
+        product_source_sha256="sha256:" + "c" * 64,
+        mapping_source_ref="synthetic-mappings",
+        mapping_source_sha256="sha256:" + "d" * 64,
+        actor="test",
+    )
+    with runtime.connect_write() as connection, connection:
+        connection.execute(
+            """
+            UPDATE inventory_authority_state
+            SET authority_mode = 'DB_AUTHORITY',
+                bootstrap_snapshot_sha256 = ?,
+                bootstrap_runtime_snapshot_sha256 = ?,
+                bootstrap_sales_watermark_date = '2026-08-12',
+                bootstrap_idempotency_key = 'synthetic-bootstrap',
+                bootstrap_completed_at = ?, bootstrap_completed_by = 'test',
+                version = 2, updated_at = ?
+            WHERE authority_key = 'REAL_INVENTORY'
+            """,
+            (
+                "sha256:" + "a" * 64,
+                "sha256:" + "b" * 64,
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO inventory_balances(
+                internal_sku, current_qty, version,
+                last_transaction_id, updated_at
+            ) VALUES ('SKU-001', 50, 1, 'BOOT-SKU-001', ?)
+            """,
+            (NOW.isoformat(),),
+        )
+
+
 def test_review_timeout_handler_uses_existing_review_service(tmp_path):
     runtime, automation, jobs = _runtime(tmp_path)
     review = ReviewTask(
@@ -119,7 +172,6 @@ def test_daily_generation_skips_until_same_trade_day_plan_input_succeeds(tmp_pat
     handler = DailyTaskGenerationAutomationHandler(
         runtime,
         automation,
-        tmp_path / "missing-products.xlsx",
         tmp_path / "missing-price-rules.xlsx",
         tmp_path / "missing-listing-rules.xlsx",
     )
@@ -133,14 +185,9 @@ def test_daily_generation_skips_until_same_trade_day_plan_input_succeeds(tmp_pat
 
 def test_daily_generation_reuses_rule_workflow_after_plan_input(tmp_path):
     runtime, automation, jobs = _runtime(tmp_path)
-    products = tmp_path / "products.xlsx"
+    _seed_products(runtime)
     price_rules = tmp_path / "price_rules.xlsx"
     listing_rules = tmp_path / "listing_rules.xlsx"
-    _write_workbook(
-        products,
-        PRODUCT_HEADERS,
-        [["SKU-001", "艾莎", "A", "70", "扎", 10, 50, True, 14, 15, "", "spring", "red"]],
-    )
     _write_workbook(
         price_rules,
         PRICE_RULE_HEADERS,
@@ -176,7 +223,6 @@ def test_daily_generation_reuses_rule_workflow_after_plan_input(tmp_path):
     outcome = DailyTaskGenerationAutomationHandler(
         runtime,
         automation,
-        products,
         price_rules,
         listing_rules,
     )(run, context)
@@ -228,14 +274,9 @@ def test_daily_generation_does_not_read_or_evaluate_a_disabled_rule_source(
     monkeypatch,
 ):
     runtime, automation, jobs = _runtime(tmp_path)
-    products = tmp_path / "products.xlsx"
+    _seed_products(runtime)
     disabled_price_rules = tmp_path / "disabled-price-rules.xlsx"
     listing_rules = tmp_path / "listing_rules.xlsx"
-    _write_workbook(
-        products,
-        PRODUCT_HEADERS,
-        [["SKU-001", "艾莎", "A", "70", "扎", 10, 50, True, 14, 15, "", "spring", "red"]],
-    )
     disabled_price_rules.write_bytes(b"not-an-xlsx-file")
     _write_workbook(
         listing_rules,
@@ -274,7 +315,6 @@ def test_daily_generation_does_not_read_or_evaluate_a_disabled_rule_source(
     outcome = DailyTaskGenerationAutomationHandler(
         runtime,
         automation,
-        products,
         disabled_price_rules,
         listing_rules,
     )(run, FakeContext(NOW))

@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import hashlib
+import sqlite3
 from contextlib import closing
 from dataclasses import dataclass, replace
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
 
 from app.enums import IncidentCategory, IncidentStatus
 from app.exceptions import ValidationError
@@ -14,11 +13,14 @@ from app.repositories.emergency_offline_policy_repository import (
     EMERGENCY_RATIO,
     EmergencyOfflinePolicyRepository,
 )
+from app.repositories.master_data_repository import (
+    RuntimeMasterDataError,
+    RuntimeMasterDataRepository,
+)
 from app.repositories.operational_incident_repository import (
     OperationalIncidentRepository,
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.repositories.workbook_repository import load_products
 from app.services.incident_management import (
     IncidentDetection,
     IncidentManagementService,
@@ -236,6 +238,7 @@ class EmergencyOfflineShadowService:
             runtime_repository
         )
         self.interpreter = EmergencyOfflinePolicyInterpreter()
+        self.master_data = RuntimeMasterDataRepository(runtime_repository)
 
     def evaluate(
         self,
@@ -243,7 +246,6 @@ class EmergencyOfflineShadowService:
         evaluation_id: str,
         incident_id: str,
         review_task_id: str,
-        products_path: Path,
         evaluated_at: datetime,
         policy_version: str | None = None,
         initial_observation_id: str | None = None,
@@ -268,7 +270,6 @@ class EmergencyOfflineShadowService:
         )
         base_cost, base_cost_source_ref, base_cost_error_reason = (
             self._read_authoritative_base_cost(
-                products_path,
                 internal_sku=incident.subject_key,
             )
         )
@@ -315,36 +316,24 @@ class EmergencyOfflineShadowService:
             master_data_incident_id=master_data_incident_id,
         )
 
-    @staticmethod
     def _read_authoritative_base_cost(
-        products_path: Path,
+        self,
         *,
         internal_sku: str,
     ) -> tuple[Decimal | None, str, str]:
         try:
-            content_before = products_path.read_bytes()
-            products = load_products(products_path)
-            content_after = products_path.read_bytes()
-        except (OSError, ValueError, ValidationError):
+            base_cost, source_ref = self.master_data.product_cost_snapshot(
+                internal_sku
+            )
+        except (
+            OSError,
+            RuntimeMasterDataError,
+            ValueError,
+            ValidationError,
+            sqlite3.Error,
+        ):
             return None, "", "PRODUCT_MASTER_UNAVAILABLE"
-        if content_before != content_after:
-            return None, "", "PRODUCT_MASTER_CHANGED_DURING_READ"
-        product = next(
-            (
-                candidate
-                for candidate in products
-                if candidate.internal_sku == internal_sku
-            ),
-            None,
-        )
-        if product is None:
-            return None, "", "PRODUCT_NOT_FOUND"
-        content_sha256 = hashlib.sha256(content_before).hexdigest()
-        return (
-            product.base_cost,
-            f"{products_path.name}:sha256:{content_sha256}",
-            "",
-        )
+        return base_cost, source_ref, ""
 
     def _write_lock_statuses(
         self,

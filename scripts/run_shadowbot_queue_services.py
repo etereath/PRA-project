@@ -24,9 +24,6 @@ from app.services.runtime import DEFAULT_RUNTIME_DB, ReviewTaskService  # noqa: 
 from app.services.shadowbot_executor import (  # noqa: E402
     build_shadowbot_task_runner_from_environment,
 )
-from app.services.shadowbot_product_read import (  # noqa: E402
-    DEFAULT_INVENTORY_PRODUCTS_PATH,
-)
 from app.services.shadowbot_queue import (  # noqa: E402
     ShadowBotLoginVerificationMonitor,
     ShadowBotQueuePaths,
@@ -38,7 +35,6 @@ from app.services.shadowbot_queue import (  # noqa: E402
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run ShadowBot result importer and queue watchdog")
     parser.add_argument("--runtime-db", type=Path, default=DEFAULT_RUNTIME_DB)
-    parser.add_argument("--products", type=Path, default=DEFAULT_INVENTORY_PRODUCTS_PATH)
     parser.add_argument("--queue-dir", type=Path, default=None)
     parser.add_argument("--poll-seconds", type=float, default=3.0)
     parser.add_argument("--stale-seconds", type=int, default=30)
@@ -197,7 +193,6 @@ def main() -> int:
         repository,
         runner,
         queue_dir,
-        inventory_products_path=args.products,
     )
     login_monitor = ShadowBotLoginVerificationMonitor(repository, runner, queue_dir)
     watchdog = ShadowBotQueueWatchdog(

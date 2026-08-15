@@ -292,7 +292,6 @@ def main() -> int:
             handlers.update(
                 build_operations_control_handlers(
                     runtime_repository=runtime_repository,
-                    products_path=args.products,
                     price_rules_path=args.price_rules,
                     listing_rules_path=args.listing_rules,
                 )
@@ -302,7 +301,6 @@ def main() -> int:
                     build_order_read_only_handlers(
                         runtime_repository=runtime_repository,
                         queue_dir=args.shadowbot_queue_dir,
-                        mapping_workbook=args.platform_mappings,
                         operational_time=operational_time,
                         timeout_seconds=args.order_timeout_seconds,
                     )

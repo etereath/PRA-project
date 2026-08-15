@@ -13,11 +13,11 @@ from typing import Any
 
 from app.exceptions import ValidationError
 from app.listing_identity import listing_identity_key
+from app.repositories.master_data_repository import RuntimeMasterDataRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.automation_repository import (
     read_order_scan_target_trade_date,
 )
-from app.repositories.workbook_repository import load_products
 from app.services.shadowbot_executor import (
     EXECUTION_MODE_COMMIT,
     SIDE_EFFECT_NOT_APPLIED,
@@ -31,7 +31,6 @@ from app.services.shadowbot_executor import (
     shadowbot_result_contract_from_data,
 )
 from app.services.shadowbot_product_read import (
-    DEFAULT_INVENTORY_PRODUCTS_PATH,
     MAX_RESULT_BYTES,
     aggregate_product_snapshots,
     normalize_multi_product_request,
@@ -195,17 +194,11 @@ class ShadowBotResultImporter:
         repository: SQLiteRuntimeRepository,
         runner: ShadowBotTaskRunner,
         queue_dir: Path,
-        *,
-        inventory_products_path: Path | None = None,
     ) -> None:
         self.repository = repository
         self.executor = ShadowBotExecutor(repository, runner)
         self.paths = ShadowBotQueuePaths(queue_dir)
-        self.inventory_products_path = Path(
-            inventory_products_path
-            or os.environ.get("PRA_PRODUCTS_PATH")
-            or DEFAULT_INVENTORY_PRODUCTS_PATH
-        )
+        self.master_data = RuntimeMasterDataRepository(repository)
         self.paths.ensure()
 
     def import_available(self) -> list[dict[str, Any]]:
@@ -877,12 +870,9 @@ class ShadowBotResultImporter:
         request_by_item = {product["item_id"]: product for product in normalized_request["products"]}
         inventory_by_identity: dict[tuple[str, str, str], Any] = {}
         ambiguous_inventory_identities: set[tuple[str, str, str]] = set()
-        try:
-            inventory_products = load_products(self.inventory_products_path)
-        except (OSError, UnicodeError, ValidationError, ValueError) as exc:
-            raise ValidationError(
-                f"INVENTORY_MAPPING_SOURCE_INVALID: {self.inventory_products_path}"
-            ) from exc
+        inventory_products = self.master_data.list_products()
+        if not inventory_products:
+            raise ValidationError("INVENTORY_MAPPING_SOURCE_EMPTY")
         for product in inventory_products:
             identity = listing_identity_key(
                 normalized_request["platform_name"],

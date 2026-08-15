@@ -83,7 +83,7 @@ from app.shadowbot_listing_contract import canonical_nonnegative_inventory
 
 @dataclass(slots=True)
 class WorkflowInputs:
-    products_path: Path
+    products_path: Path | None
     price_rules_path: Path
     listing_rules_path: Path
     output_path: Path | None = None
@@ -100,6 +100,7 @@ class WorkflowInputs:
     platform_names: tuple[str, ...] = ()
     rule_source_allowlist: frozenset[str] | None = None
     origin_ref_id: str | None = None
+    runtime_products: tuple[Product, ...] | None = None
 
 
 @dataclass(slots=True)
@@ -261,6 +262,7 @@ def generate_runtime_tasks_from_sources(
         runtime_db_path=inputs.runtime_db_path or db_path,
         rule_source_allowlist=inputs.rule_source_allowlist,
         origin_ref_id=inputs.origin_ref_id,
+        runtime_products=inputs.runtime_products,
     )
     summary = generate_tasks_from_sources(preview_inputs)
     return persist_task_generation_summary(
@@ -606,10 +608,7 @@ def list_runtime_execution_logs(
 
 
 def validate_sources(inputs: WorkflowInputs) -> ValidationSummary:
-    products = _load_inventory_aware_products(
-        inputs.products_path,
-        inputs.runtime_db_path,
-    )
+    products = _load_workflow_products(inputs)
     enabled_rule_sources = inputs.rule_source_allowlist
     price_rules = (
         load_price_rules(inputs.price_rules_path)
@@ -658,10 +657,7 @@ def generate_tasks_from_sources(
     listing_task_overrides: dict[tuple[str, str, str], tuple[object, object]]
     | None = None,
 ) -> TaskGenerationSummary:
-    products = _load_inventory_aware_products(
-        inputs.products_path,
-        inputs.runtime_db_path,
-    )
+    products = _load_workflow_products(inputs)
     enabled_rule_sources = inputs.rule_source_allowlist
     price_rules = (
         load_price_rules(inputs.price_rules_path)
@@ -784,10 +780,7 @@ def generate_tasks_from_selected_rule(
     if not selected_id:
         raise ValidationError("请选择要生成任务的规则")
 
-    products = _load_inventory_aware_products(
-        inputs.products_path,
-        inputs.runtime_db_path,
-    )
+    products = _load_workflow_products(inputs)
     price_rules = (
         [load_price_rule(inputs.price_rules_path, selected_id)]
         if normalized_type == "price"
@@ -967,6 +960,7 @@ def preview_tasks_from_selected_rule(
         platform_names=inputs.platform_names,
         rule_source_allowlist=inputs.rule_source_allowlist,
         origin_ref_id=inputs.origin_ref_id,
+        runtime_products=inputs.runtime_products,
     )
     return generate_tasks_from_selected_rule(
         preview_inputs,
@@ -1061,6 +1055,17 @@ def _load_inventory_aware_products(
         return products
     runtime = SQLiteRuntimeRepository(runtime_db_path)
     return InventoryProvider(InventoryRepository(runtime)).hydrate_products(products)
+
+
+def _load_workflow_products(inputs: WorkflowInputs) -> list[Product]:
+    if inputs.runtime_products is not None:
+        return list(inputs.runtime_products)
+    if inputs.products_path is None:
+        raise ValidationError("商品主数据来源不可用")
+    return _load_inventory_aware_products(
+        inputs.products_path,
+        inputs.runtime_db_path,
+    )
 
 
 def _load_current_platform_prices(
@@ -1183,6 +1188,7 @@ def preview_tasks_from_sources(inputs: WorkflowInputs) -> TaskGenerationSummary:
         runtime_db_path=inputs.runtime_db_path,
         rule_source_allowlist=inputs.rule_source_allowlist,
         origin_ref_id=inputs.origin_ref_id,
+        runtime_products=inputs.runtime_products,
     )
     return generate_tasks_from_sources(preview_inputs)
 

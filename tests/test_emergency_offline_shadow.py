@@ -9,12 +9,12 @@ from pathlib import Path
 import pytest
 
 from app.enums import IncidentCategory, IncidentStatus
-from app.models import EmergencyOfflinePolicy
+from app.models import EmergencyOfflinePolicy, Product
 from app.repositories.emergency_offline_policy_repository import (
     EmergencyOfflinePolicyRepository,
 )
+from app.repositories.master_data_repository import RuntimeMasterDataRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.repositories.workbook_repository import save_table_records
 from app.services.emergency_offline_shadow import (
     EmergencyOfflinePolicyInterpreter,
     EmergencyOfflineShadowService,
@@ -238,34 +238,32 @@ def _approve_policy(runtime: SQLiteRuntimeRepository) -> None:
     )
 
 
-def _products_path(
-    tmp_path: Path,
+def _seed_runtime_product(
+    runtime: SQLiteRuntimeRepository,
     *,
     include_sku: bool = True,
-    base_cost: str = "10.00",
-) -> Path:
-    path = tmp_path / "products.xlsx"
-    rows = []
-    if include_sku:
-        rows.append(
-            {
-                "internal_sku": "SKU-1",
-                "product_name": "艾莎",
-                "grade": "B",
-                "stem_length": "60cm",
-                "unit": "扎",
-                "base_cost": base_cost,
-                "current_stock": "5",
-                "sale_enabled": "True",
-                "last_price": "",
-                "recommended_price": "",
-                "remark": "",
-                "feature_season": "",
-                "feature_color": "",
-            }
-        )
-    save_table_records("products", path, rows)
-    return path
+    base_cost: Decimal = Decimal("10.00"),
+) -> None:
+    RuntimeMasterDataRepository(runtime).seed(
+        (
+            Product(
+                internal_sku="SKU-1" if include_sku else "OTHER-SKU",
+                product_name="艾莎",
+                grade="B",
+                stem_length="60cm",
+                unit="扎",
+                base_cost=base_cost,
+                current_stock=5,
+                sale_enabled=True,
+            ),
+        ),
+        (),
+        product_source_ref="synthetic-emergency-shadow",
+        product_source_sha256=f"sha256:{'1' * 64}",
+        mapping_source_ref="synthetic-empty-mapping",
+        mapping_source_sha256=f"sha256:{'2' * 64}",
+        actor="test",
+    )
 
 
 def test_application_shadow_is_zero_task_zero_run_event_and_flag_stays_off(
@@ -273,7 +271,7 @@ def test_application_shadow_is_zero_task_zero_run_event_and_flag_stays_off(
 ) -> None:
     runtime, incident_id = _runtime_with_s4_incident(tmp_path)
     _approve_policy(runtime)
-    products_path = _products_path(tmp_path)
+    _seed_runtime_product(runtime)
     pulse = _pulse()
     pulse = replace(pulse, incident_id=incident_id)
     service = EmergencyOfflineShadowService(
@@ -290,7 +288,6 @@ def test_application_shadow_is_zero_task_zero_run_event_and_flag_stays_off(
         evaluation_id="SHADOW-1",
         incident_id=incident_id,
         review_task_id="REVIEW-1",
-        products_path=products_path,
         evaluated_at=NOW + timedelta(minutes=10),
         initial_observation_id="OBS-1",
     )
@@ -323,7 +320,7 @@ def test_missing_base_cost_records_master_data_incident_and_replays(
 ) -> None:
     runtime, incident_id = _runtime_with_s4_incident(tmp_path)
     _approve_policy(runtime)
-    products_path = _products_path(tmp_path, include_sku=False)
+    _seed_runtime_product(runtime, include_sku=False)
     pulse = _pulse()
     pulse = replace(pulse, incident_id=incident_id)
     service = EmergencyOfflineShadowService(
@@ -334,7 +331,6 @@ def test_missing_base_cost_records_master_data_incident_and_replays(
         "evaluation_id": "SHADOW-MISSING-COST",
         "incident_id": incident_id,
         "review_task_id": "REVIEW-1",
-        "products_path": products_path,
         "evaluated_at": NOW + timedelta(minutes=10),
         "initial_observation_id": "OBS-1",
     }
@@ -371,7 +367,7 @@ def test_invalid_authoritative_base_cost_records_master_data_incident(
 ) -> None:
     runtime, incident_id = _runtime_with_s4_incident(tmp_path)
     _approve_policy(runtime)
-    products_path = _products_path(tmp_path, base_cost="0")
+    _seed_runtime_product(runtime, base_cost=Decimal("0"))
     pulse = replace(_pulse(), incident_id=incident_id)
     service = EmergencyOfflineShadowService(
         runtime,
@@ -382,7 +378,6 @@ def test_invalid_authoritative_base_cost_records_master_data_incident(
         evaluation_id="SHADOW-INVALID-COST",
         incident_id=incident_id,
         review_task_id="REVIEW-1",
-        products_path=products_path,
         evaluated_at=NOW + timedelta(minutes=10),
         initial_observation_id="OBS-1",
     )

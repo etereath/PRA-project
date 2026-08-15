@@ -6,6 +6,7 @@ from pathlib import Path
 
 from app.adapters.mayi_huatuan_order import MayiHuatuanOrderReadOnlyAdapter
 from app.automation_models import AutomationRun
+from app.repositories.master_data_repository import RuntimeMasterDataRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.operational_summary_repository import (
     OperationalSummaryRepository,
@@ -23,7 +24,6 @@ from app.services.order_scan_automation import (
     FullMarketScanOrderDispatchHandler,
     OrderScanHandler,
 )
-from app.services.product_mapping import compile_product_mapping_workbook
 from app.services.shadowbot_order_read import (
     ShadowBotFileQueueOrderTransport,
     ShadowBotOrderPageReader,
@@ -35,7 +35,6 @@ def build_order_read_only_handlers(
     *,
     runtime_repository: SQLiteRuntimeRepository,
     queue_dir: Path,
-    mapping_workbook: Path,
     operational_time: OperationalTimeService | None = None,
     timeout_seconds: float = 330.0,
     target_trade_date: Callable[[AutomationRun], date] | None = None,
@@ -76,9 +75,9 @@ def build_order_read_only_handlers(
             runtime_repository,
             operational_time=time_service,
         ),
-        mappings_provider=lambda: compile_product_mapping_workbook(
-            Path(mapping_workbook)
-        ),
+        mappings_provider=RuntimeMasterDataRepository(
+            runtime_repository
+        ).compiled_mappings,
         batch_id_factory=lambda run: f"ORDER-BATCH-{run.run_id}",
         target_trade_date=(
             target_trade_date

@@ -275,7 +275,6 @@ def test_formal_runtime_composition_registers_only_read_only_order_chain(
     handlers = build_order_read_only_handlers(
         runtime_repository=runtime,
         queue_dir=tmp_path / "queue",
-        mapping_workbook=tmp_path / "platform_mappings.xlsx",
     )
 
     assert set(handlers) == {FULL_MARKET_SCAN, ORDER_SCAN}

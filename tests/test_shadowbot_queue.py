@@ -14,9 +14,9 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from app.exceptions import ValidationError
-from app.models import ListingStatus
+from app.models import ListingStatus, Product
+from app.repositories.master_data_repository import RuntimeMasterDataRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.repositories.workbook_repository import save_table_records
 from app.services.shadowbot_executor import (
     EXECUTION_MODE_COMMIT,
     EXECUTION_MODE_READ_ONLY,
@@ -106,6 +106,10 @@ class ShadowBotQueueTests(unittest.TestCase):
     def test_v2_read_result_persists_bound_inventory_observation(self) -> None:
         repository = SQLiteRuntimeRepository(self.db_path)
         repository.init_schema()
+        _seed_runtime_products(
+            repository,
+            [Product("SKU-INTERNAL-001", "A", "B", "50", "扎", Decimal("10"), 1, True)],
+        )
         repository.upsert_listing_status(
             ListingStatus(
                 listing_status_id="LISTING-001",
@@ -164,6 +168,12 @@ class ShadowBotQueueTests(unittest.TestCase):
     def test_v2_complete_page_snapshot_warns_unmapped_and_zeros_absent_existing_listing(self) -> None:
         repository = SQLiteRuntimeRepository(self.db_path)
         repository.init_schema()
+        _seed_runtime_products(
+            repository,
+            [
+                Product("AISHA-B-60-Z", "Aisha", "B", "60", "扎", Decimal("10"), 1, True),
+            ],
+        )
         repository.upsert_listing_status(
             ListingStatus(
                 listing_status_id="LISTING-A",
@@ -279,28 +289,30 @@ class ShadowBotQueueTests(unittest.TestCase):
     def test_v2_unmapped_worker_row_is_promoted_from_inventory_and_created_online(self) -> None:
         repository = SQLiteRuntimeRepository(self.db_path)
         repository.init_schema()
-        products_path = self.root / "products.xlsx"
-        save_table_records(
-            "products",
-            products_path,
+        RuntimeMasterDataRepository(repository).seed(
             [
-                {
-                    "internal_sku": "CAPPUCCINO-E-45-Z",
-                    "product_name": "卡布奇诺",
-                    "grade": "E",
-                    "stem_length": "45",
-                    "unit": "扎",
-                    "base_cost": "10.00",
-                    "current_stock": 1,
-                    "sale_enabled": True,
-                }
+                Product(
+                    internal_sku="CAPPUCCINO-E-45-Z",
+                    product_name="卡布奇诺",
+                    grade="E",
+                    stem_length="45",
+                    unit="扎",
+                    base_cost=Decimal("10.00"),
+                    current_stock=1,
+                    sale_enabled=True,
+                )
             ],
+            [],
+            product_source_ref="synthetic-products",
+            product_source_sha256="sha256:" + "c" * 64,
+            mapping_source_ref="synthetic-mappings",
+            mapping_source_sha256="sha256:" + "d" * 64,
+            actor="test",
         )
         importer = ShadowBotResultImporter(
             repository,
             Mock(),
             self.queue_dir,
-            inventory_products_path=products_path,
         )
         completed_at = datetime(2026, 7, 22, 8, 30, tzinfo=UTC)
         request = {
@@ -1218,6 +1230,21 @@ class ShadowBotQueueTests(unittest.TestCase):
     @staticmethod
     def _reconcile_id(source_attempt_id: str) -> str:
         return "RECONCILE-" + hashlib.sha256(source_attempt_id.encode("utf-8")).hexdigest()[:20]
+
+
+def _seed_runtime_products(
+    repository: SQLiteRuntimeRepository,
+    products: list[Product],
+) -> None:
+    RuntimeMasterDataRepository(repository).seed(
+        products,
+        [],
+        product_source_ref="synthetic-products",
+        product_source_sha256="sha256:" + "c" * 64,
+        mapping_source_ref="synthetic-mappings",
+        mapping_source_sha256="sha256:" + "d" * 64,
+        actor="test",
+    )
 
 
 if __name__ == "__main__":

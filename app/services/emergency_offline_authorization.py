@@ -5,7 +5,6 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import date, datetime
-from pathlib import Path
 
 from app.automation_ui_channel import has_active_automation_ui_run
 from app.enums import (
@@ -49,9 +48,7 @@ class EmergencyOfflineAuthorizationService:
     def __init__(self, runtime_repository: SQLiteRuntimeRepository) -> None:
         self.runtime_repository = runtime_repository
         self.shadow = EmergencyOfflineShadowService(runtime_repository)
-        self.product_cost_reader = (
-            EmergencyOfflineShadowService._read_authoritative_base_cost
-        )
+        self.product_cost_reader = self.shadow._read_authoritative_base_cost
 
     def authorize(
         self,
@@ -59,7 +56,6 @@ class EmergencyOfflineAuthorizationService:
         authorization_id: str,
         incident_id: str,
         review_task_id: str,
-        products_path: Path,
         feature_flag_job_id: str,
         authorized_at: datetime,
         expires_at: datetime,
@@ -77,7 +73,6 @@ class EmergencyOfflineAuthorizationService:
             evaluation_id=f"authorization-shadow:{normalized_id}",
             incident_id=incident_id,
             review_task_id=review_task_id,
-            products_path=products_path,
             evaluated_at=authorized_at,
             initial_observation_id=initial_observation_id,
         )
@@ -129,7 +124,6 @@ class EmergencyOfflineAuthorizationService:
             if not platform_name or not internal_sku or not platform_trade_date:
                 raise ValidationError("Incident scope is incomplete")
             locked_base_cost, locked_source_ref, locked_error = self.product_cost_reader(
-                products_path,
                 internal_sku=internal_sku,
             )
             if (

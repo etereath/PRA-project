@@ -10,7 +10,8 @@ PRA 当前定位为：
 
 2026-08-15 的 7F 后续整改已把代码结构提升到 Runtime Schema v18：商品目录和平台映射成为
 数据库运行时主数据，真实库存继续唯一保存在 v17 库存余额/流水中。新 Web 的业务数据、
-人工任务预览与创建、执行授权以及桌面/手机紧急复核均不再读取商品或映射 XLSX；两份工作
+人工任务预览与创建、日常任务生成、订单映射、Queue/Executor/Importer、执行授权以及桌面/
+手机紧急复核均不再读取商品或映射 XLSX；两份工作
 簿只允许在干净候选库准备时一次性导入。canonical 真实库尚未执行 v18 切换或库存
 bootstrap，因此代码完成不能写成真实运行已启用，仍需新的维护窗口授权。
 
@@ -21,8 +22,8 @@ PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、�
 Event 表；v16 只增加一张 `emergency_offline_policies`，数据库和 Decimal 解释器共同固定
 `emergency_ratio=0.80`。策略先以未批准草稿创建，批准后不可原地修改，只允许版本替换和
 退休；同平台最多一个有效版本。影子服务原样复用 Review、Outbox `sent_at`、完整
-`ONLINE_PULSE`、映射/在线/价格事实和共享写锁，并像人工复核链一样从权威商品工作簿
-一致性回读 `base_cost` 与内容哈希。只有 `P <= base_cost × 0.80` 的 S4 进入 allowlist；
+`ONLINE_PULSE`、映射/在线/价格事实和共享写锁，并像人工复核链一样从 Runtime 数据库商品
+目录一致性回读 `base_cost` 与版本快照。只有 `P <= base_cost × 0.80` 的 S4 进入 allowlist；
 S3 永不自动。成本缺失/非法或来源不可追溯时复用 `MASTER_DATA` Incident fail closed。
 6B 专项为 `33 passed`，受影响回归为 `107 passed`；完整 pytest 为
 `1064 passed, 3 skipped, 97 subtests passed`，隔离系统冒烟为 `16 passed, 0 failed`。
@@ -57,7 +58,7 @@ S3/S4 价格初始 Review、Token、Outbox、兼容通知日志、`REVIEW_RECORD
 `sent_at` 开始；失败或 UNKNOWN 投递阻断无人介入推断。S4 只允许一条五分钟中途提醒，
 ACK、复核结果或恢复会抑制提醒；恢复和任务结果继续使用同一 Outbox 的稳定业务键。
 decision-first Mobile Review 已在原 GET/POST 和单事务入口增加 Incident 分支：“改价到”
-按权威工作簿最新 `base_cost` 校验后创建 MANUAL v4 任务，“立即下架”创建 MANUAL v5
+按 Runtime 数据库最新 `base_cost` 校验后创建 MANUAL v4 任务，“立即下架”创建 MANUAL v5
 任务，“我来处理”不创建平台任务；原 source-task 复核保持回归。完整 Pulse 资格已复用
 Automation Run、`MERGED_RUN` 和商品观察事实，只接受通知送达后开始、已完成导入、范围
 完整、尾部确认、同平台/交易日/SKU、`VERIFIED` 且仍在线的第二观察；失败或不完整只
@@ -109,7 +110,7 @@ result → Importer。整改没有新增表、全局锁、状态枚举、合同�
 Worker/fence 源码已更新但尚未同步真实影刀宿主，本轮没有执行真实平台动作；后续部署必须
 重新完成正常停止、同步、哈希核对与长期 Worker 恢复门禁。
 
-- 从 Excel 读取业务输入。
+- 从 Runtime DB 读取商品、平台映射和库存；价格/上下架规则暂时仍读取受控工作簿。
 - 根据规则和预测输入生成运行态任务。
 - 用 SQLite 保存运行态事实。
 - 通过 Web 后台、Mobile Review 和飞书通知完成运营复核闭环。

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import closing
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Mapping
@@ -11,6 +12,7 @@ from typing import Mapping
 from app.automation_models import AutomationRun, AutomationRunOutcome
 from app.enums import AutomationRunStatus, TaskActionType
 from app.repositories.automation_repository import AutomationRepository
+from app.repositories.master_data_repository import RuntimeMasterDataRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.automation import (
     DAILY_TASK_GENERATION,
@@ -74,7 +76,6 @@ class ReviewTimeoutAutomationHandler:
 class DailyTaskGenerationAutomationHandler:
     runtime_repository: SQLiteRuntimeRepository
     automation_repository: AutomationRepository
-    products_path: Path
     price_rules_path: Path
     listing_rules_path: Path
 
@@ -112,12 +113,21 @@ class DailyTaskGenerationAutomationHandler:
         ):
             raise ValueError("Daily task generation source_allowlist is invalid")
 
-        paths = [self.products_path]
+        paths: list[Path] = []
         if "PRICE_RULES" in sources:
             paths.append(self.price_rules_path)
         if "LISTING_RULES" in sources:
             paths.append(self.listing_rules_path)
         before = {path: path.read_bytes() for path in paths}
+        master_data = RuntimeMasterDataRepository(self.runtime_repository)
+        with closing(self.runtime_repository.connect_read()) as connection:
+            connection.execute("BEGIN")
+            runtime_products = master_data.list_products(connection=connection)
+            product_catalog_snapshot_sha256 = master_data.product_snapshot_sha256(
+                connection=connection
+            )
+        if not runtime_products:
+            raise RuntimeError("Daily task generation product catalog is empty")
         input_payload = {
             "schema_version": "daily-task-generation-input-v1",
             "plan_input_run_id": plan_input.run_id,
@@ -126,6 +136,7 @@ class DailyTaskGenerationAutomationHandler:
             "seller_operation_date": run.seller_operation_date.isoformat(),
             "time_policy_version": run.time_policy_version,
             "source_allowlist": sorted(sources),
+            "product_catalog_snapshot_sha256": product_catalog_snapshot_sha256,
             "files": {
                 path.name: "sha256:" + hashlib.sha256(content).hexdigest()
                 for path, content in before.items()
@@ -133,7 +144,7 @@ class DailyTaskGenerationAutomationHandler:
         }
         summary = generate_tasks_from_sources(
             WorkflowInputs(
-                products_path=self.products_path,
+                products_path=None,
                 price_rules_path=self.price_rules_path,
                 listing_rules_path=self.listing_rules_path,
                 platform_name=run.platform_name,
@@ -141,11 +152,14 @@ class DailyTaskGenerationAutomationHandler:
                 runtime_db_path=self.runtime_repository.db_path,
                 rule_source_allowlist=sources,
                 origin_ref_id=run.run_id,
+                runtime_products=runtime_products,
             )
         )
         after = {path: path.read_bytes() for path in paths}
         if after != before:
             raise RuntimeError("Daily task generation input changed during evaluation")
+        if master_data.product_snapshot_sha256() != product_catalog_snapshot_sha256:
+            raise RuntimeError("Daily task generation product catalog changed during evaluation")
         allowed_actions = set()
         if "PRICE_RULES" in sources:
             allowed_actions.add(TaskActionType.UPDATE_PRICE)
@@ -198,7 +212,6 @@ class DailyTaskGenerationAutomationHandler:
 def build_operations_control_handlers(
     *,
     runtime_repository: SQLiteRuntimeRepository,
-    products_path: Path,
     price_rules_path: Path,
     listing_rules_path: Path,
 ) -> Mapping[str, AutomationHandler]:
@@ -210,7 +223,6 @@ def build_operations_control_handlers(
         DAILY_TASK_GENERATION: DailyTaskGenerationAutomationHandler(
             runtime_repository,
             automation,
-            products_path,
             price_rules_path,
             listing_rules_path,
         ),

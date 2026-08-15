@@ -115,6 +115,13 @@ class RuntimeMasterDataRepository:
         *,
         connection=None,
     ) -> tuple[Decimal, str]:
+        if connection is None:
+            with closing(self.runtime.connect_read()) as opened:
+                opened.execute("BEGIN")
+                return self.product_cost_snapshot(
+                    internal_sku,
+                    connection=opened,
+                )
         product = self.get_product(internal_sku, connection=connection)
         if product is None:
             raise RuntimeMasterDataError("Product is not present in Runtime master data.")
