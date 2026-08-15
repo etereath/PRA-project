@@ -224,3 +224,32 @@ pytest 收集数从 1243 降至 1237；Web 专项为 `59 passed`；完整回归�
 `16 passed, 0 failed`。全量耗时没有随 6 项去重显著下降，因此后续性能治理应依赖测试分层
 和耗时分析，而不是继续删除安全测试。本轮没有修改生产代码，也没有访问真实 Runtime、
 Worker、Queue、飞书或平台。
+
+## 11. 2026-08-16 真实 v18 候选库订单映射整改
+
+取得用户对真实 v18 切换的明确授权后，先完成旧 canonical v14 归档和候选 v18 准备；
+canonical 库没有被替换。候选库首次真实当前日期订单 `READ_ONLY` 完整通过页面范围、尾部、
+Watchdog、Worker、Importer 和 Archive，但非空批次被导入为 `PARTIAL`。只读追溯确认页面
+源批次实际为 `ACCEPTED`，降级发生在 Importer 商品映射阶段。
+
+根因是旧专项验收脚本固定传入空的合成映射集合。该做法可以验证页面和队列能力，却会把
+任何非空真实订单全部导入为 `UNMAPPED`，不符合 v18 正式运行时以数据库主数据为唯一映射
+来源的合同。脚本现与正式订单 Composition Root 对齐，改由同一个调用方指定 Runtime DB
+中的 `RuntimeMasterDataRepository.compiled_mappings` 提供版本化映射；没有恢复工作簿运行时
+旁路。
+
+候选库原有 12 条 PRODUCT 映射均处于 `DISABLED`，但逐条保存了存在于商品目录中的唯一
+候选 SKU。只读预览核对平台、商品名称、平台等级、候选 SKU、商品目录等级和范围唯一性后，
+先生成 SQLite Backup，再通过正式 `MasterDataManagementService` 将这些候选关系确认成
+`VERIFIED`。该操作只修改尚未激活的候选库；旧 canonical 库和真实平台均未修改。确认后
+候选库 `integrity_check=ok`、外键违规为 0。
+
+随后再次执行相同真实 `READ_ONLY`：Automation Run 为 `SUCCESS`、订单批次为 `ACCEPTED`，
+范围完整、尾部确认、Watchdog 验证、导入和归档全部通过，活动 Queue 为 0，平台写操作为 0。
+当前订单快照仍然非空，因此既有“可信空 OPEN 快照”库存 bootstrap 门禁继续生效；本轮没有
+执行库存 bootstrap、候选库 verify 或 canonical 激活。
+
+修复后的验收脚本、订单 Adapter/Importer/Automation、Queue 集成和主数据专项为
+`47 passed`。`git diff --check` 和修改文件严格 UTF-8 回读通过；当前 Python 环境未安装
+Ruff，因此没有宣称 Ruff 通过。候选库映射确认前的备份和两次真实只读审计保留在仓库外
+切换目录，未向仓库写入真实订单值、平台订单号或买家信息。

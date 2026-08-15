@@ -8,7 +8,6 @@ written to the repository or emitted to stdout.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 from contextlib import closing
@@ -31,6 +30,9 @@ from app.enums import AutomationRunStatus  # noqa: E402
 from app.repositories.automation_repository import (  # noqa: E402
     AutomationRepository,
 )
+from app.repositories.master_data_repository import (  # noqa: E402
+    RuntimeMasterDataRepository,
+)
 from app.repositories.sqlite_runtime_repository import (  # noqa: E402
     SQLiteRuntimeRepository,
 )
@@ -50,9 +52,6 @@ from app.services.order_observation import (  # noqa: E402
 from app.services.order_scan_automation import (  # noqa: E402
     FullMarketScanOrderCoordinator,
     OrderScanHandler,
-)
-from app.services.product_mapping import (  # noqa: E402
-    compile_product_mapping_rows,
 )
 from app.services.shadowbot_order_read import (  # noqa: E402
     ShadowBotFileQueueOrderTransport,
@@ -89,6 +88,14 @@ def _job(
             "catchup_policy": "LATEST_ONLY",
         },
     )
+
+
+def _runtime_mappings_provider(
+    runtime: SQLiteRuntimeRepository,
+):
+    """Return the same Runtime-backed mapping provider used in production."""
+
+    return RuntimeMasterDataRepository(runtime).compiled_mappings
 
 
 def run_acceptance(
@@ -180,10 +187,6 @@ def run_acceptance(
         transport,
         attempt_id_factory=lambda: attempt_id,
     )
-    mappings = compile_product_mapping_rows(
-        (),
-        source_workbook_sha256=hashlib.sha256(b"").hexdigest(),
-    )
     handler = OrderScanHandler(
         adapter=MayiHuatuanOrderReadOnlyAdapter(
             reader,
@@ -194,7 +197,11 @@ def run_acceptance(
             operational_time=operational_time,
             clock=lambda: datetime.now(timezone.utc),
         ),
-        mappings_provider=lambda: mappings,
+        # Match the production composition root: order observations must be
+        # resolved against the versioned master data in this exact Runtime DB.
+        # An empty synthetic mapping set is only suitable for fixture tests and
+        # would silently downgrade every non-empty real scan to PARTIAL.
+        mappings_provider=_runtime_mappings_provider(runtime),
         batch_id_factory=lambda run: f"ORDER-BATCH-{run.run_id}",
         target_trade_date=(
             (lambda run: target_trade_date)
