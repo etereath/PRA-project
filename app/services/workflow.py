@@ -40,6 +40,10 @@ from app.platform_identity import (
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.inventory_repository import InventoryRepository
+from app.repositories.master_data_repository import (
+    RuntimeMasterDataError,
+    RuntimeMasterDataRepository,
+)
 from app.repositories.workbook_repository import (
     export_execution_logs,
     export_tasks,
@@ -420,7 +424,6 @@ def resolve_mobile_review(
     action: str,
     note: str = "",
     resolution_payload: dict[str, object] | None = None,
-    products_path: Path | None = None,
     now: datetime | None = None,
 ) -> MobileReviewResolutionSummary:
     repository = SQLiteRuntimeRepository(db_path)
@@ -436,6 +439,7 @@ def resolve_mobile_review(
         ) from exc
 
     token_hash = token_service._hash_raw_token(raw_token)
+    master_data = RuntimeMasterDataRepository(repository)
     emergency_base_cost = None
     emergency_base_cost_source_ref = ""
     review_task = repository.get_review_task(review_task_id)
@@ -444,23 +448,23 @@ def resolve_mobile_review(
         and review_task.review_type == "emergency_protection"
         and review_status in {ReviewTaskStatus.ADJUSTED, ReviewTaskStatus.APPROVED}
     ):
-        if products_path is None:
+        try:
+            emergency_base_cost, emergency_base_cost_source_ref = (
+                master_data.product_cost_snapshot(
+                    str(review_task.internal_sku or "")
+                )
+            )
+        except RuntimeMasterDataError as exc:
             raise MobileReviewTransactionError(
                 MobileReviewErrorCode.CONCURRENT_UPDATE,
                 "商品主数据不可用，已阻止创建平台任务",
-            )
-        emergency_base_cost, emergency_base_cost_source_ref = (
-            _read_authoritative_product_cost_snapshot(
-                products_path,
-                internal_sku=str(review_task.internal_sku or ""),
-            )
-        )
+            ) from exc
     snapshot_verifier = (
-        lambda: _read_authoritative_product_cost_snapshot(
-            products_path,
-            internal_sku=str(review_task.internal_sku or ""),
+        lambda: master_data.product_cost_snapshot(
+            str(review_task.internal_sku or "")
         )
-        if products_path is not None
+        if review_task is not None
+        and review_task.review_type == "emergency_protection"
         else None
     )
     atomic_result = repository.resolve_mobile_review_atomic(

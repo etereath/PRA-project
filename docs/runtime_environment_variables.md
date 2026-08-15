@@ -198,15 +198,17 @@ $env:PRA_ALLOWED_DATA_DIRS = "D:\PRA_Runtime\data;D:\PRA_Runtime\imports"
 
 ### 新运营 Web 固定依赖路径
 
-7B Composition Root 在启动时一次性解析以下可选变量；未提供时使用仓库既有默认路径：
+当前 Composition Root 在启动时一次性解析以下可选变量；未提供时使用仓库既有默认路径：
 
 - `PRA_RUNTIME_DB`：Runtime DB；
-- `PRA_PRODUCTS_WORKBOOK`：商品工作簿；
 - `PRA_PRICE_RULES_WORKBOOK`：价格规则工作簿；
 - `PRA_LISTING_RULES_WORKBOOK`：上下架规则工作簿；
-- `PRA_PLATFORM_MAPPINGS_WORKBOOK`：平台商品映射工作簿；
 - `PRA_SHADOWBOT_IDENTITY_MAPPING`：ShadowBot 商品身份映射 JSON；
 - `SHADOWBOT_QUEUE_DIR`：Queue 根目录。
+
+Schema v18 后，商品目录和平台映射只从 `PRA_RUNTIME_DB` 读取。Web 不再解析
+`PRA_PRODUCTS_WORKBOOK` 或 `PRA_PLATFORM_MAPPINGS_WORKBOOK`；这两个变量只允许由受控
+干净重建/一次性导入脚本使用，不能作为 Web 缺少数据库主数据时的回退路径。
 
 真实平台执行准备还可通过 `SHADOWBOT_APPLET_URI` 固定小程序 URI。该值同样只在启动时
 读取，不能由 Web 请求覆盖。未配置时，人工任务创建和只读页面仍可使用；需要准备真实

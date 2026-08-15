@@ -28,11 +28,9 @@ class OperationsWebConfigurationError(ValueError):
 @dataclass(frozen=True, slots=True)
 class OperationsWebPaths:
     runtime_db: Path
-    products_workbook: Path
     price_rules_workbook: Path
     listing_rules_workbook: Path
     queue_root: Path
-    platform_mappings_workbook: Path | None = None
     shadowbot_identity_mapping: Path | None = None
     backup_root: Path | None = None
     automation_heartbeat: Path | None = None
@@ -85,9 +83,6 @@ class OperationsWebSettings:
         root = project_root.resolve(strict=False)
         paths = OperationsWebPaths(
             runtime_db=_fixed_path(source, "PRA_RUNTIME_DB", DEFAULT_RUNTIME_DB, root),
-            products_workbook=_fixed_path(
-                source, "PRA_PRODUCTS_WORKBOOK", Path("data/samples/products.xlsx"), root
-            ),
             price_rules_workbook=_fixed_path(
                 source, "PRA_PRICE_RULES_WORKBOOK", Path("data/samples/price_rules.xlsx"), root
             ),
@@ -96,12 +91,6 @@ class OperationsWebSettings:
             ),
             queue_root=_fixed_path(
                 source, "SHADOWBOT_QUEUE_DIR", Path("data/runtime/shadowbot_queue"), root
-            ),
-            platform_mappings_workbook=_fixed_path(
-                source,
-                "PRA_PLATFORM_MAPPINGS_WORKBOOK",
-                Path("data/samples/platform_mappings.xlsx"),
-                root,
             ),
             shadowbot_identity_mapping=_fixed_path(
                 source,

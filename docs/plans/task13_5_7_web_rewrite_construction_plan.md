@@ -520,6 +520,12 @@ Route 不得接受脚本名、路径或参数，不得直接 `subprocess.run(...
 后台具有新鲜心跳后验收；真实平台写仍等待用户另行明确商品和批次授权；GitHub
 Linux/Windows CI 由本阶段 Draft PR 执行。
 
+后续整改状态（2026-08-15）：实际 Web 验收发现人工任务仍会读取商品与平台映射 XLSX，
+与“Web 为正式运营控制面”的方向冲突。现以 Runtime Schema v18 收口：商品目录和平台映射
+一次性导入候选库，Web 读模型、任务预览/创建、执行授权和桌面/手机复核均只读同一 Runtime
+DB；库存仍唯一属于 v17 库存账本。详见
+[Runtime Schema v18 商品与平台映射主数据合同](../runtime_master_data_v18.md)。
+
 ## 10. CLI 正式归宿矩阵
 
 | 当前入口 | 正式归宿 | CLI 保留 |

@@ -21,10 +21,16 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app.repositories.inventory_repository import InventoryRepository  # noqa: E402
+from app.repositories.master_data_repository import (  # noqa: E402
+    RuntimeMasterDataRepository,
+)
 from app.repositories.sqlite_runtime_repository import (  # noqa: E402
     SQLiteRuntimeRepository,
 )
-from app.repositories.workbook_repository import load_products  # noqa: E402
+from app.repositories.workbook_repository import (  # noqa: E402
+    load_products,
+    load_table_records,
+)
 from app.services.authoritative_inventory import (  # noqa: E402
     sqlite_logical_snapshot_sha256,
 )
@@ -34,8 +40,8 @@ from app.services.product_mapping import (  # noqa: E402
 
 
 MANIFEST_NAME = "clean-runtime-cutover-manifest.json"
-MANIFEST_VERSION = 1
-ACTIVATION_CONFIRMATION = "REPLACE_TEST_RUNTIME_WITH_CLEAN_V17"
+MANIFEST_VERSION = 2
+ACTIVATION_CONFIRMATION = "REPLACE_TEST_RUNTIME_WITH_CLEAN_V18"
 ROLLBACK_CONFIRMATION = "ROLLBACK_TO_ARCHIVED_TEST_RUNTIME"
 
 
@@ -90,6 +96,7 @@ def prepare_clean_runtime(
     if any(item.current_stock < 0 for item in product_items):
         raise CleanRuntimeCutoverError("商品工作簿包含负库存，不能准备切换")
     compiled_mappings = compile_product_mapping_workbook(mappings)
+    mapping_rows = tuple(load_table_records("platform_mappings", mappings))
     mapping_status_counts = Counter(
         item.mapping_status.value for item in compiled_mappings.records
     )
@@ -123,7 +130,7 @@ def prepare_clean_runtime(
     candidate_dir.mkdir()
     inputs_dir.mkdir()
     archived_runtime = archive_dir / "legacy-test-runtime.sqlite3"
-    candidate_runtime = candidate_dir / "pra_runtime-v17-candidate.sqlite3"
+    candidate_runtime = candidate_dir / "pra_runtime-v18-candidate.sqlite3"
     archived_products = inputs_dir / "products.xlsx"
     archived_mappings = inputs_dir / "platform_mappings.xlsx"
     try:
@@ -142,16 +149,25 @@ def prepare_clean_runtime(
 
         candidate_repository = SQLiteRuntimeRepository(candidate_runtime)
         candidate_repository.init_schema()
+        master_seed = RuntimeMasterDataRepository(candidate_repository).seed(
+            product_items,
+            mapping_rows,
+            product_source_ref=str(archived_products),
+            product_source_sha256=products_sha256,
+            mapping_source_ref=str(archived_mappings),
+            mapping_source_sha256=mappings_sha256,
+            actor="clean-runtime-cutover",
+        )
         candidate_health = candidate_repository.check_schema_health()
         if not candidate_health.ok:
             raise CleanRuntimeCutoverError(
-                "新建 v17 候选库未通过健康检查：" + candidate_health.summary
+                "新建 v18 候选库未通过健康检查：" + candidate_health.summary
             )
         candidate_authority = InventoryRepository(
             candidate_repository
         ).get_authority_state()
         if candidate_authority.authority_mode != "PRE_CUTOVER":
-            raise CleanRuntimeCutoverError("新建 v17 候选库不是 PRE_CUTOVER 状态")
+            raise CleanRuntimeCutoverError("新建 v18 候选库不是 PRE_CUTOVER 状态")
         candidate_snapshot = sqlite_logical_snapshot_sha256(candidate_repository)
         manifest = {
             **preview,
@@ -165,6 +181,12 @@ def prepare_clean_runtime(
             "candidate_runtime_snapshot_sha256_at_prepare": candidate_snapshot,
             "candidate_schema_health": candidate_health.as_dict(),
             "candidate_authority_mode": candidate_authority.authority_mode,
+            "product_catalog_snapshot_sha256": master_seed[
+                "product_snapshot_sha256"
+            ],
+            "platform_mapping_snapshot_sha256": master_seed[
+                "mapping_snapshot_sha256"
+            ],
             "preserved_products": [
                 {
                     "internal_sku": item.internal_sku,
@@ -205,31 +227,30 @@ def prepare_clean_runtime(
 def verify_candidate(
     *,
     manifest_path: Path,
-    products_path: Path,
-    platform_mappings_path: Path,
 ) -> dict[str, Any]:
     manifest = _load_manifest(manifest_path)
-    products = _require_file(products_path, "商品工作簿")
-    mappings = _require_file(platform_mappings_path, "平台映射工作簿")
-    _require_manifest_hashes(manifest, products, mappings)
     candidate = _manifest_file(manifest, "candidate_runtime_db")
     repository = SQLiteRuntimeRepository(candidate)
     health = repository.check_schema_health()
     if not health.ok:
-        raise CleanRuntimeCutoverError("v17 候选库未通过健康检查：" + health.summary)
+        raise CleanRuntimeCutoverError("v18 候选库未通过健康检查：" + health.summary)
     authority = InventoryRepository(repository).get_authority_state()
     if authority.authority_mode != "DB_AUTHORITY":
-        raise CleanRuntimeCutoverError("v17 候选库尚未完成真实库存 bootstrap，不能激活")
-    product_items = tuple(load_products(products))
-    expected_balances = {
-        item.internal_sku: int(item.current_stock) for item in product_items
-    }
+        raise CleanRuntimeCutoverError("v18 候选库尚未完成真实库存 bootstrap，不能激活")
+    expected_balances = _expected_inventory_from_manifest(manifest)
     balance_items = InventoryRepository(repository).list_balances()
     actual_balances = {
         item.internal_sku: int(item.current_qty) for item in balance_items
     }
     if actual_balances != expected_balances:
-        raise CleanRuntimeCutoverError("候选库逐 SKU 库存回读与商品冻结快照不一致")
+        raise CleanRuntimeCutoverError("候选库逐 SKU 库存回读与切换清单不一致")
+    master_data = RuntimeMasterDataRepository(repository)
+    product_snapshot = master_data.product_snapshot_sha256()
+    mapping_snapshot = master_data.mapping_snapshot_sha256()
+    if product_snapshot != str(manifest.get("product_catalog_snapshot_sha256")):
+        raise CleanRuntimeCutoverError("候选库商品目录与切换清单不一致")
+    if mapping_snapshot != str(manifest.get("platform_mapping_snapshot_sha256")):
+        raise CleanRuntimeCutoverError("候选库平台映射与切换清单不一致")
     integrity, foreign_key_violations = _sqlite_integrity(candidate)
     if integrity.lower() != "ok" or foreign_key_violations:
         raise CleanRuntimeCutoverError("候选库 SQLite 完整性或外键检查失败")
@@ -241,8 +262,8 @@ def verify_candidate(
         "authority_mode": authority.authority_mode,
         "sku_count": len(actual_balances),
         "inventory_total": sum(actual_balances.values()),
-        "products_sha256": _file_sha256(products),
-        "platform_mappings_sha256": _file_sha256(mappings),
+        "product_catalog_snapshot_sha256": product_snapshot,
+        "platform_mapping_snapshot_sha256": mapping_snapshot,
         "integrity_check": integrity,
         "foreign_key_violation_count": foreign_key_violations,
     }
@@ -252,8 +273,6 @@ def activate_candidate(
     *,
     manifest_path: Path,
     source_runtime_db: Path,
-    products_path: Path,
-    platform_mappings_path: Path,
     expected_source_snapshot_sha256: str,
     expected_candidate_snapshot_sha256: str,
     confirmation: str,
@@ -261,15 +280,10 @@ def activate_candidate(
 ) -> dict[str, Any]:
     manifest = _load_manifest(manifest_path)
     source = _require_file(source_runtime_db, "当前 Runtime DB")
-    products = _require_file(products_path, "商品工作簿")
-    mappings = _require_file(platform_mappings_path, "平台映射工作簿")
-    _require_canonical_inputs(source, products, mappings)
-    _require_manifest_hashes(manifest, products, mappings)
+    _require_canonical_runtime(source)
     source_snapshot = sqlite_logical_snapshot_sha256(SQLiteRuntimeRepository(source))
     candidate_verification = verify_candidate(
         manifest_path=manifest_path,
-        products_path=products,
-        platform_mappings_path=mappings,
     )
     candidate_snapshot = str(
         candidate_verification["candidate_runtime_snapshot_sha256"]
@@ -285,7 +299,7 @@ def activate_candidate(
     _check_preview_or_apply_hash(
         expected_candidate_snapshot_sha256,
         candidate_snapshot,
-        "v17 候选库逻辑快照",
+        "v18 候选库逻辑快照",
         apply=apply,
     )
     preview = {
@@ -308,7 +322,7 @@ def activate_candidate(
     activation_dir = workspace / "activation" / (f"{_timestamp()}-{uuid4().hex[:8]}")
     activation_dir.mkdir(parents=True, exist_ok=False)
     final_legacy_archive = activation_dir / "runtime-before-activation.sqlite3"
-    staged_candidate = source.with_name(f".{source.name}.clean-v17-stage-{uuid4().hex}")
+    staged_candidate = source.with_name(f".{source.name}.clean-v18-stage-{uuid4().hex}")
     displaced_source = activation_dir / "runtime-displaced.sqlite3"
     displaced_sidecars: list[tuple[Path, Path]] = []
     source_displaced = False
@@ -338,7 +352,7 @@ def activate_candidate(
         os.replace(staged_candidate, source)
         activated_verification = _verify_activated_runtime(
             source=source,
-            products=products,
+            manifest=manifest,
             expected_snapshot=candidate_snapshot,
         )
         activation_record = {
@@ -420,7 +434,7 @@ def rollback_activation(
     rollback_dir.mkdir(exist_ok=False)
     current_backup = rollback_dir / "runtime-before-rollback.sqlite3"
     staged_legacy = source.with_name(f".{source.name}.legacy-stage-{uuid4().hex}")
-    displaced_current = rollback_dir / "runtime-displaced-v17.sqlite3"
+    displaced_current = rollback_dir / "runtime-displaced-v18.sqlite3"
     displaced_sidecars: list[tuple[Path, Path]] = []
     source_displaced = False
     try:
@@ -441,7 +455,7 @@ def rollback_activation(
             "mode": "ROLLED_BACK",
             "rolled_back_at": _utc_now(),
             "restored_runtime_snapshot_sha256": restored_snapshot,
-            "preserved_v17_runtime": str(displaced_current),
+            "preserved_v18_runtime": str(displaced_current),
         }
         _atomic_write_json(rollback_dir / "rollback-record.json", result)
         return result
@@ -458,7 +472,7 @@ def rollback_activation(
 
 
 def _verify_activated_runtime(
-    *, source: Path, products: Path, expected_snapshot: str
+    *, source: Path, manifest: dict[str, Any], expected_snapshot: str
 ) -> dict[str, Any]:
     repository = SQLiteRuntimeRepository(source)
     health = repository.check_schema_health()
@@ -469,15 +483,22 @@ def _verify_activated_runtime(
     snapshot = sqlite_logical_snapshot_sha256(repository)
     if snapshot != expected_snapshot:
         raise CleanRuntimeCutoverError("激活后的 Runtime DB 逻辑快照不一致")
-    expected = {
-        item.internal_sku: int(item.current_stock) for item in load_products(products)
-    }
+    expected = _expected_inventory_from_manifest(manifest)
     actual = {
         item.internal_sku: int(item.current_qty)
         for item in InventoryRepository(repository).list_balances()
     }
     if actual != expected:
         raise CleanRuntimeCutoverError("激活后的逐 SKU 库存回读不一致")
+    master_data = RuntimeMasterDataRepository(repository)
+    if master_data.product_snapshot_sha256() != str(
+        manifest.get("product_catalog_snapshot_sha256")
+    ):
+        raise CleanRuntimeCutoverError("激活后的商品目录回读不一致")
+    if master_data.mapping_snapshot_sha256() != str(
+        manifest.get("platform_mapping_snapshot_sha256")
+    ):
+        raise CleanRuntimeCutoverError("激活后的平台映射回读不一致")
     return {
         "activated_runtime_snapshot_sha256": snapshot,
         "activated_schema_version": health.actual_version,
@@ -486,13 +507,17 @@ def _verify_activated_runtime(
     }
 
 
-def _require_manifest_hashes(
-    manifest: dict[str, Any], products: Path, mappings: Path
-) -> None:
-    if _file_sha256(products) != str(manifest.get("products_sha256")):
-        raise CleanRuntimeCutoverError("商品工作簿在准备后发生变化")
-    if _file_sha256(mappings) != str(manifest.get("platform_mappings_sha256")):
-        raise CleanRuntimeCutoverError("平台映射工作簿在准备后发生变化")
+def _expected_inventory_from_manifest(manifest: dict[str, Any]) -> dict[str, int]:
+    rows = manifest.get("preserved_products")
+    if not isinstance(rows, list) or not rows:
+        raise CleanRuntimeCutoverError("切换清单缺少逐 SKU 库存冻结值")
+    try:
+        return {
+            str(row["internal_sku"]): int(row["current_stock"])
+            for row in rows
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CleanRuntimeCutoverError("切换清单逐 SKU 库存冻结值无效") from exc
 
 
 def _load_manifest(path: Path) -> dict[str, Any]:
@@ -548,6 +573,14 @@ def _require_canonical_inputs(source: Path, products: Path, mappings: Path) -> N
     for actual, canonical, label in expected:
         if actual != canonical:
             raise CleanRuntimeCutoverError(f"{label} 不是固定环境配置路径")
+
+
+def _require_canonical_runtime(source: Path) -> None:
+    canonical = _canonical_path(
+        "PRA_RUNTIME_DB", Path("data/runtime/pra_runtime.sqlite3")
+    )
+    if source != canonical:
+        raise CleanRuntimeCutoverError("Runtime DB 不是固定环境配置路径")
 
 
 def _canonical_path(environment_name: str, default: Path) -> Path:
@@ -678,7 +711,7 @@ def _timestamp() -> str:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="归档旧测试 Runtime，并受控准备、验证、激活或回滚干净 v17 Runtime。"
+        description="归档旧测试 Runtime，并受控准备、验证、激活或回滚干净 v18 Runtime。"
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
     prepare = subparsers.add_parser("prepare")
@@ -693,14 +726,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     verify = subparsers.add_parser("verify")
     verify.add_argument("--manifest", type=Path, required=True)
-    verify.add_argument("--products", type=Path, required=True)
-    verify.add_argument("--platform-mappings", type=Path, required=True)
 
     activate = subparsers.add_parser("activate")
     activate.add_argument("--manifest", type=Path, required=True)
     activate.add_argument("--source-runtime-db", type=Path, required=True)
-    activate.add_argument("--products", type=Path, required=True)
-    activate.add_argument("--platform-mappings", type=Path, required=True)
     activate.add_argument("--expected-source-snapshot-sha256", default="")
     activate.add_argument("--expected-candidate-snapshot-sha256", default="")
     activate.add_argument("--confirmation", default="")
@@ -735,15 +764,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "verify":
             result = verify_candidate(
                 manifest_path=args.manifest,
-                products_path=args.products,
-                platform_mappings_path=args.platform_mappings,
             )
         elif args.command == "activate":
             result = activate_candidate(
                 manifest_path=args.manifest,
                 source_runtime_db=args.source_runtime_db,
-                products_path=args.products,
-                platform_mappings_path=args.platform_mappings,
                 expected_source_snapshot_sha256=(args.expected_source_snapshot_sha256),
                 expected_candidate_snapshot_sha256=(
                     args.expected_candidate_snapshot_sha256

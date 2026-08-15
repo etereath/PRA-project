@@ -535,12 +535,8 @@ def smoke_environment():
         admin_password=SMOKE_ADMIN_PASSWORD,
         paths=OperationsWebPaths(
             runtime_db=TEST_DB,
-            products_workbook=ROOT / "data" / "samples" / "products.xlsx",
             price_rules_workbook=ROOT / "data" / "samples" / "price_rules.xlsx",
             listing_rules_workbook=ROOT / "data" / "samples" / "listing_rules.xlsx",
-            platform_mappings_workbook=(
-                ROOT / "data" / "samples" / "platform_mappings.xlsx"
-            ),
             shadowbot_identity_mapping=(
                 ROOT / "shadowbot" / "test2" / "product_identity_mapping.json"
             ),

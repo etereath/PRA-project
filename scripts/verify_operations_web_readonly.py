@@ -37,11 +37,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Verify Operations Web GET routes with a fixed read-only Runtime DB."
     )
     parser.add_argument("--runtime-db", type=Path, required=True)
-    parser.add_argument("--products", type=Path, required=True)
     parser.add_argument("--price-rules", type=Path, required=True)
     parser.add_argument("--listing-rules", type=Path, required=True)
     parser.add_argument("--queue-dir", type=Path, required=True)
-    parser.add_argument("--platform-mappings", type=Path)
     parser.add_argument("--identity-mapping", type=Path)
     parser.add_argument("--backup-dir", type=Path)
     parser.add_argument("--automation-heartbeat", type=Path)
@@ -113,7 +111,7 @@ def _call_get(application, *, path: str, cookie: str) -> str:
 def main() -> int:
     args = build_parser().parse_args()
     runtime_db = args.runtime_db.resolve(strict=True)
-    fixed_inputs = (args.products, args.price_rules, args.listing_rules)
+    fixed_inputs = (args.price_rules, args.listing_rules)
     for item in fixed_inputs:
         item.resolve(strict=True)
     queue_dir = args.queue_dir.resolve(strict=True)
@@ -127,15 +125,9 @@ def main() -> int:
         admin_password="<runtime-only>",
         paths=OperationsWebPaths(
             runtime_db=runtime_db,
-            products_workbook=args.products.resolve(strict=True),
             price_rules_workbook=args.price_rules.resolve(strict=True),
             listing_rules_workbook=args.listing_rules.resolve(strict=True),
             queue_root=queue_dir,
-            platform_mappings_workbook=(
-                args.platform_mappings.resolve(strict=True)
-                if args.platform_mappings is not None
-                else None
-            ),
             shadowbot_identity_mapping=(
                 args.identity_mapping.resolve(strict=True)
                 if args.identity_mapping is not None

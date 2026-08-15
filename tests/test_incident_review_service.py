@@ -30,7 +30,8 @@ from app.operations_web.composition import OperationsWebPaths
 from app.operations_web.presenters import render_mobile_review
 from app.operations_web.queries import OperationsQueryService
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.repositories.workbook_repository import PRODUCT_HEADERS
+from app.repositories.master_data_repository import RuntimeMasterDataRepository
+from app.repositories.workbook_repository import PRODUCT_HEADERS, load_products
 from app.services.incident_management import (
     IncidentDetection,
     IncidentManagementService,
@@ -419,7 +420,6 @@ def test_mobile_review_page_shows_three_business_actions_and_price_input(
         runtime_repository,
         OperationsWebPaths(
             runtime_db=runtime_repository.db_path,
-            products_workbook=runtime_repository.db_path.parent / "products.xlsx",
             price_rules_workbook=runtime_repository.db_path.parent / "price_rules.xlsx",
             listing_rules_workbook=runtime_repository.db_path.parent / "listing_rules.xlsx",
             queue_root=runtime_repository.db_path.parent / "queue",
@@ -1021,10 +1021,18 @@ def test_authenticated_web_review_reuses_incident_atomic_path(
         ]
     )
     workbook.save(products_path)
+    RuntimeMasterDataRepository(runtime_repository).seed(
+        load_products(products_path),
+        [],
+        product_source_ref="synthetic-products",
+        product_source_sha256="sha256:" + "c" * 64,
+        mapping_source_ref="synthetic-mappings",
+        mapping_source_sha256="sha256:" + "d" * 64,
+        actor="test",
+    )
     service = ReviewResolutionApplicationService(
         runtime_repository,
         PrincipalCapabilityBackend(),
-        products_path=products_path,
     )
 
     result = service.resolve(
@@ -1386,7 +1394,7 @@ def test_manual_review_cost_snapshot_fails_closed_after_database_lock_wait(
     assert runtime_repository.list_tasks() == []
 
 
-def test_workflow_rereads_authoritative_product_base_cost_for_incident_review(
+def test_workflow_rereads_runtime_product_base_cost_for_incident_review(
     runtime_repository,
     tmp_path,
 ):
@@ -1414,6 +1422,15 @@ def test_workflow_rereads_authoritative_product_base_cost_for_incident_review(
         ]
     )
     workbook.save(products_path)
+    RuntimeMasterDataRepository(runtime_repository).seed(
+        load_products(products_path),
+        [],
+        product_source_ref="synthetic-products",
+        product_source_sha256="sha256:" + "c" * 64,
+        mapping_source_ref="synthetic-mappings",
+        mapping_source_sha256="sha256:" + "d" * 64,
+        actor="test",
+    )
 
     result = resolve_mobile_review(
         runtime_repository.db_path,
@@ -1421,7 +1438,6 @@ def test_workflow_rereads_authoritative_product_base_cost_for_incident_review(
         review.raw_token,
         ReviewTaskStatus.ADJUSTED.value,
         resolution_payload={"adjustment": {"target_price": "10.00"}},
-        products_path=products_path,
         now=NOW + timedelta(minutes=2),
     )
 
@@ -1429,7 +1445,7 @@ def test_workflow_rereads_authoritative_product_base_cost_for_incident_review(
     assert result.source_task.target_price == Decimal("10.00")
     assert result.source_task.decision_trace["base_cost"] == "10.00"
     assert str(result.source_task.decision_trace["base_cost_source_ref"]).startswith(
-        "products.xlsx:sha256:"
+        "runtime-db:product_catalog:sha256:"
     )
 
 

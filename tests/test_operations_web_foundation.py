@@ -114,7 +114,6 @@ def operations_web(tmp_path: Path):
         admin_password="synthetic-password",
         paths=OperationsWebPaths(
             runtime_db=runtime_db,
-            products_workbook=products,
             price_rules_workbook=price_rules,
             listing_rules_workbook=listing_rules,
             queue_root=queue_root,
@@ -456,7 +455,7 @@ def test_all_get_routes_are_zero_write_and_never_initialize_schema(operations_we
         ("/database/sales-analysis", authenticated_cookie, {"200"}),
         ("/database/dictionary", authenticated_cookie, {"200"}),
         ("/database/quality", authenticated_cookie, {"200"}),
-        ("/database/product/NO-SUCH-PRODUCT", authenticated_cookie, {"200"}),
+        ("/database/product/NO-SUCH-PRODUCT", authenticated_cookie, {"404"}),
         ("/management", authenticated_cookie, {"200"}),
         ("/management/task/NO-SUCH-TASK", authenticated_cookie, {"404"}),
         ("/management/review/NO-SUCH-REVIEW", authenticated_cookie, {"404"}),
@@ -482,7 +481,6 @@ def test_health_does_not_create_missing_runtime_database(tmp_path: Path) -> None
     missing_db = tmp_path / "missing" / "runtime.sqlite3"
     paths = OperationsWebPaths(
         runtime_db=missing_db,
-        products_workbook=tmp_path / "products.xlsx",
         price_rules_workbook=tmp_path / "price.xlsx",
         listing_rules_workbook=tmp_path / "listing.xlsx",
         queue_root=tmp_path / "queue",

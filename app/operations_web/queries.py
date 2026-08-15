@@ -1,6 +1,6 @@
 """Task 13.5-7C 运营事实查询。
 
-本模块只组合既有权威 Repository 和工作簿读取器，不创建 Schema、不修复数据，也不
+本模块只组合既有权威 Repository，不创建 Schema、不修复数据，也不
 调用 Queue、Worker、Importer 或平台 Adapter。
 """
 
@@ -46,6 +46,7 @@ from app.operations_web.read_models import (
 )
 from app.repositories.automation_repository import AutomationRepository
 from app.repositories.inventory_repository import InventoryRepository
+from app.repositories.master_data_repository import RuntimeMasterDataRepository
 from app.repositories.operational_incident_repository import (
     OperationalIncidentRepository,
 )
@@ -53,7 +54,6 @@ from app.repositories.operational_summary_repository import (
     OperationalSummaryRepository,
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.repositories.workbook_repository import load_products
 from app.review_policy import allowed_review_statuses, review_action_label
 from app.services.automation import (
     DAILY_TASK_GENERATION,
@@ -65,7 +65,6 @@ from app.services.automation import (
 )
 from app.services.automation_configuration import CONFIGURABLE_JOB_TYPES
 from app.services.operational_time import OperationalTimeContext, OperationalTimeService
-from app.services.authoritative_inventory import InventoryProvider
 from app.services.notification_outbox import (
     NOTIFICATION_TYPE_TITLES,
     REVIEW_TYPE_LABELS,
@@ -189,7 +188,7 @@ class OperationsQueryService:
         self.incidents = OperationalIncidentRepository(runtime_repository)
         self.summaries = OperationalSummaryRepository(runtime_repository)
         self.inventory = InventoryRepository(runtime_repository)
-        self.inventory_provider = InventoryProvider(self.inventory)
+        self.master_data = RuntimeMasterDataRepository(runtime_repository)
         self.now_provider = now_provider or (lambda: datetime.now(timezone.utc))
 
     def notification_drawer(self) -> NotificationDrawerReadModel:
@@ -749,21 +748,20 @@ class OperationsQueryService:
         components.append(ComponentReadModel("业务数据库", state, checked_at))
 
         workbook_paths = (
-            self.paths.products_workbook,
             self.paths.price_rules_workbook,
             self.paths.listing_rules_workbook,
         )
         missing = sum(1 for item in workbook_paths if not item.is_file())
         workbook_state = (
-            StateReadModel(ReadState.READY, "资料齐全", "商品和规则资料可以正常读取")
+            StateReadModel(ReadState.READY, "资料齐全", "规则资料可以正常读取")
             if missing == 0
             else StateReadModel(
                 ReadState.UNAVAILABLE,
                 "资料不完整",
-                f"有 {missing} 份商品或规则资料缺失，请联系管理员补充",
+                f"有 {missing} 份规则资料缺失，请联系管理员补充",
             )
         )
-        components.append(ComponentReadModel("商品与规则资料", workbook_state, checked_at))
+        components.append(ComponentReadModel("规则资料", workbook_state, checked_at))
 
         components.append(
             ComponentReadModel(
@@ -1909,8 +1907,7 @@ class OperationsQueryService:
 
     def _load_products(self) -> tuple[list[Product], str]:
         try:
-            products = load_products(self.paths.products_workbook)
-            return self.inventory_provider.hydrate_products(products), ""
+            return list(self.master_data.list_products()), ""
         except Exception as exc:
             return [], type(exc).__name__
 

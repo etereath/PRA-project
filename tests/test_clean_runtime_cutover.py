@@ -259,17 +259,15 @@ def test_prepare_preview_cli_runs_as_a_direct_utf8_script(tmp_path: Path) -> Non
 def test_candidate_must_be_bootstrapped_before_activation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _, products, mappings, workspace, _ = _prepare(tmp_path, monkeypatch)
+    _, _, _, workspace, _ = _prepare(tmp_path, monkeypatch)
 
     with pytest.raises(CleanRuntimeCutoverError, match="尚未完成真实库存 bootstrap"):
         verify_candidate(
             manifest_path=workspace / MANIFEST_NAME,
-            products_path=products,
-            platform_mappings_path=mappings,
         )
 
 
-def test_clean_v17_activation_and_immediate_rollback_are_verified(
+def test_clean_v18_activation_and_immediate_rollback_are_verified(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     source, products, mappings, workspace, source_snapshot = _prepare(
@@ -284,10 +282,8 @@ def test_clean_v17_activation_and_immediate_rollback_are_verified(
     )
     verification = verify_candidate(
         manifest_path=manifest_path,
-        products_path=products,
-        platform_mappings_path=mappings,
     )
-    assert verification["schema_version"] == 17
+    assert verification["schema_version"] == 18
     assert verification["authority_mode"] == "DB_AUTHORITY"
     assert verification["sku_count"] == 2
     assert verification["inventory_total"] == 19
@@ -297,8 +293,6 @@ def test_clean_v17_activation_and_immediate_rollback_are_verified(
         activate_candidate(
             manifest_path=manifest_path,
             source_runtime_db=source,
-            products_path=products,
-            platform_mappings_path=mappings,
             expected_source_snapshot_sha256=source_snapshot,
             expected_candidate_snapshot_sha256=candidate_snapshot,
             confirmation="",
@@ -312,8 +306,6 @@ def test_clean_v17_activation_and_immediate_rollback_are_verified(
     activated = activate_candidate(
         manifest_path=manifest_path,
         source_runtime_db=source,
-        products_path=products,
-        platform_mappings_path=mappings,
         expected_source_snapshot_sha256=source_snapshot,
         expected_candidate_snapshot_sha256=candidate_snapshot,
         confirmation=ACTIVATION_CONFIRMATION,
@@ -369,8 +361,6 @@ def test_activation_failure_restores_the_original_runtime(
         activate_candidate(
             manifest_path=manifest_path,
             source_runtime_db=source,
-            products_path=products,
-            platform_mappings_path=mappings,
             expected_source_snapshot_sha256=source_snapshot,
             expected_candidate_snapshot_sha256=candidate_snapshot,
             confirmation=ACTIVATION_CONFIRMATION,

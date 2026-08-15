@@ -7,7 +7,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from openpyxl import Workbook
 
 from app.enums import (
     PricingSource,
@@ -15,23 +14,19 @@ from app.enums import (
     TaskOriginType,
     TaskStatus,
 )
-from app.models import Task
+from app.models import Product, Task
 from app.operations_web.auth import (
     Capability,
     Principal,
     PrincipalCapabilityBackend,
 )
+from app.repositories.master_data_repository import RuntimeMasterDataRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.repositories.workbook_repository import (
-    PLATFORM_MAPPING_HEADERS,
-    PRODUCT_HEADERS,
-)
 from app.services.execution_authorization import (
     ExecutionAuthorizationApplicationService,
     ExecutionAuthorizationConflict,
     ExecutionAuthorizationForbidden,
 )
-from app.services.product_mapping import compile_product_mapping_workbook
 from app.services.shadowbot_commit_batch import build_commit_request
 from app.services.shadowbot_listing_action_contract import (
     V5_GATE_SUMMARY_SCHEMA_VERSION,
@@ -48,42 +43,30 @@ PLATFORM = "蚂蚁花团供应商"
 def execution_setup(tmp_path: Path):
     repository = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
     repository.init_schema()
-    products = tmp_path / "products.xlsx"
-    mappings = tmp_path / "platform_mappings.xlsx"
     identity = tmp_path / "product_identity_mapping.json"
-    _write_workbook(
-        products,
-        PRODUCT_HEADERS,
+    master_data = RuntimeMasterDataRepository(repository)
+    master_data.seed(
         [
-            {
-                "internal_sku": "AISHA-A-50-Z",
-                "product_name": "艾莎",
-                "grade": "A级",
-                "stem_length": "50cm",
-                "unit": "扎",
-                "base_cost": "5.00",
-                "current_stock": 72,
-                "sale_enabled": True,
-            },
-            {
-                "internal_sku": "AISHA-B-50-Z",
-                "product_name": "艾莎",
-                "grade": "B级",
-                "stem_length": "50cm",
-                "unit": "扎",
-                "base_cost": "4.00",
-                "current_stock": 41,
-                "sale_enabled": True,
-            },
+            Product(
+                internal_sku="AISHA-A-50-Z", product_name="艾莎", grade="A级",
+                stem_length="50cm", unit="扎", base_cost=Decimal("5.00"),
+                current_stock=72, sale_enabled=True,
+            ),
+            Product(
+                internal_sku="AISHA-B-50-Z", product_name="艾莎", grade="B级",
+                stem_length="50cm", unit="扎", base_cost=Decimal("4.00"),
+                current_stock=41, sale_enabled=True,
+            ),
         ],
-    )
-    _write_workbook(
-        mappings,
-        PLATFORM_MAPPING_HEADERS,
         [
             _mapping("MAP-A", "AISHA-A-50-Z", "A级"),
             _mapping("MAP-B", "AISHA-B-50-Z", "B级"),
         ],
+        product_source_ref="synthetic-products",
+        product_source_sha256="sha256:" + "c" * 64,
+        mapping_source_ref="synthetic-mappings",
+        mapping_source_sha256="sha256:" + "d" * 64,
+        actor="test",
     )
     identity.write_text(
         json.dumps(
@@ -142,7 +125,7 @@ def execution_setup(tmp_path: Path):
         connection.commit()
     _listing(repository, "AISHA-A-50-Z", "A级", Decimal("12"), "online")
     _listing(repository, "AISHA-B-50-Z", "B级", Decimal("9"), "online")
-    mapping_version = compile_product_mapping_workbook(mappings).mapping_version
+    mapping_version = master_data.compiled_mappings().mapping_version
     repository.insert_tasks(
         [
             _task(
@@ -253,8 +236,6 @@ def execution_setup(tmp_path: Path):
     service = ExecutionAuthorizationApplicationService(
         repository,
         authorization=PrincipalCapabilityBackend(),
-        products_workbook=products,
-        platform_mappings_workbook=mappings,
         shadowbot_identity_mapping=identity,
         queue_root=tmp_path / "queue",
         applet_uri="weixin://launchapplet/?app_id=synthetic",
@@ -471,16 +452,6 @@ def _mapping(mapping_id: str, sku: str, grade: str):
         "grade": grade,
         "mapping_status": "VERIFIED",
     }
-
-
-def _write_workbook(path: Path, headers: list[str], rows: list[dict[str, object]]) -> None:
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = "data"
-    sheet.append(headers)
-    for row in rows:
-        sheet.append([row.get(header, "") for header in headers])
-    workbook.save(path)
 
 
 def _listing(

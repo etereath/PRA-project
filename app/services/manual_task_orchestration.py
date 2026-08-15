@@ -12,7 +12,6 @@ from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
 from typing import Iterable
 
 from app.enums import (
@@ -26,13 +25,15 @@ from app.exceptions import ValidationError
 from app.models import Product, Task
 from app.repositories.automation_repository import AutomationRepository
 from app.repositories.inventory_repository import InventoryRepository
+from app.repositories.master_data_repository import (
+    RuntimeMasterDataError,
+    RuntimeMasterDataRepository,
+)
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.repositories.workbook_repository import load_products
 from app.services.operational_time import OperationalTimeService
 from app.services.product_mapping import (
     CompiledProductMappings,
     ProductMappingRecord,
-    compile_product_mapping_workbook,
     normalize_mapping_text,
 )
 from app.utils import utc_now
@@ -138,22 +139,21 @@ class ManualTaskApplicationService:
         self,
         runtime_repository: SQLiteRuntimeRepository,
         *,
-        products_workbook: Path,
-        platform_mappings_workbook: Path,
         clock=None,
         price_fact_max_age: timedelta = PRICE_FACT_MAX_AGE,
     ) -> None:
         self.runtime = runtime_repository
-        self.products_workbook = Path(products_workbook)
-        self.platform_mappings_workbook = Path(platform_mappings_workbook)
         self.clock = clock or utc_now
         self.price_fact_max_age = price_fact_max_age
         self.inventory = InventoryRepository(runtime_repository)
+        self.master_data = RuntimeMasterDataRepository(runtime_repository)
 
     def scope_options(self, *, now: datetime | None = None) -> ManualTaskScopeOptions:
         observed_at = _aware_utc(now or self.clock())
-        products, _ = self._load_products_snapshot()
-        mappings = self._load_mappings_snapshot()
+        with closing(self.runtime.connect_read()) as connection:
+            connection.execute("BEGIN")
+            products, _ = self._load_products_snapshot(connection=connection)
+            mappings = self._load_mappings_snapshot(connection=connection)
         platforms = {
             record.platform_name
             for record in mappings.records
@@ -175,6 +175,7 @@ class ManualTaskApplicationService:
         current = _aware_utc(now or self.clock())
         normalized = _normalize_request(request, require_idempotency=False)
         with closing(self.runtime.connect_read()) as connection:
+            connection.execute("BEGIN")
             return self._preview_on_connection(connection, normalized, current)
 
     def create(
@@ -261,10 +262,6 @@ class ManualTaskApplicationService:
                 raise ManualTaskConflictError(
                     "任务身份与现有开放任务冲突，未创建任何任务。"
                 )
-            self._verify_workbook_hashes(
-                products_sha256=preview.products_sha256,
-                mapping_source_sha256=preview.mapping_version.split(":", 1)[0],
-            )
             connection.commit()
         except Exception:
             if connection.in_transaction:
@@ -286,8 +283,8 @@ class ManualTaskApplicationService:
         request: ManualTaskRequest,
         current: datetime,
     ) -> ManualTaskPreview:
-        products, products_sha256 = self._load_products_snapshot()
-        mappings = self._load_mappings_snapshot()
+        products, products_sha256 = self._load_products_snapshot(connection=connection)
+        mappings = self._load_mappings_snapshot(connection=connection)
         authority = self.inventory.get_authority_state(connection=connection)
         errors: list[str] = []
         if authority.authority_mode != "DB_AUTHORITY":
@@ -587,43 +584,22 @@ class ManualTaskApplicationService:
             updated_at=current,
         )
 
-    def _load_products_snapshot(self) -> tuple[list[Product], str]:
+    def _load_products_snapshot(self, *, connection) -> tuple[list[Product], str]:
         try:
-            before = self.products_workbook.read_bytes()
-            products = load_products(self.products_workbook)
-            after = self.products_workbook.read_bytes()
-        except (OSError, UnicodeError, ValueError) as exc:
-            raise ManualTaskError("商品资料暂不可用，请稍后重试。") from exc
-        if before != after:
-            raise ManualTaskConflictError("商品资料刚刚发生变化，请重新预览。")
-        return products, hashlib.sha256(before).hexdigest()
-
-    def _load_mappings_snapshot(self) -> CompiledProductMappings:
-        try:
-            before = self.platform_mappings_workbook.read_bytes()
-            compiled = compile_product_mapping_workbook(
-                self.platform_mappings_workbook
+            products = list(self.master_data.list_products(connection=connection))
+            snapshot_sha256 = self.master_data.product_snapshot_sha256(
+                connection=connection
             )
-            after = self.platform_mappings_workbook.read_bytes()
-        except (OSError, UnicodeError, ValueError, ValidationError) as exc:
-            raise ManualTaskError("商品与平台的对应关系暂不可用，请稍后重试。") from exc
-        if before != after:
-            raise ManualTaskConflictError("商品与平台的对应关系刚刚发生变化，请重新预览。")
-        return compiled
+        except (RuntimeMasterDataError, ValueError) as exc:
+            raise ManualTaskError("商品资料暂不可用，请稍后重试。") from exc
+        return products, snapshot_sha256
 
-    def _verify_workbook_hashes(
-        self,
-        *,
-        products_sha256: str,
-        mapping_source_sha256: str,
-    ) -> None:
-        if hashlib.sha256(self.products_workbook.read_bytes()).hexdigest() != products_sha256:
-            raise ManualTaskConflictError("商品资料在任务创建期间发生变化，请重新预览。")
-        if (
-            hashlib.sha256(self.platform_mappings_workbook.read_bytes()).hexdigest()
-            != mapping_source_sha256
-        ):
-            raise ManualTaskConflictError("商品与平台的对应关系发生变化，请重新预览。")
+    def _load_mappings_snapshot(self, *, connection) -> CompiledProductMappings:
+        try:
+            compiled = self.master_data.compiled_mappings(connection=connection)
+        except (RuntimeMasterDataError, ValueError, ValidationError) as exc:
+            raise ManualTaskError("商品与平台的对应关系暂不可用，请稍后重试。") from exc
+        return compiled
 
 
 def _normalize_request(

@@ -13,7 +13,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-LATEST_RUNTIME_SCHEMA_VERSION = 17
+LATEST_RUNTIME_SCHEMA_VERSION = 18
 RUNTIME_SCHEMA_VERSIONS = tuple(range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1))
 
 REQUIRED_RUNTIME_TABLES = frozenset(
@@ -67,6 +67,8 @@ REQUIRED_RUNTIME_TABLES = frozenset(
         "inventory_transactions",
         "inventory_sales_baselines",
         "inventory_alert_policies",
+        "product_catalog",
+        "platform_product_mappings",
     }
 )
 
@@ -735,6 +737,48 @@ V17_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
     ),
 }
 
+V18_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
+    "product_catalog": (
+        "internal_sku",
+        "product_name",
+        "grade",
+        "stem_length",
+        "unit",
+        "base_cost",
+        "sale_enabled",
+        "remark",
+        "source_type",
+        "source_ref",
+        "source_sha256",
+        "version",
+        "created_at",
+        "updated_at",
+    ),
+    "platform_product_mappings": (
+        "mapping_id",
+        "mapping_kind",
+        "platform_name",
+        "platform_product_id",
+        "platform_product_name",
+        "normalized_platform_product_name",
+        "grade",
+        "internal_sku",
+        "candidate_internal_sku",
+        "search_keyword",
+        "mapping_status",
+        "effective_from",
+        "effective_to",
+        "last_verified_at",
+        "remark",
+        "source_type",
+        "source_ref",
+        "source_sha256",
+        "version",
+        "created_at",
+        "updated_at",
+    ),
+}
+
 V14_INDEX_SPECS: Mapping[str, tuple[str, ...]] = {
     "ux_operational_time_policies_current": ("timezone_name",),
     "ix_automation_jobs_type_enabled": ("job_type", "enabled"),
@@ -809,6 +853,26 @@ V17_INDEX_SPECS: Mapping[str, tuple[str, ...]] = {
         "internal_sku",
     ),
     "ux_inventory_alert_policies_scope": ("scope_type", "scope_key"),
+}
+
+V18_INDEX_SPECS: Mapping[str, tuple[str, ...]] = {
+    "ix_product_catalog_scope": (
+        "product_name",
+        "grade",
+        "sale_enabled",
+        "internal_sku",
+    ),
+    "ix_platform_product_mappings_scope": (
+        "platform_name",
+        "platform_product_name",
+        "grade",
+        "mapping_status",
+    ),
+    "ix_platform_product_mappings_sku": (
+        "internal_sku",
+        "platform_name",
+        "mapping_status",
+    ),
 }
 
 V14_TASK_ORIGIN_VALUES = frozenset(
@@ -1117,6 +1181,7 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
             **V15_REQUIRED_COLUMNS,
             **V16_REQUIRED_COLUMNS,
             **V17_REQUIRED_COLUMNS,
+            **V18_REQUIRED_COLUMNS,
         }.items():
             if table not in tables:
                 continue
@@ -1186,6 +1251,9 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
             )
             missing_index_names.update(
                 _check_v17_constraints(connection, constraint_errors)
+            )
+            missing_index_names.update(
+                _check_v18_constraints(connection, constraint_errors)
             )
         missing_indexes = tuple(sorted(missing_index_names))
 
@@ -2218,6 +2286,46 @@ def _check_v17_constraints(
         errors.append(
             "inventory_alert_policies must contain exactly one default policy"
         )
+    return tuple(sorted(missing_indexes))
+
+
+def _check_v18_constraints(
+    connection: sqlite3.Connection,
+    errors: list[str],
+) -> tuple[str, ...]:
+    missing_indexes: list[str] = []
+    for index_name, expected_columns in V18_INDEX_SPECS.items():
+        row = connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = ?",
+            (index_name,),
+        ).fetchone()
+        if row is None:
+            missing_indexes.append(index_name)
+            continue
+        actual_columns = tuple(
+            str(index_row[2])
+            for index_row in connection.execute(
+                f"PRAGMA index_info('{index_name}')"
+            ).fetchall()
+        )
+        if actual_columns != expected_columns:
+            errors.append(
+                f"{index_name} columns expected {expected_columns}, "
+                f"actual {actual_columns}"
+            )
+
+    foreign_keys = {
+        (str(row[3]), str(row[2]), str(row[4]))
+        for row in connection.execute(
+            "PRAGMA foreign_key_list('platform_product_mappings')"
+        ).fetchall()
+    }
+    for column in ("internal_sku", "candidate_internal_sku"):
+        if (column, "product_catalog", "internal_sku") not in foreign_keys:
+            errors.append(
+                "missing foreign key platform_product_mappings."
+                f"{column} -> product_catalog(internal_sku)"
+            )
     return tuple(sorted(missing_indexes))
 
 

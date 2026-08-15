@@ -201,24 +201,16 @@ class OperationsWebApplication:
             container.runtime_repository,
             alert_evaluator=inventory_alerts.evaluate_transaction,
         )
-        platform_mappings = (
-            container.settings.paths.platform_mappings_workbook
-            or (PROJECT_ROOT / "data/samples/platform_mappings.xlsx")
-        )
         identity_mapping = (
             container.settings.paths.shadowbot_identity_mapping
             or (PROJECT_ROOT / "shadowbot/test2/product_identity_mapping.json")
         )
         self.manual_tasks = ManualTaskApplicationService(
             container.runtime_repository,
-            products_workbook=container.settings.paths.products_workbook,
-            platform_mappings_workbook=platform_mappings,
         )
         self.execution_authorization = ExecutionAuthorizationApplicationService(
             container.runtime_repository,
             authorization=container.authorization,
-            products_workbook=container.settings.paths.products_workbook,
-            platform_mappings_workbook=platform_mappings,
             shadowbot_identity_mapping=identity_mapping,
             queue_root=container.settings.paths.queue_root,
             applet_uri=container.settings.shadowbot_applet_uri,
@@ -227,7 +219,6 @@ class OperationsWebApplication:
         self.review_resolution = ReviewResolutionApplicationService(
             container.runtime_repository,
             container.authorization,
-            products_path=container.settings.paths.products_workbook,
         )
         self.automation_configuration = AutomationConfigurationApplicationService(
             AutomationRepository(container.runtime_repository),
@@ -1319,7 +1310,6 @@ class OperationsWebApplication:
                     action,
                     note=self._first(form, "note"),
                     resolution_payload=resolution_payload,
-                    products_path=self.container.settings.paths.products_workbook,
                 )
             except MobileReviewTransactionError as exc:
                 return Response.text(

@@ -20,6 +20,11 @@ Review Profile：R3；真实平台执行仍沿用既有 R4 门禁
 
 ## 2. 编码前复用矩阵
 
+> 2026-08-15 后续整改：下表“商品主数据”和“平台商品映射”的工作簿读取仅代表 7E
+> 当时实现，不再是当前运行合同。当前正式 Web 和任务链改为 Runtime Schema v18 数据库
+> 主数据；工作簿只允许在干净候选库准备时一次性导入，详见
+> [v18 主数据合同](../runtime_master_data_v18.md)。
+
 | 能力 | 分类 | 7E 处理 |
 | --- | --- | --- |
 | Runtime Task、来源、状态、dedupe 和批量事务 | 原样复用 | 使用 `Task`、`RuntimeTaskService` 的规范化语义和 `SQLiteRuntimeRepository.insert_tasks` 原子写入；不建候选任务表 |

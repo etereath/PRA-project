@@ -95,6 +95,11 @@ start_web.bat
 - `PRA_COOKIE_SECURE`：development 使用 `false`，production 使用 `true`；冲突时启动失败。
 - `REVIEW_TOKEN_SECRET`：Mobile Review token HMAC 密钥，必须本地配置。
 
+运营 Web 的商品、平台映射和真实库存均从同一个 Runtime DB 读取。Schema v18 启用后，
+启动或创建任务不再需要 `PRA_PRODUCTS_WORKBOOK` / `PRA_PLATFORM_MAPPINGS_WORKBOOK`；两份
+工作簿只用于受控干净重建的准备阶段一次性导入。真实库尚未完成 v18 切换时，Web 应保持
+不可用并先执行维护窗口流程，不能回退到 XLSX 继续运营。
+
 飞书与手机端复核：
 
 - `DEFAULT_NOTIFICATION_CHANNEL=feishu`

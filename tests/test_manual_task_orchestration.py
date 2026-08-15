@@ -6,14 +6,11 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from openpyxl import Workbook
 
 from app.enums import TaskActionType
+from app.models import Product
+from app.repositories.master_data_repository import RuntimeMasterDataRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.repositories.workbook_repository import (
-    PLATFORM_MAPPING_HEADERS,
-    PRODUCT_HEADERS,
-)
 from app.services.manual_task_orchestration import (
     CHANGE_PRICE,
     SET_OFFLINE,
@@ -33,41 +30,28 @@ PLATFORM = "蚂蚁花团供应商"
 def manual_service(tmp_path: Path):
     repository = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
     repository.init_schema()
-    products = tmp_path / "products.xlsx"
-    mappings = tmp_path / "platform_mappings.xlsx"
-    _write_workbook(
-        products,
-        PRODUCT_HEADERS,
+    RuntimeMasterDataRepository(repository).seed(
         [
-            {
-                "internal_sku": "AISHA-A-50-Z",
-                "product_name": "艾莎",
-                "grade": "A级",
-                "stem_length": "50cm",
-                "unit": "扎",
-                "base_cost": "5.00",
-                "current_stock": 72,
-                "sale_enabled": True,
-            },
-            {
-                "internal_sku": "AISHA-B-50-Z",
-                "product_name": "艾莎",
-                "grade": "B级",
-                "stem_length": "50cm",
-                "unit": "扎",
-                "base_cost": "4.00",
-                "current_stock": 41,
-                "sale_enabled": True,
-            },
+            Product(
+                internal_sku="AISHA-A-50-Z", product_name="艾莎", grade="A级",
+                stem_length="50cm", unit="扎", base_cost=Decimal("5.00"),
+                current_stock=72, sale_enabled=True,
+            ),
+            Product(
+                internal_sku="AISHA-B-50-Z", product_name="艾莎", grade="B级",
+                stem_length="50cm", unit="扎", base_cost=Decimal("4.00"),
+                current_stock=41, sale_enabled=True,
+            ),
         ],
-    )
-    _write_workbook(
-        mappings,
-        PLATFORM_MAPPING_HEADERS,
         [
             _mapping("MAP-A", "AISHA-A-50-Z", "艾莎", "A级"),
             _mapping("MAP-B", "AISHA-B-50-Z", "艾莎", "B级"),
         ],
+        product_source_ref="synthetic-products",
+        product_source_sha256="sha256:" + "c" * 64,
+        mapping_source_ref="synthetic-mappings",
+        mapping_source_sha256="sha256:" + "d" * 64,
+        actor="test",
     )
     with repository.connect_write() as connection:
         connection.execute(
@@ -105,11 +89,9 @@ def manual_service(tmp_path: Path):
     _listing(repository, "AISHA-B-50-Z", "B级", Decimal("9.00"), "online")
     service = ManualTaskApplicationService(
         repository,
-        products_workbook=products,
-        platform_mappings_workbook=mappings,
         clock=lambda: NOW,
     )
-    return service, repository, products, mappings
+    return service, repository, None, None
 
 
 def test_scope_options_and_multiselect_preview_use_verified_runtime_facts(
@@ -316,7 +298,7 @@ def test_offline_has_no_price_and_online_requires_price_and_safe_inventory(
 def test_low_price_mapping_failure_and_open_task_conflict_are_explicit(
     manual_service,
 ) -> None:
-    service, _, _, mappings = manual_service
+    service, repository, _, _ = manual_service
     low = service.preview(
         ManualTaskRequest(
             varieties=("艾莎",),
@@ -328,11 +310,10 @@ def test_low_price_mapping_failure_and_open_task_conflict_are_explicit(
     )
     assert "不能低于商品基础成本" in "".join(low.items[0].blockers)
 
-    _write_workbook(
-        mappings,
-        PLATFORM_MAPPING_HEADERS,
-        [_mapping("MAP-B", "AISHA-B-50-Z", "艾莎", "B级")],
-    )
+    with repository.connect_write() as connection, connection:
+        connection.execute(
+            "DELETE FROM platform_product_mappings WHERE mapping_id = 'MAP-A'"
+        )
     unmapped = service.preview(
         ManualTaskRequest(
             varieties=("艾莎",),
@@ -381,16 +362,6 @@ def _mapping(mapping_id: str, sku: str, product_name: str, grade: str):
         "mapping_status": "VERIFIED",
         "remark": "合成测试映射",
     }
-
-
-def _write_workbook(path: Path, headers: list[str], rows: list[dict[str, object]]) -> None:
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = "data"
-    sheet.append(headers)
-    for row in rows:
-        sheet.append([row.get(header, "") for header in headers])
-    workbook.save(path)
 
 
 def _listing(

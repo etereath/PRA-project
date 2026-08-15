@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 import pytest
-from openpyxl import Workbook, load_workbook
+from openpyxl import Workbook
 
 from app.enums import (
     DataQualityLevel,
@@ -36,6 +36,7 @@ from app.operations_web.queries import (
     _review_type_label,
 )
 from app.repositories.operational_summary_repository import OperationalSummaryRepository
+from app.repositories.master_data_repository import RuntimeMasterDataRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import PRODUCT_HEADERS
 from app.repositories.workbook_repository import load_products
@@ -60,6 +61,31 @@ def read_only_web(tmp_path: Path):
     repository.init_schema()
     products = tmp_path / "products.xlsx"
     _write_products(products)
+    RuntimeMasterDataRepository(repository).seed(
+        load_products(products),
+        [
+            {
+                "mapping_id": "PLATFORM-SYNTHETIC",
+                "mapping_kind": "PLATFORM",
+                "platform_name": "蚂蚁花团供应商",
+                "mapping_status": "ACTIVE",
+            },
+            {
+                "mapping_id": "MAP-AISHA-A",
+                "mapping_kind": "PRODUCT",
+                "platform_name": "蚂蚁花团供应商",
+                "platform_product_name": "艾莎",
+                "grade": "A级",
+                "internal_sku": "AISHA-A-50-Z",
+                "mapping_status": "VERIFIED",
+            },
+        ],
+        product_source_ref="synthetic-products",
+        product_source_sha256="sha256:" + "c" * 64,
+        mapping_source_ref="synthetic-mappings",
+        mapping_source_sha256="sha256:" + "d" * 64,
+        actor="test",
+    )
     price_rules = tmp_path / "price_rules.xlsx"
     listing_rules = tmp_path / "listing_rules.xlsx"
     price_rules.write_bytes(b"synthetic")
@@ -75,7 +101,6 @@ def read_only_web(tmp_path: Path):
         admin_password="synthetic-password",
         paths=OperationsWebPaths(
             runtime_db=runtime_db,
-            products_workbook=products,
             price_rules_workbook=price_rules,
             listing_rules_workbook=listing_rules,
             queue_root=queue_root,
@@ -161,28 +186,37 @@ def test_today_presents_all_frozen_quality_and_freshness_branches(
 
 
 def test_today_sellable_inventory_excludes_disabled_products(read_only_web) -> None:
-    app, _, _, tmp_path = read_only_web
-    workbook_path = tmp_path / "products.xlsx"
-    workbook = load_workbook(workbook_path)
-    sheet = workbook["data"]
-    sheet.append(
-        [
-            "CLOSED-B-50-Z",
-            "停售商品",
-            "B级",
-            "50cm",
-            "扎",
-            8,
-            999,
-            False,
-            12,
-            12,
-            "合成测试",
-            "",
-            "",
-        ]
-    )
-    workbook.save(workbook_path)
+    app, _, repository, _ = read_only_web
+    with repository.connect_write() as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO inventory_balances(
+                internal_sku, current_qty, version, last_transaction_id, updated_at
+            ) VALUES ('AISHA-A-50-Z', 72, 1, 'TEST-ACTIVE', ?)
+            """,
+            (FIXED_NOW.isoformat(),),
+        )
+        connection.execute(
+            """
+            INSERT INTO product_catalog(
+                internal_sku, product_name, grade, stem_length, unit,
+                base_cost, sale_enabled, remark, source_type, source_ref,
+                source_sha256, version, created_at, updated_at
+            ) VALUES (
+                'CLOSED-B-50-Z', '停售商品', 'B级', '50cm', '扎',
+                '8', 0, '合成测试', 'TEST', 'test', ?, 1, ?, ?
+            )
+            """,
+            ("sha256:" + "e" * 64, FIXED_NOW.isoformat(), FIXED_NOW.isoformat()),
+        )
+        connection.execute(
+            """
+            INSERT INTO inventory_balances(
+                internal_sku, current_qty, version, last_transaction_id, updated_at
+            ) VALUES ('CLOSED-B-50-Z', 999, 1, 'TEST-CLOSED', ?)
+            """,
+            (FIXED_NOW.isoformat(),),
+        )
 
     model = app.queries.today()
     sellable_inventory = next(
@@ -664,7 +698,7 @@ def test_system_page_only_reports_current_component_state(read_only_web) -> None
 
     assert status == "200 OK"
     assert "业务数据库" in body
-    assert "商品与规则资料" in body
+    assert "规则资料" in body
     assert "平台任务传递" in body
     assert "影刀执行端" in body
     assert "历史任务" not in body

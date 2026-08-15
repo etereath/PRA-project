@@ -347,7 +347,6 @@ class MobileReviewAtomicTransactionTests(unittest.TestCase):
         ReviewResolutionApplicationService(
             desktop_repository,
             PrincipalCapabilityBackend(),
-            products_path=Path(self.temp_dir.name) / "unused-products.xlsx",
         ).resolve(
             Principal("desktop_operator", frozenset({Capability.HANDLE_REVIEW})),
             review_task_id=desktop_review_id,

@@ -2207,6 +2207,83 @@ SCHEMA_V17_SQL = [
     """,
 ]
 
+SCHEMA_V18_SQL = [
+    """
+    CREATE TABLE IF NOT EXISTS product_catalog (
+        internal_sku TEXT PRIMARY KEY CHECK (trim(internal_sku) <> ''),
+        product_name TEXT NOT NULL CHECK (trim(product_name) <> ''),
+        grade TEXT NOT NULL CHECK (trim(grade) <> ''),
+        stem_length TEXT NOT NULL CHECK (trim(stem_length) <> ''),
+        unit TEXT NOT NULL CHECK (trim(unit) <> ''),
+        base_cost TEXT NOT NULL CHECK (trim(base_cost) <> ''),
+        sale_enabled INTEGER NOT NULL CHECK (sale_enabled IN (0, 1)),
+        remark TEXT NOT NULL DEFAULT '',
+        source_type TEXT NOT NULL CHECK (trim(source_type) <> ''),
+        source_ref TEXT NOT NULL CHECK (trim(source_ref) <> ''),
+        source_sha256 TEXT NOT NULL CHECK (source_sha256 GLOB 'sha256:*'),
+        version INTEGER NOT NULL CHECK (version >= 1),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_product_catalog_scope
+    ON product_catalog(product_name, grade, sale_enabled, internal_sku)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS platform_product_mappings (
+        mapping_id TEXT PRIMARY KEY CHECK (trim(mapping_id) <> ''),
+        mapping_kind TEXT NOT NULL CHECK (mapping_kind IN ('PLATFORM', 'PRODUCT')),
+        platform_name TEXT NOT NULL CHECK (trim(platform_name) <> ''),
+        platform_product_id TEXT NOT NULL DEFAULT '',
+        platform_product_name TEXT NOT NULL DEFAULT '',
+        normalized_platform_product_name TEXT NOT NULL DEFAULT '',
+        grade TEXT NOT NULL DEFAULT '',
+        internal_sku TEXT,
+        candidate_internal_sku TEXT,
+        search_keyword TEXT NOT NULL DEFAULT '',
+        mapping_status TEXT NOT NULL CHECK (
+            mapping_status IN ('ACTIVE', 'VERIFIED', 'UNMAPPED', 'AMBIGUOUS', 'DISABLED')
+        ),
+        effective_from TEXT,
+        effective_to TEXT,
+        last_verified_at TEXT,
+        remark TEXT NOT NULL DEFAULT '',
+        source_type TEXT NOT NULL CHECK (trim(source_type) <> ''),
+        source_ref TEXT NOT NULL CHECK (trim(source_ref) <> ''),
+        source_sha256 TEXT NOT NULL CHECK (source_sha256 GLOB 'sha256:*'),
+        version INTEGER NOT NULL CHECK (version >= 1),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        FOREIGN KEY (internal_sku) REFERENCES product_catalog(internal_sku),
+        FOREIGN KEY (candidate_internal_sku) REFERENCES product_catalog(internal_sku),
+        CHECK (
+            (mapping_kind = 'PLATFORM'
+                AND platform_product_name = ''
+                AND grade = ''
+                AND internal_sku IS NULL
+                AND candidate_internal_sku IS NULL
+                AND mapping_status IN ('ACTIVE', 'DISABLED'))
+            OR
+            (mapping_kind = 'PRODUCT'
+                AND trim(platform_product_name) <> ''
+                AND trim(grade) <> ''
+                AND mapping_status IN ('VERIFIED', 'UNMAPPED', 'AMBIGUOUS', 'DISABLED'))
+        )
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_platform_product_mappings_scope
+    ON platform_product_mappings(
+        platform_name, platform_product_name, grade, mapping_status
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS ix_platform_product_mappings_sku
+    ON platform_product_mappings(internal_sku, platform_name, mapping_status)
+    """,
+]
+
 for _append_only_table in V17_APPEND_ONLY_TABLES:
     SCHEMA_V17_SQL.extend(
         (
@@ -3001,6 +3078,29 @@ def _requires_runtime_schema_v17_migration(
     )
 
 
+def _requires_runtime_schema_v18_migration(
+    connection: sqlite3.Connection,
+) -> bool:
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if "runtime_schema_migrations" not in tables:
+        return True
+    version_row = connection.execute(
+        "SELECT 1 FROM runtime_schema_migrations WHERE schema_version = 18"
+    ).fetchone()
+    return version_row is None or any(
+        table_name not in tables
+        for table_name in (
+            "product_catalog",
+            "platform_product_mappings",
+        )
+    )
+
+
 def _migrate_operational_incidents_to_v15(
     connection: sqlite3.Connection,
 ) -> None:
@@ -3304,12 +3404,14 @@ class SQLiteRuntimeRepository:
             requires_v15_migration = _requires_runtime_schema_v15_migration(connection)
             requires_v16_migration = _requires_runtime_schema_v16_migration(connection)
             requires_v17_migration = _requires_runtime_schema_v17_migration(connection)
+            requires_v18_migration = _requires_runtime_schema_v18_migration(connection)
             requires_runtime_migration = (
                 requires_v13_migration
                 or requires_v14_migration
                 or requires_v15_migration
                 or requires_v16_migration
                 or requires_v17_migration
+                or requires_v18_migration
             )
             if requires_v13_migration or requires_v15_migration:
                 connection.execute("PRAGMA foreign_keys = OFF")
@@ -3402,6 +3504,7 @@ class SQLiteRuntimeRepository:
                     15: "incident occurrence counts and append-only incident events",
                     16: "versioned emergency offline policies for shadow evaluation",
                     17: "authoritative real inventory balances, immutable ledger, sales baselines, and alert policies",
+                    18: "runtime product catalog and platform product mappings",
                 }
                 for statement in SCHEMA_V6_SQL:
                     connection.execute(statement)
@@ -3504,6 +3607,8 @@ class SQLiteRuntimeRepository:
                 for statement in SCHEMA_V16_SQL:
                     connection.execute(statement)
                 for statement in SCHEMA_V17_SQL:
+                    connection.execute(statement)
+                for statement in SCHEMA_V18_SQL:
                     connection.execute(statement)
                 now_text = _datetime_to_text(datetime.now())
                 connection.execute(

@@ -2,7 +2,7 @@
 
 本文档是当前项目文档入口。项目说明文本以中文为主，英文键名和代码标识保持原样。
 
-运行态业务数据以 SQLite 为中心，当前代码结构版本为 v17。v9 使用“平台 + 品种 + 等级”作为 `listing_status` 业务身份，v10 将任务旧价结构化，v11 增加单次请求的 ShadowBot 多商品 COMMIT 批次账本，v12 增加逐商品操作/尝试身份、活动写锁、观察时间和技术回执，v13 增加公共批次注册表、通用上下架 operation、两页快照、页面异常和 v5 动作账本；v14 增加双时间轴、Automation 账本、不可变观察、销售日结、Incident 和任务来源字段；v15 增加 Incident 出现次数与 append-only 事件流水；v16 增加版本化极简紧急下架策略；v17 增加真实库存权威状态、余额、不可变流水、切换销售水位和预警策略。真实 Runtime DB 需按独立维护、canonical 路径、工作簿独占锁、完整 SQLite 逻辑快照、最新可信空 OPEN 订单批次、备份和提交前回读门禁另行升级并执行库存 bootstrap；代码合并不等于真实库已经切换。Excel 继续承担商品和规则等主数据输入，但 cutover 后 `products.xlsx.current_stock` 只保留为历史快照，不再是业务库存权威。
+运行态业务数据以 SQLite 为中心，当前代码结构版本为 v18。v9～v16 延续既有观察、执行、Automation、日结和 Incident 合同；v17 增加真实库存权威状态、余额、不可变流水、切换销售水位和预警策略；v18 增加数据库商品目录和平台映射。真实 Runtime DB 需按独立维护、canonical 路径、完整 SQLite 逻辑快照、最新可信空 OPEN 订单批次、备份和提交前回读门禁另行升级并执行库存 bootstrap；代码合并不等于真实库已经切换。`products.xlsx` 与 `platform_mappings.xlsx` 只允许作为受控切换的一次性导入，运行中的 Web、人工任务、执行授权和复核不得依赖它们；价格与上下架规则工作簿仍是后续待数据库化的规则输入。
 
 项目长期控制面固定为：人工运营走 Web，定时业务走 Automation，未来智能调用走 Agent
 Gateway，平台执行走 Queue/Worker/Importer，开发测试与恢复走 CLI。Agent 只能通过
@@ -22,6 +22,7 @@ Query Adapter 读取，并通过 Task Adapter 提交结构化 `AgentIntent`；Re
 - [plans/task13_5_1_quality_and_settlement_contract_review.md](plans/task13_5_1_quality_and_settlement_contract_review.md)：任务13.5-1 已冻结合同；覆盖双时间轴、三个正交维度、六级数据质量、唯一 FINAL 日结状态机、v14 最小结构及迁移回滚，并授权在该边界内开始编码。
 - [reports/task13_5_1_runtime_schema_v14.md](reports/task13_5_1_runtime_schema_v14.md)：任务13.5-1 双时间轴、Runtime Schema v14、迁移兼容、质量约束、日结版本状态机和本地验收结果。
 - [runtime_schema_v14_migration.md](runtime_schema_v14_migration.md)：真实 Runtime DB 的备份、副本迁移、健康检查、切换和回滚门禁。
+- [runtime_master_data_v18.md](runtime_master_data_v18.md)：v18 商品目录与平台映射数据库权威、一次性工作簿导入、Web/任务/授权零 XLSX 运行依赖和真实切换边界。
 - [plans/task13_5_2_mapping_and_scan_input_contract.md](plans/task13_5_2_mapping_and_scan_input_contract.md)：任务13.5-2 商品映射、ONLINE_PULSE、FULL_MARKET_SCAN 商品子结果和 v14 不可变观察输入合同。
 - [plans/task13_5_4_order_history_observation_contract.md](plans/task13_5_4_order_history_observation_contract.md)：任务13.5-4 订单字段、`OPEN/CLOSED`、多重集合、完整性、Importer 和 v6 零写合同。
 - [plans/task13_5_5_sales_estimation_settlement_contract.md](plans/task13_5_5_sales_estimation_settlement_contract.md)：任务13.5-5 库存估算资格、已知调整、订单/估算权威、取消推导和 FINAL 门禁。
@@ -110,7 +111,7 @@ Query Adapter 读取，并通过 Task Adapter 提交结构化 `AgentIntent`；Re
 - [web_frontend_refresh_plan.md](web_frontend_refresh_plan.md)：Web 运行态运营后台刷新计划和当前进度。
 - [web_localization_display_spec.md](web_localization_display_spec.md)：Web 与飞书通知的运营中文展示术语表。
 - [product_inventory_input_spec.md](product_inventory_input_spec.md)：13.5-7D 切换前的商品资料与工作簿库存历史规则，以及切换后 DB 唯一库存权威、一次性 bootstrap、禁止双写和旧入口删除边界。
-- [clean_runtime_v17_rebuild.md](clean_runtime_v17_rebuild.md)：旧测试 Runtime 完整归档、正式 SKU/库存保留、干净 v17 候选库、真实空 OPEN 订单门禁、激活回读和紧急回滚流程。
+- [clean_runtime_v17_rebuild.md](clean_runtime_v17_rebuild.md)：旧测试 Runtime 完整归档、一次性商品/映射导入、干净 v18 候选库、真实空 OPEN 订单门禁、激活回读和紧急回滚流程（文件名保留以兼容既有链接）。
 - [price_rule_input_spec.md](price_rule_input_spec.md)：价格规则输入表单化规则，说明 `price_rules.xlsx` 兼容、定价字段、低价边界和旧 `/tables` 入口策略。
 - [listing_rule_input_spec.md](listing_rule_input_spec.md)：上下架规则输入表单化规则，说明 `listing_rules.xlsx` 新字段、三维筛选、策略枚举和 ListingRuleEvaluator 边界。
 - [capacity_plan_input_spec.md](capacity_plan_input_spec.md)：包装产能计划输入表单化规则，说明 `capacity_plans.xlsx` 字段、确认包装能力和 CapacityRuleEvaluator 判断口径。

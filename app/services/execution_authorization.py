@@ -23,9 +23,8 @@ from app.operations_web.auth import (
 )
 from app.models import TaskStatusHistory
 from app.repositories.inventory_repository import InventoryRepository
+from app.repositories.master_data_repository import RuntimeMasterDataRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.repositories.workbook_repository import load_products
-from app.services.product_mapping import compile_product_mapping_workbook
 from app.services.shadowbot_commit_batch import load_identity_mapping
 from app.services.shadowbot_commit_pipeline import (
     build_task_commit_manifest,
@@ -94,8 +93,6 @@ class ExecutionAuthorizationApplicationService:
         runtime_repository: SQLiteRuntimeRepository,
         *,
         authorization: AuthorizationBackend,
-        products_workbook: Path,
-        platform_mappings_workbook: Path,
         shadowbot_identity_mapping: Path,
         queue_root: Path,
         applet_uri: str,
@@ -113,8 +110,6 @@ class ExecutionAuthorizationApplicationService:
             raise ValueError("execution_profile 必须是 development 或 production。")
         self.runtime = runtime_repository
         self.authorization = authorization
-        self.products_workbook = Path(products_workbook)
-        self.platform_mappings_workbook = Path(platform_mappings_workbook)
         self.shadowbot_identity_mapping = Path(shadowbot_identity_mapping)
         self.queue_root = Path(queue_root)
         self.applet_uri = str(applet_uri or "").strip()
@@ -127,6 +122,7 @@ class ExecutionAuthorizationApplicationService:
         self.v5_propose = v5_propose
         self.v5_publish = v5_publish
         self.inventory = InventoryRepository(runtime_repository)
+        self.master_data = RuntimeMasterDataRepository(runtime_repository)
         self._preparations: dict[str, _StoredPreparation] = {}
         self._idempotency: dict[tuple[str, str], str] = {}
         self._lock = Lock()
@@ -434,20 +430,23 @@ class ExecutionAuthorizationApplicationService:
         task_ids: tuple[str, ...],
         current: datetime,
     ) -> dict[str, object]:
-        products_bytes = self.products_workbook.read_bytes()
-        products = load_products(self.products_workbook)
-        if self.products_workbook.read_bytes() != products_bytes:
-            raise ExecutionAuthorizationConflict("商品资料刚刚发生变化，请重新预览。")
-        product_by_sku = {product.internal_sku.upper(): product for product in products}
-        mapping_bytes = self.platform_mappings_workbook.read_bytes()
-        mappings = compile_product_mapping_workbook(self.platform_mappings_workbook)
-        if self.platform_mappings_workbook.read_bytes() != mapping_bytes:
-            raise ExecutionAuthorizationConflict("商品与平台的对应关系刚刚发生变化，请重新预览。")
         shadowbot_mapping_bytes = self.shadowbot_identity_mapping.read_bytes()
         identity_mapping = load_identity_mapping(self.shadowbot_identity_mapping)
         inventory = self.inventory
 
         with closing(self.runtime.connect_read()) as connection:
+            connection.execute("BEGIN")
+            products = self.master_data.list_products(connection=connection)
+            product_by_sku = {
+                product.internal_sku.upper(): product for product in products
+            }
+            products_sha256 = self.master_data.product_snapshot_sha256(
+                connection=connection
+            )
+            mappings = self.master_data.compiled_mappings(connection=connection)
+            mapping_snapshot_sha256 = self.master_data.mapping_snapshot_sha256(
+                connection=connection
+            )
             if has_active_automation_ui_run(connection, now=current):
                 raise ExecutionAuthorizationConflict(
                     "平台状态正在更新，暂不能提交执行，请稍后重试。"
@@ -597,8 +596,9 @@ class ExecutionAuthorizationApplicationService:
         return {
             "action_type": action_type.value,
             "platform_name": next(iter(platforms)),
-            "products_sha256": hashlib.sha256(products_bytes).hexdigest(),
+            "products_sha256": products_sha256,
             "platform_mapping_version": mappings.mapping_version,
+            "platform_mapping_snapshot_sha256": mapping_snapshot_sha256,
             "shadowbot_mapping_sha256": hashlib.sha256(
                 shadowbot_mapping_bytes
             ).hexdigest(),

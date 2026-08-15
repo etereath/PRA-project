@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
 
 from app.exceptions import MobileReviewTransactionError, ValidationError
 from app.models import ReviewTaskStatus
@@ -13,9 +12,12 @@ from app.operations_web.auth import (
     Capability,
     Principal,
 )
+from app.repositories.master_data_repository import (
+    RuntimeMasterDataError,
+    RuntimeMasterDataRepository,
+)
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.review_policy import allowed_review_statuses
-from app.services.workflow import _read_authoritative_product_cost_snapshot
 
 
 class ReviewResolutionError(ValueError):
@@ -36,12 +38,10 @@ class ReviewResolutionApplicationService:
         self,
         repository: SQLiteRuntimeRepository,
         authorization: AuthorizationBackend,
-        *,
-        products_path: Path,
     ) -> None:
         self.repository = repository
         self.authorization = authorization
-        self.products_path = products_path
+        self.master_data = RuntimeMasterDataRepository(repository)
 
     def resolve(
         self,
@@ -93,17 +93,12 @@ class ReviewResolutionApplicationService:
                     ReviewTaskStatus.ADJUSTED,
                     ReviewTaskStatus.APPROVED,
                 }:
-                    base_cost, base_cost_source_ref = (
-                        _read_authoritative_product_cost_snapshot(
-                            self.products_path,
-                            internal_sku=str(review.internal_sku or ""),
-                        )
+                    base_cost, base_cost_source_ref = self._product_cost_snapshot(
+                        str(review.internal_sku or "")
                     )
+
                 def verifier() -> tuple[Decimal, str]:
-                    return _read_authoritative_product_cost_snapshot(
-                        self.products_path,
-                        internal_sku=str(review.internal_sku or ""),
-                    )
+                    return self._product_cost_snapshot(str(review.internal_sku or ""))
                 resolved, created_task = (
                     self.repository.resolve_authenticated_incident_review_atomic(
                         review_task_id=clean_id,
@@ -139,3 +134,9 @@ class ReviewResolutionApplicationService:
             )
         except (MobileReviewTransactionError, ValidationError) as exc:
             raise ReviewResolutionError(str(exc)) from exc
+
+    def _product_cost_snapshot(self, internal_sku: str) -> tuple[Decimal, str]:
+        try:
+            return self.master_data.product_cost_snapshot(internal_sku)
+        except RuntimeMasterDataError as exc:
+            raise ValidationError("商品基础成本资料不可用。") from exc
