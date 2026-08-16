@@ -24,6 +24,11 @@ from app.services.authoritative_inventory import (
 )
 
 
+NONEMPTY_CUTOVER_CONFIRMATION = (
+    "CURRENT_STOCK_ALREADY_INCLUDES_OBSERVED_ORDERS"
+)
+
+
 def main() -> int:
     _configure_output()
     args = _parser().parse_args()
@@ -54,6 +59,9 @@ def main() -> int:
         "authority_mode_before": authority.authority_mode,
         "sku_count": len(products),
         "inventory_total": sum(item.current_stock for item in products),
+        "nonempty_current_snapshot_authorized": bool(
+            args.allow_nonempty_current_snapshot
+        ),
     }
     if not args.apply:
         print(json.dumps(preview, ensure_ascii=False, indent=2))
@@ -71,6 +79,7 @@ def main() -> int:
     )
     if args.backup_dir is None:
         raise ValueError("--apply 必须同时提供 --backup-dir")
+    _require_nonempty_cutover_confirmation(args)
     backup_dir = args.backup_dir.resolve(strict=False)
     backup_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -100,6 +109,9 @@ def main() -> int:
             actor=args.actor,
             freeze_validator=(
                 lambda: _locked_file_sha256(products_handle) == products_sha256
+            ),
+            allow_nonempty_current_snapshot=(
+                args.allow_nonempty_current_snapshot
             ),
         )
     balances = InventoryRepository(repository).list_balances()
@@ -151,11 +163,37 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cutover-order-observation-batch-id",
         required=True,
-        help="切换时绑定的最新可信空 OPEN 订单观察批次",
+        help="切换时绑定的最新可信完整 OPEN 订单观察批次",
+    )
+    parser.add_argument(
+        "--allow-nonempty-current-snapshot",
+        action="store_true",
+        help=(
+            "显式允许当前交易日非空订单快照；仅当冻结库存已经扣除这些订单时使用"
+        ),
+    )
+    parser.add_argument(
+        "--nonempty-confirmation",
+        default="",
+        help="非空订单切换的固定确认语句",
     )
     parser.add_argument("--backup-dir", type=Path)
     parser.add_argument("--actor", default="admin:inventory-cutover")
     return parser
+
+
+def _require_nonempty_cutover_confirmation(args) -> None:
+    provided = str(args.nonempty_confirmation or "").strip()
+    if args.allow_nonempty_current_snapshot:
+        if provided != NONEMPTY_CUTOVER_CONFIRMATION:
+            raise ValueError(
+                "允许非空订单切换时，必须明确确认当前库存已包含已观察订单"
+            )
+        return
+    if provided:
+        raise ValueError(
+            "未开启非空订单切换时，不得单独提供非空确认语句"
+        )
 
 
 def _validate_products(products) -> None:

@@ -279,9 +279,13 @@ class MayiHuatuanOrderReadOnlyAdapter:
             )
 
         parsed: list[OrderObservationInput] = []
+        excluded_zero_quantity_row_count = 0
         parse_error = ""
         for row in capture.rows:
             try:
+                if _non_negative_order_qty(row.order_qty) == 0:
+                    excluded_zero_quantity_row_count += 1
+                    continue
                 item = _parse_row(
                     row,
                     operational_time=self.operational_time,
@@ -312,11 +316,14 @@ class MayiHuatuanOrderReadOnlyAdapter:
                 end_marker_verified=False,
                 end_marker_kind="",
                 items=tuple(parsed),
+                excluded_zero_quantity_row_count=(
+                    excluded_zero_quantity_row_count
+                ),
                 error_code="ORDER_ROW_PARSE_FAILED",
                 error_message=parse_error,
             )
 
-        if not parsed:
+        if not parsed and not excluded_zero_quantity_row_count:
             if capture.trusted_empty_marker_visible:
                 return self._batch(
                     observation_batch_id=observation_batch_id,
@@ -373,6 +380,9 @@ class MayiHuatuanOrderReadOnlyAdapter:
             end_marker_verified=complete,
             end_marker_kind="NO_MORE" if complete else "",
             items=tuple(parsed),
+            excluded_zero_quantity_row_count=(
+                excluded_zero_quantity_row_count
+            ),
             error_code=(
                 ""
                 if complete
@@ -400,6 +410,7 @@ class MayiHuatuanOrderReadOnlyAdapter:
         end_marker_verified: bool,
         end_marker_kind: str,
         items: tuple[OrderObservationInput, ...],
+        excluded_zero_quantity_row_count: int = 0,
         error_code: str = "",
         error_message: str = "",
     ) -> OrderObservationBatchInput:
@@ -420,6 +431,9 @@ class MayiHuatuanOrderReadOnlyAdapter:
             end_marker_kind=end_marker_kind,
             page_count=capture.page_count,
             adapter_capabilities=self.capabilities,
+            excluded_zero_quantity_row_count=(
+                excluded_zero_quantity_row_count
+            ),
             items=items,
             error_code=error_code,
             error_message=error_message,
@@ -548,7 +562,11 @@ def _parse_row(
         raise OrderObservationError(
             "order row observed_at is outside the scan interval"
         )
-    qty = _positive_int(row.order_qty)
+    qty = _non_negative_order_qty(row.order_qty)
+    if qty == 0:
+        raise OrderObservationError(
+            "zero-quantity order rows must be excluded before parsing"
+        )
     amount = _non_negative_decimal(row.order_transaction_amount)
     return OrderObservationInput(
         order_created_at=created_at,
@@ -599,17 +617,21 @@ def _aware_utc(value: datetime, field_name: str) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def _positive_int(value: object) -> int:
+def _non_negative_order_qty(value: object) -> int:
     if isinstance(value, bool):
-        raise OrderObservationError("order_qty must be a positive integer")
+        raise OrderObservationError(
+            "order_qty must be a non-negative integer"
+        )
     try:
         qty = int(str(value).strip())
     except (TypeError, ValueError) as exc:
         raise OrderObservationError(
-            "order_qty must be a positive integer"
+            "order_qty must be a non-negative integer"
         ) from exc
-    if str(value).strip() != str(qty) or qty <= 0:
-        raise OrderObservationError("order_qty must be a positive integer")
+    if str(value).strip() != str(qty) or qty < 0:
+        raise OrderObservationError(
+            "order_qty must be a non-negative integer"
+        )
     return qty
 
 

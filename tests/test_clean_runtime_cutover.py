@@ -12,6 +12,7 @@ import pytest
 import scripts.clean_runtime_cutover as cutover
 
 from app.repositories.inventory_repository import InventoryRepository
+from app.repositories.master_data_repository import RuntimeMasterDataRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import (
     load_products,
@@ -24,11 +25,13 @@ from app.services.authoritative_inventory import (
 from app.services.operational_time import OperationalTimeService
 from scripts.clean_runtime_cutover import (
     ACTIVATION_CONFIRMATION,
+    MAPPING_CONFIRMATION,
     MANIFEST_NAME,
     ROLLBACK_CONFIRMATION,
     CleanRuntimeCutoverError,
     _file_sha256,
     activate_candidate,
+    confirm_candidate_product_mappings,
     prepare_clean_runtime,
     rollback_activation,
     verify_candidate,
@@ -207,6 +210,33 @@ def test_prepare_preview_is_zero_write_and_apply_archives_unhealthy_source(
         sqlite_logical_snapshot_sha256(SQLiteRuntimeRepository(source))
         == source_snapshot
     )
+
+
+def test_confirm_mappings_records_verified_snapshot_in_manifest(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _, products, _, workspace, _ = _prepare(tmp_path, monkeypatch)
+    manifest_path = workspace / MANIFEST_NAME
+    _bootstrap_candidate(
+        manifest_path=manifest_path,
+        products=products,
+        now=datetime(2026, 8, 16, 9, 0, tzinfo=timezone.utc),
+    )
+
+    result = confirm_candidate_product_mappings(
+        manifest_path=manifest_path,
+        confirmation=MAPPING_CONFIRMATION,
+        apply=True,
+    )
+
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    candidate = SQLiteRuntimeRepository(Path(manifest["candidate_runtime_db"]))
+    records = RuntimeMasterDataRepository(candidate).list_mapping_records()
+    assert result["status"] == "CONFIRMED"
+    assert result["confirmed_count"] == 1
+    assert manifest["mapping_confirmation"]["confirmed_count"] == 1
+    assert all(record.mapping_status == "VERIFIED" for record in records)
+    assert verify_candidate(manifest_path=manifest_path)["status"] == "VERIFIED"
 
 
 def test_prepare_preview_cli_runs_as_a_direct_utf8_script(tmp_path: Path) -> None:

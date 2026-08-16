@@ -6,11 +6,13 @@
 
 本流程只适用于当前真实 Runtime DB 主要由测试时期数据构成、无需把历史任务和事件迁入
 正式运行库的情况。旧库会完整归档用于追溯；新库只从现有正式商品工作簿接收 SKU、商品
-资料、平台映射和一次性库存余额，并继续复用现有库存合同、订单空快照门禁和库存 bootstrap。
+资料、平台映射和一次性库存余额，并继续复用现有库存合同、订单观察门禁和库存 bootstrap。
 
 本流程不会修复或删除旧库中的记录，也不会把旧任务、订单、Incident、通知或执行日志复制
 到新库。商品与平台映射工作簿只在准备阶段一次性导入 v18 候选库；原有 `DISABLED /
-UNMAPPED / AMBIGUOUS / VERIFIED` 状态不得在切换时自动改变，激活后运行时不再读取工作簿。
+UNMAPPED / AMBIGUOUS / VERIFIED` 状态不得静默改变。需要启用候选映射时，必须通过
+`confirm-mappings` 显式校验、确认并把确认后快照绑定回切换清单；激活后运行时不再读取
+工作簿。
 
 ## 2. 已查明的旧库孤立事件
 
@@ -29,7 +31,7 @@ UNMAPPED / AMBIGUOUS / VERIFIED` 状态不得在切换时自动改变，激活�
 | Runtime Schema v18 | 原样调用 `SQLiteRuntimeRepository.init_schema()` 创建候选库 |
 | 商品和初始库存 | 原样读取 `products.xlsx`；逐 SKU 与总量回读 |
 | 商品和平台映射 | 一次性导入 v18 数据库并保存数据库快照，原工作簿只归档 |
-| 当前交易日门禁 | 原样复用最新、十分钟内、可信完整且为空的 `OPEN` 订单观察批次 |
+| 订单覆盖门禁 | 原样复用最新、十分钟内、可信完整的 `OPEN` 当前交易日或刚截单 `CLOSED` 交易日批次；非空批次必须显式确认冻结库存已经包含该批订单 |
 | 库存切换 | 原样复用 `InventoryApplicationService.bootstrap()` |
 | 订单读取 | 原样复用 `ORDER_SCAN → ORDER_HISTORY_IMPORT` 只读链 |
 | 激活与回滚 | 新增最小编排；双逻辑快照哈希、固定确认文本、最终归档和回读 |
@@ -81,20 +83,34 @@ python scripts/clean_runtime_cutover.py prepare `
 Result Importer 和 Archive 全部显式绑定到同一个候选 v18 Runtime DB，再完成一次真实页面
 `READ_ONLY` 订单扫描。不得让某一进程仍写旧库。
 
-切换窗口必须满足：
+切换窗口必须满足以下两种模式之一：
 
-- 当前 PRA 交易日刚开始且尚无销售；
-- 最新订单批次为 `OPEN`；
+- 当前 PRA 交易日刚开始且尚无销售，最新订单批次为可信空 `OPEN`；或
+- 18:00 截单后，最新批次为刚结束自然日的完整 `CLOSED`，人工冻结库存已经扣除该批次
+  的全部订单，并提供固定确认文本 `CURRENT_STOCK_ALREADY_INCLUDES_OBSERVED_ORDERS`；
 - 批次 `SUCCEEDED / ACCEPTED`，范围完整且尾部标记已验证；
-- 批次为空，且当前交易日从未观察到订单；
 - 扫描完成时间距 bootstrap 不超过十分钟；
 - Watchdog → Worker → Importer → Archive 使用同一候选库并完整结束。
+
+非空模式还必须传入 `--allow-nonempty-current-snapshot`。bootstrap 只记录销售水位，不会把
+已结算订单再次从冻结库存中扣减。更早历史日、部分批次、日期错位、未验证尾部或仅依赖时间
+推断的批次一律拒绝。
 
 随后继续使用既有 `scripts/bootstrap_authoritative_inventory.py`，把 `PRA_RUNTIME_DB` 临时指向
 候选库，传入候选库 bootstrap 前逻辑快照、商品工作簿哈希和真实订单观察批次 ID。不得在
 测试中生成的空快照上执行真实切换。
 
-bootstrap 完成后执行：
+若准备清单中的 PRODUCT 映射是唯一候选且经人工核对，应先执行显式映射确认；该命令会
+校验映射集合、平台、商品、等级和候选 SKU，并把确认后的数据库快照原子写回清单：
+
+```powershell
+python scripts/clean_runtime_cutover.py confirm-mappings `
+  --manifest D:\PRA_Runtime\cutover\runtime-v18-clean\clean-runtime-cutover-manifest.json `
+  --confirmation CONFIRM_CANDIDATE_PRODUCT_MAPPINGS `
+  --apply
+```
+
+bootstrap 和必要的映射确认完成后执行：
 
 ```powershell
 python scripts/clean_runtime_cutover.py verify `
@@ -132,10 +148,10 @@ Runtime DB，并再次核对健康、Schema、库存权威、逐 SKU 库存和�
 2. `/health` 返回 200，四个一级入口均可读取；
 3. Web GET 前后主库逻辑内容不变；
 4. SKU 集合、逐 SKU 库存和库存合计与冻结工作簿一致；
-5. 平台映射状态与切换前工作簿一致；
+5. 平台映射状态与切换清单绑定的最终确认快照一致；
 6. Web、Automation、Queue、Worker、Importer/Watchdog 独立启动和停止；
 7. 手机收到一次真实飞书测试通知；
 8. 未取得新的 SKU/批次授权时，不执行任何真实平台写动作。
 
-代码合并、临时目录演练和真实库激活是三个独立结论。没有用户对真实维护窗口的再次明确
-授权，不得对 canonical Runtime DB 执行 `prepare --apply`、`activate --apply` 或回滚。
+代码合并、临时目录演练和真实库激活是三个独立结论。2026-08-16 已按本流程完成首次真实
+v18 激活；后续再次重建或回滚仍必须取得新的维护窗口授权，并重新冻结哈希和经营事实。

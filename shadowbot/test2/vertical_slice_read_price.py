@@ -185,6 +185,7 @@ ORDER_DATE_PICKER_SELECTORS = {
     "cancel": "订单管理_订单日期选择_选择框取消按钮",
 }
 ORDER_ROW_INDEX_STEP = 9
+ORDER_PRODUCT_LINE_INDEX_STEP = 5
 ORDER_LIST_END_LABEL = "没有更多了"
 ORDER_LIST_EMPTY_LABEL = "暂无订单"
 V5_KEYBOARD_LOAD_WAIT_SECONDS = 0.1
@@ -7242,7 +7243,7 @@ def _order_top_row_state(window, timeout_seconds):
 
 def _order_normalize_qty(value):
     match = re.search(r"(?<!\d)(\d+)(?:\s*扎)?", str(value or ""))
-    if not match or int(match.group(1)) <= 0:
+    if not match:
         raise SliceError(
             "ORDER_QTY_PARSE_FAILED",
             "订单数量字段无法解析",
@@ -7325,7 +7326,7 @@ def _order_scoped_element_text(element, max_depth=2):
     return ""
 
 
-def _order_indexed_children_from_grade_anchor(grade_anchor):
+def _order_indexed_context_from_grade_anchor(grade_anchor):
     try:
         grade_view = grade_anchor.parent()
         indexed_container = grade_view.parent()
@@ -7336,7 +7337,34 @@ def _order_indexed_children_from_grade_anchor(grade_anchor):
             "订单等级锚点无法解析到列表索引子元素: " + type(exc).__name__,
             retryable=True,
         ) from exc
-    return children
+    return indexed_container, children
+
+
+def _order_indexed_child_position(indexed_children, target):
+    for index, child in enumerate(indexed_children):
+        try:
+            if child is target or child == target:
+                return index
+        except Exception:
+            continue
+    try:
+        target_bounds = _bounding_dict(target)
+    except Exception as exc:
+        raise ValueError("target bounds unavailable") from exc
+    matches = []
+    for index, child in enumerate(indexed_children):
+        try:
+            child_bounds = _bounding_dict(child)
+        except Exception:
+            continue
+        if all(
+            abs(child_bounds[key] - target_bounds[key]) <= 0.5
+            for key in ("x", "y", "width", "height")
+        ):
+            matches.append(index)
+    if len(matches) != 1:
+        raise ValueError("indexed child bounds are not unique")
+    return matches[0]
 
 
 def _order_read_rows(window, timeout_seconds, max_rows):
@@ -7373,13 +7401,62 @@ def _order_read_rows(window, timeout_seconds, max_rows):
             "订单数量超过请求允许的最大读取条数",
             retryable=False,
         )
-    indexed_children = _order_indexed_children_from_grade_anchor(
+    indexed_container, indexed_children = _order_indexed_context_from_grade_anchor(
         grade_anchors[0]
     )
-    required_last_index = (
-        field_indexes["order_created_at"]
-        + ORDER_ROW_INDEX_STEP * (len(grade_anchors) - 1)
-    )
+    grade_indexes = []
+    for grade_anchor in grade_anchors:
+        try:
+            grade_view = grade_anchor.parent()
+            grade_index = _order_indexed_child_position(
+                indexed_children,
+                grade_view,
+            )
+        except Exception as exc:
+            raise SliceError(
+                "ORDER_LIST_STRUCTURE_MISMATCH",
+                "订单等级锚点无法关联到同一列表索引容器: "
+                + type(exc).__name__,
+                retryable=True,
+            ) from exc
+        grade_indexes.append(grade_index)
+    if grade_indexes != sorted(set(grade_indexes)):
+        raise SliceError(
+            "ORDER_LIST_STRUCTURE_MISMATCH",
+            "订单等级锚点顺序不一致",
+            retryable=True,
+        )
+    if grade_indexes[0] != 2:
+        raise SliceError(
+            "ORDER_CARD_INDEX_MISMATCH",
+            "订单等级锚点与列表冻结首项 index 不一致",
+            retryable=True,
+        )
+    for current_index, next_index in zip(grade_indexes, grade_indexes[1:]):
+        if next_index - current_index not in {
+            ORDER_PRODUCT_LINE_INDEX_STEP,
+            ORDER_ROW_INDEX_STEP,
+        }:
+            raise SliceError(
+                "ORDER_LIST_STRUCTURE_MISMATCH",
+                "订单商品行或订单卡片步长不符合冻结结构",
+                retryable=True,
+            )
+    date_indexes = []
+    group_end_index = grade_indexes[-1]
+    for position in range(len(grade_indexes) - 1, -1, -1):
+        current_index = grade_indexes[position]
+        if (
+            position == len(grade_indexes) - 1
+            or grade_indexes[position + 1] - current_index
+            == ORDER_ROW_INDEX_STEP
+        ):
+            group_end_index = current_index
+        date_indexes.append(
+            group_end_index + ORDER_PRODUCT_LINE_INDEX_STEP
+        )
+    date_indexes.reverse()
+    required_last_index = max(date_indexes)
     if len(indexed_children) <= required_last_index:
         raise SliceError(
             "ORDER_LIST_STRUCTURE_MISMATCH",
@@ -7387,12 +7464,16 @@ def _order_read_rows(window, timeout_seconds, max_rows):
             retryable=True,
         )
     rows = []
-    for ordinal, grade_anchor in enumerate(grade_anchors, start=1):
+    for ordinal, (grade_anchor, grade_index, date_index) in enumerate(
+        zip(grade_anchors, grade_indexes, date_indexes),
+        start=1,
+    ):
         def read_field(field, normalizer=None, expected_anchor=None):
             try:
                 target_index = (
-                    field_indexes[field]
-                    + ORDER_ROW_INDEX_STEP * (ordinal - 1)
+                    date_index
+                    if field == "order_created_at"
+                    else grade_index + field_indexes[field] - field_indexes["grade"]
                 )
                 value = _order_scoped_element_text(
                     indexed_children[target_index],

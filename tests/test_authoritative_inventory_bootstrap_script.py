@@ -5,15 +5,40 @@ import json
 import os
 import subprocess
 import sys
+from argparse import Namespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import pytest
 
 from app.repositories.inventory_repository import InventoryRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import save_table_records
 from app.services.authoritative_inventory import sqlite_logical_snapshot_sha256
 from app.services.operational_time import OperationalTimeService
+from scripts.bootstrap_authoritative_inventory import (
+    NONEMPTY_CUTOVER_CONFIRMATION,
+    _require_nonempty_cutover_confirmation,
+)
 from tests.inventory_cutover_support import insert_cutover_order_snapshot
+
+
+def test_nonempty_cutover_requires_fixed_confirmation() -> None:
+    for value in ("", "I understand"):
+        with pytest.raises(ValueError, match="库存已包含已观察订单"):
+            _require_nonempty_cutover_confirmation(
+                Namespace(
+                    allow_nonempty_current_snapshot=True,
+                    nonempty_confirmation=value,
+                )
+            )
+
+    _require_nonempty_cutover_confirmation(
+        Namespace(
+            allow_nonempty_current_snapshot=True,
+            nonempty_confirmation=NONEMPTY_CUTOVER_CONFIRMATION,
+        )
+    )
 
 
 def test_cutover_script_applies_only_canonical_frozen_snapshots(

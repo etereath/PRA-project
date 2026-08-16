@@ -34,6 +34,9 @@ from app.repositories.workbook_repository import (  # noqa: E402
 from app.services.authoritative_inventory import (  # noqa: E402
     sqlite_logical_snapshot_sha256,
 )
+from app.services.master_data_management import (  # noqa: E402
+    MasterDataManagementService,
+)
 from app.services.product_mapping import (  # noqa: E402
     compile_product_mapping_workbook,
 )
@@ -43,6 +46,7 @@ MANIFEST_NAME = "clean-runtime-cutover-manifest.json"
 MANIFEST_VERSION = 2
 ACTIVATION_CONFIRMATION = "REPLACE_TEST_RUNTIME_WITH_CLEAN_V18"
 ROLLBACK_CONFIRMATION = "ROLLBACK_TO_ARCHIVED_TEST_RUNTIME"
+MAPPING_CONFIRMATION = "CONFIRM_CANDIDATE_PRODUCT_MAPPINGS"
 
 
 class CleanRuntimeCutoverError(RuntimeError):
@@ -266,6 +270,122 @@ def verify_candidate(
         "platform_mapping_snapshot_sha256": mapping_snapshot,
         "integrity_check": integrity,
         "foreign_key_violation_count": foreign_key_violations,
+    }
+
+
+def confirm_candidate_product_mappings(
+    *,
+    manifest_path: Path,
+    confirmation: str,
+    apply: bool,
+) -> dict[str, Any]:
+    """Confirm prepared PRODUCT candidates and bind the result to the manifest."""
+
+    manifest = _load_manifest(manifest_path)
+    candidate = _manifest_file(manifest, "candidate_runtime_db")
+    repository = SQLiteRuntimeRepository(candidate)
+    health = repository.check_schema_health()
+    if not health.ok:
+        raise CleanRuntimeCutoverError(
+            "v18 候选库未通过健康检查：" + health.summary
+        )
+    expected_rows = {
+        str(item["mapping_id"]): item
+        for item in manifest.get("preserved_product_mappings", [])
+    }
+    if not expected_rows:
+        raise CleanRuntimeCutoverError("切换清单没有待确认的商品映射")
+    master_data = RuntimeMasterDataRepository(repository)
+    records = {
+        record.mapping_id: record
+        for record in master_data.list_mapping_records()
+        if record.mapping_kind == "PRODUCT"
+    }
+    if set(records) != set(expected_rows):
+        raise CleanRuntimeCutoverError("候选库商品映射集合与切换清单不一致")
+    for mapping_id, expected in expected_rows.items():
+        record = records[mapping_id]
+        candidate_sku = str(expected.get("candidate_internal_sku") or "")
+        if (
+            record.platform_name != str(expected.get("platform_name") or "")
+            or record.platform_product_name
+            != str(expected.get("platform_product_name") or "")
+            or record.grade != str(expected.get("grade") or "")
+            or not candidate_sku
+        ):
+            raise CleanRuntimeCutoverError(
+                f"候选商品映射内容与切换清单不一致：{mapping_id}"
+            )
+        valid_disabled = (
+            record.mapping_status == "DISABLED"
+            and not record.internal_sku
+            and record.candidate_internal_sku == candidate_sku
+        )
+        valid_verified = (
+            record.mapping_status == "VERIFIED"
+            and record.internal_sku == candidate_sku
+        )
+        if not (valid_disabled or valid_verified):
+            raise CleanRuntimeCutoverError(
+                f"候选商品映射不处于可确认状态：{mapping_id}"
+            )
+    preview = {
+        "mode": "APPLY" if apply else "READ_ONLY_PREVIEW",
+        "candidate_runtime_db": str(candidate),
+        "mapping_count": len(records),
+        "already_verified_count": sum(
+            record.mapping_status == "VERIFIED" for record in records.values()
+        ),
+    }
+    if not apply:
+        return preview
+    if confirmation != MAPPING_CONFIRMATION:
+        raise CleanRuntimeCutoverError("商品映射确认语句不正确，拒绝写入")
+    service = MasterDataManagementService(repository)
+    for mapping_id, expected in expected_rows.items():
+        record = records[mapping_id]
+        if record.mapping_status == "VERIFIED":
+            continue
+        service.save_product_mapping(
+            mapping_id=record.mapping_id,
+            platform_name=record.platform_name,
+            platform_product_name=record.platform_product_name,
+            grade=record.grade,
+            internal_sku=str(expected["candidate_internal_sku"]),
+            search_keyword=record.search_keyword,
+            mapping_status="VERIFIED",
+            remark="迁移前依据冻结商品目录确认",
+            expected_version=record.version,
+            actor="admin:runtime-v18-cutover",
+            idempotency_key=f"runtime-v18-cutover:mapping:{record.mapping_id}",
+        )
+    after = {
+        record.mapping_id: record
+        for record in master_data.list_mapping_records()
+        if record.mapping_kind == "PRODUCT"
+    }
+    if any(
+        record.mapping_status != "VERIFIED"
+        or record.internal_sku
+        != str(expected_rows[mapping_id]["candidate_internal_sku"])
+        for mapping_id, record in after.items()
+    ):
+        raise CleanRuntimeCutoverError("候选商品映射确认后回读不一致")
+    mapping_snapshot = master_data.mapping_snapshot_sha256()
+    confirmed_at = _utc_now()
+    manifest["platform_mapping_snapshot_sha256"] = mapping_snapshot
+    manifest["mapping_confirmation"] = {
+        "confirmed_at": confirmed_at,
+        "confirmed_count": len(after),
+        "actor": "admin:runtime-v18-cutover",
+    }
+    _atomic_write_json(manifest_path, manifest)
+    return {
+        **preview,
+        "status": "CONFIRMED",
+        "confirmed_count": len(after),
+        "platform_mapping_snapshot_sha256": mapping_snapshot,
+        "manifest_updated": str(manifest_path),
     }
 
 
@@ -727,6 +847,11 @@ def _build_parser() -> argparse.ArgumentParser:
     verify = subparsers.add_parser("verify")
     verify.add_argument("--manifest", type=Path, required=True)
 
+    confirm_mappings = subparsers.add_parser("confirm-mappings")
+    confirm_mappings.add_argument("--manifest", type=Path, required=True)
+    confirm_mappings.add_argument("--confirmation", default="")
+    confirm_mappings.add_argument("--apply", action="store_true")
+
     activate = subparsers.add_parser("activate")
     activate.add_argument("--manifest", type=Path, required=True)
     activate.add_argument("--source-runtime-db", type=Path, required=True)
@@ -764,6 +889,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "verify":
             result = verify_candidate(
                 manifest_path=args.manifest,
+            )
+        elif args.command == "confirm-mappings":
+            result = confirm_candidate_product_mappings(
+                manifest_path=args.manifest,
+                confirmation=args.confirmation,
+                apply=args.apply,
             )
         elif args.command == "activate":
             result = activate_candidate(

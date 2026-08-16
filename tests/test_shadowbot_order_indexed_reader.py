@@ -34,7 +34,8 @@ def _load_reader():
         "_order_calculate_transaction_amount",
         "_order_normalize_created_at",
         "_order_scoped_element_text",
-        "_order_indexed_children_from_grade_anchor",
+        "_order_indexed_context_from_grade_anchor",
+        "_order_indexed_child_position",
         "_order_read_rows",
     }
     nodes = [
@@ -55,6 +56,7 @@ def _load_reader():
         "datetime": datetime,
         "re": re,
         "ORDER_ROW_INDEX_STEP": 9,
+        "ORDER_PRODUCT_LINE_INDEX_STEP": 5,
         "_now_iso": lambda: next(observed),
         "_order_row_anchor_collection_selector": lambda: "grade-anchors",
     }
@@ -116,6 +118,25 @@ def _indexed_order_list(*rows):
         ]
         children.extend(order_children)
         anchors.append(order_children[2]._children[0])
+    indexed_list = _Element(children=children)
+    return indexed_list, anchors
+
+
+def _indexed_multi_product_order(*rows, created_at):
+    blocked = lambda: _Element(fail_if_read=True)
+    children = [blocked(), blocked()]
+    anchors = []
+    for grade, name, qty, price in rows:
+        product_children = [
+            _field(grade),
+            _field(name),
+            blocked(),
+            _field(qty),
+            _field(price),
+        ]
+        children.extend(product_children)
+        anchors.append(product_children[0]._children[0])
+    children.extend([_field(created_at), blocked()])
     indexed_list = _Element(children=children)
     return indexed_list, anchors
 
@@ -211,3 +232,32 @@ def test_order_reader_rejects_an_incomplete_card():
         _load_reader()(_Window(anchors), 5, 20)
 
     assert raised.value.code == "ORDER_LIST_STRUCTURE_MISMATCH"
+
+
+def test_order_reader_supports_multiple_product_lines_and_zero_quantity():
+    _, anchors = _indexed_multi_product_order(
+        ("B级", "艾莎", "数量 2扎", "¥13.00"),
+        ("C级", "艾莎", "数量 0扎", "¥7.30"),
+        created_at="下单时间：2026-08-16 09:16:54",
+    )
+
+    rows = _load_reader()(_Window(anchors), 5, 20)
+
+    assert rows == [
+        {
+            "order_created_at": "2026-08-16 09:16:54",
+            "platform_product_name": "艾莎",
+            "grade": "B级",
+            "order_qty": "2",
+            "order_transaction_amount": "26.00",
+            "observed_at": "2026-07-10T09:44:10+00:00",
+        },
+        {
+            "order_created_at": "2026-08-16 09:16:54",
+            "platform_product_name": "艾莎",
+            "grade": "C级",
+            "order_qty": "0",
+            "order_transaction_amount": "0.00",
+            "observed_at": "2026-07-10T09:44:11+00:00",
+        },
+    ]

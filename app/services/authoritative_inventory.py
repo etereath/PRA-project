@@ -8,7 +8,7 @@ from datetime import date, datetime, timedelta
 from typing import Callable, Iterable, Mapping
 from uuid import uuid4
 
-from app.enums import DataQualityLevel, FactSource
+from app.enums import DataQualityLevel, FactSource, ProductMappingStatus
 from app.inventory_models import (
     InventoryAuthorityState,
     InventoryBalance,
@@ -138,6 +138,7 @@ class InventoryApplicationService:
         idempotency_key: str,
         actor: str,
         freeze_validator: Callable[[], bool] | None = None,
+        allow_nonempty_current_snapshot: bool = False,
     ) -> InventoryBootstrapResult:
         normalized_products = tuple(sorted(products, key=lambda item: item.internal_sku))
         if not normalized_products:
@@ -168,6 +169,9 @@ class InventoryApplicationService:
             "snapshot_sha256": snapshot_sha256,
             "runtime_snapshot_sha256": runtime_snapshot_sha256,
             "cutover_order_observation_batch_id": cutover_batch_id,
+            "allow_nonempty_current_snapshot": bool(
+                allow_nonempty_current_snapshot
+            ),
         }
         request_sha256 = _sha256_payload(payload)
         now = self.clock()
@@ -251,13 +255,18 @@ class InventoryApplicationService:
                     policies=policies
                 ).classify(now)
                 watermark_date = time_context.platform_trade_date
-                cutover_snapshot = _require_trusted_empty_cutover_snapshot(
+                cutover_snapshot = _require_trusted_cutover_snapshot(
                     self.summaries,
                     connection=connection,
                     observation_batch_id=cutover_batch_id,
                     platform_trade_date=watermark_date,
                     time_policy_version=time_context.time_policy_version,
                     cutover_at=now,
+                    local_calendar_date=time_context.local_observed_at.date(),
+                    allowed_skus={
+                        item.internal_sku for item in normalized_products
+                    },
+                    allow_nonempty=bool(allow_nonempty_current_snapshot),
                 )
                 cutover_order_ref = (
                     "ORDER_OBSERVATION_BATCH:"
@@ -753,7 +762,18 @@ class InventorySalesApplicationService:
                         internal_sku=summary.scope_key,
                         connection=connection,
                     )
-                    before_sold = baseline.selected_sold_qty if baseline else 0
+                    before_sold = (
+                        baseline.selected_sold_qty
+                        if baseline is not None
+                        else _bootstrap_order_watermark_qty(
+                            connection,
+                            repository=self.summaries,
+                            authority_state=state,
+                            platform_name=platform,
+                            platform_trade_date=platform_trade_date,
+                            internal_sku=summary.scope_key,
+                        )
+                    )
                     selected_sold = int(summary.sold_qty)
                     delta_sold = selected_sold - before_sold
                     if (
@@ -902,7 +922,7 @@ class InventorySalesApplicationService:
         )
 
 
-def _require_trusted_empty_cutover_snapshot(
+def _require_trusted_cutover_snapshot(
     repository: OperationalSummaryRepository,
     *,
     connection,
@@ -910,6 +930,9 @@ def _require_trusted_empty_cutover_snapshot(
     platform_trade_date: date,
     time_policy_version: str,
     cutover_at: datetime,
+    local_calendar_date: date,
+    allowed_skus: set[str],
+    allow_nonempty: bool,
 ):
     snapshot = repository.get_order_snapshot(
         observation_batch_id,
@@ -917,23 +940,45 @@ def _require_trusted_empty_cutover_snapshot(
     )
     if snapshot is None:
         raise InventoryConflictError("库存切换绑定的订单观察批次不存在")
-    if snapshot.platform_trade_date != platform_trade_date:
-        raise InventoryConflictError("库存切换订单快照与当前 PRA 交易日不一致")
+    current_open_snapshot = bool(
+        snapshot.platform_trade_date == platform_trade_date
+        and snapshot.trade_day_status == "OPEN"
+    )
+    just_closed_snapshot = bool(
+        platform_trade_date == local_calendar_date + timedelta(days=1)
+        and snapshot.platform_trade_date == local_calendar_date
+        and snapshot.trade_day_status == "CLOSED"
+    )
+    if not current_open_snapshot and not just_closed_snapshot:
+        raise InventoryConflictError(
+            "库存切换订单快照必须是当前 OPEN 交易日，或 18:00 后刚关闭的当日交易日"
+        )
     if snapshot.time_policy_version != time_policy_version:
         raise InventoryConflictError("库存切换订单快照与当前交易日策略版本不一致")
     if (
-        snapshot.trade_day_status != "OPEN"
-        or snapshot.capability_result != "SUCCEEDED"
+        snapshot.capability_result != "SUCCEEDED"
         or snapshot.batch_status != "ACCEPTED"
         or snapshot.source_batch_status != "ACCEPTED"
         or not snapshot.scope_complete
         or not snapshot.end_marker_verified
     ):
-        raise InventoryConflictError("库存切换必须绑定可信完整的 OPEN 订单空快照")
-    if snapshot.items:
+        raise InventoryConflictError("库存切换必须绑定可信完整的订单快照")
+    if snapshot.items and not allow_nonempty:
         raise InventoryConflictError(
             "当前 PRA 交易日已经出现订单，保守库存切换门禁拒绝执行"
         )
+    if snapshot.items:
+        invalid_items = tuple(
+            item
+            for item in snapshot.items
+            if item.mapping_status is not ProductMappingStatus.VERIFIED
+            or not item.internal_sku
+            or item.internal_sku not in allowed_skus
+        )
+        if invalid_items:
+            raise InventoryConflictError(
+                "非空库存切换要求每条订单唯一映射到冻结商品 SKU"
+            )
     observed_order_count = int(
         connection.execute(
             """
@@ -946,20 +991,20 @@ def _require_trusted_empty_cutover_snapshot(
             """,
             (
                 snapshot.platform_name,
-                platform_trade_date.isoformat(),
+                snapshot.platform_trade_date.isoformat(),
             ),
         ).fetchone()[0]
     )
-    if observed_order_count:
+    if observed_order_count and not allow_nonempty:
         raise InventoryConflictError(
             "当前 PRA 交易日曾经观察到订单，保守库存切换门禁拒绝执行"
         )
     age = cutover_at - snapshot.scan_completed_at
     if age < timedelta(0) or age > CUTOVER_ORDER_SNAPSHOT_MAX_AGE:
-        raise InventoryConflictError("库存切换订单空快照已过期或时间晚于切换时刻")
+        raise InventoryConflictError("库存切换订单快照已过期或时间晚于切换时刻")
     snapshots = repository.list_order_snapshots(
         platform_name=snapshot.platform_name,
-        platform_trade_date=platform_trade_date,
+        platform_trade_date=snapshot.platform_trade_date,
         connection=connection,
     )
     latest = max(
@@ -980,12 +1025,74 @@ def _require_trusted_empty_cutover_snapshot(
             FROM order_observation_batches
             WHERE requested_platform_trade_date = ?
             """,
-            (platform_trade_date.isoformat(),),
+            (snapshot.platform_trade_date.isoformat(),),
         ).fetchall()
     }
     if platforms != {snapshot.platform_name}:
         raise InventoryConflictError("库存切换窗口只允许一个已完整覆盖的平台")
     return snapshot
+
+
+def _bootstrap_order_watermark_qty(
+    connection,
+    *,
+    repository: OperationalSummaryRepository,
+    authority_state,
+    platform_name: str,
+    platform_trade_date: date,
+    internal_sku: str,
+) -> int:
+    """Return already-accounted sales bound to the immutable bootstrap row."""
+
+    if authority_state.bootstrap_sales_watermark_date != platform_trade_date:
+        return 0
+    row = connection.execute(
+        """
+        SELECT supporting_refs_json
+        FROM inventory_transactions
+        WHERE transaction_type = 'BOOTSTRAP'
+          AND internal_sku = ?
+        """,
+        (internal_sku,),
+    ).fetchone()
+    if row is None:
+        raise InventoryAuthorityError(
+            f"商品 {internal_sku} 缺少库存切换销量水位证据"
+        )
+    references = tuple(json.loads(str(row["supporting_refs_json"])))
+    order_references = tuple(
+        reference
+        for reference in references
+        if str(reference).startswith("ORDER_OBSERVATION_BATCH:")
+    )
+    if len(order_references) != 1:
+        raise InventoryAuthorityError("库存切换订单销量水位证据不唯一")
+    parts = str(order_references[0]).split(":", 2)
+    if len(parts) != 3 or not parts[1] or not parts[2].startswith("sha256:"):
+        raise InventoryAuthorityError("库存切换订单销量水位证据格式无效")
+    snapshot = repository.get_order_snapshot(parts[1], connection=connection)
+    if snapshot is None or snapshot.content_sha256 != parts[2]:
+        raise InventoryAuthorityError("库存切换订单销量水位证据无法回读")
+    if (
+        snapshot.platform_name != platform_name
+        or snapshot.platform_trade_date != platform_trade_date
+    ):
+        return 0
+    if (
+        snapshot.trade_day_status != "OPEN"
+        or snapshot.capability_result != "SUCCEEDED"
+        or snapshot.batch_status != "ACCEPTED"
+        or snapshot.source_batch_status != "ACCEPTED"
+        or not snapshot.scope_complete
+        or not snapshot.end_marker_verified
+    ):
+        raise InventoryAuthorityError("库存切换订单销量水位不再可信")
+    return sum(
+        int(item.order_qty)
+        for item in snapshot.items
+        if item.internal_sku == internal_sku
+        and item.mapping_status is ProductMappingStatus.VERIFIED
+    )
 
 
 def _eligible_inventory_fact(summary, selection) -> bool:

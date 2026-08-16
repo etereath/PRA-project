@@ -374,6 +374,77 @@ def test_bootstrap_rejects_nonempty_open_cutover_snapshot(
     assert inventory.list_transactions() == ()
 
 
+def test_bootstrap_accepts_explicit_nonempty_snapshot_as_sales_watermark(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    batch_id = insert_cutover_order_snapshot(
+        repository,
+        batch_id="cutover-open-orders-already-in-stock",
+        observed_at=NOW,
+        platform_trade_date=date(2026, 8, 13),
+        order_quantities=(6,),
+    )
+
+    result = InventoryApplicationService(repository, clock=lambda: NOW).bootstrap(
+        _products(),
+        snapshot_sha256=SNAPSHOT_SHA256,
+        runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
+        cutover_order_observation_batch_id=batch_id,
+        idempotency_key="bootstrap:open-orders-authorized",
+        actor="admin",
+        freeze_validator=lambda: True,
+        allow_nonempty_current_snapshot=True,
+    )
+
+    inventory = InventoryRepository(repository)
+    assert result.status == "APPLIED"
+    assert inventory.get_balance("AISHA-A-50-Z").current_qty == 72
+    transaction = inventory.list_transactions(
+        internal_sku="AISHA-A-50-Z"
+    )[0]
+    assert transaction.transaction_type == "BOOTSTRAP"
+    assert len(transaction.supporting_refs) == 1
+    assert transaction.supporting_refs[0].startswith(
+        f"ORDER_OBSERVATION_BATCH:{batch_id}:sha256:"
+    )
+
+
+def test_bootstrap_accepts_just_closed_snapshot_after_platform_cutoff(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    batch_id = insert_cutover_order_snapshot(
+        repository,
+        batch_id="cutover-just-closed-orders-already-accounted",
+        observed_at=NOW,
+        platform_trade_date=date(2026, 8, 12),
+        trade_day_status="CLOSED",
+        order_quantities=(6,),
+    )
+
+    result = InventoryApplicationService(repository, clock=lambda: NOW).bootstrap(
+        _products(),
+        snapshot_sha256=SNAPSHOT_SHA256,
+        runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
+        cutover_order_observation_batch_id=batch_id,
+        idempotency_key="bootstrap:just-closed-authorized",
+        actor="admin",
+        freeze_validator=lambda: True,
+        allow_nonempty_current_snapshot=True,
+    )
+
+    assert result.status == "APPLIED"
+    assert result.authority_state.bootstrap_sales_watermark_date == date(
+        2026,
+        8,
+        13,
+    )
+    assert InventoryRepository(repository).get_balance(
+        "AISHA-A-50-Z"
+    ).current_qty == 72
+
+
 def test_bootstrap_uses_runtime_operational_time_policy_version(
     tmp_path: Path,
 ) -> None:

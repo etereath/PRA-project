@@ -20,6 +20,7 @@ def insert_cutover_order_snapshot(
     platform_name: str = "platform",
     time_policy_version: str = DEFAULT_OPERATIONAL_TIME_POLICY_VERSION,
     order_quantities: tuple[int, ...] = (),
+    internal_sku: str = "AISHA-A-50-Z",
     trade_day_status: str = "OPEN",
     capability_result: str = "SUCCEEDED",
     batch_status: str = "ACCEPTED",
@@ -129,7 +130,7 @@ def insert_cutover_order_snapshot(
                     raw_observation_sha256
                 ) VALUES (
                     ?, ?, ?, ?, ?, ?, ?, ?, 'Synthetic Rose', 'A',
-                    'AISHA-A-50-Z', 'VERIFIED', 'mapping-v1',
+                    ?, 'VERIFIED', 'mapping-v1',
                     ?, ?, ?, ?, 'NORMAL_SALES', ?
                 )
                 """,
@@ -142,6 +143,7 @@ def insert_cutover_order_snapshot(
                     _sha256(f"fingerprint-{batch_id}-{occurrence_no}"),
                     occurrence_no,
                     (observed_at - timedelta(minutes=2)).isoformat(),
+                    internal_sku,
                     quantity,
                     str(quantity * 10),
                     timestamp,

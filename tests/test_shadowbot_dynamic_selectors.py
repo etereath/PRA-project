@@ -154,8 +154,10 @@ def test_order_reader_does_not_locate_a_separate_total_amount_element():
     assert '"order_qty": 5' in reader_source
     assert '"unit_price": 6' in reader_source
     assert '"order_created_at": 7' in reader_source
-    assert "_order_indexed_children_from_grade_anchor" in reader_source
-    assert "ORDER_ROW_INDEX_STEP * (ordinal - 1)" in reader_source
+    assert "_order_indexed_context_from_grade_anchor" in reader_source
+    assert "_order_indexed_child_position" in reader_source
+    assert "ORDER_PRODUCT_LINE_INDEX_STEP" in reader_source
+    assert "ORDER_ROW_INDEX_STEP" in reader_source
     assert "expected_anchor=grade_anchor" in reader_source
 
 

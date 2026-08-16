@@ -70,6 +70,7 @@ class OrderObservationBatchInput:
     end_marker_kind: str
     page_count: int
     adapter_capabilities: Mapping[str, bool]
+    excluded_zero_quantity_row_count: int = 0
     items: tuple[OrderObservationInput, ...] = ()
     error_code: str = ""
     error_message: str = ""
@@ -195,7 +196,14 @@ class OrderObservationImporter:
                             sorted(normalized.adapter_capabilities.items())
                         ),
                         "page_count": normalized.page_count,
-                        "source_row_count": len(raw_items),
+                        "source_row_count": (
+                            len(raw_items)
+                            + normalized.excluded_zero_quantity_row_count
+                        ),
+                        "accepted_source_row_count": len(raw_items),
+                        "excluded_zero_quantity_row_count": (
+                            normalized.excluded_zero_quantity_row_count
+                        ),
                         "end_marker_kind": normalized.end_marker_kind,
                         "source_batch_status": normalized.batch_status,
                         "accepted_mapping_version": (
@@ -567,6 +575,14 @@ def normalize_order_observation_batch(
         or batch.page_count < 0
     ):
         raise OrderObservationError("page_count must be a non-negative integer")
+    if (
+        isinstance(batch.excluded_zero_quantity_row_count, bool)
+        or not isinstance(batch.excluded_zero_quantity_row_count, int)
+        or batch.excluded_zero_quantity_row_count < 0
+    ):
+        raise OrderObservationError(
+            "excluded_zero_quantity_row_count must be a non-negative integer"
+        )
     capabilities = {
         name: bool(batch.adapter_capabilities.get(name))
         for name in (
@@ -616,6 +632,9 @@ def normalize_order_observation_batch(
         end_marker_kind=str(batch.end_marker_kind or "").strip().upper(),
         page_count=int(batch.page_count),
         adapter_capabilities=capabilities,
+        excluded_zero_quantity_row_count=(
+            batch.excluded_zero_quantity_row_count
+        ),
         items=normalized_items,
         error_code=error_code,
         error_message=error_message,
@@ -731,6 +750,9 @@ def order_batch_content_sha256(
         "page_count": batch.page_count,
         "adapter_capabilities": dict(
             sorted(batch.adapter_capabilities.items())
+        ),
+        "excluded_zero_quantity_row_count": (
+            batch.excluded_zero_quantity_row_count
         ),
         "items": [
             {

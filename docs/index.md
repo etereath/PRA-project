@@ -2,7 +2,7 @@
 
 本文档是当前项目文档入口。项目说明文本以中文为主，英文键名和代码标识保持原样。
 
-运行态业务数据以 SQLite 为中心，当前代码结构版本为 v18。v9～v16 延续既有观察、执行、Automation、日结和 Incident 合同；v17 增加真实库存权威状态、余额、不可变流水、切换销售水位和预警策略；v18 增加数据库商品目录和平台映射。真实 Runtime DB 需按独立维护、canonical 路径、完整 SQLite 逻辑快照、最新可信空 OPEN 订单批次、备份和提交前回读门禁另行升级并执行库存 bootstrap；代码合并不等于真实库已经切换。`products.xlsx` 与 `platform_mappings.xlsx` 只允许作为受控切换的一次性导入，运行中的 Web、人工任务、Automation、订单映射、Queue/Worker/Importer、执行授权和紧急复核不得依赖它们；价格与上下架规则工作簿仍是后续待数据库化的规则输入。
+运行态业务数据以 SQLite 为中心，当前代码结构版本为 v18。v9～v16 延续既有观察、执行、Automation、日结和 Incident 合同；v17 增加真实库存权威状态、余额、不可变流水、切换销售水位和预警策略；v18 增加数据库商品目录和平台映射。2026-08-16 已按 canonical 路径、完整 SQLite 逻辑快照、最新可信订单批次、备份和提交前回读门禁完成真实 Runtime v18 切换与库存 bootstrap。`products.xlsx` 与 `platform_mappings.xlsx` 只允许作为受控切换的一次性导入，运行中的 Web、人工任务、Automation、订单映射、Queue/Worker/Importer、执行授权和紧急复核不得依赖它们；价格与上下架规则工作簿仍是后续待数据库化的规则输入。
 
 项目长期控制面固定为：人工运营走 Web，定时业务走 Automation，未来智能调用走 Agent
 Gateway，平台执行走 Queue/Worker/Importer，开发测试与恢复走 CLI。Agent 只能通过

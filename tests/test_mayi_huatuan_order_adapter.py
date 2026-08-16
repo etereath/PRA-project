@@ -267,3 +267,41 @@ def test_observed_at_is_preserved_per_item() -> None:
         datetime(2026, 7, 31, 9, 1, tzinfo=timezone.utc),
         datetime(2026, 7, 31, 9, 2, tzinfo=timezone.utc),
     ]
+
+
+def test_zero_quantity_refund_row_is_explicitly_excluded() -> None:
+    zero_row = replace(
+        _capture().rows[0],
+        order_qty="0",
+        order_transaction_amount="0",
+    )
+    capture = replace(
+        _capture(),
+        rows=(zero_row, *_capture().rows[1:]),
+    )
+    adapter, _ = _adapter(capture)
+
+    batch = _scan(adapter)
+
+    assert batch.batch_status == "ACCEPTED"
+    assert batch.scope_complete is True
+    assert batch.excluded_zero_quantity_row_count == 1
+    assert len(batch.items) == 2
+
+
+def test_only_zero_quantity_rows_can_still_prove_complete_scope() -> None:
+    zero_row = replace(
+        _capture().rows[0],
+        order_qty="0",
+        order_transaction_amount="0",
+    )
+    capture = replace(_capture(), rows=(zero_row,))
+    adapter, _ = _adapter(capture)
+
+    batch = _scan(adapter)
+
+    assert batch.batch_status == "ACCEPTED"
+    assert batch.scope_complete is True
+    assert batch.end_marker_kind == "NO_MORE"
+    assert batch.excluded_zero_quantity_row_count == 1
+    assert batch.items == ()

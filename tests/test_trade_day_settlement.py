@@ -895,6 +895,60 @@ def test_trusted_empty_cutover_applies_later_complete_sales_from_zero(
     assert inventory.get_balance("SKU-1").current_qty == 95
 
 
+def test_nonempty_cutover_applies_only_sales_after_bootstrap_watermark(
+    settlement,
+) -> None:
+    service, _, runtime = settlement
+    cutover_batch_id = insert_cutover_order_snapshot(
+        runtime,
+        batch_id="inventory-cutover-orders-already-accounted",
+        observed_at=BASE - timedelta(minutes=1),
+        platform_trade_date=TRADE_DATE,
+        platform_name=PLATFORM,
+        order_quantities=(3,),
+        internal_sku="SKU-1",
+    )
+    InventoryApplicationService(runtime, clock=lambda: BASE).bootstrap(
+        [
+            Product(
+                internal_sku="SKU-1",
+                product_name="Rose",
+                grade="B",
+                stem_length="50",
+                unit="扎",
+                base_cost=Decimal("5.00"),
+                current_stock=97,
+                sale_enabled=True,
+            )
+        ],
+        snapshot_sha256="sha256:" + "e" * 64,
+        runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(runtime),
+        cutover_order_observation_batch_id=cutover_batch_id,
+        idempotency_key="bootstrap:nonempty-trade-day-settlement",
+        actor="test",
+        freeze_validator=lambda: True,
+        allow_nonempty_current_snapshot=True,
+    )
+
+    _insert_order_snapshot(
+        runtime,
+        "inventory-orders-after-nonempty-cutover",
+        completed_at=BASE + timedelta(hours=2),
+        rows=(("fingerprint-a", 5, "60", "SKU-1", "VERIFIED"),),
+    )
+    _create_sku_provisional(service)
+    result = InventorySalesApplicationService(
+        runtime,
+        clock=lambda: BASE,
+    ).apply_current_sku_summaries(
+        platform_name=PLATFORM,
+        platform_trade_date=TRADE_DATE,
+    )
+
+    assert result.applied_sku_count == 1
+    assert InventoryRepository(runtime).get_balance("SKU-1").current_qty == 95
+
+
 def test_trusted_empty_cutover_does_not_seed_conflicting_current_estimate(
     settlement,
 ) -> None:
