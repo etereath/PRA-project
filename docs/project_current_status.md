@@ -469,6 +469,22 @@ Automation、Notification Outbox 和 release backup；Web Route 不接受脚本�
 写仍等待用户另行指定商品和批次授权，因此两项不能在本分支冒充已验收。详见
 [13.5-7F 实施与验收报告](reports/task13_5_7f_cutover_acceptance.md)。
 
+2026-08-31 的真实运营验收进一步确认：当前 `/management/queue` 只是 Runtime Task、ShadowBot
+文件 Queue、Operation/Write Lock 和结果的聚合 Read Model，不存在持续负责普通平台写任务
+“授权、阻塞、解除、过期、派发和终态”的统一 Coordinator。人工创建成功但提交受阻的 Task
+会保留为无具体阶段的 `pending`；写锁或 Review 解除后没有组件唤醒受影响任务；Worker 与
+Queue Service 正常也不能消费尚未投递为文件请求的 Runtime Task。该问题不等于 v4/v5、
+写锁、RECONCILE、Worker 或 Importer 单项失效，而是跨组件生命周期所有权缺失。完整证据见
+[Automation 与任务队列故障分析报告](reports/task13_5_7f_automation_queue_failure_analysis_20260831.md)。
+
+项目已将修复独立为 R4 任务 13.5-7G，先冻结 Runtime Task 与 Dispatch Attempt 双层状态、
+唯一 `TaskExecutionCoordinator`、明确 blocker/唤醒事件、Web 工作中心、Automation 来源边界
+和完整 `Task → Queue → Worker → Importer → Archive` 旅程门禁。7G 保留并复用现有执行授权、
+v4/v5、文件 Queue、写锁、唯一 RECONCILE、Review Token 和 Outbox；禁止通过扫描全部普通
+`pending`、Repository 回调盲目投递或 Web 内存重试规避持久化协调。计划见
+[13.5-7G 统一任务执行协调与运营队列闭环计划](plans/task13_5_7g_task_execution_coordinator_plan.md)。
+在 7G 完成前，当前任务页只能视为诊断/受控操作视图，不能标记为已完成的运营任务中心。
+
 ### 2.8 自动规则评估框架 MVP
 
 已完成轻量自动规则评估框架第一版：

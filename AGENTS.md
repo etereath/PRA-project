@@ -42,6 +42,13 @@
   和恢复 CLI 必须继续保留。
 - `docs/plans/task13_5_web_current_state_audit_20260729.md` 是 13.5-0 的独立 Web
   现状证据；其中数量和页面尺寸仅代表带 main/DB/视口标识的审计快照。
+- `docs/reports/task13_5_7f_automation_queue_failure_analysis_20260831.md` 是 7F 真实运营
+  验收后对 Automation、Runtime Task、Review、Queue/Worker/Importer 和 Web 当前任务页的
+  故障基线；当前任务页不得在其中列出的闭环缺口修复前宣称为可用任务中心。
+- `docs/plans/task13_5_7g_task_execution_coordinator_plan.md` 负责独立 R4 任务 13.5-7G 的
+  Task/Dispatch 双层状态、唯一 Coordinator、blocker/唤醒、来源通道、复用矩阵、子 PR
+  顺序和验收门禁。后续 Web、Automation、Agent 或 CLI 不得另建平行派发状态机，也不得
+  扫描全部普通 `PENDING` 自动执行平台写任务。
 - 本地实现可以细化 Issue #20，但不得改写其双时间轴、扫描父子合同、六级质量矩阵、
   唯一 `FINAL` 日结终态、S0–S4、`SYSTEM_EMERGENCY` 和任务 14 边界。Web 信息架构以
   用户确认的实际运营路径为准，当前固定为“今日、数据库、业务管理、系统”四个一级
@@ -62,6 +69,10 @@
   `task_ids` 和本轮重检 digest；Route 不得直接调用 Queue/Runner，也不得扫描全部
   `PENDING`。系统维护 Route 同样不得成为通用脚本 Runner，长耗时动作必须调用受控的
   类型化维护 Service，并从既有生命周期、备份或运行事实查询结果。
+- 13.5-7G 完成前，Runtime Task、执行授权和 ShadowBot 文件 Queue 仍是三个不同层次；
+  `pending` 不代表已经排入 Worker，也不构成执行授权。写锁或人工 Review 解除只表示对应
+  blocker 已消失，必须由 7G 的持久化 Dispatch Attempt 和唯一 Coordinator 重新评估明确
+  Task；不得在 Repository、Web Route 或 Review 回调中直接盲目投递后续任务。
 - Automation Web 配置只能修改每类 allowlist Job 明确开放的字段和安全范围；18:00/20:00
   及其关键扫描只能从版本化 `OperationalTimePolicy` 派生，子 Job 不得独立改 schedule，
   页面不得开放任意 Cron、脚本或 Job 编辑器。

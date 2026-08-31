@@ -45,6 +45,8 @@ Query Adapter 读取，并通过 Task Adapter 提交结构化 `AgentIntent`；Re
 - [reports/task13_5_7d_authoritative_inventory.md](reports/task13_5_7d_authoritative_inventory.md)：13.5-7D Runtime Schema v17、真实库存唯一权威切换、人工调整、销售净差、取消恢复、库存预警、新 Web 回读与未执行真实 cutover 边界实施报告。
 - [reports/task13_5_7e_control_plane.md](reports/task13_5_7e_control_plane.md)：13.5-7E 人工任务、精确执行授权、桌面/手机原子复核、固定 Automation 配置、薄 Handler、CLI 正式归宿，以及合并后时间策略与五个定时 Job 原子换版维护入口实施报告。
 - [reports/task13_5_7f_cutover_acceptance.md](reports/task13_5_7f_cutover_acceptance.md)：13.5-7F 类型化系统维护、唯一 Web 切换删除、真实库 GET 零写、桌面/手机、完整回归与仍待外部飞书/平台授权的验收边界报告。
+- [reports/task13_5_7f_automation_queue_failure_analysis_20260831.md](reports/task13_5_7f_automation_queue_failure_analysis_20260831.md)：7F 真实运营验收后对 Automation、Runtime Task、执行授权、Review、ShadowBot Queue/Worker/Importer 和 Web 当前任务页的完整故障分析、运行快照、漏审原因与整改边界。
+- [plans/task13_5_7g_task_execution_coordinator_plan.md](plans/task13_5_7g_task_execution_coordinator_plan.md)：独立 R4 任务 13.5-7G 的 Task/Dispatch 双层状态、唯一任务执行协调器、blocker/唤醒、Web/Automation/Agent/CLI 通道、复用矩阵、四个子 PR 和完整旅程验收计划。
 - [prototypes/task13_5_7_operations_web_sample.html](prototypes/task13_5_7_operations_web_sample.html)：四入口“今日”静态样板，展示销售、数据库真实库存、待办、时间轴和业务健康摘要。
 - [prototypes/task13_5_7_database_sample.html](prototypes/task13_5_7_database_sample.html)：只读数据库与销售分析静态样板。
 - [prototypes/task13_5_7_business_management_sample.html](prototypes/task13_5_7_business_management_sample.html)：任务创建/授权、人工复核、固定 Automation 方案和真实库存业务静态样板。
