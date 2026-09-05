@@ -1,346 +1,183 @@
 # AGENTS.md
 
-## 项目名称
-
-鲜花多平台销售自动化管理系统
-
-## 项目背景
-
-本项目用于帮助切花月季种植/销售业务管理多个线上销售平台的商品价格、上下架状态和执行记录。
-
-业务现状：
-- 商品主要是切花月季等鲜切花。
-- 销售渠道分散在多个线上平台。
-- 当前第五阶段已选定一个真实平台作为单平台适配和实机验收对象：蚂蚁花团供应商微信小程序；平台专属差异必须封装在 ShadowBot adapter/executor 中。
-- 多平台仍是长期目标，但第二平台适配尚未进入当前任务；公共数据、任务、审批、日志和验收层仍必须保持平台无关。
-- 影刀 RPA 当前已经是本阶段的受控执行层。开发实机测试在投递完整 COMMIT 队列前按固定商品清单获得一次批次授权；正式运行以任务中心有效任务、页面动态唯一定位和旧价校验为执行依据，不再依赖运行时用户确认。
-
-## 项目目标
-
-当前阶段的目标是同时维护平台无关的基础系统，在已授权的单一平台上完成受控闭环，并通过任务 13.5 补齐执行端、Web 主控端和数据库之间的运营自动化：
-
-1. 商品主数据管理
-2. 价格规则管理
-3. 上下架规则管理
-4. 任务生成
-5. 执行日志记录
-6. 为未来 RPA 执行层预留接口或任务表
-7. 在当前单一平台上完成结构化 READ_ONLY、单次完整 COMMIT 队列和 RECONCILE
-8. 在任务 13.5 完成 18:00/20:00 双时间轴、定时只读扫描、历史订单观察、销售日结、S0–S4 异常治理、任务来源对齐、受控紧急保护和运营 Web 重写
-
-### 任务 13.5 计划权威
-
-- [GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20) 合并截至
-  2026-08-12 已采纳评论后的正文，是任务 13.5 的宏观范围、业务语义、阶段划分和
-  任务 14 边界权威；历史评论仅用于追溯。
-- `docs/plans/task13_5_0_kickoff_baseline.md` 负责 13.5-0 的黄金基线、脚本盘点、
-  禁止重写资产、合同草案、子 PR 顺序和开工门禁。
-- `docs/plans/task13_5_operational_closed_loop_and_web_rewrite.md` 负责本仓库的模块、数据库、迁移和测试细节。
-- `docs/plans/task13_5_web_rewrite_plan.md` 负责 2026-08-12 依据实际运营路径重新冻结的
-  13.5-7 运营 Web 替代重写、CLI 残留业务迁移、四个一级入口、性能和可用性细节。当前项目
-  尚未正式投入使用，不保留旧 Web 路由或双 Web；开发测试、Mock、验收、诊断、备份
-  和恢复 CLI 必须继续保留。
-- `docs/plans/task13_5_web_current_state_audit_20260729.md` 是 13.5-0 的独立 Web
-  现状证据；其中数量和页面尺寸仅代表带 main/DB/视口标识的审计快照。
-- 本地实现可以细化 Issue #20，但不得改写其双时间轴、扫描父子合同、六级质量矩阵、
-  唯一 `FINAL` 日结终态、S0–S4、`SYSTEM_EMERGENCY` 和任务 14 边界。Web 信息架构以
-  用户确认的实际运营路径为准，当前固定为“今日、数据库、业务管理、系统”四个一级
-  入口；Issue #20 和历史计划中的八入口文字必须随本轮重基线同步，不得反向约束新 Web。
-- Web 计划的权威顺序固定为：用户确认的实际运营流程 → 当前四入口样板及业务合同 →
-  已验证的领域、安全和执行门禁 → 当前施工计划 → 旧 Web 与历史页面清单。旧计划中
-  仅为兼容旧 Web、重复展示同一事实或缺少实际使用场景的页面必须删除，不得因历史
-  文档存在而继续承担开发和维护成本。
-- 13.5-7 的当前恢复点为 Git Tag
-  `checkpoint/pre-task13-5-7-web-rewrite-20260807`。新 Web 直接替代当前
-  `app/web.py` 页面架构；后台只复用既有领域 Service，不得恢复“先统一所有 CLI、
-  脚本和 Automation 入口再开始 Web”的扩大化前置门禁。
-- 13.5-7D 切换完成后，Runtime DB 库存余额和不可变流水是唯一真实库存权威；
-  `products.xlsx.current_stock` 只允许作为一次性 bootstrap 输入和历史快照，不得继续
-  作为可编辑业务库存，也不得与 DB 双写。TaskGeneration、ListingDecision、上架库存
-  上限和库存预警必须读取同一个库存 Provider/Application Service。
-- Web 的普通平台执行必须经过 Service 层 `SUBMIT_EXECUTION` 授权，绑定已认证主体、明确
-  `task_ids` 和本轮重检 digest；Route 不得直接调用 Queue/Runner，也不得扫描全部
-  `PENDING`。系统维护 Route 同样不得成为通用脚本 Runner，长耗时动作必须调用受控的
-  类型化维护 Service，并从既有生命周期、备份或运行事实查询结果。
-- Automation Web 配置只能修改每类 allowlist Job 明确开放的字段和安全范围；18:00/20:00
-  及其关键扫描只能从版本化 `OperationalTimePolicy` 派生，子 Job 不得独立改 schedule，
-  页面不得开放任意 Cron、脚本或 Job 编辑器。
-- S4 不在 13.5-1 或核心 v14 中冻结最终策略，但不得移出任务 13.5：必须在
-  13.5-6 先完成 Incident 人工闭环，再依据真实数据冻结策略、迁移正式结构并实现
-  受控自动紧急下架。
-- 当前自动紧急下架必须保持禁用：`automatic_emergency_offline=false`。在 13.5-6
-  完成人工 Incident 闭环、策略评审、策略结构迁移、实机验收并由管理员显式启用前，
-  任何 Agent、Web、Scheduler 或脚本都不得创建或执行 `SYSTEM_EMERGENCY` 自动下架。
-
-### 项目级业务调用通道（后续任务强制遵守）
-
-长期控制面只允许以下分工：人工运营走 Web，定时业务走 Automation，未来智能调用走
-Agent Gateway，平台执行走 Queue/Worker/Importer，开发测试、诊断和恢复走 CLI。各调用方
-共享权威 Query/Application Service，不得为同一职责另建平行状态机、数据库写入口或执行链。
-
-未来 Agent 接入必须遵守：
-
-- 读取经营数据只能走 `Agent Query Adapter → 权威 Query Service / Read Model`；不得抓取
-  Web HTML，不得直接读取 SQLite、Excel、Queue 文件或平台页面作为业务接口。
-- Agent 唯一写入口是 `Agent Task Adapter`，且只接收结构化 `AgentIntent`。这里的
-  “Task Application Service”只是既有 `RuntimeTaskService`、任务生成、规则校验及其他权威
-  Application/Domain Service 的逻辑统称，不授权新增万能服务或平行控制面。
-- 既有确定性服务负责决定 `AgentIntent` 被拒绝、形成 Review、生成 Runtime Task 或产生
-  Outbox/通知；Agent 不得直接调用 Review 或 Notification 写服务，也不得直接调用 CLI、
-  Web Route、平台 Adapter、ShadowBot 或 COMMIT，不得拼 Queue JSON。
-- `AgentIntent` / `AgentProposal` 只是 Adapter 边界的逻辑载荷，不是已批准的 Runtime 表。
-  未形成 Task 或 Review 的建议直接返回；若未来需要长期保存未物化建议，必须另开 R4，
-  依据真实需求评审最小 Schema。
-- 任何 Agent 来源的 `UPDATE_PRICE`、`SET_ONLINE`、`SET_OFFLINE` 都不得直接进入可执行
-  `PENDING`，必须先有人工 Review 和显式授权。“低风险直接 PENDING”只适用于对真实平台
-  零副作用的任务；未来 Agent 自主改价等能力必须另开 R4 并补齐版本化授权策略和 v4/v5
-  来源门禁。
-- Agent 永远不得伪造 `SYSTEM_EMERGENCY`；该来源只能由 13.5-6 的专用授权服务创建。
-- 未来正式身份预留为 `origin_type=AGENT`、
-  `origin_ref_id=agent-run:<stable-run-id>` 和版本化审批策略。当前 Schema 尚未支持
-  `AGENT`，在独立评审和最小迁移完成前，不得冒充 `MANUAL` 或 `AUTOMATION` 落库。
-- 若 Agent 由 Automation 触发，必须同时保留父 `automation-run:<run_id>` 关联，但业务
-  来源仍为 `AGENT`，不能因此改写为普通自动任务。
-- 买家页面可见的“第 N 次购买”、每日人工花材质量评价、买家客户端实时售价和外部市场
-  指数均只作为未来 Agent 销售分析的数据来源规划。13.5-7 不补采、不推断、不扩 Schema，
-  当前 Web 不展示虚构值；Agent 阶段必须先完成各自合同、最小迁移和真实来源验收。
-- Agent 审计优先复用 `origin_type/origin_ref_id`、`changed_by`、`resolved_by`、结构化
-  metadata/event payload 和现有审计链；不得预先要求每张表新增 Agent 专属字段。
-
-任务 13.5-7 只冻结上述合同，不实现 Agent，也不新增 Agent Schema、状态、队列或平台动作。
-任何实际 Agent 接入均是未来独立 R4，不属于 13.5-7B～7F，也不属于只负责综合验收的
-任务 14。后续功能必须先复用本边界；不得再次开发直连 Web、CLI、数据库、Queue 或平台
-执行器的替代通道。
-
-最终希望实现：
-- 用户只维护一份商品和规则数据。
-- 系统根据库存、成本、销售状态等生成待执行任务。
-- RPA 执行层读取任务并到各平台执行改价、上架、下架。
-- 执行结果回写到系统。
-
-## 当前阶段范围
-
-### 已完成并继续复用的平台无关核心
-
-- 商品主表
-- 价格规则表
-- 上下架规则表
-- 任务表
-- 任务生成逻辑
-- 执行日志结构
-- 基础管理界面或命令行工具
-
-### 当前第五阶段允许实施的单平台能力
-
-- 当前蚂蚁花团供应商微信小程序的结构化 READ_ONLY 商品读取和状态模型（任务11已完成）。
-- 同一平台多商品动态唯一定位、按页面顺序严格串行并以单次请求完成 COMMIT（任务12）；开发测试使用批次清单授权，正式运行不携带开发确认字段。
-- 提交后独立 READ_ONLY、UNKNOWN、唯一 RECONCILE、暂停/恢复和部分完成账本。
-- 任务 13 已完成“上架中/待上架”两页状态扫描和单平台上下架闭环；后续任务必须复用其合同、写锁、Importer 和唯一 RECONCILE。
-- 任务 13.5 允许实施 `ONLINE_PULSE`、`FULL_MARKET_SCAN`、订单管理页面历史只读观察、18:00 平台交易日、20:00 卖家作业日、销售日结、S0–S4 Incident、人工/自动/系统任务分组和运营 Web 重写。
-- 任务 13.5 规划中的唯一无人值守写动作是受控 `SYSTEM_EMERGENCY` 紧急下架；当前必须保持禁用。只有在 13.5-6 完成人工 Incident 闭环、策略评审、策略结构迁移、实机验收并由管理员显式启用后，才允许对极端低价商品从初始通知 Outbox 的 `sent_at` 开始等待，使用其后下一个计划槽中另一个完整且已导入的 `ONLINE_PULSE` 二次读取，并确认“紧急情况仍存在且没有复核结果”，再创建明确授权与单一 `SET_OFFLINE` 任务。第二次观察冻结本轮价格业务判断；最终执行不得因为价格随后上涨而重新计算阈值或撤销授权，但必须继续检查授权、策略、开关、Review、同商品更高优先级人工改价/下架意图、写锁、UNKNOWN/唯一 RECONCILE、商品唯一身份与在线状态。人工 Review 在既有 v5 副作用提交边界前返回时必须优先使自动任务失效。该动作必须复用 v5、Importer、写锁和唯一 RECONCILE，且不得自动重新上架；不使用每日次数上限或冷却，人工重新上架后仍按正常 S3/S4 流程重新评估。
-- 影刀登录、验证码人工介入和残留窗口收尾等执行层操作，但必须遵守本文件的影刀客户端操作约束。
-
-### 当前明确不在范围内
-
-- 第二个平台适配器或跨平台混合批次。
-- AI 自动定价、AI 自动审批、扫描全部 `pending` 或普通业务任务自动发起 COMMIT；尚未通过 13.5-6 启用门禁的 `SYSTEM_EMERGENCY` 也不得执行。
-- 绕过任务中心任务有效性、页面旧价校验或唯一身份匹配直接执行真实写操作。
-- 修改订单、确认发货、退款、支付、资金对账等订单或资金写操作；任务 13.5 只允许订单管理页面的最小化只读经营事实采集，且不得保存客户姓名、电话、地址或聊天内容。
-
-平台专属页面定位、元素、登录和动作逻辑可以存在于当前平台 adapter/executor；公共服务层不得依赖具体页面细节，也不得把当前平台实现复制成第二平台方案。
-
-### 复用优先开发门禁
-
-- 后续任务开始编码前，必须先盘点任务 11/12/13、当前公共服务和平台
-  adapter/executor 中已经通过自动测试与实机验收的能力，形成“原样复用 / 参数化复用 /
-  抽取公共能力 / 确需新增”四类清单。没有该清单不得开始实现。
-- 默认顺序固定为：原样调用既有入口 → 为既有入口增加参数 → 从既有成功链路抽取公共
-  助手 → 最后才允许新增平行实现。不得因为新页面、新合同版本或新 Adapter 就跳过前
-  三步。
-- 复用必须保留完整控制流和安全属性，不能只复制局部代码。任务 12 已验证的列表物化
-  语义包括“聚焦列表首项 → `END` → 验证明确尾部 → `HOME` → 验证首项恢复”；同一
-  小程序宿主中的商品、状态和订单列表默认必须复用该体系，页面选择器、字段步长和行
-  解析器仅作为平台专属参数。
-- 只有存在可复现的不兼容证据时才允许新建实现。证据至少包括：既有入口、失败输入、
-  实际输出或错误、不可参数化原因、替代方案比较、额外测试和实机验收范围。仅以
-  “实现更短”“当前数据量小”“现有测试通过”或“页面名称不同”为理由无效。
-- 新实现不得与既有实现长期平行承担同一职责。若必须先做探索性替代，必须标记为
-  临时、默认禁用，并在同一任务内完成公共抽取或删除；不得带着两套控制流进入
-  Ready for review。
-- 单页、默认视口或未进入目标分支的实机样本，不能证明滚动、分页、回顶或异常恢复
-  已验收。CI 通过也不能替代对新增分支的受控实机覆盖。
-- PR 和实施报告必须提供复用矩阵，逐项说明复用了哪些合同、状态机、队列、列表控制
-  流、测试和实机证据；任何重新实现的同职责能力都必须单列并取得评审结论。
-
-## 核心业务概念
-
-### 商品主数据
-
-商品主数据是系统的核心，不依赖任何平台。
-
-典型字段：
-- internal_sku：内部商品编码
-- product_name：标准商品名
-- variety：品种
-- grade：等级
-- stem_length：枝长或规格
-- unit：单位
-- base_cost：基础成本
-- current_stock：当前库存
-- sale_enabled：是否允许销售
-- remark：备注
-
-### 价格规则
-
-价格规则用于根据成本、平台、库存、等级等因素生成目标售价。
-
-当前阶段可以先实现简单规则：
-- 固定加价
-- 百分比加价
-- 最低价限制
-- 取整规则
-
-### 上下架规则
-
-上下架规则用于根据库存和销售状态生成任务。
-
-示例：
-- 库存小于等于 0 时生成下架任务
-- 库存高于指定阈值时允许上架
-- sale_enabled 为 false 时强制下架
-
-### 任务
-
-任务是系统和 RPA 执行层之间的中间格式。
-
-典型任务类型：
-- update_price
-- set_online
-- set_offline
-- sync_status
-
-任务表不应绑定具体 RPA 工具。
-
-## 推荐数据表
-
-优先保持数据结构简单，便于后续接入 Excel、SQLite、MySQL、飞书多维表或 RPA 工具。
-
-建议至少包含：
-
-- products
-- price_rules
-- listing_rules
-- tasks
-- execution_logs
-- platform_mappings，当前可预留但不强制使用
-
-## 设计原则
-
-1. 先做简单可运行版本，不要过度设计。
-2. 业务逻辑和 RPA 执行逻辑必须分离。
-3. 任务表是业务系统和 RPA 之间的边界。
-4. 平台相关逻辑必须封装在未来的 adapter 或 executor 中。
-5. 不假设任何平台提供 API；当前平台仍通过封装后的 ShadowBot adapter/executor 执行。
-6. 平台名称、登录、元素定位和动作细节只能出现在平台适配层或配置中，公共核心不得写死页面细节；当前单平台适配不等于完成多平台抽象。
-7. 所有账号、密码、token 必须通过环境变量或配置文件管理，不得写入代码。
-8. 所有执行任务都应有状态、时间、错误信息和可追踪日志。
-9. 对失败任务要保留错误原因，不要静默忽略。
-10. 优先保证可维护性，而不是功能堆叠。
-
-## 影刀客户端操作约束
-
-### 长期 Worker 与生命周期状态
-
-- `test2/module1` 是常驻队列 Worker，默认最多连续运行 8 小时或处理 50 个请求；完成单个请求后不会自动返回。正常开发和连续实机验证默认复用同一个 Worker，不再执行“每轮检查 → 启动 → 停止 → 再检查”的完整生命周期，也不为了单轮收尾把 Worker 改成 `max_tasks=1`。
-- 生命周期记录固定保存在 `D:\PRA_Runtime\shadowbot_queue\control\shadowbot_lifecycle_state.json`，不得写入仓库。`recorded_state` 只允许为 `RUNNING / STOPPED / UNKNOWN`；至少记录 `schema_version`、`app_name`、`recorded_state`、`worker_started_at`、`worker_processed_count`、`last_used_at`、`last_execution_attempt_id`、`shadowbot_window_state`、`updated_at` 和 `reason`。文件使用 UTF-8 JSON，不得包含账号、密码、token、任务业务数据或授权正文。
-- 生命周期记录是“上一次已核实状态”，不是运行真值。`heartbeat.json`、`inbox/working/results` 的磁盘内容和已归档结果仍是事实来源。每次使用影刀前先读取生命周期记录，再做一次轻量一致性检查；不得仅凭记录文件直接投递任务。
-- 若记录为 `RUNNING`，且 Worker 心跳为 30 秒内更新的 `RUNNING`、`stop.signal` 不存在，则直接复用当前 Worker。此时只检查是否存在上一请求的活动 `working` 或未导入 `results`：有则继续跟踪或先完成导入，不得启动第二个应用或重复投递；均无则可直接开始新请求。
-- 若记录为 `STOPPED`，且心跳确为 `STOPPED`、队列无活动文件、`stop.signal` 不存在，则只需从影刀应用列表启动一次 `test2`，等待新心跳变为 `RUNNING`，再把生命周期记录更新为 `RUNNING`。启动时必须确认应用名为 `test2`；不要根据固定屏幕坐标或列表排序猜测目标应用。
-- 每次请求完成后，先由 Result Importer 导入并归档结果，再更新 `last_used_at`、`last_execution_attempt_id`、`worker_processed_count` 和 `updated_at`。只要 Worker 仍为新鲜的 `RUNNING` 且未达到运行上限，就保持应用运行，不创建 `stop.signal`，并把 `recorded_state` 保持为 `RUNNING`。
-- 只有以下情况才计划停止并重新启动 `test2`：需要同步或修改 `test2` 的 Python/流程/元素；Worker 已接近或达到 8 小时、50 个请求的上限；Worker 自身正常返回；用户明确要求停止；或进入下述异常恢复链路。普通 READ_ONLY、COMMIT、结果导入和任务切换都不是重启理由。
-- 当前已核实的 `主流程.flow` 顺序是“调用 `module1` → 等待 1 秒 → 调用 `关闭.flow`”。不得在主流程开头调用 `关闭.flow`；它仅在 Worker 返回后执行收尾，后面不得再安排结果写入、日志落盘或业务动作。
-
-### 代码同步与计划重启
-
-- 外部同步 `test2` Python 文件前，必须先停止 Worker 并关闭影刀编辑器；不得在 Worker 运行期间覆盖宿主代码。停止前先确认结果已导入归档，且 `inbox/working/results` 均无活动文件，然后创建 `D:\PRA_Runtime\shadowbot_queue\control\stop.signal`。
-- Worker 仅在没有活动 `working` 请求时响应 `stop.signal`；正常响应后写出 `heartbeat.status=STOPPED` 并从 `module1` 返回，主流程等待 1 秒后调用 `关闭.flow`。确认返回影刀应用列表后，立即删除 `stop.signal` 并回读确认不存在，再把生命周期记录更新为 `STOPPED`。
-- 外部同步后默认保持在影刀“应用”主页面，不进入“编辑”页面；选中 `test2` 后点击该应用行内的圆形“运行应用”图标启动。直接从应用列表运行可避免已打开设计器把内存缓存或旧流程写回磁盘。
-- 只有需要人工捕获或修改流程元素时才进入编辑器。进入编辑器前必须完成上述正常停止；编辑完成后保存并退出编辑器。后续若再由外部工具同步 Python，仍必须先关闭编辑器。
-- 同步并校验部署哈希后启动 `test2`，等新心跳变为 `RUNNING`，记录新的 `worker_started_at`、初始处理计数和部署原因。除非同步内容本身要求一次性退出，否则恢复长期监听模式。
-
-### 状态不一致与异常恢复
-
-- 生命周期记录与事实不一致时，先将其视为 `UNKNOWN` 并进行只读核对，不要直接重复启动或强制结束进程。若记录为 `STOPPED`，但心跳是新鲜的 `RUNNING`，以心跳为准更新记录并复用 Worker；这属于状态记录滞后，不需要重启。
-- 若记录为 `RUNNING`，但心跳为 `STOPPED` 或已超过 30 秒未更新：先检查 `working/results`。存在活动 `working` 或未落盘结果时，保留请求和 phase 证据并进入故障处理；队列为空且影刀主窗口可定位、处于应用列表时，可正常重新启动 `test2` 并更新记录。
-- 若 Worker 已停止或心跳失效，同时影刀主窗口无法调出或不可定位，则进入影刀异常重启链路：确认没有活动请求和未保存编辑内容；必要时结束已核实路径的残留 `ShadowBot.Shell.exe`；重新启动影刀；等待至少 20 秒完成登录；定位应用列表中的 `test2`；启动 Worker；核对新鲜 `RUNNING` 心跳；最后更新生命周期记录。
-- 不依赖 Computer Use 是否能枚举 `RobotRunnerView` 判断 Worker 是否运行或窗口是否已关闭；当前环境已确认该窗口可能不可见。仅当“Worker 已停止/失去心跳”与“影刀主窗口不可定位”同时成立时，运行窗口不可见才构成异常重启依据。
-- `stop.signal` 不是强制中断。若创建后任务仍卡在活动 `working`、结果尚未落盘或 Worker 无法正常响应，先保留请求和 phase 证据，再发送全局快捷键 `Ctrl+Alt+Q`。发送后重新检查队列、心跳和影刀主窗口；只有主窗口仍不可定位时，才按上述条件结束 `ShadowBot.Shell.exe` 并重启。
-
-
-## 建议目录结构
-
-如果使用 Python，可以采用：
-
-```text
-flower_automation/
-  app/
-    models/
-    services/
-    rules/
-    tasks/
-    repositories/
-    adapters/
-  data/
-    templates/
-  docs/
-  tests/
-  scripts/
-```
-
-## 强制执行协议
-
-本节用于把 Codex global guidance 落地为本项目的可执行门禁。它不是建议；无法满足门禁时必须暂停写入、说明阻塞原因，并先修复门禁。
-
-### 规则优先级
-
-1. 用户本轮明确要求。
-2. Codex global guidance 和开发者安全约束。
-3. 本文件的项目约束。
-4. 代码、脚本和工具的默认行为。
-
-低优先级规则不得覆盖高优先级规则。工具默认编码、终端代码页和影刀编辑器缓存都不能视为项目规范。
-
-### 任务开始前门禁
-
-- 先确认项目规则文件位置，并完整读取本文件；不要假设规则已经被工具自动加载。
-- 检查工作区状态，保留用户已有改动，不用重置或覆盖无关文件。
-- 涉及中文、CSV、JSON、Markdown、Windows 脚本、影刀或外部同步时，先写出本次任务的编码和同步边界。
-
-### 编码与字符集门禁
-
-- Python、JSON、Markdown、普通文本默认使用 UTF-8；CSV/TSV 默认使用 UTF-8-SIG，确保 Excel/WPS 正确识别中文。
-- 所有 Python `open`、`Path.read_text`、`Path.write_text`、`subprocess` 文本管道都必须显式指定 encoding；读取外部 JSON 可使用 `utf-8-sig` 兼容 BOM，写出 JSON 必须使用 UTF-8。
-- JSON 的业务文件使用 `ensure_ascii=False` 保留中文；若跨越不可靠的日志/命令行边界，优先传递文件路径或 ASCII 安全的摘要，不把终端显示当作数据真值。
-- 不依赖当前 PowerShell 代码页判断内容是否正确。读取或写入含中文文件时显式指定 `-Encoding UTF8`，写后必须回读并验证 UTF-8 解码、首行/表头和 1 至 3 行样例。
-- 修改源码必须使用 `apply_patch`；不得用 `cat`、重定向、未指定编码的 `Set-Content` 或临时 shell 写文件替代受控修改。
-- 运行 Python/影刀子进程前，若会输出中文，设置 `PYTHONIOENCODING=utf-8`，并在程序入口尝试将 stdout/stderr `reconfigure(encoding="utf-8", errors="replace")`；若宿主不支持，必须把结果落盘后再读取验证。
-- 换行符告警（LF/CRLF）与字符集错误是两类问题，必须分别检查，不得用其中一项代替另一项。
-
-### 影刀同步与运行门禁
-
-- 每次开始影刀工作时先读取 `D:\PRA_Runtime\shadowbot_queue\control\shadowbot_lifecycle_state.json`，再核对 Worker 心跳、`stop.signal` 和队列活动文件。状态一致且 Worker 为新鲜的 `RUNNING` 时直接复用；不得仅为了开始新请求而停止或重启应用。
-- 只有在 Worker 为 `STOPPED` 时才执行启动门禁：确认应用名为 `test2`、`stop.signal` 不存在、队列无上一轮活动文件，并从应用列表启动。启动成功以新心跳变为 `RUNNING` 为准，不要求捕获 `RobotRunnerView`。
-- 外部同步 `test2` Python/流程/元素前必须完成正常停止并关闭影刀编辑器；同步后保持应用列表页，不进入编辑器确认代码。同步完成、哈希一致且重新启动成功后恢复长期监听。
-- 队列 JSON、phase、result 和校验文件以磁盘内容为准；影刀日志、PowerShell 输出和控制台显示只能作为辅助证据。
-- 每轮结果落盘后先由 Result Importer 导入归档；若未触发代码同步、运行上限、正常返回、用户停止或异常恢复条件，则保持 Worker `RUNNING`，更新生命周期记录后结束本轮，不创建 `stop.signal`。
-- 计划停止时，确认 `inbox/working/results` 均无活动文件，再创建 `stop.signal`；等待心跳变为 `STOPPED` 和主流程任务日志写出“执行结束”，确认应用返回列表后立即删除信号并更新生命周期记录。不得把 Computer Use 未枚举到 `RobotRunnerView` 当作窗口关闭的单独证据。
-- 状态不一致时按“状态不一致与异常恢复”处理；只有 Worker 已停止或心跳失效且影刀主窗口不可定位时才进入强制重启。强制重启前确认没有未保存编辑内容，重启后等待至少 20 秒登录完成。
-
-### 完成前验收门禁
-
-- 回读本次修改的中文文件并进行编码自检。
-- 对 JSON/CSV/结果文件验证结构、中文字段、校验和及关键样例。
-- 对普通影刀请求同时核对：结果文件状态、证据文件哈希、Result Importer 导入归档、队列活动文件、`stop.signal` 不存在，以及生命周期记录与新鲜心跳一致。Worker 可以保持 `RUNNING`，不得把 `STOPPED` 和关闭运行窗口作为每轮完成条件。
-- 对涉及 `test2` 代码同步、解释器或部署变更的任务，额外核对实际解释器路径和版本、部署文件哈希、编辑器已关闭，以及重启后的新鲜 `RUNNING` 心跳；若本轮按计划停止，则核对 `STOPPED`、应用列表状态和生命周期记录。
-- 报告中必须区分“文件内容正确”“控制台显示正确”“影刀实际运行成功”；三者不能互相替代。
-- 未通过任一门禁时不得写“已完成”或“验收通过”，必须列出未通过项和下一步。
+## 当前任务
+
+当前项目阶段为 **Task 13.6：PRA 项目文档重整、业务语义重基线与 AI 开发上下文校准**。
+
+父级任务入口：GitHub Issue #41。
+
+Task 13.5 已正式冻结为 `STOPPED / SUPERSEDED`。PR #38 已合并；PR #39 已关闭且未合并。
+
+**不得继续 Task 13.5-7G、不得按 7G 候选切片继续编码，也不得因为历史 Issue、计划、实施报告或旧 AGENTS 内容存在，就把其中的业务假设自动当作当前 Canonical Contract。**
+
+Task 13.7 必须等待 Task 13.6 Stage Goal = `PASS` 后才可开始生产功能开发。
+
+---
+
+## Task 13.6 的工作目标
+
+Task 13.6 不是普通文档整理，也不是生产功能开发。
+
+目标是重新建立一套让项目 owner 与没有参与历史讨论的 AI 都能正确理解的项目基线，至少回答：
+
+1. PRA 当前为什么存在、服务哪条真实经营链；
+2. 当前阶段谁负责销售决策；
+3. 供给、库存、成交承诺、平台 Exposure、交易日、页面日期和日结分别是什么；
+4. 当前代码实际已经实现到哪里；
+5. 哪些历史合同仍有效、哪些已经失效、哪些只是历史证据或候选设计；
+6. Task 13.7 真正需要实现和验证什么。
+
+Task 13.6 必须把以下内容明确区分：
+
+- 项目 owner 明确提供的业务事实；
+- 项目 owner 曾采纳的设计决定；
+- 当前指定 Git SHA 的生产代码事实；
+- 测试、CI、实机验收和运行记录；
+- AI 的建议、推断和历史候选架构。
+
+历史对话、Issue、计划和实施报告都是重要输入，但不拥有永久业务权威。若发现更简单、更可靠、更符合真实业务的方案，可以提出替代方案；不得为了保持历史设计一致而继续错误方向。
+
+---
+
+## 当前工作顺序
+
+### 13.6-0：Rebaseline Bootstrap
+
+当前先完成：
+
+- Codex 仓库上下文从 Task 13.5 切换到 Task 13.6；
+- 建立 Task 13.6 当前入口、来源分类、范围、禁止事项和完成条件；
+- 保留历史证据，但取消旧 13.5/Issue #20 对 Task 13.6 的自动现役约束；
+- 不写生产功能。
+
+### 13.6-1：业务与文档权威重基线
+
+- 盘点历史文档、Issue、PR 和关键实现证据；
+- 重建项目定位、核心术语与业务主链；
+- 建立 Open Decision Register；
+- 在本阶段末尾集中执行 Business Decision Closure，再进入架构重基线。
+
+### 13.6-2：系统架构与实现差距重基线
+
+- 分别描述当前实现与目标职责；
+- 审核 `业务意图 → 持久状态 → 调度/授权 → 执行 → 结果 → 恢复/复核 → 终态` 的责任链；
+- 输出复用、调整、新增、删除/退役和 Task 13.7 输入；
+- 不提前实现 13.7。
+
+### 13.6-3：入口收口与 Cold-start 验收
+
+- 收口 README、AGENTS、docs index、Current Status、Roadmap；
+- 由不携带历史聊天的独立 AI 只读 Canonical 文档进行冷启动理解验收；
+- 项目 owner 确认核心经营情景与阶段边界；
+- 只有 Stage Goal = `PASS` 才允许 Task 13.7 开始。
+
+---
+
+## Task 13.6 当前禁止事项
+
+Task 13.6 期间不得：
+
+- 修改生产业务代码；
+- 修改 Runtime Schema；
+- 修改真实 Runtime DB、Queue、Worker、运行配置或平台状态；
+- 执行真实平台写入；
+- 继续 13.5-7G 或把 7G 直接改名为 13.7 继续施工；
+- 提前实现 Current Sales Commitment、Sales Control Intent、Dispatch Attempt、TaskExecutionCoordinator、新的 S0–S4 逻辑或 Agent；
+- 因为历史代码已经存在，就未经业务裁决新增第二状态机、第二 Summary、第二 Queue、万能 Service 或其他平行控制面；
+- 将“设计已采纳”写成“实现已完成”；
+- 将“测试通过”写成“真实业务闭环已验收”。
+
+如果在 13.6 审计中发现生产代码缺陷，只记录为实现差距、风险或 Task 13.7 输入；除非项目 owner 单独开启独立修复任务，否则本任务不顺手修改生产代码。
+
+---
+
+## 仍然有效的基础安全边界
+
+虽然历史 13.5 业务合同需要重新审计，但以下已经验证且与本次业务重基线不冲突的基础安全边界继续生效：
+
+1. 真实平台写动作不得由 Web Route、文档脚本、Agent 或临时工具绕过正式应用服务和执行链直接点击平台。
+2. `UNKNOWN / NEEDS_RECONCILIATION` 不得通过猜测性重复写入解决；保持唯一、只读的 RECONCILE 原则，直到后续任务明确修改并重新验收。
+3. 平台人工直接操作属于正常经营场景。系统不得假设 PRA 永远是平台状态唯一写入者，也不得在无法确认实际状态时盲目覆盖人工变化。
+4. 真实写操作继续坚持执行前读取、比较预期旧状态、执行、执行后回读确认的原则。
+5. 凭据、密码、Token、Cookie、Webhook secret、完整 Mobile Review token URL 和本地生产配置不得提交到 Git 或输出到日志/文档证据。
+6. 平台专属页面、登录、选择器和 UI 操作逻辑继续限制在平台 Adapter / ShadowBot 执行边界；公共业务文档和公共核心不得把蚂蚁花团页面细节当成所有平台的共同业务规则。
+7. 当前单机、SQLite、单 Worker 架构不因为“未来多平台”自动升级为分布式消息总线、外部锁服务或多节点高可用；新增复杂度必须由真实需求证明。
+
+这些安全规则不代表旧 13.5 的库存、日结、S0–S4、Agent、Automation 或 Web 业务语义自动继续有效。
+
+---
+
+## 历史 Task 13.5 材料的身份
+
+以下材料仍然需要阅读，但默认身份改为 **Historical / Audit Input**，而不是 Task 13.6 的不可修改业务合同：
+
+- GitHub Issue #20；
+- `docs/plans/task13_5_*`；
+- `docs/reports/task13_5_*`；
+- Task 13.5 的旧 Current Status 段落；
+- PR #39 中的 7G 候选计划；
+- 旧 `business_decision_spec.md` 中与当前业务冲突的阶段性参数和方案。
+
+读取这些材料时必须保留其时间、Git SHA、工作树、验收范围和上下文。历史文档中的“已冻结”“必须”“权威”等词，只对其当时任务有效，不能自动阻止 Task 13.6 对业务语义重新裁决。
+
+PR #39 中的 `task13_5_7f_automation_queue_failure_analysis_20260831.md` 是重要历史故障证据，但报告针对特定工作树和审查快照；不得把其中行号或候选修复直接当作当前 `main` 的实现事实。
+
+---
+
+## 当前已确认的重基线输入
+
+以下内容是 Task 13.6 的重点审计输入。它们仍需在 13.6-1 中写入新的 Canonical 业务合同，并与当前代码实现状态分开：
+
+- 当前销售 Controller 是人类管理者，通过 Operations Web 作出经营判断；当前阶段不要求自动销售 Agent。
+- 同一生产日 `PRODUCTION_FORECAST → HARVEST_ESTIMATE → PACKAGED_ACTUAL` 表示同一当日供给逐步收敛，三者是覆盖关系，不得相加。
+- `CARRYOVER_CONFIRMED` 表示独立确认的上一周期剩余事实，不能自动由上一日全部 `PACKAGED_ACTUAL` 复制得到。
+- 平台目标库存属于 sales exposure，不是实物 reservation。单个平台或多个平台 exposure 超过当前供给，不单凭这一点判定已经超卖。
+- 盘中需要独立的 Current Sales Commitment 概念；其来源可能包括订单事实、平台提供的“品种 + 等级 + 累计成交数量”聚合窗口、以及 QUICK-derived estimate。
+- 聚合窗口只有品种、等级、数量时，不得伪造订单号、订单行、金额、买家、支付状态或其他不存在的订单级事实。
+- PRA 自己修改平台 Exposure 后形成的数量变化必须有可审计 evidence；销量估算不得把该调整误认成成交。
+- 平台业务交易日与订单页面当前展示交易日是不同概念。页面展示日必须以实际观察为准，不能只按墙上时钟推定。
+- 新业务决定需要能够安全替代旧决定；已经跨越 Queue / 平台副作用边界的旧动作不得通过删除记录假装没有发生。
+- 未来执行协调器应优先评估复用现有长期 Queue Service 作为宿主，而不是默认新增独立 daemon；是否新增持久结构由 13.7 的字段级复用审计决定。
+- Observation Health 的 S3 应主动触发适合当前平台模式的 recovery calibration；主动恢复确认平台级失败后直接进入 S4，不再仅靠继续等待时间升级。具体阈值和业务限制在 13.6 Business Decision Closure 中集中裁决。
+- Agent 自动诊断/介入实际实现后置到 Task 14 的并行工作线；确定性恢复和人工处置不能依赖 Agent 可用。
+
+---
+
+## 当前待集中裁决的主题
+
+不要在 13.6-0 或后续编码中零散拍板。先进入 Open Decision Register，在 13.6-1 主业务链初稿完成后集中收口：
+
+- carryover、三阶段供给与成交承诺如何避免重复扣减；
+- 聚合成交观察、订单观察与 QUICK 推导之间的接管和 reconciliation；
+- 每日 19:00 指定日结与现有 Settlement/Summary 设施的最终关系；
+- S0–S3 的 freshness/capability 阈值，以及排队等待、人工停用、单 SKU 异常、平台级链路失败的区别；
+- Intent supersession 的作用范围、有效期和外部人工修改后的行为；
+- Task 14 原综合验收职责与 Agent Intervention / Ops Agent 并行工作线的最终边界。
+
+若 13.6-2 发现必须改变已经通过 G1 的核心业务定义，应明确标记 `BUSINESS BASELINE REOPENED` 并返回业务基线评审，不得在架构文档中静默改写。
+
+---
+
+## 文档与证据原则
+
+- 业务目标不能由旧代码反向决定；当前代码事实也不能被目标文档伪装成已实现。
+- 代码存在、自动测试通过、CI 通过、真实 READ_ONLY、真实平台 COMMIT、长期运行通过是不同等级的证据，必须分别描述。
+- 历史证据应尽量保留原文件和原 SHA，不为了“文档更整齐”修改被测试或哈希绑定的证据内容。
+- README、AGENTS、`docs/index.md`、`docs/project_current_status.md` 应最终成为短入口，而不是复制完整业务合同。
+- 13.6 优先减少重复和冲突的文档，不以增加更多文档数量作为成功标准。
+
+---
+
+## Task 13.6 Stage Goal
+
+只有全部满足以下条件才允许 Stage Goal = `PASS`：
+
+1. 常用项目入口不再把 13.5/7G 描述为当前开发方向；
+2. 核心业务语义、时间轴、数量口径和数据来源已经收敛；
+3. 当前实现与目标能力分开表达，关键缺口有明确后续 owner；
+4. 历史文档有清晰的 Canonical / Current Implementation / Historical / Draft 身份；
+5. 不携带历史聊天的独立 AI 仅阅读指定 Canonical 文档后，可以正确回答核心经营情景；
+6. 项目 owner 确认新基线准确反映真实经营；
+7. 本任务没有夹带生产功能开发或真实平台副作用。
+
+Task 13.6 完成后，Task 13.7 才负责重新实现和验证人工销售控制闭环；Task 14 承接综合验收与 Agent Intervention / Ops Agent 并行工作线。
