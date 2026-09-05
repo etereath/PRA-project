@@ -454,7 +454,8 @@ Worker、写 Queue、发送通知或执行真实平台动作。完整实现与�
 `1280 passed, 3 skipped, 102 subtests passed`，隔离系统冒烟为 `16 passed, 0 failed`；构建、
 严格制品审计、secret scan、wheel 隔离安装和 Windows 临时 ShadowBot fixture 均通过。
 
-7F 当前在 `codex/task13-5-7f-cutover-acceptance` 独立分支完成唯一 Web 切换和本地验收。
+7F 已完成唯一 Web 切换和本地验收，当前在合并后外部验收分支补齐真实后台生命周期与
+平台 READ_ONLY。
 旧 `app.web`、旧样式和重复测试已删除，制品审计禁止旧模块回流；`serve-web` 只启动新运营
 Web。系统入口已分成运行状态、通知通路、数据与备份和高级诊断，`SYSTEM_ADMIN` 与只读
 查看权限分离。Worker 恢复、通知测试和备份只提交固定类型化意图，分别复用既有 Incident /
@@ -465,8 +466,21 @@ Automation、Notification Outbox 和 release backup；Web Route 不接受脚本�
 `/health` 返回 503，7F 没有初始化、迁移或修复真实数据。桌面和 390×844 手机验收通过，
 任务动作字段显隐、无平台映射阻断和静态资源发布重验证已修复。完整 pytest 为
 `1215 passed, 3 skipped, 82 subtests passed`，系统冒烟为 `16 passed, 0 failed`，制品构建、
-审计、隔离安装和 Windows fixture 均通过。真实飞书仍等待独立通知后台新鲜心跳；真实平台
-写仍等待用户另行指定商品和批次授权，因此两项不能在本分支冒充已验收。详见
+审计、隔离安装和 Windows fixture 均通过。
+
+2026-08-14 又使用仓库外一次性健康 v17 Runtime DB 完成独立 Queue Service、Automation
+Service 和 Web 生命周期验收：验收 Web 停止及重新启动期间两个后台心跳持续推进，Web
+恢复后 `/health` 再次返回 200。真实订单 READ_ONLY 首轮发现订单页日期文本仍错误复用
+商品页选择器路径；修复为订单 Page-Frame 文本枚举后，`2026-08-14` OPEN 快照读取 7 条，
+完成 END 尾部确认、HOME 回顶、Watchdog 精确 Run/日期审计、Importer 和 Archive，活动队列
+归零且平台写操作为 0。同步同时暴露并修复 emergency fence 对项目包的宿主导入依赖；业务
+侧与影刀侧现在复用同一份标准库依赖实现，受影响回归 `121 passed`。验收临时轮询配置已
+恢复为 3 秒，常驻 Worker 严格健康检查通过；隔离后台进程和 8766 端口已清理。最终完整
+pytest 为 `1229 passed, 3 skipped, 82 subtests passed`，耗时 352.52 秒；隔离系统冒烟为
+`16 passed, 0 failed`。
+
+真实飞书仍等待独立通知后台新鲜心跳；真实平台写仍等待用户另行指定商品、动作和批次授权，
+因此两项不能在本分支冒充已验收。详见
 [13.5-7F 实施与验收报告](reports/task13_5_7f_cutover_acceptance.md)。
 
 ### 2.8 自动规则评估框架 MVP

@@ -12,9 +12,10 @@
 类型化意图，不接受脚本、命令、SQL、路径或 Queue 内容，也不在 Web 请求内启动 Worker、
 发送通知、执行备份或等待长任务。
 
-本分支没有迁移或修复真实 Runtime DB，没有启动或重启真实 Worker，没有投递真实 Queue，
-没有发送真实飞书，也没有执行真实平台读写动作。真实飞书验收需要独立通知后台服务具有
-新鲜心跳；真实平台写验收仍需用户另行明确商品和批次授权。
+初始 7F 分支没有迁移或修复真实 Runtime DB，没有启动或重启真实 Worker，没有投递真实
+Queue，没有发送真实飞书，也没有执行真实平台读写动作。2026-08-14 的合并后外部验收已
+补做独立后台生命周期和真实平台 READ_ONLY，详见第 8 节；真实飞书仍需要独立通知后台服务
+具有新鲜心跳，真实平台写验收仍需用户另行明确商品、动作和批次授权。
 
 旧库数据已确认为测试时期数据，不再要求完整迁移。7F 收尾新增受控干净重建入口：完整
 归档旧库以便追溯，只从正式商品和映射工作簿保留 SKU、商品资料、库存与映射状态；候选
@@ -116,3 +117,44 @@ Linux/Windows CI 由 Draft PR 执行；本地 Windows 结果不能替代 GitHub 
 上述第 3 项现已有 `scripts/clean_runtime_cutover.py` 和
 `docs/clean_runtime_v17_rebuild.md` 的受控实施路径，但本分支仍未对 canonical 真实库执行
 准备、bootstrap 或激活。真实执行必须另取维护窗口和用户明确授权。
+
+## 8. 2026-08-14 外部生命周期与真实 READ_ONLY
+
+本次使用仓库外一次性健康 v17 Runtime DB，启动独立 Queue Service、Automation Service
+和验收 Web（`127.0.0.1:8766`）。Web `/health` 首次返回 200；停止 Web 后 Queue 周期从
+61 增至 65，Automation 心跳继续前进且两服务保持 `RUNNING`；重新启动 Web 后 `/health`
+再次返回 200。由此确认 Web 重启不启停 Queue、Worker 或 Automation。验收完成后，隔离
+Web、Queue Service 和 Automation Service 进程全部停止，端口 8766 不再监听，避免它们以
+验收数据库继续观察真实 Queue；常驻影刀 Worker 独立保持运行。
+
+首次真实订单 READ_ONLY 暴露两个执行端问题并在本分支修复：
+
+- 日期 `2026-08-14` 在订单页可见，但日期读取仍沿用商品页文本选择器路径，返回
+  `ORDER_DATE_NOT_READABLE`。现在从已捕获的订单行选择器截取到订单 Page-Frame 文档根，
+  只枚举该订单页的 `StaticText`；不使用 OCR、屏幕坐标或订单号。
+- 同步后的 `emergency_offline_fence.py` 在影刀宿主导入 `app.services`，导致 Worker 启动时报
+  `No module named emergency_offline_fence`。listing review gate 的无副作用查询与阻断判断
+  已下沉到同一份标准库依赖 fence 模块，业务侧和影刀侧复用同一实现；独立 `-I` 导入测试
+  防止再次把项目包依赖带入宿主。
+
+最终验收固定目标日期 `2026-08-14`，常驻 Watchdog、Worker、Order Importer 与 Archive
+绑定同一个一次性 v17 Runtime DB。为消除验收审计与 Worker 领取的轮询竞态，仅在本机未
+跟踪配置中临时把 Worker poll 从 3 秒调整为 10 秒，使 Watchdog 先输出与 Automation Run、
+目标日期精确绑定的 `READY_REQUEST_VALIDATED`；验收后原配置已完整恢复为 3 秒并重启。
+最终结果为：
+
+- `trade_day_status=OPEN`；
+- 读取 7 条原始订单观察，`scope_complete=true`、`end_marker_verified=true`；
+- 批次为 `PARTIAL`，原因是该一次性验收不导入真实商品映射；这不影响页面能力、范围完整性
+  或零副作用门禁；
+- `watchdog_validated=true`、`result_imported=true`、`result_archived=true`；
+- `inbox/working/results` 均为 0，`platform_write_operations=0`；
+- 本机配置恢复后 Worker 严格健康检查通过，生命周期记录更新为 `RUNNING`。
+
+修复后的订单、Worker、授权栅栏和直接依赖专项为 `121 passed`。最终完整 pytest 为
+`1229 passed, 3 skipped, 82 subtests passed`，耗时 352.52 秒；隔离系统冒烟为
+`16 passed, 0 failed`，使用 mock 通知且未发送真实飞书。源码编译、`git diff --check`、
+仓库与影刀部署文件 SHA-256 一致性以及含中文文档的严格 UTF-8 回读均通过。
+
+本次没有提交任何真实平台写请求。COMMIT 仍停在“用户明确商品、动作和批次授权”门禁前；
+真实飞书与真实 Runtime v17 canonical 切换也仍分别按第 7 节处理。

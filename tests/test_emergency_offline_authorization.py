@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import time
 from contextlib import closing
 from dataclasses import replace
@@ -49,6 +51,25 @@ from app.shadowbot_contract_primitives import contract_identity_key
 from app.shadowbot_listing_contract import derive_v5_batch_semantics, v5_result_counts
 NOW = datetime(2026, 8, 3, 2, tzinfo=timezone.utc)
 TEST_CURRENT = NOW + timedelta(hours=1)
+
+
+def test_emergency_fence_module_loads_without_project_package() -> None:
+    source = Path("app/emergency_offline_fence.py").resolve()
+    probe = (
+        "import importlib.util,sys;"
+        "spec=importlib.util.spec_from_file_location('host_fence',sys.argv[1]);"
+        "module=importlib.util.module_from_spec(spec);"
+        "spec.loader.exec_module(module);"
+        "assert callable(module.validate_emergency_authorization_binding)"
+    )
+
+    subprocess.run(
+        [sys.executable, "-I", "-c", probe, str(source)],
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
 
 
 class _FixedDateTime(datetime):
