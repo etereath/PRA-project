@@ -52,10 +52,17 @@ Current Sales Commitment 不通过把多个来源相加得到，而是选择当�
 
 - 品种；
 - 等级；
-- 页面售价；
 - 数量；
 - 下单时间 `order_created_at`；
 - 页面可见的“第 N 次购买”/复购序号 `purchase_sequence`。
+
+页面售价属于 Closing 的重要研究指标，但不新增第二套采集/持久化事实。当前订单链已经使用页面展示单价与 `order_qty` 通过 `Decimal` 精确相乘生成 `order_transaction_amount`，因此售价按以下公式从现有事实派生：
+
+```text
+page_unit_price = order_transaction_amount / order_qty
+```
+
+`order_qty` 为正整数时，该派生值等于当前订单采集链用于计算成交金额的页面单价。Closing 展示、统计或研究需要售价时应按该公式派生；不得再增加独立售价采集字段造成同一事实的双来源和一致性风险。
 
 此外还应保留必要的审计元数据，例如平台、目标交易日、观察批次、`observed_at`、完整性/尾部验证和内容 hash；但不要求采集买家 PII 或平台订单 ID。
 
@@ -151,11 +158,23 @@ Task 14 采用两条并行工作线：
 
 因此 `purchase_sequence` 是 Daily Sales Closing 的明确最小采集缺口，后续实现需要受控元素定位、解析、持久化和 READ_ONLY 回归。
 
-### 2.3 页面售价当前未独立持久化
+### 2.3 页面售价可由现有事实稳定派生
 
-当前订单读取链会读取页面展示的单价与数量，并计算 `order_transaction_amount`；正式订单 observation 保存的是 `order_qty + order_transaction_amount`，没有独立保存页面售价字段。
+当前订单读取链会读取页面展示单价与数量，并通过 `Decimal` 精确计算：
 
-Daily Sales Closing 将“页面售价”定义为长期回顾研究字段，因此 13.6-2 需要评估最小复用/迁移方式。不得仅因为当前金额可由售价×数量得到，就把“售价作为直接观察字段”的业务要求删掉。
+```text
+order_transaction_amount = page_unit_price × order_qty
+```
+
+正式订单 observation 已持久化 `order_qty` 与 `order_transaction_amount`。因此 Daily Sales Closing 所需页面售价可以稳定反算：
+
+```text
+page_unit_price = order_transaction_amount / order_qty
+```
+
+这不是新的采集缺口，也不应新增独立售价持久化字段。新增第二套售价事实会带来双来源漂移风险，而没有提供额外业务信息。
+
+如果未来平台订单金额语义发生变化，例如引入无法从页面单价与数量解释的订单级优惠、折扣或其他调整，应重新验证该派生关系；在当前蚂蚁平台已验证的订单采集合同下，优先保持现有单一事实链。
 
 ## 3. G1 入口
 
