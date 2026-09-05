@@ -1,199 +1,207 @@
 # Task 13.6-1：业务与文档权威重基线
 
 更新时间：2026-09-06  
-状态：Draft / In Progress  
+状态：`POST-CLOSURE / G1 RETEST READY`  
 父任务：GitHub Issue #41  
 基线：`main@6857254b136c36ba72d9bb89a0904b0570f906e6`  
 前置：Task 13.6-0 Stage Goal = `PASS`
 
 ## 1. 任务定位
 
-13.6-1 负责把 PRA 的历史材料重新整理成一套可供项目 owner 审核的业务基线输入。
+13.6-1 负责把 PRA 的历史材料重新整理成一套经过 owner Business Decision Closure 的业务基线候选。
 
-本阶段不负责生产功能开发，也不负责把候选架构写死为实现方案。核心问题是：
+本阶段不进行生产功能开发，也不把候选架构写死为实现方案。核心目标是：
 
-> 在不把历史对话、旧 Issue、旧计划或当前代码自动视为永久业务权威的前提下，重新说明 PRA 到底服务什么经营流程、关键数量和日期分别代表什么、哪些材料仍可信、哪些冲突必须由 owner 一次性裁决。
+> 明确 PRA 当前真实经营流程、关键数量和日期语义、现役与历史文档角色，以及后续 13.6-2 必须面对的实现差距。
 
-13.6-1 的最终输出是 **G1 Business Baseline Review 的输入**，不是 Task 13.6 总体 PASS。
+13.6-1 的最终 Gate 是 **G1 Business Baseline Review**。G1 通过后才能进入 13.6-2。
 
-## 2. 本阶段四个交付物
+## 2. 当前交付物
 
 ### 2.1 文档与证据权威盘点
 
-文件：`docs/rebaseline/task13_6_document_authority_inventory.md`
+`docs/rebaseline/task13_6_document_authority_inventory.md`
 
-目标：
+当前状态：`POST-CLOSURE / READY FOR G1 RETEST`。
 
-- 给高影响入口、业务规范、历史计划、实施报告和证据目录分配明确角色；
-- 记录它们可以证明什么、不能证明什么；
-- 找出当前仍会误导人类或 AI 的冲突；
-- 避免通过“把旧文件全部归档”或“最新文件覆盖一切”这种粗粒度规则丢失有效工程证据。
+作用：
 
-### 2.2 业务基线草案
+- 对高影响入口、历史计划、实现文档、验证 evidence 和旧合同分配明确角色；
+- 标明主要冲突是已解决业务问题、待 13.6-2 实现/架构问题，还是待 13.6-3 入口收口问题；
+- 防止当前代码、旧 Issue 或历史报告反向成为永久业务权威。
 
-文件：`docs/rebaseline/task13_6_business_baseline_draft.md`
+### 2.2 业务基线候选
 
-目标：
+`docs/rebaseline/task13_6_business_baseline_draft.md`
 
-- 用经营语言重建当前业务主链；
-- 明确人工 Controller、供给、成交承诺、Exposure、平台观察、时间轴、日结和执行关系；
-- 已确认规则直接写入草案；
-- 尚未裁决的细节引用 Open Decision Register，不在正文中偷偷拍板。
+当前状态：`POST-CLOSURE / G1 CANDIDATE / NOT YET CANONICAL`。
 
-该文件在 G1 通过前始终是 `DRAFT / G1 INPUT`，不得作为 13.7 的编码授权。
+已吸收 OD-01～OD-06，包括：
 
-### 2.3 Open Decision Register
+- 18:00 单一销售日界；
+- 20:00 planning checkpoint；
+- Daily Supply 三阶段覆盖 + Carryover；
+- Sales Exposure 非 reservation；
+- Current Sales Commitment provider；
+- `CurrentTradeDaySalesObservation`；
+- 19:00 独立 Daily Sales Closing；
+- Closing 重试/S2/管理员维护边界；
+- Observation Health；
+- one-shot Intent supersession；
+- Task 14-A / 14-B 双工作线。
 
-文件：`docs/rebaseline/task13_6_open_decision_register.md`
+### 2.3 Decision Register
 
-目标：
+`docs/rebaseline/task13_6_open_decision_register.md`
 
-- 收集会改变经营语义、数据口径或后续架构的真正待决问题；
-- 不把普通实现细节交给项目 owner 重复决定；
-- 在业务主链初稿完成后一次性进行 Business Decision Closure；
-- G1 通过后原则上不再零散重新打开核心业务定义。
+当前角色已经从 OPEN input 转为 `CLOSED / DECISION HISTORY`。OD-01～OD-06 均已关闭，不得再作为 owner 待决问题重新提出。
 
-### 2.4 G1 Review 输入清单
+### 2.4 Business Decision Closure
 
-在本阶段收尾时形成，不提前伪造 PASS。
+`docs/rebaseline/task13_6_business_decision_closure.md`
 
-至少需要：
+记录一次性 owner 裁决及 Closure 过程中识别出的当前实现缺口。
 
-- 业务基线草案；
-- Open Decision Register 的 owner 裁决结果；
-- 主要历史冲突与 supersession 清单；
-- 固定经营情景推演；
-- 明确仍需 13.6-2 处理的实现/架构差距。
+## 3. Business Decision Closure 已完成
 
-## 3. 信息来源与权威规则
-
-### 3.1 Business Fact
-
-项目 owner 对真实经营、平台行为、人工流程、日期和数量口径的直接说明。
-
-它定义“业务实际怎样运行”，但仍需在文档中写清适用平台、日期和前提，避免把单平台事实误写成全局规则。
-
-### 3.2 Accepted Design
-
-项目 owner 曾明确采纳的设计。
-
-它是强输入，但不是不可重新审查的永久合同。如果存在更简单、更可靠、更符合当前经营目标的方案，可以在 Open Decision Register 中提出替代设计。
-
-### 3.3 Current Implementation Evidence
-
-指定 Git SHA 的生产代码、正式入口和真实调用关系。
-
-它回答“系统当前实际上做了什么”，不能反向决定业务应该怎样运行。
-
-### 3.4 Validation Evidence
-
-测试、CI、READ_ONLY、受控 COMMIT、恢复演练和长期运行记录。
-
-不同证据等级必须分开，不得用自动测试替代真实平台验收，也不得用一次受控实机成功推导生产常驻能力。
-
-### 3.5 Historical / Candidate Design
-
-历史 Issue、计划、旧业务规范、旧 AGENTS、未合并 PR 和历史 AI 建议。
-
-保留其时间、SHA、工作树和上下文，但不自动约束新业务基线。
-
-## 4. 本阶段不做
-
-13.6-1 不得：
-
-- 修改 `app/`、`shadowbot/`、生产 `scripts/` 或 Runtime Schema；
-- 修改真实 Runtime DB、Queue、Worker、Automation 配置或平台状态；
-- 执行真实平台写入；
-- 实现 Current Sales Commitment、Supply 新结构、Intent、Dispatch Attempt、Coordinator、Observation Health 或 Agent；
-- 为了让文档“看起来一致”而修改历史 evidence、哈希绑定文件或归档 AGENTS；
-- 把旧 13.5 计划整体改名继续使用；
-- 在发现一个冲突时立刻把局部方案写成最终 Canonical。
-
-生产代码中发现的业务冲突只登记为 `Implementation Gap / Task 13.7 Input`。
-
-## 5. 盘点策略
-
-为了避免数百份历史文件逐篇改写，采用“目录默认角色 + 高影响文档逐项审计”。
-
-默认规则：
-
-- `docs/archive/**`：Historical Evidence / Archived Context；
-- `docs/plans/task13_5_*`：Historical / Candidate Design；
-- `docs/reports/task13_5_*`：Historical Validation Evidence，只在其明确 SHA、工作树和验收范围内有效；
-- `docs/evidence/**`：Validation Evidence，原则上保持原样；
-- Task 12 / Task 13 final handoff 与对应 evidence：已验证执行资产的历史实现/验收证据，不直接定义新业务语义；
-- 根级 `README.md`、`AGENTS.md`、`docs/index.md`、`docs/project_current_status.md`、业务规范和治理文档：逐项审计。
-
-文件是否属于某个目录不能覆盖内容事实；如有重要例外，必须在权威盘点中单列。
-
-## 6. 业务主链初稿的固定范围
-
-13.6-1 至少必须解释：
-
-1. 当前销售决策由谁负责；
-2. 一个生产周期中预测、采摘估计、包装实数和结转库存怎样变化；
-3. 平台 Exposure 与实物供给为什么不是 reservation 关系；
-4. 盘中 Current Sales Commitment 的作用与证据来源；
-5. 平台交易日、卖家作业日、生产日、订单页展示日和观察时间的区别；
-6. 订单页尚未跨日时，旧日关闭证据与新日盘中成交如何同时存在；
-7. PRA 自己的 Exposure 调整怎样避免被误认为销量；
-8. 每日指定日结与盘中实时状态分别负责什么；
-9. 人工新决定、外部人工平台修改和已经跨越副作用边界的旧执行怎样共存；
-10. 未来 Agent 与当前人工 Controller 的边界。
-
-## 7. Business Decision Closure 执行时点
-
-执行顺序固定为：
+执行顺序已经完成到：
 
 ```text
 文档/证据盘点
 → 业务主链初稿
-→ Open Decision Register 完整化
-→ 一次性 Business Decision Closure
-→ 更新业务基线草案
-→ G1 Business Baseline Review
-→ 通过后进入 13.6-2
+→ Open Decision Register
+→ Business Decision Closure
+→ 回灌 Business Baseline
+→ 文档权威状态收口
+→ G1 Retest   ← 当前
 ```
 
-不要在盘点阶段遇到一个问题就逐项临时冻结。
+不存在仍待 owner 裁决的 G1 blocker。
 
-只有会改变经营语义、风险承担、数量口径或后续系统职责的选项才交给项目 owner。普通字段命名、Repository 选择、表数量等实现问题留给 13.6-2 / 13.7。
+若 G1 retest 发现问题，应先判断：
 
-## 8. G1 通过后的 reopen 规则
+- **文档收口缺陷**：直接修复，不重新开启 Business Decision Closure；
+- **实现/架构问题**：登记给 13.6-2；
+- **真正业务矛盾**：只有新的平台事实、owner 新要求或基线内部不可成立时才允许显式 `BUSINESS BASELINE REOPENED`。
 
-G1 通过后，13.6-2 应回答“现有系统如何支持这些业务、缺什么、谁负责”，而不是继续重新定义怎样经营。
+## 4. 已冻结的核心业务方向
 
-只有出现以下情况才允许重新打开业务基线：
+### 4.1 Sales Controller
 
-- 新的真实平台/经营事实推翻既有前提；
-- 项目 owner 主动改变经营要求；
-- 发现 G1 内部逻辑矛盾导致核心旅程无法成立。
+当前实时销售决策者是人类管理者。Evaluator、Automation 和未来 Agent 都不能因为已有技术能力自动成为 Sales Controller。
 
-重新打开时必须显式记录：
+### 4.2 日期与日界
 
-`BUSINESS BASELINE REOPENED`
+- 当前蚂蚁平台 18:00 `platform_trade_date` 是唯一销售业务换日点；
+- 20:00 `seller_operation_date` 第二日界已经被 supersede；
+- 20:00 左右仅作为 Supply / Strategy planning checkpoint；
+- `production_date` 保留为生产供给日期；
+- `order_page_visible_trade_date` 只作为订单页 UI/capability 事实。
 
-不得在架构文档里静默改变业务语义。
-
-## 9. 13.6-1 完成条件
-
-本阶段只有在以下条件满足时才可进入 G1：
-
-- [ ] 高影响文档与目录默认角色已完成盘点；
-- [ ] 主要现行/历史冲突已登记；
-- [ ] 业务主链草案覆盖本计划第 6 节的十个主题；
-- [ ] 所有未决核心问题集中在 Open Decision Register；
-- [ ] 未决问题没有被 Codex/ChatGPT 在正文中静默拍板；
-- [ ] 没有生产代码、Schema、真实数据、运行配置或平台副作用；
-- [ ] 可用固定业务情景对业务基线进行整体推演；
-- [ ] G1 前仍明确标记为 `DRAFT / NOT YET VALIDATED`。
-
-## 10. 阶段状态
-
-当前：
+### 4.3 Supply / Carryover
 
 ```text
-Task 13.6-1: IN PROGRESS
+PRODUCTION_FORECAST
+→ HARVEST_ESTIMATE
+→ PACKAGED_ACTUAL
+```
+
+同一生产日覆盖、不相加。
+
+`CARRYOVER_CONFIRMED` 是进入新交易日后确认的、未被上一周期承诺占用、仍可继续销售/履约的剩余。
+
+### 4.4 Current Sales Commitment
+
+- 冻结期：`CurrentTradeDaySalesObservation` 直接校准当前平台交易日实时销售；
+- 订单页 rollover 后：Full Scan 中 current-trade-day Order Observation 作为直接 provider；
+- Light Scan 全时段提供价格、Exposure、上下架和 QUICK-derived 辅助；
+- provider 接管，不重复相加；
+- 直接观察只证明其真实粒度。
+
+### 4.5 Daily Sales Closing
+
+- 19:00 独立扫描冻结的上一交易日订单页；
+- 与 Current Sales Commitment 完全分离；
+- 首次失败：故障报告 + 自动重试一次；
+- 第二次失败：Closing S2 + 人工复核，停止自动重试；
+- 成功后自动链不得再次对同平台/交易日发起 Closing 扫描；
+- 后续维护必须由管理员显式发起并审计；
+- `purchase_sequence` 是当前明确最小采集缺口；
+- 页面售价由 `order_transaction_amount / order_qty` 派生，不新增独立采集字段。
+
+### 4.6 Intent / Execution
+
+人工 Intent 是有范围、有效期和完成条件的 one-shot business intent。已跨越副作用边界的旧执行必须先收口，不得通过删除或假取消消失。
+
+### 4.7 Observation Health
+
+S0～S4 的实时观察风险按 provider expected cadence + capability 判断；S3 主动 Recovery，实际确认链路失败才 S4。Closing 自身故障链最高只到 Closing S2。
+
+### 4.8 Task 14
+
+- 14-A：Integrated Acceptance & Freeze；
+- 14-B：Agent Intervention / Ops Agent；
+- 14-B 首版不直接成为自动销售 Controller；
+- 两线真实接入前共同 integration gate。
+
+## 5. 当前明确留给 13.6-2 的问题
+
+这些不是 G1 owner 决策：
+
+- 当前代码中的 20:00 dual-boundary 如何退役/兼容；
+- 旧 Settlement/Summary 哪些底层能力复用、哪些状态机退役；
+- Supply / Commitment / Intent 的最小持久化方式；
+- Runtime Task 端到端推进 owner 与 coordinator 最小职责；
+- `purchase_sequence` 的最小元素定位、合同、持久化和 READ_ONLY 回归；
+- Closing 管理员维护入口；
+- 当前 `target_inventory <= real inventory` 等 stale business rules 的清理范围；
+- Observation Health 的实现位置与配置；
+- Agent interface 的最小受控边界。
+
+## 6. 13.6-1 不做
+
+不得：
+
+- 修改 `app/`、`shadowbot/`、生产 `scripts/` 或 Runtime Schema；
+- 修改真实 Runtime DB、Queue、Worker、Automation 配置或平台状态；
+- 执行真实平台写；
+- 实现 Supply、Commitment、Intent、Coordinator、Closing、Observation Health 或 Agent；
+- 修改历史 evidence 或哈希绑定材料；
+- 恢复 13.5-7G；
+- 因为当前代码存在而重新定义 G1 业务语义。
+
+## 7. G1 Retest 固定情景
+
+G1 retest 至少验证：
+
+1. **Supply convergence**：Carryover + Forecast → Harvest → Packaged，不重复扣上一周期 Commitment；
+2. **18:00 rollover**：CurrentTradeDaySalesObservation 服务新交易日，冻结订单页服务旧日 Closing；
+3. **19:00 Closing success**：成功后普通自动链不能重扫同日；
+4. **Closing double failure**：第一次自动重试，第二次 Closing S2 + 人工，停止自动重试；
+5. **Exposure adjustment**：PRA 自身 adjustment evidence 不被误判为销量；
+6. **Intent supersession**：未副作用旧动作可替代，QUEUED/RUNNING/UNKNOWN 必须先收口；
+7. **Observation Recovery**：S3 排队/合法等待不等于 S4，probe 真实失败才 S4；
+8. **Task 14 boundary**：14-A 综合验收与 14-B Ops Agent 并行但不绕过确定性链。
+
+## 8. 13.6-1 完成条件
+
+- [x] 高影响文档与目录默认角色已完成盘点；
+- [x] 主要冲突已登记并分类；
+- [x] 业务主链初稿完成；
+- [x] Open Decision Register 建立；
+- [x] Business Decision Closure 完成；
+- [x] OD-01～OD-06 全部关闭；
+- [x] 裁决已回灌业务基线；
+- [x] Decision Register 已转 CLOSED 历史角色；
+- [x] Authority Inventory 已吸收 post-closure 状态；
+- [x] 没有生产代码、Schema、真实数据或平台副作用；
+- [ ] G1 Business Baseline Retest = PASS。
+
+## 9. 当前状态
+
+```text
+Task 13.6-1: G1 RETEST READY
+Business Decision Closure: CLOSED
 G1 Business Baseline: NOT YET VALIDATED
 Task 13.6 Overall: NOT YET VALIDATED
 Task 13.7 Readiness: NOT READY
