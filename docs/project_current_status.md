@@ -2,13 +2,22 @@
 
 本文档用于同步当前仓库的真实项目状态，避免早期规划、阶段计划和当前已实现能力混淆。
 
+> **当前阶段状态（2026-09-05）**：Task 13.5 已正式冻结为
+> `STOPPED / SUPERSEDED`，不是普通 `FAILED`。不得继续 13.5-7G 或按其候选切片编码。
+> 下一阶段登记为 Task 13.6；Task 13.7 必须等待 Task 13.6 Stage Goal 为 `PASS`。
+>
+> PR #38 已合并到 `main@244efc5`。PR #39 已关闭且未合并，其内容仅作历史讨论证据，
+> 不构成当前实现或继续开发 Task 13.5 的授权。
+
 ## 1. 当前项目定位
 
 PRA 当前定位为：
 
 鲜切花预测性销售决策系统 + 运行态任务运营后台。
 
-PRA 已形成任务中心到蚂蚁花团供应商微信小程序的单平台、多商品、受控 RPA 改价与上下架闭环；任务 13.5 已插入任务 13 与任务 14 之间，用于补齐 18:00 平台交易日/20:00 卖家作业日双时间轴、持续只读扫描、历史订单观察、销售日结、S0–S4 异常治理、任务来源对齐、受控紧急保护和运营 Web 重写。当前 13.5-1 已完成双时间轴、Runtime Schema v14、六级质量约束和日结状态机；13.5-2 已通过 PR #23 合并商品映射编译、扫描 JSON 输入、任务 13 双页快照适配和 v14 商品观察导入；13.5-3 已通过 PR #24 合并独立 Automation Service 的计划窗口、租约、合并、补跑、父子 run、心跳和健康控制面。13.5-4 已实现订单只读合同、蚂蚁花团 Adapter、平台无关 Importer、v6 ShadowBot 只读队列边界和 `FULL_MARKET_SCAN → ORDER_SCAN → ORDER_HISTORY_IMPORT` 接入；当前日按 `OPEN`、历史日按 `CLOSED`，重复订单按指纹多重集合保留。最新审查修复已增加历史目标日期 Run Event 精确冻结、Watchdog/Importer 全链路绑定、`HH:10` 完整扫描、跨 18:00 整批失败和正式 Automation Service 只读 Handler 组合。受控真实页面 READ_ONLY 已完成 2026-07-31、2026-07-30 和 2026-07-22 三日期矩阵，分别读取 3、5、4 条并完成范围/尾部验证、导入归档和零平台写副作用；日期轮已修复“隐藏日期存在于无障碍树却不在视口”的误判，从 7 月 30 日到 7 月 22 日的向上滚动以及从 7 月 22 日回到 7 月 31 日的向下滚动、确认和精确日期回读均已通过。2026-07-10 又完成 20 条历史订单 READ_ONLY：订单调用方点击新捕获的 `订单管理_容器` 右边缘空白带，共享助手发送 2 次 `END` 后验证“没有更多了”，再由 `HOME` 恢复首卡；`scroll_progress_verified=true`，订单列表真实滚动门禁已关闭。复用优先整改保留商品和订单共用的参数化列表物化助手，并以 `scroll_count / scroll_progress_verified` 独立记录滚动证据。真实 Runtime DB 因既有 `NEEDS_RECONCILIATION` 安全门禁保持未迁移、未写入订单事实，因此仍不承诺生产级无人值守写操作，也未扩展到第二平台。系统核心职责是：
+PRA 已形成到蚂蚁花团供应商微信小程序的单平台、多商品、受控 RPA 改价与上下架执行链；
+这不等于普通 Runtime Task 从创建到终态的运营生命周期已经闭环。Task 13.5 曾位于任务 13
+与任务 14 之间，用于补齐 18:00 平台交易日/20:00 卖家作业日双时间轴、持续只读扫描、历史订单观察、销售日结、S0–S4 异常治理、任务来源对齐、受控紧急保护和运营 Web 重写。当前 13.5-1 已完成双时间轴、Runtime Schema v14、六级质量约束和日结状态机；13.5-2 已通过 PR #23 合并商品映射编译、扫描 JSON 输入、任务 13 双页快照适配和 v14 商品观察导入；13.5-3 已通过 PR #24 合并独立 Automation Service 的计划窗口、租约、合并、补跑、父子 run、心跳和健康控制面。13.5-4 已实现订单只读合同、蚂蚁花团 Adapter、平台无关 Importer、v6 ShadowBot 只读队列边界和 `FULL_MARKET_SCAN → ORDER_SCAN → ORDER_HISTORY_IMPORT` 接入；当前日按 `OPEN`、历史日按 `CLOSED`，重复订单按指纹多重集合保留。最新审查修复已增加历史目标日期 Run Event 精确冻结、Watchdog/Importer 全链路绑定、`HH:10` 完整扫描、跨 18:00 整批失败和正式 Automation Service 只读 Handler 组合。受控真实页面 READ_ONLY 已完成 2026-07-31、2026-07-30 和 2026-07-22 三日期矩阵，分别读取 3、5、4 条并完成范围/尾部验证、导入归档和零平台写副作用；日期轮已修复“隐藏日期存在于无障碍树却不在视口”的误判，从 7 月 30 日到 7 月 22 日的向上滚动以及从 7 月 22 日回到 7 月 31 日的向下滚动、确认和精确日期回读均已通过。2026-07-10 又完成 20 条历史订单 READ_ONLY：订单调用方点击新捕获的 `订单管理_容器` 右边缘空白带，共享助手发送 2 次 `END` 后验证“没有更多了”，再由 `HOME` 恢复首卡；`scroll_progress_verified=true`，订单列表真实滚动门禁已关闭。复用优先整改保留商品和订单共用的参数化列表物化助手，并以 `scroll_count / scroll_progress_verified` 独立记录滚动证据。真实 Runtime DB 因既有 `NEEDS_RECONCILIATION` 安全门禁保持未迁移、未写入订单事实，因此仍不承诺生产级无人值守写操作，也未扩展到第二平台。系统核心职责是：
 
 13.5-6 已完成编码前计划评议、6A-0/6A-1 本地实现以及 6B 的 Runtime Schema v16
 极简策略和零副作用影子判定。v15 只增加 Incident 出现次数、扩展类别和一张 append-only
@@ -109,7 +118,8 @@ Worker/fence 源码已更新但尚未同步真实影刀宿主，本轮没有执�
 - 通过 Web 后台、Mobile Review 和飞书通知完成运营复核闭环。
 - 为后续生产级真实平台调度、真实 RPA 和 AI Agent 预留边界。
 
-任务 13.5 的宏观权威是 [GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20)；
+任务 13.5 的原宏观范围权威是 [GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20)；
+其当前状态已由本页冻结为 `STOPPED / SUPERSEDED`。
 [对齐评估](plans/task13_5_issue20_alignment_review.md)记录了其与本地计划的裁决，
 [本地实施计划](plans/task13_5_operational_closed_loop_and_web_rewrite.md)和
 [Web 重写计划](plans/task13_5_web_rewrite_plan.md)负责仓库内的具体落地；
@@ -454,8 +464,8 @@ Worker、写 Queue、发送通知或执行真实平台动作。完整实现与�
 `1280 passed, 3 skipped, 102 subtests passed`，隔离系统冒烟为 `16 passed, 0 failed`；构建、
 严格制品审计、secret scan、wheel 隔离安装和 Windows 临时 ShadowBot fixture 均通过。
 
-7F 已完成唯一 Web 切换和本地验收，当前在合并后外部验收分支补齐真实后台生命周期与
-平台 READ_ONLY。
+7F 已完成唯一 Web 切换、本地验收、真实后台生命周期与平台 READ_ONLY；外部验收修复已由
+PR #38 合并到 `main@244efc5`。
 旧 `app.web`、旧样式和重复测试已删除，制品审计禁止旧模块回流；`serve-web` 只启动新运营
 Web。系统入口已分成运行状态、通知通路、数据与备份和高级诊断，`SYSTEM_ADMIN` 与只读
 查看权限分离。Worker 恢复、通知测试和备份只提交固定类型化意图，分别复用既有 Incident /
@@ -794,6 +804,18 @@ Web 复核主入口：
 
 ## 8. 后续推荐优先级
 
+当前有效顺序只有：
+
+1. 完成 Task 13.6 的文档权威/supersession 审计、业务语义重基线和 cold-start AI
+   architecture review；本阶段不得写生产功能。
+2. 仅在 Task 13.6 Stage Goal 为 `PASS` 后开始 Task 13.7，重新冻结人工销售控制闭环和执行
+   生命周期；不得从 13.5-7G 的历史讨论直接恢复实现。
+3. Agent 自动介入和 Observation Health 自动诊断继续后置到 Task 14。
+
+PR #38 已合并，PR #39 已关闭且未合并，两者均不再是待处置项。Issue #20 的远端归档方式
+仍待项目 owner 决定。以下段落是 2026-09-05 冻结前的历史进度记录，只用于追溯，不是当前
+推荐顺序。
+
 任务12审查修复版已通过 PR #18 合并，其正常 COMMIT 与受控
 UNKNOWN→唯一 RECONCILE 继续作为稳定基线。任务13的实现、受控实机验收、
 脱敏证据、最终本地回归、PR #19 审查修复和 Windows/Linux Core 均已完成。
@@ -805,7 +827,7 @@ Code Review 后的高中低风险问题已完成修复，系统冒烟测试、�
 `679 passed, 3 skipped, 97 subtests passed in 144.54s`。该结果证明当前代码回归通过，
 不代替后续 v14、Automation、订单、S4、Web 或实机验收。
 
-推荐顺序：
+历史推荐顺序（已失效，不得执行）：
 
 1. 以 [reports/task13_final_handoff_20260727.md](reports/task13_final_handoff_20260727.md) 为任务13审查入口，复核四维状态模型、Runtime Schema v13、v5上下架流水线、运行边界和证据矩阵。
 2. 任务13独立 PR #19 的 COMMENT Review 修复、Windows Core 和 Linux Core 已通过；后续合并和任务状态仍由审查方处理。
