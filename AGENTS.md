@@ -106,7 +106,17 @@ Task 13.6 期间不得：
 
 这些底线不意味着旧 13.5 的库存、日结、Automation、S0–S4、Agent 或 Web 业务语义自动继续有效。
 
-## 7. 历史材料
+## 7. Task 13.6 文档与仓库工作门禁
+
+这些规则仅用于保证重基线过程本身可审计、不会破坏现有工作区和历史证据；它们不恢复旧 13.5 的业务设计。
+
+- 开始修改前检查当前 branch / worktree 状态；保留项目 owner 或其他任务已经存在的改动，不重置、覆盖或删除与本任务无关的文件。
+- Markdown、JSON、Python 和普通文本统一使用 UTF-8；修改含中文的文档后必须严格 UTF-8 回读，并至少抽查标题、关键中文段落和受影响的链接/路径。
+- 历史 evidence、hash-bound 文件以及 `docs/archive/` 中声明为原样归档的文件不得为了格式、措辞或目录整齐而重写；如需解释，修改上层索引或另写说明。
+- 代码存在、测试通过、CI 通过、READ_ONLY、真实 COMMIT、长期运行分别报告，不得互相替代。
+- 尚未完成要求的验证时不得把结果写成 `PASS`、`已完成` 或 `已验收`；应明确写为 `NOT YET VALIDATED`、`BLOCKED` 或列出剩余验证项。
+
+## 8. 历史材料
 
 以下内容默认属于 Historical / Audit Input，需保留版本和上下文，但不得自动限制 Task 13.6：
 
@@ -119,7 +129,7 @@ Task 13.6 期间不得：
 
 Task 12/13 的 v4/v5、operation/attempt、write lock、UNKNOWN→RECONCILE、Queue、Worker、Importer、Watchdog、Review、Outbox 等资产仍可能继续复用，但必须在 13.6-2 依据当前代码和新业务合同重新确认，不因历史“禁止重写”条款自动获得永久豁免。
 
-## 8. 临时 AGENTS 生命周期
+## 9. 临时 AGENTS 生命周期
 
 本文件必须有明确退役条件，不能演变为新的永久历史包袱。
 
@@ -140,7 +150,7 @@ Task 13.6-0 合并后，本文件作为根级 `AGENTS.md` 对 Codex 生效。
 3. cold-start AI 必须在正式版已生效的状态下完成最终理解验收；
 4. 若验收发现正式版本身造成误解，应修订正式版并重新验收，而不是恢复旧 13.5 `AGENTS.md`。
 
-## 9. Stage Goal
+## 10. Stage Goal
 
 Task 13.6 总体 Stage Goal 在 13.6-0/1/2 期间保持 `NOT YET VALIDATED`。
 
