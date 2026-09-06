@@ -10,7 +10,7 @@
 | 业务应该怎样运行 | [业务合同](business_contract.md) | G1 及用户最新明确裁决；实现偏差不能反向改业务 |
 | 当前源码实际做什么 | [实现责任图](rebaseline/task13_6_current_implementation_map.md)及指定 SHA 源码 | Current Implementation，不能当未来产品规范 |
 | 各段由谁负责、13.7 补什么 | [目标职责/gap/IG-01～11](rebaseline/task13_6_target_responsibility_and_gap_matrix.md) | 已采纳架构，不是生产完成证明 |
-| 如何开发、审查、控制复杂度 | [治理 v2.0](pra_review_risk_and_complexity_governance.md)与[AGENTS](../AGENTS.md) | 仓库工作规则；常规选择由执行者判断，业务冲突显式报告 |
+| 如何开发、审查、控制复杂度 | [审核治理规范](pra_review_risk_and_complexity_governance.md)与[AGENTS](../AGENTS.md) | 仓库工作规则；常规选择由执行者判断，业务冲突显式报告 |
 | 当前阶段通过了吗 | [当前状态](project_current_status.md)与绑定版本的验收记录 | CI、READ_ONLY、COMMIT、部署、长期运行分别证明 |
 
 每个主题只在主文档维护一次。README/AGENTS/Status 是短入口；历史材料不能通过标题中的“冻结”“必须”重新成为现役合同。用户最新明确指令优先于仓库旧规则，但不使未实现能力自动成为事实。
