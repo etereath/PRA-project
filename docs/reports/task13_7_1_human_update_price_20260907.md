@@ -4,6 +4,8 @@
 
 ## 版本与结论
 
+后续状态说明（2026-09-07）：本报告保留 `8a1040d` 首版实现及开发自检快照。[正式首审](https://github.com/etereath/PRA-project/pull/47#pullrequestreview-5126336815)对交付 Head `ceb88a0` 判定 Implementation FAIL，发现 P1-47-01 人工终态入口缺失和两项非阻塞 P2，取代本报告“未发现未处理 P1/P2”的开发自检判断。后续修复、人工结论记录和超时策略见[P1 修复报告](task13_7_1_p1_human_resolution_20260907.md)；以下历史测试不代替修复版本证据。
+
 - 实现源码与测试：`8a1040da308caf6f2ccc60fda7f18b9b2237be24`。本报告之后的文档提交不改变该源码；PR 说明另记录最终 Head 的 CI。
 - 承接 Head：`3be9f15f11298e1cee06f706d117c95afdb3f7aa`；已合并 main 起点：`f227cd2517687e4a6dfadea90c2e126a5da69711`。承接时核验了正文、评论、提交、差异和 Windows/Linux CI，没有新增外部审核意见。
 - 分支：`codex/task13-7-1-human-update-price`。独立 worktree 施工，保留原 main 及其本地改动。

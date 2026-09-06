@@ -1,6 +1,6 @@
 # PRA 当前阶段与验证状态
 
-角色：Current Status；唯一当前阶段状态页。更新于 2026-09-07。PR [#46](https://github.com/etereath/PRA-project/pull/46) 已合并，本次交接起点为 main `f227cd2517687e4a6dfadea90c2e126a5da69711`。当前在 Draft PR [#47](https://github.com/etereath/PRA-project/pull/47)、分支 `codex/task13-7-1-human-update-price` 交付首切片实现；源码版本 `8a1040da308caf6f2ccc60fda7f18b9b2237be24`。未合并、未部署；[实现与证据](reports/task13_7_1_human_update_price_20260907.md)，[开发 Goal](plans/task13_7_first_slice_codex_goal.md)。
+角色：Current Status；唯一当前阶段状态页。更新于 2026-09-07。PR [#46](https://github.com/etereath/PRA-project/pull/46) 已合并，本次交接起点为 main `f227cd2517687e4a6dfadea90c2e126a5da69711`。当前在 Draft PR [#47](https://github.com/etereath/PRA-project/pull/47)、分支 `codex/task13-7-1-human-update-price` 修复首审 P1-47-01；修复源码版本 `b22420887a1df7129ba67dd7d4f9a858fd2ccf2e`。未合并、未部署；[P1 修复与证据](reports/task13_7_1_p1_human_resolution_20260907.md)，[首版实现快照](reports/task13_7_1_human_update_price_20260907.md)，[开发 Goal](plans/task13_7_first_slice_codex_goal.md)。
 
 | 项目 | 状态 | 依据/下一步 |
 |---|---|---|
@@ -12,9 +12,9 @@
 | Task 13.6 Overall | PASS | G1/G2、入口/正式AGENTS及负责人最终验收已收口；验收记录见阶段报告追加节 |
 | Task 13.7 Readiness | READY | 业务与文档交接条件通过；首条纵切计划/Goal已准备 |
 | Task 13.7-1 开工交接 | COMPLETE | Codex 已在原分支/PR 承接，没有另建计划 PR |
-| Task 13.7-1 代码实现 | COMPLETE / 待审核 | 持久授权、Queue Service owner、价格决定替代/等待、恢复与 Web 回读；Schema v18 |
-| Task 13.7-1 隔离旅程 | PASS | 正式 Web/Application、v4/file Queue/Worker/Importer，同一临时 Runtime；仅替换外部 UI |
-| Task 13.7-1 Implementation Review | 待 ChatGPT 首审 | 开发自检与固定 SHA 测试见实现报告；最终 Head CI 见 PR，Merge Gate 未放行 |
+| Task 13.7-1 代码实现 | P1 修复完成 / 待复核 | 新增有证据的正式人工收口、持久负责人及催办；复用 Review/Outbox/快照，Schema 仍为 v18 |
+| Task 13.7-1 隔离旅程 | P1 定向回归 PASS | 同一临时 Runtime：UNKNOWN、唯一对账失败、正式 Web 人工收口、重启、新决定正常授权执行；外部平台使用隔离替身 |
+| Task 13.7-1 Implementation Review | 首审 FAIL；P1 修复待复核 | 首审 1 个 P1 blocking、2 个 P2 nonblocking、0 个额外 Merge Gate。复核仅 P1 与直接回归，合并门禁未放行 |
 | Task 13.7-1 Stage Goal | NOT YET VALIDATED | 尚无包含重启或 blocker 恢复的受控实机证据，需负责人主持 |
 
 ## 当前能力与限制
@@ -39,7 +39,7 @@
 
 先完成1 SKU、1次人工UPDATE_PRICE，从决定、Runtime Task、正式授权、持久交接，经既有v4/Queue/Worker/Importer到终态与平台回读，并验证重启或阻塞解除后的责任连续。详见[首切片计划](plans/task13_7_human_update_price_vertical_slice.md)与[开发Goal](plans/task13_7_first_slice_codex_goal.md)。
 
-Codex 已完成原 Draft PR 的实现及隔离验证交付。下一步由 ChatGPT 按指定 SHA 进行业务/架构/代码首审、冻结 blocker；负责人安排受控现场验收并决定合并。必要迁移和配置说明见实现报告。合并、结束 Draft、部署和真实平台写入仍按各自授权处理；本次均未执行。
+ChatGPT 已对 `ceb88a0` 完成[首审并冻结问题](https://github.com/etereath/PRA-project/pull/47#pullrequestreview-5126336815)：UNKNOWN → 唯一对账失败缺少正式人工终态路径，Implementation 为 FAIL。Codex 按用户“开始修复并推送”授权完成 P1 修复，下一步按上述修复 SHA 复核 P1 与直接回归；两项非阻塞 P2 保留。原首版开发自检不能覆盖正式首审结论。负责人仍需安排受控现场验收并决定合并，必要配置和证据边界见修复报告。合并、结束 Draft、部署和真实平台写入本次均未执行。
 
 PR #44 已关闭且未合并，仍作历史平行分析；有效增量已随 #45 吸收，未采纳设计不成为施工合同。Issue #41 与旧报告的阶段叙述按其历史范围读取，不重新打开已完成的 13.6。
 
