@@ -25,6 +25,7 @@ from app.operations_web.composition import (
 from app.operations_web.presenters import (
     render_database,
     render_detail,
+    render_price_execution_resolution,
     render_management,
     render_mobile_review,
     render_notification_drawer,
@@ -45,6 +46,7 @@ from app.services.execution_authorization import (
     ExecutionAuthorizationApplicationService,
     ExecutionAuthorizationError,
 )
+from app.services.price_execution_resolution import PriceExecutionResolutionApplicationService
 from app.repositories.automation_repository import AutomationRepository
 from app.repositories.inventory_repository import InventoryRepository
 from app.services.automation_configuration import (
@@ -66,7 +68,7 @@ from app.services.operations_maintenance import (
     OperationsMaintenanceError,
 )
 from app.services.security import LOGIN_RATE_LIMITER, record_security_event
-from app.exceptions import MobileReviewTransactionError
+from app.exceptions import MobileReviewTransactionError, ValidationError
 from app.mobile_review_http import mobile_review_http_status
 from app.services.workflow import resolve_mobile_review
 
@@ -224,6 +226,7 @@ class OperationsWebApplication:
             applet_uri=container.settings.shadowbot_applet_uri,
             execution_profile=container.settings.environment,
         )
+        self.price_resolution = PriceExecutionResolutionApplicationService(self.execution_authorization)
         self.review_resolution = ReviewResolutionApplicationService(
             container.runtime_repository,
             container.authorization,
@@ -354,6 +357,11 @@ class OperationsWebApplication:
             if method != "POST":
                 return self._method_not_allowed("POST")
             return self._review_resolve(environ)
+
+        if path in {"/management/price-resolutions/claim", "/management/price-resolutions/resolve"}:
+            if method != "POST":
+                return self._method_not_allowed("POST")
+            return self._price_resolution(environ, path)
 
         if path == "/management/automation/configure":
             if method != "POST":
@@ -729,6 +737,20 @@ class OperationsWebApplication:
             if detail is None:
                 return Response.text("404 Not Found", "未找到该记录。")
             content = render_detail(detail)
+            task_id = unquote(match.group(3)) if match.group(2) == 'task' else ''
+            if match.group(2) == 'review':
+                review = self.container.runtime_repository.get_review_task(unquote(match.group(3)))
+                task_id = review.source_task_id if review else ''
+            if task_id:
+                model = self.price_resolution.for_task(task_id)
+                if model:
+                    error = self.control_store.get(self._first(query, 'price_resolution_error'),
+                        session.principal.subject)
+                    content += render_price_execution_resolution(model,
+                        csrf_token=session.csrf_token, idempotency_key=secrets.token_urlsafe(18),
+                        subject=session.principal.subject,
+                        can_handle=self.container.authorization.allows(session.principal, Capability.HANDLE_REVIEW),
+                        error=error if isinstance(error, str) else '')
         drawer = render_notification_drawer(self.queries.notification_drawer())
         body = render_template(
             "page.html",
@@ -1032,6 +1054,31 @@ class OperationsWebApplication:
             (result.batch_id, result.execution_attempt_id),
         )
         return self._management_redirect("execution_receipt", token)
+
+    def _price_resolution(self, environ, path) -> Response:
+        session, form, denied = self._management_write_context(
+            environ, route=path, capability=Capability.HANDLE_REVIEW)
+        if denied is not None:
+            return denied
+        review_id = self._first(form, 'review_id')
+        review = self.container.runtime_repository.get_review_task(review_id)
+        if review is None or review.review_type != 'price_execution_unknown':
+            return Response.text('404 Not Found', '未找到人工改价复核。')
+        location = '/management/task/' + quote(review.source_task_id, safe='')
+        try:
+            if path.endswith('/claim'):
+                self.price_resolution.claim(session.principal, review_id=review_id)
+            else:
+                self.price_resolution.resolve(session.principal, review_id=review_id,
+                    **{key: self._first(form, key) for key in
+                       ('evidence_id', 'evidence_digest', 'conclusion', 'idempotency_key', 'note')})
+        except ValidationError as exc:
+            token = self.control_store.put(session.principal.subject, str(exc))
+            location += '?price_resolution_error=' + quote(token, safe='')
+        except Exception:
+            token = self.control_store.put(session.principal.subject, '处置未完成，请刷新核对；未保存部分收口结果。')
+            location += '?price_resolution_error=' + quote(token, safe='')
+        return Response.text('303 See Other', '', headers=[('Location', location)])
 
     def _review_resolve(self, environ) -> Response:
         session, form, denied = self._management_write_context(

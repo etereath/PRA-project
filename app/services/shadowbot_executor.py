@@ -1137,6 +1137,19 @@ class ShadowBotExecutor:
         operation = self.repository.get_shadowbot_operation(attempt.operation_id)
         if operation is None:
             raise ValidationError("operation_id does not exist.")
+        # For an accepted v4 UNKNOWN, the Task is already in manual_review.
+        # An inconclusive reconcile replay has no new fact to project. Skip it
+        # based on immutable ownership, so concurrent human closure cannot be
+        # overwritten between a status check and the projection writes.
+        from contextlib import closing
+        with closing(self.repository.connect_read()) as connection:
+            if (attempt.execution_mode == EXECUTION_MODE_RECONCILE
+                    and result.side_effect_state not in {SIDE_EFFECT_VERIFIED, SIDE_EFFECT_NOT_APPLIED}
+                    and connection.execute(
+                        'SELECT 1 FROM execution_continuations c JOIN shadowbot_commit_batch_items i '
+                        'ON i.batch_id = c.batch_id WHERE i.operation_id = ?',
+                        (operation.operation_id,)).fetchone() is not None):
+                return
         operation_status = _operation_status_from_result(result)
         if result.status in {STATUS_READ_COMPLETED, STATUS_PREVIEW_COMPLETED}:
             operation_status = str(

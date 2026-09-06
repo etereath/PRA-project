@@ -22,6 +22,7 @@ from app.services.execution_authorization import (
 from app.services.shadowbot_commit_batch import validate_request
 from app.services.shadowbot_executor import ShadowBotStartBoundaryError
 from app.services.shadowbot_queue import ShadowBotQueuePaths, read_checked_queue_json
+from app.services.price_execution_resolution import PriceExecutionResolutionApplicationService
 
 
 MESSAGES = {
@@ -35,6 +36,7 @@ MESSAGES = {
     'SUPERSEDED': '本次价格决定已取消或由新决定替代。',
     'ALREADY_APPLIED': '新鲜平台观察已证明目标价格，无需再次写入。',
     'COMPLETE': '执行链已收口；执行结果及平台回读见下方记录。',
+    'HUMAN_RESOLVED': '已按平台证据人工终止旧决定；原未知执行历史保留。',
     'RETRY_PENDING': '执行服务暂时异常，将重试检查；已有执行不会重复投递。',
 }
 
@@ -47,6 +49,7 @@ class TaskExecutionCoordinator:
         self.executor = executor
         self.paths = ShadowBotQueuePaths(authorization_service.queue_root)
         self.publishing_grace = publishing_grace
+        self.price_resolution = PriceExecutionResolutionApplicationService(authorization_service)
 
     def run_cycle(self, *, now=None):
         current = now or self.service.clock()
@@ -64,6 +67,8 @@ class TaskExecutionCoordinator:
         return events
 
     def _note(self, batch_id, outcome, now, *, close=False, task_status=None, evidence=None):
+        if outcome == 'HUMAN':
+            self.price_resolution.ensure_reviews(batch_id, now=now)
         self.store.note(batch_id, outcome, MESSAGES[outcome], now=now,
                         close=close, task_status=task_status, evidence=evidence)
         return outcome
@@ -88,7 +93,11 @@ class TaskExecutionCoordinator:
             return self._note(batch_id, 'HUMAN', now)
         if batch['status'] == 'UNKNOWN':
             operations = [self.runtime.get_shadowbot_operation(i['operation_id']) for i in items]
-            if all(op and op.status in {'VERIFIED', 'NOT_APPLIED'} for op in operations):
+            with closing(self.runtime.connect_read()) as connection:
+                resolved = {op.operation_id for op in operations if op and
+                            self.price_resolution.is_resolved(connection, op.operation_id)}
+            if all(op and (op.status in {'VERIFIED', 'NOT_APPLIED'} or op.operation_id in resolved)
+                   for op in operations):
                 for operation in operations:
                     task = self.runtime.get_task(operation.task_id)
                     if operation.status == 'NOT_APPLIED' and task.task_status is TaskStatus.MANUAL_REVIEW:
@@ -98,8 +107,9 @@ class TaskExecutionCoordinator:
                             metadata={'operation_id': operation.operation_id, 'batch_id': batch_id},
                             result_message='只读对账确认未应用；旧决定已终止，新决定需正常授权。',
                         )
-                return self._note(batch_id, 'COMPLETE', now, close=True)
-            if any(op and op.status in {'MANUAL_REVIEW', 'MANUAL_HANDLED'} for op in operations):
+                return self._note(batch_id, 'HUMAN_RESOLVED' if resolved else 'COMPLETE', now, close=True)
+            if any(op and op.status in {'MANUAL_REVIEW', 'MANUAL_HANDLED'}
+                   and op.operation_id not in resolved for op in operations):
                 return self._note(batch_id, 'HUMAN', now)
             for item, operation in zip(items, operations):
                 if operation and operation.status == 'NEEDS_RECONCILIATION':

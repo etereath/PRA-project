@@ -542,7 +542,7 @@ class OperationsQueryService:
                                 ),
                             )
                         )
-                if actions:
+                if actions or review.review_type == 'price_execution_unknown':
                     pending_review_options.append(
                         ReviewControlReadModel(
                             review_task_id=review.review_task_id,

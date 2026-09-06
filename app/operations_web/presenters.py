@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from urllib.parse import quote
+
 from app.operations_web.read_models import (
     DatabaseReadModel,
     DetailReadModel,
@@ -15,6 +17,48 @@ from app.operations_web.read_models import (
 )
 from app.operations_web.rendering import html
 
+
+def render_price_execution_resolution(model, *, csrf_token, idempotency_key, subject, can_handle, error=''):
+    from app.services.price_execution_resolution import CONCLUSIONS
+    owner = model['payload']['owner_subject']
+    parts = ['<section class="panel"><h2>改价执行人工核验</h2>',
+             '<p>负责人：' + html(owner) + '</p>']
+    if error:
+        parts.append('<p role="alert">' + html(error) + '</p>')
+    if model['review_status'] != 'pending':
+        result = model['resolution']
+        evidence = result.get('evidence', {})
+        parts.extend(['<p>人工处置已记录：' + html(result.get('conclusion_label', '旧决定已终止')) + '</p>',
+            '<p>处理人：' + html(result.get('principal_subject', '')) + '；时间：' + html(result.get('resolved_at', '')) + '</p>',
+            '<p>平台核验价格：' + html(evidence.get('observed_price', '')) + '；观察时间：' + html(evidence.get('observed_at', '')) + '</p>',
+            '<p>证据：' + html(evidence.get('snapshot_item_id', '')) + '</p>',
+            '<p>备注：' + html(result.get('note', '')) + '</p>',
+            '<p>旧执行结果仍为未知，旧决定已终止。后续改价请创建新决定并重新授权。</p></section>'])
+        return ''.join(parts)
+    if model['overdue']:
+        parts.append('<p>已逾期；已提醒 ' + html(str(model['payload'].get('reminder_count', 0))) + ' 次。接手确认前原负责人继续负责。</p>')
+    parts.append('<p>先取得旧执行及唯一对账停止后的平台状态扫描，再选择证据提交结论。等待期间保留写锁，超时不会自动收口。</p>')
+    hidden = ('<input type="hidden" name="csrf_token" value="' + html(csrf_token) + '">'
+              '<input type="hidden" name="review_id" value="' + html(model['review_task_id']) + '">')
+    if can_handle and owner != subject:
+        parts.append('<form method="post" action="/management/price-resolutions/claim">' + hidden +
+                     '<button type="submit">确认由我接手</button></form>')
+    if model['evidence_error']:
+        parts.append('<p>' + html(model['evidence_error']) + '</p>')
+    for evidence in model['evidence']:
+        parts.append('<div><p>平台核验价格：' + html(evidence['observed_price']) + '；观察时间：' + html(evidence['observed_at']) + '</p>' +
+                     '<p>核验记录：' + html(evidence['snapshot_item_id']) + '</p>')
+        if can_handle and owner == subject:
+            parts.append('<form method="post" action="/management/price-resolutions/resolve">' + hidden +
+                '<input type="hidden" name="idempotency_key" value="' + html(idempotency_key) + '">' +
+                '<input type="hidden" name="evidence_id" value="' + html(evidence['snapshot_item_id']) + '">' +
+                '<input type="hidden" name="evidence_digest" value="' + html(evidence['digest']) + '">' +
+                '<label>人工结论<select name="conclusion" required><option value="">请选择</option>' +
+                ''.join('<option value="' + html(key) + '">' + html(label) + '</option>' for key, label in CONCLUSIONS.items()) +
+                '</select></label><label>备注（不能代替平台证据）<textarea name="note" maxlength="1000"></textarea></label>' +
+                '<button type="submit">按所选证据终止旧决定</button></form>')
+        parts.append('</div>')
+    return ''.join(parts) + '</section>'
 
 MANUAL_ACTION_LABELS = {
     "SET_PRICE": "调整价格到",
@@ -288,6 +332,8 @@ def _render_review_controls(
                 </form>
                 """
             )
+        if not forms:
+            forms.append('<a href="/management/review/' + html(quote(review.review_task_id, safe='')) + '">打开人工核验</a>')
         cards.append(
             f"""
             <article class="review-control-card">

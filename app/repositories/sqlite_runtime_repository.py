@@ -5159,6 +5159,9 @@ class SQLiteRuntimeRepository:
                         "链接已失效或无权访问该复核任务",
                     )
 
+                if review_row["review_type"] == "price_execution_unknown":
+                    raise ValidationError("请登录经营管理，凭平台核验记录提交人工结论。")
+
                 expires_at = (
                     _text_to_datetime(token_row["expires_at"])
                     if token_row is not None
