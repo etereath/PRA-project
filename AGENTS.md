@@ -1,162 +1,38 @@
-# AGENTS.md — TEMPORARY TASK 13.6 REBASELINE INSTRUCTIONS
+# AGENTS.md — PRA 项目工作指令
 
-> **临时文件 / TEMPORARY**
->
-> 本文件仅在 Task 13.6 文档、业务语义与架构重基线期间作为 Codex 的仓库级工作指令。
-> 它不是 PRA 的最终项目规则。
->
-> Task 13.6 验收阶段必须根据新的 Canonical 文档生成正式 `AGENTS.md`；正式版经审查后替换本文件，本临时版随后归档。
->
-> Task 13.5 结束前的原始 `AGENTS.md` 已原样归档到：
-> `docs/archive/AGENTS_task13_5_pre_rebaseline_20260905.md`
+本文件是仓库工作入口。业务主定义、实现事实和当前阶段分别由下列文档承担，不把历史计划当永久权限。
 
-## 1. 当前任务
+## 先读什么
 
-当前阶段：**Task 13.6 — PRA 项目文档重整、业务语义重基线与 AI 开发上下文校准**。
+1. `docs/project_current_status.md`：当前阶段、证据与开工门槛。
+2. `docs/project_overview.md`：产品目标与路线。
+3. `docs/business_contract.md`：当前业务定义。
+4. `docs/rebaseline/task13_6_current_implementation_map.md`：指定 SHA 的实际实现。
+5. `docs/rebaseline/task13_6_target_responsibility_and_gap_matrix.md`：目标 owner、复用/gap、IG-01～IG-11、13.7/14 边界。
+6. `docs/pra_review_risk_and_complexity_governance.md`：审核和开发方法；其他材料按 `docs/index.md` 身份读取。
 
-父任务：GitHub Issue #41。
+## 工作判断
 
-Task 13.5 已 `STOPPED / SUPERSEDED`。不得继续 13.5-7G，也不得把 PR #39 的候选设计直接改名为 13.7 后继续施工。
+- PRA 是鲜切花持续观察、人工经营决策、可靠执行与恢复系统。当前 Controller 是 Human/Operations Web；未来 Agent 经过既有校验、授权、执行与恢复接口。
+- 每次新任务先核验最新 main/PR head、正文/评论、changed files/commits、适用 AGENTS、相关文档、正式生产入口与调用链、测试/CI。报告指定 SHA；合并、部署、实机、长期运行分别证明。
+- 对业务应该怎样运行、代码实际怎样运行、验证到何程度，分别采用最新用户裁决、指定 SHA 源码和相应范围证据。历史设计可修订，原始历史事实不改写。
+- 同时审业务可行性、安全正确性、开发维护效率。出现施工边界妨碍目标时，显式 `BOUNDARY CONFLICT`：证据、后果、最小替代方案；不静默扩权，也不增加旁路掩盖矛盾。
+- 检查完整业务旅程：非终态的 owner、下一步、触发、失败、重启和收尾。人工等待授权可以合法；已最终确认后的执行不能只靠页面或内存承担恢复。
+- 逻辑责任不等于新表/状态机。新增复杂度须证明具体事故与复用不足；优先既有 v4/v5、Queue、Worker、Importer、Watchdog、Review/Outbox 和库存 ledger。
+- Review Profile 按影响选 R1～R4，Task Type 单列。首审尽量冻结完整 blocker，复审检查原问题与直接回归；用户明确要求完整实现重审时重新完整审。较大任务分别给 Implementation Review（P1/P2/Merge Gate）与 Stage Goal（PASS/FAIL/NOT YET VALIDATED）。
 
-Task 13.7 只有在 Task 13.6 Stage Goal = `PASS` 后才能开始生产功能开发。
+## 硬边界
 
-## 2. Task 13.6 的目标
+- 真实写经正式授权链：写前读取→比较预期旧状态→执行→写后读取。外部员工修改平台是正常经营；过时 Intent 不默认写回。
+- UNKNOWN/NEEDS_RECONCILIATION 不能用第二次猜测写解决；沿既有唯一 RECONCILE，不能猜测平台事实。
+- PENDING 未授权 Task 不自动执行；Coordinator 只拥有已形成持久 execution continuation 的对象。Observation S4 不继承 Emergency S4 下架权限。新旧业务 authority 不得同时扣减/生成计划。
+- 区分 platform_name/account_id/internal_sku/platform_product_identity；平台 UI/登录/selector 留在 Adapter/Executor/ShadowBot。
+- 凭据、完整 Review token URL、本地生产配置及 Runtime 数据不进入 Git/日志/公开证据。
+- 开始修改前检查 branch/worktree，保留他人改动。文本 UTF-8 严格回读；历史/hash-bound evidence、原样 archive 不为格式修改。按实际风险验证，不用 CI 代替业务验收。
 
-本任务不是生产功能开发，而是重建人类与 AI 可以共同使用的项目基线，明确：
+## 阶段与权限
 
-- PRA 的真实经营目标与当前阶段目标；
-- 业务事实、已采纳设计、当前实现、验证证据和历史候选之间的区别；
-- 时间、供给、成交承诺、平台 Exposure、日结、人工决策与执行恢复的业务语义；
-- 当前代码真实实现到哪里；
-- 哪些旧合同仍有效、哪些已失效、哪些需要项目 owner 决策；
-- Task 13.7 的真实实现输入与边界。
-
-历史对话、Issue、计划、报告和旧 `AGENTS.md` 都是审计输入，不拥有永久业务权威。若存在更简单、更可靠、更符合真实业务的方案，可以提出替代方案。
-
-## 3. 来源分类
-
-Task 13.6 处理信息时必须标明其性质：
-
-1. **Business Fact**：项目 owner 对真实经营、平台行为、人工流程、日期和数量口径的直接说明；
-2. **Accepted Design**：项目 owner 曾采纳的设计决定，可在 13.6 中重新审查；
-3. **Current Implementation Evidence**：指定 Git SHA 的生产代码、正式入口和真实调用链；
-4. **Validation Evidence**：测试、CI、真实 READ_ONLY、受控 COMMIT、实机恢复、长期运行记录；
-5. **Historical / Candidate Design**：旧 Issue、旧计划、旧 `AGENTS.md`、PR #39 候选方案及未重新确认的 AI 建议。
-
-不得把“设计已采纳”写成“代码已实现”，也不得把“测试通过”写成“真实运营闭环已验收”。
-
-## 4. 当前工作顺序
-
-### 13.6-0 — Rebaseline Bootstrap
-
-- 归档旧 `AGENTS.md`；
-- 使用本临时 `AGENTS.md` 切换 Codex 上下文；
-- 建立父 Issue、bootstrap 文档、来源分类和禁止事项；
-- 不裁决最终业务架构，不写生产代码。
-
-### 13.6-1 — 业务与文档权威重基线
-
-- 盘点历史文档、Issue、PR 与关键实现证据；
-- 重建项目定位、业务主链、核心术语、时间和数量口径；
-- 建立 Open Decision Register；
-- 在业务主链初稿完成后执行一次 Business Decision Closure；
-- G1 业务基线通过后才进入 13.6-2。
-
-### 13.6-2 — 系统架构与实现差距重基线
-
-- 分开描述当前实现和目标职责；
-- 审核完整责任链：`业务意图 → 持久状态 → 调度/授权 → 执行 → 结果 → 恢复/复核 → 终态`；
-- 输出复用、调整、新增、退役矩阵；
-- 形成 Task 13.7 输入，不提前实现 13.7。
-
-### 13.6-3 — 入口收口与验收
-
-- 收口 README、docs index、Current Status、Roadmap 等 Canonical 入口；
-- 由 Codex 根据新的 Canonical 文档生成**正式 `AGENTS.md` 候选版**；
-- 审查候选版是否准确反映新基线且没有重新复制历史冲突；
-- 退役本临时 `AGENTS.md`，将其归档；
-- 用通过审查的正式版替换根级 `AGENTS.md`；
-- 再执行 cold-start AI 理解验收与项目 owner 最终确认；
-- 只有 Task 13.6 Stage Goal = `PASS` 才允许 Task 13.7 开工。
-
-## 5. Task 13.6 禁止事项
-
-Task 13.6 期间不得：
-
-- 修改生产业务代码、Runtime Schema、真实 Runtime DB、Queue、Worker 或生产运行配置；
-- 执行真实平台写入；
-- 继续 13.5-7G；
-- 提前实现 Current Sales Commitment、Sales Control Intent、Dispatch Attempt、TaskExecutionCoordinator、Observation Health 或 Agent；
-- 因为旧代码或旧计划存在，就未经业务裁决新增第二状态机、第二 Summary、第二 Queue 或万能 Service；
-- 为了文档整齐而修改被测试、哈希或验收绑定的历史证据内容。
-
-发现生产代码问题时，登记为实现差距、风险或 Task 13.7 输入；除非项目 owner 另开独立修复任务，否则不要顺手改代码。
-
-## 6. 仍然有效的基础安全边界
-
-在新业务合同完成前，以下安全底线继续保持：
-
-- 真实平台写不得绕过正式应用服务与执行链直接点击平台；
-- `UNKNOWN / NEEDS_RECONCILIATION` 不得通过猜测性重复写解决；
-- 人工直接在平台/App 修改属于正常经营场景，系统不得假设自己是唯一写入者；
-- 真实写继续遵循写前读取、旧状态比较、写后回读；
-- secrets、密码、Token、Cookie、Webhook secret、完整 Mobile Review token URL 和本地生产配置不得进入 Git、日志或公开证据；
-- 平台专属页面、登录、选择器与 UI 操作留在平台 Adapter / ShadowBot 边界；
-- 当前单机、SQLite、单 Worker 架构不因“未来多平台”自动升级为分布式系统；新增复杂度必须由真实需求证明。
-
-这些底线不意味着旧 13.5 的库存、日结、Automation、S0–S4、Agent 或 Web 业务语义自动继续有效。
-
-## 7. Task 13.6 文档与仓库工作门禁
-
-这些规则仅用于保证重基线过程本身可审计、不会破坏现有工作区和历史证据；它们不恢复旧 13.5 的业务设计。
-
-- 开始修改前检查当前 branch / worktree 状态；保留项目 owner 或其他任务已经存在的改动，不重置、覆盖或删除与本任务无关的文件。
-- Markdown、JSON、Python 和普通文本统一使用 UTF-8；修改含中文的文档后必须严格 UTF-8 回读，并至少抽查标题、关键中文段落和受影响的链接/路径。
-- 历史 evidence、hash-bound 文件以及 `docs/archive/` 中声明为原样归档的文件不得为了格式、措辞或目录整齐而重写；如需解释，修改上层索引或另写说明。
-- 代码存在、测试通过、CI 通过、READ_ONLY、真实 COMMIT、长期运行分别报告，不得互相替代。
-- 尚未完成要求的验证时不得把结果写成 `PASS`、`已完成` 或 `已验收`；应明确写为 `NOT YET VALIDATED`、`BLOCKED` 或列出剩余验证项。
-
-## 8. 历史材料
-
-以下内容默认属于 Historical / Audit Input，需保留版本和上下文，但不得自动限制 Task 13.6：
-
-- GitHub Issue #20；
-- `docs/plans/task13_5_*`；
-- `docs/reports/task13_5_*`；
-- `docs/archive/AGENTS_task13_5_pre_rebaseline_20260905.md`；
-- PR #39 的 7G 候选计划；
-- 旧 `business_decision_spec.md` 中尚未重新确认的业务参数。
-
-Task 12/13 的 v4/v5、operation/attempt、write lock、UNKNOWN→RECONCILE、Queue、Worker、Importer、Watchdog、Review、Outbox 等资产仍可能继续复用，但必须在 13.6-2 依据当前代码和新业务合同重新确认，不因历史“禁止重写”条款自动获得永久豁免。
-
-## 9. 临时 AGENTS 生命周期
-
-本文件必须有明确退役条件，不能演变为新的永久历史包袱。
-
-### 启用
-
-Task 13.6-0 合并后，本文件作为根级 `AGENTS.md` 对 Codex 生效。
-
-### 生成正式版
-
-13.6-3 中，只有在业务基线和系统架构基线已经通过相应评审后，才根据新的 Canonical 文档生成正式 `AGENTS.md` 候选版。正式版应保持精简，只包含后续开发真正需要长期强制遵守的项目规则，不复制整套业务规范。
-
-### 退役
-
-正式候选版通过审查后：
-
-1. 将本临时文件原样归档，例如 `docs/archive/AGENTS_task13_6_temporary.md`；
-2. 用正式版替换根级 `AGENTS.md`；
-3. cold-start AI 必须在正式版已生效的状态下完成最终理解验收；
-4. 若验收发现正式版本身造成误解，应修订正式版并重新验收，而不是恢复旧 13.5 `AGENTS.md`。
-
-## 10. Stage Goal
-
-Task 13.6 总体 Stage Goal 在 13.6-0/1/2 期间保持 `NOT YET VALIDATED`。
-
-只有 Canonical 文档、正式 `AGENTS.md`、冷启动理解验收和项目 owner 最终确认全部通过后，才可标记：
-
-```text
-Task 13.6 Stage Goal: PASS
-Task 13.7 Readiness: READY
-```
+- 当前阶段只从状态页读取。Task13.5 STOPPED/SUPERSEDED；旧 7G 不继续。Task13.6 Overall PASS 前不开始 13.7。
+- 13.6 限纯文档；不修改生产代码/Schema/运行配置/真实 DB/Queue/Worker，不运行平台操作。其目标是认知和交接准确，不要求提前修完 13.7 缺口。
+- 正式 AGENTS 替换与 Canonical 收口完成后，由项目负责人主持不携带历史聊天的独立 AI cold-start；实施者可准备中性问题和分开的评分依据，不以自答或实施者预检代替正式验收。新会话启动前，受测工作树必须已放置固定 SHA 的正式 AGENTS；在已注入旧指令的会话内补读正式版，不能消除已注入上下文。记录原始输入/回答、版本和环境限制，语义修订按直接影响定向复核，方法见计划与治理。负责人对最终交付确认前，Overall 保持 NOT YET VALIDATED。
+- 用户当前明确授权优先且在会话内持续有效。未经明确要求不 merge、不结束 Draft、不修改无关分支/远端状态。创建任务分支和提交 PR 的授权不等于合并或部署授权。最终报告说明是否合并。
