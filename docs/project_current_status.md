@@ -1,6 +1,6 @@
 # PRA 当前阶段与验证状态
 
-角色：Current Status；唯一当前阶段状态页。更新于 2026-09-06。PR [#46](https://github.com/etereath/PRA-project/pull/46) 已合并，本次交接起点为 main `f227cd2517687e4a6dfadea90c2e126a5da69711`；其相对 `08041bfe25a7f31f032564a2abca35e5eb5f5330` 的净变更仅为文档。当前任务分支：`codex/task13-7-1-human-update-price`；承接流程见[开发 Goal](plans/task13_7_first_slice_codex_goal.md)。
+角色：Current Status；唯一当前阶段状态页。更新于 2026-09-07。PR [#46](https://github.com/etereath/PRA-project/pull/46) 已合并，本次交接起点为 main `f227cd2517687e4a6dfadea90c2e126a5da69711`。当前在 Draft PR [#47](https://github.com/etereath/PRA-project/pull/47)、分支 `codex/task13-7-1-human-update-price` 交付首切片实现；源码版本 `8a1040da308caf6f2ccc60fda7f18b9b2237be24`。未合并、未部署；[实现与证据](reports/task13_7_1_human_update_price_20260907.md)，[开发 Goal](plans/task13_7_first_slice_codex_goal.md)。
 
 | 项目 | 状态 | 依据/下一步 |
 |---|---|---|
@@ -11,13 +11,15 @@
 | Task 13.6-3 | PASS | 负责人接受语义快照 `4d51f51`；PR #46 已合并，正式 AGENTS 与 Canonical 已进入 main |
 | Task 13.6 Overall | PASS | G1/G2、入口/正式AGENTS及负责人最终验收已收口；验收记录见阶段报告追加节 |
 | Task 13.7 Readiness | READY | 业务与文档交接条件通过；首条纵切计划/Goal已准备 |
-| Task 13.7-1 开工交接 | READY | 材料提交至 `codex/task13-7-1-human-update-price` 的 Draft PR，Codex 在同一分支/PR 承接 |
-| Task 13.7-1 代码实现 | NOT STARTED | 本次提交仅交接文档；由 Codex 开始实现并更新此状态 |
-| Task 13.7-1 Stage Goal | NOT YET VALIDATED | 需首切片实现、完整旅程及相应实机证据；文档/CI 不代替 |
+| Task 13.7-1 开工交接 | COMPLETE | Codex 已在原分支/PR 承接，没有另建计划 PR |
+| Task 13.7-1 代码实现 | COMPLETE / 待审核 | 持久授权、Queue Service owner、价格决定替代/等待、恢复与 Web 回读；Schema v18 |
+| Task 13.7-1 隔离旅程 | PASS | 正式 Web/Application、v4/file Queue/Worker/Importer，同一临时 Runtime；仅替换外部 UI |
+| Task 13.7-1 Implementation Review | 待 ChatGPT 首审 | 开发自检与固定 SHA 测试见实现报告；最终 Head CI 见 PR，Merge Gate 未放行 |
+| Task 13.7-1 Stage Goal | NOT YET VALIDATED | 尚无包含重启或 blocker 恢复的受控实机证据，需负责人主持 |
 
 ## 当前能力与限制
 
-已有正式人工 Web 创建/授权入口和 v4/v5、Queue/Worker/Importer、UNKNOWN/RECONCILE、Review/Outbox、DB 实物库存等资产。新 one-shot Intent、持久执行 owner、Commitment、冻结期销售 Provider、Closing、Supply、Observation Health 及 authority cutover 仍属于实现缺口。完整事实与来源只在[当前实现图](rebaseline/task13_6_current_implementation_map.md)维护。
+已有正式人工 Web 创建/授权入口和 v4/v5、Queue/Worker/Importer、UNKNOWN/RECONCILE、Review/Outbox、DB 实物库存等资产。PR #47 为一次人工改价补齐 Task 决定记录、授权后持久交接与 Queue Service owner，尚未合入 main 或证明现场可用。Commitment、冻结期销售 Provider、Closing、Supply、Observation Health 及 authority cutover 仍是后续缺口。[原版本实现图](rebaseline/task13_6_current_implementation_map.md)保持其指定 SHA 身份，本次增量事实见[13.7-1 实现报告](reports/task13_7_1_human_update_price_20260907.md)。
 
 经营目标由[业务合同](business_contract.md)定义，13.7 的职责/复用/gates 由[目标架构](rebaseline/task13_6_target_responsibility_and_gap_matrix.md)定义；这两份目标文档不证明生产能力已经运行。
 
@@ -37,7 +39,7 @@
 
 先完成1 SKU、1次人工UPDATE_PRICE，从决定、Runtime Task、正式授权、持久交接，经既有v4/Queue/Worker/Importer到终态与平台回读，并验证重启或阻塞解除后的责任连续。详见[首切片计划](plans/task13_7_human_update_price_vertical_slice.md)与[开发Goal](plans/task13_7_first_slice_codex_goal.md)。
 
-负责人已明确“可以由你开PR，将材料推送，然后codex承接”。本次由 ChatGPT 创建交接 Draft PR；Codex 负责首切片代码、必要迁移/测试与运行证据，ChatGPT 回到业务/架构/代码审核角色，负责人主持现场验收并决定合并。Codex fetch 后跟踪 `origin/codex/task13-7-1-human-update-price`，读取该 PR 最新 Head/正文/评论，在同一分支继续提交，无需先合并交接 PR 或另建重复计划 PR。合并/结束 Draft/真实平台写入仍按各自授权处理。
+Codex 已完成原 Draft PR 的实现及隔离验证交付。下一步由 ChatGPT 按指定 SHA 进行业务/架构/代码首审、冻结 blocker；负责人安排受控现场验收并决定合并。必要迁移和配置说明见实现报告。合并、结束 Draft、部署和真实平台写入仍按各自授权处理；本次均未执行。
 
 PR #44 已关闭且未合并，仍作历史平行分析；有效增量已随 #45 吸收，未采纳设计不成为施工合同。Issue #41 与旧报告的阶段叙述按其历史范围读取，不重新打开已完成的 13.6。
 

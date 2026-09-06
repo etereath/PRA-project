@@ -29,6 +29,7 @@
 
 ## 当前任务与验证证据
 
+- [13.7-1 人工改价实现、迁移和隔离验证](reports/task13_7_1_human_update_price_20260907.md)：绑定实现 SHA；真实平台 Stage Goal 仍未验证
 - [13.7 首条人工改价纵向切片计划](plans/task13_7_human_update_price_vertical_slice.md)与[开发 Goal](plans/task13_7_first_slice_codex_goal.md)：准备/交接材料，施工时从包含已验收13.6交付的最新main开始；不替代业务合同或目标职责
 - [13.6-3 计划](plans/task13_6_3_canonical_entrypoint_convergence.md)
 - [13.6-3 历史预检原始问答、外部测试反馈与修订记录](reports/task13_6_3_canonical_entrypoint_and_cold_start_20260906.md)：证据材料，不是冷启动受测阅读集；旧版本结果不自动覆盖修订后的文档，正式验收由负责人主持

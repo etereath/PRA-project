@@ -2,7 +2,7 @@
 
 PRA 支持鲜切花预测性销售：持续观察平台与供给事实，供管理者通过 Operations Web 作出决定，再经授权、执行、回读和恢复形成闭环。当前销售 Controller 是人类。
 
-项目负责人已验收 **Task 13.6 Overall PASS**，PR #46 已合并，当前进入 **Task 13.7-1 首条人工改价闭环的开发交接**。[最新状态与验收证据](docs/project_current_status.md)；[首切片计划与 Codex 承接 Goal](docs/plans/task13_7_human_update_price_vertical_slice.md)。Codex 在由最新 main 创建的任务分支上承接实现；实现进度、CI 与实机证据分别记录。
+项目负责人已验收 **Task 13.6 Overall PASS**，PR #46 已合并。**Task 13.7-1 首条人工改价实现已在 Draft PR #47 交付，等待审核与现场验收**，尚未合并或部署。[最新状态](docs/project_current_status.md)；[实现、迁移与隔离验证](docs/reports/task13_7_1_human_update_price_20260907.md)；[首切片计划](docs/plans/task13_7_human_update_price_vertical_slice.md)。代码、CI、隔离旅程和实机分别记录。
 
 ## 阅读入口
 
@@ -14,7 +14,7 @@ PRA 支持鲜切花预测性销售：持续观察平台与供给事实，供管�
 
 开发 AI 从根级 [AGENTS.md](AGENTS.md) 开始。其他文件按[文档索引及身份](docs/index.md)读取。
 
-已有成熟资产包括 v4 改价、v5 上下架、文件 Queue、Worker/Importer/Watchdog、UNKNOWN/RECONCILE、人工授权、Review/Outbox 与 DB 实物库存。新业务持续执行 owner、Commitment、Closing 等尚需实现；目标架构不等于部署状态。
+已有成熟资产包括 v4 改价、v5 上下架、文件 Queue、Worker/Importer/Watchdog、UNKNOWN/RECONCILE、人工授权、Review/Outbox 与 DB 实物库存。PR #47 增加一次人工改价授权后的持久执行 owner；Commitment、Closing 等仍属后续范围。目标架构和分支实现不等于部署状态。
 
 ## 本地运行与运维
 
