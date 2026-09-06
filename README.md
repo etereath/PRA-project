@@ -2,7 +2,7 @@
 
 PRA 支持鲜切花预测性销售：持续观察平台与供给事实，供管理者通过 Operations Web 作出决定，再经授权、执行、回读和恢复形成闭环。当前销售 Controller 是人类。
 
-项目负责人已验收 **Task 13.6 Overall PASS**，当前准备 **Task 13.7 首条人工改价闭环**。[最新状态与验收证据](docs/project_current_status.md)；[下一阶段计划与开发 Goal](docs/plans/task13_7_human_update_price_vertical_slice.md)。代码施工从 PR #46 合入后的最新 main 新建分支，验收通过不等于已合并或已部署。
+项目负责人已验收 **Task 13.6 Overall PASS**，PR #46 已合并，当前进入 **Task 13.7-1 首条人工改价闭环的开发交接**。[最新状态与验收证据](docs/project_current_status.md)；[首切片计划与 Codex 承接 Goal](docs/plans/task13_7_human_update_price_vertical_slice.md)。Codex 在由最新 main 创建的任务分支上承接实现；实现进度、CI 与实机证据分别记录。
 
 ## 阅读入口
 
@@ -20,7 +20,7 @@ PRA 支持鲜切花预测性销售：持续观察平台与供给事实，供管�
 
 当前 Web 主入口为 `/today`、`/database`、`/management`、`/system`；数据质量位于 `/database/quality`。商品/规则/预测等仍有工作簿输入；实物库存使用 DB authority，平台 Exposure 与实物库存是不同事实。
 
-安装与配置按[核心发行物部署](docs/core_wheel_shadowbot_deployment.md)及[环境变量](docs/runtime_environment_variables.md)执行。现有 Windows 启动入口：`scripts/start_local.ps1` 只启动 Web，`scripts/start_local_services.ps1` 独立管理 Queue Service。运行或部署操作需匹配用户当前授权；13.6 文档工作不启动这些服务。
+安装与配置按[核心发行物部署](docs/core_wheel_shadowbot_deployment.md)及[环境变量](docs/runtime_environment_variables.md)执行。现有 Windows 启动入口：`scripts/start_local.ps1` 只启动 Web，`scripts/start_local_services.ps1` 独立管理 Queue Service。运行或部署操作需匹配用户当前授权；文档交接本身不启动这些服务。
 
 ShadowBot 的凭据使用部署机本地 Windows Credential Manager；真实 target、账号/密码、Token、Webhook、本地配置和 Runtime DB 不提交 Git。[Worker/Queue 运维](docs/shadowbot_file_queue_operations.md)包含显式 app-dir、部署核对、登录与回读要求。
 

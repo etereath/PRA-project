@@ -1,6 +1,6 @@
 # PRA 当前阶段与验证状态
 
-角色：Current Status；唯一当前阶段状态页。更新于 2026-09-06，工作 PR [#46](https://github.com/etereath/PRA-project/pull/46)。生产实现基线为 `08041bfe25a7f31f032564a2abca35e5eb5f5330`，本 PR 为纯文档。
+角色：Current Status；唯一当前阶段状态页。更新于 2026-09-06。PR [#46](https://github.com/etereath/PRA-project/pull/46) 已合并，本次交接起点为 main `f227cd2517687e4a6dfadea90c2e126a5da69711`；其相对 `08041bfe25a7f31f032564a2abca35e5eb5f5330` 的净变更仅为文档。当前任务分支：`codex/task13-7-1-human-update-price`；承接流程见[开发 Goal](plans/task13_7_first_slice_codex_goal.md)。
 
 | 项目 | 状态 | 依据/下一步 |
 |---|---|---|
@@ -8,10 +8,12 @@
 | Task 13.6-0 | PASS | PR #42 已合并 |
 | Task 13.6-1 / G1 | PASS | PR #43 已合并；OD-01～OD-06 已关闭 |
 | Task 13.6-2 / G2 与增量吸收 | PASS | PR #45 已合并；不是待合并任务 |
-| Task 13.6-3 | PASS | 负责人明确“验收通过，准备下一阶段”，接受语义快照 `4d51f51` |
+| Task 13.6-3 | PASS | 负责人接受语义快照 `4d51f51`；PR #46 已合并，正式 AGENTS 与 Canonical 已进入 main |
 | Task 13.6 Overall | PASS | G1/G2、入口/正式AGENTS及负责人最终验收已收口；验收记录见阶段报告追加节 |
 | Task 13.7 Readiness | READY | 业务与文档交接条件通过；首条纵切计划/Goal已准备 |
-| Task 13.7 实施 | NOT STARTED | 本轮仅准备；PR #46仍Draft且未合并，生产施工从其合入后的最新main新建分支 |
+| Task 13.7-1 开工交接 | READY | 材料提交至 `codex/task13-7-1-human-update-price` 的 Draft PR，Codex 在同一分支/PR 承接 |
+| Task 13.7-1 代码实现 | NOT STARTED | 本次提交仅交接文档；由 Codex 开始实现并更新此状态 |
+| Task 13.7-1 Stage Goal | NOT YET VALIDATED | 需首切片实现、完整旅程及相应实机证据；文档/CI 不代替 |
 
 ## 当前能力与限制
 
@@ -22,20 +24,22 @@
 ## 13.6-3 验收
 
 - Canonical entrypoint convergence：PASS；负责人已接受测试反馈后的最终交付。
-- 正式 AGENTS：YES，已审查并在本 PR 分支实际生效；临时版原样归档。
+- 正式 AGENTS：YES，已审查、在验收版本实际生效并随 PR #46 合入 main；临时版原样归档。
 - 实施者独立 AI 预检：历史 PASS，五组完整情景，输入提交 `a7bf4aa2919a0462c62d52046e6e3f9c6cde22c5`；原始问答保留，不代替负责人正式验收。
 - 负责人提供的外部样本：输入 `0de43bf78f8c61847e6406c3b74dc1fbc7995f32`。DeepSeek 首答+定向复核的内容审查 PASS，D-1 CLOSED；GLM G-1 部分解决，累计范围/唯一映射仍未通过；Luna 首答有计算/状态语义错误，未收到复核。各环境限制与摘录见报告。
 - 正式 Cold-start Validation：PASS（负责人最终验收裁决）。接受版本 `4d51f51edcafc4168149928f6ee64467cd12421a`，正式AGENTS blob `2e580b9c9169717743f265a2e20085039c38ef46`；本记录不虚构新模型运行或改写旧样本结果，证据边界见报告。
 - Owner final confirmation：CONFIRMED，2026-09-06，原话“验收通过,准备下一阶段”。
-- PR CI：已接受语义版本 `4d51f51` 的 Windows/Linux [Core CI 已通过](https://github.com/etereath/PRA-project/actions/runs/34041256409)。本次只补负责人验收记录与13.7交接材料，不改已接受的业务合同、目标职责和正式AGENTS；新补证Head的CI仍在 [PR #46](https://github.com/etereath/PRA-project/pull/46)独立回读。
+- CI：已接受语义版本 `4d51f51` 的 [Core CI](https://github.com/etereath/PRA-project/actions/runs/34041256409)、PR #46 最终交接 Head `c585b0b` 的 [Windows/Linux CI](https://github.com/etereath/PRA-project/actions/runs/34044060100)，以及合并 main `f227cd2` 的 [Core CI](https://github.com/etereath/PRA-project/actions/runs/34044462783) 均已通过。13.7 分支新增提交的 CI 在对应 PR 按 Head 单独核验，不能引用这些历史结果代替。
 
 计划：[Task 13.6-3](plans/task13_6_3_canonical_entrypoint_convergence.md)。[本次验收记录与原始问答](reports/task13_6_3_canonical_entrypoint_and_cold_start_20260906.md)。13.6 PASS 只代表认知/文档/交接通过，不代表 13.7 功能完成、现场部署或真实平台写授权。
 
-## 下一阶段：13.7 第一条纵向切片
+## 当前交接：13.7-1 第一条纵向切片
 
 先完成1 SKU、1次人工UPDATE_PRICE，从决定、Runtime Task、正式授权、持久交接，经既有v4/Queue/Worker/Importer到终态与平台回读，并验证重启或阻塞解除后的责任连续。详见[首切片计划](plans/task13_7_human_update_price_vertical_slice.md)与[开发Goal](plans/task13_7_first_slice_codex_goal.md)。
 
-本轮“准备下一阶段”授权用于记录验收及准备计划，未开始生产代码开发。PR #46在核验时仍为Draft、未合并；验收PASS不自动执行merge或结束Draft。获得合并指令并完成合入后，开发者从届时最新main新建13.7分支，不能延续旧13.6工作分支。无需重新索要已给出的13.6验收确认。
+负责人已明确“可以由你开PR，将材料推送，然后codex承接”。本次由 ChatGPT 创建交接 Draft PR；Codex 负责首切片代码、必要迁移/测试与运行证据，ChatGPT 回到业务/架构/代码审核角色，负责人主持现场验收并决定合并。Codex fetch 后跟踪 `origin/codex/task13-7-1-human-update-price`，读取该 PR 最新 Head/正文/评论，在同一分支继续提交，无需先合并交接 PR 或另建重复计划 PR。合并/结束 Draft/真实平台写入仍按各自授权处理。
+
+PR #44 已关闭且未合并，仍作历史平行分析；有效增量已随 #45 吸收，未采纳设计不成为施工合同。Issue #41 与旧报告的阶段叙述按其历史范围读取，不重新打开已完成的 13.6。
 
 历史证据：[G1](reports/task13_6_1_g1_business_baseline_review_20260906.md)、[G2](reports/task13_6_2_g2_architecture_handoff_review_20260906.md)、[增量 G2](reports/task13_6_2_g2_incremental_parallel_absorption_review_20260906.md)。旧报告中的“next 13.6-2 / merge #45”只代表当时状态。
 
