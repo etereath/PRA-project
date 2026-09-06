@@ -272,3 +272,70 @@ Cold-start Validation：PASS（5 组完整情景）。未发现关键误解；�
 - Task 13.7 Readiness：NOT READY。
 
 PR 保持 Draft。没有修改生产文件、真实 Runtime 或平台，也没有执行合并。依据正式 AGENTS 的阶段规则，负责人对最终交付确认前不得把 Overall 写为 PASS。
+
+## 测试反馈修订（2026-09-06，追加记录）
+
+本节记录上述初次交付之后的用户测试与文档修订。前文绑定 `a7bf4aa` 的原始提示、答复、blob 清单和当时判断逐字保留；按负责人后续明确指令，它是**实施者独立 AI 预检**，不是负责人正式验收结论。本节也不覆盖原 G1/G2 的历史 PASS。当前阶段只从[状态页](../project_current_status.md)读取。
+
+### 输入与版本边界
+
+负责人提供了三个环境的首答，均声明以 `0de43bf78f8c61847e6406c3b74dc1fbc7995f32` 的八份文件为输入，随后在会话中转贴 DeepSeek 与 GLM 的定向复核回答，最后明确要求“根据测试结果重新完善文档”。本轮据此修改原 PR 的现役说明，不将模型回复自动变成新业务合同。
+
+首答原件由负责人随会话上传并保留；下表列原始字节指纹，以下只摘录影响判断的原句，不冒称这里包含三份完整原件或环境工具轨迹。模型名称沿用上传文件名，不据此对模型或工具环境做通用排名。
+
+| 首答原件 | SHA-256 |
+|---|---|
+| `deepseekv4 flash(claudecode).md` | `fc3d0fc55aefa68f483a4faa7db7bb6156e16e595d8797ce83d0b2d1549619b9` |
+| `gpt5.6 luna(codex).md` | `f8b7c2c4211e21b333b1d54dc982bab941667960c96163d9821dd5d98bc9a452` |
+| `GLM5.3(Zcode).md` | `17e765371330c4d7fbef28a71c4478ba31cb3a50eebaf03f43862a2198589f83` |
+
+原受测文档：[业务合同](https://github.com/etereath/PRA-project/blob/0de43bf78f8c61847e6406c3b74dc1fbc7995f32/docs/business_contract.md)、[目标职责](https://github.com/etereath/PRA-project/blob/0de43bf78f8c61847e6406c3b74dc1fbc7995f32/docs/rebaseline/task13_6_target_responsibility_and_gap_matrix.md)、[正式 AGENTS](https://github.com/etereath/PRA-project/blob/0de43bf78f8c61847e6406c3b74dc1fbc7995f32/AGENTS.md)。原题的 A 组使用 Carryover 36、Forecast 130、Harvest 124、Packaged 118、Commitment 22 后到 31；B 组使用 Exposure 90→127、调整目标+45、累计22→25、两SKU聚合。不得混用前文预检的40/120/115/113数值。
+
+文档修订前再次从 GitHub 核对 main `08041bfe25a7f31f032564a2abca35e5eb5f5330`、PR #46 Head `0de43bf`、正文/评论/Review/变更文件/提交及 Head CI。main/Head 均未推进；PR 为 Draft，未合并，未发现新增审查评论。`0de43bf` 的 Windows/Linux [Core CI](https://github.com/etereath/PRA-project/actions/runs/34023796458) 均 success。重新读取同一生产基线的 Manual Task、Execution Authorization、Web queries、Queue Service 与两份相关测试，未发现本轮需要更改当前实现图的事实。目标说明与已实现接线继续分离。
+
+### 原问题、复核与归因
+
+以下 ID 延续首轮作答审查；严重度只描述答卷误解及其诱导风险，不映射为当前代码缺陷或新增全局 Merge Gate。
+
+| ID / 首轮判断 | 可追溯原句与判断 | 本轮处理与样本状态 |
+|---|---|---|
+| L-1 / P1 | Luna 算出 `(127-90)-45=-8` 后写“剩余 -8 不能解释成销量”，把负 Exposure 残差误当成不能形成正候选消耗 | 业务合同 §8 原概念式未明示正负方向，是文档可改善处；补充 R/Q、已知调整及覆盖条件。未收到 Luna 复核，不能声称其已答对 |
+| L-2 / P2 | Luna 写 `36+118−31=119`，正确值123 | 属算术错误；现有覆盖原则不改，计划保留144/138/132/123的有限计算复核，不为单次错算新增业务规则 |
+| L-3 / P2 | Luna 将聚合粒度不足描述为“粒度不足或 NEEDS_RECONCILIATION”，并泛化未知到执行恢复 | 合同 §6.3 明确聚合可信、SKU缺失与写执行UNKNOWN分属不同对象；不自动引入执行锁、RECONCILE或人工Review链 |
+| D-1 / P2 | DeepSeek 将“shadow 已能算、旧 Settlement 还在扣库存出计划、Web 还读旧 Summary”称为“禁止态” | 一次中性定向复核后正确区分三种状态，D-1 CLOSED；首答+复核的内容审查 PASS。目标矩阵 §5 增加判定表，避免仅靠顺序推导 |
+| G-1 / 原为待澄清 | GLM 首答列“唯一化映射、更细粒度的平台观察、或人工决定”，末尾又写“人工拆分” | 一次复核已分清人工判断与成交事实，但新增的下架/唯一映射解释仍错误；G-1 PARTIALLY RESOLVED，累计范围问题保持未通过。合同 §6.3 补完整覆盖范围及反例，不直接改成样本PASS |
+
+DeepSeek 定向提示只要求判定三种情形：旧唯一写/新shadow/Web旧、新旧都写、新唯一写/Web旧；并解释owner、下一步/触发、原句修正。负责人转贴的回复明确写“情形1符合文档”“情形2双authority禁止”“情形3是IG-09同gate一致性问题”，并给出旧OFF→baseline→新ON及Web同步的理由，故关闭原问题。此为原样本的定向复核，不是新的独立首答；本记录不声称已审计主持人是否另行提供了评分答案。
+
+GLM 定向提示使用聚合30、人工分配18/12、管理员确认、后续同范围订单14/16，并询问唯一映射及仅改配置是否足够。回复已明确“管理员权限不改变结论”，但又把“B 已真实下架”作为唯一映射的例子，声称变化只对“未来观察”生效。这遗漏了未来采集仍可能覆盖整日历史：B下架前成交仍在当日累计内。G-1 未关闭的正是原粒度问题的直接延续，不另开新的全项目问题集。
+
+### 内容与环境分别判断
+
+| 样本 | 内容审查 | 已披露环境及证据用途 |
+|---|---|---|
+| DeepSeek / Claude Code | 首答+定向复核 PASS，D-1 CLOSED | 声明固定SHA/八文件、无历史注入；未披露反证，可由负责人结合实际启动过程接受为正式样本；本报告不替负责人作最终接受 |
+| Luna / Codex | 首答 FAIL，未收到复核 | 明确披露“当前会话包含上一轮同步提交的对话和环境注入的项目指令”；不能作为严格独立冷启动通过证据 |
+| GLM / Zcode | G-1 部分解决，尚不能无条件PASS | 明确披露启动时收到旧临时AGENTS，再git show正式版；文件版本正确不消除已注入上下文。其补答是有限复核，不变成纯冷启动 |
+
+不要求三者全部通过。DeepSeek已关闭的问题不因GLM未通过而重新打开；模型未答对也不等于13.7必须新增某个控制结构。负责人如选择足够可信的样本，可据其首答和必要复核作正式验收；本次用户要求完善文档，并未表示已正式接受Overall。
+
+### 本轮 Canonical 修订与复杂度
+
+- 业务合同 §6.2：累计接管须核对截至时点/范围；22→25不自动成为冲突、人工核对任务或精确区间销量。
+- §6.3：唯一映射覆盖完整累计范围；新增30→下架B→32的反例；区分人工判断、可验证人工证据、聚合事实、SKU归属与执行UNKNOWN；保留原始证据不禁止按新证据修正派生解释。
+- §8 / Scenario E：明确调整后净变化R与候选消耗Q的相反符号、实际调整与目标值、其他非销售变化及UNKNOWN分支。
+- 目标矩阵 §5 / §6：合法shadow、双authority、Web未切读分列；明确切换触发和责任；纯改价首切片不无条件捆绑后续Exposure改造。
+- 正式AGENTS、治理、计划、状态与索引：落实负责人主持；正式版先实际生效再启动新会话；预检/样本内容/环境独立性/正式接受分开，保留有限复核和停止规则。
+
+共修改8个既有Markdown文件，不新增主文档或生产表/字段/状态机/锁/Service/daemon，不修改生产代码、Schema、tests或运行配置。当前实现图及正式AGENTS的原样历史归档均不改。唯一映射的说明不批准合并SKU、下架商品或新增人工拆分功能。
+
+### 新版验证与下一步
+
+本轮文档静态检查及远端Head核对结果在PR正文记录；CI等待本修订提交触发后按新SHA读取，旧CI不替代新结果。不为记录自身提交SHA反复生成补证提交。新受测快照固定为PR正文登记的修订Head，正式AGENTS须来自同一快照。
+
+本轮尚未运行新版独立cold-start或用户定向复核，不以作者按已知案例推演冒充。有限复核材料见[计划“测试反馈后的定向复核”](../plans/task13_6_3_canonical_entrypoint_convergence.md)。按B/D及直接受影响的A覆盖，不重跑已通过G1/G2，不要求所有模型重答。
+
+- Documentation Implementation：修订已写入，编码/路径/diff/数值检查及新Head CI结果见PR；不等于模型理解已通过。
+- Answer Review：D-1 CLOSED；G-1 PARTIALLY RESOLVED；L-1～L-3未收到复核，不因文档修正自动关闭。
+- Formal Cold-start / Task 13.6-3 / Overall Stage Goal：NOT YET VALIDATED，Owner Final Confirmation尚未给出。
+- Task 13.7 Readiness：NOT READY；PR仍Draft，未执行合并或平台操作。

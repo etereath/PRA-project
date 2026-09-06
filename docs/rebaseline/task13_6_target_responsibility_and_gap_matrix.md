@@ -91,7 +91,15 @@ Closing 需要 quantity、amount、order_created_at、purchase_sequence 及品�
 
 ## 5. Authority cutover 与回滚
 
+| 场景 | 判定与当前责任 |
+|---|---|
+| 旧链独占扣减/计划 authority；新链仅 shadow/read-only；Web 当前页面读旧链 | 合法的切换前状态，符合 IG-04；现有旧链保持经营责任，新链由 13.7 实施者比对和验收。不能把“新事实已能算”当成已启用新 authority |
+| 新旧链同时扣减或生成正式计划 | 违反 IG-04，必须停止 authority 重叠；选择保留哪条链须依据实际切换状态与证据，不能用切 Web 读源掩盖双写 |
+| 新链已是唯一经营 authority，但 Web 当前销售仍用旧 Summary | 违反 IG-09，属于切换不完整；旧 Summary 可作历史展示，不能继续充当当前销售事实 |
+
 顺序：新事实 shadow/read-only → 比对证据/输出并通过相关能力验收 → 停止旧 Settlement 业务 authority 与相关 Job 写路径 → baseline/migration 对齐 → 启用新 authority 并同 gate 切换 Web 当前读模型 → 验证跨日、重启、blocker、UNKNOWN、外部人工漂移 → 再考虑物理清理。
+
+相关切换由 13.7 实施者负责，触发条件是实现、相关能力验收与 IG-05 的无重复扣减证明成立；13.6 文档通过本身不触发运行切换。切换后当前经营事实与 Web 读模型的责任一起交接，不能留成“后台以后更新、页面继续旧数”的非终态。
 
 IG-05 的库存记账事件选择是明确保留给 13.7 的实现契约；未裁决和证明 no-double-count 前不得切换相关实物扣减接线。Closing 成功本身不是扣实物理由。回滚可切 read path/Job/selector，但不删除 observation、Closing、Intent/Task/execution、旧 Summary/transaction 证据，也不重新同时启用两套 authority。
 
@@ -100,6 +108,8 @@ IG-05 的库存记账事件选择是明确保留给 13.7 的实现契约；未�
 第一条纵切：1 SKU + 一次人工 UPDATE_PRICE，从 Intent/Task、Human Authorization、durable handoff，经既有 v4/Queue/Worker/Importer 到 terminal 与平台回读；至少覆盖 final-confirmation crash 或 restart/blocked recovery。若既有 Watchdog/Importer 已完整处理某段，Coordinator 只持久发现和投影，不复制其逻辑。
 
 随后按依赖扩展 Exposure、先复用 rollover 后订单 Provider 的 Commitment、冻结期 Provider、Closing、Supply、Observation Health。存在 authority 重叠的路径先 shadow，验收后显式 cutover；不能因“旧链最后退役”让两套 authority 同时经营。Web 随切片接入，不最后才第一次联调。
+
+两处 Exposure/实物上限校验在相关 Exposure 行为受本切片影响时调整；不因它们是已知 gap，就要求纯 UPDATE_PRICE 首条纵切无条件同时完成 Exposure 改造。也不为所有 13.7 开发前置要求完成后续 Provider 或库存 cutover 的全部门槛。
 
 G2 未批准固定新增表集合、独立 Dispatch 状态机、Commitment 必须 snapshot 表、Closing 维护只能 generation 重扫、全面废除 sales-driven accounting，或按横向 Package A→G 逐个写完才集成。
 

@@ -1,2 +1,0 @@
-"""PRA MVP package."""
-

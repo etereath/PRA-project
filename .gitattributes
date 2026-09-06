@@ -1,7 +1,0 @@
-docs/evidence/task12/**/*.json text eol=lf
-docs/evidence/task12/index.md text eol=lf
-docs/evidence/task13/**/*.json text eol=lf
-docs/evidence/task13/**/*.md text eol=lf
-docs/evidence/task13/**/product_identity_mapping.json binary !eol
-shadowbot/test2/product_identity_mapping.json binary !eol
-data/samples/platform_mappings.immutable.json binary !eol

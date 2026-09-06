@@ -30,7 +30,7 @@
 ## 当前任务与验证证据
 
 - [13.6-3 计划](plans/task13_6_3_canonical_entrypoint_convergence.md)
-- [13.6-3 验收记录与独立冷启动原始问答](reports/task13_6_3_canonical_entrypoint_and_cold_start_20260906.md)
+- [13.6-3 历史预检原始问答、外部测试反馈与修订记录](reports/task13_6_3_canonical_entrypoint_and_cold_start_20260906.md)：证据材料，不是冷启动受测阅读集；旧版本结果不自动覆盖修订后的文档，正式验收由负责人主持
 - [G1 Gate](reports/task13_6_1_g1_business_baseline_review_20260906.md)
 - [G2 Gate](reports/task13_6_2_g2_architecture_handoff_review_20260906.md)、[增量 G2 Gate](reports/task13_6_2_g2_incremental_parallel_absorption_review_20260906.md)
 - [文档迁移与来源映射](rebaseline/task13_6_document_authority_inventory.md)

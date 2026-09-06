@@ -8,7 +8,7 @@
 | Task 13.6-0 | PASS | PR #42 已合并 |
 | Task 13.6-1 / G1 | PASS | PR #43 已合并；OD-01～OD-06 已关闭 |
 | Task 13.6-2 / G2 与增量吸收 | PASS | PR #45 已合并；不是待合并任务 |
-| Task 13.6-3 | AWAITING OWNER CONFIRMATION | 文档/正式 AGENTS/独立 cold-start 已交付；最终阶段确认待负责人 |
+| Task 13.6-3 | IN PROGRESS / OWNER VALIDATION PENDING | 已吸收三份作答及复核反馈修订文档；新版定向复核及正式接受由负责人主持 |
 | Task 13.6 Overall | NOT YET VALIDATED | 最终 AGENTS、独立 cold-start、负责人最终确认全部通过后才能 PASS |
 | Task 13.7 Readiness | NOT READY | 不开始生产功能开发 |
 
@@ -20,15 +20,17 @@
 
 ## 13.6-3 验收
 
-- Canonical entrypoint convergence：PASS（文档范围）。
+- Canonical entrypoint convergence：已完成入口收口；本轮局部语义澄清已写入，文档检查与受测结果分开记录。
 - 正式 AGENTS：YES，已审查并在本 PR 分支实际生效；临时版原样归档。
-- Independent cold-start：PASS，五组完整情景，输入提交 `a7bf4aa2919a0462c62d52046e6e3f9c6cde22c5`；完整原始问答见报告。
+- 实施者独立 AI 预检：历史 PASS，五组完整情景，输入提交 `a7bf4aa2919a0462c62d52046e6e3f9c6cde22c5`；原始问答保留，不代替负责人正式验收。
+- 负责人提供的外部样本：输入 `0de43bf78f8c61847e6406c3b74dc1fbc7995f32`。DeepSeek 首答+定向复核的内容审查 PASS，D-1 CLOSED；GLM G-1 部分解决，累计范围/唯一映射仍未通过；Luna 首答有计算/状态语义错误，未收到复核。各环境限制与摘录见报告。
+- 正式 Cold-start Validation：NOT YET VALIDATED。新版 Exposure 计算、粒度/映射、authority 说明及 AGENTS 验收身份已经改动；旧样本不能直接证明新版通过。由负责人固定包含修订的 SHA，按计划进行有限复核并作正式判定，不要求全部模型 PASS。
 - Owner final confirmation：NOT YET CONFIRMED。
-- PR CI：文档语义提交 `a7bf4aa` 的 Windows/Linux [Core CI 已通过](https://github.com/etereath/PRA-project/actions/runs/34023342547)。后续仅补验收证据/状态链接；最终 head 的检查见 PR #46，不以历史 CI 冒充最终 head。
+- PR CI：旧语义提交 `a7bf4aa` 的 Windows/Linux [Core CI 已通过](https://github.com/etereath/PRA-project/actions/runs/34023342547)，旧补证提交 `0de43bf` 的 [Core CI 也已通过](https://github.com/etereath/PRA-project/actions/runs/34023796458)。本轮包含语义修改；新的 Head、差异与 CI 回读记录在 [PR #46](https://github.com/etereath/PRA-project/pull/46)，不沿用旧结果。
 
 计划：[Task 13.6-3](plans/task13_6_3_canonical_entrypoint_convergence.md)。[本次验收记录与原始问答](reports/task13_6_3_canonical_entrypoint_and_cold_start_20260906.md)。13.6 PASS 只代表认知/文档/交接通过，不代表 13.7 功能完成、现场部署或真实平台写授权。
 
-剩余动作由项目负责人负责：确认最终 Canonical 文档及本次情景结果准确承接真实经营和 13.7 边界。收到明确确认并核验剩余 Gate 后，再记录 Task 13.6-3 / Overall PASS、13.7 READY。当前授权不包含合并，PR 保持 Draft。
+剩余动作由项目负责人负责：主持修订语义的有限复核，结合独立样本及环境披露确认最终 Canonical 文档、情景结果和 13.7 边界。实施者提供材料与核对结果，不代替正式接受。收到明确确认并核验剩余 Gate 后，再记录 Task 13.6-3 / Overall PASS、13.7 READY。当前授权不包含合并，PR 保持 Draft。
 
 历史证据：[G1](reports/task13_6_1_g1_business_baseline_review_20260906.md)、[G2](reports/task13_6_2_g2_architecture_handoff_review_20260906.md)、[增量 G2](reports/task13_6_2_g2_incremental_parallel_absorption_review_20260906.md)。旧报告中的“next 13.6-2 / merge #45”只代表当时状态。
 
