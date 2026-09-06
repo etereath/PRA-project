@@ -29,6 +29,7 @@ def _repository(tmp_path: Path) -> SQLiteRuntimeRepository:
 def _downgrade_to_v16(repository: SQLiteRuntimeRepository) -> None:
     with closing(repository.connect_write()) as connection, connection:
         for table_name in (
+            "execution_continuations",
             "inventory_alert_policies",
             "inventory_sales_baselines",
             "inventory_transactions",
@@ -37,7 +38,7 @@ def _downgrade_to_v16(repository: SQLiteRuntimeRepository) -> None:
         ):
             connection.execute(f"DROP TABLE {table_name}")
         connection.execute(
-            "DELETE FROM runtime_schema_migrations WHERE schema_version = 17"
+            "DELETE FROM runtime_schema_migrations WHERE schema_version >= 17"
         )
 
 
@@ -46,8 +47,8 @@ def test_v17_new_database_has_explicit_pre_cutover_authority(
 ) -> None:
     repository = _repository(tmp_path)
 
-    assert LATEST_RUNTIME_SCHEMA_VERSION == 17
-    assert repository.schema_versions() == list(range(1, 18))
+    assert LATEST_RUNTIME_SCHEMA_VERSION >= 17
+    assert repository.schema_versions() == list(range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1))
     health = repository.check_schema_health()
     assert health.ok, health.summary
     with closing(repository.connect_read()) as connection:

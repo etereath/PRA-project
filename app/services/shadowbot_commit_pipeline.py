@@ -20,6 +20,7 @@ from app.services.shadowbot_commit_batch import (
     CONTRACT_VERSION,
     build_commit_manifest,
     build_commit_request,
+    compute_instruction_hash,
     load_identity_mapping,
     validate_request,
 )
@@ -157,8 +158,9 @@ def publish_task_commit_batch(
     window_title: str = "蚂蚁花团供应商",
     capture_evidence: bool = False,
     fault_injection: str = "",
+    authorization_batch_id: str = "",
 ) -> tuple[dict[str, Any], ShadowBotStartResult]:
-    """Publish one request. Production uses valid pending tasks as its authority."""
+    """Publish once; Web price decisions also require their durable authorization."""
 
     suffix = uuid4().hex[:16]
     request = build_commit_request(
@@ -179,6 +181,24 @@ def publish_task_commit_batch(
     now_value = datetime.fromisoformat(now)
     with closing(repository.connect_write()) as connection, connection:
         connection.execute("BEGIN IMMEDIATE")
+        authorization = connection.execute(
+            'SELECT * FROM execution_continuations WHERE batch_id = ?', (request['batch_id'],),
+        ).fetchone()
+        if authorization_batch_id or authorization is not None:
+            from app.repositories.execution_continuation_repository import digest_json
+            if (authorization is None or authorization['closed_at'] is not None
+                    or authorization_batch_id != request['batch_id']):
+                raise ValidationError('Durable authorization is absent or closed')
+            envelope = json.loads(authorization['envelope_json'])
+            if (digest_json(envelope) != authorization['envelope_sha256']
+                    or envelope['manifest']['manifest_sha256'] != request['manifest_sha256']
+                    or envelope['context']['execution_profile'] != execution_profile
+                    or envelope['context']['applet_uri_sha256'] != digest_json(applet_uri)
+                    or sorted(envelope['task_ids']) != sorted(i['source_task_id'] for i in request['items'])):
+                raise ValidationError('Durable authorization does not match publication')
+            request['expires_at'] = min(request['expires_at'], envelope['expires_at'])
+            request['instruction_hash'] = compute_instruction_hash(request)
+            validate_request(request)
         assert_selected_tasks_have_dispatch_priority(
             connection,
             selected_task_ids=[
@@ -210,7 +230,7 @@ def publish_task_commit_batch(
             task = connection.execute(
                 """
                 SELECT task_status, action_type, internal_sku, platform_name,
-                       expected_old_price, target_price, expires_at
+                       expected_old_price, target_price, expires_at, decision_trace_json
                 FROM tasks WHERE task_id = ?
                 """,
                 (item["source_task_id"],),
@@ -236,6 +256,11 @@ def publish_task_commit_batch(
                 or not _same_price(task["target_price"], item["target_price"])
             ):
                 raise ValidationError(f"任务在发布前已变化：{item['source_task_id']}")
+            trace = json.loads(task['decision_trace_json'] or '{}')
+            from app.services.price_decisions import unresolved_predecessors
+            if (trace.get('price_decision_version') and not authorization_batch_id
+                    or unresolved_predecessors(connection, item['source_task_id'])):
+                raise ValidationError('Price decision requires final authorization and settled predecessors')
             active_lock = connection.execute(
                 """
                 SELECT operation_id, item_execution_attempt_id, status
@@ -743,19 +768,28 @@ def import_task_commit_result(
                     """
                     UPDATE listing_status
                     SET internal_sku = ?, current_price = ?, source = 'shadowbot_commit_v4',
-                        updated_at = ?
+                        updated_at = ?, price_source = 'shadowbot_commit_v4',
+                        price_observed_at = ?, price_source_attempt_id = ?
                     WHERE platform_name = ? AND variety = ? AND grade = ?
+                      AND (price_observed_at IS NULL OR
+                           julianday(price_observed_at) <= julianday(?))
                     """,
                     (
                         item["internal_sku"],
                         item["actual_price"],
                         item["readback_observed_at"],
+                        item["readback_observed_at"],
+                        item["item_execution_attempt_id"],
                         identity[0],
                         identity[1],
                         identity[2],
+                        item["readback_observed_at"],
                     ),
                 )
-                if cursor.rowcount != 1:
+                if cursor.rowcount != 1 and connection.execute(
+                    'SELECT 1 FROM listing_status WHERE platform_name = ? AND variety = ? AND grade = ?',
+                    identity,
+                ).fetchone() is None:
                     raise ValidationError(f"平台状态身份不存在或不唯一：{task_id}")
         for observation in plan.listing_observations:
             _apply_listing_observation(connection, observation)
@@ -1129,7 +1163,8 @@ def _apply_listing_observation(connection: Any, observation: dict[str, Any]) -> 
     existing = connection.execute(
         """
         SELECT listing_status_id, current_price, online_status,
-               inventory_observed_at, inventory_source_attempt_id
+               inventory_observed_at, inventory_source_attempt_id,
+               price_source, price_observed_at, price_source_attempt_id
         FROM listing_status
         WHERE platform_name = ? AND variety = ? AND grade = ?
         """,
@@ -1144,7 +1179,13 @@ def _apply_listing_observation(connection: Any, observation: dict[str, Any]) -> 
             not in {"", observation["execution_attempt_id"]}
         ):
             return
-    if observation["preserve_existing_price"]:
+    existing_price_time = (_optional_observation_time(existing['price_observed_at'], 'price_observed_at')
+                           if existing is not None else None)
+    preserve_price = observation['preserve_existing_price'] or (
+        existing_price_time is not None
+        and datetime.fromisoformat(existing_price_time) > observation['observed_at']
+    )
+    if preserve_price:
         if existing is None:
             raise ValidationError("UNKNOWN 页面价格没有可保留的状态记录。")
         observed_price = str(existing["current_price"])
@@ -1162,8 +1203,8 @@ def _apply_listing_observation(connection: Any, observation: dict[str, Any]) -> 
             listing_status_id, platform_name, internal_sku, variety, grade,
             current_price, platform_stock_qty, sold_qty, online_status,
             source, updated_at, inventory_source, inventory_observed_at,
-            inventory_source_attempt_id
-        ) VALUES (?, ?, '', ?, ?, ?, ?, 0, ?, ?, ?, 'shadowbot', ?, ?)
+            inventory_source_attempt_id, price_source, price_observed_at, price_source_attempt_id
+        ) VALUES (?, ?, '', ?, ?, ?, ?, 0, ?, ?, ?, 'shadowbot', ?, ?, ?, ?, ?)
         ON CONFLICT(platform_name, variety, grade) DO UPDATE SET
             current_price = excluded.current_price,
             platform_stock_qty = excluded.platform_stock_qty,
@@ -1172,6 +1213,9 @@ def _apply_listing_observation(connection: Any, observation: dict[str, Any]) -> 
             inventory_source = excluded.inventory_source,
             inventory_observed_at = excluded.inventory_observed_at,
             inventory_source_attempt_id = excluded.inventory_source_attempt_id,
+            price_source = excluded.price_source,
+            price_observed_at = excluded.price_observed_at,
+            price_source_attempt_id = excluded.price_source_attempt_id,
             updated_at = excluded.updated_at
         """,
         (
@@ -1186,6 +1230,9 @@ def _apply_listing_observation(connection: Any, observation: dict[str, Any]) -> 
             observed_text,
             observed_text,
             observation["execution_attempt_id"],
+            existing['price_source'] if preserve_price else 'shadowbot_commit_v4_page_snapshot',
+            existing['price_observed_at'] if preserve_price else observed_text,
+            existing['price_source_attempt_id'] if preserve_price else observation['execution_attempt_id'],
         ),
     )
 

@@ -79,6 +79,7 @@ from app.runtime_schema import (
     inspect_runtime_schema,
 )
 from app.utils import serialize_decimal, utc_now
+from app.repositories.execution_continuation_repository import SCHEMA_V18_SQL
 
 TERMINAL_TASK_STATUSES = ("success", "skipped", "cancelled", "expired")
 
@@ -3304,12 +3305,16 @@ class SQLiteRuntimeRepository:
             requires_v15_migration = _requires_runtime_schema_v15_migration(connection)
             requires_v16_migration = _requires_runtime_schema_v16_migration(connection)
             requires_v17_migration = _requires_runtime_schema_v17_migration(connection)
+            requires_v18_migration = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'execution_continuations'"
+            ).fetchone() is None
             requires_runtime_migration = (
                 requires_v13_migration
                 or requires_v14_migration
                 or requires_v15_migration
                 or requires_v16_migration
                 or requires_v17_migration
+                or requires_v18_migration
             )
             if requires_v13_migration or requires_v15_migration:
                 connection.execute("PRAGMA foreign_keys = OFF")
@@ -3402,6 +3407,7 @@ class SQLiteRuntimeRepository:
                     15: "incident occurrence counts and append-only incident events",
                     16: "versioned emergency offline policies for shadow evaluation",
                     17: "authoritative real inventory balances, immutable ledger, sales baselines, and alert policies",
+                    18: "durable v4 execution authorization continuation",
                 }
                 for statement in SCHEMA_V6_SQL:
                     connection.execute(statement)
@@ -3504,6 +3510,8 @@ class SQLiteRuntimeRepository:
                 for statement in SCHEMA_V16_SQL:
                     connection.execute(statement)
                 for statement in SCHEMA_V17_SQL:
+                    connection.execute(statement)
+                for statement in SCHEMA_V18_SQL:
                     connection.execute(statement)
                 now_text = _datetime_to_text(datetime.now())
                 connection.execute(
@@ -3710,6 +3718,8 @@ class SQLiteRuntimeRepository:
         current_price: Decimal,
         source: str,
         updated_at: datetime,
+        price_observed_at: datetime | None = None,
+        price_source_attempt_id: str = '',
     ) -> bool:
         normalized_price = Decimal(str(current_price))
         if not normalized_price.is_finite() or normalized_price < 0:
@@ -3720,24 +3730,33 @@ class SQLiteRuntimeRepository:
             platform_name, variety, grade
         )
 
+        if (price_observed_at is None) != (not price_source_attempt_id):
+            raise ValueError('Price observation requires both timestamp and attempt identity')
+
         def operation() -> bool:
             with closing(self.connection_factory.connect_write()) as connection:
                 cursor = connection.execute(
                     """
                     UPDATE listing_status
                     SET current_price = ?, source = ?, updated_at = ?,
-                        price_source = ?, price_observed_at = NULL,
-                        price_source_attempt_id = ''
+                        price_source = ?, price_observed_at = ?,
+                        price_source_attempt_id = ?
                     WHERE platform_name = ? AND variety = ? AND grade = ?
+                      AND (? IS NULL OR price_observed_at IS NULL
+                           OR julianday(price_observed_at) <= julianday(?))
                     """,
                     (
                         serialize_decimal(normalized_price),
                         source,
                         _datetime_to_text(updated_at),
                         source,
+                        _datetime_to_text(price_observed_at),
+                        price_source_attempt_id,
                         platform_name,
                         variety,
                         grade,
+                        _datetime_to_text(price_observed_at),
+                        _datetime_to_text(price_observed_at),
                     ),
                 )
                 connection.commit()

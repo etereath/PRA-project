@@ -1166,7 +1166,9 @@ class ShadowBotExecutor:
         operation: ShadowBotOperationLedger,
         result: ShadowBotResultContract,
     ) -> None:
-        if result.business_operation_completed is not True:
+        if result.business_operation_completed is not True and not (
+            result.execution_mode == EXECUTION_MODE_RECONCILE and result.status == STATUS_NOT_APPLIED
+        ):
             return
         variety = str(
             operation.product_identity.get("expected_product_name")
@@ -1182,13 +1184,17 @@ class ShadowBotExecutor:
         ).strip()
         if not variety or not grade:
             return
-        raw_price = result.raw_output.get("actual_price") or result.raw_output.get("verified_price")
+        raw_price = result.raw_output.get("actual_price")
+        if raw_price in (None, ""):
+            raw_price = result.raw_output.get("verified_price")
+        if raw_price in (None, "") and result.execution_mode == EXECUTION_MODE_RECONCILE:
+            return
         try:
             current_price = Decimal(str(raw_price)) if raw_price not in (None, "") else operation.target_price
             if not current_price.is_finite() or current_price < 0:
-                current_price = operation.target_price
+                return
         except (InvalidOperation, TypeError, ValueError):
-            current_price = operation.target_price
+            return
         existing = self.repository.get_listing_status(operation.platform, variety, grade)
         if existing is None:
             return
@@ -1211,6 +1217,8 @@ class ShadowBotExecutor:
             current_price=current_price,
             source="shadowbot",
             updated_at=observed_at,
+            price_observed_at=observed_at if raw_price not in (None, '') else None,
+            price_source_attempt_id=result.execution_attempt_id if raw_price not in (None, '') else '',
         )
 
     def open_login_verification_handoff(self, phase_data: dict[str, Any]) -> str:

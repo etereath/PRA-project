@@ -255,6 +255,9 @@ class ManualTaskApplicationService:
                 )
                 for item in preview.included_items
             ]
+            from app.services.price_decisions import record_price_supersession
+
+            record_price_supersession(connection, tasks, subject=subject, now=current)
             SQLiteRuntimeRepository._validate_tasks_for_insert(tasks)
             inserted = SQLiteRuntimeRepository._insert_tasks_on_connection(connection, tasks)
             if inserted != len(tasks):
@@ -279,6 +282,42 @@ class ManualTaskApplicationService:
             preview_digest=preview.preview_digest,
             origin_ref_id=origin_ref_id,
         )
+
+    def cancel_price_decisions(self, task_ids, *, authenticated_subject: str, now=None) -> None:
+        subject = str(authenticated_subject or '').strip()
+        ids = tuple(dict.fromkeys(str(t).strip() for t in task_ids))
+        if not subject or not ids or len(ids) > MAX_MANUAL_TASK_ITEMS:
+            raise ManualTaskError('请选择需要取消的价格决定。')
+        current = _aware_utc(now or self.clock())
+        with closing(self.runtime.connect_write()) as connection, connection:
+            connection.execute('BEGIN IMMEDIATE')
+            for task_id in ids:
+                row = connection.execute('SELECT * FROM tasks WHERE task_id = ?', (task_id,)).fetchone()
+                if (row is None or row['origin_type'] != 'MANUAL'
+                        or not str(row['origin_ref_id']).startswith('web-manual:')
+                        or row['action_type'] != 'update_price'):
+                    raise ManualTaskError('只能取消尚未执行的人工价格决定。')
+                if row['task_status'] in {'cancelled', 'expired'}:
+                    continue
+                published = connection.execute(
+                    """SELECT 1 FROM shadowbot_commit_batch_items i
+                       JOIN shadowbot_commit_batches b ON b.batch_id = i.batch_id
+                       WHERE i.source_task_id = ? AND b.status <> 'PREPARED'
+                       UNION ALL SELECT 1 FROM shadowbot_operations
+                       WHERE task_id = ? AND status NOT IN ('PENDING', 'START_FAILED')""",
+                    (task_id, task_id),
+                ).fetchone()
+                if row['task_status'] != 'pending' or published:
+                    raise ManualTaskError('任务已进入执行或对账，必须先收口结果，不能取消。')
+                expired = row['expires_at'] and _aware_utc(datetime.fromisoformat(row['expires_at'])) <= current
+                status = 'expired' if expired else 'cancelled'
+                connection.execute('UPDATE tasks SET task_status = ?, updated_at = ? WHERE task_id = ?',
+                                   (status, current.isoformat(), task_id))
+                from app.services.price_decisions import close_price_authorizations
+                close_price_authorizations(connection, task_id, now=current)
+                connection.execute('INSERT INTO task_status_history VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                    ('CANCEL-' + task_id, task_id, 'pending', status, subject, current.isoformat(),
+                     'price_decision_cancelled', '{}'))
 
     def _preview_on_connection(
         self,
@@ -465,7 +504,7 @@ class ManualTaskApplicationService:
             elif balance is not None and target_inventory > balance.current_qty:
                 blockers.append("平台目标库存不能超过数据库库存。")
 
-        if (
+        if request.action not in {SET_PRICE, CHANGE_PRICE} and (
             product.internal_sku.upper(),
             normalize_mapping_text(platform_name),
         ) in open_identities:

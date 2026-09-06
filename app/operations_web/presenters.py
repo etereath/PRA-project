@@ -574,7 +574,7 @@ def _render_execution_controls(
         else ""
     )
     receipt_html = (
-        '<div class="state-banner state-ready"><strong>执行请求已发送</strong><p>可在当前任务和执行记录中查看进度。</p></div>'
+        '<div class="state-banner state-ready"><strong>执行授权已接受</strong><p>执行服务将继续推进。请在任务详情查看阻塞、结果及平台回读。</p></div>'
         if receipt
         else ""
     )
@@ -599,6 +599,7 @@ def _render_execution_controls(
         <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
         <input type="hidden" name="idempotency_key" value="{html(idempotency_key)}">
         <div class="choice-list">{checks}</div><button type="submit">预览执行影响</button>
+        <button type="submit" formaction="/management/tasks/cancel-price">取消所选未执行价格决定</button>
       </form>
     </div>
     """

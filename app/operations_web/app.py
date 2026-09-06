@@ -335,6 +335,11 @@ class OperationsWebApplication:
                 return self._method_not_allowed("POST")
             return self._manual_task_create(environ)
 
+        if path == '/management/tasks/cancel-price':
+            if method != 'POST':
+                return self._method_not_allowed('POST')
+            return self._cancel_price_decisions(environ)
+
         if path == "/management/executions/prepare":
             if method != "POST":
                 return self._method_not_allowed("POST")
@@ -947,6 +952,22 @@ class OperationsWebApplication:
             result.task_ids,
         )
         return self._management_redirect("task_receipt", token)
+
+    def _cancel_price_decisions(self, environ) -> Response:
+        session, form, denied = self._management_write_context(
+            environ, route='/management/tasks/cancel-price', capability=Capability.MANAGE_BUSINESS,
+        )
+        if denied is not None:
+            return denied
+        assert session is not None and session.principal is not None
+        try:
+            self.manual_tasks.cancel_price_decisions(self._many(form, 'task_ids'),
+                authenticated_subject=session.principal.subject)
+        except ManualTaskError as exc:
+            return self._control_error_redirect(session.principal.subject, 'execution_error', str(exc))
+        return Response.text('303 See Other', '', headers=[
+            ('Location', '/management#tasks'), ('Cache-Control', 'no-store'),
+        ])
 
     def _execution_prepare(self, environ) -> Response:
         session, form, denied = self._management_write_context(

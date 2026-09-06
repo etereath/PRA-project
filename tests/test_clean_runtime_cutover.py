@@ -287,7 +287,8 @@ def test_clean_v17_activation_and_immediate_rollback_are_verified(
         products_path=products,
         platform_mappings_path=mappings,
     )
-    assert verification["schema_version"] == 17
+    from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION
+    assert verification["schema_version"] == LATEST_RUNTIME_SCHEMA_VERSION
     assert verification["authority_mode"] == "DB_AUTHORITY"
     assert verification["sku_count"] == 2
     assert verification["inventory_total"] == 19
