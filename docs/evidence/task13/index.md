@@ -1,0 +1,48 @@
+# 任务13脱敏实机证据
+
+> 本索引由 `scripts/export_task13_sanitized_evidence.py` 自动生成；CI 分别使用 Task13 的 SYNC_STATUS、单商品往返、多商品成功、串行 UNKNOWN、UNKNOWN→RECONCILE（VERIFIED/NOT_APPLIED）、ALREADY_APPLIED 和批次预检零写校验器复算 v5 合同、request/result/phase/receipt/ACK 绑定、页面事实、0 写点击、数据库账本和计数恒等式。
+
+| 运行 ID | 批次 | 结果 | 上架中/待上架观察 | 快照项 | 数据库投影/异常 |
+|---|---|---|---:|---:|---:|
+| [ATTEMPT-T13-KEYBOARD-SYNC-20260725-04](ATTEMPT-T13-KEYBOARD-SYNC-20260725-04/validation_report.json) | `BATCH-T13-KEYBOARD-SYNC-20260725-04` | `VERIFIED` | 1/11 | 17 | 8/11 |
+| [ATTEMPT-T13-POST-OFFLINE-SYNC-20260726-01](ATTEMPT-T13-POST-OFFLINE-SYNC-20260726-01/validation_report.json) | `BATCH-T13-POST-OFFLINE-SYNC-20260726-01` | `VERIFIED` | 3/9 | 17 | 8/11 |
+| [ATTEMPT-T13-POST-PREFLIGHT-RESCAN-20260727-01](ATTEMPT-T13-POST-PREFLIGHT-RESCAN-20260727-01/validation_report.json) | `BATCH-T13-POST-PREFLIGHT-RESCAN-20260727-01` | `VERIFIED` | 2/10 | 17 | 9/10 |
+
+## 单商品状态往返
+
+| 证据包 | SKU | 上架批次 | 下架批次 | 后置快照 | 结果 |
+|---|---|---|---|---|---|
+| [ROUND-TRIP-AISHA-A-70-Z-20260726](ROUND-TRIP-AISHA-A-70-Z-20260726/validation_report.json) | `AISHA-A-70-Z` | `BATCH-T13-AISHA-A-SET-ONLINE-20260726-02` | `BATCH-T13-AISHA-A-SET-OFFLINE-20260726-04` | `SNAPSHOT-8f4cb3732a41a07f50c5a593` | `VERIFIED` |
+
+## 多商品正常上架与下架
+
+| 证据包 | SKU | 上架批次 | 下架批次 | 结果 |
+|---|---|---|---|---|
+| [MULTI-SUCCESS-AISHA-E-CAPPUCCINO-E-20260726](MULTI-SUCCESS-AISHA-E-CAPPUCCINO-E-20260726/validation_report.json) | `AISHA-E-45-Z, CAPPUCCINO-E-45-Z` | `BATCH-T13-OPTIMIZED-SET-ONLINE-20260726-02` | `BATCH-T13-OPTIMIZED-SET-OFFLINE-20260726-02` | `VERIFIED` |
+
+## 受控 UNKNOWN 与唯一自动对账
+
+| 证据包 | SKU | 批次 | COMMIT 运行 ID | RECONCILE 运行 ID | 最终结果 |
+|---|---|---|---|---|---|
+| [UNKNOWN-NOT-APPLIED-AISHA-B-60-Z-20260727](UNKNOWN-NOT-APPLIED-AISHA-B-60-Z-20260727/validation_report.json) | `AISHA-B-60-Z` | `BATCH-T13-UNKNOWN-NOT-APPLIED-20260727-01` | `ATTEMPT-T13-UNKNOWN-NOT-APPLIED-20260727-01` | `RECONCILE-bcd7f9f2293440cf2d38fef9` | `NOT_APPLIED` |
+| [UNKNOWN-RECONCILE-AISHA-B-60-Z-20260727](UNKNOWN-RECONCILE-AISHA-B-60-Z-20260727/validation_report.json) | `AISHA-B-60-Z` | `BATCH-T13-AUTO-RECONCILE-CONTROLLED-UNKNOWN-20260727-03` | `ATTEMPT-664d3064fd864dcc` | `RECONCILE-ab020713eb4633c24441f141` | `VERIFIED` |
+
+## 严格串行：成功、UNKNOWN、后续停止
+
+| 证据包 | 成功 SKU | UNKNOWN SKU | 未尝试 SKU | 批次 | 结果 |
+|---|---|---|---|---|---|
+| [SERIAL-UNKNOWN-AISHA-B-C-D-20260726](SERIAL-UNKNOWN-AISHA-B-C-D-20260726/validation_report.json) | `AISHA-C-55-Z` | `AISHA-D-50-Z` | `AISHA-B-60-Z` | `BATCH-T13-CONTROLLED-UNKNOWN-20260726-01` | `VERIFIED` |
+
+## 幂等 ALREADY_APPLIED
+
+| 证据包 | SKU | 批次 | 运行 ID | 写点击 | 结果 |
+|---|---|---|---|---:|---|
+| [ALREADY-APPLIED-AISHA-B-60-Z-20260727](ALREADY-APPLIED-AISHA-B-60-Z-20260727/validation_report.json) | `AISHA-B-60-Z` | `BATCH-T13-ALREADY-APPLIED-20260727-01` | `ATTEMPT-f2a0b9089ed84b7b` | 0 | `ALREADY_APPLIED` |
+
+## 批次预检不一致与整批零写
+
+| 证据包 | 正常 SKU | 不一致 SKU | 批次 | 运行 ID | 写点击 | 结果 |
+|---|---|---|---|---|---:|---|
+| [PREFLIGHT-ZERO-WRITE-AISHA-A-E-20260727](PREFLIGHT-ZERO-WRITE-AISHA-A-E-20260727/validation_report.json) | `AISHA-A-70-Z` | `AISHA-E-45-Z` | `BATCH-T13-PREFLIGHT-ZERO-WRITE-20260727-01` | `ATTEMPT-591f3a642e2b43f9` | 0 | `FAILED` |
+
+脱敏仅替换本机路径和 Worker 设备标识；商品身份、价格、库存、时间、批次/运行/快照 ID、页面位置、异常分类和数据库计数均保留。

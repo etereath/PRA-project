@@ -1,0 +1,201 @@
+{
+  "checks": [
+    {
+      "detail": "RECONCILE-57cc1892fb8d24961556",
+      "name": "attempt_exists",
+      "ok": true
+    },
+    {
+      "detail": "RECONCILE",
+      "name": "execution_mode_matches",
+      "ok": true
+    },
+    {
+      "detail": "2026-07-09 09:21:17.735661+00:00",
+      "name": "attempt_finished",
+      "ok": true
+    },
+    {
+      "detail": "sha256:a2377a55ecdbdc60a9bde4973eed0bf38d12b2d2925289adad3a98da58f81e5c",
+      "name": "instruction_hash_recorded",
+      "ok": true
+    },
+    {
+      "detail": "90d0a771b784a2f9164ecb7d4ba10a405141b70e8e2b1bf0ec0db94da6e8afc6",
+      "name": "request_sha256_recorded",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\inbox\\RECONCILE-57cc1892fb8d24961556.ready.json",
+      "name": "queue_request_path_recorded",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\archive\\RECONCILE-57cc1892fb8d24961556",
+      "name": "archive_directory_exists",
+      "ok": true
+    },
+    {
+      "detail": [
+        "D:\\PRA_Runtime\\shadowbot_queue\\archive\\RECONCILE-57cc1892fb8d24961556\\RECONCILE-57cc1892fb8d24961556.request.json"
+      ],
+      "name": "one_archived_request",
+      "ok": true
+    },
+    {
+      "detail": [
+        "D:\\PRA_Runtime\\shadowbot_queue\\archive\\RECONCILE-57cc1892fb8d24961556\\RECONCILE-57cc1892fb8d24961556.result.json"
+      ],
+      "name": "one_archived_result",
+      "ok": true
+    },
+    {
+      "detail": [
+        "D:\\PRA_Runtime\\shadowbot_queue\\archive\\RECONCILE-57cc1892fb8d24961556\\RECONCILE-57cc1892fb8d24961556.phase.json"
+      ],
+      "name": "one_archived_phase",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\archive\\RECONCILE-57cc1892fb8d24961556\\RECONCILE-57cc1892fb8d24961556.request.json",
+      "name": "request_checksum_valid",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\archive\\RECONCILE-57cc1892fb8d24961556\\RECONCILE-57cc1892fb8d24961556.result.json",
+      "name": "result_checksum_valid",
+      "ok": true
+    },
+    {
+      "detail": "90d0a771b784a2f9164ecb7d4ba10a405141b70e8e2b1bf0ec0db94da6e8afc6",
+      "name": "request_hash_matches_database",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "TASK-UNKNOWN-COMMIT-20260709-002",
+        "result": "TASK-UNKNOWN-COMMIT-20260709-002"
+      },
+      "name": "binding_task_id",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "OP-UNKNOWN-COMMIT-20260709-002",
+        "result": "OP-UNKNOWN-COMMIT-20260709-002"
+      },
+      "name": "binding_operation_id",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "RECONCILE-57cc1892fb8d24961556",
+        "result": "RECONCILE-57cc1892fb8d24961556"
+      },
+      "name": "binding_execution_attempt_id",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "RECONCILE",
+        "result": "RECONCILE"
+      },
+      "name": "binding_execution_mode",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "sha256:a2377a55ecdbdc60a9bde4973eed0bf38d12b2d2925289adad3a98da58f81e5c",
+        "result": "sha256:a2377a55ecdbdc60a9bde4973eed0bf38d12b2d2925289adad3a98da58f81e5c"
+      },
+      "name": "binding_instruction_hash",
+      "ok": true
+    },
+    {
+      "detail": "90d0a771b784a2f9164ecb7d4ba10a405141b70e8e2b1bf0ec0db94da6e8afc6",
+      "name": "result_request_hash_matches",
+      "ok": true
+    },
+    {
+      "detail": "RECONCILE",
+      "name": "result_mode_matches",
+      "ok": true
+    },
+    {
+      "detail": "VERIFIED",
+      "name": "result_status_accepted",
+      "ok": true
+    },
+    {
+      "detail": true,
+      "name": "technical_run_succeeded",
+      "ok": true
+    },
+    {
+      "detail": "RESULT_WRITTEN",
+      "name": "phase_result_written",
+      "ok": true
+    },
+    {
+      "detail": "LAPTOP-O9O76RQV",
+      "name": "phase_worker_recorded",
+      "ok": true
+    },
+    {
+      "detail": 1,
+      "name": "evidence_present",
+      "ok": true
+    },
+    {
+      "detail": "1d27ffc7efbbab91765acf383ee181821d163ff112c38b5b394e0d1f5c6ff0f5",
+      "name": "evidence_1_sha256",
+      "ok": true
+    },
+    {
+      "detail": "2026-07-09T17:20:17+08:00",
+      "name": "evidence_1_captured_at",
+      "ok": true
+    },
+    {
+      "detail": "SKIPPED",
+      "name": "evidence_1_upload_success",
+      "ok": false
+    },
+    {
+      "detail": false,
+      "name": "evidence_1_hash_verified",
+      "ok": false
+    },
+    {
+      "detail": ".",
+      "name": "evidence_1_storage_exists",
+      "ok": false
+    },
+    {
+      "detail": [],
+      "name": "no_active_queue_files",
+      "ok": true
+    },
+    {
+      "detail": [],
+      "name": "not_quarantined",
+      "ok": true
+    },
+    {
+      "detail": 2,
+      "name": "execution_log_written",
+      "ok": true
+    }
+  ],
+  "execution_attempt_id": "RECONCILE-57cc1892fb8d24961556",
+  "execution_mode": "RECONCILE",
+  "failed_checks": [
+    "evidence_1_upload_success",
+    "evidence_1_hash_verified",
+    "evidence_1_storage_exists"
+  ],
+  "ok": false,
+  "profile": "NORMAL",
+  "schema_version": "shadowbot-filequeue-acceptance-1.0",
+  "status": "VERIFIED"
+}

@@ -1,0 +1,11 @@
+{
+  "batch_id": "BATCH-T13-POST-OFFLINE-SYNC-20260726-01",
+  "execution_attempt_id": "ATTEMPT-T13-POST-OFFLINE-SYNC-20260726-01",
+  "report_path": "<REDACTED_PATH>/ATTEMPT-T13-POST-OFFLINE-SYNC-20260726-01.sync-report.md",
+  "result_file_sha256": "0758053c474e878f26025b90f47a5a320b2941adc83210348e3ff05f4c7c111c",
+  "result_id": "RESULT-8f4cb3732a41a07f50c5a593",
+  "schema_version": "shadowbot-listing-sync-import-ack-1.0",
+  "snapshot_id": "SNAPSHOT-8f4cb3732a41a07f50c5a593",
+  "status": "VERIFIED",
+  "written_at": "2026-07-25T20:40:47.466890+00:00"
+}

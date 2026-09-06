@@ -1,0 +1,10 @@
+{
+  "batch_id": "BATCH-T13-AISHA-A-SET-ONLINE-20260726-02",
+  "execution_attempt_id": "ATTEMPT-T13-AISHA-A-SET-ONLINE-20260726-02",
+  "report_path": "<REDACTED_PATH>/ATTEMPT-T13-AISHA-A-SET-ONLINE-20260726-02.listing-action-report.md",
+  "result_file_sha256": "c55a8ec18e047a636b43a234622d0cc8aad26fd68ac636be01e0d38a71bb705d",
+  "result_id": "RESULT-9967c86f5282e8b08fa194dc",
+  "schema_version": "shadowbot-listing-action-import-ack-1.0",
+  "status": "VERIFIED",
+  "written_at": "2026-07-25T19:13:07.170962+00:00"
+}

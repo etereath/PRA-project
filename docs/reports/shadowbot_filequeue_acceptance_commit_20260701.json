@@ -1,0 +1,249 @@
+{
+  "checks": [
+    {
+      "detail": "ATTEMPT-ACCEPT-COMMIT-94538902e3dd",
+      "name": "attempt_exists",
+      "ok": true
+    },
+    {
+      "detail": "COMMIT",
+      "name": "execution_mode_matches",
+      "ok": true
+    },
+    {
+      "detail": "2026-07-01 10:09:30.215978+00:00",
+      "name": "attempt_finished",
+      "ok": true
+    },
+    {
+      "detail": "sha256:c6838a6c0ac0c96be2b8cf11ffff6b0e016d68942794033551077c14470a2a26",
+      "name": "instruction_hash_recorded",
+      "ok": true
+    },
+    {
+      "detail": "3307db9f2f8f0f6e40a1d4a42ec13d1382aae236f309f8f857c70660009360bf",
+      "name": "request_sha256_recorded",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\inbox\\ATTEMPT-ACCEPT-COMMIT-94538902e3dd.ready.json",
+      "name": "queue_request_path_recorded",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-ACCEPT-COMMIT-94538902e3dd",
+      "name": "archive_directory_exists",
+      "ok": true
+    },
+    {
+      "detail": [
+        "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-ACCEPT-COMMIT-94538902e3dd\\ATTEMPT-ACCEPT-COMMIT-94538902e3dd.request.json"
+      ],
+      "name": "one_archived_request",
+      "ok": true
+    },
+    {
+      "detail": [
+        "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-ACCEPT-COMMIT-94538902e3dd\\ATTEMPT-ACCEPT-COMMIT-94538902e3dd.result.json"
+      ],
+      "name": "one_archived_result",
+      "ok": true
+    },
+    {
+      "detail": [
+        "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-ACCEPT-COMMIT-94538902e3dd\\ATTEMPT-ACCEPT-COMMIT-94538902e3dd.phase.json"
+      ],
+      "name": "one_archived_phase",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-ACCEPT-COMMIT-94538902e3dd\\ATTEMPT-ACCEPT-COMMIT-94538902e3dd.request.json",
+      "name": "request_checksum_valid",
+      "ok": true
+    },
+    {
+      "detail": "D:\\PRA_Runtime\\shadowbot_queue\\archive\\ATTEMPT-ACCEPT-COMMIT-94538902e3dd\\ATTEMPT-ACCEPT-COMMIT-94538902e3dd.result.json",
+      "name": "result_checksum_valid",
+      "ok": true
+    },
+    {
+      "detail": "3307db9f2f8f0f6e40a1d4a42ec13d1382aae236f309f8f857c70660009360bf",
+      "name": "request_hash_matches_database",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "TASK-ACCEPT-COMMIT-94538902e3dd",
+        "result": "TASK-ACCEPT-COMMIT-94538902e3dd"
+      },
+      "name": "binding_task_id",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "OP-ACCEPT-COMMIT-94538902e3dd",
+        "result": "OP-ACCEPT-COMMIT-94538902e3dd"
+      },
+      "name": "binding_operation_id",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "ATTEMPT-ACCEPT-COMMIT-94538902e3dd",
+        "result": "ATTEMPT-ACCEPT-COMMIT-94538902e3dd"
+      },
+      "name": "binding_execution_attempt_id",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "COMMIT",
+        "result": "COMMIT"
+      },
+      "name": "binding_execution_mode",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "sha256:c6838a6c0ac0c96be2b8cf11ffff6b0e016d68942794033551077c14470a2a26",
+        "result": "sha256:c6838a6c0ac0c96be2b8cf11ffff6b0e016d68942794033551077c14470a2a26"
+      },
+      "name": "binding_instruction_hash",
+      "ok": true
+    },
+    {
+      "detail": "3307db9f2f8f0f6e40a1d4a42ec13d1382aae236f309f8f857c70660009360bf",
+      "name": "result_request_hash_matches",
+      "ok": true
+    },
+    {
+      "detail": "COMMIT",
+      "name": "result_mode_matches",
+      "ok": true
+    },
+    {
+      "detail": "SUCCESS",
+      "name": "result_status_accepted",
+      "ok": true
+    },
+    {
+      "detail": true,
+      "name": "technical_run_succeeded",
+      "ok": true
+    },
+    {
+      "detail": true,
+      "name": "business_completed",
+      "ok": true
+    },
+    {
+      "detail": "VERIFIED",
+      "name": "side_effect_verified",
+      "ok": true
+    },
+    {
+      "detail": {
+        "request": "10.30",
+        "result": "10.30"
+      },
+      "name": "commit_actual_price_matches_target",
+      "ok": true
+    },
+    {
+      "detail": "RESULT_WRITTEN",
+      "name": "phase_result_written",
+      "ok": true
+    },
+    {
+      "detail": "LAPTOP-O9O76RQV",
+      "name": "phase_worker_recorded",
+      "ok": true
+    },
+    {
+      "detail": 2,
+      "name": "evidence_present",
+      "ok": true
+    },
+    {
+      "detail": "6b5abe90ec0a48b36141546bee5da8b35bc34c2ff5cb80fe5b96b4f8385019f3",
+      "name": "evidence_1_sha256",
+      "ok": true
+    },
+    {
+      "detail": "2026-07-01T18:08:47+08:00",
+      "name": "evidence_1_captured_at",
+      "ok": true
+    },
+    {
+      "detail": "SUCCESS",
+      "name": "evidence_1_upload_success",
+      "ok": true
+    },
+    {
+      "detail": true,
+      "name": "evidence_1_hash_verified",
+      "ok": true
+    },
+    {
+      "detail": "\\\\LAPTOP-O9O76RQV\\pra-evidence\\ATTEMPT-ACCEPT-COMMIT-94538902e3dd\\ATTEMPT-ACCEPT-COMMIT-94538902e3dd_before_submit.png",
+      "name": "evidence_1_storage_exists",
+      "ok": true
+    },
+    {
+      "detail": "6b5abe90ec0a48b36141546bee5da8b35bc34c2ff5cb80fe5b96b4f8385019f3",
+      "name": "evidence_1_storage_hash",
+      "ok": true
+    },
+    {
+      "detail": "930c09f4dd7fda05878b0a4bd207c97764395c14990ea488ab8366f56b633259",
+      "name": "evidence_2_sha256",
+      "ok": true
+    },
+    {
+      "detail": "2026-07-01T18:09:09+08:00",
+      "name": "evidence_2_captured_at",
+      "ok": true
+    },
+    {
+      "detail": "SUCCESS",
+      "name": "evidence_2_upload_success",
+      "ok": true
+    },
+    {
+      "detail": true,
+      "name": "evidence_2_hash_verified",
+      "ok": true
+    },
+    {
+      "detail": "\\\\LAPTOP-O9O76RQV\\pra-evidence\\ATTEMPT-ACCEPT-COMMIT-94538902e3dd\\ATTEMPT-ACCEPT-COMMIT-94538902e3dd_after_submit.png",
+      "name": "evidence_2_storage_exists",
+      "ok": true
+    },
+    {
+      "detail": "930c09f4dd7fda05878b0a4bd207c97764395c14990ea488ab8366f56b633259",
+      "name": "evidence_2_storage_hash",
+      "ok": true
+    },
+    {
+      "detail": [],
+      "name": "no_active_queue_files",
+      "ok": true
+    },
+    {
+      "detail": [],
+      "name": "not_quarantined",
+      "ok": true
+    },
+    {
+      "detail": 1,
+      "name": "execution_log_written",
+      "ok": true
+    }
+  ],
+  "execution_attempt_id": "ATTEMPT-ACCEPT-COMMIT-94538902e3dd",
+  "execution_mode": "COMMIT",
+  "failed_checks": [],
+  "ok": true,
+  "schema_version": "shadowbot-filequeue-acceptance-1.0",
+  "status": "SUCCESS"
+}

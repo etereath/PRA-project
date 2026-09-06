@@ -1,0 +1,60 @@
+{
+  "applet_launch_timeout_seconds": 90,
+  "applet_uri": "weixin://launchapplet/?app_id=wxdc8ef8e770254c0e",
+  "contract_version": 2,
+  "created_at": "2026-07-19T14:54:43.723755+00:00",
+  "element_timeout_seconds": 30,
+  "evidence_share_dir": "\\\\LAPTOP-O9O76RQV\\pra-evidence",
+  "execution_attempt_id": "ATTEMPT-T11-COVERAGE-R2-20260719-225443",
+  "execution_mode": "READ_ONLY",
+  "expires_at": "2026-07-19T15:14:43.723755+00:00",
+  "instruction_hash": "sha256:3b8ec37081dee27929ace7e732db6fcd77ae379a5851137619a1c40f41565c7f",
+  "limits": {
+    "max_pages": 20,
+    "max_scrolls": 100,
+    "max_seconds": 300
+  },
+  "operation_id": "READ-READ-BATCH-T11-COVERAGE-R2-20260719-225443",
+  "platform_name": "蚂蚁花团供应商",
+  "products": [
+    {
+      "expected_grade": "B级",
+      "expected_product_name": "卡布奇诺",
+      "item_id": "ITEM-CAPPUCCINO-B-COVERAGE-R2-20260719-225443",
+      "platform": "蚂蚁花团供应商",
+      "platform_sku": "SKU-CAPPUCCINO-B"
+    },
+    {
+      "expected_grade": "B级",
+      "expected_product_name": "艾莎",
+      "item_id": "ITEM-AISHA-B-COVERAGE-R2-20260719-225443",
+      "platform": "蚂蚁花团供应商",
+      "platform_sku": "SKU-AISHA-B"
+    },
+    {
+      "expected_grade": "C级",
+      "expected_product_name": "艾莎",
+      "item_id": "ITEM-AISHA-C-COVERAGE-R2-20260719-225443",
+      "platform": "蚂蚁花团供应商",
+      "platform_sku": "SKU-AISHA-C"
+    },
+    {
+      "expected_grade": "C级",
+      "expected_product_name": "卡布奇诺",
+      "item_id": "ITEM-CAPPUCCINO-C-COVERAGE-R2-20260719-225443",
+      "platform": "蚂蚁花团供应商",
+      "platform_sku": "SKU-CAPPUCCINO-C"
+    },
+    {
+      "expected_grade": "D级",
+      "expected_product_name": "艾莎",
+      "item_id": "ITEM-AISHA-D-COVERAGE-R2-20260719-225443",
+      "platform": "蚂蚁花团供应商",
+      "platform_sku": "SKU-AISHA-D"
+    }
+  ],
+  "read_batch_id": "READ-BATCH-T11-COVERAGE-R2-20260719-225443",
+  "schema_version": "shadowbot-request-2.0",
+  "task_id": "TASK-T11-COVERAGE-R2-20260719-225443",
+  "window_title": "蚂蚁花团供应商"
+}

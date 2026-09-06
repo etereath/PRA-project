@@ -1,0 +1,16 @@
+{
+  "action_type": "sync_status",
+  "batch_id": "BATCH-T13-POST-PREFLIGHT-RESCAN-20260727-01",
+  "contract_version": 5,
+  "detail_effect_state": "NOT_STARTED",
+  "execution_attempt_id": "ATTEMPT-T13-POST-PREFLIGHT-RESCAN-20260727-01",
+  "instruction_hash": "sha256:fa2d6d79f3b136733d0fc0c4afb3eff36a5f7f0ef313330acc58b3f6ec21b9f3",
+  "listing_effect_state": "NOT_STARTED",
+  "manifest_sha256": "sha256:10377d76df0a256b32e03c6f64a7769df4bdd431f85874ddb7e9d221d6193c08",
+  "phase": "RESULT_WRITTEN",
+  "phase_at": "2026-07-27T08:16:34.878864+00:00",
+  "phase_snapshot_sha256": "sha256:c55b79f1c8fb9d49406c152e1d8f797f96dab14006b5411d56be11e7db01174a",
+  "request_file_sha256": "sha256:57c8a18e83703012ac744ca7e63d0db2a17c140a13e3d005693555cee6dbe005",
+  "schema_version": "shadowbot-listing-action-batch-phase-1.0",
+  "worker_id": "<REDACTED_DEVICE>"
+}

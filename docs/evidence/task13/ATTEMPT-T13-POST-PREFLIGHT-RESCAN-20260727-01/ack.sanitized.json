@@ -1,0 +1,11 @@
+{
+  "batch_id": "BATCH-T13-POST-PREFLIGHT-RESCAN-20260727-01",
+  "execution_attempt_id": "ATTEMPT-T13-POST-PREFLIGHT-RESCAN-20260727-01",
+  "report_path": "<REDACTED_PATH>/ATTEMPT-T13-POST-PREFLIGHT-RESCAN-20260727-01.sync-report.md",
+  "result_file_sha256": "5016a15dadaca15aae1d5ca2c64d931b1d7b23444b256531b82f0cbcb21029a9",
+  "result_id": "RESULT-dfac7a5eb363ba8aa270e0e1",
+  "schema_version": "shadowbot-listing-sync-import-ack-1.0",
+  "snapshot_id": "SNAPSHOT-dfac7a5eb363ba8aa270e0e1",
+  "status": "VERIFIED",
+  "written_at": "2026-07-27T08:16:37.611899+00:00"
+}

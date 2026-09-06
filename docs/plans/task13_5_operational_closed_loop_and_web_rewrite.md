@@ -1,0 +1,991 @@
+# 任务 13.5：单平台运营自动化闭环与 Web 主控重写实施计划
+
+- 计划日期：2026-07-28；按父 Issue 合并正文修订于 2026-07-29；13.5-7 替代重写与
+  Agent 通道边界修订于 2026-08-07
+- 插入位置：任务 13 完成后、任务 14 开始前
+- 当前状态：13.5-0 已通过 PR #21 合并；13.5-1
+  [双时间轴、质量与日结合同](task13_5_1_quality_and_settlement_contract_review.md)
+  已冻结并完成本地 v14 实现与验收；13.5-2 已通过 PR #23 合并；13.5-3 独立
+  调度控制面见
+  [Automation Service 合同](task13_5_3_automation_service_contract.md)。
+  真实 Runtime DB 尚未迁移，真实扫描 handler 尚未部署
+- 适用对象：PRA Web 主控端、SQLite 运行态、自动化服务、ShadowBot 单平台执行端
+- 宏观权威：[GitHub Issue #20](https://github.com/etereath/PRA-project/issues/20)
+- 对齐评估：[Issue #20 与本地实施计划对齐评估](task13_5_issue20_alignment_review.md)
+- 核心原则：Issue #20 合并截至 2026-07-29 已采纳评论后的正文决定业务语义和阶段
+  边界；历史评论仅用于追溯。本计划负责本仓库中的模块、迁移、测试和 Web 落地
+- 开工基线：[13.5-0 基线冻结与正式开工清单](task13_5_0_kickoff_baseline.md)
+- Web 审计：[Web 现状独立审计快照](task13_5_web_current_state_audit_20260729.md)
+
+## 1. 任务背景
+
+任务 12 和任务 13 已经完成单平台多商品改价、上下架、状态扫描、结果导入、
+UNKNOWN 后唯一 RECONCILE、写锁和审计证据等核心动作闭环。但是，这些任务的目标
+主要是证明“动作可以安全、可审查地执行”，没有完整解决日常运营问题：
+
+- 一些能力通过独立脚本启动，缺少统一调度、运行状态、失败恢复和 Web 运维入口。
+- 为完成实机验收而临时补充的流程已经可用，但尚未统一成正式模块和稳定数据合同。
+- 商品扫描没有形成小扫描、完整扫描和交易日截单日结的自动运行制度。
+- 订单管理页面尚未纳入只读采集和销售事实沉淀，不能支持可靠的销售预测。
+- 自动规则产生的任务与运营人员人工创建的任务，在页面和运行责任上没有充分隔离。
+- 异常分散在任务、Review、Outbox、执行日志、队列文件和页面异常表中，运营人员缺少
+  一个统一的异常处置入口。
+- 当前 Web 页面沿开发过程持续叠加，信息架构、文案和操作路径偏开发者视角，不能满足
+  日常运营和故障值守需要。
+
+因此，任务 13.5 要把已有执行能力、主控端、数据库和运营界面整理成可持续运行的
+单平台业务闭环。普通真实写动作继续复用任务 12/13 的显式任务、授权、写锁和恢复链路；
+唯一新增的无人值守写动作是满足版本化 S4 策略、完整二次观察和禁止条件检查后的
+`SYSTEM_EMERGENCY` 紧急下架。任务 14 不再补做控制面，而是负责综合验收、正式授权和
+观察版本冻结。
+
+## 2. 目标和完成定义
+
+任务 13.5 完成后，系统应具备以下能力：
+
+1. 定时执行只读小扫描、完整扫描和交易日截单日结，且每次运行均可追踪、可重试、
+   可审计。
+2. 将商品状态、订单只读事实、销售汇总、异常和调度运行状态统一投影到 SQLite。
+3. 自动脚本任务与人工任务在来源、队列、页面、权限边界和指标上明确分离。
+4. 自动扫描和规则评估可以生成事实、建议、Review 或候选任务；调度器不得扫描全部
+   `pending` 并发布 COMMIT。只有通过版本化 S4 策略的 `SYSTEM_EMERGENCY` 可以在
+   二次观察后创建明确授权并复用 v5 执行紧急下架。
+5. Web 主控端按运营工作流重写，运营人员无需理解内部合同、phase、hash 或脚本名称
+   也能完成日常操作；技术细节保留在高级诊断页。
+6. 异常具备统一分类、严重度、责任人、处置状态、去重指纹、证据和恢复记录。
+7. 日结数据能够支持后续按品种、等级、时段、价格和库存约束进行销售预测。
+8. 具备进入后续观察所需的最小运行安全：单实例保护、错过任务补偿、运行超时、告警、
+   证据保留和可验证备份；完整长期运维收口留给任务 17。
+
+任务 13.5 的“完成”必须同时满足代码回归、Web 验收、数据库迁移验证、自动调度观察、
+只读实机证据和运维恢复演练。任何一项不能用另一项替代。
+
+## 3. 范围边界
+
+### 3.1 本任务包含
+
+- 蚂蚁花团供应商微信小程序的定时只读扫描编排。
+- “上架中”“待上架”和订单管理页面的只读采集。
+- 每 10 分钟 `ONLINE_PULSE`、每小时 `FULL_MARKET_SCAN`、18:00 边界扫描和 20:00 日结。
+- 平台交易日和卖家作业日双时间轴，以及跨边界逐条观察归属。
+- 自动化服务、调度记录、运行租约、幂等、补偿和失败恢复。
+- 自动任务与人工任务的来源和执行通道分离。
+- 统一异常中心和运营告警。
+- 销售事实、日结指标和预测特征准备。
+- Web 信息架构、运营文案、页面布局和交互流程重写。
+- 任务 12/13 现有脚本入口向正式服务入口的收口和兼容。
+- 进入任务 14/15 验收所需的日志、证据、最小备份、清理保护和操作说明。
+
+### 3.2 本任务不包含
+
+- 第二平台适配或跨平台混合批次。
+- 24 小时/7 天正式观察验收；由任务 15 承接。
+- 第二平台或预测影子运行；由任务 16 承接。
+- 完整运维看板、长期备份/保留策略、正式 Runbook 和项目收口；由任务 17 承接。
+- AI 自动决策、AI 自动定价或普通业务任务自动审批。
+- 除通过版本化 S4 紧急策略的 `SYSTEM_EMERGENCY` 外，无人值守发布改价、上架或下架。
+- 修改订单、确认发货、退款、支付、资金对账等订单写操作。
+- 客户姓名、电话、地址、聊天内容等个人信息采集。
+- 用订单页面的展示值直接替代财务结算数据。
+- 迁移 Excel 主数据到 SQLite。
+- 为了重写 Web 而重写任务 12/13 的动作合同、点击链路、写锁、Importer 或唯一
+  RECONCILE。
+- 第二套任务表、第二套执行账本或绕过现有 service/repository 的直接写库实现。
+- 完整企业级权限系统；本任务只补充满足运营和管理员分工的最小权限边界。
+
+### 3.3 复用优先工程门禁
+
+任务 13.5 的默认开发顺序是：原样复用 → 参数化复用 → 从成功链路抽取公共能力 →
+最后才允许新增实现。每个子任务编码前必须提交复用矩阵，列明既有入口、实机证据、
+本次最小差异、禁止重写点和确需新增项。
+
+平台专属 Adapter 可以新增页面入口、选择器、字段步长和解析器，但不得因此复制登录、
+窗口准备、列表物化、队列、租约、phase、Importer、Watchdog、写锁、终态或恢复语义。
+若既有入口无法参数化，必须先用只读证据证明不兼容，并记录替代方案比较和额外验收；
+没有评审结论不得进入 Ready for review。
+
+同一小程序宿主中的列表默认共享任务 12 已验证的“聚焦首项 → `END` → 尾部验证 →
+`HOME` → 首项恢复”控制流。单页数据、默认视口、未进入滚动分支的实机运行或 CI 通过
+不能替代该分支验收。
+
+### 3.4 与任务 14 的边界
+
+任务 13.5 完成控制服务、订单与商品观察、销售估算、日结、异常分级、紧急保护、脚本
+收口、任务来源对齐和 Web 产品化。任务 14 只负责：
+
+- 多品种、多动作和异常恢复的综合验收。
+- 普通写动作的正式授权与策略验收。
+- `SYSTEM_EMERGENCY` 策略的安全验收。
+- 观察版本冻结和交付判定。
+
+在任务 14 完成并审查前：
+
+- 定时只读扫描和历史订单页读取可以无人值守执行。
+- 自动规则可以生成 proposal、Review 或候选任务。
+- 普通真实写动作仍要求操作人员明确选择一个或多个 `task_id`。
+- `pending` 只表示候选状态，不代表执行授权；调度器不得批量发布。
+- S4 紧急下架必须逐项满足版本化策略、二次观察和禁止条件，创建
+  `SYSTEM_EMERGENCY` 授权及单一 `SET_OFFLINE` 任务；不得自动重新上架。
+- 副作用状态不明必须进入现有唯一 RECONCILE。
+
+## 4. 目标架构
+
+```text
+双时间轴与版本化调度配置
+        │
+        ▼
+Automation Scheduler ──► Automation Run Ledger
+        │                         │
+        ├── 小扫描（只读）        ├── 运行状态 / 心跳 / 租约 / 告警
+        ├── 完整扫描（只读）      └── 步骤结果 / 重试 / 证据
+        ├── 订单同步（只读）
+        ├── 18:00 边界扫描 / 20:00 日结
+        └── 规则评估
+                 │
+                 ▼
+        SQLite 运行态与经营事实
+                 │
+      ┌──────────┼──────────┐
+      ▼          ▼          ▼
+  任务中心    异常中心    销售分析
+  人工通道    统一处置    日结/预测特征
+  自动通道
+      │
+      ▼
+ 任务 14 综合验收与观察版本冻结
+      │
+      ▼
+已验收的 ShadowBot 写动作链路
+```
+
+### 4.1 服务职责
+
+建议将运行职责拆为以下长期模块：
+
+| 模块 | 职责 | 是否允许平台写操作 |
+| --- | --- | --- |
+| `automation-scheduler` | 交易日历、触发、单实例租约、错过任务补偿 | 否 |
+| `scan-worker` | 小扫描、完整扫描、订单管理页面只读采集 | 否 |
+| `rule-worker` | evaluator 的 dry-run/apply、proposal 和 Review 创建 | 否 |
+| `notification-worker` | Outbox 投递和失败重试 | 否 |
+| `shadowbot-queue-services` | 文件队列 Importer、Watchdog、唯一 RECONCILE | 仅复用既有边界 |
+| `command-executor` | 接收明确授权后的普通写任务或 `SYSTEM_EMERGENCY` | 是，必须有明确任务和授权 |
+| Web 主控端 | 配置、观察、人工处置和审计 | 不直接执行平台动作 |
+| 未来 Agent Gateway | 适配 Agent 查询和任务意图到权威 Query/Application Service | 否；不得直接入队或 COMMIT |
+
+Web 请求线程不得承担长期调度、循环扫描或 ShadowBot Worker 生命周期。CLI 保留为
+排障和手工补跑入口，但日常业务不再依赖操作人员打开终端执行脚本。
+
+项目长期调用关系固定为：人工运营走 Web，定时业务走 Automation，未来智能调用走
+Agent Gateway，平台执行走 Queue/Worker/Importer，开发测试与恢复走 CLI。Agent 不得
+抓取 Web、调用 CLI、直读 Runtime DB/Excel、拼 Queue JSON 或直连平台 Adapter；读取必须
+经 Agent Query Adapter 调用权威 Query Service/Read Model，写入只能经 Agent Task Adapter
+提交结构化 `AgentIntent`。既有权威 Application/Domain Service 与确定性规则决定拒绝、
+Review、Runtime Task 和 Outbox/通知；Agent 不得直接写 Review 或通知。这里的“Task
+Application Service”只是现有服务的逻辑统称，不授权新增万能服务。
+
+## 5. 自动扫描与日结流程
+
+### 5.1 交易日和时间配置
+
+所有业务时间使用 `Asia/Shanghai`，并同时保存两个日期：
+
+- 平台交易日：以 18:00 为边界，区间为前一自然日 18:00（含）至当前自然日
+  18:00（不含）。本地时间小于 18:00 时归当前自然日，大于等于 18:00 时归下一日期。
+- 卖家作业日：以 20:00 为边界，区间为前一自然日 20:00（含）至当前自然日
+  20:00（不含）。
+- `NORMAL_SALES`：20:00 至次日 16:00。
+- `PEAK_SALES`：16:00 至 18:00。
+- `DELIVERY_OVERLAP`：18:00 至 20:00。
+- `SETTLEMENT`：20:00 后运行的后台作业，不是排他的全局运营阶段。
+
+边界测试必须覆盖 17:59、18:00、19:59 和 20:00。跨边界扫描不能按批次起止时间整体
+归属日期，必须按每条记录的 `observed_at` 计算平台交易日和卖家作业日。核心边界采用
+版本化配置；修改必须保留操作者、策略版本、修改前后值、生效时间和回滚记录。
+
+### 5.2 小扫描
+
+`ONLINE_PULSE` 默认每 10 分钟执行一次，只扫描“上架中”商品，目标是快速发现：
+
+- 实际价格变化。
+- 平台库存变化。
+- 已映射目标本轮未观察到、重复身份或页面读取不完整。
+- 上次成功观察时间是否过旧。
+
+未观察到商品只表示 `NOT_OBSERVED / UNKNOWN` 或扫描异常，不能推断为待上架、下架或不存在。
+
+小扫描要求：
+
+- 使用独立 `scan_profile=ONLINE_PULSE`，不能伪装成完整 `SYNC_STATUS`。
+- 同一平台同一 profile 不允许并发重叠。
+- 扫描结果必须带父快照、页面范围、起止时间、完整性和证据绑定。
+- 小扫描只写入正向 `ONLINE` 观察；未出现商品不得改变完整 `listing_location`。
+- 只有完整两页 `LISTING_STATUS_SCAN` 可以更新完整位置事实。
+- 只在完整性门禁通过后更新本轮正向观察投影；失败快照保留，但不能覆盖最后一个可信快照。
+- 连续无变化可以保存摘要和内容哈希，避免重复保存大体积相同证据。
+
+### 5.3 完整扫描
+
+`FULL_MARKET_SCAN` 是通用平台父作业，默认每小时 `HH:10` 执行一次；`18:10`
+是 18:00 换日后的关键完整扫描：
+
+```text
+FULL_MARKET_SCAN
+├─ LISTING_STATUS_SCAN
+│  ├─ 上架中
+│  └─ 待上架
+└─ ORDER_SCAN
+   └─ ORDER_HISTORY_IMPORT
+```
+
+Adapter 必须显式声明：
+
+```text
+supports_order_scan
+supports_current_trade_day
+supports_historical_trade_day
+```
+
+当前蚂蚁花团平台为 `true / true / true`。
+
+完整扫描要求：
+
+- 使用 `scan_profile=FULL_MARKET_SCAN`。
+- `LISTING_STATUS_SCAN` 继续复用任务 13 正式 v5 `SYNC_STATUS` 的两页读取、身份匹配
+  和异常语义。
+- 订单页面采集必须使用独立合同和独立结果表，不能塞入商品状态结果。
+- 商品和订单子结果由同一父级 `automation_run_id` 关联，但 request/result、完整性、
+  结束标记、hash、Importer、错误码和数据质量均独立保存。
+- 子结果使用 `UNSUPPORTED / UNAVAILABLE / FAILED`：分别表示平台明确不支持、平台
+  支持但目标日期/范围当前不可用、能力应可用但本次运行失败；三者不得混写。
+- 一个子结果失败不能使另一个已满足合同并被接受的事实失效。
+- 页面结束标记、滚动轨迹、读取总数和去重结果必须可验证。
+- 若订单页面存在分页或时间筛选，必须记录实际查询时间窗和平台返回范围。
+
+### 5.4 边界扫描与日结
+
+- 18:00 前执行 `PRE_CUTOFF_FULL_SCAN` 商品边界扫描，18:00 后执行
+  `POST_CUTOFF_PULSE`，并在 18:10 执行关键 `FULL_MARKET_SCAN`；截单前父任务不派生
+  订单扫描。
+- 订单批次的起止时间若跨越 18:00，必须整批失败关闭；不得按逐项
+  `observed_at` 拆分后接受为完整订单事实。
+- 20:00 执行结算作业，生成 `PROVISIONAL` 平台交易日汇总和下一销售计划输入。
+- 历史订单观察到达后按
+  `PROVISIONAL → OBSERVED → RECONCILED → FINAL` 单向推进；只有 `FINAL` 是正式
+  终态。
+- FINAL 后出现迟到数据或修正时，创建新的汇总版本并以
+  `supersedes_summary_id` 指向旧版本，重新经过 OBSERVED、RECONCILED 和 FINAL；
+  不删除或静默覆盖旧事实。
+- 数据不完整时使用 `UNAVAILABLE` 或对应低质量等级并创建异常，不能输出“数据正常”。
+- 结算批次只能选择最新、已接受且完整的订单观察批次；不同扫描批次不能累加为订单数。
+
+## 6. 订单只读事实与销售预测数据
+
+### 6.1 数据最小化
+
+2026-07-31 首轮无副作用实测确认订单管理页可以读取当前交易日截至 `observed_at`
+的开放快照，也可以读取相邻历史交易日。能力合同必须明确记录：
+
+- `supports_order_scan=true`
+- `supports_current_trade_day=true`
+- `supports_historical_trade_day=true`
+
+系统必须把 `supports_current_trade_day` 与 `OPEN / CLOSED` 或等价终态分开：
+当前开放交易日结果只是截至观察时刻的快照，不能伪装成闭市完整订单或提前进入
+`FINAL`；可信“暂无订单”空页不得写成 `UNAVAILABLE`。每次读取写入不可变的
+`order_observation_batches` 和 `order_observation_items`。页面没有稳定订单 ID 或订单行
+ID 时，使用规范化行指纹、`occurrence_no` 和 `occurrence_count` 表示重复行多重集：
+
+- `source_row_fingerprint` 只用于候选分组和完整性校验，不是 canonical ID。
+- `occurrence_no` 表示同一批次中每条相同指纹记录的实例序号。
+- `occurrence_count` 表示同一批次按指纹分组的对账计数，可派生或固化。
+- 指纹不能作为绝对唯一主键，不能建立会吞掉真实重复行的唯一索引。
+- 跨批次只比较多重集合计数和内容差异，不把不同批次累加为销量。
+- 结算选择最新、已接受的完整批次；历史批次只用于审计、差异分析和修订证据。
+
+当前已冻结并实现的订单字段为：
+
+- 平台、平台交易日、平台商品名称和等级。
+- 内部 SKU 映射结果与映射状态；平台本身没有内部 SKU。
+- 准确的 `order_created_at`。
+- 页面展示的 `order_qty`。
+- 页面展示的 `order_transaction_amount`；它不是卖家实收、扣佣收入、退款净额或财务到账。
+- `observed_at`、来源批次、完整性和质量。
+
+页面可见“第 N 次购买”，可以在不保存买家身份或 PII 的前提下作为
+`purchase_sequence`。但 13.5-4 冻结后的 Worker、Importer 和 v14 正式表当前没有保存
+该字段；必须先完成受控元素定位、整数解析、原始观察/指纹合同、最小迁移和 READ_ONLY
+回归，之后才能汇总“首次购买订单数 / 复购订单数 / 复购订单占比”。完成前该指标固定为
+不可用，不得从重复指纹或订单数量推断。
+
+取消量只有在无副作用 UI 探索证明稳定方法后才能推导，并保存方法、输入和置信度。
+禁止持久化或声称采集平台订单 ID、订单行 ID、独立规格字段、商品累计销量、退款数量、
+支付状态、支付/完成时间，以及客户姓名、手机号、地址、聊天记录、付款账号等个人信息。
+
+### 6.2 日结核心指标
+
+销售事实必须把来源、质量和日结生命周期作为三个正交维度：
+
+```text
+fact_source:
+  ORDER_OBSERVED | SCAN_ESTIMATED
+
+quality_level:
+  ORDER_COMPLETE | ORDER_PARTIAL |
+  SCAN_ESTIMATED_HIGH | SCAN_ESTIMATED_MEDIUM |
+  SCAN_ESTIMATED_LOW | UNAVAILABLE
+
+summary_status:
+  PROVISIONAL -> OBSERVED -> RECONCILED -> FINAL
+```
+
+| `quality_level` | 进入条件 | 主要降级条件 | 日报 | 销售计划 | 规则输入 |
+| --- | --- | --- | --- | --- | --- |
+| `ORDER_COMPLETE` | 最新已接受批次覆盖目标交易日，字段、分页结束和映射满足合同 | 覆盖、字段、映射或分页不完整 | 正式订单事实 | 可以 | 只可分析或生成 proposal |
+| `ORDER_PARTIAL` | 存在真实订单行，但覆盖、字段或映射有明确缺口 | 批次不可接受或关键字段不可读 | 单列部分事实 | 不进入正式计划 | 不允许 |
+| `SCAN_ESTIMATED_HIGH` | 相邻完整观察、同一交易日、VERIFIED 映射、持续在线、库存可读且无已知调整 | 扫描间隔、价格区间或非关键支撑信息不确定 | 可用，必须标估算 | 可以 | 只可分析或生成 proposal |
+| `SCAN_ESTIMATED_MEDIUM` | 数量仍可解释，但存在可界定的时间或价格不确定 | 未解释库存变化、关键扫描缺失或映射问题 | 单列 | 降权使用 | 不允许自动写 |
+| `SCAN_ESTIMATED_LOW` | 只有方向性或宽区间估算 | 区间不再满足估算资格 | 低置信附注 | 不进入正式计划 | 不允许 |
+| `UNAVAILABLE` | 无可接受订单事实且无合格扫描估算，或能力不可用 | — | 不伪造 0 | 不允许 | 不允许 |
+
+任何质量等级都不能单独构成平台写授权。S4 依赖两次完整价格观察和独立版本化策略，
+不能把销售质量枚举当作价格与成本门禁。
+
+扫描估算使用：
+
+```text
+estimated_sold_qty =
+  max(inventory_before - inventory_after - known_inventory_adjustment, 0)
+```
+
+每个估算区间至少保存：
+
+```text
+interval_started_at
+interval_ended_at
+inventory_before
+inventory_after
+known_inventory_adjustment
+known_adjustment_source_refs
+mapping_version
+estimation_eligible
+estimation_reason
+confidence
+supporting_observation_ids
+```
+
+人工修改库存、上架重设库存、已知 `target_inventory` 或其他库存写入、无法解释的库存
+增加、期间离线、映射变化/不唯一、扫描不完整、价格或库存不可读，以及跨越 18:00
+且无法按逐项 `observed_at` 归属时，必须 `estimation_eligible=false`，并按需要降级
+质量或创建 Incident。
+
+平台结算继续按“平台交易日 × 平台 × 品种 × 等级 × 数据来源”统计销量、成交金额、
+成交单价、销售时段和数据质量，并服务订单对账与 FINAL。面向销售计划的汇总直接使用
+既有 `seller_operation_date`：卖家作业日 D 为 D-1 20:00（含）至 D 20:00（不含）。
+计划投影中的 `plan_for_seller_operation_date` 只是说明目标作业日，不是第三套日期。
+预测/计划层不得再把
+`platform_trade_date` 作为第二个分组日期。跨平台交易日的订单、价格、库存和上下架
+观察必须按逐项时间或已保存的作业日归属重新汇总。
+
+销售过程汇总至少包含销量、成交金额、成交单价、销售时段、首末销售时间、峰值份额、
+库存和价格轨迹、可售时长、异常影响和数据质量。
+不能从页面可靠得到订单数时不得输出伪造的订单数；可输出观察行数，但名称和口径必须
+明确。
+
+### 6.3 当前销售过程汇总与后续数据来源规划
+
+当前任务只实现平台销售过程中能够采集或由现有事实复算的汇总：
+
+- 10/30/60 分钟时间桶的销量与成交金额曲线。
+- 平台价格、成交单价、价格变化次数和观察持续时长，三者口径不得混用。
+- 上架状态、可销售时长、缺货开始时间和补货时间。
+- 期初/期末库存、已知库存调整、补货区间和库存约束标记。
+- 同品种不同等级之间的销量替代关系。
+- 订单到达间隔、销售峰值、峰值出现时间和峰值持续时长。
+- 16:00–18:00 高峰销售占比，以及计划生成前 18:00–20:00 的领先信号。
+- 当前在线商品、价格、库存、商品轨迹和可售时长。
+- 取消推导量、异常影响和后续订单观察修订量。
+- 商品映射质量、日结完整性、扫描覆盖率和字段质量分数。
+- 在 `purchase_sequence` 采集合同完成后汇总首次购买/复购订单数量和占比。
+
+以下只保留后续 Provider/数据源规划，不进入当前任务实现：
+
+- 采摘量、实际等级分布、包装、冷库流水和外部补采等线下经营事实；
+- 平台佣金和退款；
+- 由模型联网检索并保留来源/观察时间的节假日、天气和活动标签；
+- 今日花价指数、平台价格指数、特定品种外部价格/销量及其他市场行情。
+
+平台不会提供曝光、浏览、访客等口径，因此当前及规划均不得从订单和上架时长伪造
+曝光量或转化率。仅凭订单和可售时长计算的结果统一命名为“销售速度”。
+
+外部来源未来接入时必须使用 `seller_operation_date` 对齐，并保存 provider、来源引用、
+检索/观察时间和质量；外部自然日或平台交易日不能成为预测层的第二日期主键。
+
+## 7. 自动任务与人工任务分离
+
+### 7.1 来源模型
+
+普通任务和系统任务必须记录：
+
+- `origin_type`
+- `origin_ref_id`
+- `approval_policy`
+- `policy_version`
+
+`MANUAL` 和 `AUTOMATION` 类新任务都必须提供非空、稳定的 `origin_ref_id`；人工
+入口使用 `web:`、`cli:`、`workbook:`、`acceptance:` 等可追溯前缀，测试工具使用
+`test-harness:`。历史记录缺少结构化来源时只标记 `LEGACY`，不得猜测。
+
+核心 `origin_type` 只能取：
+
+- `MANUAL`
+- `AUTOMATION`
+- `SYSTEM_EMERGENCY`
+- `LEGACY`
+
+这是当前 v14—v16 的已实现集合。未来 Agent 正式接入时必须通过独立评审和最小迁移增加
+`AGENT`，使用 `origin_ref_id=agent-run:<stable-run-id>` 与版本化审批策略；当前任务不得
+把 Agent 冒充为 `MANUAL` 或 `AUTOMATION`。由 Automation 触发时另保留父
+`automation-run:<run_id>` 关联，但 Agent 业务来源不变。
+
+`AgentIntent` / `AgentProposal` 只是在 Agent Adapter 边界传递的逻辑载荷，不是当前批准
+的 Runtime 表。Agent 来源的 `UPDATE_PRICE`、`SET_ONLINE`、`SET_OFFLINE` 必须先经人工
+Review 和显式授权，不得直接进入可执行 `PENDING`；只有对真实平台零副作用的任务才可
+讨论低风险直入。未形成 Task 或 Review 的建议直接返回，长期 proposal 持久化与任何自主
+真实平台写权限都必须在未来独立 R4 中重新评审。
+
+Issue #20 中的细分来源名称是运营语义，不扩张为第二套数据库枚举，固定映射为：
+
+| 运营语义 | 核心来源 |
+| --- | --- |
+| `MANUAL_WEB` | `MANUAL + web:<request-or-form-id>` |
+| `MANUAL_CLI` | `MANUAL + cli:<command-run-id>` |
+| `AUTOMATION_RULE` | `AUTOMATION + rule:<rule-or-run-id>` |
+| `AUTOMATION_SCAN` | `AUTOMATION + scan:<automation-run-id>` |
+| `SYSTEM_RECONCILE` | `AUTOMATION + reconcile:<execution-attempt-id>` |
+| `SYSTEM_EMERGENCY` | `SYSTEM_EMERGENCY + emergency:<authorized-run-id>` |
+| `LEGACY` | `LEGACY + NULL` |
+
+`origin_type` 与 `origin_ref_id` 创建后均不可修改。通用 Repository 不得新建
+`LEGACY` 或 `SYSTEM_EMERGENCY`；数据库不可通过 UPDATE 把既有任务改成这两种来源。
+`SYSTEM_EMERGENCY` 仍只能由 13.5-6 的专用授权入口创建。
+
+自动化运行使用 `automation_jobs`、`automation_runs`、`automation_run_events` 和
+`automation_run_links` 独立建模。扫描不是普通任务；只有扫描或规则产生的业务处置才
+创建任务，并通过 link 表关联来源运行。`created_by`、trigger 和 dedupe 信息可以作为
+实现补充，但不得代替上述来源与授权合同。
+
+### 7.2 模块边界
+
+- 人工任务模块展示运营人员直接创建、调整或选择的任务。
+- 自动任务模块展示规则评估产生的候选任务；扫描运行在自动化模块展示。
+- 系统任务模块展示紧急下架和唯一 RECONCILE。
+- 自动任务失败不能阻塞人工任务列表的查看和处置。
+- 人工任务和自动任务可以复用同一任务状态机、Review 服务和执行账本，但必须可以按
+  来源、通道和运行批次独立筛选、统计和暂停。
+- 暂停自动化通道不得删除候选任务，也不得停止正在副作用区内执行的操作。
+- 除满足全部 S4 门禁的 `SYSTEM_EMERGENCY` 外，自动化通道的最高权限是创建
+  proposal、Review 或候选任务。
+- Web、CLI、Automation 和未来 Agent Gateway 必须调用同一权威 application service；
+  Web/Agent 不得通过 subprocess、自定义队列 JSON 或备用 gate 绕过服务层。
+- Agent 只提交 `AgentIntent`，不得直接创建 Review 或通知；确定性业务服务根据结果复用
+  现有 Review、Runtime Task、Outbox 和通知链。Agent 审计优先复用现有来源、操作者、
+  metadata/event payload，不预先要求每张表增加专属字段。
+- `SYSTEM_EMERGENCY` 只能由 13.5-6 专用授权服务创建；Web、CLI、Automation 普通 Handler
+  和未来 Agent 均不得伪造该来源。
+
+## 8. 异常分类与处理
+
+### 8.1 统一异常分类
+
+运营表和通知使用中文名称；英文稳定代码只用于合同、数据库和排障。初始类别为：
+
+- 平台登录异常（`PLATFORM_LOGIN`）
+- 平台网络异常（`PLATFORM_NETWORK`）
+- 页面结构异常（`PAGE_STRUCTURE`）
+- 扫描不完整（`SCAN_INCOMPLETE`）
+- Worker 不可用（`WORKER_UNAVAILABLE`）
+- 队列积压（`QUEUE_BACKLOG`）
+- 商品映射异常（`PRODUCT_MAPPING`）
+- 价格异常（`PRICE_ANOMALY`）
+- 库存异常（`INVENTORY_ANOMALY`）
+- 订单页面不可用（`ORDER_PAGE_UNAVAILABLE`）
+- 订单数据不一致（`ORDER_DATA_INCONSISTENT`）
+- 销售估算置信度低（`SALES_ESTIMATE_LOW_CONFIDENCE`）
+- 通知投递异常（`NOTIFICATION_FAILURE`）
+- 写结果不明（`WRITE_UNKNOWN`）
+- 自动化服务异常（`AUTOMATION_SERVICE`）
+- 运行数据库或存储异常（`RUNTIME_STORAGE`）
+- 队列或结果导入异常（`QUEUE_IMPORT`）
+- 交易日或系统时间异常（`TRADE_DAY_TIME`）
+- 商品上下架状态异常（`LISTING_STATE`）
+- 成本或经营主数据异常（`MASTER_DATA`）
+- 日结处理异常（`SETTLEMENT_PROCESSING`）
+- 人工复核通道异常（`REVIEW_CHANNEL`）
+
+登录凭据、日期选择、单次重试、映射候选等细节继续使用稳定 reason code，不扩张为
+独立类别。严重度表示当前业务风险，不是类别的永久属性。
+
+### 8.2 严重度和处置策略
+
+| 等级 | 名称 | 默认动作 |
+| --- | --- | --- |
+| `S0` | `INFO` | 记录信息，不要求处置 |
+| `S1` | `LOW` | 日报汇总 |
+| `S2` | `MEDIUM` | 首次提醒；未解决时按较长周期提醒 |
+| `S3` | `HIGH` | 立即通知，目标响应时限 30 分钟；按处置状态跟进 |
+| `S4` | `CRITICAL` | 立即请求复核；只有极端低价可评估受控自动保护 |
+
+每个异常至少记录：
+
+- 稳定异常代码和去重指纹。
+- 严重度、当前状态、首次出现、最后出现和累计次数。
+- 影响平台、商品、订单摘要、运行或批次。
+- 不可变检测、状态变化、Review、Run、Task 和恢复证据引用。
+- `OPEN / WAITING_HUMAN / AUTO_PROTECTING / RESOLVED / CLOSED` 核心状态。
+
+自动处理只允许安全重试、重新只读扫描、补发通知和恢复数据库投影。任何可能重复产生
+平台副作用的异常仍必须遵守写锁、phase 和唯一 RECONCILE。
+
+`ACK` 是事件，不是主状态，也不是复核结果。`RETRYING/ACKNOWLEDGED` 仅为 v14 历史
+兼容值，新 Incident 流程不再写入。提醒按“需要什么业务动作”发送；S4 价格 Review
+最多为初始消息和一次中途提醒，不再每 5 分钟无限广播。
+
+### 8.3 S4 紧急下架
+
+普通低于成本异常是 S3，极端低价才是可进入自动保护评估的 S4。实施顺序为：
+
+1. v15 增加 `occurrence_count` 和一张 append-only Incident Event 表，先完成人工闭环；
+2. v16 增加一张极简 `emergency_offline_policies`，只进行影子判定；
+3. 专用授权通过受控验收后，才允许临时开放一次自动下架。
+
+在上述门禁全部完成前，`automatic_emergency_offline=false`，任何 Agent、Web、Scheduler
+或脚本都不得创建或执行 `SYSTEM_EMERGENCY` 自动下架。
+
+最低安全价固定为商品 `base_cost`；缺失基础成本视为主数据损坏并 fail closed。使用
+Decimal 精确计算，紧急比例固定为 `0.80`：
+
+```text
+异常低价且 P >= base_cost                 → 首次 S1，连续两次 S2
+base_cost × 0.80 < P < base_cost           → S3，只允许人工处置
+P <= base_cost × 0.80                      → S4，先发起人工复核
+```
+
+人工复核只提供：`改价到（输入值） / 立即下架 / 我来处理`。前两项分别复用任务 12
+v4 `UPDATE_PRICE` 和任务 13 v5 `SET_OFFLINE`；“我来处理”不创建平台任务。任一复核
+结果都结束本轮无人值守路径，ACK 不算复核结果。
+
+只有命中已批准、未退休策略并同时满足下列流程，才允许无人值守紧急下架：
+
+1. 第一次完整观察创建 Incident 并通知。
+2. 以初始 Outbox 的 `sent_at` 作为等待起点，只接受其后下一个计划槽开始的另一个
+   完整、已导入 `ONLINE_PULSE`；通知送达前的 Pulse 不得复用，失败、不完整或错过的
+   Pulse 只延后，跨 18:00 则重新建轮次。
+3. 重新读取当前价格、在线状态、`base_cost`、策略、Review 和写锁。
+4. 若紧急情况仍存在且没有复核结果，创建 `SYSTEM_EMERGENCY` 授权和单一
+   `SET_OFFLINE` 业务任务。
+5. 复用 v5 写动作和 Importer；结果为 UNKNOWN 时只允许现有唯一 RECONCILE。
+
+第二次完整观察冻结价格业务判断。后续发布和点击只检查授权及执行安全，不因价格上涨重新
+计算 `base_cost × 0.80` 或撤销授权；但同平台/SKU 的更高优先级人工改价/下架意图、人工
+Review、策略/开关失效、活动写锁、未决 UNKNOWN/RECONCILE、身份不唯一或不再在线仍会
+阻止点击。自动评估时间不等于 Review/Token 到期；人工结果在 v5
+`SUBMIT_INTENT_RECORDED` 前到达时优先。
+
+以下任一条件存在时禁止自动下架：映射不是 `VERIFIED`、成本缺失或过期、价格不可读、
+扫描不完整、存在活动/UNKNOWN 写锁、商品已下架、策略未批准/已退休、功能开关关闭、
+Review 有结果或其通知未确认送达，以及页面结构异常。
+
+不使用每商品每日次数上限或冷却期。紧急下架后不得自动重新上架；人工重新上架后若
+条件仍成立，重新走正常 S3/S4 检测和 Review。详细合同以
+[任务 13.5-6 审查计划](task13_5_6_incident_and_emergency_protection_review_plan.md)为准。
+
+## 9. Web 前端重写
+
+### 9.1 设计目标
+
+Web 主控端以运营人员的工作问题组织页面：
+
+- 今天发生了什么？
+- 哪些事情需要我处理？
+- 自动化是否正常运行？
+- 哪些商品、订单或数据有异常？
+- 今天卖了多少，什么时间、什么品种和等级卖得最好？
+- 哪些动作已经执行，结果是否确认？
+- 系统是否具备继续运行的条件？
+
+内部 schema、合同版本、operation/attempt、phase、hash 和本地路径默认不出现在主流程，
+仅在“高级诊断”中按需展开。
+
+2026-08-12 依据实际运营路径重新冻结：当前项目尚未正式投入使用，新 Web 不渐进兼容旧
+Web。重写前的
+`main` 已标记为 `checkpoint/pre-task13-5-7-web-rewrite-20260807`；新应用验收后直接
+删除旧路由、Renderer 和样式，恢复依靠 Git 检查点，不依靠双 Web。
+
+Web 产品决策以实际使用为主，不以旧 Web 或历史计划页面清单为主。权威顺序是用户确认的
+实际运营流程、当前四入口样板、已验证的领域/安全/执行合同、当前施工计划、旧 Web 与历史
+档案。UI 可以删除旧页面，但不能绕过 Task、Review、授权、Queue/Worker/Importer、写锁、
+UNKNOWN/RECONCILE、交易日和数据质量合同。
+
+### 9.2 推荐导航
+
+1. **今日**
+   - 展示 PRA 交易日、OPEN/CLOSED/结算状态、销量、金额、均价、数据库真实库存、待办、
+     当日时间轴和组件业务影响摘要。
+   - 品种、等级、销售额和真实库存使用紧凑表格；完整历史进入数据库。
+2. **数据库**
+   - 只读查看业务数据、项目运行数据、销售分析、字段说明和质量与新鲜度。
+   - 销售分析严格区分 `ORDER_OBSERVED` 与 `SCAN_ESTIMATED`，并作为未来 Agent 分析的
+     稳定展示入口；当前不显示复购、买家端价格或 Agent 假建议。
+3. **业务管理**
+   - 创建任务、独立执行授权、人工复核、固定 Automation 方案和人工真实库存业务。
+   - 品种/等级/平台多选，支持调整价格到、加/降价、下架、上架+平台目标库存。
+4. **系统**
+   - 只显示组件当前状态、业务影响和恢复动作；详细运行历史留在数据库。
+   - 提供受控 Worker 恢复、通知测试、显式数据库维护、备份、权限边界和高级诊断。
+
+旧“平台商品、自动化、待处理、任务中心、业务资料”不再默认保留为页面：唯一事实分别并入
+数据库、业务管理或系统；没有独立运营价值的 Route、Presenter、模板和测试一起删除。
+
+### 9.3 页面和交互规则
+
+- 状态文案必须是运营语言，例如“等待人工复核”“平台结果待确认”，不能只显示
+  `PENDING` 或 `UNKNOWN`。
+- 危险操作与只读补跑在视觉和确认方式上严格区分。
+- 页面顶部只显示与当前角色相关的主操作；诊断操作放在二级区域。
+- 所有列表提供时间范围、平台、状态、来源和关键字筛选，并支持保存常用筛选。
+- 详情页展示“发生了什么—影响什么—系统做了什么—需要我做什么”的时间线。
+- 空状态、加载状态、数据过期和部分失败必须明确，不能用空白页面代替。
+- 自动刷新不得丢失筛选条件、表单输入或当前查看位置。
+- 所有时间显示业务时区，并可查看原始 ISO 时间。
+- Web 不直接启动不可审查的 subprocess，不在请求线程中执行长任务。
+- 保留服务端渲染技术路线，除非在 T13.5-0 审查后另行批准前后端分离。
+- 新建独立 `app/operations_web/`，包含 Composition Root、认证、CSRF、路由、
+  Presenter、模板和静态资源；业务应用服务继续保留在 `app/services/`。
+- Runtime DB、工作簿和 Queue 在启动时固定；URL、Session 和表单不能切换。普通 GET 永不
+  初始化、迁移或修复 Schema。
+- development 必须显式使用 `PRA_ENV=development` 和非 Secure Cookie；production 必须
+  HTTPS + Secure Cookie；冲突时拒绝启动并给出中文原因。
+- 新 Web 不承诺旧路由、query-string、HTML、Session 或书签兼容；只复用已验证的
+  安全属性和后端业务合同。
+
+## 10. 建议的数据结构
+
+任务 13.5 的候选迁移版本为 schema v14。以下表名作为合同基线，不表示可跳过无损迁移、
+索引、外键、回滚和旧库兼容评审：
+
+### 10.1 自动化运行
+
+- `automation_jobs`
+- `automation_runs`
+- `automation_run_events`
+- `automation_run_links`
+
+### 10.2 商品与订单观察
+
+- `product_observation_batches`
+- `product_observation_items`
+- `order_observation_batches`
+- `order_observation_items`
+
+### 10.3 销售与日结
+
+- `sales_estimate_segments`
+- `platform_trade_day_summaries`
+
+### 10.4 异常
+
+- `operational_incidents`
+- `incident_notification_state`
+- v15 `operational_incident_events`
+- v16 `emergency_offline_policies`
+
+### 10.5 现有表扩展
+
+- `tasks.origin_type`
+- `tasks.origin_ref_id`
+- `tasks.approval_policy`
+- `tasks.policy_version`
+
+实施时必须冻结：
+
+- `script_runs` 与 `automation_runs` 的兼容或迁移关系，避免双运行账本。
+- 现有 `listing_sync_snapshots` 到不可变商品观察批次的映射。
+- 订单行指纹规范、`occurrence_no / occurrence_count`、多重集合比较和已接受完整
+  批次选择规则。
+- `PROVISIONAL → OBSERVED → RECONCILED → FINAL` 与 supersedes 关系。
+- `listing_anomaly_cases` 与 `operational_incidents` 的兼容投影，避免两个异常系统。
+
+核心 v14 只在任务来源字段中预留 `SYSTEM_EMERGENCY` 和策略扩展边界。
+13.5-6 已裁决 v15 只增加 Incident 出现次数、事件流水和类别扩展，v16 只增加极简
+`emergency_offline_policies`，并以数据库 CHECK 和 Decimal 服务双重固定 `0.80`；授权
+证据复用 Automation Event，不新增授权表。FINAL 在事务内按平台、交易日、subject 与
+当前 Summary 输入清单动态匹配阻断 Incident，不要求 Incident 预先引用 Summary ID。
+
+## 11. 调度、幂等和恢复要求
+
+- 同一 schedule 在同一计划时间只允许生成一个逻辑运行。
+- 使用数据库租约或等效单实例机制，不能仅依赖进程内锁。
+- 每次运行记录 `scheduled_for / started_at / heartbeat_at / finished_at`。
+- 自动化运行对外状态使用 `SCHEDULED / RUNNING / SUCCESS / PARTIAL / FAILED /
+  MISSED / MERGED / SKIPPED / CANCELLED`；详细步骤结果保存在事件中。
+- 重试必须复用逻辑运行身份并增加 attempt，不得产生无法关联的重复运行。
+- 错过小扫描时只补最近一次；完整扫描和日结按交易日策略补跑，避免启动后形成任务风暴。
+- 运行超时后先判断是否进入平台副作用区；只读扫描可以安全终止，写操作沿用现有恢复状态机。
+- 手工补跑必须记录操作者、原因、原计划时间和是否覆盖正常结果。
+- 暂停 schedule 不等于中止正在运行的任务。
+- 服务器时间变化、休眠唤醒和跨日必须有测试。
+
+## 12. 最小运维和可观测性
+
+任务 13.5 只补齐进入综合验收和连续观察所需的最小能力：
+
+- 服务健康总览和结构化健康检查。
+- 最近成功时间、数据新鲜度、运行耗时和失败率指标。
+- 队列积压、Outbox 积压、异常未处理数量和日结不完整告警。
+- 冷态与暖态扫描耗时分别统计。
+- 证据、日志、快照和归档的保留周期。
+- 磁盘容量阈值和安全清理策略；不能删除未导入、UNKNOWN 或未完成审查的证据。
+- SQLite 在线备份、恢复校验和迁移前备份。
+- 服务账号、最小权限、密钥轮换和配置校验。
+- 系统暂停、单模块暂停、恢复、补跑和灾难恢复操作手册。
+- 功能开关：先 shadow/dry-run，再只读实机，最后开放运营入口。
+
+任务 17 再完成正式运维看板、长期保留政策、完整备份轮换、生产 Runbook 和项目收口；
+任务 13.5 不以这些后续工作未完成为由放宽当前安全门禁。
+
+## 13. 分阶段实施
+
+### T13.5-0：黄金基线与临时能力审计
+
+- 冻结任务 12/13 最后成功代码 SHA、实机 Run ID、证据和禁止重写函数。
+- 盘点所有需要手工运行的脚本、入口、环境变量、运行责任和 Web 可见性。
+- 标记临时代码：保留、正式化、替换或归档。
+- 输出当前数据流、进程图、故障点和 Web 页面问题清单。
+- 归档带精确时间、main SHA、Runtime DB 脱敏快照、浏览器/视口/角色、路由和 DOM
+  hash 的独立 Web 审计。
+- 输出数据质量、日结状态、多重集合、库存估算和 S4 扩展边界草案，不创建 v14 表，
+  不修改业务路径。
+
+验收：审计清单完整，且明确每个脚本未来归属；不改真实平台动作。
+
+### T13.5-1：双时间轴与 schema v14
+
+- 冻结 18:00 平台交易日、20:00 卖家作业日、三个运营阶段和逐条观察归属函数。
+- 设计 schema v14 无损迁移、回滚、旧数据兼容和索引。
+- 冻结 `fact_source / quality_level / summary_status` 三个正交维度、六级数据质量矩阵和
+  `PROVISIONAL → OBSERVED → RECONCILED → FINAL`。
+- 冻结自动化账本、观察批次、日结、任务来源和 Incident 核心合同。
+- 预留 `SYSTEM_EMERGENCY` 来源和扩展边界；该阶段不实现自动紧急下架。最终 S4
+  业务口径已在后续 13.5-6 计划中冻结，不回填或改写核心 v14。
+
+验收：质量矩阵和日结状态机先通过评审，随后 17:59、18:00、19:59、20:00 边界
+测试、迁移测试和事务失败注入通过。
+
+### T13.5-2：商品映射与扫描器提取
+
+- 从任务 13 链路中提取可复用的两页只读扫描与身份匹配服务。
+- 实现 `ONLINE_PULSE`、`FULL_MARKET_SCAN` 和不可变商品观察批次。
+- 实现 `supports_order_scan / supports_current_trade_day /
+  supports_historical_trade_day` 以及 `UNSUPPORTED / UNAVAILABLE / FAILED`。
+- 不完整扫描保留证据但不覆盖最后可信投影。
+
+验收：上架中、待上架、重复身份、双页冲突、结束标记和跨边界归属均有测试。
+
+### T13.5-3：独立 Automation Service
+
+- 实现 jobs/runs/events/links、单实例租约、10 分钟/每小时触发、合并、补跑和心跳。
+- 统一 UI 通道优先级：UNKNOWN/RECONCILE、紧急下架、普通授权写、边界扫描、日结扫描、
+  小时完整扫描、10 分钟脉冲。
+- 复用长期 Worker 生命周期，不为每次扫描重复启动影刀。
+
+验收：重叠、休眠、错过、合并、超时、重启恢复和任务风暴防护测试通过。
+
+### T13.5-4：订单页探索与历史观察
+
+- 已完成无副作用探索并冻结
+  `supports_order_scan / supports_current_trade_day /
+  supports_historical_trade_day=true`、字段白名单、日期选择、滚动和结束标记。
+- 实现不可变订单批次、无平台订单 ID 的
+  `order_identity_fingerprint + occurrence_no` 多重集合、逐项 `observed_at`、
+  商品映射和完整批次接受规则。
+- 当前交易日只形成截至 `observed_at` 的 `OPEN` 快照；历史交易日为 `CLOSED`。
+  `OPEN` 不进入 `FINAL`。
+- 页面数量固定为 `order_qty`，页面成交金额固定为
+  `order_transaction_amount`，汇总为 `transaction_amount_total`；不得解释为卖家
+  实收、扣佣收入、退款净额或财务到账。
+- 复用 Automation 父子 run、单 Worker 文件队列、租约、checksum、phase 和归档，
+  不建立新的 R4 控制面；v6 订单请求严格为零平台写副作用。
+- 订单字段和日期控件由订单 Adapter 适配；订单列表加载、焦点、`END/HOME`、尾部验证、
+  回顶和无进展停止必须复用任务 12 的列表物化体系，优先抽取为商品与订单共用助手，
+  不得保留两套同职责控制流。
+- 13.5-4 不伪造取消行；13.5-5 才能在同平台同交易日的相邻完整快照之间按多重集合
+  减少推导取消。
+
+验收：`OPEN/CLOSED`、重复行、精确重放、冲突、可信空页、滚动/尾标失败、日期错位、
+映射异常、错绑、事务回滚、PII 拒绝和零平台写副作用均有自动测试；Ready for review
+前另做受控真实页面 READ_ONLY。至少一个真实订单日期必须实际进入共享列表物化助手的
+滚动分支并验证焦点、`END`、尾部、`HOME` 和首项恢复；`page_count=1` 或只有日期选择器
+滚动不算通过。
+
+### T13.5-5：销售估算、日结和计划输入
+
+- 分离 `ORDER_OBSERVED` 与 `SCAN_ESTIMATED`，落实六级数据质量。
+- 在编码前冻结估算区间、已知库存调整来源、映射版本、资格原因、置信度和支撑观察。
+- 生成 20:00 `PROVISIONAL`，后续按
+  `OBSERVED → RECONCILED → FINAL` 单向推进并保留 supersedes 版本链。
+- 输出高峰份额、18:00–20:00 早期销售、价格库存轨迹、异常和质量等预测输入。
+
+验收：不同来源不得混算，低质量不得包装为精确事实，日结可以复算和追溯。
+
+### T13.5-6：异常、重复提醒与紧急保护
+
+- 13.5-6A-0 以 v15 增加 `occurrence_count`、Incident Event 和类别扩展。
+- 13.5-6A-1 复用 Review、Mobile Review、Outbox、飞书和 Worker 恢复完成人工闭环。
+- 人工复核固定为“改价到 / 立即下架 / 我来处理”，分别复用 v4/v5 或进入人工等待。
+- 13.5-6B 以 v16 迁移极简策略：最低安全价为 `base_cost`，紧急比例为 `0.80`；
+  shadow/dry-run 不创建任务。
+- 13.5-6C 只在极端低价仍存在、没有复核结果、初始通知 `sent_at` 后下一个计划槽的
+  另一个完整 Pulse 已导入时创建 `SYSTEM_EMERGENCY`，复用 v5 下架和 UNKNOWN 恢复；
+  第二次观察后不再重算价格阈值，但仍重验人工任务冲突和全部执行安全门禁。
+- 不增加每日次数上限、冷却、自动重新上架或通用策略引擎。
+
+验收：人工闭环和支撑数据先通过评审；ACK 只是事件；同异常不刷屏；Worker 异常运行
+完整恢复程序；禁止条件逐项阻断；紧急下架后不能自动上架。
+
+### T13.5-7：运营 Web 替代重写与 CLI 残留业务迁移
+
+- 在最新 `main` 建立可推送的 Git 恢复检查点，不保留双 Web。
+- 新建唯一运营 Web，按“今日、数据库、业务管理、系统”四个一级入口组织页面。
+- 直接复用 Task、Review、Automation、Incident、日结、Queue/Importer 和唯一
+  RECONCILE，不重构已验证后台动作链。
+- 按 R4 冻结认证/Session/CSRF、Presenter 权威输入、单一可信 Runtime DB、`/health` 与
+  Mobile Review 外部协议切换、任务来源和恢复成本。
+- 将 CLI 中残留的日常任务生成、复核、超时维护和运营查询迁移到 Web、Automation 或
+  Queue；保留测试、Mock、验收、诊断、备份、恢复和进程启动 CLI。
+- 业务管理复用既有输入服务，并新增即时人工任务编排；创建 Task 和真实平台执行授权分成
+  两个可审计阶段。普通 `PENDING` 不得无人值守执行；Web 只通过 Service 层
+  `SUBMIT_EXECUTION` 授权对明确 task IDs 和重检 digest 提交，Route 不直连 Queue/Runner。
+- 冻结数据库真实库存和平台库存：真实库存代表还有多少花可卖，由人工入库和权威销售差额
+  更新；平台库存只代表单平台买家可购上限。7D 将 `products.xlsx.current_stock` 仅一次
+  bootstrap 到 DB，之后 DB 余额/流水是唯一权威，禁止双写。库存只接受完整订单净差和
+  合格 HIGH 估算正向扣减；部分/OPEN、中低估算和不可用事实零写，取消不重复恢复。
+- 固定 Automation 方案按 Job 类型开放有限字段和安全范围；18:00/20:00 由版本化时间
+  策略统一派生，child job 不可独立配置，不开放脚本或任意 Cron。
+- 在既有 Automation 框架增加“Review 超时”和“每日自动任务生成”两个薄 Handler，不
+  新建 Scheduler 或任务系统。
+- 在根级规则中预留唯一 Agent Gateway 通道；13.5-7 不实现 Agent、不扩 Schema、不批准
+  proposal 表或自主平台写权限，后续不得另建直连 Web、CLI、数据库、Queue 或平台的
+  Agent 路径。任何实际 Agent 接入均为未来独立 R4，不属于 7B～7F 或任务 14。
+- 13.5-7 当前不补采“第 N 次购买”、买家客户端价格或花材质量评价，不实现 Agent；这些
+  只在 Agent 阶段按独立合同落地。
+- 完成新应用骨架、四入口只读、真实库存、人工流程、系统维护、切换删除和桌面/手机验收。
+- 系统维护 Route 只调用类型化 Service 并查询现有状态，不直接运行或等待任意脚本；长耗时
+  Worker 恢复、备份和维护动作复用既有生命周期/维护边界。
+- 7B—7F 按“骨架安全 / 四入口只读 / 真实库存 / 人工任务与 Automation / 切换验收”顺序
+  小 PR；后一项只在前一项通过评审后开始。
+- 具体工作包、CLI 矩阵和复杂度预算见
+  [任务 13.5-7 Web 重写计划](task13_5_web_rewrite_plan.md)。
+
+验收：新 Web 是唯一人工运营入口；日常业务不依赖 CLI；测试与管理员 CLI 仍可用；
+旧 Web 已删除；普通 GET 零写；真实库存、平台库存和执行授权语义正确；后台唯一平台动作
+链未被重写；Agent 唯一通道已经冻结但没有提前实现。
+
+### T13.5-8 / T13.5-9：内容并入 T13.5-7
+
+原“Web 架构拆分”和“Web 运营 UI 重写”不再作为要求兼容旧 Web 的独立前置阶段，其
+内容已并入 T13.5-7 的 7B—7F 工作包。Issue #20 已于 2026-08-12 同步为当前
+13.5-7 路线。
+
+### T13.5-10：集成回归与任务 14 交接
+
+- 完成代码、迁移、Web、调度、只读实机和受控紧急策略回归。
+- 连续观察至少覆盖一个完整平台交易日和卖家作业日。
+- 输出脱敏证据、验收矩阵、运行手册、已知限制和任务 14 输入。
+
+验收：任务 14 可以直接进行多品种、多动作、异常恢复、正式授权和版本冻结验收，不需要
+补做任务 13.5 的控制面。
+
+## 14. 关键验收场景
+
+### 14.1 调度
+
+- 正常 10 分钟 `ONLINE_PULSE` 和每小时 `FULL_MARKET_SCAN`。
+- 17:59、18:00、19:59、20:00 的日期与阶段归属。
+- 小扫描与完整扫描同一时刻触发时按优先级合并，不重叠操作同一平台页面。
+- Windows 休眠后恢复，不产生补跑风暴。
+- 调度服务重启后租约和运行状态可恢复。
+- 暂停、恢复和人工补跑均有审计记录。
+
+### 14.2 数据
+
+- 相同订单观察行以指纹和 `occurrence_no` 保留真实实例，`occurrence_count` 可复算，
+  跨批次按多重集合比较而不累加销售。
+- 当前开放交易日快照或请求日期真实不可用时，能力标志、终态、质量和页面实际范围一致。
+- `ORDER_OBSERVED` 与 `SCAN_ESTIMATED` 不混算。
+- `fact_source / quality_level / summary_status` 独立保存。
+- 后续历史订单按 `OBSERVED → RECONCILED → FINAL` 推进，而不是静默覆盖
+  `PROVISIONAL`。
+- 不合格库存区间设置 `estimation_eligible=false`，无法解释的变化创建 Incident。
+- 不完整扫描不更新可信当前投影。
+- 日结卖家实收金额、有效数量和分桶合计可自动复算；不可得订单数不伪造。
+- 数据库中不存在客户个人敏感信息。
+
+### 14.3 异常
+
+- 登录失效、网络失败、白屏、页面结构漂移和结束标记缺失。
+- 重复商品身份、商品双页出现、双页缺失和订单业务键冲突。
+- Worker 心跳失效、Outbox 堵塞、磁盘不足和备份失败。
+- UNKNOWN 只由现有唯一 RECONCILE 恢复。
+- 通知按业务动作和状态提醒；ACK 不关闭异常，也不作为 S4 复核结果。
+- Worker 不可用执行既有完整恢复链，不重复启动或覆盖活动请求。
+- S4 只对极端低价开放；`base_cost`、`0.80`、第二个完整 Pulse、无复核结果、映射、
+  页面完整性、功能开关和写锁门禁逐项通过。
+- 紧急下架后只允许人工审查重新上架。
+
+### 14.4 Web
+
+- 运营人员可在 3 次点击内看到今日待处理事项。
+- 可区分“自动化运行失败”“候选任务待复核”“平台动作结果未知”。
+- 可查看下一次扫描时间、最近成功时间和数据新鲜度。
+- 首屏同时显示平台交易日、卖家作业日、当前阶段和截单倒计时。
+- 可按品种、等级、时段、事实来源和质量查看销售统计。
+- 技术人员可从高级诊断进入原始 operation/attempt/phase/证据摘要。
+- 页面不展示密钥、原始 token、客户个人信息或不必要的本地路径。
+
+## 15. 任务 14 前置门禁
+
+只有满足以下条件才开始任务 14：
+
+- [ ] 任务 12/13 黄金基线和禁止重写清单已经冻结。
+- [ ] 每个 13.5 子任务均有复用矩阵；不存在未经不兼容证据和评审批准的平行实现。
+- [ ] 双时间轴、边界归属和 schema v14 迁移通过验收。
+- [ ] `ONLINE_PULSE`、`FULL_MARKET_SCAN` 和日结具备稳定运行记录及新鲜度指标。
+- [ ] 自动任务、人工任务和系统任务具备可靠来源与策略版本。
+- [ ] 候选任务、Review 和异常之间可以追溯到来源运行。
+- [ ] Web 能清楚展示候选、复核、授权、执行和异常，不把 `pending` 解释为授权。
+- [ ] 订单页能力声明、不可变批次、销售事实质量和日结修订机制通过验收。
+- [ ] S0–S4、重复提醒、S4 禁止条件和紧急下架恢复通过演练。
+- [ ] 普通写动作仍被明确任务与授权门禁阻止；`SYSTEM_EMERGENCY` 只有一个受控入口。
+- [ ] Web 四个一级入口、后端分页、移动端、通知闭环和高级诊断通过运营验收。
+- [ ] 中文文档、JSON、CSV/TSV 和 SQLite 迁移均通过编码及结构验证。
+- [ ] 实机证据、自动化测试和文档结论彼此一致。
+
+## 16. 待冻结的实现策略
+
+18:00/20:00 双时间轴、事实来源、异常等级、紧急保护、四个 Web 入口和任务 14 边界已经
+由 Issue #20 冻结，不再作为开放产品问题。实施阶段仍需冻结：
+
+1. 不营业日、临时维护窗口和节假日的维护方式。
+2. 非交易时段脉冲是否降频，以及错过运行的最大补跑窗口。
+3. 订单页面可稳定读取的历史天数、分页范围和取消量推导方法。
+4. S4 价格口径已冻结为 `base_cost × 0.80`，最低安全价为 `base_cost`；策略审批人为
+   管理员，且不使用次数上限和冷却。编码时只需冻结配置落点、迁移和回滚步骤。
+5. 通知动作和响应时限已冻结；编码时只需确认当前飞书收件范围和运营文案。
+6. 管理员负责策略版本/开关，运营员负责 Review 和任务；更复杂权限不在本阶段。
+7. 自动化、日志、订单观察、商品观察和证据的保留周期。
+8. 冷态/暖态扫描、页面首屏和列表查询的 SLO。
+9. 模板层是否引入 Jinja；若引入，必须补齐 wheel 依赖和隔离安装测试。
+
+未冻结的实现策略可以先采用保守默认值进行只读原型和测试，但不得改变 Issue #20 的业务
+口径，也不得在没有版本化策略时开放 `SYSTEM_EMERGENCY`。

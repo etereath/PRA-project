@@ -1,0 +1,228 @@
+{
+  "schema_version": "shadowbot-t11-coverage-validation-1.0",
+  "attempt_id": "ATTEMPT-T11-COVERAGE-R3-20260719-225645",
+  "validated_at": "2026-07-19T14:58:22.428569+00:00",
+  "checks": {
+    "request_sidecar": true,
+    "result_sidecar": true,
+    "overall_status": true,
+    "execution_mode": true,
+    "total_count": true,
+    "processed_count": true,
+    "success_count": true,
+    "failed_count": true,
+    "skipped_count": true,
+    "manual_check_count": true,
+    "business_operation_completed": true,
+    "side_effect_state": true,
+    "phase": true,
+    "item_1": true,
+    "item_2": true,
+    "item_3": true,
+    "item_4": true,
+    "item_5": true
+  },
+  "all_pass": true,
+  "observed_order": [
+    "卡布奇诺 B级",
+    "艾莎 B级",
+    "艾莎 C级",
+    "卡布奇诺 C级",
+    "艾莎 D级"
+  ],
+  "items": [
+    {
+      "position": 1,
+      "item_id": "ITEM-CAPPUCCINO-B-COVERAGE-R3-20260719-225645",
+      "product_name": "卡布奇诺",
+      "grade": "B级",
+      "inventory": 1,
+      "price": "24.00",
+      "listing_status": "ONLINE",
+      "item_status": "SUCCESS",
+      "row_identity": "parent-index:1",
+      "locator_summary": "parent_index=1",
+      "evidence": [
+        {
+          "captured_at": "2026-07-19T14:57:37+00:00",
+          "evidence_id": "EVD-READ-BATCH-T11-COVERAGE-R3-20260719-225645-ITEM-CAPPUCCINO-B-COVERAGE-R3-20260719-225645",
+          "evidence_type": "PRODUCT_READ",
+          "execution_attempt_id": "ATTEMPT-T11-COVERAGE-R3-20260719-225645",
+          "hash_verified": true,
+          "item_id": "ITEM-CAPPUCCINO-B-COVERAGE-R3-20260719-225645",
+          "local_path": "C:\\Users\\etere\\AppData\\Local\\ShadowBot\\evidence\\vertical_slice\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-CAPPUCCINO-B-COVERAGE-R3-20260719-225645_product_read.png",
+          "read_batch_id": "READ-BATCH-T11-COVERAGE-R3-20260719-225645",
+          "relative_path": "READ-BATCH-T11-COVERAGE-R3-20260719-225645/ITEM-CAPPUCCINO-B-COVERAGE-R3-20260719-225645/ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-CAPPUCCINO-B-COVERAGE-R3-20260719-225645_product_read.png",
+          "sha256": "2c1903d4ce23bbf80d01c016754769a21f9f838c4412af7d9ea475dc63d0bd3b",
+          "size_bytes": 526225,
+          "storage_path": "\\\\LAPTOP-O9O76RQV\\pra-evidence\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-CAPPUCCINO-B-COVERAGE-R3-20260719-225645\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-CAPPUCCINO-B-COVERAGE-R3-20260719-225645_product_read.png",
+          "storage_sha256": "2c1903d4ce23bbf80d01c016754769a21f9f838c4412af7d9ea475dc63d0bd3b",
+          "storage_uri": "\\\\LAPTOP-O9O76RQV\\pra-evidence\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-CAPPUCCINO-B-COVERAGE-R3-20260719-225645\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-CAPPUCCINO-B-COVERAGE-R3-20260719-225645_product_read.png",
+          "type": "PRODUCT_READ",
+          "upload_error": "",
+          "upload_status": "SUCCESS"
+        }
+      ]
+    },
+    {
+      "position": 2,
+      "item_id": "ITEM-AISHA-B-COVERAGE-R3-20260719-225645",
+      "product_name": "艾莎",
+      "grade": "B级",
+      "inventory": 19,
+      "price": "8.60",
+      "listing_status": "ONLINE",
+      "item_status": "SUCCESS",
+      "row_identity": "parent-index:17",
+      "locator_summary": "parent_index=17",
+      "evidence": [
+        {
+          "captured_at": "2026-07-19T14:57:37+00:00",
+          "evidence_id": "EVD-READ-BATCH-T11-COVERAGE-R3-20260719-225645-ITEM-AISHA-B-COVERAGE-R3-20260719-225645",
+          "evidence_type": "PRODUCT_READ",
+          "execution_attempt_id": "ATTEMPT-T11-COVERAGE-R3-20260719-225645",
+          "hash_verified": true,
+          "item_id": "ITEM-AISHA-B-COVERAGE-R3-20260719-225645",
+          "local_path": "C:\\Users\\etere\\AppData\\Local\\ShadowBot\\evidence\\vertical_slice\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-AISHA-B-COVERAGE-R3-20260719-225645_product_read.png",
+          "read_batch_id": "READ-BATCH-T11-COVERAGE-R3-20260719-225645",
+          "relative_path": "READ-BATCH-T11-COVERAGE-R3-20260719-225645/ITEM-AISHA-B-COVERAGE-R3-20260719-225645/ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-AISHA-B-COVERAGE-R3-20260719-225645_product_read.png",
+          "sha256": "2c1903d4ce23bbf80d01c016754769a21f9f838c4412af7d9ea475dc63d0bd3b",
+          "size_bytes": 526225,
+          "storage_path": "\\\\LAPTOP-O9O76RQV\\pra-evidence\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-AISHA-B-COVERAGE-R3-20260719-225645\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-AISHA-B-COVERAGE-R3-20260719-225645_product_read.png",
+          "storage_sha256": "2c1903d4ce23bbf80d01c016754769a21f9f838c4412af7d9ea475dc63d0bd3b",
+          "storage_uri": "\\\\LAPTOP-O9O76RQV\\pra-evidence\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-AISHA-B-COVERAGE-R3-20260719-225645\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-AISHA-B-COVERAGE-R3-20260719-225645_product_read.png",
+          "type": "PRODUCT_READ",
+          "upload_error": "",
+          "upload_status": "SUCCESS"
+        }
+      ]
+    },
+    {
+      "position": 3,
+      "item_id": "ITEM-AISHA-C-COVERAGE-R3-20260719-225645",
+      "product_name": "艾莎",
+      "grade": "C级",
+      "inventory": 20,
+      "price": "6.00",
+      "listing_status": "ONLINE",
+      "item_status": "SUCCESS",
+      "row_identity": "parent-index:33",
+      "locator_summary": "parent_index=33",
+      "evidence": [
+        {
+          "captured_at": "2026-07-19T14:57:37+00:00",
+          "evidence_id": "EVD-READ-BATCH-T11-COVERAGE-R3-20260719-225645-ITEM-AISHA-C-COVERAGE-R3-20260719-225645",
+          "evidence_type": "PRODUCT_READ",
+          "execution_attempt_id": "ATTEMPT-T11-COVERAGE-R3-20260719-225645",
+          "hash_verified": true,
+          "item_id": "ITEM-AISHA-C-COVERAGE-R3-20260719-225645",
+          "local_path": "C:\\Users\\etere\\AppData\\Local\\ShadowBot\\evidence\\vertical_slice\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-AISHA-C-COVERAGE-R3-20260719-225645_product_read.png",
+          "read_batch_id": "READ-BATCH-T11-COVERAGE-R3-20260719-225645",
+          "relative_path": "READ-BATCH-T11-COVERAGE-R3-20260719-225645/ITEM-AISHA-C-COVERAGE-R3-20260719-225645/ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-AISHA-C-COVERAGE-R3-20260719-225645_product_read.png",
+          "sha256": "2c1903d4ce23bbf80d01c016754769a21f9f838c4412af7d9ea475dc63d0bd3b",
+          "size_bytes": 526225,
+          "storage_path": "\\\\LAPTOP-O9O76RQV\\pra-evidence\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-AISHA-C-COVERAGE-R3-20260719-225645\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-AISHA-C-COVERAGE-R3-20260719-225645_product_read.png",
+          "storage_sha256": "2c1903d4ce23bbf80d01c016754769a21f9f838c4412af7d9ea475dc63d0bd3b",
+          "storage_uri": "\\\\LAPTOP-O9O76RQV\\pra-evidence\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-AISHA-C-COVERAGE-R3-20260719-225645\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-AISHA-C-COVERAGE-R3-20260719-225645_product_read.png",
+          "type": "PRODUCT_READ",
+          "upload_error": "",
+          "upload_status": "SUCCESS"
+        }
+      ]
+    },
+    {
+      "position": 4,
+      "item_id": "ITEM-CAPPUCCINO-C-COVERAGE-R3-20260719-225645",
+      "product_name": "卡布奇诺",
+      "grade": "C级",
+      "inventory": 1,
+      "price": "16.80",
+      "listing_status": "ONLINE",
+      "item_status": "SUCCESS",
+      "row_identity": "parent-index:49",
+      "locator_summary": "parent_index=49",
+      "evidence": [
+        {
+          "captured_at": "2026-07-19T14:57:37+00:00",
+          "evidence_id": "EVD-READ-BATCH-T11-COVERAGE-R3-20260719-225645-ITEM-CAPPUCCINO-C-COVERAGE-R3-20260719-225645",
+          "evidence_type": "PRODUCT_READ",
+          "execution_attempt_id": "ATTEMPT-T11-COVERAGE-R3-20260719-225645",
+          "hash_verified": true,
+          "item_id": "ITEM-CAPPUCCINO-C-COVERAGE-R3-20260719-225645",
+          "local_path": "C:\\Users\\etere\\AppData\\Local\\ShadowBot\\evidence\\vertical_slice\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-CAPPUCCINO-C-COVERAGE-R3-20260719-225645_product_read.png",
+          "read_batch_id": "READ-BATCH-T11-COVERAGE-R3-20260719-225645",
+          "relative_path": "READ-BATCH-T11-COVERAGE-R3-20260719-225645/ITEM-CAPPUCCINO-C-COVERAGE-R3-20260719-225645/ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-CAPPUCCINO-C-COVERAGE-R3-20260719-225645_product_read.png",
+          "sha256": "2c1903d4ce23bbf80d01c016754769a21f9f838c4412af7d9ea475dc63d0bd3b",
+          "size_bytes": 526225,
+          "storage_path": "\\\\LAPTOP-O9O76RQV\\pra-evidence\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-CAPPUCCINO-C-COVERAGE-R3-20260719-225645\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-CAPPUCCINO-C-COVERAGE-R3-20260719-225645_product_read.png",
+          "storage_sha256": "2c1903d4ce23bbf80d01c016754769a21f9f838c4412af7d9ea475dc63d0bd3b",
+          "storage_uri": "\\\\LAPTOP-O9O76RQV\\pra-evidence\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-CAPPUCCINO-C-COVERAGE-R3-20260719-225645\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-CAPPUCCINO-C-COVERAGE-R3-20260719-225645_product_read.png",
+          "type": "PRODUCT_READ",
+          "upload_error": "",
+          "upload_status": "SUCCESS"
+        }
+      ]
+    },
+    {
+      "position": 5,
+      "item_id": "ITEM-AISHA-D-COVERAGE-R3-20260719-225645",
+      "product_name": "艾莎",
+      "grade": "D级",
+      "inventory": 6,
+      "price": "5.00",
+      "listing_status": "ONLINE",
+      "item_status": "SUCCESS",
+      "row_identity": "parent-index:65",
+      "locator_summary": "parent_index=65",
+      "evidence": [
+        {
+          "captured_at": "2026-07-19T14:57:37+00:00",
+          "evidence_id": "EVD-READ-BATCH-T11-COVERAGE-R3-20260719-225645-ITEM-AISHA-D-COVERAGE-R3-20260719-225645",
+          "evidence_type": "PRODUCT_READ",
+          "execution_attempt_id": "ATTEMPT-T11-COVERAGE-R3-20260719-225645",
+          "hash_verified": true,
+          "item_id": "ITEM-AISHA-D-COVERAGE-R3-20260719-225645",
+          "local_path": "C:\\Users\\etere\\AppData\\Local\\ShadowBot\\evidence\\vertical_slice\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-AISHA-D-COVERAGE-R3-20260719-225645_product_read.png",
+          "read_batch_id": "READ-BATCH-T11-COVERAGE-R3-20260719-225645",
+          "relative_path": "READ-BATCH-T11-COVERAGE-R3-20260719-225645/ITEM-AISHA-D-COVERAGE-R3-20260719-225645/ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-AISHA-D-COVERAGE-R3-20260719-225645_product_read.png",
+          "sha256": "2c1903d4ce23bbf80d01c016754769a21f9f838c4412af7d9ea475dc63d0bd3b",
+          "size_bytes": 526225,
+          "storage_path": "\\\\LAPTOP-O9O76RQV\\pra-evidence\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-AISHA-D-COVERAGE-R3-20260719-225645\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-AISHA-D-COVERAGE-R3-20260719-225645_product_read.png",
+          "storage_sha256": "2c1903d4ce23bbf80d01c016754769a21f9f838c4412af7d9ea475dc63d0bd3b",
+          "storage_uri": "\\\\LAPTOP-O9O76RQV\\pra-evidence\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-AISHA-D-COVERAGE-R3-20260719-225645\\ATTEMPT-T11-COVERAGE-R3-20260719-225645_ITEM-AISHA-D-COVERAGE-R3-20260719-225645_product_read.png",
+          "type": "PRODUCT_READ",
+          "upload_error": "",
+          "upload_status": "SUCCESS"
+        }
+      ]
+    }
+  ],
+  "product_list_refreshes": [
+    {
+      "ended_at": "2026-07-19T22:57:05+08:00",
+      "refresh_entry": "蚂蚁_首页_商品管理_入口",
+      "stage": "BEFORE_PRODUCT_READ",
+      "started_at": "2026-07-19T22:57:00+08:00",
+      "status": "SUCCESS"
+    }
+  ],
+  "phase": {
+    "contract_version": 2,
+    "execution_attempt_id": "ATTEMPT-T11-COVERAGE-R3-20260719-225645",
+    "execution_mode": "READ_ONLY",
+    "instruction_hash": "sha256:db83ddb5ffd4728dc9bc0aa2bd14c6eb38cba4e2fd9b5abeecf1477b19dbe936",
+    "lease_owner_token": "",
+    "lease_version": 0,
+    "operation_id": "READ-READ-BATCH-T11-COVERAGE-R3-20260719-225645",
+    "phase": "RESULT_WRITTEN",
+    "read_batch_id": "READ-BATCH-T11-COVERAGE-R3-20260719-225645",
+    "request_file_sha256": "668798ee25e88a67b1725589f62802d1fb680fdd4a3dc929fe2b5af39b0a862c",
+    "side_effect_state": "NOT_STARTED",
+    "task_id": "TASK-T11-COVERAGE-R3-20260719-225645",
+    "total_count": 5,
+    "updated_at": "2026-07-19T14:57:37.787853+00:00",
+    "worker_id": "LAPTOP-O9O76RQV"
+  },
+  "request_sha256": "668798ee25e88a67b1725589f62802d1fb680fdd4a3dc929fe2b5af39b0a862c",
+  "result_sha256": "58a36e64f9354241adbfa782c35b90aa9ff2b70a767f8305aaad5bbc2549b91b"
+}

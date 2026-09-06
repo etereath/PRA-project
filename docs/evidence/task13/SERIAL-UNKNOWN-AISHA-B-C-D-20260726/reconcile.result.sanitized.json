@@ -1,0 +1,139 @@
+{
+  "action_type": "set_offline",
+  "active_listing_filter": "ONLINE",
+  "active_listing_filter_selected_at": "2026-07-26T23:09:45+08:00",
+  "actual_price": "",
+  "applet_launch": {
+    "source": "EXISTING_WINDOW",
+    "uri_opened": false,
+    "window_ready_at": "2026-07-26T23:09:36+08:00"
+  },
+  "batch_id": "BATCH-T13-CONTROLLED-UNKNOWN-20260726-01",
+  "batch_status": "VERIFIED",
+  "business_operation_completed": false,
+  "contract_version": 5,
+  "counts": {
+    "already_applied_count": 0,
+    "attempted_count": 0,
+    "batch_target_count": 1,
+    "failed_count": 0,
+    "not_applied_count": 0,
+    "not_attempted_count": 0,
+    "partial_effect_count": 0,
+    "unknown_count": 0,
+    "verified_applied_count": 1,
+    "verified_count": 1
+  },
+  "current_step": "VALIDATE_INPUT",
+  "ended_at": "2026-07-26T15:09:53+00:00",
+  "error_code": "",
+  "error_message": "",
+  "evidence": [],
+  "evidence_status": "NONE",
+  "execution_attempt_id": "RECONCILE-e88fb8a4b4d60936236f0e0a",
+  "execution_mode": "RECONCILE",
+  "expected_old_price": "",
+  "grade": "",
+  "instruction_hash": "sha256:b017b84362201a71d59219fa6e8cc5eb0e51d8fb7b0ef15dad13e56ee277a8f2",
+  "items": [
+    {
+      "action_clicked_at": null,
+      "action_confirm_clicked": false,
+      "actual_inventory": null,
+      "actual_price": null,
+      "detail_effect_state": "NOT_APPLIED",
+      "detail_save_clicked": false,
+      "detail_save_clicked_at": null,
+      "error_code": "",
+      "error_message": "",
+      "internal_sku": "AISHA-D-50-Z",
+      "item_execution_attempt_id": "ATTEMPT-998270bb749a6d09b9dadad0",
+      "item_payload_sha256": "sha256:39ba834208ddd5c0a18d9b165ee0830b81100cb2bb2ffc6e5ba61b588ea68956",
+      "listing_effect_state": "VERIFIED",
+      "observed_inventory_after_detail_save": null,
+      "observed_inventory_before_action": null,
+      "observed_price_after_detail_save": null,
+      "observed_price_before_action": null,
+      "operation_id": "OP-60181b534f0096928bdf272f",
+      "operation_result": "VERIFIED",
+      "readback_observed_at": "2026-07-26T15:09:53+00:00",
+      "source_task_id": "0bb3cc1d45b4"
+    }
+  ],
+  "login": {
+    "check_path": "BUSINESS_ENTRY_FAST_PATH",
+    "login_completed_at": "2026-07-26T23:09:38+08:00"
+  },
+  "manifest_sha256": "sha256:6341690fa193937953149143ffc7d1ba83fcd38f076f0de26e418c550d8a2fee",
+  "old_price": "",
+  "partial_effect_count": 0,
+  "product_keyword": "",
+  "product_list_refreshes": [
+    {
+      "ended_at": "2026-07-26T23:09:46+08:00",
+      "refresh_entry": "蚂蚁_首页_商品管理_入口",
+      "stage": "BEFORE_LISTING_RECONCILE",
+      "started_at": "2026-07-26T23:09:38+08:00",
+      "status": "SUCCESS"
+    }
+  ],
+  "product_name": "",
+  "queue_phase": "RESULT_WRITTEN",
+  "reconciliation_pending": false,
+  "request_file_sha256": "sha256:bcb60249c712d7905d1c83eead13963cddf10dda615dfa9e6f2021181ef0a111",
+  "requires_manual_review": false,
+  "result_id": "RESULT-29e5404d514b98f4c628fedb",
+  "result_path": "<REDACTED_PATH>/RECONCILE-e88fb8a4b4d60936236f0e0a.json",
+  "result_payload_sha256": "sha256:259e2ba741626e1b28e55103bac39375fbe1469754b7ac49b13a4a4bd876ba57",
+  "retryable": false,
+  "run_success_flag": true,
+  "schema_version": "shadowbot-listing-action-batch-result-1.0",
+  "selector_model": {
+    "inventory_index_offset": 6,
+    "inventory_text_index": 0,
+    "parent_class": "van-checkbox-group",
+    "price_index_offset": 9,
+    "row_index_start": 1,
+    "row_index_step": 16,
+    "waiting_row_index_step": 15
+  },
+  "side_effect_state": "VERIFIED",
+  "spec": "",
+  "spec_available": false,
+  "started_at": "2026-07-26T15:09:35+00:00",
+  "status": "VERIFIED",
+  "target_price": "",
+  "task_id": "",
+  "timing_trace": [
+    {
+      "duration_ms": 1982,
+      "stage": "window_prepare"
+    },
+    {
+      "duration_ms": 765,
+      "stage": "login_check"
+    },
+    {
+      "duration_ms": 8104,
+      "stage": "product_list_refresh"
+    },
+    {
+      "duration_ms": 6724,
+      "identity_rows": 1,
+      "inventory_reads": 0,
+      "non_target_rows_skipped": 1,
+      "page_type": "online",
+      "price_reads": 0,
+      "stage": "reconcile_online_scan",
+      "target_rows_hydrated": 0
+    },
+    {
+      "duration_ms": 17591,
+      "internal_sku": "AISHA-D-50-Z",
+      "stage": "listing_action_reconcile_total"
+    }
+  ],
+  "window_title": "",
+  "worker_heartbeat_at": "2026-07-26T15:09:53.430661+00:00",
+  "worker_id": "<REDACTED_DEVICE>"
+}

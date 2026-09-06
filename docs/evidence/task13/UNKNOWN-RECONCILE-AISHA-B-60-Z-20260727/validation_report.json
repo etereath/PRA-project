@@ -1,0 +1,55 @@
+{
+  "batch_id": "BATCH-T13-AUTO-RECONCILE-CONTROLLED-UNKNOWN-20260727-03",
+  "bundle_id": "UNKNOWN-RECONCILE-AISHA-B-60-Z-20260727",
+  "checks": {
+    "controlled_unknown_click_boundary_valid": true,
+    "count_equations_valid": true,
+    "final_database_ledger_valid": true,
+    "receipt_and_ack_binding_valid": true,
+    "redaction_valid": true,
+    "review_closed_by_reconcile_valid": true,
+    "single_read_only_reconcile_valid": true,
+    "two_stage_contract_binding_valid": true,
+    "write_lock_released_valid": true
+  },
+  "commit_execution_attempt_id": "ATTEMPT-664d3064fd864dcc",
+  "commit_item_execution_attempt_id": "ATTEMPT-49a4e1b1e6d18b4fe9cc88ca",
+  "generated_at": "2026-07-26T21:25:42.272264+00:00",
+  "internal_sku": "AISHA-B-60-Z",
+  "operation_id": "OP-8d6fbb4aad301d6979fc864d",
+  "reconcile_execution_attempt_id": "RECONCILE-ab020713eb4633c24441f141",
+  "reconcile_item_execution_attempt_id": "ATTEMPT-452d0d19de48a2579c13a17f",
+  "redaction_policy": {
+    "preserved": [
+      "business_identity",
+      "operation_and_attempt_ids",
+      "prices_and_inventory",
+      "timestamps",
+      "click_boundary",
+      "database_ledger_and_review_facts"
+    ],
+    "replaced": [
+      "local_or_unc_paths",
+      "worker_device_identifier"
+    ]
+  },
+  "sanitized_sha256": {
+    "commit.ack.sanitized.json": "8ad9e94ad2db09441b3786df054fa11247f114fb1362e26a5c58a45267d619dd",
+    "commit.phase.sanitized.json": "b746d5dedb3887d42cfaf78bd0ff82b3b8f09cd8b093c9edcb77736e2c7408ec",
+    "commit.receipt.sanitized.json": "f1926b761bbbbeb5c244f4dc29a57d0902e806f03fdd1cfdcba4931eedf93e87",
+    "commit.report.sanitized.md": "aafdb7d2aa97fccd67cb9bc015544550f69b334ec2470a757d65a74ef5f1bffa",
+    "commit.request.sanitized.json": "63f62b9c6a06004b5054c17a52856ce14332859aad6ee61709d827851f4ed4cf",
+    "commit.result.sanitized.json": "c5edf1fdabd28bcfae71d4d31afbfdf1ccbd9ca4ddcbeeead6f0b6f6cda7763e",
+    "database_backread.sanitized.json": "d81d56537fc40198460627e1c68d9be88c02e33ff872dbb947407f5d307add20",
+    "evidence_manifest.json": "ef59189e4c90ae2049af5137813e06b6518563faa9e6fe2a8736771913bf81e6",
+    "product_identity_mapping.json": "24f0dd9f88f0fe5e42587cc2b7866f035fef88bcbface3d0353afd99c4fa5ce6",
+    "reconcile.ack.sanitized.json": "eeec73c55a8f890d2c71037de9fc4be1bbc056bd7dce854e31c6eba2f9b3a0b6",
+    "reconcile.phase.sanitized.json": "8d82978426aa528b6fbeefa23801535ed0f25857a375c52922669fc8aeeac05d",
+    "reconcile.receipt.sanitized.json": "bc46a1485fde90f7d6c2ee5508abf90f623b08cf91e81fb153c7bce0a2f7faf3",
+    "reconcile.report.sanitized.md": "d49f4f6a0bb73431bec2c3c9e92059f615f458706d3fd0b47e7d3431e61ac907",
+    "reconcile.request.sanitized.json": "24c59e1a148cb0d5eb08c8abf8271c83d2013ffec4301548ddb443748780157e",
+    "reconcile.result.sanitized.json": "526d2e140b5be424b114196ac3d3e00152b78c22bcb17ffdc0abe9a327679aa7"
+  },
+  "schema_version": "task13-unknown-reconcile-evidence-validation-1.0",
+  "status": "VERIFIED"
+}

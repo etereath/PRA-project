@@ -1,0 +1,43 @@
+{
+  "action_type": "set_offline",
+  "applet_uri": "weixin://launchapplet/?app_id=wxdc8ef8e770254c0e",
+  "batch_id": "BATCH-T13-CONTROLLED-UNKNOWN-20260726-01",
+  "capture_evidence": false,
+  "contract_version": 5,
+  "created_at": "2026-07-26T15:09:35.053350+00:00",
+  "execution_attempt_id": "RECONCILE-e88fb8a4b4d60936236f0e0a",
+  "execution_mode": "RECONCILE",
+  "execution_profile": "development",
+  "expires_at": "2026-07-26T15:39:35.053350+00:00",
+  "instruction_hash": "sha256:b017b84362201a71d59219fa6e8cc5eb0e51d8fb7b0ef15dad13e56ee277a8f2",
+  "items": [
+    {
+      "action_type": "set_offline",
+      "expected_grade": "D级",
+      "expected_old_status": "online",
+      "expected_product_name": "艾莎",
+      "internal_sku": "AISHA-D-50-Z",
+      "item_execution_attempt_id": "ATTEMPT-998270bb749a6d09b9dadad0",
+      "item_id": "ITEM-2f5ab80a48b1bf5df79635ed",
+      "item_payload_sha256": "sha256:39ba834208ddd5c0a18d9b165ee0830b81100cb2bb2ffc6e5ba61b588ea68956",
+      "operation_id": "OP-60181b534f0096928bdf272f",
+      "page_identity_key": "蚂蚁花团供应商|name:艾莎|grade:D",
+      "source_task_id": "0bb3cc1d45b4",
+      "target_inventory": null,
+      "target_price": null,
+      "target_status": "offline",
+      "task_expires_at": "2026-07-26T15:04:00+00:00",
+      "write_identity_key": "蚂蚁花团供应商|sku:AISHA-D-50-Z"
+    }
+  ],
+  "manifest_sha256": "sha256:6341690fa193937953149143ffc7d1ba83fcd38f076f0de26e418c550d8a2fee",
+  "mapping_source_version": "sha256:24f0dd9f88f0fe5e42587cc2b7866f035fef88bcbface3d0353afd99c4fa5ce6",
+  "operation_id": "OP-60181b534f0096928bdf272f",
+  "platform_name": "蚂蚁花团供应商",
+  "scan_scope": "online",
+  "schema_version": "shadowbot-listing-action-batch-request-1.0",
+  "source_execution_attempt_id": "ATTEMPT-d671a8ef6c500c9dce9832fc",
+  "source_result_id": "RESULT-b5fba286c48d34f2ab689511",
+  "task_id": "0bb3cc1d45b4",
+  "window_title": "蚂蚁花团供应商"
+}

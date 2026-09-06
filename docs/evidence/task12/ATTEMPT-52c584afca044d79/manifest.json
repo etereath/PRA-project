@@ -1,0 +1,62 @@
+{
+  "batch_id": "BATCH-T12-REMEDIATION-COMMIT-20260723-01",
+  "development_confirmation_text": "确认授权批次 BATCH-T12-REMEDIATION-COMMIT-20260723-01 以上4项真实COMMIT",
+  "execution_mode": "COMMIT",
+  "items": [
+    {
+      "expected_grade": "B",
+      "expected_old_price": "10.00",
+      "expected_product_name": "艾莎",
+      "internal_sku": "AISHA-B-60-Z",
+      "item_id": "ITEM-634925d61e9cf1e65c9c572b56d9cae5",
+      "item_payload_sha256": "sha256:e1b67deb3d79fe508c3ec31cc8e5d988ea3e5981cfada616977aa3e46ab1b3fe",
+      "operation_id": "OP-407084a9ab062361e98c77d4d47c51b8",
+      "page_identity_key": "蚂蚁花团供应商|艾莎|B",
+      "source_task_id": "44832c9ddcb3",
+      "target_price": "10.10",
+      "write_identity_key": "蚂蚁花团供应商|AISHA-B-60-Z"
+    },
+    {
+      "expected_grade": "C",
+      "expected_old_price": "7.80",
+      "expected_product_name": "艾莎",
+      "internal_sku": "AISHA-C-55-Z",
+      "item_id": "ITEM-a321f9c08b6d12d5755fc638d59108b0",
+      "item_payload_sha256": "sha256:8fefd72ae17c2c6d80782cd81a8557fbe4f804df88f64b63c174bd3291c310f9",
+      "operation_id": "OP-bbb0762744d02564cdd0069bd738762b",
+      "page_identity_key": "蚂蚁花团供应商|艾莎|C",
+      "source_task_id": "d2e183fba9a7",
+      "target_price": "7.90",
+      "write_identity_key": "蚂蚁花团供应商|AISHA-C-55-Z"
+    },
+    {
+      "expected_grade": "D",
+      "expected_old_price": "9.00",
+      "expected_product_name": "艾莎",
+      "internal_sku": "AISHA-D-50-Z",
+      "item_id": "ITEM-396dc3181a60b8bfd8b89f11d180e1e9",
+      "item_payload_sha256": "sha256:eb267cb31ab9712130eef4d334c78b3b43425c11c0d0524e19b1b97a5c313615",
+      "operation_id": "OP-14fe6afd8fee39872c2114f2ebaef030",
+      "page_identity_key": "蚂蚁花团供应商|艾莎|D",
+      "source_task_id": "d8255d95290d",
+      "target_price": "9.10",
+      "write_identity_key": "蚂蚁花团供应商|AISHA-D-50-Z"
+    },
+    {
+      "expected_grade": "E",
+      "expected_old_price": "12.50",
+      "expected_product_name": "卡布奇诺",
+      "internal_sku": "CAPPUCCINO-E-45-Z",
+      "item_id": "ITEM-80b34dbddb3ac49b440335d82c39acd9",
+      "item_payload_sha256": "sha256:1bd64d1462d1843d4c4e11c7d98adabeca974fd763664b193e659ec54c92fb46",
+      "operation_id": "OP-61040c5324d1e4abee923fd285f51a64",
+      "page_identity_key": "蚂蚁花团供应商|卡布奇诺|E",
+      "source_task_id": "fbf5602937a5",
+      "target_price": "12.60",
+      "write_identity_key": "蚂蚁花团供应商|CAPPUCCINO-E-45-Z"
+    }
+  ],
+  "manifest_sha256": "sha256:880a883c80b6e2af76def524e63429e628bd33d2de57a7ad2b941ab1602a7957",
+  "platform_name": "蚂蚁花团供应商",
+  "schema_version": "shadowbot-commit-manifest-1.2"
+}

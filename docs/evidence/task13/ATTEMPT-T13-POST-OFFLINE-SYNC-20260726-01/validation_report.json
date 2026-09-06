@@ -1,0 +1,61 @@
+{
+  "batch_id": "BATCH-T13-POST-OFFLINE-SYNC-20260726-01",
+  "bundle_id": "ATTEMPT-T13-POST-OFFLINE-SYNC-20260726-01",
+  "checks": {
+    "database_backread_count_identity_valid": true,
+    "mapping_binding_valid": true,
+    "read_only_side_effect_boundary_valid": true,
+    "receipt_and_ack_binding_valid": true,
+    "redaction_valid": true,
+    "request_contract_valid": true,
+    "request_result_phase_binding_valid": true,
+    "snapshot_count_identity_valid": true,
+    "two_page_completeness_valid": true
+  },
+  "database_counts": {
+    "open_anomaly_count": 11,
+    "projected_listing_status_count": 8,
+    "related_notification_count": 11,
+    "related_review_count": 11
+  },
+  "execution_attempt_id": "ATTEMPT-T13-POST-OFFLINE-SYNC-20260726-01",
+  "generated_at": "2026-07-25T20:45:09.847335+00:00",
+  "location_counts": {
+    "ambiguous": 6,
+    "neither": 5,
+    "online_only": 3,
+    "waiting_only": 3
+  },
+  "online_observations": 3,
+  "redaction_policy": {
+    "preserved": [
+      "business_identity",
+      "prices_and_inventory",
+      "task_and_attempt_ids",
+      "timestamps",
+      "page_location_and_anomaly_facts",
+      "database_backread_counts"
+    ],
+    "replaced": [
+      "local_or_unc_paths",
+      "worker_device_identifier"
+    ]
+  },
+  "result_id": "RESULT-8f4cb3732a41a07f50c5a593",
+  "sanitized_sha256": {
+    "ack": "c65b669751f3f04bed2abc229802e949b83313c8589e271cccc2df3b51b19f29",
+    "database_projection": "4941c76ed71fd2a0bc75918d9f58f296ec2c33751e4b85bb54de990f77c2a45a",
+    "manifest": "b6ff250b516d21e7564d6300854840b5406b4dad7dc68668a2b2b651f1c4d89a",
+    "mapping": "c2217c91d8a00879867373f570f7e574141351f860fcc12481f68e4f559ab4b8",
+    "phase": "73574fd282d4d1a573e113b47a007ac1cd8bcbd1bfd46f79a88ad8917d7acf59",
+    "receipt": "a9a04ae0a0149811ef5b046beac1c4a6a22c75d170b322f08811a9608c16a528",
+    "report": "55e02e8d5aec7c29767b18b0cf11ec0a1d2c73c24432f7ce63bf1efdb1452449",
+    "request": "dbd029ddda976ee47147c1e446333c3fe7a912f792d12f65baad8d2de4aa4f94",
+    "result": "0758053c474e878f26025b90f47a5a320b2941adc83210348e3ff05f4c7c111c"
+  },
+  "schema_version": "task13-sanitized-evidence-validation-1.0",
+  "snapshot_id": "SNAPSHOT-8f4cb3732a41a07f50c5a593",
+  "snapshot_item_count": 17,
+  "status": "VERIFIED",
+  "waiting_observations": 9
+}

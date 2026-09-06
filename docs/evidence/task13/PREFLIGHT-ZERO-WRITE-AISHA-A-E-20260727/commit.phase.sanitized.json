@@ -1,0 +1,16 @@
+{
+  "action_type": "set_online",
+  "batch_id": "BATCH-T13-PREFLIGHT-ZERO-WRITE-20260727-01",
+  "contract_version": 5,
+  "detail_effect_state": "NOT_STARTED",
+  "execution_attempt_id": "ATTEMPT-591f3a642e2b43f9",
+  "instruction_hash": "sha256:5f126a61c5413fcabc7c3e4b7a4c68484824ed7e40d1a2523ece1eb12f12e3d1",
+  "listing_effect_state": "NOT_STARTED",
+  "manifest_sha256": "sha256:2a7ad2e97d076a84b7d47e7fe875e3894c12e58db782962f45f4999784607b14",
+  "phase": "RESULT_WRITTEN",
+  "phase_at": "2026-07-26T23:23:54.220353+00:00",
+  "phase_snapshot_sha256": "sha256:69ceff31c054f9a47579fbf6fe2b46af603fe88bf41ccd9b7faba5550bc1c069",
+  "request_file_sha256": "sha256:9bf5502a6c65d2ec12a9a2a5ff682538bcab83b052c24467779f43d6f1431473",
+  "schema_version": "shadowbot-listing-action-batch-phase-1.0",
+  "worker_id": "<REDACTED_DEVICE>"
+}

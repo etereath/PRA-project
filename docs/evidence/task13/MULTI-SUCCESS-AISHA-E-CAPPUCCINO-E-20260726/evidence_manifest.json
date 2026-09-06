@@ -1,0 +1,34 @@
+{
+  "expected": {
+    "internal_skus": [
+      "AISHA-E-45-Z",
+      "CAPPUCCINO-E-45-Z"
+    ],
+    "per_batch_target_count": 2,
+    "per_batch_verified_count": 2,
+    "set_offline_batch_id": "BATCH-T13-OPTIMIZED-SET-OFFLINE-20260726-02",
+    "set_offline_execution_attempt_id": "ATTEMPT-T13-OPTIMIZED-SET-OFFLINE-20260726-02",
+    "set_online_batch_id": "BATCH-T13-OPTIMIZED-SET-ONLINE-20260726-02",
+    "set_online_execution_attempt_id": "ATTEMPT-T13-OPTIMIZED-SET-ONLINE-20260726-02"
+  },
+  "mapping_sha256": "24f0dd9f88f0fe5e42587cc2b7866f035fef88bcbface3d0353afd99c4fa5ce6",
+  "original_archive_sha256": {
+    "set_offline": {
+      "ack": "5c3613f12e096fc96ca262d1e3540569830c1a5e4d7f95696439283e5ce68f4b",
+      "phase": "c4da06fdb20ffe86764c5fe80781bb09ab230489302e7d6b41adde9878b10193",
+      "receipt_canonical_json": "b323c759c98b2dfaeec394fe10419fe6c300003972b30ac3ba913262da803d78",
+      "report": "8757f1a729e490852d6197c84ab947654d4cab16144099e26ac1c5d20bc2edc0",
+      "request": "379c026286dad2b488dc8a8bd15834e9d85136cddad9872fbc8004c834267025",
+      "result": "091944ecc06a159140a6d4e0adfc96e85a744bf82c0c3c9cdbcc10835fd8587e"
+    },
+    "set_online": {
+      "ack": "10f18b5918b9945b7fe68e17f11936ff9beb206dc153982da6d91f7397fe3a25",
+      "phase": "83511a133016bac5db92508965d26b86873ce1048d2edf89831490d4674ea5e1",
+      "receipt_canonical_json": "a0bd46546e70011f39e3508217bed8c474b6b090289e32b11d4e34d9f47ab8d6",
+      "report": "e5e6c75a252c539611c6b96831e30f8a0c2297100329e53662f5e2198c8a9b8c",
+      "request": "3d47e419741be598373b736f0c09ffce5ea7c3abfc89363878f38af93980166c",
+      "result": "61c2acb8cce7f07a388ab6f1e31684b1a8bd0bf8d6c32722a7cd84cef8a279d8"
+    }
+  },
+  "schema_version": "task13-multi-success-evidence-manifest-1.0"
+}
