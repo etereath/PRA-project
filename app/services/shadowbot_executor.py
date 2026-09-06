@@ -1137,6 +1137,19 @@ class ShadowBotExecutor:
         operation = self.repository.get_shadowbot_operation(attempt.operation_id)
         if operation is None:
             raise ValidationError("operation_id does not exist.")
+        # For an accepted v4 UNKNOWN, the Task is already in manual_review.
+        # An inconclusive reconcile replay has no new fact to project. Skip it
+        # based on immutable ownership, so concurrent human closure cannot be
+        # overwritten between a status check and the projection writes.
+        from contextlib import closing
+        with closing(self.repository.connect_read()) as connection:
+            if (attempt.execution_mode == EXECUTION_MODE_RECONCILE
+                    and result.side_effect_state not in {SIDE_EFFECT_VERIFIED, SIDE_EFFECT_NOT_APPLIED}
+                    and connection.execute(
+                        'SELECT 1 FROM execution_continuations c JOIN shadowbot_commit_batch_items i '
+                        'ON i.batch_id = c.batch_id WHERE i.operation_id = ?',
+                        (operation.operation_id,)).fetchone() is not None):
+                return
         operation_status = _operation_status_from_result(result)
         if result.status in {STATUS_READ_COMPLETED, STATUS_PREVIEW_COMPLETED}:
             operation_status = str(
@@ -1166,7 +1179,9 @@ class ShadowBotExecutor:
         operation: ShadowBotOperationLedger,
         result: ShadowBotResultContract,
     ) -> None:
-        if result.business_operation_completed is not True:
+        if result.business_operation_completed is not True and not (
+            result.execution_mode == EXECUTION_MODE_RECONCILE and result.status == STATUS_NOT_APPLIED
+        ):
             return
         variety = str(
             operation.product_identity.get("expected_product_name")
@@ -1182,13 +1197,17 @@ class ShadowBotExecutor:
         ).strip()
         if not variety or not grade:
             return
-        raw_price = result.raw_output.get("actual_price") or result.raw_output.get("verified_price")
+        raw_price = result.raw_output.get("actual_price")
+        if raw_price in (None, ""):
+            raw_price = result.raw_output.get("verified_price")
+        if raw_price in (None, "") and result.execution_mode == EXECUTION_MODE_RECONCILE:
+            return
         try:
             current_price = Decimal(str(raw_price)) if raw_price not in (None, "") else operation.target_price
             if not current_price.is_finite() or current_price < 0:
-                current_price = operation.target_price
+                return
         except (InvalidOperation, TypeError, ValueError):
-            current_price = operation.target_price
+            return
         existing = self.repository.get_listing_status(operation.platform, variety, grade)
         if existing is None:
             return
@@ -1211,6 +1230,8 @@ class ShadowBotExecutor:
             current_price=current_price,
             source="shadowbot",
             updated_at=observed_at,
+            price_observed_at=observed_at if raw_price not in (None, '') else None,
+            price_source_attempt_id=result.execution_attempt_id if raw_price not in (None, '') else '',
         )
 
     def open_login_verification_handoff(self, phase_data: dict[str, Any]) -> str:

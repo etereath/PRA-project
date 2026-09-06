@@ -23,6 +23,9 @@ from app.operations_web.auth import (
 )
 from app.models import TaskStatusHistory
 from app.repositories.inventory_repository import InventoryRepository
+from app.repositories.execution_continuation_repository import (
+    ExecutionContinuationRepository, digest_json,
+)
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import load_products
 from app.services.product_mapping import compile_product_mapping_workbook
@@ -42,7 +45,7 @@ from app.utils import utc_now
 
 AUTHORIZATION_TTL = timedelta(minutes=10)
 MAX_PREPARATIONS = 512
-CONTRACT_VERSION = "task13.5-7e-execution-authorization-1.0"
+CONTRACT_VERSION = "task13.7-1-execution-authorization-1.0"
 
 
 class ExecutionAuthorizationError(ValidationError):
@@ -55,6 +58,10 @@ class ExecutionAuthorizationForbidden(ExecutionAuthorizationError):
 
 class ExecutionAuthorizationConflict(ExecutionAuthorizationError):
     pass
+
+
+class ExecutionAuthorizationBlocked(ExecutionAuthorizationConflict):
+    """A temporary scheduling condition; the accepted authorization may wait."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -127,6 +134,7 @@ class ExecutionAuthorizationApplicationService:
         self.v5_propose = v5_propose
         self.v5_publish = v5_publish
         self.inventory = InventoryRepository(runtime_repository)
+        self.continuations = ExecutionContinuationRepository(runtime_repository)
         self._preparations: dict[str, _StoredPreparation] = {}
         self._idempotency: dict[tuple[str, str], str] = {}
         self._lock = Lock()
@@ -157,6 +165,7 @@ class ExecutionAuthorizationApplicationService:
                     "本次执行请求与之前的任务不同，请刷新页面后重新预览。"
                 )
 
+        self._refresh_correction(task_ids, authenticated_principal.subject, current)
         facts = self._revalidate(task_ids, current)
         action_type = TaskActionType(str(facts["action_type"]))
         batch_id = _batch_id(
@@ -180,7 +189,10 @@ class ExecutionAuthorizationApplicationService:
                     "上下架执行门禁未通过，请处理阻断项后重试。"
                 )
 
-        expires_at = current + AUTHORIZATION_TTL
+        expires_at = min([current + AUTHORIZATION_TTL] + [
+            _parse_datetime(item['task_expires_at']) for item in facts['items']
+            if item['task_expires_at']
+        ])
         digest_payload = {
             "contract_version": CONTRACT_VERSION,
             "principal_subject": authenticated_principal.subject,
@@ -233,6 +245,15 @@ class ExecutionAuthorizationApplicationService:
         task_ids = _exact_task_ids(exact_task_ids)
         digest = str(confirmation_digest or "").strip()
         key = str(idempotency_key or "").strip()
+        replay = self.continuations.replay(authenticated_principal.subject, key)
+        if replay is not None:
+            envelope = json.loads(replay['envelope_json'])
+            if (envelope['confirmation_digest'] != digest
+                    or tuple(envelope['task_ids']) != task_ids):
+                raise ExecutionAuthorizationForbidden(
+                    "执行确认与登录身份或任务批次不匹配。"
+                )
+            return ExecutionSubmissionResult(replay['batch_id'], '', '', task_ids)
         with self._lock:
             self._purge(current)
             stored = self._preparations.get(digest)
@@ -299,6 +320,24 @@ class ExecutionAuthorizationApplicationService:
                 raise ExecutionAuthorizationError(
                     "未配置 SHADOWBOT_APPLET_URI，已阻止投递。"
                 )
+            if action_type is TaskActionType.UPDATE_PRICE:
+                envelope = {
+                    'version': 1,
+                    'capability': Capability.SUBMIT_EXECUTION.value,
+                    'principal_subject': authenticated_principal.subject,
+                    'idempotency_hash': digest_json(key),
+                    'confirmation_digest': digest,
+                    'task_ids': list(task_ids),
+                    'batch_id': public.batch_id,
+                    'expires_at': public.expires_at.isoformat(),
+                    'facts': facts,
+                    'manifest': latest_payload,
+                    'context': self.continuation_context(),
+                }
+                self.continuations.accept(envelope, now=current)
+                with self._lock:
+                    stored.state = 'SUBMITTED'
+                return ExecutionSubmissionResult(public.batch_id, '', '', task_ids)
             runner = self.runner_factory(self.queue_root)
             self._record_authorization_audit(
                 task_ids=task_ids,
@@ -312,35 +351,14 @@ class ExecutionAuthorizationApplicationService:
             confirmed_by = (
                 authenticated_principal.subject if development_confirmation else ""
             )
-            if action_type is TaskActionType.UPDATE_PRICE:
-                confirmation_text = (
-                    str(latest_payload.get("development_confirmation_text") or "")
-                    if development_confirmation
-                    else ""
-                )
-                request, start = self.v4_publish(
-                    self.runtime,
-                    runner,
-                    manifest=latest_payload,
-                    execution_profile=self.execution_profile,
-                    applet_uri=self.applet_uri,
-                    confirmation_text=confirmation_text,
-                    confirmed_by=confirmed_by,
-                )
-            else:
-                confirmation_text = (
-                    str(latest_payload.get("required_confirmation") or "")
-                    if development_confirmation
-                    else ""
-                )
-                request, start = self.v5_publish(
-                    self.runtime,
-                    runner,
-                    proposal=latest_payload,
-                    applet_uri=self.applet_uri,
-                    confirmation_text=confirmation_text,
-                    confirmed_by=confirmed_by,
-                )
+            confirmation_text = (
+                str(latest_payload.get("required_confirmation") or "")
+                if development_confirmation else ""
+            )
+            request, start = self.v5_publish(
+                self.runtime, runner, proposal=latest_payload, applet_uri=self.applet_uri,
+                confirmation_text=confirmation_text, confirmed_by=confirmed_by,
+            )
         except Exception:
             with self._lock:
                 stored.state = "CONSUMED_FAILED"
@@ -395,6 +413,13 @@ class ExecutionAuthorizationApplicationService:
                 "执行授权审计未完整写入，已阻止投递。"
             )
 
+    def continuation_context(self) -> dict[str, str]:
+        return {
+            'execution_profile': self.execution_profile,
+            'queue_root': str(self.queue_root.resolve()),
+            'applet_uri_sha256': digest_json(self.applet_uri),
+        }
+
     def _prepare_v4(
         self,
         task_ids: tuple[str, ...],
@@ -433,6 +458,8 @@ class ExecutionAuthorizationApplicationService:
         self,
         task_ids: tuple[str, ...],
         current: datetime,
+        *,
+        allow_already_applied: bool = False,
     ) -> dict[str, object]:
         products_bytes = self.products_workbook.read_bytes()
         products = load_products(self.products_workbook)
@@ -449,7 +476,7 @@ class ExecutionAuthorizationApplicationService:
 
         with closing(self.runtime.connect_read()) as connection:
             if has_active_automation_ui_run(connection, now=current):
-                raise ExecutionAuthorizationConflict(
+                raise ExecutionAuthorizationBlocked(
                     "平台状态正在更新，暂不能提交执行，请稍后重试。"
                 )
             authority = inventory.get_authority_state(connection=connection)
@@ -479,6 +506,9 @@ class ExecutionAuthorizationApplicationService:
             item_facts: list[dict[str, object]] = []
             for task_id in task_ids:
                 row = rows_by_id[task_id]
+                from app.services.price_decisions import unresolved_predecessors
+                if unresolved_predecessors(connection, task_id):
+                    raise ExecutionAuthorizationBlocked("先前操作尚未收口；新的价格决定已保留。")
                 if str(row["task_status"]) != TaskStatus.PENDING.value:
                     raise ExecutionAuthorizationConflict("所选任务已不在待执行状态，请刷新列表。")
                 expires_at = _parse_datetime(row["expires_at"])
@@ -513,7 +543,7 @@ class ExecutionAuthorizationApplicationService:
                     (task_id, sku, next(iter(platforms))),
                 ).fetchone()
                 if pending_review is not None:
-                    raise ExecutionAuthorizationConflict(f"任务仍有待处理复核：{task_id}")
+                    raise ExecutionAuthorizationBlocked(f"任务仍有待处理复核：{task_id}")
                 active_locks = connection.execute(
                     """
                     SELECT lock.status, operation.platform,
@@ -535,7 +565,7 @@ class ExecutionAuthorizationApplicationService:
                     for row in active_locks
                 )
                 if active_lock:
-                    raise ExecutionAuthorizationConflict(f"商品 {sku} 正在执行其他平台操作，请稍后重试。")
+                    raise ExecutionAuthorizationBlocked(f"商品 {sku} 正在执行其他平台操作，请稍后重试。")
 
                 identity = identity_mapping.get(sku)
                 if identity is None:
@@ -548,9 +578,17 @@ class ExecutionAuthorizationApplicationService:
                 if listing is None:
                     raise ExecutionAuthorizationConflict(f"缺少商品 {sku} 的最新平台状态。")
                 expected_old = _optional_decimal(row["expected_old_price"])
+                if action_type is TaskActionType.UPDATE_PRICE:
+                    observed_at = listing.price_observed_at
+                    if (observed_at is None or not listing.price_source_attempt_id
+                            or not timedelta(0) <= current - _aware_utc(observed_at) <= timedelta(minutes=30)):
+                        raise ExecutionAuthorizationConflict("平台价格观察已过期，请先刷新平台事实。")
+                    if str(listing.online_status).lower() != 'online':
+                        raise ExecutionAuthorizationConflict("商品当前未上架，请重新决定。")
                 if (
                     action_type is TaskActionType.UPDATE_PRICE
                     and expected_old != listing.current_price
+                    and not (allow_already_applied and target_price == listing.current_price)
                 ):
                     raise ExecutionAuthorizationConflict(
                         "任务中的原价格与平台最新价格不一致，请重新预览。"
@@ -577,6 +615,7 @@ class ExecutionAuthorizationApplicationService:
                     {
                         "task_id": task_id,
                         "task_updated_at": str(row["updated_at"]),
+                        "task_expires_at": str(row['expires_at'] or ''),
                         "action_type": action_type.value,
                         "internal_sku": sku,
                         "expected_old_price": _decimal_text(expected_old),
@@ -589,6 +628,8 @@ class ExecutionAuthorizationApplicationService:
                         "listing_price": _decimal_text(listing.current_price),
                         "listing_status": listing.online_status,
                         "listing_updated_at": _datetime_text(listing.updated_at),
+                        "listing_price_observed_at": _datetime_text(listing.price_observed_at),
+                        "listing_price_source_attempt_id": listing.price_source_attempt_id,
                     }
                 )
 
@@ -604,6 +645,58 @@ class ExecutionAuthorizationApplicationService:
             ).hexdigest(),
             "items": item_facts,
         }
+
+    def _refresh_correction(self, task_ids, subject, current):
+        """Explicit human re-preview may rebase a waiting/reconfirm decision.
+
+        It changes only an unpublished Task. Previously prepared manifests and
+        accepted envelopes stay immutable and cannot authorize the new old price.
+        """
+        from app.services.price_decisions import unresolved_predecessors
+        mapping = load_identity_mapping(self.shadowbot_identity_mapping)
+        with closing(self.runtime.connect_write()) as connection, connection:
+            connection.execute('BEGIN IMMEDIATE')
+            for task_id in task_ids:
+                row = connection.execute('SELECT * FROM tasks WHERE task_id = ?', (task_id,)).fetchone()
+                if row is None or row['task_status'] != 'pending' or row['action_type'] != 'update_price':
+                    continue
+                trace = json.loads(row['decision_trace_json'] or '{}')
+                if not trace.get('price_decision_version') or unresolved_predecessors(connection, task_id):
+                    continue
+                active = connection.execute(
+                    """SELECT 1 FROM execution_continuations c JOIN shadowbot_commit_batch_items i
+                       ON i.batch_id = c.batch_id WHERE i.source_task_id = ? AND c.closed_at IS NULL""",
+                    (task_id,),
+                ).fetchone()
+                reconfirm = connection.execute(
+                    """SELECT 1 FROM execution_continuations c JOIN shadowbot_commit_batch_items i
+                       ON i.batch_id = c.batch_id WHERE i.source_task_id = ? AND c.outcome = 'RECONFIRM'""",
+                    (task_id,),
+                ).fetchone()
+                if active or not (trace.get('predecessor_task_ids') or reconfirm):
+                    continue
+                identity = mapping.get(str(row['internal_sku']).upper())
+                if identity is None:
+                    continue
+                listing = self.runtime.get_listing_status(row['platform_name'],
+                    identity['expected_product_name'], identity['expected_grade'])
+                if (listing is None or listing.current_price is None or not listing.price_source_attempt_id
+                        or listing.price_observed_at is None
+                        or not timedelta(0) <= current - _aware_utc(listing.price_observed_at) <= timedelta(minutes=30)):
+                    continue
+                if _optional_decimal(row['expected_old_price']) == listing.current_price:
+                    continue
+                connection.execute('UPDATE tasks SET expected_old_price = ?, updated_at = ? WHERE task_id = ?',
+                    (_decimal_text(listing.current_price), current.isoformat(), task_id))
+                connection.execute(
+                    'INSERT INTO task_status_history VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                    ('REBASE-' + uuid4().hex, task_id, 'pending', 'pending', subject,
+                     current.isoformat(), 'price_correction_preview', json.dumps({
+                         'previous_expected_old_price': row['expected_old_price'],
+                         'expected_old_price': _decimal_text(listing.current_price),
+                         'observation_attempt_id': listing.price_source_attempt_id,
+                     }, ensure_ascii=False)),
+                )
 
     def _require_capability(self, principal: Principal) -> None:
         if not self.authorization.allows(principal, Capability.SUBMIT_EXECUTION):

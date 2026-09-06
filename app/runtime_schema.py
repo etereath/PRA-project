@@ -13,13 +13,14 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-LATEST_RUNTIME_SCHEMA_VERSION = 17
+LATEST_RUNTIME_SCHEMA_VERSION = 18
 RUNTIME_SCHEMA_VERSIONS = tuple(range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1))
 
 REQUIRED_RUNTIME_TABLES = frozenset(
     {
         "runtime_schema_migrations",
         "tasks",
+        "execution_continuations",
         "review_tasks",
         "review_tokens",
         "execution_logs",
@@ -82,6 +83,13 @@ V14_APPEND_ONLY_TABLES = (
 
 V15_APPEND_ONLY_TABLES = ("operational_incident_events",)
 V17_APPEND_ONLY_TABLES = ("inventory_transactions",)
+
+V18_REQUIRED_COLUMNS = {
+    "execution_continuations": (
+        "batch_id", "principal_subject", "idempotency_hash", "envelope_sha256",
+        "envelope_json", "accepted_at", "closed_at", "outcome", "message",
+    ),
+}
 
 V7_REQUIRED_COLUMNS: Mapping[str, tuple[str, ...]] = {
     "listing_status": (
@@ -1117,6 +1125,7 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
             **V15_REQUIRED_COLUMNS,
             **V16_REQUIRED_COLUMNS,
             **V17_REQUIRED_COLUMNS,
+            **V18_REQUIRED_COLUMNS,
         }.items():
             if table not in tables:
                 continue
@@ -1187,6 +1196,7 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
             missing_index_names.update(
                 _check_v17_constraints(connection, constraint_errors)
             )
+            missing_index_names.update(_check_v18_constraints(connection, constraint_errors))
         missing_indexes = tuple(sorted(missing_index_names))
 
         ok = not (
@@ -2130,6 +2140,24 @@ def _check_v16_constraints(
             errors.append(f"missing trigger {trigger_name}")
 
     return tuple(sorted(missing_indexes))
+
+
+def _check_v18_constraints(connection, errors):
+    indexes = {
+        tuple(str(c[2]) for c in connection.execute(f"PRAGMA index_info('{row[1]}')"))
+        for row in connection.execute("PRAGMA index_list('execution_continuations')")
+        if row[2]
+    }
+    if ('principal_subject', 'idempotency_hash') not in indexes:
+        errors.append('execution continuation idempotency constraint is missing')
+    for name in ('execution_continuations_authorization_immutable', 'execution_continuations_no_delete'):
+        trigger = connection.execute("SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?", (name,)).fetchone()
+        if trigger is None or 'execution authorization is immutable' not in str(trigger[0]):
+            errors.append('missing trigger ' + name)
+    index = connection.execute("PRAGMA index_info('ix_execution_continuations_open')").fetchall()
+    if tuple(str(c[2]) for c in index) != ('closed_at', 'accepted_at'):
+        return ('ix_execution_continuations_open',)
+    return ()
 
 
 def _check_v17_constraints(

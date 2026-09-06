@@ -542,7 +542,7 @@ class OperationsQueryService:
                                 ),
                             )
                         )
-                if actions:
+                if actions or review.review_type == 'price_execution_unknown':
                     pending_review_options.append(
                         ReviewControlReadModel(
                             review_task_id=review.review_task_id,
@@ -1754,6 +1754,58 @@ class OperationsQueryService:
             DetailFieldReadModel("结果", _task_result_detail(item)),
         )
         state = _task_state(item)
+        if item.action_type.value == 'update_price':
+            from contextlib import closing
+            from app.services.task_execution_coordinator import MESSAGES
+            with closing(self.runtime.connect_read()) as connection:
+                continuation = connection.execute(
+                    """SELECT c.*, b.status AS batch_status FROM execution_continuations c
+                       JOIN shadowbot_commit_batches b ON b.batch_id = c.batch_id
+                       JOIN shadowbot_commit_batch_items i ON i.batch_id = c.batch_id
+                       WHERE i.source_task_id = ? ORDER BY c.accepted_at DESC LIMIT 1""",
+                    (task_id,),
+                ).fetchone()
+                readback = connection.execute(
+                    """SELECT i.actual_price, i.readback_observed_at, i.item_execution_attempt_id,
+                              i.operation_id, b.result_id
+                       FROM shadowbot_commit_batch_items i
+                       JOIN shadowbot_commit_batches b ON b.batch_id = i.batch_id
+                       WHERE i.source_task_id = ? AND i.actual_price IS NOT NULL
+                       ORDER BY i.updated_at DESC LIMIT 1""", (task_id,),
+                ).fetchone()
+            fields += (DetailFieldReadModel('预期原价格', _money(item.expected_old_price)),
+                       DetailFieldReadModel('决定有效期', _datetime(item.expires_at)))
+            if continuation:
+                outcome = continuation['outcome'] or 'ACCEPTED'
+                fields += (
+                    DetailFieldReadModel('执行进度', MESSAGES.get(outcome, '执行状态待核对。')),
+                    DetailFieldReadModel('授权批次', continuation['batch_id']),
+                    DetailFieldReadModel('当前责任方', '管理员' if outcome == 'HUMAN' else
+                        ('执行服务' if continuation['closed_at'] is None else '人工 / 已收口')),
+                )
+            else:
+                fields += (DetailFieldReadModel('下一步', '人工预览并确认；先前操作未收口时保留本次决定。'),)
+            if readback:
+                fields += (DetailFieldReadModel('执行回读价格', _money(Decimal(readback['actual_price']))),
+                           DetailFieldReadModel('回读时间', str(readback['readback_observed_at'] or '—')),
+                           DetailFieldReadModel('回读来源', str(readback['item_execution_attempt_id'])),
+                           DetailFieldReadModel('结果凭据', str(readback['result_id'])))
+            with closing(self.runtime.connect_read()) as connection:
+                reconciles = connection.execute(
+                    """SELECT a.execution_attempt_id, a.status, a.raw_output_json, o.operation_id
+                       FROM shadowbot_execution_attempts a JOIN shadowbot_operations o
+                         ON o.operation_id = a.operation_id
+                       WHERE o.task_id = ? AND a.execution_mode = 'RECONCILE'
+                       ORDER BY a.started_at DESC LIMIT 1""", (task_id,),
+                ).fetchone()
+            if reconciles:
+                raw = json.loads(reconciles['raw_output_json'] or '{}')
+                fields += (DetailFieldReadModel('对账操作', reconciles['operation_id']),
+                           DetailFieldReadModel('唯一对账记录', reconciles['execution_attempt_id']),
+                           DetailFieldReadModel('对账状态', reconciles['status']))
+                if raw.get('actual_price') and (raw.get('observed_at') or raw.get('readback_observed_at')):
+                    fields += (DetailFieldReadModel('对账回读价格', str(raw['actual_price'])),
+                               DetailFieldReadModel('对账观察时间', str(raw.get('readback_observed_at') or raw['observed_at'])))
         return DetailReadModel("任务详情", "任务信息", state, fields)
 
     def _review_detail(self, review_task_id: str) -> DetailReadModel | None:
