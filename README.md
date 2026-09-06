@@ -2,7 +2,7 @@
 
 PRA 支持鲜切花预测性销售：持续观察平台与供给事实，供管理者通过 Operations Web 作出决定，再经授权、执行、回读和恢复形成闭环。当前销售 Controller 是人类。
 
-当前进行 **Task 13.6-3 文档入口与 AI 上下文收口**。G1/G2 已合并；13.6 Overall 尚未验收通过，13.7 不得开工。[最新状态与证据](docs/project_current_status.md)
+项目负责人已验收 **Task 13.6 Overall PASS**，当前准备 **Task 13.7 首条人工改价闭环**。[最新状态与验收证据](docs/project_current_status.md)；[下一阶段计划与开发 Goal](docs/plans/task13_7_human_update_price_vertical_slice.md)。代码施工从 PR #46 合入后的最新 main 新建分支，验收通过不等于已合并或已部署。
 
 ## 阅读入口
 

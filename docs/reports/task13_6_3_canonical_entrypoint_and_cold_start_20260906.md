@@ -339,3 +339,32 @@ GLM 定向提示使用聚合30、人工分配18/12、管理员确认、后续同
 - Answer Review：D-1 CLOSED；G-1 PARTIALLY RESOLVED；L-1～L-3未收到复核，不因文档修正自动关闭。
 - Formal Cold-start / Task 13.6-3 / Overall Stage Goal：NOT YET VALIDATED，Owner Final Confirmation尚未给出。
 - Task 13.7 Readiness：NOT READY；PR仍Draft，未执行合并或平台操作。
+
+## 负责人最终验收与13.7交接（2026-09-06，追加记录）
+
+负责人在收到测试反馈修订、新Head与CI结果后明确回复：
+
+> 验收通过,准备下一阶段
+
+本次接受对应上一轮实际交付的 `4d51f51edcafc4168149928f6ee64467cd12421a`。记录前再次读取GitHub：PR #46 Head仍为此SHA，main仍为 `08041bfe25a7f31f032564a2abca35e5eb5f5330`，PR仍Draft且未合并；正式AGENTS blob为 `2e580b9c9169717743f265a2e20085039c38ef46`；该Head的[Windows/Linux Core CI](https://github.com/etereath/PRA-project/actions/runs/34041256409)均success。没有新增PR审查评论需要处理。
+
+这是负责人给出的正式验收裁决，按已约定规则记录Cold-start Validation、Owner Final Confirmation和Stage Goal通过，不再索要同一确认。本轮未额外运行独立模型，也未收到一份新的逐题答卷，因此不虚构模型名、运行日志或新的场景分数。前文DeepSeek D-1关闭、GLM G-1部分解决、Luna未复核和各环境限制保留原状；负责人接受最终交付不等于所有历史答卷被改写为PASS。
+
+| 验收对象 | 最终结论 |
+|---|---|
+| Canonical Entrypoint Convergence | PASS |
+| Final AGENTS Effective | YES，接受版本已在PR分支实际生效，临时版原样归档 |
+| Formal Cold-start Validation | PASS，负责人正式裁决；非本轮实施者重新运行 |
+| Owner Final Confirmation | CONFIRMED |
+| Task 13.6-3 Stage Goal | PASS |
+| Task 13.6 Overall | PASS |
+| Task 13.7 Readiness | READY，业务与文档交接条件成立 |
+| Task 13.7 implementation / real-platform acceptance | NOT STARTED / NOT YET VALIDATED |
+
+本次后续提交只同步状态/README/索引、追加本节，并加入[13.7首切片计划](../plans/task13_7_human_update_price_vertical_slice.md)与[开发Goal](../plans/task13_7_first_slice_codex_goal.md)。不修改已接受的AGENTS、业务合同、目标职责、实现图或治理；不为补验收结论再次重跑完整cold-start。新增计划是下一阶段实现准备，不把13.7实现选择自动变成已完成的Canonical能力。
+
+准备时实际读取最新main的ManualTaskApplicationService、ExecutionAuthorization、v4 manifest/prepare/publish/result、Task/history与operation/attempt/batch/receipt schema、Queue Service、Importer/Watchdog/Recovery及授权/v4/Queue测试。确认PREPARED批次可在最终授权前存在；授权history不足以单独承担完整恢复；新决定保存及授权后持续owner仍需实现。复用判断、边界和验收方式在首切片计划维护，不新增平行架构主文档。
+
+本轮完整树、修改路径、编码/链接检查及补证Head CI结果记录在PR正文，避免反复生成自引用提交。历史报告前文原样保留。
+
+“验收通过”不包含执行merge或结束Draft授权。PR #46核验时尚未合并，13.7代码施工从其合入后的最新main新建分支；本轮只完成验收入库与准备工作，没有修改生产代码、Runtime、Queue、Worker或平台，没有执行合并。
