@@ -1,3 +1,5 @@
+> 文档身份：当前库存功能说明与迁移历史；不是总体业务合同。DB 实物库存 authority 保留。文中旧平台目标库存上限/Settlement 触发口径仅描述旧实现；现行业务以[业务合同](business_contract.md)为准，转接由[目标职责 IG-04/05](rebaseline/task13_6_target_responsibility_and_gap_matrix.md)约束。
+
 # 商品资料与库存补充录入说明
 
 > 状态说明（2026-08-12）：本文主体记录 13.5-7D 权威切换前的历史工作簿行为，仅用于
