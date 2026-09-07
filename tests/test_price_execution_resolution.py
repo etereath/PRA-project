@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time
 import types
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -64,6 +65,12 @@ def scan(unknown, monkeypatch, *, price='14.00', suffix='001'):
     request, _ = publish_listing_sync_batch(j.runtime, ShadowBotFileQueueRunner(j.service.queue_root),
         manifest=manifest, execution_profile=j.service.execution_profile, applet_uri=j.service.applet_uri)
     # A platform observation fixture crosses the same real file Worker/import boundary.
+    # Whole-second observations must be strictly later than the stopped execution.
+    stopped = unknown.service.for_task(unknown.old)['payload']['execution_stopped_at']
+    not_before = datetime.fromisoformat(stopped).replace(microsecond=0) + timedelta(seconds=1)
+    delay = (not_before - datetime.now(UTC)).total_seconds()
+    if delay > 0:
+        time.sleep(delay)
     now = datetime.now(UTC).replace(microsecond=0)
     result = _result(request, scan_started_at=now.isoformat())
     snapshot = result['snapshot']
