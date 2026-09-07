@@ -1,6 +1,6 @@
 # Task 13.7-1：已满足目标的确认与授权回执修复
 
-角色：Implementation / Validation Evidence；日期：2026-09-07。源码与测试版本 `4f843bedbaf9885cf4e2a7462caf96be6773fe24`；后续文档提交不改变该源码。承接 [PR #47](https://github.com/etereath/PRA-project/pull/47) 的 P1 交付 Head `869f1a4d7ccff6a83293551b5d68f8202dd255d6`，main 为 `f227cd2517687e4a6dfadea90c2e126a5da69711`。按用户“开始修复并推送”授权修复两项非阻塞 P2，继续原分支与 Draft PR；未合并、未部署、未操作真实平台。
+角色：Implementation / Validation Evidence；日期：2026-09-07。源码与测试版本 `5604a4d8807d49ba70d09bd5dc6c2e603df970a5`；后续文档提交不改变该源码。承接 [PR #47](https://github.com/etereath/PRA-project/pull/47) 的 P1 交付 Head `869f1a4d7ccff6a83293551b5d68f8202dd255d6`，main 为 `f227cd2517687e4a6dfadea90c2e126a5da69711`。按用户“开始修复并推送”授权修复两项非阻塞 P2，继续原分支与 Draft PR；未合并、未部署、未操作真实平台。
 
 Task Type：Bugfix / Integration；Review Profile：沿用 R4，含 R3 授权边界。复核范围为首审 P1、此次明确授权修复的两个 P2 及其直接回归，不扩大到其他业务切片。
 
@@ -36,6 +36,8 @@ Web 缓存保留会话所属回执身份；GET 从 Runtime 更新状态，避免
 新增 24 个定向用例：`tests/test_price_authorization_no_write.py` 的 11 个用例通过正式 Web、真实授权服务、发布器和重启后的 Queue Service 验证零写结束、冻结权限、过期/无来源观察、混合范围拒绝、未决前驱、收口竞争、页面刷新和读取失败；`tests/test_execution_authorization_receipts.py` 的 13 个用例验证 12 种持久状态和缺失历史消息，核对重放后的 AUTH/continuation/attempt 数量和身份绑定。
 
 原授权及完整链路 31 个用例通过，P1 人工收口 6 个用例通过。P2 零写链路的平台价格由隔离观察 fixture 提供；测试没有宣称实际人工平台操作已经发生。P1 回归复用生产 Worker/Importer 和最低层 UI 替身。
+
+首轮全量与 Linux CI 检出一项旧展示测试仍传入两元素回执；已更新为正式 DTO，保留原内部批次/attempt 标识隐藏断言，并补充 run 标识隐藏与任务链接断言。修正后 Web foundation 34 个用例通过；该测试修正提交未改变生产源码。
 
 本地全量命令：`python -m pytest -q tests --disable-warnings --junitxml=<隔离证据目录>/p2-final.xml`。全量结果、源码 SHA 和最终 Head 的 Windows/Linux Core CI 链接记录于 [PR 交付说明](https://github.com/etereath/PRA-project/pull/47)，不能用上一次 P1 的测试数字或 CI 代替本次版本。
 

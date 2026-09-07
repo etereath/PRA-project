@@ -1,6 +1,6 @@
 # PRA 当前阶段与验证状态
 
-角色：Current Status；唯一当前阶段状态页。更新于 2026-09-07。PR [#46](https://github.com/etereath/PRA-project/pull/46) 已合并，本次交接起点为 main `f227cd2517687e4a6dfadea90c2e126a5da69711`。当前在 Draft PR [#47](https://github.com/etereath/PRA-project/pull/47)、分支 `codex/task13-7-1-human-update-price` 完成首审 P1 与两个 P2 修复；最新源码版本 `4f843bedbaf9885cf4e2a7462caf96be6773fe24`。未合并、未部署；[P2 修复与证据](reports/task13_7_1_p2_authorization_receipts_20260907.md)，[P1 修复与证据](reports/task13_7_1_p1_human_resolution_20260907.md)，[首版实现快照](reports/task13_7_1_human_update_price_20260907.md)，[开发 Goal](plans/task13_7_first_slice_codex_goal.md)。
+角色：Current Status；唯一当前阶段状态页。更新于 2026-09-07。PR [#46](https://github.com/etereath/PRA-project/pull/46) 已合并，本次交接起点为 main `f227cd2517687e4a6dfadea90c2e126a5da69711`。当前在 Draft PR [#47](https://github.com/etereath/PRA-project/pull/47)、分支 `codex/task13-7-1-human-update-price` 完成首审 P1 与两个 P2 修复；最新源码版本 `5604a4d8807d49ba70d09bd5dc6c2e603df970a5`。未合并、未部署；[P2 修复与证据](reports/task13_7_1_p2_authorization_receipts_20260907.md)，[P1 修复与证据](reports/task13_7_1_p1_human_resolution_20260907.md)，[首版实现快照](reports/task13_7_1_human_update_price_20260907.md)，[开发 Goal](plans/task13_7_first_slice_codex_goal.md)。
 
 | 项目 | 状态 | 依据/下一步 |
 |---|---|---|
