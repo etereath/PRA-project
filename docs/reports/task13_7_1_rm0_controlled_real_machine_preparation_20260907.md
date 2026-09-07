@@ -215,11 +215,11 @@ RM0 不决定目标价格，也不从旧日志推断当前价格。
 
 ### 当前结论
 
-`RM0 = BLOCKED`
+`RM0 TECHNICAL READINESS = PASS WITH HISTORICAL DEBT`
 
-B1 的 Runtime v18 物理 schema、B2 的 ShadowBot 源码差异和 B3 的服务生命周期问题已修复。迁移后的完整执行账本重查发现一个此前未覆盖的 `set_online` UNKNOWN 批次，涉及 `AISHA-B/C/D`；该对象及其 operation、attempt、lock、receipt 和 reconcile 证据均未清理或改写。B4 的 12 条商品 mapping 仍全部为 `DISABLED`，测试对象和目标价格未由负责人确认。
+B1 的 Runtime v18 物理 schema、B2 的 ShadowBot 源码差异和 B3 的服务生命周期问题已修复。迁移后的完整执行账本重查发现一个此前未覆盖的 `set_online` UNKNOWN 批次，涉及 `AISHA-B/C/D`；2026-09-08 的定向核验确认其中 `AISHA-C-55-Z` 已由旧版正式人工处置流程收口，历史 UNKNOWN 保留，但不再承载自动恢复责任。该对象及其 operation、attempt、lock、receipt 和 history 均未清理或改写。B4 的 12 条商品 mapping 仍全部为 `DISABLED`，测试对象和目标价格未由负责人确认。
 
-因此当前不满足“只剩负责人确认测试对象”的条件，不声明 `RM0 TECHNICAL READINESS = PASS`。Stage Goal 继续为 **NOT YET VALIDATED**，不得进入 RM1。
+因此旧 `WEB7E-6646…` 作为 `LEGACY HISTORICAL UNKNOWN / OPERATIONALLY CLOSED` 永久保留，不再构成全平台 RM1 blocker。RM0 技术准备以历史审计债务通过；RM1 业务授权仍为 **WAIT OWNER**，Stage Goal 继续为 **NOT YET VALIDATED**。本记录不授权进入 RM1。
 
 `REAL PLATFORM WRITE NOT AUTHORIZED / NOT EXECUTED`
 
@@ -231,7 +231,7 @@ B1 的 Runtime v18 物理 schema、B2 的 ShadowBot 源码差异和 B3 的服务
 
 ### B1 — Runtime v18 physical schema
 
-处理结果：**schema 子项 CLOSED；遗留执行子项 OPEN。**
+处理结果：**schema 子项 CLOSED；遗留执行事实保留为历史审计债务。**
 
 1. 在 Web / Queue Service 均停止且活动 attempt 为 0 时，使用 SQLite online backup 创建一致性备份；备份文件名为 `runtime.before-v18-remediation.sqlite3`，大小 1,343,488 bytes，SHA-256 为 `318f4e19358acdbbe31dca21153de809ad069f603e8348de006b56d9d041939c`。备份 `integrity_check=ok`、FK violation=0，migration 记录完整为 1..18。备份保留在仓库外，不记录完整本地路径。
 2. 使用当前 main 的正式入口 `python -m app.cli init-runtime-db --runtime-db <configured-runtime>` 执行修复。没有手工 `CREATE TABLE`，没有删除 v18 migration row，也没有修改或清除历史 Task / operation / attempt / receipt。
@@ -246,7 +246,7 @@ B1 的 Runtime v18 物理 schema、B2 的 ShadowBot 源码差异和 B3 的服务
 | `OP-f2fc27e5d0c546d2746f258e` | `MANUAL_HANDLED`，batch item 仍为 `NEEDS_RECONCILIATION` | `AISHA-C-55-Z`；相关历史 UNKNOWN attempts 保留 |
 | `OP-44a2c1659f0dfcf7efa2537f` | `VERIFIED`，batch 仍未收口 | `AISHA-D-50-Z`；历史 UNKNOWN attempt 与后续 VERIFIED attempt 均保留 |
 
-相关 write lock 当前均为 `RELEASED`，但这不允许把 UNKNOWN batch 当作已关闭。Reviewer 必须先判断其账本收口方式；本轮不自行清理。`AISHA-B/C/D` 停止 RM1 准备。
+相关 write lock 当前均为 `RELEASED`。batch-level UNKNOWN 不改写，三个 item 按各自历史事实保留；其运营责任是否已关闭见下文定向核验。本轮不自行清理，也不以该历史 batch 全局阻塞其他 SKU。
 
 ### B2 — ShadowBot deployed source
 
@@ -266,6 +266,7 @@ B1 的 Runtime v18 物理 schema、B2 的 ShadowBot 源码差异和 B3 的服务
 - 使用既有 `ShadowBotLifecycleStore.write_verified_state()` 在 fresh heartbeat、空 Queue 和实际影刀窗口事实均通过后记录 lifecycle：`recorded_state=RUNNING`、`shadowbot_window_state=RUNNING_VERIFIED`、reason=`RM0_REMEDIATION_VERIFIED_START`。没有删除旧 heartbeat 或 lifecycle 文件。
 - Web composition、Queue Service 和 Worker 配置指向同一正式 Queue；Web 与 Queue Service 指向同一正式 Runtime。部署 identity mapping 与正式配置哈希一致，Importer 和 Coordinator 均由该 Queue Service 托管。
 - 启动后 `inbox/working/results` 始终为 0，没有投递平台读写请求。8 个历史 pending Review 和 notification outbox 均未发生状态变化，Queue Service 日志没有产生催办、通知或错误事件。
+- 上述为 B3 整改窗口的生命周期证据；Worker 后续已按负责人要求停止。该正常停机不撤销 B3 的技术核验证据，但 RM1 若获授权仍须按既有运维入口启动并重新确认 fresh heartbeat。
 
 ### B4 — 测试对象候选与 mapping
 
@@ -278,9 +279,9 @@ B1 的 Runtime v18 物理 schema、B2 的 ShadowBot 源码差异和 B3 的服务
 | internal SKU | 商品名称 | 等级 | 唯一 ShadowBot identity | 当前 mapping | 激活前仍缺 |
 |---|---|---|---|---|---|
 | `AISHA-A-70-Z` | 艾莎 | A级 | 是 | DISABLED | 负责人确认 platform / account / product identity |
-| `AISHA-B-60-Z` | 艾莎 | B级 | 是 | DISABLED | Reviewer 先处理旧 UNKNOWN；负责人再确认 identity |
-| `AISHA-C-55-Z` | 艾莎 | C级 | 是 | DISABLED | Reviewer 先处理旧 UNKNOWN；负责人再确认 identity |
-| `AISHA-D-50-Z` | 艾莎 | D级 | 是 | DISABLED | Reviewer 先处理旧 UNKNOWN；负责人再确认 identity |
+| `AISHA-B-60-Z` | 艾莎 | B级 | 是 | DISABLED | 负责人确认 platform / account / product identity |
+| `AISHA-C-55-Z` | 艾莎 | C级 | 是 | DISABLED | 负责人确认 platform / account / product identity；历史 UNKNOWN 只作审计保留 |
+| `AISHA-D-50-Z` | 艾莎 | D级 | 是 | DISABLED | 负责人确认 platform / account / product identity |
 | `AISHA-E-45-Z` | 艾莎 | E级 | 是 | DISABLED | 负责人确认 platform / account / product identity |
 | `CAPPUCCINO-A-70-Z` | 卡布奇诺 | A级 | 是 | DISABLED | 负责人确认 platform / account / product identity |
 | `CAPPUCCINO-B-60-Z` | 卡布奇诺 | B级 | 是 | DISABLED | 负责人确认 platform / account / product identity |
@@ -292,16 +293,62 @@ B1 的 Runtime v18 物理 schema、B2 的 ShadowBot 源码差异和 B3 的服务
 
 负责人还需为最终测试对象明确当前实际价格、目标价格和测试时段。本轮不默认选择“艾莎 B级”，也不决定任何真实目标价格。
 
+### 旧 `AISHA-C` UNKNOWN 定向核验
+
+本节只判断旧版人工处置是否已经结束当时的自动恢复责任，不重新执行或以今天的平台状态反推 2026-08-30 的平台副作用。核验以 Runtime 的只读查询、[PR #38](https://github.com/etereath/PRA-project/pull/38)及本机保留的 13.5-7F 历史工作区源码与故障分析、未合并的 [PR #39](https://github.com/etereath/PRA-project/pull/39)和 13.5-7G 计划为边界；不把后来 13.7-1 的 `price_execution_human_resolved`、durable continuation 或 Coordinator 合同反套旧记录。
+
+| 对象 | 只读事实 | 结论 |
+|---|---|---|
+| source Task | `TASK-MANUAL-994adbff5cb5faee936d7235`；旧任务组 Review 处理后为 `cancelled` | Task 已有终态；旧合同允许人工处置 operation 时保留已取消 Task |
+| Review | `fa2c8f09d571`；`manual_review`；`cancelled`；`resolved_by=operations`；`resolved_at=2026-08-30T15:59:53.735236Z` | 不是 `pending`，无 open Review |
+| batch item | `ITEM-7e197…`；`operation_result=NEEDS_RECONCILIATION`；listing effect `UNKNOWN` | 历史执行事实保持 UNKNOWN，不改成 VERIFIED / NOT_APPLIED |
+| operation | `OP-f2fc27e5d0c546d2746f258e`；`status=MANUAL_HANDLED`；`resolution_status=MANUAL_HANDLED`；`resolved_by=web:admin`；`resolved_at=2026-08-31T10:14:39.586979Z` | 旧版人工处置为合法运营终态 |
+| attempts | 1 次 COMMIT 与 1 次 RECONCILE，均以 UNKNOWN 结束；第一次写后无合格 readback，第二次列表刷新失败 | 无 active attempt；不能据此断言平台成功或失败 |
+| result / receipt | 初始执行与两次 reconcile 共 3 份 accepted receipt，均已写入账本且无 projection error | 历史输入已落账，不需重放 |
+| write lock | 对应 `蚂蚁花团供应商|sku:AISHA-C-55-Z` 的锁为 `RELEASED`，释放时间与 operation 人工处置时间完全一致 | 按旧合同释放，无 active lock |
+| 后续责任 | 该旧 v5 batch 无 `execution_continuation`；当前也无关联 active attempt、active lock 或 open Review | 没有当前系统必须继续自动恢复的持久责任 |
+| 负责人补充确认 | 负责人于 2026-09-08 确认，其在 2026-08-30 当时已观察到 `AISHA-C-55-Z` 目标商品成功上架 | 与旧正式入口记录的 `TARGET_APPLIED` 一致，进一步证明人工处置实际发生 |
+
+Task status history 保留旧任务组 `cancel_task` 事件，没有后来 13.7-1 才定义的 `price_execution_human_resolved`。前者证明旧 Task 已按当时流程终止，后者的缺失是符合年代边界的预期事实，本轮不补造。
+
+`MANUAL_HANDLED` 来自旧版正式入口而非可见的直接改库：13.5-7F 的管理 Web 以 `HANDLE_REVIEW` 权限调用 `resolve_shadowbot_operation_manually()`；该事务会写入 `web:admin`、将 operation 置为 `MANUAL_HANDLED`、写入 `operations_web_manual_confirmation` execution log，并在同一事务释放 write lock。Runtime 中字段组合、专用日志载荷和完全相同的 resolution / release 时间与这条唯一正式路径一致。旧 7F 测试也明确覆盖“已取消 Task 保持 cancelled，但 operation 与 lock 被人工收口”的情况。
+
+旧界面中操作者选择过 `TARGET_APPLIED`，因此 operation 的旧 `operation_result` 列记录为 `VERIFIED`；负责人现已明确确认该选择源于其当时观察到目标商品成功上架。该确认是有效的旧版运营处置证据，足以支持 `MANUAL_HANDLED` 和恢复责任关闭；但它不是系统留存的、时间绑定且可回读验证的平台 observation。batch item 的 `NEEDS_RECONCILIATION`、两次 UNKNOWN attempt 和缺失合格 readback 均原样保留，所以机器可验证的历史副作用真值仍只定性为 `INDETERMINATE`，不把 item 或 batch 改成 `VERIFIED`。
+
+本机历史材料 `docs/reports/task13_5_7f_automation_queue_failure_analysis_20260831.md` 已记录：旧人工确认能原子解决 operation、释放 write lock 并收口 Review / token / outbox，但系统当时没有持久 owner 推进被阻塞的后续 Task。[13.5-7G Coordinator 计划](https://github.com/etereath/PRA-project/blob/4c9c0acd4b0d73cdc6c4efa4aaf51b7ea1d4e457/docs/plans/task13_5_7g_task_execution_coordinator_plan.md)正是为这个后续责任缺口提出，且 PR #39 未合并。该历史缺口不把已经 `MANUAL_HANDLED` 的原 operation 重新变成待自动恢复对象。
+
+定向核验过程中 Runtime 以 SQLite `mode=ro` 和 `query_only=ON` 打开；核验前后文件大小、修改时间及 SHA-256 `7d217fe8abd892fce0e9697899ca576d15c55ca1fa7a7ba57561feb478fe7c33` 均一致。未调用真实平台 READ_ONLY / WRITE，未修改 Runtime。
+
+### 历史分类与 SKU 隔离
+
+```text
+Historical execution fact:
+NEEDS_RECONCILIATION / historical UNKNOWN
+
+Legacy operational disposition:
+MANUAL_HANDLED
+
+Historical recovery responsibility:
+CLOSED under legacy manual-resolution workflow
+
+Historical side-effect truth:
+INDETERMINATE
+```
+
+负责人对当时平台状态的运营确认是 `TARGET_APPLIED / 成功上架`；上述 `INDETERMINATE` 专指缺少合格系统 readback 时不可升级的机器可验证历史事实层，两者不互相覆盖。
+
+`WEB7E-6646…` 可永久保留 batch-level UNKNOWN：`AISHA-B-60-Z` 保持 `FAILED / NOT_APPLIED`，`AISHA-C-55-Z` 保持 historical UNKNOWN + `MANUAL_HANDLED`，`AISHA-D-50-Z` 保持 `VERIFIED`；不要求重写 batch 聚合结果。历史 UNKNOWN 不成为全平台或其他 SKU 的 RM1 blocker。当前 SKU 是否允许新任务，仅按该 SKU 当前的 active lock、open Review、新鲜平台事实、mapping、Task 和新授权判断；不得对原 operation 再做自动 RECONCILE 或重放原 `SET_ONLINE`。
+
 ### Remediation 后 RM0 Gate
 
 | Gate | 结果 | 说明 |
 |---|---|---|
 | Runtime schema / SQLite health | PASS | v18 物理结构、health、integrity、FK 均通过 |
-| Runtime execution ledger | BLOCKED | 旧 `WEB7E-6646…` listing batch 仍为 UNKNOWN |
+| Runtime execution ledger | PASS WITH HISTORICAL DEBT | 旧 `WEB7E-6646…` 保留 batch-level UNKNOWN；AISHA-C 的旧人工处置已关闭恢复责任，无活动责任或当前阻塞对象 |
 | ShadowBot deployed source | PASS | 所有受控文件 CURRENT；配置和 selector 未改 |
 | Lifecycle / environment alignment | PASS | Queue Service、Worker、lifecycle fresh/一致；Web 配置、Importer、Coordinator 对齐正式 Runtime/Queue |
 | Mapping / test object | WAIT OWNER | 12 条 mapping 均 DISABLED；负责人尚未确认测试对象 |
 | Queue active directories | PASS | `inbox/working/results` 均为 0 |
 | Credential / security | PASS | 当前 Worker 用户上下文可读取 Generic Credential；只记录非空布尔结果，无 secret、target、username、password、token、Webhook 或完整私密路径进入 Git/报告 |
 
-下一步只能由 Reviewer 先处理旧 UNKNOWN 批次的证据收口，再由负责人确认一个不冲突的测试对象、platform、account、product identity、当前价、目标价和时段。完成前不得创建或授权真实 UPDATE_PRICE，不得进入 RM1，也不得开始 13.7-2。
+`RM0 TECHNICAL READINESS = PASS WITH HISTORICAL DEBT`。`RM1 BUSINESS AUTHORIZATION = WAIT OWNER`。下一步由负责人确认一个满足当前 SKU 隔离门禁的测试对象、platform、account、product identity、当前价、目标价和时段，并决定 B4 mapping 的受控维护；在负责人明确授权前不得创建或授权真实 UPDATE_PRICE，不得进入 RM1，也不得开始 13.7-2。Stage Goal 保持 **NOT YET VALIDATED**。
