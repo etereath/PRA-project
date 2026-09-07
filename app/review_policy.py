@@ -9,6 +9,7 @@ from app.services.manual_intervention import MANUAL_INTERVENTION_ACTIONS
 RETRY_TASK_DECISION = "retry_task"
 CANCEL_TASK_DECISION = "cancel_task"
 RETRY_TASK_DEADLINE_MINUTES = 30
+PRICE_EXECUTION_REVIEW_TYPE = "price_execution_unknown"
 
 DEFAULT_REVIEW_STATUSES = (
     ReviewTaskStatus.APPROVED,
@@ -83,6 +84,8 @@ def allowed_review_statuses(
     review_task: ReviewTask,
     source_task: Task | None = None,
 ) -> tuple[ReviewTaskStatus, ...]:
+    if review_task.review_type == PRICE_EXECUTION_REVIEW_TYPE:
+        return ()
     if is_execution_failure_review(review_task, source_task):
         return EXECUTION_FAILURE_REVIEW_STATUSES
     return DEFAULT_REVIEW_STATUSES

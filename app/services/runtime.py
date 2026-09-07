@@ -455,6 +455,8 @@ class ReviewTaskService:
         review_task = self.repository.get_review_task(review_task_id)
         if review_task is None:
             raise ValidationError(f"review task not found: {review_task_id}")
+        if review_task.review_type == "price_execution_unknown":
+            raise ValidationError("请登录经营管理，凭平台核验记录提交人工结论。")
         if review_task.review_status != ReviewTaskStatus.PENDING:
             raise ValidationError(f"review task already handled: {review_task_id}")
         self._validate_transition(review_task.review_status, status)
@@ -635,12 +637,12 @@ class ReviewTaskService:
         pending_reviews = self.repository.list_pending_review_tasks_due_before(cutoff)
         summary = ExpireReviewTasksSummary(scanned_review_tasks=len(pending_reviews))
         for review in pending_reviews:
-            if review.review_type == "emergency_protection":
+            if review.review_type in {"emergency_protection", "price_execution_unknown"}:
                 # ``required_by`` is the automatic-evaluation deadline for an
                 # emergency Review, not the final lifetime of the human entry.
                 # The formal Mobile Review remains pending until the platform
                 # side-effect boundary or an explicit resolution.
-                summary.skipped_review_tasks += 1
+                summary.skipped_source_tasks += 1
                 continue
             source_task = (
                 self.runtime_task_service.get_task(review.source_task_id)
@@ -800,6 +802,15 @@ class ReviewTaskService:
             )
             return summary
         for review in pending_reviews:
+            if review.review_type == "price_execution_unknown":
+                from app.services.price_execution_resolution import renew_price_execution_review
+                try:
+                    if renew_price_execution_review(self.repository, review, now=cutoff):
+                        summary.renewed_review_tasks += 1
+                        summary.notification_logs_created += 1
+                except Exception as exc:
+                    summary.errors.append(f"{review.review_task_id}: {type(exc).__name__}: {exc}")
+                continue
             source_task = (
                 self.runtime_task_service.get_task(review.source_task_id)
                 if review.source_task_id

@@ -60,6 +60,7 @@ NOTIFICATION_KEY_VERSION = "v1"
 MAX_NOTIFICATION_PAYLOAD_BYTES = 16_384
 TEST_NOTIFICATION_CHANNELS = frozenset({"mock", "fake", "scripted"})
 REVIEW_TYPE_LABELS = {
+    "price_execution_unknown": "改价执行人工核验",
     "capacity_warning": "产能预警",
     "labor_required": "人工用工确认",
     "shortage_warning": "短缺预警",
@@ -987,6 +988,10 @@ class NotificationOutboxService:
             return notification, ""
         from app.services.runtime import ReviewTokenService
 
+        review = self.repository.get_review_task(notification.related_review_task_id)
+        if review is not None and review.review_type == "price_execution_unknown":
+            # This review requires a signed-in owner and persisted platform evidence.
+            return notification, ""
         token_service = ReviewTokenService(self.repository)
         existing_tokens = self.repository.list_review_tokens_by_review_task_id(
             notification.related_review_task_id

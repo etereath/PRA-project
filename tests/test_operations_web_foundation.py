@@ -965,6 +965,8 @@ def test_manual_task_dialog_hides_conditional_fields_and_blocks_empty_platforms(
 
 
 def test_operator_copy_humanizes_schedules_and_hides_internal_receipt_ids() -> None:
+    from app.services.execution_authorization import ExecutionSubmissionResult
+
     interval_job = AutomationControlReadModel(
         job_id="JOB-INTERNAL",
         job_type="FULL_MARKET_SCAN",
@@ -978,7 +980,7 @@ def test_operator_copy_humanizes_schedules_and_hides_internal_receipt_ids() -> N
         csrf_token="csrf",
         task_options=(),
         preparation=None,
-        receipt=("BATCH-SECRET", "ATTEMPT-SECRET"),
+        receipt=ExecutionSubmissionResult("BATCH-SECRET", "ATTEMPT-SECRET", "RUN-SECRET", ("TASK-LINK",)),
         error="",
         idempotency_key="execution-test",
     )
@@ -994,10 +996,12 @@ def test_operator_copy_humanizes_schedules_and_hides_internal_receipt_ids() -> N
     for secret in (
         "BATCH-SECRET",
         "ATTEMPT-SECRET",
+        "RUN-SECRET",
         "REVIEW-SECRET",
         "TASK-SECRET",
     ):
         assert secret not in execution + review
+    assert 'href="/management/task/TASK-LINK"' in execution
 
 
 def test_static_assets_must_revalidate_after_deployment(operations_web) -> None:

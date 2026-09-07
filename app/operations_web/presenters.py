@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from urllib.parse import quote
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.services.execution_authorization import ExecutionSubmissionResult
+
 from app.operations_web.read_models import (
     DatabaseReadModel,
     DetailReadModel,
@@ -15,6 +21,48 @@ from app.operations_web.read_models import (
 )
 from app.operations_web.rendering import html
 
+
+def render_price_execution_resolution(model, *, csrf_token, idempotency_key, subject, can_handle, error=''):
+    from app.services.price_execution_resolution import CONCLUSIONS
+    owner = model['payload']['owner_subject']
+    parts = ['<section class="panel"><h2>改价执行人工核验</h2>',
+             '<p>负责人：' + html(owner) + '</p>']
+    if error:
+        parts.append('<p role="alert">' + html(error) + '</p>')
+    if model['review_status'] != 'pending':
+        result = model['resolution']
+        evidence = result.get('evidence', {})
+        parts.extend(['<p>人工处置已记录：' + html(result.get('conclusion_label', '旧决定已终止')) + '</p>',
+            '<p>处理人：' + html(result.get('principal_subject', '')) + '；时间：' + html(result.get('resolved_at', '')) + '</p>',
+            '<p>平台核验价格：' + html(evidence.get('observed_price', '')) + '；观察时间：' + html(evidence.get('observed_at', '')) + '</p>',
+            '<p>证据：' + html(evidence.get('snapshot_item_id', '')) + '</p>',
+            '<p>备注：' + html(result.get('note', '')) + '</p>',
+            '<p>旧执行结果仍为未知，旧决定已终止。后续改价请创建新决定并重新授权。</p></section>'])
+        return ''.join(parts)
+    if model['overdue']:
+        parts.append('<p>已逾期；已提醒 ' + html(str(model['payload'].get('reminder_count', 0))) + ' 次。接手确认前原负责人继续负责。</p>')
+    parts.append('<p>先取得旧执行及唯一对账停止后的平台状态扫描，再选择证据提交结论。等待期间保留写锁，超时不会自动收口。</p>')
+    hidden = ('<input type="hidden" name="csrf_token" value="' + html(csrf_token) + '">'
+              '<input type="hidden" name="review_id" value="' + html(model['review_task_id']) + '">')
+    if can_handle and owner != subject:
+        parts.append('<form method="post" action="/management/price-resolutions/claim">' + hidden +
+                     '<button type="submit">确认由我接手</button></form>')
+    if model['evidence_error']:
+        parts.append('<p>' + html(model['evidence_error']) + '</p>')
+    for evidence in model['evidence']:
+        parts.append('<div><p>平台核验价格：' + html(evidence['observed_price']) + '；观察时间：' + html(evidence['observed_at']) + '</p>' +
+                     '<p>核验记录：' + html(evidence['snapshot_item_id']) + '</p>')
+        if can_handle and owner == subject:
+            parts.append('<form method="post" action="/management/price-resolutions/resolve">' + hidden +
+                '<input type="hidden" name="idempotency_key" value="' + html(idempotency_key) + '">' +
+                '<input type="hidden" name="evidence_id" value="' + html(evidence['snapshot_item_id']) + '">' +
+                '<input type="hidden" name="evidence_digest" value="' + html(evidence['digest']) + '">' +
+                '<label>人工结论<select name="conclusion" required><option value="">请选择</option>' +
+                ''.join('<option value="' + html(key) + '">' + html(label) + '</option>' for key, label in CONCLUSIONS.items()) +
+                '</select></label><label>备注（不能代替平台证据）<textarea name="note" maxlength="1000"></textarea></label>' +
+                '<button type="submit">按所选证据终止旧决定</button></form>')
+        parts.append('</div>')
+    return ''.join(parts) + '</section>'
 
 MANUAL_ACTION_LABELS = {
     "SET_PRICE": "调整价格到",
@@ -158,7 +206,7 @@ def render_management(
     task_receipt: tuple[str, ...] = (),
     task_error: str = "",
     execution_preparation=None,
-    execution_receipt: tuple[str, str] | None = None,
+    execution_receipt: ExecutionSubmissionResult | None = None,
     execution_error: str = "",
     review_receipt: tuple[str, str, str] | None = None,
     review_error: str = "",
@@ -288,6 +336,8 @@ def _render_review_controls(
                 </form>
                 """
             )
+        if not forms:
+            forms.append('<a href="/management/review/' + html(quote(review.review_task_id, safe='')) + '">打开人工核验</a>')
         cards.append(
             f"""
             <article class="review-control-card">
@@ -560,7 +610,7 @@ def _render_execution_controls(
     csrf_token: str,
     task_options: tuple[tuple[str, str], ...],
     preparation,
-    receipt: tuple[str, str] | None,
+    receipt: ExecutionSubmissionResult | None,
     error: str,
     idempotency_key: str,
 ) -> str:
@@ -573,24 +623,22 @@ def _render_execution_controls(
         if error
         else ""
     )
-    receipt_html = (
-        '<div class="state-banner state-ready"><strong>执行请求已发送</strong><p>可在当前任务和执行记录中查看进度。</p></div>'
-        if receipt
-        else ""
-    )
+    receipt_html = _render_execution_receipt(receipt)
     confirmation = ""
     if preparation is not None:
         ids = "".join(
             f'<input type="hidden" name="task_ids" value="{html(task_id)}">'
             for task_id in preparation.task_ids
         )
+        action_label = '平台观察已满足目标，无需改价；仅确认结束本次决定' if preparation.resolution_only else _manual_action_label(preparation.action_type)
+        button_label = '确认结束本次决定' if preparation.resolution_only else '确认并发送执行'
         confirmation = f"""
-        <div class="state-banner state-incomplete"><strong>请二次确认</strong><p>{html(preparation.platform_name)} · {preparation.item_count} 项 · {html(_manual_action_label(preparation.action_type))}；请在 {html(preparation.expires_at.strftime('%H:%M'))} 前确认</p></div>
+        <div class="state-banner state-incomplete"><strong>请二次确认</strong><p>{html(preparation.platform_name)} · {preparation.item_count} 项 · {html(action_label)}；请在 {html(preparation.expires_at.strftime('%H:%M'))} 前确认</p></div>
         <form method="post" action="/management/executions/submit" class="inline-actions">
           <input type="hidden" name="csrf_token" value="{html(csrf_token)}">{ids}
           <input type="hidden" name="confirmation_digest" value="{html(preparation.confirmation_digest)}">
           <input type="hidden" name="idempotency_key" value="{html(preparation.idempotency_key)}">
-          <button type="submit">确认并发送执行</button>
+          <button type="submit">{html(button_label)}</button>
         </form>
         """
     return f"""
@@ -599,9 +647,28 @@ def _render_execution_controls(
         <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
         <input type="hidden" name="idempotency_key" value="{html(idempotency_key)}">
         <div class="choice-list">{checks}</div><button type="submit">预览执行影响</button>
+        <button type="submit" formaction="/management/tasks/cancel-price">取消所选未执行价格决定</button>
       </form>
     </div>
     """
+
+
+def _render_execution_receipt(receipt: ExecutionSubmissionResult | None) -> str:
+    if receipt is None:
+        return ''
+    labels = {
+        'ACCEPTED': '执行授权已接受', 'DISPATCHED': '执行请求已投递',
+        'BLOCKED': '执行暂时受阻', 'TRACKING': '执行处理中', 'RECONCILING': '正在对账',
+        'HUMAN': '需要人工核验', 'RETRY_PENDING': '等待服务恢复',
+        'COMPLETE': '执行已结束', 'EXPIRED': '本次授权已过期', 'RECONFIRM': '需要重新确认',
+        'SUPERSEDED': '本次决定已取消或被替代', 'ALREADY_APPLIED': '目标已满足，决定已结束',
+        'HUMAN_RESOLVED': '已人工收口', 'UNAVAILABLE': '执行状态暂不可用',
+    }
+    label = labels.get(receipt.outcome, '本次授权已结束' if receipt.closed_at else '执行状态待确认')
+    state = 'incomplete' if receipt.outcome in {'BLOCKED', 'HUMAN', 'RETRY_PENDING', 'RECONFIRM', 'UNAVAILABLE'} else 'ready'
+    links = ' '.join('<a href="/management/task/' + html(quote(task_id, safe='')) + '">查看任务详情</a>' for task_id in receipt.task_ids)
+    ended = '<p>结束时间：' + html(receipt.closed_at) + '</p>' if receipt.closed_at else ''
+    return '<div class="state-banner state-' + state + '"><strong>' + html(label) + '</strong><p>' + html(receipt.message) + '</p>' + ended + links + '</div>'
 
 
 def render_system(

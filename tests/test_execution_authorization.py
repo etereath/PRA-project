@@ -291,17 +291,21 @@ def test_v4_prepare_and_submit_bind_exact_principal_tasks_and_actor(
     )
 
     assert prepared.action_type is TaskActionType.UPDATE_PRICE
-    assert submitted.execution_attempt_id == "ATTEMPT-V4"
+    assert submitted.execution_attempt_id == ""
+    assert not calls
+    from app.services.task_execution_coordinator import TaskExecutionCoordinator
+    TaskExecutionCoordinator(service, executor=None).run_cycle(now=NOW)
     assert calls[0][0] == "v4"
     assert calls[0][1]["confirmed_by"] == "admin"
     assert calls[0][1]["manifest"]["items"][0]["source_task_id"] == "TASK-PRICE-A"
-    with pytest.raises(ExecutionAuthorizationConflict, match="不能重复"):
-        service.submit_execution(
+    replay = service.submit_execution(
             admin,
             ["TASK-PRICE-A"],
             prepared.confirmation_digest,
             "auth-v4",
         )
+    assert replay.batch_id == submitted.batch_id
+    assert len(calls) == 1
 
 
 def test_production_publish_omits_development_confirmation_and_audits_actor(
@@ -319,6 +323,9 @@ def test_production_publish_omits_development_confirmation_and_audits_actor(
         "auth-production",
     )
 
+    assert not calls
+    from app.services.task_execution_coordinator import TaskExecutionCoordinator
+    TaskExecutionCoordinator(service, executor=None).run_cycle(now=NOW)
     assert calls[0][1]["confirmed_by"] == ""
     assert calls[0][1]["confirmation_text"] == ""
     assert calls[0][1]["execution_profile"] == "production"

@@ -1,16 +1,24 @@
 # Task 13.7：首条人工 UPDATE_PRICE 纵向切片
 
-角色：Implementation Plan / Next-stage Handoff，准备稿；不替代[业务合同](../business_contract.md)与[目标职责](../rebaseline/task13_6_target_responsibility_and_gap_matrix.md)。日期：2026-09-06。负责人已明确“验收通过,准备下一阶段”，13.6状态见[唯一状态页](../project_current_status.md)。本轮只准备，未实现本计划。
+角色：Implementation Plan / Codex Handoff；不替代[业务合同](../business_contract.md)与[目标职责](../rebaseline/task13_6_target_responsibility_and_gap_matrix.md)。日期：2026-09-06。负责人已明确“验收通过,准备下一阶段”，13.6状态见[唯一状态页](../project_current_status.md)。本次提交为开发交接，未实现本计划；接下来的代码由 Codex 承接。
 
 开发入口：[可直接交给Codex的Goal](task13_7_first_slice_codex_goal.md)。
 
 ## 1. 起点与最小业务结果
 
-13.6已接受语义版本为 `4d51f51edcafc4168149928f6ee64467cd12421a`；本次实际生产源码核验基线为最新main `08041bfe25a7f31f032564a2abca35e5eb5f5330`。PR #46尚未合并，因此准备工作可完成，生产施工须从它合入后的最新main新建分支。届时重新读取AGENTS、PR/Issue、源码、测试与CI；不要从13.6旧分支续写或为绕过合并状态复制生产改动。
+13.6已接受语义版本为 `4d51f51edcafc4168149928f6ee64467cd12421a`，PR #46 已合并。本次交接从核验时最新 main `f227cd2517687e4a6dfadea90c2e126a5da69711` 创建 `codex/task13-7-1-human-update-price`。本计划首次生产源码审计绑定 `08041bfe25a7f31f032564a2abca35e5eb5f5330`；当前 main 相对该提交仅有文档净变更，下面的源码引用保留原版本。Codex 承接时仍须核对最新 main、任务 PR Head/正文/评论、AGENTS、相关源码、测试与 CI，以新事实更新实现判断。
 
 推荐首个实现任务标识：**13.7-1 / One-SKU Human UPDATE_PRICE**。它要证明：管理者的一个有限期改价决定，经正式授权后有人持续推进，即使Web退出或合法blocker暂时存在，也能恢复、回读并明确完成/失败/终止；发布未知不能猜测重写。
 
 范围限定为当前已支持平台/账号的一种商品与价格维度。公共身份仍区分platform/account/internal_sku/platform_product_identity，不把蚂蚁UI写进公共核心。最小不是绕过正式Web或把中间组件替换为测试直达函数；仍须沿完整经营旅程。
+
+### 承接方式与角色
+
+- **Codex**：fetch 并跟踪 `origin/codex/task13-7-1-human-update-price`，在此 Draft PR 上完成复用审计、实现、必要迁移/测试和证据；这是从已合并 main 创建的 13.7 分支，不是旧 13.6 分支。先检查本地 branch/worktree 并保留已有改动；远端已有新提交时按最新 Head 接续，不覆盖他人提交。
+- **ChatGPT 审核者**：材料交付后回到业务、架构和代码审核；依真实代码和旅程证据出具双结论，首审冻结 blocker，复审限定原问题与直接回归。
+- **项目负责人**：确认经营与现场验收，决定合并及真实平台副作用授权；已完成的 13.6 验收不重复请求。
+
+本 PR 初始提交只含文档，Codex 无需等待其先合并才能承接代码。复用选择直接记录在同一 PR 说明或必要的短设计记录，不先另开一轮总纲。较大边界冲突按治理报告，日常实现选择由 Codex 完成。交付时更新同一 PR 的实现范围、最新 Head、验证与未验证项，保持 Draft 直到收到相应明确指令。
 
 ## 2. 已读取的生产资产与复用约束
 

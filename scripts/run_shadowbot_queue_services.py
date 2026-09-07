@@ -4,6 +4,7 @@ import argparse
 import json
 import msvcrt
 import os
+import sqlite3
 import sys
 import time
 from datetime import UTC, datetime
@@ -33,12 +34,15 @@ from app.services.shadowbot_queue import (  # noqa: E402
     ShadowBotQueueWatchdog,
     ShadowBotResultImporter,
 )
+from app.services.task_execution_coordinator import TaskExecutionCoordinator  # noqa: E402
+from app.services.execution_authorization import ExecutionAuthorizationApplicationService  # noqa: E402
+from app.operations_web.auth import PrincipalCapabilityBackend  # noqa: E402
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run ShadowBot result importer and queue watchdog")
-    parser.add_argument("--runtime-db", type=Path, default=DEFAULT_RUNTIME_DB)
-    parser.add_argument("--products", type=Path, default=DEFAULT_INVENTORY_PRODUCTS_PATH)
+    parser.add_argument("--runtime-db", type=Path, default=Path(os.environ.get('PRA_RUNTIME_DB') or DEFAULT_RUNTIME_DB))
+    parser.add_argument("--products", type=Path, default=Path(os.environ.get('PRA_PRODUCTS_WORKBOOK') or DEFAULT_INVENTORY_PRODUCTS_PATH))
     parser.add_argument("--queue-dir", type=Path, default=None)
     parser.add_argument("--poll-seconds", type=float, default=3.0)
     parser.add_argument("--stale-seconds", type=int, default=30)
@@ -53,6 +57,7 @@ def run_cycle(
     login_monitor: ShadowBotLoginVerificationMonitor | None = None,
     notification_worker: NotificationOutboxWorker | None = None,
     review_service: ReviewTaskService | None = None,
+    coordinator: TaskExecutionCoordinator | None = None,
 ) -> list[dict[str, object]]:
     events: list[dict[str, object]] = []
     if login_monitor is not None:
@@ -141,10 +146,38 @@ def run_cycle(
                     "error_message": str(exc),
                 }
             )
+    if coordinator is not None:
+        try:
+            events.extend(coordinator.run_cycle())
+        except sqlite3.DatabaseError:
+            raise
+        except Exception:
+            events.append({'status': 'RETRY_PENDING', 'error_code': 'COORDINATOR_FAILED'})
     return events
 
 
+def build_execution_coordinator(repository, importer, *, products, queue_dir):
+    """Use the same fixed workbook/identity settings as Operations Web."""
+    profile = os.environ.get('PRA_ENV', 'production').strip().lower()
+    if profile not in {'development', 'production'}:
+        profile = 'production'
+    service = ExecutionAuthorizationApplicationService(
+        repository, authorization=PrincipalCapabilityBackend(),
+        products_workbook=products,
+        platform_mappings_workbook=Path(os.environ.get('PRA_PLATFORM_MAPPINGS_WORKBOOK')
+                                       or PROJECT_ROOT / 'data/samples/platform_mappings.xlsx'),
+        shadowbot_identity_mapping=Path(os.environ.get('PRA_SHADOWBOT_IDENTITY_MAPPING')
+                                       or PROJECT_ROOT / 'shadowbot/test2/product_identity_mapping.json'),
+        queue_root=queue_dir, applet_uri=os.environ.get('SHADOWBOT_APPLET_URI', ''),
+        execution_profile=profile,
+    )
+    return TaskExecutionCoordinator(service, executor=importer.executor)
+
+
 def main() -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, 'reconfigure'):
+            stream.reconfigure(encoding='utf-8', errors='replace')
     args = build_parser().parse_args()
     queue_dir = args.queue_dir or Path(
         os.environ.get("SHADOWBOT_QUEUE_DIR")
@@ -199,6 +232,7 @@ def main() -> int:
         queue_dir,
         inventory_products_path=args.products,
     )
+    coordinator = build_execution_coordinator(repository, importer, products=args.products, queue_dir=queue_dir)
     login_monitor = ShadowBotLoginVerificationMonitor(repository, runner, queue_dir)
     watchdog = ShadowBotQueueWatchdog(
         queue_dir,
@@ -230,6 +264,7 @@ def main() -> int:
                     login_monitor,
                     notification_worker,
                     review_service,
+                    coordinator,
                 )
                 cycle_count += 1
                 for event in events:
@@ -310,6 +345,7 @@ def _service_heartbeat_payload(
             "login_verification_monitor",
             "review_reminder",
             "notification_outbox",
+            "task_execution_coordinator",
         ],
         "reason": reason,
     }
