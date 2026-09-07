@@ -10,7 +10,6 @@ PRA 支持鲜切花预测性销售：持续观察平台与供给事实，供管�
 2. [当前业务合同](docs/business_contract.md)
 3. [当前实现及差距](docs/rebaseline/task13_6_current_implementation_map.md)
 4. [目标职责与 13.7 交接](docs/rebaseline/task13_6_target_responsibility_and_gap_matrix.md)
-5. [审核治理](docs/pra_review_risk_and_complexity_governance.md)
 
 开发 AI 从根级 [AGENTS.md](AGENTS.md) 开始。其他文件按[文档索引及身份](docs/index.md)读取。
 
@@ -26,4 +25,4 @@ ShadowBot 的凭据使用部署机本地 Windows Credential Manager；真实 tar
 
 ## 验证
 
-按任务影响选择验证，见[审核治理](docs/pra_review_risk_and_complexity_governance.md)和[Core CI](docs/core_ci.md)。CI、受控实机操作与长期运行分别报告。文档改动检查编码/链接/差异并执行所需理解验收，不为获得“通过”运行真实平台写操作。
+按任务影响选择验证，见[工作指令](AGENTS.md)和[Core CI](docs/core_ci.md)。CI、受控实机操作与长期运行分别报告。文档改动检查编码/链接/差异并执行所需理解验收，不为获得“通过”运行真实平台写操作。
