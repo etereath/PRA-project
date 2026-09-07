@@ -5,7 +5,8 @@ from __future__ import annotations
 import hashlib
 import json
 from contextlib import closing
-from datetime import datetime
+from datetime import UTC, datetime
+from decimal import Decimal
 
 from app.exceptions import ValidationError
 
@@ -105,6 +106,7 @@ class ExecutionContinuationRepository:
                      envelope['principal_subject'], now.isoformat(), json.dumps({
                          'batch_id': batch_id, 'confirmation_digest': envelope['confirmation_digest'],
                          'capability': envelope['capability'],
+                         'resolution_only': bool(envelope.get('resolution_only')),
                      }, ensure_ascii=False)),
                 )
 
@@ -119,6 +121,13 @@ class ExecutionContinuationRepository:
              close: bool = False, task_status: str | None = None, evidence: dict | None = None) -> None:
         with closing(self.runtime.connect_write()) as connection, connection:
             connection.execute('BEGIN IMMEDIATE')
+            if outcome == 'ALREADY_APPLIED':
+                current = connection.execute(
+                    'SELECT closed_at FROM execution_continuations WHERE batch_id = ?', (batch_id,),
+                ).fetchone()
+                if current is None or current['closed_at'] is not None:
+                    return
+                self._validate_no_write_closure(connection, batch_id, evidence or {})
             changed = connection.execute(
                 'UPDATE execution_continuations SET outcome = ?, message = ?, closed_at = ? '
                 'WHERE batch_id = ? AND closed_at IS NULL AND '
@@ -145,3 +154,39 @@ class ExecutionContinuationRepository:
                          row['task_id'], row['task_status'], task_status, now.isoformat(),
                          outcome, json.dumps({'batch_id': batch_id, **(evidence or {})}, ensure_ascii=False)),
                     )
+
+    @staticmethod
+    def _validate_no_write_closure(connection, batch_id, evidence):
+        """The observation cannot change between validation and atomic closure."""
+        items = connection.execute(
+            'SELECT i.source_task_id, i.write_identity_key, b.status AS batch_status '
+            'FROM shadowbot_commit_batch_items i JOIN shadowbot_commit_batches b ON b.batch_id = i.batch_id '
+            'WHERE i.batch_id = ?', (batch_id,),
+        ).fetchall()
+        facts = evidence.get('platform_observation', [])
+        if not items or {i['source_task_id'] for i in items} != {f['task_id'] for f in facts}:
+            raise ValidationError('No-write closure scope changed')
+        for item in items:
+            if item['batch_status'] != 'PREPARED' or connection.execute(
+                    "SELECT 1 FROM shadowbot_write_locks WHERE write_identity_key = ? AND status <> 'RELEASED'",
+                    (item['write_identity_key'],)).fetchone():
+                raise ValidationError('No-write closure is blocked by published work')
+        for fact in facts:
+            row = connection.execute(
+                'SELECT t.task_status, t.updated_at AS task_updated_at, l.current_price, l.online_status, '
+                'l.price_observed_at, l.price_source_attempt_id FROM tasks t JOIN listing_status l '
+                'ON l.platform_name = t.platform_name AND l.internal_sku = t.internal_sku WHERE t.task_id = ?',
+                (fact['task_id'],),
+            ).fetchone()
+            if (row is None or row['task_status'] != 'pending' or row['task_updated_at'] != fact['task_updated_at']
+                    or Decimal(row['current_price']) != Decimal(fact['target_price'])
+                    or row['online_status'] != fact['listing_status']
+                    or row['price_source_attempt_id'] != fact['listing_price_source_attempt_id']
+                    or not row['price_observed_at']
+                    or _utc_timestamp(row['price_observed_at']) != _utc_timestamp(fact['listing_price_observed_at'])):
+                raise ValidationError('Platform observation changed before no-write closure')
+
+
+def _utc_timestamp(value):
+    parsed = datetime.fromisoformat(value)
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)

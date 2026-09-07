@@ -45,6 +45,7 @@ from app.services.inventory_alert import InventoryAlertService
 from app.services.execution_authorization import (
     ExecutionAuthorizationApplicationService,
     ExecutionAuthorizationError,
+    ExecutionSubmissionResult,
 )
 from app.services.price_execution_resolution import PriceExecutionResolutionApplicationService
 from app.repositories.automation_repository import AutomationRepository
@@ -615,6 +616,14 @@ class OperationsWebApplication:
                 self._first(query, "execution_receipt"),
                 subject,
             )
+            if isinstance(execution_receipt_value, ExecutionSubmissionResult):
+                try:
+                    execution_receipt_value = self.execution_authorization.refresh_submission_result(
+                        session.principal, execution_receipt_value)
+                except Exception:
+                    execution_receipt_value = ExecutionSubmissionResult(
+                        execution_receipt_value.batch_id, '', '', execution_receipt_value.task_ids,
+                        outcome='UNAVAILABLE', message='执行状态暂时无法读取，请刷新或查看任务详情。')
             review_receipt_value = self.control_store.get(
                 self._first(query, "review_receipt"),
                 subject,
@@ -655,8 +664,7 @@ class OperationsWebApplication:
                 ),
                 execution_receipt=(
                     execution_receipt_value
-                    if isinstance(execution_receipt_value, tuple)
-                    and len(execution_receipt_value) == 2
+                    if isinstance(execution_receipt_value, ExecutionSubmissionResult)
                     else None
                 ),
                 execution_error=self._control_message(
@@ -1051,7 +1059,7 @@ class OperationsWebApplication:
             )
         token = self.control_store.put(
             session.principal.subject,
-            (result.batch_id, result.execution_attempt_id),
+            result,
         )
         return self._management_redirect("execution_receipt", token)
 

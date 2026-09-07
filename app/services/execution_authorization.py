@@ -76,6 +76,7 @@ class ExecutionPreparation:
     principal_subject: str
     idempotency_key: str
     payload_digest: str
+    resolution_only: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +85,9 @@ class ExecutionSubmissionResult:
     execution_attempt_id: str
     shadowbot_run_id: str
     task_ids: tuple[str, ...]
+    outcome: str = "ACCEPTED"
+    closed_at: str | None = None
+    message: str = "授权已保存，由执行服务继续推进。"
 
 
 @dataclass(slots=True)
@@ -91,6 +95,15 @@ class _StoredPreparation:
     public: ExecutionPreparation
     payload: dict[str, object]
     state: str = "PREPARED"
+
+
+def _resolution_only(facts) -> bool:
+    if facts['action_type'] != TaskActionType.UPDATE_PRICE.value:
+        return False
+    satisfied = [Decimal(item['listing_price']) == Decimal(item['target_price']) for item in facts['items']]
+    if any(satisfied) and not all(satisfied):
+        raise ExecutionAuthorizationConflict('所选商品仅部分达到目标价，请分别选择已满足和仍需改价的任务重新确认。')
+    return all(satisfied)
 
 
 class ExecutionAuthorizationApplicationService:
@@ -166,7 +179,8 @@ class ExecutionAuthorizationApplicationService:
                 )
 
         self._refresh_correction(task_ids, authenticated_principal.subject, current)
-        facts = self._revalidate(task_ids, current)
+        facts = self._revalidate(task_ids, current, allow_already_applied=True)
+        resolution_only = _resolution_only(facts)
         action_type = TaskActionType(str(facts["action_type"]))
         batch_id = _batch_id(
             authenticated_principal.subject,
@@ -203,6 +217,7 @@ class ExecutionAuthorizationApplicationService:
             "facts": facts,
             "execution_payload": _execution_payload_identity(payload, action_type),
             "expires_at": expires_at.isoformat(),
+            "resolution_only": resolution_only,
         }
         payload_digest = _sha256_json(digest_payload)
         confirmation_digest = payload_digest
@@ -217,6 +232,7 @@ class ExecutionAuthorizationApplicationService:
             principal_subject=authenticated_principal.subject,
             idempotency_key=key,
             payload_digest=payload_digest,
+            resolution_only=resolution_only,
         )
         with self._lock:
             self._purge(current)
@@ -253,7 +269,7 @@ class ExecutionAuthorizationApplicationService:
                 raise ExecutionAuthorizationForbidden(
                     "执行确认与登录身份或任务批次不匹配。"
                 )
-            return ExecutionSubmissionResult(replay['batch_id'], '', '', task_ids)
+            return self._submission_result(replay, task_ids)
         with self._lock:
             self._purge(current)
             stored = self._preparations.get(digest)
@@ -275,7 +291,8 @@ class ExecutionAuthorizationApplicationService:
             stored.state = "SUBMITTING"
 
         try:
-            facts = self._revalidate(task_ids, current)
+            facts = self._revalidate(task_ids, current, allow_already_applied=True)
+            resolution_only = _resolution_only(facts)
             action_type = public.action_type
             if str(facts["action_type"]) != action_type.value:
                 raise ExecutionAuthorizationConflict("任务动作在确认前发生变化。")
@@ -311,6 +328,7 @@ class ExecutionAuthorizationApplicationService:
                     action_type,
                 ),
                 "expires_at": public.expires_at.isoformat(),
+                "resolution_only": resolution_only,
             }
             if _sha256_json(latest_digest_payload) != public.payload_digest:
                 raise ExecutionAuthorizationConflict(
@@ -333,11 +351,14 @@ class ExecutionAuthorizationApplicationService:
                     'facts': facts,
                     'manifest': latest_payload,
                     'context': self.continuation_context(),
+                    'resolution_only': resolution_only,
                 }
                 self.continuations.accept(envelope, now=current)
                 with self._lock:
                     stored.state = 'SUBMITTED'
-                return ExecutionSubmissionResult(public.batch_id, '', '', task_ids)
+                return ExecutionSubmissionResult(public.batch_id, '', '', task_ids,
+                    message=('结束决定的确认已保存；执行服务将复核平台观察后收口，无需改价。'
+                             if resolution_only else '授权已保存，由执行服务继续推进。'))
             runner = self.runner_factory(self.queue_root)
             self._record_authorization_audit(
                 task_ids=task_ids,
@@ -370,7 +391,34 @@ class ExecutionAuthorizationApplicationService:
             execution_attempt_id=str(request["execution_attempt_id"]),
             shadowbot_run_id=str(start.shadowbot_run_id),
             task_ids=task_ids,
+            outcome="DISPATCHED",
+            message="已投递平台执行，请查看任务详情获取当前结果。",
         )
+
+    def refresh_submission_result(self, principal: Principal, receipt: ExecutionSubmissionResult) -> ExecutionSubmissionResult:
+        """Refresh a session-owned receipt without accepting or advancing any work."""
+        with closing(self.runtime.connect_read()) as connection:
+            row = connection.execute(
+                'SELECT * FROM execution_continuations WHERE batch_id = ? AND principal_subject = ?',
+                (receipt.batch_id, principal.subject),
+            ).fetchone()
+        if row is None:
+            if receipt.outcome == 'DISPATCHED':
+                return receipt  # Existing v5 dispatch receipt; no v4 continuation.
+            raise ExecutionAuthorizationForbidden('未找到属于当前账号的执行回执。')
+        return self._submission_result(row, receipt.task_ids)
+
+    @staticmethod
+    def _submission_result(row, task_ids) -> ExecutionSubmissionResult:
+        envelope = json.loads(row['envelope_json'])
+        if digest_json(envelope) != row['envelope_sha256'] or tuple(envelope['task_ids']) != task_ids:
+            raise ExecutionAuthorizationConflict('执行回执与原确认不一致，请检查任务详情。')
+        message = row['message'] or ('本次授权已结束，请查看任务详情。' if row['closed_at'] else (
+            '结束决定的确认已保存；执行服务将复核平台观察后收口，无需改价。'
+            if envelope.get('resolution_only') else '授权已保存，由执行服务继续推进。'))
+        return ExecutionSubmissionResult(row['batch_id'], '', '', task_ids,
+            outcome=row['outcome'] or ('CLOSED' if row['closed_at'] else 'ACCEPTED'),
+            closed_at=row['closed_at'], message=message)
 
     def _record_authorization_audit(
         self,

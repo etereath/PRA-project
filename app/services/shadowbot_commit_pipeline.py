@@ -190,6 +190,8 @@ def publish_task_commit_batch(
                     or authorization_batch_id != request['batch_id']):
                 raise ValidationError('Durable authorization is absent or closed')
             envelope = json.loads(authorization['envelope_json'])
+            if envelope.get('resolution_only'):
+                raise ValidationError('Resolution-only confirmation cannot authorize a platform write')
             if (digest_json(envelope) != authorization['envelope_sha256']
                     or envelope['manifest']['manifest_sha256'] != request['manifest_sha256']
                     or envelope['context']['execution_profile'] != execution_profile

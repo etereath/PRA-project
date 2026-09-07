@@ -146,6 +146,8 @@ class TaskExecutionCoordinator:
         if all(Decimal(i['listing_price']) == Decimal(i['target_price']) for i in facts['items']):
             return self._note(batch_id, 'ALREADY_APPLIED', now, close=True, task_status='skipped',
                               evidence={'platform_observation': facts['items']})
+        if envelope.get('resolution_only'):
+            return self._note(batch_id, 'RECONFIRM', now, close=True)
         if (_semantic_facts(facts) != _semantic_facts(envelope['facts'])
                 or manifest['manifest_sha256'] != batch['manifest_sha256']):
             return self._note(batch_id, 'RECONFIRM', now, close=True)
