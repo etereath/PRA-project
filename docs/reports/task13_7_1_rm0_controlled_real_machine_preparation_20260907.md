@@ -2,7 +2,9 @@
 
 角色：Operations / Real-Machine Acceptance Preparation；检查时间：2026-09-07T21:55:00+08:00。对应已合并 PR [#47](https://github.com/etereath/PRA-project/pull/47)，由 [PR #49](https://github.com/etereath/PRA-project/pull/49) 交付。本记录只覆盖 RM0，不证明部署或真实平台纵向旅程已通过。
 
-## 结论与边界
+> 2026-09-08 已追加 blocker remediation 结果；本节以下至“RM1 PASS 证据模板”保留 2026-09-07 初始 RM0 快照，最新结论见文末“2026-09-08 Blocker Remediation”。
+
+## 结论与边界（2026-09-07 初始检查）
 
 **RM0 结果：BLOCKED；当前不得进入真实 UPDATE_PRICE 写操作。** 仓库起点和非敏感本地配置已收口，正式 Queue 活动目录为空，已有执行账本未发现活动 attempt、UNKNOWN 或未释放写锁，Credential provider 在预期 Windows 用户上下文中可读取凭据。但以下门禁尚未通过：
 
@@ -208,3 +210,98 @@ RM0 不决定目标价格，也不从旧日志推断当前价格。
 | 验证码 / blocker / UNKNOWN / 人工漂移 | `<NONE 或事实记录>` |
 
 只有完整证据经过 Reviewer 判断后，才可更新 Stage Goal；RM0 不作 PASS 宣告。
+
+## 2026-09-08 Blocker Remediation
+
+### 当前结论
+
+`RM0 = BLOCKED`
+
+B1 的 Runtime v18 物理 schema、B2 的 ShadowBot 源码差异和 B3 的服务生命周期问题已修复。迁移后的完整执行账本重查发现一个此前未覆盖的 `set_online` UNKNOWN 批次，涉及 `AISHA-B/C/D`；该对象及其 operation、attempt、lock、receipt 和 reconcile 证据均未清理或改写。B4 的 12 条商品 mapping 仍全部为 `DISABLED`，测试对象和目标价格未由负责人确认。
+
+因此当前不满足“只剩负责人确认测试对象”的条件，不声明 `RM0 TECHNICAL READINESS = PASS`。Stage Goal 继续为 **NOT YET VALIDATED**，不得进入 RM1。
+
+`REAL PLATFORM WRITE NOT AUTHORIZED / NOT EXECUTED`
+
+### 版本与维护窗口
+
+- 远端 main 仍为 `08f4e70fc2ffcd54de6a247ae48f4804da136056`；整改开始时 PR #49 Head 为 `11ed44da9034324b2d614befa01c9ddadf98bd4e`，相对 main 只有文档差异，`app/`、`scripts/` 和 `shadowbot/` 生产源码与 main 一致。
+- 整改前 Operations Web 进程为 0，Queue Service 进程为 0；Worker heartbeat 为历史 `STOPPED`，Worker lock 可获取，活动 execution attempt 为 0。影刀只打开“应用”列表，没有打开编辑器或设计器。
+- 本轮未启动 Operations Web；已从上述代码版本启动 Queue Service，并从影刀应用列表启动同步后的 `test2` Worker。
+
+### B1 — Runtime v18 physical schema
+
+处理结果：**schema 子项 CLOSED；遗留执行子项 OPEN。**
+
+1. 在 Web / Queue Service 均停止且活动 attempt 为 0 时，使用 SQLite online backup 创建一致性备份；备份文件名为 `runtime.before-v18-remediation.sqlite3`，大小 1,343,488 bytes，SHA-256 为 `318f4e19358acdbbe31dca21153de809ad069f603e8348de006b56d9d041939c`。备份 `integrity_check=ok`、FK violation=0，migration 记录完整为 1..18。备份保留在仓库外，不记录完整本地路径。
+2. 使用当前 main 的正式入口 `python -m app.cli init-runtime-db --runtime-db <configured-runtime>` 执行修复。没有手工 `CREATE TABLE`，没有删除 v18 migration row，也没有修改或清除历史 Task / operation / attempt / receipt。
+3. 正式 `check-runtime-health` 返回 `ok=True`、schema 1..18、`runtime schema v18 healthy`；SQLite operational health 为 WAL、`synchronous=NORMAL`、`foreign_keys=1`、`busy_timeout_ms=5000`。
+4. 独立回读确认 `execution_continuations` 存在，9 个 v18 必需列完整；`ix_execution_continuations_open`、授权字段不可变 trigger 和 no-delete trigger 均存在。`integrity_check=ok`，FK violation=0。
+5. migration 后账本重查：open continuation=0、STARTING/RUNNING attempt=0、活动 update-price batch=0、NEEDS_RECONCILIATION operation status=0、ACTIVE/UNKNOWN write lock=0；但有 1 个 listing-action batch 仍为 UNKNOWN：
+
+| 对象 | 状态 | 范围 / 事实 |
+|---|---|---|
+| `WEB7E-6646163b9fc5df85359b2e756b6c02b4` | `UNKNOWN` | 2026-08-30 的 `set_online`；涉及 `AISHA-B-60-Z`、`AISHA-C-55-Z`、`AISHA-D-50-Z` |
+| `OP-1c65202b1e2cb1ac5adc8234` | `FAILED / NOT_APPLIED` | `AISHA-B-60-Z` |
+| `OP-f2fc27e5d0c546d2746f258e` | `MANUAL_HANDLED`，batch item 仍为 `NEEDS_RECONCILIATION` | `AISHA-C-55-Z`；相关历史 UNKNOWN attempts 保留 |
+| `OP-44a2c1659f0dfcf7efa2537f` | `VERIFIED`，batch 仍未收口 | `AISHA-D-50-Z`；历史 UNKNOWN attempt 与后续 VERIFIED attempt 均保留 |
+
+相关 write lock 当前均为 `RELEASED`，但这不允许把 UNKNOWN batch 当作已关闭。Reviewer 必须先判断其账本收口方式；本轮不自行清理。`AISHA-B/C/D` 停止 RM1 准备。
+
+### B2 — ShadowBot deployed source
+
+处理结果：**CLOSED。**
+
+- 同步前再次确认 Worker 停止、Worker lock 可获取、活动 attempt=0、影刀编辑器未打开。
+- 使用既有 `scripts/sync_shadowbot_test2.py --app-dir <configured-app-dir>` 完成同步；没有从影刀目录反向覆盖仓库，没有修改 selector、Credential 或业务 mapping。
+- 同步后使用同一脚本的 `--check` 验证：`module1.py`、`vertical_slice_read_price.py`、`shadowbot_queue_worker.py` 及其余 4 个受控文件全部 `CURRENT`，配置文件 `EXISTS`。
+- `shadowbot_worker_config.json` 与 `selectorsV2.xml` 的 SHA-256 在同步前后不变。app-dir 只以脱敏 fingerprint `7c13091a…` 记录，完整路径未写入 Git。
+
+### B3 — Queue Service / Worker lifecycle
+
+处理结果：**CLOSED。**
+
+- Queue Service 于 `2026-09-08T02:49:39+08:00` 从当前 main 等价源码启动；heartbeat 为 fresh `RUNNING`，包含 Result Importer、Watchdog、登录验证码监视、Review reminder、Outbox 和 `task_execution_coordinator` 六个组件。
+- `test2` Worker 从影刀“应用”列表启动。严格 Worker health 检查通过：heartbeat fresh `RUNNING`，Worker lock 被运行实例持有，heartbeat write failures=0、consecutive failures=0、thread restarts=0。
+- 使用既有 `ShadowBotLifecycleStore.write_verified_state()` 在 fresh heartbeat、空 Queue 和实际影刀窗口事实均通过后记录 lifecycle：`recorded_state=RUNNING`、`shadowbot_window_state=RUNNING_VERIFIED`、reason=`RM0_REMEDIATION_VERIFIED_START`。没有删除旧 heartbeat 或 lifecycle 文件。
+- Web composition、Queue Service 和 Worker 配置指向同一正式 Queue；Web 与 Queue Service 指向同一正式 Runtime。部署 identity mapping 与正式配置哈希一致，Importer 和 Coordinator 均由该 Queue Service 托管。
+- 启动后 `inbox/working/results` 始终为 0，没有投递平台读写请求。8 个历史 pending Review 和 notification outbox 均未发生状态变化，Queue Service 日志没有产生催办、通知或错误事件。
+
+### B4 — 测试对象候选与 mapping
+
+处理结果：**WAIT OWNER。**
+
+正式产品工作簿、平台 mapping 工作簿和 ShadowBot identity mapping 分别有 12 个对象，哈希仍为 `611a7cce…`、`a47b7c29…`、`24f0dd9f…`。每个 internal SKU 在产品数据和 ShadowBot active identity 中均唯一；12 条 PRODUCT mapping 仍全部 `DISABLED`，本轮没有修改工作簿、immutable mapping 或 SQLite。
+
+当前 Operations Web 的商品映射 read model 明确返回“目录暂不可用”，没有产品级 VERIFIED mapping 的 Web 维护页面。运营权威源仍是 `platform_mappings.xlsx`，由现有编译器执行四状态和唯一性校验。负责人确认具体 platform / account / product identity 后，需在独立受控维护中更新该权威工作簿并重新编译验证；本轮不以直接改 SQLite、伪造 VERIFIED 或历史日志猜测替代。
+
+| internal SKU | 商品名称 | 等级 | 唯一 ShadowBot identity | 当前 mapping | 激活前仍缺 |
+|---|---|---|---|---|---|
+| `AISHA-A-70-Z` | 艾莎 | A级 | 是 | DISABLED | 负责人确认 platform / account / product identity |
+| `AISHA-B-60-Z` | 艾莎 | B级 | 是 | DISABLED | Reviewer 先处理旧 UNKNOWN；负责人再确认 identity |
+| `AISHA-C-55-Z` | 艾莎 | C级 | 是 | DISABLED | Reviewer 先处理旧 UNKNOWN；负责人再确认 identity |
+| `AISHA-D-50-Z` | 艾莎 | D级 | 是 | DISABLED | Reviewer 先处理旧 UNKNOWN；负责人再确认 identity |
+| `AISHA-E-45-Z` | 艾莎 | E级 | 是 | DISABLED | 负责人确认 platform / account / product identity |
+| `CAPPUCCINO-A-70-Z` | 卡布奇诺 | A级 | 是 | DISABLED | 负责人确认 platform / account / product identity |
+| `CAPPUCCINO-B-60-Z` | 卡布奇诺 | B级 | 是 | DISABLED | 负责人确认 platform / account / product identity |
+| `CAPPUCCINO-C-55-Z` | 卡布奇诺 | C级 | 是 | DISABLED | 负责人确认 platform / account / product identity |
+| `CAPPUCCINO-D-50-Z` | 卡布奇诺 | D级 | 是 | DISABLED | 负责人确认 platform / account / product identity |
+| `CAPPUCCINO-E-45-Z` | 卡布奇诺 | E级 | 是 | DISABLED | 负责人确认 platform / account / product identity |
+| `ZIXIA-0-FG-Z` | 紫霞仙子 | 0级 | 是 | DISABLED | 负责人确认 platform / account / product identity |
+| `ZIXIA-B-FG-Z` | 紫霞仙子 | B级 | 是 | DISABLED | 负责人确认 platform / account / product identity |
+
+负责人还需为最终测试对象明确当前实际价格、目标价格和测试时段。本轮不默认选择“艾莎 B级”，也不决定任何真实目标价格。
+
+### Remediation 后 RM0 Gate
+
+| Gate | 结果 | 说明 |
+|---|---|---|
+| Runtime schema / SQLite health | PASS | v18 物理结构、health、integrity、FK 均通过 |
+| Runtime execution ledger | BLOCKED | 旧 `WEB7E-6646…` listing batch 仍为 UNKNOWN |
+| ShadowBot deployed source | PASS | 所有受控文件 CURRENT；配置和 selector 未改 |
+| Lifecycle / environment alignment | PASS | Queue Service、Worker、lifecycle fresh/一致；Web 配置、Importer、Coordinator 对齐正式 Runtime/Queue |
+| Mapping / test object | WAIT OWNER | 12 条 mapping 均 DISABLED；负责人尚未确认测试对象 |
+| Queue active directories | PASS | `inbox/working/results` 均为 0 |
+| Credential / security | PASS | 当前 Worker 用户上下文可读取 Generic Credential；只记录非空布尔结果，无 secret、target、username、password、token、Webhook 或完整私密路径进入 Git/报告 |
+
+下一步只能由 Reviewer 先处理旧 UNKNOWN 批次的证据收口，再由负责人确认一个不冲突的测试对象、platform、account、product identity、当前价、目标价和时段。完成前不得创建或授权真实 UPDATE_PRICE，不得进入 RM1，也不得开始 13.7-2。
