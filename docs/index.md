@@ -1,58 +1,51 @@
 # PRA 文档索引与权威角色
 
-本页是文档身份和阅读顺序的主入口；阶段进度只在[当前状态](project_current_status.md)维护。
+本页仅维护文档路径、主题和角色，不保存项目进度、验收结论或当前待办。项目进度统一见[当前状态](project_current_status.md)。
 
-## Canonical 与当前实现
+## 项目主文档
 
-| 问题 | 主文档/证据 | 权威边界 |
+| 主题 | 文档 | 角色 |
 |---|---|---|
-| 产品为什么存在、路线是什么 | [产品与路线图](project_overview.md) | 当前目标和长期方向 |
-| 业务应该怎样运行 | [业务合同](business_contract.md) | G1 及用户最新明确裁决；实现偏差不能反向改业务 |
-| 当前源码实际做什么 | [实现责任图](rebaseline/task13_6_current_implementation_map.md)及指定 SHA 源码 | Current Implementation，不能当未来产品规范 |
-| 各段由谁负责、13.7 补什么 | [目标职责/gap/IG-01～11](rebaseline/task13_6_target_responsibility_and_gap_matrix.md) | 已采纳架构，不是生产完成证明 |
-| 开发 Agent 如何工作 | [AGENTS](../AGENTS.md) | 根级长期工作规则、硬边界和权限 |
-| 开发如何控制范围与注意力 | [开发范围与效率治理](pra_development_scope_and_efficiency_governance.md) | Developer / Execution Governance；不导入 Reviewer 工作流 |
-| 当前阶段通过了吗 | [当前状态](project_current_status.md)与绑定版本的验收记录 | CI、READ_ONLY、COMMIT、部署、长期运行分别证明 |
+| 项目进度与验证状态 | [当前状态](project_current_status.md) | 唯一进度页 |
+| 产品目标与路线 | [产品与路线图](project_overview.md) | 产品定义 |
+| 业务定义 | [业务合同](business_contract.md) | 业务主定义 |
+| 实现责任与调用关系 | [实现责任图](rebaseline/task13_6_current_implementation_map.md) | 指定 SHA 的实现事实 |
+| 目标职责与缺口 | [目标职责 / gap / IG-01～11](rebaseline/task13_6_target_responsibility_and_gap_matrix.md) | 目标架构 |
+| Agent 工作入口 | [AGENTS](../AGENTS.md) | 硬边界、权限与最小入口 |
+| 开发范围与投入判断 | [开发范围与效率治理](pra_development_scope_and_efficiency_governance.md) | WHY / WHEN |
+| 开发执行步骤 | [开发执行参考](development_workflow.md) | HOW |
 
-每个主题只在主文档维护一次。README/AGENTS/Status 是短入口；历史材料不能通过标题中的“冻结”“必须”重新成为现役合同。用户最新明确指令优先于仓库旧规则，但不使未实现能力自动成为事实。
+## 实现与运维参考
 
-## 按需开发参考
-
-- [开发执行参考](development_workflow.md)：仅在需要安排测试、接口适配或交付细节时按节读取，不属于默认阅读集。
-
-## Current Implementation & Operations
-
-这些是特定运行能力说明，使用前核对对应代码/版本；不覆盖上述业务定义。
-
-- [核心 wheel/ShadowBot 部署](core_wheel_shadowbot_deployment.md)
+- [核心 wheel / ShadowBot 部署](core_wheel_shadowbot_deployment.md)
 - [环境变量](runtime_environment_variables.md)、[Core CI](core_ci.md)
-- [Queue/Worker 运维](shadowbot_file_queue_operations.md)、[上下架集成](shadowbot_listing_status_integration.md)
+- [Queue / Worker 运维](shadowbot_file_queue_operations.md)、[上下架集成](shadowbot_listing_status_integration.md)
 - [DB 库存输入及迁移背景](product_inventory_input_spec.md)、[SQLite 并发](sqlite_concurrency.md)
 - [通知 Outbox](notification_outbox.md)、[Mobile Review token](mobile_review_token_spec.md)
-- [业务规则评估框架](business_rule_evaluation_framework.md)：现有 evaluator 功能，不能自动升级为销售 Controller
-- [产能输入](capacity_plan_input_spec.md)、[冷库输入](cold_storage_input_spec.md)：辅助输入说明，不定义新 Supply authority
+- [业务规则评估框架](business_rule_evaluation_framework.md)
+- [产能输入](capacity_plan_input_spec.md)、[冷库输入](cold_storage_input_spec.md)
 
-## 当前任务与验证证据
+## 任务计划与证据目录
 
-- [13.7-1 P2 已满足目标确认与授权回执修复](reports/task13_7_1_p2_authorization_receipts_20260907.md)：用户追加授权的两个 P2；零写结束、旧授权重放与实时回执，待正式复核
-- [13.7-1 P1 人工终态收口修复](reports/task13_7_1_p1_human_resolution_20260907.md)：首审 FAIL 后的修复与定向回归；待正式复核
-- [13.7-1 人工改价实现、迁移和隔离验证](reports/task13_7_1_human_update_price_20260907.md)：绑定实现 SHA；真实平台 Stage Goal 仍未验证
-- [13.7 首条人工改价纵向切片计划](plans/task13_7_human_update_price_vertical_slice.md)与[开发 Goal](plans/task13_7_first_slice_codex_goal.md)：准备/交接材料，施工时从包含已验收13.6交付的最新main开始；不替代业务合同或目标职责
+- [13.7-1 已满足目标确认与授权回执](reports/task13_7_1_p2_authorization_receipts_20260907.md)：P2 修复报告
+- [13.7-1 人工终态收口](reports/task13_7_1_p1_human_resolution_20260907.md)：P1 修复报告
+- [13.7-1 人工改价实现、迁移和隔离验证](reports/task13_7_1_human_update_price_20260907.md)：首版实现报告
+- [13.7 首条人工改价纵向切片计划](plans/task13_7_human_update_price_vertical_slice.md)、[开发 Goal](plans/task13_7_first_slice_codex_goal.md)
 - [13.6-3 计划](plans/task13_6_3_canonical_entrypoint_convergence.md)
-- [13.6-3 历史预检原始问答、外部测试反馈与修订记录](reports/task13_6_3_canonical_entrypoint_and_cold_start_20260906.md)：证据材料，不是冷启动受测阅读集；旧版本结果不自动覆盖修订后的文档，正式验收由负责人主持
+- [13.6-3 原始问答、外部测试反馈与修订记录](reports/task13_6_3_canonical_entrypoint_and_cold_start_20260906.md)
 - [G1 Gate](reports/task13_6_1_g1_business_baseline_review_20260906.md)
 - [G2 Gate](reports/task13_6_2_g2_architecture_handoff_review_20260906.md)、[增量 G2 Gate](reports/task13_6_2_g2_incremental_parallel_absorption_review_20260906.md)
 - [文档迁移与来源映射](rebaseline/task13_6_document_authority_inventory.md)
 
-## Historical / Superseded / Draft
+## 历史与归档目录
 
-| 材料 | 角色和用途 |
+| 材料 | 文档角色 |
 |---|---|
-| `docs/plans/task13_5_*`、Issue #20、PR #39 | Historical/Candidate；13.5 STOPPED，7G 不继续；未合并 PR 不是 main 事实 |
-| `docs/reports/task13_5_*`、`docs/evidence/**`、Task12/13 evidence | 历史验证；只在绑定 SHA/工作树/平台/scope 成立，原始/hash-bound 文件不改写 |
-| G1 Closure、Open Decision Register、旧 G1 候选入口 | 决策历史；OD-01～OD-06 已关闭，现役规则见业务合同 |
-| [平行吸收补充](rebaseline/task13_6_parallel_analysis_absorption_addendum.md)、PR #44 | G2 采纳历史与 donor；有效 delta 已合入目标职责；未采纳表/状态机不生效 |
-| [旧业务规范](business_decision_spec.md)、[旧 Agent 入口](ai_agent_integration_spec.md)、`doc/project_overview.md` | 历史/转向入口，不再定义当前业务或任务归属 |
-| [Archive](archive/README.md) | 原样归档证据，包括旧 AGENTS；不自动继承其指令 |
+| `docs/plans/task13_5_*`、Issue #20、PR #39 | 历史计划与候选设计 |
+| `docs/reports/task13_5_*`、`docs/evidence/**`、Task12/13 evidence | 绑定版本、环境与范围的原始验证材料 |
+| G1 Closure、Open Decision Register、旧 G1 候选入口 | 决策历史 |
+| [平行吸收补充](rebaseline/task13_6_parallel_analysis_absorption_addendum.md)、PR #44 | 历史分析与来源材料 |
+| [旧业务规范](business_decision_spec.md)、[旧 Agent 入口](ai_agent_integration_spec.md)、`doc/project_overview.md` | 历史定义与转向入口 |
+| [Archive](archive/README.md) | 原样归档证据 |
 
-其他 `docs/*.md` 默认是特定 feature/implementation 或历史说明，不因路径浅而自动成为 Canonical。高影响旧入口的处置见迁移表；需要追溯原导航可读取[收口前完整索引](https://github.com/etereath/PRA-project/blob/08041bfe25a7f31f032564a2abca35e5eb5f5330/docs/index.md)。不要求历史旧词零命中，不批量改写历史报告。
+其他 `docs/*.md` 的主题与角色见相应文件和迁移表。[旧版完整索引](https://github.com/etereath/PRA-project/blob/08041bfe25a7f31f032564a2abca35e5eb5f5330/docs/index.md)仅用于历史导航；历史材料不自动成为现役规则。

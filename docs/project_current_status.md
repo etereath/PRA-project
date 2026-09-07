@@ -1,6 +1,10 @@
 # PRA 当前阶段与验证状态
 
-角色：Current Status；唯一当前阶段状态页。更新于 2026-09-07。PR [#46](https://github.com/etereath/PRA-project/pull/46) 已合并，本次交接起点为 main `f227cd2517687e4a6dfadea90c2e126a5da69711`。当前在 Draft PR [#47](https://github.com/etereath/PRA-project/pull/47)、分支 `codex/task13-7-1-human-update-price` 完成首审 P1 与两个 P2 修复；最新源码版本 `5604a4d8807d49ba70d09bd5dc6c2e603df970a5`。未合并、未部署；[P2 修复与证据](reports/task13_7_1_p2_authorization_receipts_20260907.md)，[P1 修复与证据](reports/task13_7_1_p1_human_resolution_20260907.md)，[首版实现快照](reports/task13_7_1_human_update_price_20260907.md)，[开发 Goal](plans/task13_7_first_slice_codex_goal.md)。
+角色：Current Status；项目进度与验证状态的唯一维护页。Codex 每次推送前同步更新，包括纯文档推送；`index.md` 仅负责索引。更新于 2026-09-07。
+
+当前在 Draft PR [#47](https://github.com/etereath/PRA-project/pull/47)、分支 `codex/task13-7-1-human-update-price` 完成 13.7-1 首版、首审 P1 与两个 P2 修复，以及 Windows CI 测试时序修复。PR #46 已合并，交接起点为 main `f227cd2517687e4a6dfadea90c2e126a5da69711`；本 PR 尚未合并或部署。
+
+最新生产代码变更为 `4f843bedbaf9885cf4e2a7462caf96be6773fe24`，最新测试变更为 `eb6e24b8e5d85829d22c76b65c0b86cce2ddc797`。后续改动均为文档；最近已完成验证的 Head `d57a5158ccab2d6a948cc89503d3b5a6be770c09` 的 [Core CI](https://github.com/etereath/PRA-project/actions/runs/34114037262) 为 SUCCESS。当前这批文档职责调整的 CI 待推送后运行，实际 PR Head 与检查结果见 [PR 检查项](https://github.com/etereath/PRA-project/pull/47/checks)和 PR 正文，不用历史绿色结果冒充新 Head 验证。
 
 | 项目 | 状态 | 依据/下一步 |
 |---|---|---|
@@ -13,9 +17,18 @@
 | Task 13.7 Readiness | READY | 业务与文档交接条件通过；首条纵切计划/Goal已准备 |
 | Task 13.7-1 开工交接 | COMPLETE | Codex 已在原分支/PR 承接，没有另建计划 PR |
 | Task 13.7-1 代码实现 | P1/P2 修复完成 / 待复核 | 正式人工收口及催办、目标已满足时确认结束决定、回执刷新持久状态；Schema 仍为 v18 |
-| Task 13.7-1 隔离旅程 | P1/P2 定向回归 PASS | P1 完整链路回归通过；P2 验证零写结束、重启与竞争、旧授权重放和页面刷新。全量与最终 Head CI 见 PR 交付说明 |
+| Task 13.7-1 隔离旅程 | P1/P2 定向回归 PASS | P1 人工收口与后续执行、P2 零写结束及实时回执已有隔离证据；测试时序修复后的 4 个失败用例定向通过，完整门禁见下节 |
+| Windows CI 时序修复 | 已修复并验证 | `scan()` 保持整秒精度，必要时等待到旧执行停止后的下一整秒；`eb6e24b` 的 Windows / Linux Core CI 完整通过 |
+| 开发文档治理 | 职责调整完成 | AGENTS 已精简，网页审核材料已原样归档；治理文档只定义 WHY / WHEN，执行参考承接 HOW，索引移除进度；每次推送前同步本页 |
 | Task 13.7-1 Implementation Review | 首审 FAIL；P1/P2 修复待复核 | 首审 1 个 P1 blocking、2 个 P2 nonblocking、0 个额外 Merge Gate。用户已追加授权修复两项 P2，复核覆盖原问题与直接回归；合并门禁未放行 |
 | Task 13.7-1 Stage Goal | NOT YET VALIDATED | 尚无包含重启或 blocker 恢复的受控实机证据，需负责人主持 |
+
+## 本批变更与验证依据
+
+- 本批仅调整 AGENTS、Developer Governance、development_workflow、索引和本状态页的职责，并同步 PR 正文。生产代码和测试未变；文档执行 UTF-8 回读、中文/表头抽查、链接、差异与职责一致性检查。
+- `scan()` 原夹具的微秒观察时间与后续整秒回读不一致；`35d08ad` 单独截断微秒后，[CI](https://github.com/etereath/PRA-project/actions/runs/34109479644) 仍有 4 个用例因扫描未严格晚于旧执行停止时刻而失败。`eb6e24b` 补齐时序，四个失败用例定向 **4 passed**，其 [Core CI](https://github.com/etereath/PRA-project/actions/runs/34110475983) 的 Windows / Linux 均 SUCCESS。失败记录保留，未通过重跑碰绿收口。
+- 后续治理文档增加归档读取授权、CI 排查范围和有证据的同版本重跑规则；`d57a515` 的 Core CI 已通过。本批继续拆分 WHY / WHEN 与 HOW，不重做 P1/P2 全量审核或本地源码全量测试。
+- [P2 修复与证据](reports/task13_7_1_p2_authorization_receipts_20260907.md)、[P1 修复与证据](reports/task13_7_1_p1_human_resolution_20260907.md)、[首版实现及 v18 迁移](reports/task13_7_1_human_update_price_20260907.md)保留各自绑定版本。当前仍需正式复核与受控实机证据，绿色 CI 不替代这两项。
 
 ## 当前能力与限制
 
@@ -39,7 +52,7 @@
 
 先完成1 SKU、1次人工UPDATE_PRICE，从决定、Runtime Task、正式授权、持久交接，经既有v4/Queue/Worker/Importer到终态与平台回读，并验证重启或阻塞解除后的责任连续。详见[首切片计划](plans/task13_7_human_update_price_vertical_slice.md)与[开发Goal](plans/task13_7_first_slice_codex_goal.md)。
 
-ChatGPT 已对 `ceb88a0` 完成[首审并冻结问题](https://github.com/etereath/PRA-project/pull/47#pullrequestreview-5126336815)：UNKNOWN → 唯一对账失败缺少正式人工终态路径，Implementation 为 FAIL。Codex 按用户授权完成 P1 修复后，又按追加“开始修复并推送”授权完成两个 P2：授权前已达到目标的正常结束入口、关闭后旧授权回执的真实状态。下一步按最新源码 SHA 复核原 P1/P2 与直接回归；修复完成不等于正式审核已经通过。负责人仍需安排受控现场验收并决定合并，必要配置和证据边界见修复报告。合并、结束 Draft、部署和真实平台写入本次均未执行。
+ChatGPT 已对 `ceb88a0` 完成[首审并冻结问题](https://github.com/etereath/PRA-project/pull/47#pullrequestreview-5126336815)：UNKNOWN → 唯一对账失败缺少正式人工终态路径，Implementation 为 FAIL。Codex 已按授权交付 P1、两个 P2 及测试时序修复；截至本次同步，PR 上未新增正式复核通过结论。下一步由审核者按当前实现复核原 P1/P2 与直接回归，负责人安排包含重启或 blocker 恢复的受控现场验收并决定合并。治理文档评阅与绿色 CI 不关闭实现审核问题；必要配置和证据边界见修复报告。
 
 PR #44 已关闭且未合并，仍作历史平行分析；有效增量已随 #45 吸收，未采纳设计不成为施工合同。Issue #41 与旧报告的阶段叙述按其历史范围读取，不重新打开已完成的 13.6。
 
