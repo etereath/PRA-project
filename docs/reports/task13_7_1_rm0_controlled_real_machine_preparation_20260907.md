@@ -352,3 +352,31 @@ INDETERMINATE
 | Credential / security | PASS | 当前 Worker 用户上下文可读取 Generic Credential；只记录非空布尔结果，无 secret、target、username、password、token、Webhook 或完整私密路径进入 Git/报告 |
 
 `RM0 TECHNICAL READINESS = PASS WITH HISTORICAL DEBT`。`RM1 BUSINESS AUTHORIZATION = WAIT OWNER`。下一步由负责人确认一个满足当前 SKU 隔离门禁的测试对象、platform、account、product identity、当前价、目标价和时段，并决定 B4 mapping 的受控维护；在负责人明确授权前不得创建或授权真实 UPDATE_PRICE，不得进入 RM1，也不得开始 13.7-2。Stage Goal 保持 **NOT YET VALIDATED**。
+
+## 2026-09-08 RM0.5 — Owner Decision、Mapping 与 RM1 Preflight
+
+负责人确认本次受控验收范围：平台为“蚂蚁花团供应商”，经营账号为“千芳花卉”，测试对象为 `AISHA-B-60-Z`、`AISHA-C-55-Z`、`AISHA-D-50-Z`，平台商品身份采用“商品名＋等级”，当前时段可用于后续验收。目标价格必须在 RM1-A 新鲜 READ-BEFORE 后另行决定；本次没有读取平台当前价格，也没有创建 Task、授权或真实平台动作。
+
+运营 mapping 工作簿原 SHA-256 为 `a47b7c298ad93a6e999694a02ec14d9a5636f982bd6f3198bdcfefd0cf3bc41e`。受控维护前已在仓库外保存原文件备份，只将 `MAYI-PRODUCT-02/03/04` 从候选 `DISABLED` 转为对应 SKU 的 `VERIFIED`，清空 `candidate_internal_sku`，记录本次生效和核验时间；其余 9 条 PRODUCT mapping 保持 `DISABLED`。工作簿回读、表头和三条中文商品/等级抽查通过，修改后 SHA-256 为 `0f2cfa41bb6d74eb3384c8632940e739a4142262ae52f95d93b10f7ce23d5663`。现有编译器的唯一性、状态和生效范围校验通过，不可变 JSON SHA-256 / mapping version 均为 `faa792548297dc7e3a19a5ad3631d8741d9d28bc3489587110010705cc36ba6f`。工作簿、备份和编译产物均保留在仓库外，没有提交真实运营文件。
+
+ShadowBot 版本化 identity 中三个 SKU 均各有一个 active“艾莎＋B级/C级/D级”身份，部署 `--check` 的 7 个受控文件全部 `CURRENT`，配置文件存在。Runtime schema v18 health 通过；正式 Queue 的 `inbox/working/results` 均为 0；Worker 为正常 `STOPPED`，Queue Service 保持 `RUNNING`。Credential provider 在当前 Windows 用户上下文可读，自动登录和员工通道均已启用。Credential 登录名不作为经营主体名称的权威来源；“千芳花卉”由负责人本次确认，RM1-A 仍须在真实页面 read-before 时核对实际经营账号范围。
+
+三个 SKU 的 Runtime 定向只读预检结果：active attempt=0，`ACTIVE/UNKNOWN/REVIEW_BLOCKED` write lock=0，open action-blocking Review=0，open execution continuation=0，活动/current operation conflict=0，活动 Queue 冲突=0。C、D 各保留一条 2026-08-31 已过有效期、未授权、未生成 operation/attempt/lock 的旧人工改价 Task，数据库状态仍为 `pending`；现有改价预览不会把另一条价格决定作为同 SKU 冲突，且授权服务会拒绝过期 Task，因此不构成本次 RM1-A/RM1-B 的活动执行责任。本轮不借 RM0.5 取消或改写该历史状态。
+
+```text
+RM0 TECHNICAL READINESS = PASS WITH HISTORICAL DEBT
+
+B4 SELECTED SKU / MAPPING = READY
+
+RM1 PREFLIGHT = READY
+
+RM1-A REAL READ_ONLY = NOT AUTHORIZED / NOT EXECUTED
+
+RM1-B REAL WRITE = NOT AUTHORIZED / NOT EXECUTED
+
+TARGET PRICE = OWNER DECISION AFTER READ-BEFORE
+
+Stage Goal = NOT YET VALIDATED
+```
+
+RM1 后续仍严格拆分：负责人另行授权 RM1-A 后，只启动服务并执行真实 READ_ONLY；成功获得三个 SKU 的新鲜当前价格、身份、时间和证据后停止，由负责人确定精确目标价格。RM1-A 不授权 RM1-B；任何 Human UPDATE_PRICE、COMMIT、价格恢复或其他平台写操作均须新的明确授权。
