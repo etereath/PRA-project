@@ -64,7 +64,7 @@ def scan(unknown, monkeypatch, *, price='14.00', suffix='001'):
     request, _ = publish_listing_sync_batch(j.runtime, ShadowBotFileQueueRunner(j.service.queue_root),
         manifest=manifest, execution_profile=j.service.execution_profile, applet_uri=j.service.applet_uri)
     # A platform observation fixture crosses the same real file Worker/import boundary.
-    now = datetime.now(UTC)
+    now = datetime.now(UTC).replace(microsecond=0)
     result = _result(request, scan_started_at=now.isoformat())
     snapshot = result['snapshot']
     for key in list(snapshot):
