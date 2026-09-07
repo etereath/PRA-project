@@ -1,6 +1,6 @@
 # Task 13.7-1 RM0：受控真实平台验收准备
 
-角色：Operations / Real-Machine Acceptance Preparation；检查时间：2026-09-07T21:55:00+08:00。对应已合并 PR [#47](https://github.com/etereath/PRA-project/pull/47)。本记录只覆盖 RM0，不证明部署或真实平台纵向旅程已通过。
+角色：Operations / Real-Machine Acceptance Preparation；检查时间：2026-09-07T21:55:00+08:00。对应已合并 PR [#47](https://github.com/etereath/PRA-project/pull/47)，由 [PR #49](https://github.com/etereath/PRA-project/pull/49) 交付。本记录只覆盖 RM0，不证明部署或真实平台纵向旅程已通过。
 
 ## 结论与边界
 

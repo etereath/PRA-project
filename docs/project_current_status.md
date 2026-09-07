@@ -4,7 +4,7 @@
 
 PR [#47](https://github.com/etereath/PRA-project/pull/47) 已合并，当前 main 为 `08f4e70fc2ffcd54de6a247ae48f4804da136056`，PR 最终 Head 为 `1011091d21bf8ae2be0bb9da7c124e2281bddf04`。Task 13.7-1 Implementation Review = **PASS**，P1-47-01、P2-47-01、P2-47-02 均 **CLOSED**。代码已进入 main，但尚未部署或完成真实平台纵向验收。
 
-当前下一步是 **Controlled Real-Machine Acceptance**。2026-09-07 的 [RM0 环境准备](reports/task13_7_1_rm0_controlled_real_machine_preparation_20260907.md)已固定 main 与 RM1 步骤，并完成脱敏只读检查；Runtime health、ShadowBot 源码一致性、生命周期和 VERIFIED 商品映射仍有 blocker，因此真实写尚未授权或执行。本批文档在分支 `codex/task13-7-1-rm0-preparation` 交付，Stage Goal 保持 **NOT YET VALIDATED**。
+当前下一步是 **Controlled Real-Machine Acceptance**。2026-09-07 的 [RM0 环境准备](reports/task13_7_1_rm0_controlled_real_machine_preparation_20260907.md)已固定 main 与 RM1 步骤，并完成脱敏只读检查；Runtime health、ShadowBot 源码一致性、生命周期和 VERIFIED 商品映射仍有 blocker，因此真实写尚未授权或执行。本批文档由 [PR #49](https://github.com/etereath/PRA-project/pull/49)、分支 `codex/task13-7-1-rm0-preparation` 交付，Stage Goal 保持 **NOT YET VALIDATED**。
 
 | 项目 | 状态 | 依据/下一步 |
 |---|---|---|
