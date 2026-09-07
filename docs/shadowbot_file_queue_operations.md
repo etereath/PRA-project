@@ -1,6 +1,6 @@
 # ShadowBot 常驻文件队列运行手册
 
-Task 13.7-1 从 Schema v18 起在同一 Queue Service 中托管人工改价持久授权。部署前核对[版本、迁移、配置一致性与恢复出口](reports/task13_7_1_human_update_price_20260907.md)；服务启动会继续推进仍有效的已接受授权。该分支实现尚未代表生产已部署。
+Task 13.7-1 从 Schema v18 起在同一 Queue Service 中托管人工改价持久授权。部署前核对[版本、迁移、配置一致性与恢复出口](reports/task13_7_1_human_update_price_20260907.md)；服务启动会继续推进仍有效的已接受授权。该实现已随 PR #47 合入 main，但尚未代表生产已部署或真实平台纵向验收通过。
 
 ## 1. 运行边界
 
@@ -69,7 +69,7 @@ provider 使用 Python 标准库 `ctypes` 调用 `CredReadW`/`CredFree`，不依
 实机验收约定：
 
 - 投递实机请求前必须加载 `scripts\local_env.ps1`；否则请求会进入项目内开发队列 `data\runtime\shadowbot_queue`，不会被 `D:\PRA_Runtime\shadowbot_queue` 的影刀 Worker 领取。
-- 当前在售测试商品为“艾莎 B级”。请求中的 `expected_grade` 必须使用 `B级`；传入 `C级` 得到 `PRODUCT_NOT_FOUND` 是业务条件不匹配，不代表登录、刷新或元素定位失败。
+- 历史实机记录使用“艾莎 B级”，当时请求中的 `expected_grade` 为 `B级`；传入 `C级` 得到 `PRODUCT_NOT_FOUND` 是当时业务条件不匹配，不代表登录、刷新或元素定位失败。该记录不是当前平台事实，新的实机请求必须先由负责人确认 platform、account、internal SKU、platform product identity、商品名称/等级、当前价格、目标价格和测试时段。
 - 验证码测试需要留出足够时间让小程序跳转回首页；验收通过的标志是同一 `execution_attempt_id` 从 `LOGIN_VERIFICATION_REQUIRED` 继续到 `READ_COMPLETED`，而不是另起 attempt 的后续读取成功。
 - 验收结束后，必须让 Result Importer 导入结果并确认 `working/`、`results/` 没有该 attempt 的活动文件，随后再停止 Worker 并关闭影刀残留运行窗口。
 - 商品管理页的 WebView 页面实例 ID（如 `page-103`）会在登录后变化。适配器会优先使用人工捕获的列表容器选择器；未命中时自动移除 `page-*` 临时 ID 后再次查找，稳定的结构属性仍保留。不要把这种容器未命中直接归类为小程序白屏。

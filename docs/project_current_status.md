@@ -2,9 +2,9 @@
 
 角色：Current Status；项目进度与验证状态的唯一维护页。Codex 每次推送前同步更新，包括纯文档推送；`index.md` 仅负责索引。更新于 2026-09-07。
 
-当前在 Draft PR [#47](https://github.com/etereath/PRA-project/pull/47)、分支 `codex/task13-7-1-human-update-price` 完成 13.7-1 首版、首审 P1 与两个 P2 修复，以及 Windows CI 测试时序修复。PR #46 已合并，交接起点为 main `f227cd2517687e4a6dfadea90c2e126a5da69711`；本 PR 尚未合并或部署。
+PR [#47](https://github.com/etereath/PRA-project/pull/47) 已合并，当前 main 为 `08f4e70fc2ffcd54de6a247ae48f4804da136056`，PR 最终 Head 为 `1011091d21bf8ae2be0bb9da7c124e2281bddf04`。Task 13.7-1 Implementation Review = **PASS**，P1-47-01、P2-47-01、P2-47-02 均 **CLOSED**。代码已进入 main，但尚未部署或完成真实平台纵向验收。
 
-最新生产代码变更为 `4f843bedbaf9885cf4e2a7462caf96be6773fe24`，最新测试变更为 `eb6e24b8e5d85829d22c76b65c0b86cce2ddc797`。后续改动均为文档；本次合并前同步已核验最新完成的 [Core CI #188](https://github.com/etereath/PRA-project/actions/runs/34123119465) 为 **SUCCESS**，绑定 Head `366a757f970ff6ac296214cf13d0dd9579df69d6`。本批仅同步最终状态；推送后的新 Head 检查另见 [PR 检查项](https://github.com/etereath/PRA-project/pull/47/checks)和 PR 正文，不将 #188 记为后续提交的运行结果。
+当前下一步是 **Controlled Real-Machine Acceptance**。2026-09-07 的 [RM0 环境准备](reports/task13_7_1_rm0_controlled_real_machine_preparation_20260907.md)已固定 main 与 RM1 步骤，并完成脱敏只读检查；Runtime health、ShadowBot 源码一致性、生命周期和 VERIFIED 商品映射仍有 blocker，因此真实写尚未授权或执行。本批文档在分支 `codex/task13-7-1-rm0-preparation` 交付，Stage Goal 保持 **NOT YET VALIDATED**。
 
 | 项目 | 状态 | 依据/下一步 |
 |---|---|---|
@@ -16,24 +16,26 @@
 | Task 13.6 Overall | PASS | G1/G2、入口/正式AGENTS及负责人最终验收已收口；验收记录见阶段报告追加节 |
 | Task 13.7 Readiness | READY | 业务与文档交接条件通过；首条纵切计划/Goal已准备 |
 | Task 13.7-1 开工交接 | COMPLETE | Codex 已在原分支/PR 承接，没有另建计划 PR |
-| Task 13.7-1 代码实现 | 修复完成 / 复核 PASS | 正式人工收口及催办、目标已满足时确认结束决定、回执刷新持久状态；Schema 仍为 v18 |
+| Task 13.7-1 代码实现 | 已合并 / 复核 PASS | #47 已进入 main `08f4e70`；正式人工收口及催办、目标已满足时确认结束决定、回执刷新持久状态；Schema 目标仍为 v18 |
 | Task 13.7-1 隔离旅程 | P1/P2 定向回归 PASS | P1 人工收口与后续执行、P2 零写结束及实时回执已有隔离证据；测试时序修复后的 4 个失败用例定向通过，完整门禁见下节 |
 | Windows CI 时序修复 | 已修复并验证 | `scan()` 保持整秒精度，必要时等待到旧执行停止后的下一整秒；`eb6e24b` 的 Windows / Linux Core CI 完整通过 |
 | 开发文档治理 | 职责调整完成 | AGENTS 已精简，网页审核材料已原样归档；治理文档只定义 WHY / WHEN，执行参考承接 HOW，索引移除进度；每次推送前同步本页 |
 | Task 13.7-1 Implementation Review | PASS | 2026-09-07 用户最终裁决；冻结问题 P1-47-01、P2-47-01、P2-47-02 全部 CLOSED，无遗留冻结问题 |
-| 合并前 CI | #188 SUCCESS | 绑定 `366a757`；后续状态同步提交的检查按实际 Head 另记 |
+| #47 合并与最终检查 | MERGED / SUCCESS | merge commit `08f4e70`；最终 Head `1011091` 的 Windows / Linux Core 均 SUCCESS |
+| Task 13.7-1 RM0 | BLOCKED | Queue 活动目录与已有执行账本无遗留写；Runtime 缺 `execution_continuations`、ShadowBot 有 3 个源码差异、heartbeat/lifecycle 不一致、平台映射均 DISABLED；修复后重验才能进入 RM1 |
 | Task 13.7-1 Stage Goal | NOT YET VALIDATED | 尚无包含重启或 blocker 恢复的受控实机证据，需负责人主持 |
 
-## 本批变更与验证依据
+## 13.7-1 实现与当前 RM0 验证依据
 
-- 本批按 2026-09-07 用户最终裁决同步 Current Status / PR 正文：**Implementation Review = PASS**，**P1-47-01、P2-47-01、P2-47-02 全部 CLOSED**，最新已完成 **CI #188 SUCCESS**。本次是裁决记录同步，不虚构额外审核运行；生产代码和测试未变，文档执行 UTF-8 回读、中文/表头抽查、链接和差异检查。
+- 当前 RM0 绑定 main `08f4e70`，核验 #47 已合并且最终 Windows / Linux Core SUCCESS。脱敏现场检查发现 Runtime health、ShadowBot 源码、生命周期和 VERIFIED 映射 blocker；正式 Queue 活动目录为空，已有执行表未发现 active / UNKNOWN 写状态。完整范围见 [RM0 记录](reports/task13_7_1_rm0_controlled_real_machine_preparation_20260907.md)。
+- 合并前按 2026-09-07 用户最终裁决同步的历史结论为：**Implementation Review = PASS**，**P1-47-01、P2-47-01、P2-47-02 全部 CLOSED**，Core CI #188 SUCCESS。该运行绑定当时 Head `366a757`；#47 最终 Head 检查已另行核验，不混用版本。
 - `scan()` 原夹具的微秒观察时间与后续整秒回读不一致；`35d08ad` 单独截断微秒后，[CI](https://github.com/etereath/PRA-project/actions/runs/34109479644) 仍有 4 个用例因扫描未严格晚于旧执行停止时刻而失败。`eb6e24b` 补齐时序，四个失败用例定向 **4 passed**，其 [Core CI](https://github.com/etereath/PRA-project/actions/runs/34110475983) 的 Windows / Linux 均 SUCCESS。失败记录保留，未通过重跑碰绿收口。
 - 治理文档已增加归档读取授权、CI 排查范围和有证据的同版本重跑规则，并在 `366a757` 完成 WHY / WHEN 与 HOW 拆分、索引去进度及推送前状态同步要求；对应 CI #188 已通过。
 - [P2 修复与证据](reports/task13_7_1_p2_authorization_receipts_20260907.md)、[P1 修复与证据](reports/task13_7_1_p1_human_resolution_20260907.md)、[首版实现及 v18 迁移](reports/task13_7_1_human_update_price_20260907.md)保留各自绑定版本。实现审核已按用户裁决通过；受控实机证据仍未验证，绿色 CI 不替代现场验收。
 
 ## 当前能力与限制
 
-已有正式人工 Web 创建/授权入口和 v4/v5、Queue/Worker/Importer、UNKNOWN/RECONCILE、Review/Outbox、DB 实物库存等资产。PR #47 为一次人工改价补齐 Task 决定记录、授权后持久交接与 Queue Service owner，尚未合入 main 或证明现场可用。Commitment、冻结期销售 Provider、Closing、Supply、Observation Health 及 authority cutover 仍是后续缺口。[原版本实现图](rebaseline/task13_6_current_implementation_map.md)保持其指定 SHA 身份，本次增量按[首版实现](reports/task13_7_1_human_update_price_20260907.md)、[P1 修复](reports/task13_7_1_p1_human_resolution_20260907.md)和[P2 修复](reports/task13_7_1_p2_authorization_receipts_20260907.md)各自绑定版本读取。
+已有正式人工 Web 创建/授权入口和 v4/v5、Queue/Worker/Importer、UNKNOWN/RECONCILE、Review/Outbox、DB 实物库存等资产。PR #47 已为一次人工改价补齐 Task 决定记录、授权后持久交接与 Queue Service owner 并合入 main，但尚未部署或证明现场可用。Commitment、冻结期销售 Provider、Closing、Supply、Observation Health 及 authority cutover 仍是后续缺口。[原版本实现图](rebaseline/task13_6_current_implementation_map.md)保持其指定 SHA 身份，本次增量按[首版实现](reports/task13_7_1_human_update_price_20260907.md)、[P1 修复](reports/task13_7_1_p1_human_resolution_20260907.md)和[P2 修复](reports/task13_7_1_p2_authorization_receipts_20260907.md)各自绑定版本读取。
 
 经营目标由[业务合同](business_contract.md)定义，13.7 的职责/复用/gates 由[目标架构](rebaseline/task13_6_target_responsibility_and_gap_matrix.md)定义；这两份目标文档不证明生产能力已经运行。
 
@@ -53,7 +55,7 @@
 
 先完成1 SKU、1次人工UPDATE_PRICE，从决定、Runtime Task、正式授权、持久交接，经既有v4/Queue/Worker/Importer到终态与平台回读，并验证重启或阻塞解除后的责任连续。详见[首切片计划](plans/task13_7_human_update_price_vertical_slice.md)与[开发Goal](plans/task13_7_first_slice_codex_goal.md)。
 
-ChatGPT 对 `ceb88a0` 的[首审 FAIL 与冻结问题](https://github.com/etereath/PRA-project/pull/47#pullrequestreview-5126336815)保留历史身份。P1、两个 P2 及测试时序修复交付后，用户于 2026-09-07 明确裁决 **Implementation Review = PASS、冻结问题全部 CLOSED**，本页据此更新当前结论。下一步由负责人决定合并，并安排包含重启或 blocker 恢复的受控现场验收；本次同步不执行合并、结束 Draft 或部署。Stage Goal 仍未验证，必要配置和证据边界见修复报告。
+ChatGPT 对 `ceb88a0` 的[首审 FAIL 与冻结问题](https://github.com/etereath/PRA-project/pull/47#pullrequestreview-5126336815)保留历史身份。P1、两个 P2 及测试时序修复交付后，用户于 2026-09-07 明确裁决 **Implementation Review = PASS、冻结问题全部 CLOSED**；#47 随后合入 main `08f4e70`。下一步是包含重启或 blocker 恢复的 Controlled Real-Machine Acceptance，先按 [RM0 记录](reports/task13_7_1_rm0_controlled_real_machine_preparation_20260907.md)关闭环境门禁，再由负责人明确授权 RM1。Stage Goal 仍未验证，必要配置和证据边界见实现、修复与 RM0 报告。
 
 PR #44 已关闭且未合并，仍作历史平行分析；有效增量已随 #45 吸收，未采纳设计不成为施工合同。Issue #41 与旧报告的阶段叙述按其历史范围读取，不重新打开已完成的 13.6。
 
