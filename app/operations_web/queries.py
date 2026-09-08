@@ -70,7 +70,7 @@ from app.services.notification_outbox import (
     NOTIFICATION_TYPE_TITLES,
     REVIEW_TYPE_LABELS,
 )
-from app.services.runtime import ReviewTokenService
+from app.services.runtime import ReviewTokenService, TERMINAL_TASK_STATUSES
 from app.services.shadowbot_worker_health import (
     build_shadowbot_worker_health_report,
 )
@@ -1775,7 +1775,12 @@ class OperationsQueryService:
                        ORDER BY i.updated_at DESC LIMIT 1""",
                     (task_id,),
                 ).fetchone()
-        execution_display = _price_execution_display(continuation)
+        historical_execution_display = _price_execution_display(continuation)
+        execution_display = (
+            None
+            if item.task_status in TERMINAL_TASK_STATUSES
+            else historical_execution_display
+        )
         result_detail = (
             execution_display[0]
             if execution_display is not None
@@ -1821,6 +1826,12 @@ class OperationsQueryService:
                     DetailFieldReadModel('授权批次', continuation['batch_id']),
                     DetailFieldReadModel('当前责任方', responsibility),
                 )
+                if execution_display is None and historical_execution_display is not None:
+                    fields += (
+                        DetailFieldReadModel(
+                            '最近执行记录', historical_execution_display[0]
+                        ),
+                    )
             else:
                 fields += (DetailFieldReadModel('下一步', '人工预览并确认；先前操作未收口时保留本次决定。'),)
             if readback:

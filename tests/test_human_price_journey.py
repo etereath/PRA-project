@@ -21,6 +21,8 @@ pytest.importorskip('msvcrt', reason='The formal Queue Worker uses Windows proce
 
 from app.enums import TaskStatus
 from app.models import ShadowBotOperationLedger
+from app.operations_web.composition import OperationsWebPaths
+from app.operations_web.queries import OperationsQueryService
 from app.services.execution_authorization import ExecutionAuthorizationConflict
 from app.services.manual_task_orchestration import ManualTaskApplicationService, ManualTaskRequest
 from app.services.manual_task_orchestration import ManualTaskError
@@ -434,6 +436,83 @@ def test_terminal_pre_submit_failure_can_be_cancelled(journey):
     journey.manual.cancel_price_decisions([task], authenticated_subject="admin")
 
     assert journey.runtime.get_task(task).task_status is TaskStatus.CANCELLED
+
+
+def test_worker_price_drift_can_be_cancelled_and_replaced(journey, monkeypatch):
+    task = decide(journey)
+    accept(journey, task)
+    coordinator, importer, watchdog = rebuild(journey)
+    run_cycle(importer, watchdog, coordinator=coordinator)
+
+    state, result = platform_worker(journey, monkeypatch, price="12.50")
+
+    assert state["writes"] == 0
+    assert result["status"] == "FAILED"
+    assert result["items"][0]["status"] == "FAILED"
+    assert result["items"][0]["error_code"] == "OLD_PRICE_CHANGED"
+    assert result["items"][0]["submit_attempted"] is False
+    assert result["items"][0]["side_effect_state"] == "NOT_STARTED"
+
+    coordinator, importer, watchdog = rebuild(journey)
+    run_cycle(importer, watchdog, coordinator=coordinator)
+    assert journey.runtime.get_task(task).task_status is TaskStatus.PENDING
+    with journey.runtime.connect_read() as connection:
+        record = connection.execute(
+            """SELECT b.batch_id, b.status AS batch_status, i.status AS item_status,
+                      a.status AS attempt_status, a.ended_at,
+                      o.status AS operation_status, l.status AS lock_status,
+                      c.outcome, c.closed_at
+               FROM shadowbot_commit_batch_items i
+               JOIN shadowbot_commit_batches b ON b.batch_id = i.batch_id
+               JOIN shadowbot_execution_attempts a
+                 ON a.execution_attempt_id = i.item_execution_attempt_id
+               JOIN shadowbot_operations o ON o.operation_id = i.operation_id
+               JOIN shadowbot_write_locks l ON l.batch_id = i.batch_id
+               JOIN execution_continuations c ON c.batch_id = i.batch_id
+               WHERE i.source_task_id = ?""",
+            (task,),
+        ).fetchone()
+    assert record is not None
+    assert record["batch_status"] == "FAILED"
+    assert record["item_status"] == "FAILED"
+    assert record["attempt_status"] == "FAILED"
+    assert record["ended_at"] is not None
+    assert record["operation_status"] == "PENDING"
+    assert record["lock_status"] == "RELEASED"
+    assert record["outcome"] == "COMPLETE"
+    assert record["closed_at"] is not None
+
+    journey.manual.cancel_price_decisions([task], authenticated_subject="admin")
+
+    assert journey.runtime.get_task(task).task_status is TaskStatus.CANCELLED
+    web_queries = OperationsQueryService(
+        journey.runtime,
+        OperationsWebPaths(
+            runtime_db=journey.root / "runtime.sqlite3",
+            products_workbook=journey.service.products_workbook,
+            price_rules_workbook=journey.root / "price_rules.xlsx",
+            listing_rules_workbook=journey.root / "listing_rules.xlsx",
+            queue_root=journey.service.queue_root,
+        ),
+        now_provider=journey.service.clock,
+    )
+    detail = web_queries.detail("task", task)
+    assert detail is not None
+    assert detail.state.state.value == "empty"
+    assert detail.state.title == "已取消"
+    values = {field.label: field.value for field in detail.fields}
+    assert values["状态"] == "已取消"
+    assert values["结果"] == "已取消"
+    assert values["当前责任方"] == "无需处理"
+    assert values["授权批次"] == record["batch_id"]
+    assert "本次执行未完成" in values["最近执行记录"]
+    assert "待重新处理" not in " ".join(values.values())
+
+    successor = decide(journey, "14", "after-price-drift")
+    preparation = journey.service.prepare_execution(
+        seed._admin(), [successor], "after-price-drift-auth"
+    )
+    assert preparation.task_ids == (successor,)
 
 
 def test_cancelling_one_batch_item_returns_remaining_decision_to_confirmation(journey):

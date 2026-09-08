@@ -305,7 +305,7 @@ class ManualTaskApplicationService:
                        WHERE i.source_task_id = ? AND b.status <> 'PREPARED'
                          AND NOT (
                            b.status = 'FAILED'
-                           AND i.status = 'NOT_ATTEMPTED'
+                           AND i.status IN ('FAILED', 'NOT_ATTEMPTED')
                            AND i.submit_attempted = 0
                            AND i.side_effect_state = 'NOT_STARTED'
                            AND EXISTS (

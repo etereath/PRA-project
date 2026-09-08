@@ -1,10 +1,10 @@
 # PRA 当前阶段与验证状态
 
-角色：Current Status；项目进度与验证状态的唯一维护页。Codex 每次推送前同步更新，包括纯文档推送；`index.md` 仅负责索引。更新于 2026-09-08。
+角色：Current Status；项目进度与验证状态的唯一维护页。Codex 每次推送前同步更新，包括纯文档推送；`index.md` 仅负责索引。更新于 2026-09-09。
 
 PR [#47](https://github.com/etereath/PRA-project/pull/47) 与 RM0 交付 PR [#49](https://github.com/etereath/PRA-project/pull/49) 均已合并，当前 main 为 `37523f668cc6abe204b5beaac5e5c012cf18b09f`。Task 13.7-1 Implementation Review = **PASS**，P1-47-01、P2-47-01、P2-47-02 均 **CLOSED**。代码和 RM0 记录已进入 main；RM1-A 真实 READ_ONLY 已通过。RM1-B 首次授权在提交前以 `OLD_PRICE_PARSE_FAILED / NOT_STARTED` 失败，相关列表筛选、Web 责任表达及固定价格新鲜度门禁已经修复；2026-09-08 负责人重新授权后，`AISHA-B-60-Z` 已通过唯一一次真实提交由 `10.80` 调整为 `10.30`，写后独立回读、Importer、Archive、锁释放及持久 continuation 收口均为 **VERIFIED**。
 
-当前 Controlled Real-Machine Acceptance 的技术链路已经完成，下一步是负责人确认本阶段业务验收结论并收口 PR。完整现场证据见 [RM0 环境准备与 RM1 现场记录](reports/task13_7_1_rm0_controlled_real_machine_preparation_20260907.md)：Runtime v18、ShadowBot、Queue Service 和 Worker 已对齐；旧 `WEB7E-6646…` 继续保持历史 UNKNOWN，但运营责任已关闭。RM1-A 已取得 B/C/D 的完整真实 READ-BEFORE；RM1-B 重新验收使用新 Task `TASK-MANUAL-c9b09e6c5ee2cfb64accc3b4` 和批次 `WEB7E-eb1ed34bdd4db6546ca5f218fa276176`，写前读到 `10.80`，一次提交后于 20:14 回读 `10.30`。Task、operation、item、attempt 均为成功/VERIFIED，result receipt 为 WRITTEN，锁已释放，continuation 为 COMPLETE，活动 Queue 为 0。Stage Goal 不由本次实现者自行裁决，保持 **NOT YET VALIDATED / WAIT OWNER**。
+当前 Controlled Real-Machine Acceptance 的技术链路已经完成。PR #50 首审后保留的两个 Blocking P2 已完成代码整改：Worker 风格的提交前价格漂移失败在具备完整零副作用证据时可通过正式服务终止，终止后同 SKU 可创建新决定并进入授权；Web 以 Task 当前终态和责任为准，同时保留最近失败执行记录。生产接线合成旅程和直接依赖回归共 **88 passed**，Ruff 与 diff 检查通过；本轮没有执行新的真实平台写入。下一步为最新 Head CI、Reviewer 复审及负责人 Stage Goal 裁决。完整现场证据见 [RM0 环境准备与 RM1 现场记录](reports/task13_7_1_rm0_controlled_real_machine_preparation_20260907.md)：Runtime v18、ShadowBot、Queue Service 和 Worker 已对齐；旧 `WEB7E-6646…` 继续保持历史 UNKNOWN，但运营责任已关闭。RM1-A 已取得 B/C/D 的完整真实 READ-BEFORE；RM1-B 重新验收使用新 Task `TASK-MANUAL-c9b09e6c5ee2cfb64accc3b4` 和批次 `WEB7E-eb1ed34bdd4db6546ca5f218fa276176`，写前读到 `10.80`，一次提交后于 20:14 回读 `10.30`。Task、operation、item、attempt 均为成功/VERIFIED，result receipt 为 WRITTEN，锁已释放，continuation 为 COMPLETE，活动 Queue 为 0。Stage Goal 不由本次实现者自行裁决，保持 **NOT YET VALIDATED / WAIT OWNER**。
 
 | 项目 | 状态 | 依据/下一步 |
 |---|---|---|
@@ -25,6 +25,7 @@ PR [#47](https://github.com/etereath/PRA-project/pull/47) 与 RM0 交付 PR [#49
 | Task 13.7-1 RM0 / RM0.5 | PASS WITH HISTORICAL DEBT / PREFLIGHT READY | 旧 `WEB7E-6646…` 保留审计；B/C/D 三个艾莎 SKU 已由负责人确认并完成受控 VERIFIED mapping，当前无活动执行 blocker |
 | Task 13.7-1 RM1-A | READ-BEFORE VERIFIED | `ATTEMPT-95a494700a2d4178`；B/C/D 当前价 `10.80 / 6.80 / 6.20`，均为 `online_only`；Importer ACK WRITTEN，活动 Queue=0，Worker STOPPED；未执行平台写 |
 | Task 13.7-1 RM1-B | VERIFIED | `AISHA-B-60-Z` 写前 `10.80`，唯一一次平台提交后独立回读 `10.30`；Task / operation / item / attempt、Importer、Archive、锁和 continuation 全部收口 |
+| PR #50 首审整改 | 已修复 / 待最新 Head CI 与复审 | 零副作用 `FAILED / NOT_ATTEMPTED` 可正式终止；terminal Task 优先于历史执行投影，历史失败记录仍保留；直接依赖回归 88 passed，未新增真实平台写 |
 | Task 13.7-1 Stage Goal | NOT YET VALIDATED / WAIT OWNER | RM1 技术验收证据已完成；等待负责人确认阶段业务验收结论，不由实现者自行宣告 |
 
 ## 13.7-1 实现与当前 RM0 验证依据
@@ -37,7 +38,7 @@ PR [#47](https://github.com/etereath/PRA-project/pull/47) 与 RM0 交付 PR [#49
 
 ## 当前能力与限制
 
-已有正式人工 Web 创建/授权入口和 v4/v5、Queue/Worker/Importer、UNKNOWN/RECONCILE、Review/Outbox、DB 实物库存等资产。PR #47 已为一次人工改价补齐 Task 决定记录、授权后持久交接与 Queue Service owner 并合入 main；2026-09-08 的 RM0 整改已把 Runtime、Queue Service 和 ShadowBot Worker 对齐到当前 main。旧 `WEB7E-6646…` batch 作为历史审计债务保留，不再全局阻止 RM1；新任务仍按当前 SKU 的 active lock、open Review、mapping、Task 和新授权单独判断。人工改价要求原价格存在，但不再以观察距今时长作为硬门禁；执行端仍必须写前读取真实页面并比对原价格。三个选定 SKU 的 mapping、负责人测试对象确认和真实平台 READ-BEFORE 已完成；B 已在重新验收中由 `10.80` 成功改为 `10.30` 并独立回读。失败前序 Task 也已通过正式 Web 入口按“批次 FAILED、item NOT_ATTEMPTED、未提交、NOT_STARTED、attempt 已结束、continuation 已关闭、锁已释放”的完整证据收口；UNKNOWN 或存在活动责任的操作仍不可取消。Commitment、冻结期销售 Provider、Closing、Supply、Observation Health 及 authority cutover 仍是后续缺口。[原版本实现图](rebaseline/task13_6_current_implementation_map.md)保持其指定 SHA 身份，本次增量按[首版实现](reports/task13_7_1_human_update_price_20260907.md)、[P1 修复](reports/task13_7_1_p1_human_resolution_20260907.md)和[P2 修复](reports/task13_7_1_p2_authorization_receipts_20260907.md)各自绑定版本读取。
+已有正式人工 Web 创建/授权入口和 v4/v5、Queue/Worker/Importer、UNKNOWN/RECONCILE、Review/Outbox、DB 实物库存等资产。PR #47 已为一次人工改价补齐 Task 决定记录、授权后持久交接与 Queue Service owner 并合入 main；2026-09-08 的 RM0 整改已把 Runtime、Queue Service 和 ShadowBot Worker 对齐到当前 main。旧 `WEB7E-6646…` batch 作为历史审计债务保留，不再全局阻止 RM1；新任务仍按当前 SKU 的 active lock、open Review、mapping、Task 和新授权单独判断。人工改价要求原价格存在，但不再以观察距今时长作为硬门禁；执行端仍必须写前读取真实页面并比对原价格。三个选定 SKU 的 mapping、负责人测试对象确认和真实平台 READ-BEFORE 已完成；B 已在重新验收中由 `10.80` 成功改为 `10.30` 并独立回读。失败前序 Task 可通过正式入口按“批次 FAILED、item 为 FAILED 或 NOT_ATTEMPTED、未提交、NOT_STARTED、attempt 已结束、continuation 已关闭、锁已释放”的完整证据收口；终态 Task 的 Web 当前责任不会再被历史失败 continuation 覆盖，UNKNOWN 或存在活动责任的操作仍不可取消。Commitment、冻结期销售 Provider、Closing、Supply、Observation Health 及 authority cutover 仍是后续缺口。[原版本实现图](rebaseline/task13_6_current_implementation_map.md)保持其指定 SHA 身份，本次增量按[首版实现](reports/task13_7_1_human_update_price_20260907.md)、[P1 修复](reports/task13_7_1_p1_human_resolution_20260907.md)和[P2 修复](reports/task13_7_1_p2_authorization_receipts_20260907.md)各自绑定版本读取。
 
 RM0.5 已完成三个测试 SKU 的负责人裁决、mapping 和活动责任预检，RM1-A 又完成了真实平台 READ-BEFORE；这两步都不授权 RM1-B 平台写。商品/平台映射以及价格/上下架规则从 Excel 迁移到 SQLite 的范围、旧未合并 Runtime 主数据分支可复用内容与迁移顺序，登记为本任务收口后的独立讨论项；不得在 RM1-B 中顺带扩大施工。
 
