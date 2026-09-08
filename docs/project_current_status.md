@@ -6,7 +6,7 @@ PR [#47](https://github.com/etereath/PRA-project/pull/47)、RM0 交付 PR [#49](
 
 当前 Controlled Real-Machine Acceptance 的技术链路已经完成。PR #50 首审后保留的两个 Blocking P2 已完成代码整改：Worker 风格的提交前价格漂移失败在具备完整零副作用证据时可通过正式服务终止，终止后同 SKU 可创建新决定并进入授权；Web 以 Task 当前终态和责任为准，同时保留最近失败执行记录。生产接线合成旅程和直接依赖回归共 **88 passed**，最终 Head 的 Windows / Linux Core 均通过并已合并；本轮没有执行新的真实平台写入。下一步为负责人 Stage Goal 裁决。完整现场证据见 [RM0 环境准备与 RM1 现场记录](reports/task13_7_1_rm0_controlled_real_machine_preparation_20260907.md)：Runtime v18、ShadowBot、Queue Service 和 Worker 已对齐；旧 `WEB7E-6646…` 继续保持历史 UNKNOWN，但运营责任已关闭。RM1-A 已取得 B/C/D 的完整真实 READ-BEFORE；RM1-B 重新验收使用新 Task `TASK-MANUAL-c9b09e6c5ee2cfb64accc3b4` 和批次 `WEB7E-eb1ed34bdd4db6546ca5f218fa276176`，写前读到 `10.80`，一次提交后于 20:14 回读 `10.30`。Task、operation、item、attempt 均为成功/VERIFIED，result receipt 为 WRITTEN，锁已释放，continuation 为 COMPLETE，活动 Queue 为 0。Stage Goal 不由本次实现者自行裁决，保持 **NOT YET VALIDATED / WAIT OWNER**。
 
-Task 13.7-2A 已在 Draft PR [#52](https://github.com/etereath/PRA-project/pull/52) 形成合同候选：Product/Mapping/Rule/Inventory/Observation/Human Decision/ShadowBot identity authority matrix、GQB-1～GQB-4 最小 blocker、UNKNOWN 当前责任、`a3485af` selective salvage 和 2B/2C/2D 输入均已写入现役业务合同、目标责任矩阵与开发流程。五项 Open Decisions 已在候选中冻结为 `NOT_INITIALIZED` 库存语义、Rule workbook authority、显式 account-aware mapping identity、fact-only qualification contract 和 GQB Proposal workflow。本批仅修改文档并同步 main；未切换真实 Runtime authority、未执行平台写、未开始 2B/2C/2D 实现。2A 当前为 **CONTRACT CANDIDATE / WAIT OWNER-REVIEWER ACCEPTANCE**，下游仍受 #52 接受门禁约束。
+Task 13.7-2A 已在 Draft PR [#52](https://github.com/etereath/PRA-project/pull/52) 形成合同候选：Product/Mapping/Rule/Inventory/Observation/Human Decision/ShadowBot identity authority matrix、GQB-1～GQB-4 最小 blocker、UNKNOWN 当前责任、`a3485af` selective salvage 和 2B/2C/2D 输入均已写入现役业务合同、目标责任矩阵与开发流程。首次正式评审在 Head `8818fd5` 冻结 4 个 Blocking P2；`bfe4add` 已集中整改为：Operating fact qualification 与 ACK/archive health 分层、唯一 current qualified candidate 支持合法 retry、全部正式 Runtime consumers 同 gate cutover 并登记离线例外、target `account_id` 与 active session binding evidence 分层。整改仅修改文档，未切换真实 Runtime authority、未执行平台写、未开始 2B/2C/2D 实现；四项状态为 **FIX IMPLEMENTED / WAIT RE-REVIEW**，不由实现者自行宣告关闭，下游仍受 #52 接受门禁约束。
 
 | 项目 | 状态 | 依据/下一步 |
 |---|---|---|
@@ -17,7 +17,7 @@ Task 13.7-2A 已在 Draft PR [#52](https://github.com/etereath/PRA-project/pull/
 | Task 13.6-3 | PASS | 负责人接受语义快照 `4d51f51`；PR #46 已合并，正式 AGENTS 与 Canonical 已进入 main |
 | Task 13.6 Overall | PASS | G1/G2、入口/正式AGENTS及负责人最终验收已收口；验收记录见阶段报告追加节 |
 | Task 13.7 Readiness | READY | 业务与文档交接条件通过；首条纵切计划/Goal已准备 |
-| Task 13.7-2A Authority & Continuity Contract | CONTRACT CANDIDATE / WAIT ACCEPTANCE | Draft PR #52；已完成 Authority Matrix、五项 Open Decisions、GQB/UNKNOWN 合同、legacy 分类及 2B/2C/2D 输入；未切换 Runtime authority |
+| Task 13.7-2A Authority & Continuity Contract | REVIEW FIX READY / WAIT RE-REVIEW | Draft PR #52；首审 4 个 Blocking P2 已在 `bfe4add` 集中整改，等待 Owner/Reviewer 复审；未切换 Runtime authority |
 | Task 13.7-1 开工交接 | COMPLETE | Codex 已在原分支/PR 承接，没有另建计划 PR |
 | Task 13.7-1 代码实现 | 已合并 / 复核 PASS | #47 已进入 main `08f4e70`；正式人工收口及催办、目标已满足时确认结束决定、回执刷新持久状态；Schema 目标仍为 v18 |
 | Task 13.7-1 隔离旅程 | P1/P2 定向回归 PASS | P1 人工收口与后续执行、P2 零写结束及实时回执已有隔离证据；测试时序修复后的 4 个失败用例定向通过，完整门禁见下节 |
