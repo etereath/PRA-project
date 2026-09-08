@@ -303,6 +303,27 @@ class ManualTaskApplicationService:
                     """SELECT 1 FROM shadowbot_commit_batch_items i
                        JOIN shadowbot_commit_batches b ON b.batch_id = i.batch_id
                        WHERE i.source_task_id = ? AND b.status <> 'PREPARED'
+                         AND NOT (
+                           b.status = 'FAILED'
+                           AND i.status = 'NOT_ATTEMPTED'
+                           AND i.submit_attempted = 0
+                           AND i.side_effect_state = 'NOT_STARTED'
+                           AND EXISTS (
+                             SELECT 1 FROM shadowbot_execution_attempts a
+                             WHERE a.execution_attempt_id = i.item_execution_attempt_id
+                               AND a.status = 'FAILED'
+                               AND a.side_effect_state = 'NOT_STARTED'
+                               AND a.ended_at IS NOT NULL
+                           )
+                           AND EXISTS (
+                             SELECT 1 FROM execution_continuations c
+                             WHERE c.batch_id = b.batch_id AND c.closed_at IS NOT NULL
+                           )
+                           AND NOT EXISTS (
+                             SELECT 1 FROM shadowbot_write_locks l
+                             WHERE l.batch_id = b.batch_id AND l.status <> 'RELEASED'
+                           )
+                         )
                        UNION ALL SELECT 1 FROM shadowbot_operations
                        WHERE task_id = ? AND status NOT IN ('PENDING', 'START_FAILED')""",
                     (task_id, task_id),

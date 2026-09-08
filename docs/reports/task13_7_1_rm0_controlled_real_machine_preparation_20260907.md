@@ -469,3 +469,33 @@ Operations Web 原先把 continuation 的 `COMPLETE` 直接显示为“人工 / 
 第一次创建 RM1-B Task 前，Operations Web 确实因 14:17 的价格观察超过 30 分钟而阻断预览，随后才在 16:38:10 重新读取 `10.80`。该时间线保留为旧规则下的历史事实。现场复盘后确认，固定 30 分钟价格新鲜度不应成为人工改价创建或授权门禁：已有原价格用于形成 `expected_old_price`，真正执行时 v4 会重新读取商品页并在写前逐项比对，价格不一致即以零写停止，写后仍回读验证。
 
 因此当前规则改为：人工 `UPDATE_PRICE` 只有原价格缺失时才因价格事实阻断；观察时间与来源继续进入摘要和审计，但不以距今时长拒绝创建、授权或失败后 correction 的原价重绑定。上下架状态、映射、授权、锁、未决 operation 和其他既有门禁保持不变。本次仅完成代码、合同与合成回归修复，没有执行真实平台 READ_ONLY 或 WRITE，也没有消费新的写授权。
+
+### 2026-09-08 RM1-B 重新验收
+
+负责人再次明确授权对 `AISHA-B-60-Z` 执行一次真实 `UPDATE_PRICE`，目标仍为 `10.30`。Operations Web 使用已有 `10.80` 原价格事实创建新 Task `TASK-MANUAL-c9b09e6c5ee2cfb64accc3b4`，没有再因观察距今时间阻断。首次提交新授权后，旧 Queue Service 进程仍加载整改前的新鲜度规则，Coordinator 将 continuation 安全关闭为 `RECONFIRM`；该批次保持 `PREPARED`，未创建 operation、attempt 或 write lock，也未投递 Worker，因此没有平台副作用。重启 Queue Service 加载当前代码后，负责人在同一 Task 上重新预览并确认，形成批次 `WEB7E-eb1ed34bdd4db6546ca5f218fa276176`。
+
+Worker 写前于 `2026-09-08T20:13:52+08:00` 重新进入商品管理“上架中”页面并读取到 `10.80`，与 Task 的 `expected_old_price` 一致；于 20:13:57 记录提交意图，20:14:00 执行唯一一次平台提交并独立回读 `10.30`。item 为 `VERIFIED`，`submit_attempted=true`，`side_effect_state=VERIFIED`，`actual_price=10.30`，错误字段为空。Task 为 `success`，operation `OP-a525452a90710c75e153abb050ffbc5b` 为 `VERIFIED`，item attempt `ATTEMPT-7a54785b20131078d9645fdb67710e98` 为 `VERIFIED / VERIFIED`；同一 Task 只有这一次 execution attempt。
+
+Result `RESULT-3e3fc4ae25a2e028468c3bbf` 已由 Importer 接受，receipt 为 `WRITTEN` 且无 projection error；请求、phase、结果、checksum 和 ACK 已归档到 `ATTEMPT-0a4d555d914d4863` 目录。`listing_status` 已回读为 `AISHA-B-60-Z / online / 10.30`，来源 attempt 与本次结果一致；write lock 已释放，continuation 为 `COMPLETE`，正式 Queue 的 `inbox/working/results` 均为 0。Worker 验收后保持长驻 `RUNNING`，严格 heartbeat 检查通过；本轮没有恢复原价，也没有第二次平台写。
+
+重新验收前还暴露出一个内部收口缺口：首次失败的旧 Task 虽有 `batch=FAILED / item=NOT_ATTEMPTED / submit_attempted=false / side_effect_state=NOT_STARTED / attempt 已结束 / continuation 已关闭 / lock 已释放` 的完整零副作用证据，正式取消入口仍把任何非 `PREPARED` 批次一律视为不可取消。现已把取消条件仅放宽到上述可证明“提交前终止”的完整组合；UNKNOWN、已记录提交、未结束 attempt、未关闭 continuation、未释放 lock 或非价格任务仍禁止取消。旧 Task 已经由 Operations Web 正式入口按过期状态收口，没有直接修改 SQLite；相应合成回归覆盖可取消的提交前失败和仍不可取消的活动/不确定操作。
+
+```text
+RM1-B REAL UPDATE_PRICE = VERIFIED
+
+SKU = AISHA-B-60-Z
+
+READ-BEFORE = 10.80
+
+AUTHORIZED PLATFORM SUBMIT = ONCE
+
+READBACK = 10.30
+
+SIDE EFFECT = VERIFIED
+
+IMPORTER / ARCHIVE / LOCK / CONTINUATION = CLOSED
+
+ACTIVE QUEUE = 0
+
+Stage Goal = NOT YET VALIDATED / WAIT OWNER
+```

@@ -21,14 +21,12 @@ pytest.importorskip('msvcrt', reason='The formal Queue Worker uses Windows proce
 
 from app.enums import TaskStatus
 from app.models import ShadowBotOperationLedger
-from app.services.execution_authorization import ExecutionAuthorizationApplicationService
 from app.services.execution_authorization import ExecutionAuthorizationConflict
 from app.services.manual_task_orchestration import ManualTaskApplicationService, ManualTaskRequest
 from app.services.manual_task_orchestration import ManualTaskError
 from app.services.shadowbot_commit_pipeline import publish_task_commit_batch
 from app.services.shadowbot_executor import ShadowBotFileQueueRunner
 from app.services.shadowbot_queue import ShadowBotResultImporter, ShadowBotQueueWatchdog
-from app.services.task_execution_coordinator import TaskExecutionCoordinator
 from scripts.run_shadowbot_queue_services import run_cycle, build_execution_coordinator
 import tests.test_execution_authorization as seed
 
@@ -384,6 +382,58 @@ def test_pending_task_with_unresolved_operation_cannot_be_cancelled(journey):
     with pytest.raises(ManualTaskError, match='不能取消'):
         journey.manual.cancel_price_decisions([task], authenticated_subject='admin')
     assert journey.runtime.get_task(task).task_status is TaskStatus.PENDING
+
+
+def test_terminal_pre_submit_failure_can_be_cancelled(journey):
+    task = decide(journey)
+    accept(journey, task)
+    coordinator, importer, watchdog = rebuild(journey)
+    run_cycle(importer, watchdog, coordinator=coordinator)
+    with journey.runtime.connect_write() as connection, connection:
+        batch_id = connection.execute(
+            "SELECT batch_id FROM shadowbot_commit_batch_items WHERE source_task_id = ?",
+            (task,),
+        ).fetchone()[0]
+        connection.execute(
+            "UPDATE shadowbot_commit_batches SET status = 'FAILED' WHERE batch_id = ?",
+            (batch_id,),
+        )
+        connection.execute(
+            """UPDATE shadowbot_commit_batch_items
+               SET status = 'NOT_ATTEMPTED', submit_attempted = 0,
+                   side_effect_state = 'NOT_STARTED'
+               WHERE batch_id = ?""",
+            (batch_id,),
+        )
+        connection.execute(
+            """UPDATE shadowbot_execution_attempts
+               SET status = 'FAILED', side_effect_state = 'NOT_STARTED', ended_at = ?
+               WHERE operation_id IN (
+                 SELECT operation_id FROM shadowbot_commit_batch_items WHERE batch_id = ?
+               )""",
+            (journey.service.clock().isoformat(), batch_id),
+        )
+        connection.execute(
+            "UPDATE shadowbot_operations SET status = 'PENDING' WHERE task_id = ?",
+            (task,),
+        )
+        connection.execute(
+            "UPDATE tasks SET task_status = 'pending' WHERE task_id = ?",
+            (task,),
+        )
+        connection.execute(
+            """UPDATE shadowbot_write_locks
+               SET status = 'RELEASED', released_at = ? WHERE batch_id = ?""",
+            (journey.service.clock().isoformat(), batch_id),
+        )
+        connection.execute(
+            """UPDATE execution_continuations
+               SET outcome = 'COMPLETE', closed_at = ? WHERE batch_id = ?""",
+            (journey.service.clock().isoformat(), batch_id),
+        )
+    journey.manual.cancel_price_decisions([task], authenticated_subject="admin")
+
+    assert journey.runtime.get_task(task).task_status is TaskStatus.CANCELLED
 
 
 def test_cancelling_one_batch_item_returns_remaining_decision_to_confirmation(journey):
