@@ -352,3 +352,150 @@ INDETERMINATE
 | Credential / security | PASS | 当前 Worker 用户上下文可读取 Generic Credential；只记录非空布尔结果，无 secret、target、username、password、token、Webhook 或完整私密路径进入 Git/报告 |
 
 `RM0 TECHNICAL READINESS = PASS WITH HISTORICAL DEBT`。`RM1 BUSINESS AUTHORIZATION = WAIT OWNER`。下一步由负责人确认一个满足当前 SKU 隔离门禁的测试对象、platform、account、product identity、当前价、目标价和时段，并决定 B4 mapping 的受控维护；在负责人明确授权前不得创建或授权真实 UPDATE_PRICE，不得进入 RM1，也不得开始 13.7-2。Stage Goal 保持 **NOT YET VALIDATED**。
+
+## 2026-09-08 RM0.5 — Owner Decision、Mapping 与 RM1 Preflight
+
+负责人确认本次受控验收范围：平台为“蚂蚁花团供应商”，经营账号为“千芳花卉”，测试对象为 `AISHA-B-60-Z`、`AISHA-C-55-Z`、`AISHA-D-50-Z`，平台商品身份采用“商品名＋等级”，当前时段可用于后续验收。目标价格必须在 RM1-A 新鲜 READ-BEFORE 后另行决定；本次没有读取平台当前价格，也没有创建 Task、授权或真实平台动作。
+
+运营 mapping 工作簿原 SHA-256 为 `a47b7c298ad93a6e999694a02ec14d9a5636f982bd6f3198bdcfefd0cf3bc41e`。受控维护前已在仓库外保存原文件备份，只将 `MAYI-PRODUCT-02/03/04` 从候选 `DISABLED` 转为对应 SKU 的 `VERIFIED`，清空 `candidate_internal_sku`，记录本次生效和核验时间；其余 9 条 PRODUCT mapping 保持 `DISABLED`。工作簿回读、表头和三条中文商品/等级抽查通过，修改后 SHA-256 为 `0f2cfa41bb6d74eb3384c8632940e739a4142262ae52f95d93b10f7ce23d5663`。现有编译器的唯一性、状态和生效范围校验通过，不可变 JSON SHA-256 / mapping version 均为 `faa792548297dc7e3a19a5ad3631d8741d9d28bc3489587110010705cc36ba6f`。工作簿、备份和编译产物均保留在仓库外，没有提交真实运营文件。
+
+ShadowBot 版本化 identity 中三个 SKU 均各有一个 active“艾莎＋B级/C级/D级”身份，部署 `--check` 的 7 个受控文件全部 `CURRENT`，配置文件存在。Runtime schema v18 health 通过；正式 Queue 的 `inbox/working/results` 均为 0；Worker 为正常 `STOPPED`，Queue Service 保持 `RUNNING`。Credential provider 在当前 Windows 用户上下文可读，自动登录和员工通道均已启用。Credential 登录名不作为经营主体名称的权威来源；“千芳花卉”由负责人本次确认，RM1-A 仍须在真实页面 read-before 时核对实际经营账号范围。
+
+三个 SKU 的 Runtime 定向只读预检结果：active attempt=0，`ACTIVE/UNKNOWN/REVIEW_BLOCKED` write lock=0，open action-blocking Review=0，open execution continuation=0，活动/current operation conflict=0，活动 Queue 冲突=0。C、D 各保留一条 2026-08-31 已过有效期、未授权、未生成 operation/attempt/lock 的旧人工改价 Task，数据库状态仍为 `pending`；现有改价预览不会把另一条价格决定作为同 SKU 冲突，且授权服务会拒绝过期 Task，因此不构成本次 RM1-A/RM1-B 的活动执行责任。本轮不借 RM0.5 取消或改写该历史状态。
+
+```text
+RM0 TECHNICAL READINESS = PASS WITH HISTORICAL DEBT
+
+B4 SELECTED SKU / MAPPING = READY
+
+RM1 PREFLIGHT = READY
+
+RM1-A REAL READ_ONLY = NOT AUTHORIZED / NOT EXECUTED
+
+RM1-B REAL WRITE = NOT AUTHORIZED / NOT EXECUTED
+
+TARGET PRICE = OWNER DECISION AFTER READ-BEFORE
+
+Stage Goal = NOT YET VALIDATED
+```
+
+RM1 后续仍严格拆分：负责人另行授权 RM1-A 后，只启动服务并执行真实 READ_ONLY；成功获得三个 SKU 的新鲜当前价格、身份、时间和证据后停止，由负责人确定精确目标价格。RM1-A 不授权 RM1-B；任何 Human UPDATE_PRICE、COMMIT、价格恢复或其他平台写操作均须新的明确授权。
+
+## 2026-09-08 RM1-A — 真实 READ-BEFORE
+
+负责人明确授权 RM1-A 后，使用正式 Queue Service、`test2` Worker、Runtime v18 和 v5 `SYNC_STATUS` 执行了一次真实平台 READ_ONLY。请求合同为 `action_type=sync_status`、`execution_mode=READ_ONLY`、`items=[]`，不含 Task、Review、目标价格、执行授权或写动作；结果记录 `business_operation_completed=false`、`side_effect_state=NOT_STARTED`。
+
+平台窗口为“蚂蚁花团供应商”。读取完成后在现有登录会话主页核对到“千芳花卉”经营主体显示；未记录平台账号 ID、手机号、凭据或截图。为把本批映射目标限制在负责人指定的 B/C/D，Worker 运行映射临时收窄为三个已确认身份，原文件先备份；结果归档后已恢复原文件，恢复 SHA-256 为 `24f0dd9f88f0fe5e42587cc2b7866f035fef88bcbface3d0353afd99c4fa5ce6`。该配置动作没有改动 Git、运营 mapping 工作簿或平台数据。
+
+v5 完整快照合同会遍历“上架中”和“待上架”列表并保留页面上其他未映射身份，因此本批数据库 `batch_target_count=14`；只有下列三个已授权、已映射 SKU 被用作本次 READ-BEFORE 结论和正式状态投影。遍历其他页面行是定位与证明完整结束标记所需的只读观察，不产生平台副作用，也未将未确认身份启用为业务 mapping。
+
+完整快照同时形成 11 个当前未映射页面身份异常：复用已有 dedupe 后新建 6 个 `listing_location_anomaly` 待复核并由正式 Outbox 各发送一次飞书通知，另有 3 个旧页面位置异常被新完整快照自动清除。新建复核分别属于艾莎 A/E 及卡布奇诺 A/B/D/E 页面身份，不涉及本次 B/C/D 三个已映射 SKU，也不构成其 RM1-B blocker。它们是 READ_ONLY 导入后的内部控制面投影，不是平台写；由于对应页面身份仍未获得负责人 mapping 裁决，本轮不删除、取消或伪造收口。
+
+| internal SKU | 平台身份 | 位置 | 当前价格 | 平台库存 | observed_at（Asia/Shanghai） | Runtime source |
+|---|---|---|---:|---:|---|---|
+| `AISHA-B-60-Z` | 艾莎＋B级 | `online_only` | `10.80` | 9 | `2026-09-08T14:17:13+08:00` | `shadowbot_sync_status` |
+| `AISHA-C-55-Z` | 艾莎＋C级 | `online_only` | `6.80` | 5 | `2026-09-08T14:17:13+08:00` | `shadowbot_sync_status` |
+| `AISHA-D-50-Z` | 艾莎＋D级 | `online_only` | `6.20` | 5 | `2026-09-08T14:17:13+08:00` | `shadowbot_sync_status` |
+
+完整性与落账证据：
+
+- batch `BATCH-RM1A-20260908T061654Z-030b6973`、attempt `ATTEMPT-95a494700a2d4178`、result `RESULT-2efbfffeb1b9bfcfdd938b66` 均已绑定；
+- `online_scan_complete=1`、`waiting_scan_complete=1`、两个 end marker 均已验证，snapshot `SNAPSHOT-2efbfffeb1b9bfcfdd938b66` 为 `VERIFIED`；
+- 结果 SHA-256 为 `3124c0831102380d1dafab570780a4da792a9f4cf7f802772c512a4c4547cf84`，Importer receipt 为 `WRITTEN`，无 projection error；请求、结果、checksum、phase、ACK 和只读报告已归档到 attempt 对应目录；
+- `listing_status` 已逐项回读，三个 SKU 的价格、库存、上架状态、source、observed_at 和 source attempt 与快照一致；
+- 结束时正式 Queue 的 `inbox/working/results` 均为 0；Worker 安全停止且本次 `processed=1`，lifecycle 已同步为 `STOPPED / STOPPED_VERIFIED`，Queue Service 继续运行。
+
+```text
+RM1-A REAL READ_ONLY = VERIFIED
+
+CURRENT PRICE:
+AISHA-B-60-Z = 10.80
+AISHA-C-55-Z = 6.80
+AISHA-D-50-Z = 6.20
+
+WAIT OWNER TARGET PRICE
+
+RM1-B REAL WRITE = NOT AUTHORIZED / NOT EXECUTED
+
+Stage Goal = NOT YET VALIDATED
+```
+
+本次不创建 Human UPDATE_PRICE、不执行 COMMIT、不恢复价格、不重放历史动作，也不开始 13.7-2。下一步仅由负责人基于以上 READ-BEFORE 指定测试 SKU 与精确目标价格，并另行决定是否授权 RM1-B。
+
+## 2026-09-08 RM1-B — 受控真实 UPDATE_PRICE 验收
+
+负责人指定 `AISHA-B-60-Z` 的目标价格为 `10.30`，并明确授权本次一次性真实 `UPDATE_PRICE`。执行前因 Operations Web 判断原 14:17 快照已过期，未绕过质量门禁；先通过正式 v5 `SYNC_STATUS / READ_ONLY` 重新取得完整快照。该批次 `BATCH-RM1B-READBEFORE-20260908T083751Z-f9d3abe0`、attempt `ATTEMPT-5c01fefb45874bd8`、result `RESULT-916da0a0cf94ada6b7e61692` 均已验证并由 Importer 落账，`AISHA-B-60-Z` 在 `2026-09-08T16:38:10+08:00` 仍为上架中、当前价格 `10.80`、平台库存 9。
+
+随后仅在 Operations Web 中创建并选择一个人工改价 Task：`TASK-MANUAL-c2378ce0008a2513897d41db`，写前预期价格 `10.80`、目标价格 `10.30`。为验证持久责任交接，Queue Service 在授权前停止；Web 确认后先形成唯一 open continuation，再重启 Queue Service。Coordinator 接管同一授权并发布 v4 COMMIT 批次 `WEB7E-2678b95570b3b10a73f4ebcdf450000e`，证明“Web 授权 → durable continuation → Queue Service / Coordinator → Worker → Importer → Archive”在进程重启边界上可交接。
+
+本次唯一真实写尝试在真正提交前失败：Worker 于批次预检阶段将页面上的“报名秒杀”文本带入供货价格解析，返回 `OLD_PRICE_PARSE_FAILED / 供货价格无法唯一解析: 报名秒杀`。批次为 `FAILED`，item 为 `NOT_ATTEMPTED`，item attempt `ATTEMPT-7bdf237a07322ab208b626d3c9aa48ae` 为 `FAILED / NOT_STARTED`；`submit_attempted=false`，`submit_intent_at`、`submit_clicked_at`、`readback_observed_at` 均为空。因此没有点击平台提交按钮，没有产生本次价格写入，也不需要对 UNKNOWN 副作用做猜测或 RECONCILE。Runtime 中最后一条合格价格事实仍是 16:38:10 的 `10.80`；本轮不以它证明失败后的新鲜平台状态，只用于说明没有新的系统价格观察覆盖该事实。
+
+结果 `RESULT-981becdc0aada27dfd870fac`、result SHA-256 `79a97ec04e2257ace67e6148a4c4575db3c21d9170b530fc8d4b68c92304afe5` 已由 Importer 以 `WRITTEN` receipt 接受并完成 Archive；对应 write lock 已按失败路径释放。收尾时 open continuation、active attempt 和 active write lock 均为 0，正式 Queue 的 `inbox/working/results` 均为 0，Runtime v18 health 继续通过；Worker 已停止，Queue Service 保持运行。本次授权只允许一个真实写尝试，失败后没有自动重试。
+
+现场同时暴露一项控制面语义缺陷：continuation 被标为 `COMPLETE / 执行链已收口`，但 Task 正确保留 `pending`、operation 保持 `PENDING / UNRESOLVED`，Web 又显示“当前责任方：人工 / 已收口”，且没有直接展示上述预检失败原因。这里的 `COMPLETE` 只能表示本次授权执行链生命周期已结束，不能表示业务成功或 Task 已终结。后续修复必须同时覆盖旧 v4 商品行价格解析和失败后的 Task / continuation / Web 责任状态表达；修复与定向回归完成后，如需再次执行真实平台写，必须由负责人重新确认目标价格并重新授权。
+
+```text
+RM1-B AUTHORIZED ATTEMPT = EXECUTED ONCE
+
+PLATFORM SUBMIT = NOT ATTEMPTED
+
+SIDE EFFECT = NOT_STARTED
+
+BUSINESS RESULT = FAILED (OLD_PRICE_PARSE_FAILED)
+
+LAST QUALIFIED PRICE OBSERVATION = 10.80 @ 2026-09-08T16:38:10+08:00
+
+AUTOMATIC RETRY = NOT PERFORMED
+
+Stage Goal = NOT YET VALIDATED
+```
+
+### RM1-B 失败后的商品列表定向修复
+
+只读复查历史 Task 12 记录和停用的 `codex/task13-5-7f-runtime-master-data` 分支后确认：旧分支没有本问题的现成修复。Task 12 曾明确记录，小程序会保留上一次“上架中/待上架”筛选页；在待上架页套用上架中价格偏移会读到“报名秒杀”。本次 RM1-B 前刚完成“上架中＋待上架”的全量 READ_ONLY，页面最后停在待上架；随后 v4 COMMIT 的 `_reuse_current_product_list()` 只因存在结构化商品行便接受当前页，结果中也只有 `refresh_entry=CURRENT_PRODUCT_LIST`，没有 `active_listing_filter=ONLINE`。因此本次不是数字解析器本身不能处理价格，而是列表复用绕过了 Task 12 已验证的页面筛选门禁。
+
+最小修复只调整 v4 COMMIT 的批次预检：`_commit_v4_prepare_product_list()` 不再复用未经筛选证明的当前商品页，而是重新进入商品管理并显式选择“上架中”，两次确认列表就绪后才读取上架中价格。单个 batch 仍只做一次完整预检，后续 item 继续复用已验证的同一窗口，不改变最终提交、写前旧价比较、UNKNOWN 或锁语义。新增回归门禁证明 v4 预检固定传入 `reuse_requested=False`；既有刷新测试继续证明选择“上架中”发生在列表就绪判断之前。
+
+定向测试 `111 passed`，覆盖 Human price journey、v4 commit pipeline / orchestration / success baseline、商品列表刷新、Executor 和 commit batch。Worker 保持 `STOPPED`；修复已通过正式同步脚本部署到 `test2`，二次 `--check` 的 7 个受控文件均为 `CURRENT`，部署验证 PASS。该修复和部署没有投递 Queue，没有执行真实平台 READ_ONLY 或 WRITE，也没有消费新的平台写授权。再次 RM1-B 前仍须由负责人重新授权。
+
+### RM1-B 失败后的 Web 责任状态修复
+
+Operations Web 原先把 continuation 的 `COMPLETE` 直接显示为“人工 / 已收口”，混淆了“本次授权执行生命周期结束”和“业务任务成功完成”。现已改为联合读取 Task、batch、item、是否提交及副作用状态：对于本次 `Task=pending / batch=FAILED / item=NOT_ATTEMPTED / submit_attempted=false / side_effect_state=NOT_STARTED`，页面显示“待重新处理”，结果说明“执行准备阶段未完成；平台价格未开始修改”，当前责任方显示“管理员 / 待重新处理”。底层 Task 与历史执行事实均未改写，也未重新打开旧 continuation。
+
+本次旧结果的顶层 `OLD_PRICE_PARSE_FAILED` 没有被当时的 Importer 投影到 item 错误字段，因此 Web 不从已归档 Queue 文件反向拼接 Runtime 真值，也不把本报告中的人工诊断伪装成数据库事实；页面仅按 Runtime 可证明的阶段给出上述说明。合成用例同时覆盖错误码已持久化时显示“无法读取当前供货价格”，并确保原始页面文本不直接暴露给运营页面。Operations Web read model、相邻 Web 基础与完整 Human price journey 合计 `89 passed`；当前真实 Runtime 只读投影复核通过。Web 已重启，Worker 仍保持 `STOPPED`，本次没有执行平台 READ_ONLY 或 WRITE。
+
+### 人工改价价格新鲜度门禁更正
+
+第一次创建 RM1-B Task 前，Operations Web 确实因 14:17 的价格观察超过 30 分钟而阻断预览，随后才在 16:38:10 重新读取 `10.80`。该时间线保留为旧规则下的历史事实。现场复盘后确认，固定 30 分钟价格新鲜度不应成为人工改价创建或授权门禁：已有原价格用于形成 `expected_old_price`，真正执行时 v4 会重新读取商品页并在写前逐项比对，价格不一致即以零写停止，写后仍回读验证。
+
+因此当前规则改为：人工 `UPDATE_PRICE` 只有原价格缺失时才因价格事实阻断；观察时间与来源继续进入摘要和审计，但不以距今时长拒绝创建、授权或失败后 correction 的原价重绑定。上下架状态、映射、授权、锁、未决 operation 和其他既有门禁保持不变。本次仅完成代码、合同与合成回归修复，没有执行真实平台 READ_ONLY 或 WRITE，也没有消费新的写授权。
+
+### 2026-09-08 RM1-B 重新验收
+
+负责人再次明确授权对 `AISHA-B-60-Z` 执行一次真实 `UPDATE_PRICE`，目标仍为 `10.30`。Operations Web 使用已有 `10.80` 原价格事实创建新 Task `TASK-MANUAL-c9b09e6c5ee2cfb64accc3b4`，没有再因观察距今时间阻断。首次提交新授权后，旧 Queue Service 进程仍加载整改前的新鲜度规则，Coordinator 将 continuation 安全关闭为 `RECONFIRM`；该批次保持 `PREPARED`，未创建 operation、attempt 或 write lock，也未投递 Worker，因此没有平台副作用。重启 Queue Service 加载当前代码后，负责人在同一 Task 上重新预览并确认，形成批次 `WEB7E-eb1ed34bdd4db6546ca5f218fa276176`。
+
+Worker 写前于 `2026-09-08T20:13:52+08:00` 重新进入商品管理“上架中”页面并读取到 `10.80`，与 Task 的 `expected_old_price` 一致；于 20:13:57 记录提交意图，20:14:00 执行唯一一次平台提交并独立回读 `10.30`。item 为 `VERIFIED`，`submit_attempted=true`，`side_effect_state=VERIFIED`，`actual_price=10.30`，错误字段为空。Task 为 `success`，operation `OP-a525452a90710c75e153abb050ffbc5b` 为 `VERIFIED`，item attempt `ATTEMPT-7a54785b20131078d9645fdb67710e98` 为 `VERIFIED / VERIFIED`；同一 Task 只有这一次 execution attempt。
+
+Result `RESULT-3e3fc4ae25a2e028468c3bbf` 已由 Importer 接受，receipt 为 `WRITTEN` 且无 projection error；请求、phase、结果、checksum 和 ACK 已归档到 `ATTEMPT-0a4d555d914d4863` 目录。`listing_status` 已回读为 `AISHA-B-60-Z / online / 10.30`，来源 attempt 与本次结果一致；write lock 已释放，continuation 为 `COMPLETE`，正式 Queue 的 `inbox/working/results` 均为 0。Worker 验收后保持长驻 `RUNNING`，严格 heartbeat 检查通过；本轮没有恢复原价，也没有第二次平台写。
+
+重新验收前还暴露出一个内部收口缺口：首次失败的旧 Task 虽有 `batch=FAILED / item=NOT_ATTEMPTED / submit_attempted=false / side_effect_state=NOT_STARTED / attempt 已结束 / continuation 已关闭 / lock 已释放` 的完整零副作用证据，正式取消入口仍把任何非 `PREPARED` 批次一律视为不可取消。现已把取消条件仅放宽到上述可证明“提交前终止”的完整组合；UNKNOWN、已记录提交、未结束 attempt、未关闭 continuation、未释放 lock 或非价格任务仍禁止取消。旧 Task 已经由 Operations Web 正式入口按过期状态收口，没有直接修改 SQLite；相应合成回归覆盖可取消的提交前失败和仍不可取消的活动/不确定操作。
+
+```text
+RM1-B REAL UPDATE_PRICE = VERIFIED
+
+SKU = AISHA-B-60-Z
+
+READ-BEFORE = 10.80
+
+AUTHORIZED PLATFORM SUBMIT = ONCE
+
+READBACK = 10.30
+
+SIDE EFFECT = VERIFIED
+
+IMPORTER / ARCHIVE / LOCK / CONTINUATION = CLOSED
+
+ACTIVE QUEUE = 0
+
+Stage Goal = NOT YET VALIDATED / WAIT OWNER
+```

@@ -3967,13 +3967,19 @@ def _commit_v4_counts(items):
 
 
 def _commit_v4_prepare_product_list(window, timeout_seconds, result, stage):
-    """Use the product-list preparation path proven by the successful queue."""
+    """Open and verify ONLINE before reading prices for a v4 COMMIT batch.
+
+    A preceding full READ_ONLY scan ends on the waiting-products page.  That
+    page also exposes structured product rows, so the generic reuse fast path
+    cannot prove that the online price offset is safe.  A write preflight must
+    re-enter product management and explicitly select ONLINE instead.
+    """
     return _prepare_product_list(
         window,
         timeout_seconds,
         result,
         stage,
-        reuse_requested=True,
+        reuse_requested=False,
     )
 
 

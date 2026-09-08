@@ -43,7 +43,7 @@ CHANGE_PRICE = "CHANGE_PRICE"
 SET_OFFLINE = "SET_OFFLINE"
 SET_ONLINE = "SET_ONLINE"
 MANUAL_ACTIONS = frozenset({SET_PRICE, CHANGE_PRICE, SET_OFFLINE, SET_ONLINE})
-PRICE_FACT_MAX_AGE = timedelta(minutes=30)
+LISTING_STATUS_FACT_MAX_AGE = timedelta(minutes=30)
 TASK_LIFETIME = timedelta(minutes=30)
 MAX_MANUAL_TASK_ITEMS = 50
 CONTRACT_VERSION = "task13.5-7e-manual-task-1.0"
@@ -141,13 +141,13 @@ class ManualTaskApplicationService:
         products_workbook: Path,
         platform_mappings_workbook: Path,
         clock=None,
-        price_fact_max_age: timedelta = PRICE_FACT_MAX_AGE,
+        listing_status_fact_max_age: timedelta = LISTING_STATUS_FACT_MAX_AGE,
     ) -> None:
         self.runtime = runtime_repository
         self.products_workbook = Path(products_workbook)
         self.platform_mappings_workbook = Path(platform_mappings_workbook)
         self.clock = clock or utc_now
-        self.price_fact_max_age = price_fact_max_age
+        self.listing_status_fact_max_age = listing_status_fact_max_age
         self.inventory = InventoryRepository(runtime_repository)
 
     def scope_options(self, *, now: datetime | None = None) -> ManualTaskScopeOptions:
@@ -303,6 +303,27 @@ class ManualTaskApplicationService:
                     """SELECT 1 FROM shadowbot_commit_batch_items i
                        JOIN shadowbot_commit_batches b ON b.batch_id = i.batch_id
                        WHERE i.source_task_id = ? AND b.status <> 'PREPARED'
+                         AND NOT (
+                           b.status = 'FAILED'
+                           AND i.status IN ('FAILED', 'NOT_ATTEMPTED')
+                           AND i.submit_attempted = 0
+                           AND i.side_effect_state = 'NOT_STARTED'
+                           AND EXISTS (
+                             SELECT 1 FROM shadowbot_execution_attempts a
+                             WHERE a.execution_attempt_id = i.item_execution_attempt_id
+                               AND a.status = 'FAILED'
+                               AND a.side_effect_state = 'NOT_STARTED'
+                               AND a.ended_at IS NOT NULL
+                           )
+                           AND EXISTS (
+                             SELECT 1 FROM execution_continuations c
+                             WHERE c.batch_id = b.batch_id AND c.closed_at IS NOT NULL
+                           )
+                           AND NOT EXISTS (
+                             SELECT 1 FROM shadowbot_write_locks l
+                             WHERE l.batch_id = b.batch_id AND l.status <> 'RELEASED'
+                           )
+                         )
                        UNION ALL SELECT 1 FROM shadowbot_operations
                        WHERE task_id = ? AND status NOT IN ('PENDING', 'START_FAILED')""",
                     (task_id, task_id),
@@ -472,10 +493,8 @@ class ManualTaskApplicationService:
         if request.action in {SET_PRICE, CHANGE_PRICE}:
             if current_status != "online":
                 blockers.append("改价只允许当前上架中的商品。")
-            if not _fact_is_fresh(price_fact_at, current, self.price_fact_max_age):
-                blockers.append("当前价格记录缺失或已过期。")
             if current_price is None:
-                blockers.append("当前价格不可用。")
+                blockers.append("缺少原价格，请先读取平台价格。")
             elif request.action == SET_PRICE:
                 target_price = request.price_value
             elif request.price_value is not None:
@@ -483,12 +502,16 @@ class ManualTaskApplicationService:
         elif request.action == SET_OFFLINE:
             if current_status != "online":
                 blockers.append("下架只允许当前上架中的商品。")
-            if not _fact_is_fresh(status_fact_at, current, self.price_fact_max_age):
+            if not _fact_is_fresh(
+                status_fact_at, current, self.listing_status_fact_max_age
+            ):
                 blockers.append("当前上下架状态缺失或已过期。")
         elif request.action == SET_ONLINE:
             if current_status != "offline":
                 blockers.append("上架只允许当前待上架商品。")
-            if not _fact_is_fresh(status_fact_at, current, self.price_fact_max_age):
+            if not _fact_is_fresh(
+                status_fact_at, current, self.listing_status_fact_max_age
+            ):
                 blockers.append("当前上下架状态缺失或已过期。")
             target_price = request.price_value
             target_inventory = request.target_inventory

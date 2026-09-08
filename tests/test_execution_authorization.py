@@ -276,6 +276,47 @@ def test_prepare_requires_submit_execution_capability(execution_setup) -> None:
         service.prepare_execution(viewer, ["TASK-PRICE-A"], "auth-1")
 
 
+def test_update_price_authorization_accepts_old_observation(
+    execution_setup,
+) -> None:
+    service, repository, calls = execution_setup
+    with repository.connect_write() as connection:
+        connection.execute(
+            """UPDATE listing_status
+               SET price_observed_at = ?
+               WHERE platform_name = ? AND internal_sku = ?""",
+            ((NOW - timedelta(hours=2)).isoformat(), PLATFORM, "AISHA-A-50-Z"),
+        )
+        connection.commit()
+
+    prepared = service.prepare_execution(_admin(), ["TASK-PRICE-A"], "stale-price")
+    submitted = service.submit_execution(
+        _admin(),
+        ["TASK-PRICE-A"],
+        prepared.confirmation_digest,
+        "stale-price",
+    )
+
+    assert submitted.batch_id
+    assert submitted.execution_attempt_id == ""
+    assert not calls
+
+
+def test_update_price_authorization_rejects_missing_original_price(
+    execution_setup,
+) -> None:
+    service, repository, _ = execution_setup
+    with repository.connect_write() as connection:
+        connection.execute(
+            "UPDATE tasks SET expected_old_price = NULL WHERE task_id = ?",
+            ("TASK-PRICE-A",),
+        )
+        connection.commit()
+
+    with pytest.raises(ExecutionAuthorizationConflict, match="任务缺少原价格"):
+        service.prepare_execution(_admin(), ["TASK-PRICE-A"], "missing-price")
+
+
 def test_v4_prepare_and_submit_bind_exact_principal_tasks_and_actor(
     execution_setup,
 ) -> None:

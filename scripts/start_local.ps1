@@ -13,7 +13,13 @@ $ExampleEnvPath = Join-Path $PSScriptRoot "local_env.example.ps1"
 Set-Location $ProjectRoot
 $env:PYTHONIOENCODING = "utf-8"
 
-$PythonExe = (& python -c "import sys; print(sys.executable)").Trim()
+$ProjectPython = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+if (Test-Path -LiteralPath $ProjectPython) {
+    $PythonExe = (Resolve-Path -LiteralPath $ProjectPython).Path
+} else {
+    $PythonExe = (& python -c "import sys; print(sys.executable)").Trim()
+    Write-Warning "Missing project .venv; using Python from PATH: $PythonExe"
+}
 if (-not $PythonExe) {
     throw "Unable to resolve the active Python interpreter."
 }

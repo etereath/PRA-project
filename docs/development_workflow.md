@@ -20,7 +20,7 @@
 | 接口 / DTO | 更新直接 caller 与 fixture，跑受影响用例及直接调用链 |
 | 授权 / 持久化 / 事务 / 并发 / UNKNOWN / 恢复 | 使用真实临时 Runtime，覆盖受影响的授权绑定、幂等、原子性、失败和重启路径 |
 
-用具体测试节点运行原失败用例，例如 `python -m pytest -q tests/目标文件.py::目标用例`。正常结果保留摘要，失败时保留对应断言和堆栈。完整 Gate 的适用时机见治理文档。
+本地开发统一使用项目环境，例如 `& .\.venv\Scripts\python.exe -m pytest -q tests/目标文件.py::目标用例`；静态检查使用 `& .\.venv\Scripts\python.exe -m ruff check 目标文件`。正常结果保留摘要，失败时保留对应断言和堆栈。完整 Gate 的适用时机见治理文档。
 
 ## 3. CI failure：怎么定位
 
