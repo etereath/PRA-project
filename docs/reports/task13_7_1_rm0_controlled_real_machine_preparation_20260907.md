@@ -421,3 +421,31 @@ Stage Goal = NOT YET VALIDATED
 ```
 
 本次不创建 Human UPDATE_PRICE、不执行 COMMIT、不恢复价格、不重放历史动作，也不开始 13.7-2。下一步仅由负责人基于以上 READ-BEFORE 指定测试 SKU 与精确目标价格，并另行决定是否授权 RM1-B。
+
+## 2026-09-08 RM1-B — 受控真实 UPDATE_PRICE 验收
+
+负责人指定 `AISHA-B-60-Z` 的目标价格为 `10.30`，并明确授权本次一次性真实 `UPDATE_PRICE`。执行前因 Operations Web 判断原 14:17 快照已过期，未绕过质量门禁；先通过正式 v5 `SYNC_STATUS / READ_ONLY` 重新取得完整快照。该批次 `BATCH-RM1B-READBEFORE-20260908T083751Z-f9d3abe0`、attempt `ATTEMPT-5c01fefb45874bd8`、result `RESULT-916da0a0cf94ada6b7e61692` 均已验证并由 Importer 落账，`AISHA-B-60-Z` 在 `2026-09-08T16:38:10+08:00` 仍为上架中、当前价格 `10.80`、平台库存 9。
+
+随后仅在 Operations Web 中创建并选择一个人工改价 Task：`TASK-MANUAL-c2378ce0008a2513897d41db`，写前预期价格 `10.80`、目标价格 `10.30`。为验证持久责任交接，Queue Service 在授权前停止；Web 确认后先形成唯一 open continuation，再重启 Queue Service。Coordinator 接管同一授权并发布 v4 COMMIT 批次 `WEB7E-2678b95570b3b10a73f4ebcdf450000e`，证明“Web 授权 → durable continuation → Queue Service / Coordinator → Worker → Importer → Archive”在进程重启边界上可交接。
+
+本次唯一真实写尝试在真正提交前失败：Worker 于批次预检阶段将页面上的“报名秒杀”文本带入供货价格解析，返回 `OLD_PRICE_PARSE_FAILED / 供货价格无法唯一解析: 报名秒杀`。批次为 `FAILED`，item 为 `NOT_ATTEMPTED`，item attempt `ATTEMPT-7bdf237a07322ab208b626d3c9aa48ae` 为 `FAILED / NOT_STARTED`；`submit_attempted=false`，`submit_intent_at`、`submit_clicked_at`、`readback_observed_at` 均为空。因此没有点击平台提交按钮，没有产生本次价格写入，也不需要对 UNKNOWN 副作用做猜测或 RECONCILE。Runtime 中最后一条合格价格事实仍是 16:38:10 的 `10.80`；本轮不以它证明失败后的新鲜平台状态，只用于说明没有新的系统价格观察覆盖该事实。
+
+结果 `RESULT-981becdc0aada27dfd870fac`、result SHA-256 `79a97ec04e2257ace67e6148a4c4575db3c21d9170b530fc8d4b68c92304afe5` 已由 Importer 以 `WRITTEN` receipt 接受并完成 Archive；对应 write lock 已按失败路径释放。收尾时 open continuation、active attempt 和 active write lock 均为 0，正式 Queue 的 `inbox/working/results` 均为 0，Runtime v18 health 继续通过；Worker 已停止，Queue Service 保持运行。本次授权只允许一个真实写尝试，失败后没有自动重试。
+
+现场同时暴露一项控制面语义缺陷：continuation 被标为 `COMPLETE / 执行链已收口`，但 Task 正确保留 `pending`、operation 保持 `PENDING / UNRESOLVED`，Web 又显示“当前责任方：人工 / 已收口”，且没有直接展示上述预检失败原因。这里的 `COMPLETE` 只能表示本次授权执行链生命周期已结束，不能表示业务成功或 Task 已终结。后续修复必须同时覆盖旧 v4 商品行价格解析和失败后的 Task / continuation / Web 责任状态表达；修复与定向回归完成后，如需再次执行真实平台写，必须由负责人重新指定当时新鲜旧价格、目标价格并重新授权。
+
+```text
+RM1-B AUTHORIZED ATTEMPT = EXECUTED ONCE
+
+PLATFORM SUBMIT = NOT ATTEMPTED
+
+SIDE EFFECT = NOT_STARTED
+
+BUSINESS RESULT = FAILED (OLD_PRICE_PARSE_FAILED)
+
+LAST QUALIFIED PRICE OBSERVATION = 10.80 @ 2026-09-08T16:38:10+08:00
+
+AUTOMATIC RETRY = NOT PERFORMED
+
+Stage Goal = NOT YET VALIDATED
+```
