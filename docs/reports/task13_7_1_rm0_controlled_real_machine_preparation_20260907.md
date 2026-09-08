@@ -380,3 +380,44 @@ Stage Goal = NOT YET VALIDATED
 ```
 
 RM1 后续仍严格拆分：负责人另行授权 RM1-A 后，只启动服务并执行真实 READ_ONLY；成功获得三个 SKU 的新鲜当前价格、身份、时间和证据后停止，由负责人确定精确目标价格。RM1-A 不授权 RM1-B；任何 Human UPDATE_PRICE、COMMIT、价格恢复或其他平台写操作均须新的明确授权。
+
+## 2026-09-08 RM1-A — 真实 READ-BEFORE
+
+负责人明确授权 RM1-A 后，使用正式 Queue Service、`test2` Worker、Runtime v18 和 v5 `SYNC_STATUS` 执行了一次真实平台 READ_ONLY。请求合同为 `action_type=sync_status`、`execution_mode=READ_ONLY`、`items=[]`，不含 Task、Review、目标价格、执行授权或写动作；结果记录 `business_operation_completed=false`、`side_effect_state=NOT_STARTED`。
+
+平台窗口为“蚂蚁花团供应商”。读取完成后在现有登录会话主页核对到“千芳花卉”经营主体显示；未记录平台账号 ID、手机号、凭据或截图。为把本批映射目标限制在负责人指定的 B/C/D，Worker 运行映射临时收窄为三个已确认身份，原文件先备份；结果归档后已恢复原文件，恢复 SHA-256 为 `24f0dd9f88f0fe5e42587cc2b7866f035fef88bcbface3d0353afd99c4fa5ce6`。该配置动作没有改动 Git、运营 mapping 工作簿或平台数据。
+
+v5 完整快照合同会遍历“上架中”和“待上架”列表并保留页面上其他未映射身份，因此本批数据库 `batch_target_count=14`；只有下列三个已授权、已映射 SKU 被用作本次 READ-BEFORE 结论和正式状态投影。遍历其他页面行是定位与证明完整结束标记所需的只读观察，不产生平台副作用，也未将未确认身份启用为业务 mapping。
+
+完整快照同时形成 11 个当前未映射页面身份异常：复用已有 dedupe 后新建 6 个 `listing_location_anomaly` 待复核并由正式 Outbox 各发送一次飞书通知，另有 3 个旧页面位置异常被新完整快照自动清除。新建复核分别属于艾莎 A/E 及卡布奇诺 A/B/D/E 页面身份，不涉及本次 B/C/D 三个已映射 SKU，也不构成其 RM1-B blocker。它们是 READ_ONLY 导入后的内部控制面投影，不是平台写；由于对应页面身份仍未获得负责人 mapping 裁决，本轮不删除、取消或伪造收口。
+
+| internal SKU | 平台身份 | 位置 | 当前价格 | 平台库存 | observed_at（Asia/Shanghai） | Runtime source |
+|---|---|---|---:|---:|---|---|
+| `AISHA-B-60-Z` | 艾莎＋B级 | `online_only` | `10.80` | 9 | `2026-09-08T14:17:13+08:00` | `shadowbot_sync_status` |
+| `AISHA-C-55-Z` | 艾莎＋C级 | `online_only` | `6.80` | 5 | `2026-09-08T14:17:13+08:00` | `shadowbot_sync_status` |
+| `AISHA-D-50-Z` | 艾莎＋D级 | `online_only` | `6.20` | 5 | `2026-09-08T14:17:13+08:00` | `shadowbot_sync_status` |
+
+完整性与落账证据：
+
+- batch `BATCH-RM1A-20260908T061654Z-030b6973`、attempt `ATTEMPT-95a494700a2d4178`、result `RESULT-2efbfffeb1b9bfcfdd938b66` 均已绑定；
+- `online_scan_complete=1`、`waiting_scan_complete=1`、两个 end marker 均已验证，snapshot `SNAPSHOT-2efbfffeb1b9bfcfdd938b66` 为 `VERIFIED`；
+- 结果 SHA-256 为 `3124c0831102380d1dafab570780a4da792a9f4cf7f802772c512a4c4547cf84`，Importer receipt 为 `WRITTEN`，无 projection error；请求、结果、checksum、phase、ACK 和只读报告已归档到 attempt 对应目录；
+- `listing_status` 已逐项回读，三个 SKU 的价格、库存、上架状态、source、observed_at 和 source attempt 与快照一致；
+- 结束时正式 Queue 的 `inbox/working/results` 均为 0；Worker 安全停止且本次 `processed=1`，lifecycle 已同步为 `STOPPED / STOPPED_VERIFIED`，Queue Service 继续运行。
+
+```text
+RM1-A REAL READ_ONLY = VERIFIED
+
+CURRENT PRICE:
+AISHA-B-60-Z = 10.80
+AISHA-C-55-Z = 6.80
+AISHA-D-50-Z = 6.20
+
+WAIT OWNER TARGET PRICE
+
+RM1-B REAL WRITE = NOT AUTHORIZED / NOT EXECUTED
+
+Stage Goal = NOT YET VALIDATED
+```
+
+本次不创建 Human UPDATE_PRICE、不执行 COMMIT、不恢复价格、不重放历史动作，也不开始 13.7-2。下一步仅由负责人基于以上 READ-BEFORE 指定测试 SKU 与精确目标价格，并另行决定是否授权 RM1-B。
