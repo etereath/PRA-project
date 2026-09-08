@@ -22,70 +22,62 @@
 6. UNKNOWN 在 RECONCILE 仍无法证明历史副作用后，可由 stopped boundary 之后的 qualified current observation 结束旧 one-shot business responsibility；历史 side-effect 仍可保持 UNKNOWN。`current != old target` 时旧决定终止，不自动继续旧改价，释放当前 write blocker，后续按当前事实创建新决定。
 7. Human decision 与 final platform authorization 保持分离；`Task → explicit authorization → durable continuation → Coordinator → existing v4/v5/Queue/Worker/Importer` 是当前执行基线。
 
-## 3. Authority Matrix 必须冻结
+## 3. Authority Matrix 冻结结论
 
-至少对下列对象明确：current authority、允许写入口、运行期读入口、历史/导入源、版本/identity、允许产生的 blocker scope。
+完整矩阵以[业务合同 §23](../business_contract.md)为唯一业务定义，[目标职责 §1.1～1.2](../rebaseline/task13_6_target_responsibility_and_gap_matrix.md)定义实现 owner。冻结摘要如下：
 
-| 对象 | 需要冻结的核心问题 |
-|---|---|
-| Product Master / internal SKU | Runtime DB 是否为 current authority；新增/停售/基础成本/品种等级如何版本化 |
-| Platform Product Mapping | 必须包含 `platform_name + account_id + internal_sku + platform_product_identity`；mapping status 与有效期语义 |
-| Price Rules | 当前 workbook 是否继续作为 runtime rule authority；若未来迁 DB，单独 cutover |
-| Listing Rules | 同上；不得与本轮 Master Data 迁移机械绑定 |
-| Physical Inventory | 继续由既有 DB inventory ledger authority；不得复制到 Product Master |
-| Platform Observation | immutable evidence、current projection、qualified observation 的角色分离 |
-| Human one-shot Decision | 当前经营决定，不是平台事实；外部变化可使其 stale/terminal |
-| ShadowBot identity mapping JSON | 平台执行定位配置，不得变成 Product/Mapping 业务 authority |
+| 对象 | current → target authority | 版本/identity 与 blocker 边界 |
+|---|---|---|
+| Product Master | `products.xlsx` → 2B 显式 cutover 后 Runtime DB | 版本化 snapshot；新 SKU 不自动建立 0 inventory，缺失为 `NOT_INITIALIZED`；默认最多 SKU 全动作 |
+| Platform Product Mapping | `platform_mappings.xlsx` 编译结果 → 2B 显式 cutover 后 Runtime DB | 显式 platform/account/canonical product identity/SKU/status/半开有效期；默认只影响相关 identity/SKU/action |
+| Price / Listing Rules | 本阶段继续各自 workbook authority | 绑定规范化规则集 digest；未来迁 DB 另做 cutover，不随 2B 机械迁移 |
+| Physical Inventory | 继续既有 Runtime DB ledger | Product Master 不复制余额；只阻断真实依赖库存的动作，不阻断 UPDATE_PRICE |
+| Platform Observation | immutable evidence + 可失效的 current qualified projection | qualification 输出事实/质量，不直接决定 blocker；单 identity 问题默认局部隔离 |
+| Human one-shot Decision | 最新有效 Intent/Task；授权和平台事实分离 | 外部事实可使旧决定 stale/terminal；默认 Task 或 SKU+action |
+| ShadowBot identity JSON | Executor 本地定位配置 | 与授权 mapping snapshot 校验但不成为业务 authority/fallback；系统性身份失真才可能 GQB-4 |
 
-### 默认方向
-
-- `products.xlsx` / `platform_mappings.xlsx` 不应继续作为正式运行期 Product/Mapping authority；可以保留一次性 bootstrap、批量导入/导出或受控维护辅助角色。
-- Runtime DB Product/Mapping authority 的实现允许复用 `a3485af` 的 Repository/Service/version/idempotency/snapshot 思路，但新 Schema 必须按当前 main 与多平台 `account_id` 重新设计。
-- `price_rules.xlsx` / `listing_rules.xlsx` 本任务只冻结角色，不默认迁入 SQLite；是否数据库化若会扩大施工，拆成独立后续任务。
+`account_id` 必须由负责人/受控部署配置显式赋值，不能从 platform 名、profile、窗口标题、登录显示文本或 applet URI 推断。`platform_product_identity` 使用 adapter 定义的版本化 canonical JSON 与 SHA-256 digest；当前蚂蚁无稳定 ID 时可用规范化商品名+等级，online/waiting 页面位置和 UI selector 不进入公共身份。
 
 ## 4. `a3485af` Selective Salvage Boundary
 
-### 允许作为高价值候选复用
-
-- `RuntimeMasterDataRepository` 的读取、编译、snapshot/version 思路；
-- `MasterDataManagementService` 的 expected_version、idempotency、source digest、operator write pattern；
-- `clean_runtime_cutover.py` 的 preview/hash/backup/candidate verification/explicit confirmation/rollback-guard 方法；
-- `listing_scan_quality.py` 的 run/batch/scope/end-marker/freshness/source-snapshot/mapping 一致性 qualification；
-- `listing_automation_runtime.py` 的既有 Automation→READ_ONLY→Queue/Worker→immutable observation→ACK/Archive 接线思路；
-- Task Queue / Master Data 的 Read Model、Query、Presenter/UI 资产；
-- structured blocker context 与 notification presentation；
-- `review_display.py` 仅在展示边界翻译原始 reason/code 的模式；
-- per-item ManualTask values 作为未来批量 Human Sales Control 候选。
-
-### 明确不得原样恢复
-
-- 整体 cherry-pick 7F/7G；
-- 旧 `v18 = product_catalog/platform_product_mappings` 迁移编号；当前 v18 已被 execution continuation 占用；
-- 旧 mapping 缺少 `account_id` 的 identity 结构；
-- clean-runtime 直接以空白 candidate 整库替换当前 canonical Runtime；
-- Human Task create 后自动 prepare+submit；
-- generic `PENDING/FAILED` batch cancel predicate；
-- 人工直接声明 `TARGET_APPLIED/TARGET_NOT_APPLIED` 并把它作为当前标准机器收口；
-- 同 SKU+platform 任意 pending Review 的 blanket write block；
-- 对 UPDATE_PRICE 等无关动作的 Inventory `DB_AUTHORITY` / balance blanket gate；
-- 旧 Settlement / 20:00 seller day authority；
-- 未重新经过业务裁决的固定 20 扎安全余量。
+| `a3485af` 候选 | 结论 | 当前采用边界 |
+|---|---|---|
+| `RuntimeMasterDataRepository` read/compiler/snapshot/version | ADAPT | 复用职责与接口思路；按当前 main 的 additive schema、account identity 与 Product/Inventory 分离重写 |
+| `MasterDataManagementService` expected_version/idempotency/source digest/operator pattern | ADAPT | 保留并发与重放保护；删除 create-product 自动初始化 0 inventory，写前后读取及 actor/source 继续显式 |
+| `clean_runtime_cutover.py` preview/hash/backup/candidate verify/confirm/rollback guard | ADAPT | 复用步骤；只做 additive import/switch，不替换或清空 canonical Runtime |
+| `listing_scan_quality.py` run/batch/scope/end-marker/freshness/source/mapping checks | ADAPT | 扩成 account-aware 公共 contract 和结构化 reason codes；不自行产生 global blocker |
+| `listing_automation_runtime.py` Automation→READ_ONLY→Queue/Worker→evidence→ACK/Archive | ADAPT | 接当前 Queue/Importer 与 2B mapping snapshot；合法 retry/recovery 不被旧 batch 永久阻断 |
+| Master Data / Task Queue Read Model、Query、Presenter/UI | ADAPT | 复用展示资产；Current Queue 与 History 分开，UI 不成为责任 owner |
+| structured blocker context / notification presentation | ADAPT | 使用 2A category/scope/evidence/allowed-ops/release contract；重写 blanket policy |
+| `review_display.py` 展示边界翻译 reason/code 模式 | REUSE | 只在 Presenter 翻译；原始 reason/code 仍保留，不进入业务判定 |
+| per-item ManualTask values | DEFER | 作为未来批量 Human Sales Control 候选，不进入 2A～2D |
+| 整体 7F/7G commit / 架构 | REJECT | 禁止整体 cherry-pick；当前 #47～#50 execution baseline 保持有效 |
+| 旧 `v18` Product/Mapping migration | REJECT | v18 已被 continuation 占用；2B 只能在当前 latest 后新增 migration |
+| 缺少 `account_id` 的 mapping identity | REJECT | 2B 必须使用显式 account-aware identity |
+| blank candidate 整库 replacement | REJECT | 不删除 Task/history/continuation/Review/observation/UNKNOWN/RM1/inventory evidence |
+| Task create 后自动 prepare+submit | REJECT | PENDING 仍由 Human/Web 显式授权 |
+| generic `PENDING/FAILED` batch cancel predicate | REJECT | 必须依据副作用边界、owner 与具体 action 判断 |
+| 人工 `TARGET_APPLIED/TARGET_NOT_APPLIED` 作为标准机器收口 | REJECT | 仅保留正式人工 fallback；标准自动路径使用唯一 RECONCILE + qualified current observation，且不改写历史因果 |
+| 任意 pending Review blanket write block | REJECT | 复用 `blocked_actions` 的 action-scoped 语义；malformed context fail closed 仍取可信最小范围 |
+| Inventory authority/balance 对无关 action 的 blanket gate | REJECT | UPDATE_PRICE 与其他无库存依赖动作不得被其阻断；Exposure/SET_ONLINE 的具体整改留后续切片 |
+| 旧 Settlement / 20:00 seller day authority | REJECT | 已被现行业务合同 supersede |
+| 固定 20 扎安全余量 | DEFER | 未经独立业务裁决不进入规则或硬门禁 |
 
 ## 5. Schema / Cutover 约束
 
 1. 不复用旧 migration number；在当前 main 最新 schema 之后 additive migration。
 2. 不删除或重建 #47～#50 的 Task/history/continuation/Review/observation/UNKNOWN/RM1 evidence。
-3. 新 master-data cutover 推荐：`backup → additive schema → import → shadow compare → explicit authority switch → Web/Automation/Authorization 同 gate 切读 → old source 退为 import/history`。
+3. 新 master-data cutover 固定为：`backup → additive schema → import → shadow compare → explicit authority switch → Web/Automation/Authorization 同 gate 切读 → old source 退为 import/history`。
 4. 不允许 Web 读 SQLite、Authorization 读 Excel、Automation 再读另一份 source 的长期 split-brain。
 5. 一个 platform/account 的 mapping 或 observation 问题默认不传播到其他 account/platform。
 
-## 6. 本任务必须回答的 Open Decisions
+## 6. Open Decisions 已冻结
 
-1. Product Master 新增 SKU 时，库存未初始化应表示 `unknown/not_initialized` 还是自动建立 0 balance；不得仅因数据库整齐默认 0=真实库存。
-2. Price Rules / Listing Rules 本阶段继续 workbook authority 还是计划迁 DB；若继续 workbook，如何做 version/digest/cutover 绑定。
-3. Mapping 的 `account_id` 来源、唯一键与 platform_product_identity 形状。
-4. qualified observation 的公共 contract：quality/freshness/scope/identity/source refs 输出什么；谁决定是否构成 blocker。
-5. Global Queue Blocker Proposal 的 developer workflow 落点。
+1. **库存：`NOT_INITIALIZED`。** Product 创建不写库存；`0` 只来自独立、可审计、幂等的库存初始化事实。
+2. **Rules：继续 workbook authority。** Price/Listing 评估和 Task 绑定规范化规则集 digest、来源与加载时间；未来 DB 化另行 shadow/cutover。
+3. **Mapping：显式 account-aware identity。** `account_id` 由负责人/部署配置提供；唯一性为 platform/account/product identity digest + 有效期，canonical identity 不含 UI selector/page state。
+4. **Qualification：事实/质量输出，不是 blocker 决策。** 输出 contract/provider/capability version、quality codes、scope/pages/end marker、platform/account/product identity、mapping version、时间/freshness/fresh_until 与 run/batch/snapshot/manifest/result/evidence/ACK refs/digests；Authorization、Coordinator、Observation Health 各自按动作消费。
+5. **GQB Proposal：治理触发、Workflow 第 6 节执行。** 除 GQB-1～4 外或扩大至无共享风险对象时先停工，按模板提交，未经 Owner/Reviewer 接受不得实现。
 
 ## 7. Deliverables
 
@@ -105,7 +97,9 @@
 
 ## 9. Downstream
 
-- Task 13.7-2B：Runtime Master Data Authority selective salvage。
-- Task 13.7-2C：Qualified Observation & Listing READ_ONLY selective salvage。
-- Task 13.7-2D：Queue Operational Continuity，以 2A 合同为准并复用 2B/2C 的 authority/qualification。
+- Task 13.7-2B：在当前 latest schema 后新增 additive migration；Product 与 Mapping 分表/版本化，mapping 必含显式 `account_id` 与 canonical identity JSON/digest；Product create 不初始化库存；import 后逐项 shadow compare，显式切换 Web/Automation/Authorization，全链无 workbook fallback。
+- Task 13.7-2C：建立 account-aware qualification DTO/result；至少验证 scheduled run、唯一 batch、scope/pages/end marker、时间/freshness、mapping/capability snapshot、source manifest/result/evidence、ACK/archive；负面原因结构化；它不直接写 blocker，也不修改历史 execution result。
+- Task 13.7-2D：以本合同实现 Queue-OPS-01/02R/03/04；新决定先记录，Review action-scoped，Current Queue/History 分离；02R 只在 stopped boundary 后消费 2C qualified observation，关闭旧 one-shot 当前责任而保留 historical UNKNOWN；运行期 blocker 记录 category/scope/evidence/allowed recovery/release owner。
 - Exposure/Inventory 解耦（原 Queue-OPS-05）不放入本轮，随 Exposure/SET_ONLINE 后续切片处理。
+
+2B/2C 可以在 2A 接受后并行；2D 的 identity 最终接 2B，Queue-OPS-02R 最终接 2C。在依赖未到位时只允许接口替身或只读探索，不得以临时 fallback 冻结第二套 authority。
