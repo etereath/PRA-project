@@ -12,6 +12,13 @@ dependencies = [
   "tzdata>=2025.2; platform_system == 'Windows'",
 ]
 
+[project.optional-dependencies]
+dev = [
+  "build==1.5.0",
+  "pytest==9.1.1",
+  "ruff==0.15.21",
+]
+
 [project.scripts]
 pra = "app.cli:main"
 "pra-mvp" = "app.cli:main"
