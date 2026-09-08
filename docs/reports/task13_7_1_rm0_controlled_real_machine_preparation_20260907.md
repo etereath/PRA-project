@@ -449,3 +449,11 @@ AUTOMATIC RETRY = NOT PERFORMED
 
 Stage Goal = NOT YET VALIDATED
 ```
+
+### RM1-B 失败后的商品列表定向修复
+
+只读复查历史 Task 12 记录和停用的 `codex/task13-5-7f-runtime-master-data` 分支后确认：旧分支没有本问题的现成修复。Task 12 曾明确记录，小程序会保留上一次“上架中/待上架”筛选页；在待上架页套用上架中价格偏移会读到“报名秒杀”。本次 RM1-B 前刚完成“上架中＋待上架”的全量 READ_ONLY，页面最后停在待上架；随后 v4 COMMIT 的 `_reuse_current_product_list()` 只因存在结构化商品行便接受当前页，结果中也只有 `refresh_entry=CURRENT_PRODUCT_LIST`，没有 `active_listing_filter=ONLINE`。因此本次不是数字解析器本身不能处理价格，而是列表复用绕过了 Task 12 已验证的页面筛选门禁。
+
+最小修复只调整 v4 COMMIT 的批次预检：`_commit_v4_prepare_product_list()` 不再复用未经筛选证明的当前商品页，而是重新进入商品管理并显式选择“上架中”，两次确认列表就绪后才读取上架中价格。单个 batch 仍只做一次完整预检，后续 item 继续复用已验证的同一窗口，不改变最终提交、写前旧价比较、UNKNOWN 或锁语义。新增回归门禁证明 v4 预检固定传入 `reuse_requested=False`；既有刷新测试继续证明选择“上架中”发生在列表就绪判断之前。
+
+定向测试 `111 passed`，覆盖 Human price journey、v4 commit pipeline / orchestration / success baseline、商品列表刷新、Executor 和 commit batch。Worker 保持 `STOPPED`；修复已通过正式同步脚本部署到 `test2`，二次 `--check` 的 7 个受控文件均为 `CURRENT`，部署验证 PASS。该修复和部署没有投递 Queue，没有执行真实平台 READ_ONLY 或 WRITE，也没有消费新的平台写授权。再次 RM1-B 前仍须取得新鲜旧价格并由负责人重新授权。

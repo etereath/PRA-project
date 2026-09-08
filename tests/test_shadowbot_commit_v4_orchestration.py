@@ -41,6 +41,7 @@ def _load_functions():
             "_commit_v4_counts",
             "_commit_v4_page_snapshot",
             "_commit_v4_update_page_snapshot",
+            "_commit_v4_prepare_product_list",
             "_commit_v4_prepare_first_target_for_click",
             "_run_commit_batch_v4",
         }
@@ -134,6 +135,51 @@ def test_v4_batch_defers_row_four_to_existing_downward_scroll_path():
 
     assert result["status"] == "DEFERRED_TO_ITEM_SCROLL"
     assert result["attempts"] == []
+
+
+def test_v4_preflight_never_reuses_an_unverified_current_listing_page():
+    namespace = _load_functions()
+    calls = []
+    prepared_window = object()
+    result = {"product_list_refreshes": []}
+
+    def prepare_product_list(
+        window,
+        timeout_seconds,
+        supplied_result,
+        stage,
+        reuse_requested=False,
+    ):
+        calls.append(
+            {
+                "window": window,
+                "timeout_seconds": timeout_seconds,
+                "result": supplied_result,
+                "stage": stage,
+                "reuse_requested": reuse_requested,
+            }
+        )
+        return {"status": "SUCCESS", "active_listing_filter": "ONLINE"}
+
+    namespace["_prepare_product_list"] = prepare_product_list
+
+    output = namespace["_commit_v4_prepare_product_list"](
+        prepared_window,
+        15,
+        result,
+        "BATCH_PREFLIGHT",
+    )
+
+    assert output == {"status": "SUCCESS", "active_listing_filter": "ONLINE"}
+    assert calls == [
+        {
+            "window": prepared_window,
+            "timeout_seconds": 15,
+            "result": result,
+            "stage": "BATCH_PREFLIGHT",
+            "reuse_requested": False,
+        }
+    ]
 
 
 def test_v4_stable_request_forwards_validated_batch_fault_injection():
