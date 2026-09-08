@@ -19,7 +19,7 @@ PR [#47](https://github.com/etereath/PRA-project/pull/47)、RM0 交付 PR [#49](
 | Task 13.7-1 代码实现 | 已合并 / 复核 PASS | #47 已进入 main `08f4e70`；正式人工收口及催办、目标已满足时确认结束决定、回执刷新持久状态；Schema 目标仍为 v18 |
 | Task 13.7-1 隔离旅程 | P1/P2 定向回归 PASS | P1 人工收口与后续执行、P2 零写结束及实时回执已有隔离证据；测试时序修复后的 4 个失败用例定向通过，完整门禁见下节 |
 | Windows CI 时序修复 | 已修复并验证 | `scan()` 保持整秒精度，必要时等待到旧执行停止后的下一整秒；`eb6e24b` 的 Windows / Linux Core CI 完整通过 |
-| 开发文档治理 | 资源门禁已补充 | AGENTS 已精简并增加资源、读取与验证预算；全量回归必须事前获得负责人明确授权，文档/历史快照/单纯推送默认不运行测试或全仓静态检查 |
+| 开发文档治理 | PR #56 P2 整改完成 / 待复审 | 根 AGENTS 已补充用户既有完整验证授权复用及高风险验证不得降级；WHY/HOW 文档已统一完整 Gate 与同 Head 重跑授权语义；草稿缩为只指向 Canonical rule 的决策记录 |
 | Task 13.7-1 Implementation Review | PASS | 2026-09-07 用户最终裁决；冻结问题 P1-47-01、P2-47-01、P2-47-02 全部 CLOSED，无遗留冻结问题 |
 | #47 合并与最终检查 | MERGED / SUCCESS | merge commit `08f4e70`；最终 Head `1011091` 的 Windows / Linux Core 均 SUCCESS |
 | Task 13.7-1 RM0 / RM0.5 | PASS WITH HISTORICAL DEBT / PREFLIGHT READY | 旧 `WEB7E-6646…` 保留审计；B/C/D 三个艾莎 SKU 已由负责人确认并完成受控 VERIFIED mapping，当前无活动执行 blocker |
