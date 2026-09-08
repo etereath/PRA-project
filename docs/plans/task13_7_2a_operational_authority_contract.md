@@ -32,11 +32,11 @@
 | Platform Product Mapping | `platform_mappings.xlsx` 编译结果 → 2B 显式 cutover 后 Runtime DB | 显式 platform/account/canonical product identity/SKU/status/半开有效期；默认只影响相关 identity/SKU/action |
 | Price / Listing Rules | 本阶段继续各自 workbook authority | 绑定规范化规则集 digest；未来迁 DB 另做 cutover，不随 2B 机械迁移 |
 | Physical Inventory | 继续既有 Runtime DB ledger | Product Master 不复制余额；只阻断真实依赖库存的动作，不阻断 UPDATE_PRICE |
-| Platform Observation | immutable evidence + 可失效的 current qualified projection | qualification 输出事实/质量，不直接决定 blocker；单 identity 问题默认局部隔离 |
+| Platform Observation | immutable evidence + 可失效的 current qualified projection | Operating fact qualification 与 Evidence delivery/archive health 分维度输出；单 identity 或归档问题默认局部隔离 |
 | Human one-shot Decision | 最新有效 Intent/Task；授权和平台事实分离 | 外部事实可使旧决定 stale/terminal；默认 Task 或 SKU+action |
-| ShadowBot identity JSON | Executor 本地定位配置 | 与授权 mapping snapshot 校验但不成为业务 authority/fallback；系统性身份失真才可能 GQB-4 |
+| ShadowBot identity JSON | Executor 本地定位配置 | cutover 后从 Runtime mapping generation 生成/同步为 derived locator，绑定 generation/digest；部署只补 UI-only 字段，不成为业务 authority/fallback |
 
-`account_id` 必须由负责人/受控部署配置显式赋值，不能从 platform 名、profile、窗口标题、登录显示文本或 applet URI 推断。`platform_product_identity` 使用 adapter 定义的版本化 canonical JSON 与 SHA-256 digest；当前蚂蚁无稳定 ID 时可用规范化商品名+等级，online/waiting 页面位置和 UI selector 不进入公共身份。
+Configured target `account_id` 必须由负责人/受控部署配置显式赋值，不能从 platform 名、profile、窗口标题、登录显示文本或 applet URI 推断；Adapter/Executor/登录链另行提供 active session/account binding evidence。真实写前二者必须匹配，并与 internal SKU、platform product identity、authority/mapping generation 和 locator digest 一起绑定 authorization/execution evidence。无法证明或 mismatch 时按 GQB-4 阻止受影响账号全部新写，保留安全 READ_ONLY identity calibration/diagnostics，不记录凭据且不影响无关账号。`platform_product_identity` 使用 adapter 定义的版本化 canonical JSON 与 SHA-256 digest；当前蚂蚁无稳定 ID 时可用规范化商品名+等级，online/waiting 页面位置和 UI selector 不进入公共身份。
 
 ## 4. `a3485af` Selective Salvage Boundary
 
@@ -45,8 +45,8 @@
 | `RuntimeMasterDataRepository` read/compiler/snapshot/version | ADAPT | 复用职责与接口思路；按当前 main 的 additive schema、account identity 与 Product/Inventory 分离重写 |
 | `MasterDataManagementService` expected_version/idempotency/source digest/operator pattern | ADAPT | 保留并发与重放保护；删除 create-product 自动初始化 0 inventory，写前后读取及 actor/source 继续显式 |
 | `clean_runtime_cutover.py` preview/hash/backup/candidate verify/confirm/rollback guard | ADAPT | 复用步骤；只做 additive import/switch，不替换或清空 canonical Runtime |
-| `listing_scan_quality.py` run/batch/scope/end-marker/freshness/source/mapping checks | ADAPT | 扩成 account-aware 公共 contract 和结构化 reason codes；不自行产生 global blocker |
-| `listing_automation_runtime.py` Automation→READ_ONLY→Queue/Worker→evidence→ACK/Archive | ADAPT | 接当前 Queue/Importer 与 2B mapping snapshot；合法 retry/recovery 不被旧 batch 永久阻断 |
+| `listing_scan_quality.py` run/batch/scope/end-marker/freshness/source/mapping checks | ADAPT | 扩成 account-aware 公共 contract；按唯一 current qualified candidate 选取合法 retry，不以数据库物理 batch 数量判失败 |
+| `listing_automation_runtime.py` Automation→READ_ONLY→Queue/Worker→evidence→ACK/Archive | ADAPT | 拆分 Operating fact trust 与 Evidence delivery/archive health；局部 ACK/archive 失败不否定仍可验证的 immutable fact，接当前 Queue/Importer 与 2B mapping snapshot |
 | Master Data / Task Queue Read Model、Query、Presenter/UI | ADAPT | 复用展示资产；Current Queue 与 History 分开，UI 不成为责任 owner |
 | structured blocker context / notification presentation | ADAPT | 使用 2A category/scope/evidence/allowed-ops/release contract；重写 blanket policy |
 | `review_display.py` 展示边界翻译 reason/code 模式 | REUSE | 只在 Presenter 翻译；原始 reason/code 仍保留，不进入业务判定 |
@@ -67,16 +67,17 @@
 
 1. 不复用旧 migration number；在当前 main 最新 schema 之后 additive migration。
 2. 不删除或重建 #47～#50 的 Task/history/continuation/Review/observation/UNKNOWN/RM1 evidence。
-3. 新 master-data cutover 固定为：`backup → additive schema → import → shadow compare → explicit authority switch → Web/Automation/Authorization 同 gate 切读 → old source 退为 import/history`。
-4. 不允许 Web 读 SQLite、Authorization 读 Excel、Automation 再读另一份 source 的长期 split-brain。
+3. 新 master-data cutover 固定为：`backup → additive schema → import → shadow compare → 枚举全部正式 Runtime consumers → explicit authority switch → 全部正式 consumers 同 gate 切读 → old source 退为受控例外`。
+4. 2B 必须把 Product/Mapping direct reader 逐项标为 `CUTOVER` 或 `OFFLINE/IMPORT/EXPORT/DIAGNOSTIC EXCEPTION`；当前已知类别包括 Web/Manual Task、Authorization、Automation/Observation、Order mapping、Task generation，以及 Queue/Executor/Importer、Emergency、Workflow/business-rule evaluation 的实际依赖。切换后正式路径不得依赖旧 workbook 环境变量或隐式 fallback。
 5. 一个 platform/account 的 mapping 或 observation 问题默认不传播到其他 account/platform。
+6. rollback 必须恢复全部正式 consumers 到一个 authority；cutover 后若已有新的 authoritative mutation 或依赖新 mapping 的平台副作用，则禁止静默回到旧 authority，只能 forward correction 或负责人显式维护/re-cutover。
 
 ## 6. Open Decisions 已冻结
 
 1. **库存：`NOT_INITIALIZED`。** Product 创建不写库存；`0` 只来自独立、可审计、幂等的库存初始化事实。
 2. **Rules：继续 workbook authority。** Price/Listing 评估和 Task 绑定规范化规则集 digest、来源与加载时间；未来 DB 化另行 shadow/cutover。
-3. **Mapping：显式 account-aware identity。** `account_id` 由负责人/部署配置提供；唯一性为 platform/account/product identity digest + 有效期，canonical identity 不含 UI selector/page state。
-4. **Qualification：事实/质量输出，不是 blocker 决策。** 输出 contract/provider/capability version、quality codes、scope/pages/end marker、platform/account/product identity、mapping version、时间/freshness/fresh_until 与 run/batch/snapshot/manifest/result/evidence/ACK refs/digests；Authorization、Coordinator、Observation Health 各自按动作消费。
+3. **Mapping：显式 account-aware identity。** 配置的 target `account_id` 与 active session binding evidence 分层；写前必须匹配。唯一性为 platform/account/product identity digest + 有效期，canonical identity 不含 UI selector/page state；ShadowBot locator 从 authority generation 派生并绑定 digest。
+4. **Qualification：经营事实资格与证据交付健康分开。** Operating fact 输出 contract/provider/capability version、quality codes、scope/pages/end marker、platform/account/product identity、mapping version、时间/freshness/fresh_until 与 run/attempt/batch/snapshot/manifest/result/immutable-evidence refs/digests；ACK/archive/notification 单列 delivery health。局部 delivery 失败不否定仍可验证的事实；selector 允许历史 retry batch 并只选一个 current qualified candidate。Authorization、Coordinator、Observation Health 各自按动作消费。
 5. **GQB Proposal：治理触发、Workflow 第 6 节执行。** 除 GQB-1～4 外或扩大至无共享风险对象时先停工，按模板提交，未经 Owner/Reviewer 接受不得实现。
 
 ## 7. Deliverables
@@ -90,6 +91,9 @@
 
 - Authority Matrix 无双权威/隐式 fallback；
 - Product/Mapping、Rule、Inventory、Observation、Human Decision、ShadowBot identity 的角色不混淆；
+- Operating fact qualification 不被局部 ACK/archive health 机械否定，证据本身不可验证时仍 fail closed；
+- 合法 retry/recovery 可选出唯一 current qualified candidate，冲突候选 fail closed 且不合并；
+- Product/Mapping cutover 覆盖全部正式 Runtime consumers并登记离线例外；target account 与 active session binding 分层且写前匹配；
 - #51 的 Queue-OPS-01/02R/03/04 能根据合同判断最小 blocker scope；
 - `a3485af` 每项遗产有 `REUSE / ADAPT / REJECT / DEFER` 结论；
 - 不新建平行 Coordinator、Queue、Review 状态机或配置中心；
@@ -97,9 +101,9 @@
 
 ## 9. Downstream
 
-- Task 13.7-2B：在当前 latest schema 后新增 additive migration；Product 与 Mapping 分表/版本化，mapping 必含显式 `account_id` 与 canonical identity JSON/digest；Product create 不初始化库存；import 后逐项 shadow compare，显式切换 Web/Automation/Authorization，全链无 workbook fallback。
-- Task 13.7-2C：建立 account-aware qualification DTO/result；至少验证 scheduled run、唯一 batch、scope/pages/end marker、时间/freshness、mapping/capability snapshot、source manifest/result/evidence、ACK/archive；负面原因结构化；它不直接写 blocker，也不修改历史 execution result。
-- Task 13.7-2D：以本合同实现 Queue-OPS-01/02R/03/04；新决定先记录，Review action-scoped，Current Queue/History 分离；02R 只在 stopped boundary 后消费 2C qualified observation，关闭旧 one-shot 当前责任而保留 historical UNKNOWN；运行期 blocker 记录 category/scope/evidence/allowed recovery/release owner。
+- Task 13.7-2B：在当前 latest schema 后新增 additive migration；Product 与 Mapping 分表/版本化，mapping 必含 configured target `account_id` 与 canonical identity JSON/digest；Product create 不初始化库存；生成/同步绑定 generation/digest 的 ShadowBot locator；枚举全部生产 direct readers，逐项 `CUTOVER` 或登记离线例外，正式路径无 workbook fallback；rollback 遵守不可静默回退边界。
+- Task 13.7-2C：建立 account-aware qualification DTO/result；分开 Operating fact trust 与 Evidence delivery/archive health；selector 允许 FAILED/SUPERSEDED/retry/recovery 历史 batch，按 run/attempt/scope/completion/time/identity 选唯一 current candidate。验证“首次失败→retry 成功仍合格”、“两份冲突 current 候选 fail closed”、“事实合格但 ACK/archive 局部失败仍可用”和“交付失败导致 immutable evidence 不可验证则 fail closed”。它不直接写 blocker，也不修改历史 execution result。
+- Task 13.7-2D：以本合同实现 Queue-OPS-01/02R/03/04；新决定先记录，Review action-scoped，Current Queue/History 分离；02R 只在 stopped boundary 后消费 2C qualified observation，关闭旧 one-shot 当前责任而保留 historical UNKNOWN；写前核对 target account 与 session binding，mismatch 不发布；运行期 blocker 记录 category/scope/evidence/allowed recovery/release owner。
 - Exposure/Inventory 解耦（原 Queue-OPS-05）不放入本轮，随 Exposure/SET_ONLINE 后续切片处理。
 
 2B/2C 可以在 2A 接受后并行；2D 的 identity 最终接 2B，Queue-OPS-02R 最终接 2C。在依赖未到位时只允许接口替身或只读探索，不得以临时 fallback 冻结第二套 authority。

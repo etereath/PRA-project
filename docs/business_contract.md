@@ -569,16 +569,18 @@ PRA 将 Exposure 100 → 150，随后平台显示 142。
 
 | 对象 | 本轮合同接受时的 current authority | 目标 authority / 允许写入口 | 运行期读取、版本与历史边界 | 默认最大 blocker 作用域 |
 |---|---|---|---|---|
-| Product Master / internal SKU | `products.xlsx`；库存字段不再具有实物库存权威 | 13.7-2B 经显式 cutover 后为 Runtime DB；只允许版本化的管理 Service、受控 bootstrap/import 写入 | Web、Automation、Authorization 在 cutover gate 后统一读同一 DB snapshot/version；工作簿退为 import/export/history，不作隐式 fallback | 单 SKU 全动作；只有已证明的 Runtime 根本故障才可按 GQB-3 扩大 |
+| Product Master / internal SKU | `products.xlsx`；库存字段不再具有实物库存权威 | 13.7-2B 经显式 cutover 后为 Runtime DB；只允许版本化的管理 Service、受控 bootstrap/import 写入 | 全部正式 Runtime consumers 在 cutover gate 后统一读同一 DB snapshot/version；工作簿退为受控离线例外，不作隐式 fallback | 单 SKU 全动作；只有已证明的 Runtime 根本故障才可按 GQB-3 扩大 |
 | Platform Product Mapping | `platform_mappings.xlsx` 的编译结果 | 13.7-2B 经显式 cutover 后为 Runtime DB；只允许版本化管理 Service 或受控 import 写入 | 绑定 `platform_name + account_id + platform_product_identity + internal_sku`、status、半开有效期与 mapping snapshot digest；旧工作簿和 ShadowBot JSON 不作 fallback | 对应 platform/account 的具体 identity、候选 SKU 与 action；不得默认传播至整个平台或其他账号 |
 | Price Rules | `price_rules.xlsx` | 本阶段继续由既有 Web/受控文件入口写工作簿；不随 Product/Mapping 迁库 | 每次评估/生成 Task 绑定规范化规则集 digest、加载时间与来源；既有 Task 保留当时 digest，不被后改规则静默重解释 | 依赖该规则的 Task/SKU/action；单条规则损坏不是 Global Queue Blocker |
 | Listing Rules | `listing_rules.xlsx` | 本阶段继续由既有 Web/受控文件入口写工作簿；不随 Product/Mapping 迁库 | 与 Price Rules 相同；未来若迁 DB，必须另做 shadow compare 与 explicit cutover | 依赖该规则的 Task/SKU/action；不机械阻断人工风险降低动作 |
 | Physical Inventory | 既有 Runtime DB inventory ledger | 仅既有 Inventory Application / ledger 事务入口 | Product Master 不保存或复制 current balance；新增 SKU 的缺失余额表示 `NOT_INITIALIZED`，初始化和入库是独立、有 actor/source/idempotency 的库存事实 | 只阻断实际依赖实物库存的动作；不得无关阻断 UPDATE_PRICE |
 | Platform Observation | Runtime 中 immutable evidence；current projection 只是其派生当前视图 | READ_ONLY Adapter → Importer 写 immutable evidence；selector/qualification 只能派生，不改写原证据 | 每项 current fact 必须保留 provider、时间、scope、identity、mapping/capability version 与 source refs/digests；更新事实替换 current，不删除历史 | 缺失只阻断受影响 identity/action；platform/account 级 blindness 满足 GQB-2 时才可扩大 |
 | Human one-shot Decision | 最新有效、具 scope/TTL/完成条件的 Intent/Task 决定记录 | Human / Operations Web 先记录决定；final platform authorization 是后续独立动作 | 决定不是平台事实；外部变化或合格新观察可使旧决定 completed/stale/terminal，历史仍保留 | Task 或 SKU+action；已跨副作用边界时只保留收口所需最小锁 |
-| ShadowBot identity mapping JSON | 当前 Executor 的本地定位配置 | 只由部署/执行配置流程维护，并与已授权 mapping snapshot 校验 | 可含平台 UI 所需期望名称/等级/selector 资料；不得成为 Product/Mapping 业务 authority，也不得为其提供 fallback | 单目标 identity；只有系统性无法确认账号/目标或防止重复副作用时才可按 GQB-4 扩大 |
+| ShadowBot identity mapping JSON | 当前 Executor 的本地定位配置 | Product/Mapping cutover 后必须由 Runtime authority generation 生成/同步为 derived execution locator；部署流程只可补充 UI-only 定位字段 | artifact 必须绑定 authority/mapping generation、identity 与自身 digest；不得独立维护业务映射、成为 Product/Mapping authority 或提供 fallback | 单目标 identity；只有系统性无法确认账号/目标或防止重复副作用时才可按 GQB-4 扩大 |
 
-Product/Mapping cutover 顺序固定为：`backup → additive schema → import → shadow compare → explicit authority switch → Web/Automation/Authorization 同 gate 切读 → old source 退为 import/history`。回滚只能恢复一个明确 authority 及其全套读入口，不得让新旧源同时经营；历史 observation、Task、Review、continuation、UNKNOWN、receipt 和 inventory ledger 不删除。
+Product/Mapping cutover 顺序固定为：`backup → additive schema → import → shadow compare → 枚举全部正式 Runtime consumers → explicit authority switch → 全部正式 consumers 同 gate 切读 → old source 退为受控例外`。正式 consumers 指任何参与正常经营的 Product/Mapping 读取路径；当前已知类别包括 Web/Manual Task、Authorization、Automation/Product Observation、Order mapping、Task generation，以及 Queue/Executor/Importer、Emergency、Workflow、business-rule evaluation 中实际依赖这些事实的部分。2B 开工必须逐项把 direct reader 标为 `CUTOVER`，或标为不参与正常运行的 `OFFLINE/IMPORT/EXPORT/DIAGNOSTIC EXCEPTION`；切换后正式路径不得依赖 `PRA_PRODUCTS_WORKBOOK`、`PRA_PLATFORM_MAPPINGS_WORKBOOK` 或其它旧工作簿入口，也不得隐式 fallback。
+
+回滚只能把全部正式 consumers 恢复到一个已验证 authority；旧工作簿仅可用于显式 import/export、离线诊断、历史归档或 rollback 工具。cutover 后一旦发生新的 authoritative master-data mutation，或出现依赖新 mapping generation 的平台副作用，就跨过静默回退边界：不得把旧工作簿重新宣告为 current authority；必须采用 forward correction，或由负责人从显式维护/re-cutover 流程处理。历史 observation、Task、Review、continuation、UNKNOWN、receipt 和 inventory ledger 不删除。
 
 新增 Product Master 行不自动创建 `0` 库存。`0` 只能来自明确完成的库存初始化事实；尚无该事实时读模型显示 `NOT_INITIALIZED`，不能把缺行解释成 0，也不能由 Product 管理 Service 代写库存账本。停售只改变商品可销售状态，不抹除库存、mapping 或历史执行证据。
 
@@ -586,7 +588,9 @@ Price/Listing Rules 在 13.7-2B/2C/2D 期间继续保持工作簿 authority。�
 
 ### 23.2 Account 与平台商品身份
 
-`account_id` 是经营账号的稳定、非机密、显式标识，由负责人/受控部署配置为目标账号赋值并在 Product/Mapping cutover 前绑定；不得从 `platform_name`、窗口标题、`execution_profile`、登录显示文本或 applet URI 推断。当前单账号实现尚无该字段，不得用 platform 名伪造。缺少或无法核对 `account_id` 时，该账号写入 fail closed，但不阻断其他账号或 READ_ONLY 身份校准。
+`configured/target account_id` 是经营目标账号的稳定、非机密、显式标识，由负责人/受控部署配置在 Product/Mapping cutover 前赋值；不得从 `platform_name`、窗口标题、`execution_profile`、登录显示文本或 applet URI 推断。当前单账号实现尚无该字段，不得用 platform 名伪造，也不得把“当前只有一个账号”当作实际会话证明。
+
+`active session/account binding evidence` 是 Adapter/Executor/受控部署登录链对当前平台会话属于哪个账号的可验证证明，与 target account 配置是两个对象。真实写发布前两者必须匹配；authorization/execution identity evidence 必须绑定 `platform_name + target account_id + internal_sku + platform_product_identity + authority/mapping generation + locator artifact digest + session binding ref/digest`。公共 evidence 只保留非敏感 ref/digest 与判定，不记录凭据、完整登录材料或敏感账号数据。无法证明 session binding 或发现 mismatch 时，按 GQB-4 阻止受影响 platform/account 的全部新写（包括可能写错目标的 SET_OFFLINE），但保留安全的 READ_ONLY identity calibration/diagnostics，且不得冻结无关账号。
 
 Mapping 的当前唯一性按 `(platform_name, account_id, platform_product_identity_digest, effective interval)` 判断；同一时点一个平台商品 identity 最多 VERIFIED 到一个 `internal_sku`，一个 SKU 可以对应多个不同平台商品。有效期采用 `[effective_from, effective_to)`；`VERIFIED` 指向唯一 SKU，`UNMAPPED` 不指向 SKU，`AMBIGUOUS` 只保存候选集合且不得授权写，`DISABLED` 不参与当前解析。
 
@@ -594,13 +598,19 @@ Mapping 的当前唯一性按 `(platform_name, account_id, platform_product_iden
 
 ### 23.3 Qualified Observation 公共合同
 
-Qualification 只回答“这份当前观察在什么范围和时点是否足以作为经营事实”，不直接决定 blocker。输出至少包含：
+Qualification 只回答“这份当前观察在什么范围和时点是否足以作为经营事实”，不直接决定 blocker。同一结构化结果必须分开表达两组维度：
 
-- contract/provider/capability version，`qualified` 与结构化 quality reason codes；
+**Operating fact qualification** 至少包含：
+
+- contract/provider/capability version，`operating_fact_qualified` 与结构化 fact quality reason codes；
 - `platform_name`、`account_id`、覆盖 scope/pages/end marker，以及逐项 platform identity digest、mapping status/internal SKU；
 - observed/completed/evaluated time、expected cadence 或 max age、`fresh_until`，明确 future/stale 判定；
-- automation run、observation batch、source snapshot、manifest/result/evidence、mapping snapshot 的 refs/digests，以及 ACK/archive 完整性；
-- 完整性、唯一性、scope、identity、freshness、来源链各维度结果。负面结果同样保留具体失败维度，不压成一个自由文本原因。
+- automation run/attempt、observation batch、source snapshot、manifest/result/immutable evidence、mapping snapshot 的 refs/digests；
+- 内容完整性、scope、identity、freshness 与 source-integrity 各维度结果。负面结果同样保留具体失败维度，不压成一个自由文本原因。
+
+**Evidence delivery / archive health** 单独包含 ACK、archive、通知或后续证据保管状态及结构化 health codes。Importer 已接受的 immutable observation 若在 identity、scope、completeness、time、content/source digest 上仍可验证，后续 ACK/archive 局部失败不得仅凭自身把 `operating_fact_qualified` 改为 false，也不得单独触发 GQB-2；它可以形成局部 incident/health degradation。只有交付/归档故障实际使 observation identity、内容摘要、来源绑定或不可变证据本身无法验证时，Operating fact 才 fail closed。
+
+同一 job/run/经营范围可以存在历史 FAILED、SUPERSEDED、retry 或 Recovery batch。Selector 必须依据正式 run/attempt、scope、terminal completion、时间和 identity 选出唯一 current qualified candidate；首次失败后合法 retry 成功可以成为 current fact。只有多份候选同时满足 current 资格且无法唯一选择时才以 ambiguous/unqualified fail closed；不得把多个 batch 相加、拼接或静默合并成一个事实。
 
 Qualification 不修改 immutable observation，也不把成功 READ_ONLY 解释为历史写入结果。Authorization 对新写、Coordinator 对 continuation/UNKNOWN、Observation Health 对 provider/account health，分别消费同一 qualification 输出并按动作风险决定最小 blocker；Review 继续使用既有 action-scoped 语义，不新增平行状态机或全局 blocker 服务。
 
@@ -628,8 +638,8 @@ Current write eligibility = RELEASED
 - **GQB-1 Platform-level Critical Business Risk**：已证明存在无法缩小到具体 SKU 的账号级严重经营风险；
 - **GQB-2 Observation Blindness**：账号级关键当前事实无法由主 Provider 或可信 fallback 获得，继续风险增加写会失去可靠事实基础；
 - **GQB-3 Critical Control Plane Failure**：Runtime、Authorization、Coordinator、Queue/Importer 无法可靠持久化、恢复或确认执行责任；
-- **GQB-4 Side-effect / Identity Integrity Failure**：无法确认正确账号/商品、授权/manifest/request/checksum 身份或唯一副作用边界。
+- **GQB-4 Side-effect / Identity Integrity Failure**：无法确认 target account 与 active session、正确商品、authority/mapping generation、locator artifact、授权/manifest/request/checksum 身份或唯一副作用边界。
 
-Global blocker 默认只阻止新的风险增加型写，不得机械关闭 READ_ONLY Observation、Recovery Calibration、唯一 RECONCILE、Health/diagnostics、必要人工核验或已证明安全的恢复操作。一个 platform/account 的 blocker 默认不得传播到其他平台；只有共享的 GQB-3/GQB-4 且无法隔离时才可升级 cross-platform。
+Global blocker 默认只阻止新的风险增加型写，不得机械关闭 READ_ONLY Observation、Recovery Calibration、唯一 RECONCILE、Health/diagnostics、必要人工核验或已证明安全的恢复操作。GQB-2 下，身份和目标范围仍可证明的人工风险降低写可以经额外确认沿既有授权链执行；GQB-4 的账号/商品 identity 无法证明时，任何可能写错目标的平台写（包括 SET_OFFLINE）都必须停止，仅保留不增加副作用风险的 identity calibration/diagnostics。一个 platform/account 的 blocker 默认不得传播到其他平台；只有共享的 GQB-3/GQB-4 且无法隔离时才可升级 cross-platform。
 
 运行期 blocker 必须保存 category、evidence refs、精确受影响范围、被阻止与仍允许的 operations、owner、自动释放条件和人工恢复路径。新增 GQB-5 或扩大到无共享风险的 SKU/action/READ_ONLY 前，开发者必须停止实现并按开发流程提交 Global Queue Blocker Proposal，未经 Owner/Reviewer 明确接受不得施工。
