@@ -141,6 +141,45 @@ def test_scope_options_and_multiselect_preview_use_verified_runtime_facts(
     assert all(item.price_fact_version.startswith("sha256:") for item in preview.items)
 
 
+def test_price_preview_accepts_old_observation_but_requires_original_price(
+    manual_service,
+    monkeypatch,
+) -> None:
+    service, repository, _, _ = manual_service
+    service.clock = lambda: NOW + timedelta(hours=2)
+    request = ManualTaskRequest(
+        varieties=("艾莎",),
+        grades=("A级",),
+        platforms=(PLATFORM,),
+        action=SET_PRICE,
+        price_value=Decimal("13"),
+    )
+
+    stale_preview = service.preview(request)
+
+    assert stale_preview.creatable is True
+    assert stale_preview.items[0].current_price == Decimal("12.00")
+    listing = repository.get_listing_status(PLATFORM, "艾莎", "A级")
+    assert listing is not None
+    monkeypatch.setattr(
+        repository,
+        "get_listing_status",
+        lambda *_args, **_kwargs: replace(
+            listing,
+            current_price=None,
+            price_observed_at=None,
+            price_source_attempt_id=None,
+        ),
+    )
+
+    missing_preview = service.preview(request)
+
+    assert missing_preview.creatable is False
+    assert missing_preview.items[0].blockers == (
+        "缺少原价格，请先读取平台价格。",
+    )
+
+
 def test_negative_delta_creates_exact_manual_tasks_without_queue_side_effect(
     manual_service,
     tmp_path: Path,

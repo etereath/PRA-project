@@ -481,7 +481,7 @@ Runtime DB READ_ONLY 验收零写。
 
 1. 品种/等级/平台多选和有效商品展开；
 2. 调整价格到、加/降价、下架、上架+平台目标库存；
-3. 逐项预览、排除、最低成本、价格新鲜度、映射和冲突校验；
+3. 逐项预览、排除、最低成本、原价格可用性、映射和冲突校验；
 4. 创建 Task 与提交执行两个后台阶段；
 5. 6.3 的 Execution Authorization Application Service、`SUBMIT_EXECUTION`、精确 task IDs、
    digest、批次重检、优先队列和既有 v4/v5 提交；

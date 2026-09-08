@@ -44,6 +44,7 @@ from app.utils import utc_now
 
 
 AUTHORIZATION_TTL = timedelta(minutes=10)
+NO_WRITE_RESOLUTION_MAX_AGE = timedelta(minutes=30)
 MAX_PREPARATIONS = 512
 CONTRACT_VERSION = "task13.7-1-execution-authorization-1.0"
 
@@ -97,10 +98,23 @@ class _StoredPreparation:
     state: str = "PREPARED"
 
 
-def _resolution_only(facts) -> bool:
+def _resolution_only(facts, current: datetime) -> bool:
     if facts['action_type'] != TaskActionType.UPDATE_PRICE.value:
         return False
-    satisfied = [Decimal(item['listing_price']) == Decimal(item['target_price']) for item in facts['items']]
+    satisfied = []
+    for item in facts['items']:
+        observed_at = _parse_datetime(item.get('listing_price_observed_at'))
+        observation_is_qualified = (
+            observed_at is not None
+            and bool(item.get('listing_price_source_attempt_id'))
+            and timedelta(0)
+            <= current - _aware_utc(observed_at)
+            <= NO_WRITE_RESOLUTION_MAX_AGE
+        )
+        satisfied.append(
+            observation_is_qualified
+            and Decimal(item['listing_price']) == Decimal(item['target_price'])
+        )
     if any(satisfied) and not all(satisfied):
         raise ExecutionAuthorizationConflict('所选商品仅部分达到目标价，请分别选择已满足和仍需改价的任务重新确认。')
     return all(satisfied)
@@ -180,7 +194,7 @@ class ExecutionAuthorizationApplicationService:
 
         self._refresh_correction(task_ids, authenticated_principal.subject, current)
         facts = self._revalidate(task_ids, current, allow_already_applied=True)
-        resolution_only = _resolution_only(facts)
+        resolution_only = _resolution_only(facts, current)
         action_type = TaskActionType(str(facts["action_type"]))
         batch_id = _batch_id(
             authenticated_principal.subject,
@@ -292,7 +306,7 @@ class ExecutionAuthorizationApplicationService:
 
         try:
             facts = self._revalidate(task_ids, current, allow_already_applied=True)
-            resolution_only = _resolution_only(facts)
+            resolution_only = _resolution_only(facts, current)
             action_type = public.action_type
             if str(facts["action_type"]) != action_type.value:
                 raise ExecutionAuthorizationConflict("任务动作在确认前发生变化。")
@@ -627,10 +641,14 @@ class ExecutionAuthorizationApplicationService:
                     raise ExecutionAuthorizationConflict(f"缺少商品 {sku} 的最新平台状态。")
                 expected_old = _optional_decimal(row["expected_old_price"])
                 if action_type is TaskActionType.UPDATE_PRICE:
-                    observed_at = listing.price_observed_at
-                    if (observed_at is None or not listing.price_source_attempt_id
-                            or not timedelta(0) <= current - _aware_utc(observed_at) <= timedelta(minutes=30)):
-                        raise ExecutionAuthorizationConflict("平台价格观察已过期，请先刷新平台事实。")
+                    if expected_old is None:
+                        raise ExecutionAuthorizationConflict(
+                            "任务缺少原价格，请重新创建任务。"
+                        )
+                    if listing.current_price is None:
+                        raise ExecutionAuthorizationConflict(
+                            "平台原价格缺失，请先读取平台价格。"
+                        )
                     if str(listing.online_status).lower() != 'online':
                         raise ExecutionAuthorizationConflict("商品当前未上架，请重新决定。")
                 if (
@@ -728,9 +746,7 @@ class ExecutionAuthorizationApplicationService:
                     continue
                 listing = self.runtime.get_listing_status(row['platform_name'],
                     identity['expected_product_name'], identity['expected_grade'])
-                if (listing is None or listing.current_price is None or not listing.price_source_attempt_id
-                        or listing.price_observed_at is None
-                        or not timedelta(0) <= current - _aware_utc(listing.price_observed_at) <= timedelta(minutes=30)):
+                if listing is None or listing.current_price is None:
                     continue
                 if _optional_decimal(row['expected_old_price']) == listing.current_price:
                     continue

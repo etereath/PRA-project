@@ -432,7 +432,7 @@ Stage Goal = NOT YET VALIDATED
 
 结果 `RESULT-981becdc0aada27dfd870fac`、result SHA-256 `79a97ec04e2257ace67e6148a4c4575db3c21d9170b530fc8d4b68c92304afe5` 已由 Importer 以 `WRITTEN` receipt 接受并完成 Archive；对应 write lock 已按失败路径释放。收尾时 open continuation、active attempt 和 active write lock 均为 0，正式 Queue 的 `inbox/working/results` 均为 0，Runtime v18 health 继续通过；Worker 已停止，Queue Service 保持运行。本次授权只允许一个真实写尝试，失败后没有自动重试。
 
-现场同时暴露一项控制面语义缺陷：continuation 被标为 `COMPLETE / 执行链已收口`，但 Task 正确保留 `pending`、operation 保持 `PENDING / UNRESOLVED`，Web 又显示“当前责任方：人工 / 已收口”，且没有直接展示上述预检失败原因。这里的 `COMPLETE` 只能表示本次授权执行链生命周期已结束，不能表示业务成功或 Task 已终结。后续修复必须同时覆盖旧 v4 商品行价格解析和失败后的 Task / continuation / Web 责任状态表达；修复与定向回归完成后，如需再次执行真实平台写，必须由负责人重新指定当时新鲜旧价格、目标价格并重新授权。
+现场同时暴露一项控制面语义缺陷：continuation 被标为 `COMPLETE / 执行链已收口`，但 Task 正确保留 `pending`、operation 保持 `PENDING / UNRESOLVED`，Web 又显示“当前责任方：人工 / 已收口”，且没有直接展示上述预检失败原因。这里的 `COMPLETE` 只能表示本次授权执行链生命周期已结束，不能表示业务成功或 Task 已终结。后续修复必须同时覆盖旧 v4 商品行价格解析和失败后的 Task / continuation / Web 责任状态表达；修复与定向回归完成后，如需再次执行真实平台写，必须由负责人重新确认目标价格并重新授权。
 
 ```text
 RM1-B AUTHORIZED ATTEMPT = EXECUTED ONCE
@@ -456,10 +456,16 @@ Stage Goal = NOT YET VALIDATED
 
 最小修复只调整 v4 COMMIT 的批次预检：`_commit_v4_prepare_product_list()` 不再复用未经筛选证明的当前商品页，而是重新进入商品管理并显式选择“上架中”，两次确认列表就绪后才读取上架中价格。单个 batch 仍只做一次完整预检，后续 item 继续复用已验证的同一窗口，不改变最终提交、写前旧价比较、UNKNOWN 或锁语义。新增回归门禁证明 v4 预检固定传入 `reuse_requested=False`；既有刷新测试继续证明选择“上架中”发生在列表就绪判断之前。
 
-定向测试 `111 passed`，覆盖 Human price journey、v4 commit pipeline / orchestration / success baseline、商品列表刷新、Executor 和 commit batch。Worker 保持 `STOPPED`；修复已通过正式同步脚本部署到 `test2`，二次 `--check` 的 7 个受控文件均为 `CURRENT`，部署验证 PASS。该修复和部署没有投递 Queue，没有执行真实平台 READ_ONLY 或 WRITE，也没有消费新的平台写授权。再次 RM1-B 前仍须取得新鲜旧价格并由负责人重新授权。
+定向测试 `111 passed`，覆盖 Human price journey、v4 commit pipeline / orchestration / success baseline、商品列表刷新、Executor 和 commit batch。Worker 保持 `STOPPED`；修复已通过正式同步脚本部署到 `test2`，二次 `--check` 的 7 个受控文件均为 `CURRENT`，部署验证 PASS。该修复和部署没有投递 Queue，没有执行真实平台 READ_ONLY 或 WRITE，也没有消费新的平台写授权。再次 RM1-B 前仍须由负责人重新授权。
 
 ### RM1-B 失败后的 Web 责任状态修复
 
 Operations Web 原先把 continuation 的 `COMPLETE` 直接显示为“人工 / 已收口”，混淆了“本次授权执行生命周期结束”和“业务任务成功完成”。现已改为联合读取 Task、batch、item、是否提交及副作用状态：对于本次 `Task=pending / batch=FAILED / item=NOT_ATTEMPTED / submit_attempted=false / side_effect_state=NOT_STARTED`，页面显示“待重新处理”，结果说明“执行准备阶段未完成；平台价格未开始修改”，当前责任方显示“管理员 / 待重新处理”。底层 Task 与历史执行事实均未改写，也未重新打开旧 continuation。
 
 本次旧结果的顶层 `OLD_PRICE_PARSE_FAILED` 没有被当时的 Importer 投影到 item 错误字段，因此 Web 不从已归档 Queue 文件反向拼接 Runtime 真值，也不把本报告中的人工诊断伪装成数据库事实；页面仅按 Runtime 可证明的阶段给出上述说明。合成用例同时覆盖错误码已持久化时显示“无法读取当前供货价格”，并确保原始页面文本不直接暴露给运营页面。Operations Web read model、相邻 Web 基础与完整 Human price journey 合计 `89 passed`；当前真实 Runtime 只读投影复核通过。Web 已重启，Worker 仍保持 `STOPPED`，本次没有执行平台 READ_ONLY 或 WRITE。
+
+### 人工改价价格新鲜度门禁更正
+
+第一次创建 RM1-B Task 前，Operations Web 确实因 14:17 的价格观察超过 30 分钟而阻断预览，随后才在 16:38:10 重新读取 `10.80`。该时间线保留为旧规则下的历史事实。现场复盘后确认，固定 30 分钟价格新鲜度不应成为人工改价创建或授权门禁：已有原价格用于形成 `expected_old_price`，真正执行时 v4 会重新读取商品页并在写前逐项比对，价格不一致即以零写停止，写后仍回读验证。
+
+因此当前规则改为：人工 `UPDATE_PRICE` 只有原价格缺失时才因价格事实阻断；观察时间与来源继续进入摘要和审计，但不以距今时长拒绝创建、授权或失败后 correction 的原价重绑定。上下架状态、映射、授权、锁、未决 operation 和其他既有门禁保持不变。本次仅完成代码、合同与合成回归修复，没有执行真实平台 READ_ONLY 或 WRITE，也没有消费新的写授权。

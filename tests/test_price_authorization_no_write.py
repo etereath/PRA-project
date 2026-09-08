@@ -11,10 +11,18 @@ import pytest
 from app.enums import TaskActionType, TaskStatus
 from app.exceptions import ValidationError
 from app.services.execution_authorization import ExecutionAuthorizationConflict
-from tests.test_human_price_journey import journey, decide, accept, rebuild, run_cycle, seed
+from tests.test_human_price_journey import (
+    accept,
+    decide,
+    rebuild,
+    run_cycle,
+    seed,
+)
 from tests.test_operations_web_foundation import call_app, header_values
 from tests.test_price_execution_resolution import web
 
+
+pytest_plugins = ("tests.test_human_price_journey",)
 
 def observe(j, price='13'):
     seed._listing(j.runtime, 'AISHA-A-50-Z', 'A级', Decimal(price), 'online')
@@ -131,7 +139,7 @@ def test_close_confirmation_cannot_authorize_a_later_price_change(journey, new_p
 
 
 @pytest.mark.parametrize('missing_source', [False, True])
-def test_already_target_still_requires_fresh_sourced_observation(journey, missing_source):
+def test_unqualified_target_price_uses_live_execution_instead_of_blocking(journey, missing_source):
     j = journey
     task = decide(j)
     observe(j)
@@ -141,9 +149,14 @@ def test_already_target_still_requires_fresh_sourced_observation(journey, missin
         else:
             connection.execute('UPDATE listing_status SET price_observed_at = ?',
                                ((seed.NOW - timedelta(days=1)).isoformat(),))
-    with pytest.raises(ExecutionAuthorizationConflict):
-        prepare(j, task)
-    assert_no_write(j)
+    prepared = j.service.prepare_execution(seed._admin(), [task], 'unqualified-target')
+    assert prepared.resolution_only is False
+    submitted = j.service.submit_execution(
+        seed._admin(), [task], prepared.confirmation_digest, 'unqualified-target')
+    assert submitted.batch_id
+    continuation = j.service.continuations.active()[0]
+    assert json.loads(continuation['envelope_json'])['resolution_only'] is False
+    assert not list(j.service.queue_root.glob('inbox/*.ready.json'))
 
 
 def test_mixed_satisfaction_requires_explicit_separate_selection(journey):
