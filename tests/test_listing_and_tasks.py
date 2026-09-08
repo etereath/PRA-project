@@ -172,6 +172,11 @@ class ListingAndTaskTests(unittest.TestCase):
                     TaskActionType.SET_OFFLINE,
                     "当前商品未上架，无需重复下架",
                 ),
+                (
+                    "SKU-OFFLINE",
+                    TaskActionType.UPDATE_PRICE,
+                    "当前商品未上架，改价任务已忽略",
+                ),
             },
         )
 
@@ -262,6 +267,32 @@ class ListingAndTaskTests(unittest.TestCase):
             },
         )
         self.assertEqual(ignored, [])
+
+    def test_uninitialized_inventory_does_not_blanket_block_price_task(self) -> None:
+        generator = TaskGenerationService(
+            pricing_service=PricingService(ai_provider=NullAISuggestionProvider()),
+            listing_service=ListingService(),
+        )
+        product = Product(
+            internal_sku="SKU-NOT-INITIALIZED",
+            product_name="new product",
+            grade="A",
+            stem_length="60cm",
+            unit="bundle",
+            base_cost=Decimal("10"),
+            current_stock=None,
+            sale_enabled=True,
+        )
+
+        tasks = generator.generate(
+            [product],
+            self.price_rules,
+            [],
+            platform_name="测试平台",
+        )
+
+        self.assertEqual(len(tasks), 1)
+        self.assertIs(tasks[0].action_type, TaskActionType.UPDATE_PRICE)
 
     def test_set_online_reads_latest_platform_price_and_inventory(self) -> None:
         generator = TaskGenerationService(

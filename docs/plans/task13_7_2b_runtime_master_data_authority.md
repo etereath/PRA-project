@@ -6,15 +6,20 @@
 
 本任务不是恢复旧 7F/7G，也不整体 cherry-pick。当前执行/恢复基线始终以 `main` 上 #47～#50 为准。
 
-## 2. Dependency Gate
+## 2. Dependency Gate 与开工基线
 
-开始实现前必须读取并服从 Task 13.7-2A 最终接受版本。若 2A 尚未冻结以下内容，只允许做只读探索和兼容性分析，不得先写 Schema：
+Task 13.7-2A 已由负责人/Reviewer 接受并合入 `main`；本任务的开工基线为
+`a2a0b65d355fe35809f874baed6e7624f732f904`。以下已冻结内容是 2B 的实现输入，
+不是本任务可重新解释的待决项：
 
 - Product Master current authority；
 - Mapping identity（至少 `platform_name + account_id + platform_product_identity + internal_sku`）；
 - 新 SKU 与 inventory 未初始化的语义；
 - Price Rules / Listing Rules 是否仍保持 workbook authority；
 - authority cutover / rollback 规则。
+
+2B 只在临时/测试 Runtime 上实施和验证。本任务不授权真实 Runtime authority
+cutover、部署或平台写。
 
 ## 3. Legacy Assets to Salvage
 
@@ -36,6 +41,19 @@
   - Product Master / Product Mapping Read Model、Query、Presenter/UI，可按当前 Web 架构抽取。
 
 ## 4. Required Adaptations
+
+### 4.0 Selective-salvage 决定
+
+| `a3485af` 资产 | 决定 | 当前实现 |
+|---|---|---|
+| `RuntimeMasterDataRepository`、snapshot digest、DB rows → compiler | `ADAPTED` | 按当前 v19 schema、`account_id`、canonical identity、库存 `NOT_INITIALIZED` 和现役 compiler 重写；未复制旧 migration number |
+| Management Service 的 expected version、idempotency、source digest、四态 mapping | `ADAPTED` | 保留事务语义，补充 authority generation、append-only event、rollback irreversible boundary；Product 写不创建库存余额 |
+| `clean_runtime_cutover.py` 的 preview/hash/confirmation/rollback guard | `ADAPTED` | 新增 `runtime_master_data_cutover.py`，对当前 Runtime 做 additive import、shadow compare 与显式 authority switch，不替换整库 |
+| 旧 Operations Web Product/Mapping read model | `ADAPTED` | 现役 Query 通过统一 provider 读取 Product 与 account-scoped Mapping；未恢复旧 Web composition |
+| 旧 migration number、空 candidate 整库替换、旧 7F/7G daemon/dispatcher | `REJECTED` | 与当前 v18 continuation、Task/Review/UNKNOWN/恢复账本边界冲突 |
+| 旧 Product workbook 库存字段进入 Product Master | `REJECTED` | 库存继续只由 inventory ledger 权威；缺余额显示 `NOT_INITIALIZED` |
+
+本任务没有可逐字复制且无需适配的遗产资产，因此没有标记为 `REUSED` 的条目。
 
 ### 4.1 Schema
 
@@ -59,7 +77,12 @@ Web / Manual Task / Authorization / Automation / Observation / Order mapping
 - 正式运行期 Product/Mapping 不再直接读取 `products.xlsx` / `platform_mappings.xlsx`。
 - Excel 可以保留为一次性 bootstrap、批量导入/导出或人工维护辅助，但不能与 Runtime DB 同时成为运行 authority。
 - `price_rules.xlsx` / `listing_rules.xlsx` 除非 2A 明确裁决，否则本任务不迁移、不扩张施工。
-- ShadowBot `product_identity_mapping.json` 继续只作为执行定位配置与 hash gate，不成为业务 Product/Mapping authority。
+- ShadowBot `product_identity_mapping.json` 在 cutover 后只能由 Runtime mapping
+  generation 生成/同步为 derived locator artifact；部署流程只可补充 UI-only
+  locator 字段。artifact 必须绑定 authority generation、mapping digest 和自身
+  digest，不能独立维护业务映射、成为 authority 或提供 fallback。
+  当前派生文件额外保存 `artifact_payload_sha256`，执行授权同时核对文件字节
+  digest；同一账号若无法生成唯一平台/SKU locator，则 fail closed，不猜测目标。
 
 ### 4.3 Cutover
 
@@ -74,25 +97,47 @@ backup current Runtime
 → validate hashes / mapping compile / identity uniqueness
 → shadow compare with current Excel-derived behavior
 → explicit owner cutover
-→ Web + Manual Task + Authorization + Automation + Observation 同 gate 切读
+→ 全部正式 Runtime consumers 同 gate 切读
 → Excel runtime reads disabled
 ```
 
 允许使用 current Runtime 的离线副本做 dry-run；最终不得丢失 #47～#50 已有 Task/history/Review/continuation/UNKNOWN/observation/RM1 evidence。
 
-## 5. Runtime Consumers to Migrate
+rollback 只允许让全部正式 consumers 原子恢复到同一个已验证 authority。cutover
+后若已经发生新的 authoritative Product/Mapping mutation，或发生依赖新 mapping
+的真实平台副作用，禁止静默回退到旧工作簿；此时只能 forward correction，或由
+负责人执行显式 maintenance/re-cutover。任何回退都不得删除新 evidence、历史
+generation 或 continuation。
 
-至少审计并迁移以下正式消费者，禁止遗漏后形成 split-brain：
+## 5. Direct-reader Inventory 与切源处置
 
-- Operations Web 商品/映射展示；
-- ManualTaskApplicationService 的 product/mapping scope 与 preview；
-- ExecutionAuthorization 的 product cost / mapping revalidation；
-- Product Observation / Order Observation mapping compiler；
-- Automation listing/order handlers；
-- emergency protection 中需要的 base cost snapshot；
-- ShadowBot READ_ONLY target 生成中由 Product Master 提供的业务身份。
+下表冻结写 Schema 前完成的 direct-reader inventory。`CUTOVER` 表示必须经同一个
+Runtime authority gate 读取 DB snapshot/version；`EXCEPTION` 只允许在正常经营
+路径之外显式调用，且不得成为 fallback。
 
-每个消费者迁移后应能证明正式运行路径不再读取两个业务 workbook。
+| 当前路径 / consumer | 当前 source | 处置 | 目标与理由 |
+|---|---|---|---|
+| `app/operations_web/queries.py` 商品、库存选择与系统健康 | `products.xlsx` + Inventory Provider | `CUTOVER` | Product 读 Runtime snapshot；库存仍由 ledger hydrate，缺余额显示 `NOT_INITIALIZED` |
+| `app/operations_web/app.py` Manual Task、Authorization、Review composition | Product/Mapping workbook path | `CUTOVER` | 统一注入 Runtime master-data provider，不允许各服务自行选 source |
+| `ManualTaskApplicationService` scope/preview/create | `products.xlsx` + `platform_mappings.xlsx` | `CUTOVER` | preview 和 create 绑定同一 authority generation/product digest/mapping digest |
+| `ExecutionAuthorizationApplicationService` cost/mapping revalidation | 两个 workbook + locator JSON | `CUTOVER` | 写发布前重读 Runtime generation；locator 仅作绑定该 generation 的派生 artifact |
+| `ReviewResolutionApplicationService`、`workflow.resolve_mobile_review`、Emergency authorization/shadow | `products.xlsx` base cost | `CUTOVER` | base-cost snapshot 改读 Runtime Product，并保留 source ref/digest |
+| `workflow.py`、`DailyTaskGenerationAutomationHandler`、`business_rule_evaluation.py` | `products.xlsx`；Price/Listing Rule workbook | `CUTOVER` | Product 改读 Runtime；Price/Listing Rule 保持 workbook authority，输入 manifest 分别绑定 digest |
+| `order_automation_runtime.py` → Order Observation/Importer | `platform_mappings.xlsx` compiler | `CUTOVER` | provider 改读 account-scoped Runtime mapping snapshot |
+| Product Observation / Order Observation / Task generation | 上游传入的 compiled workbook mapping | `CUTOVER` | 消费并持久绑定 Runtime mapping generation/digest，不自行回读 workbook |
+| `shadowbot_product_read.py`、`ShadowBotExecutor` READ_ONLY target 生成 | `products.xlsx` | `CUTOVER` | target 来自 Runtime Product/Mapping identity；必须显式 target `account_id` |
+| `ShadowBotResultImporter` identity resolution | `products.xlsx` | `CUTOVER` | 导入按请求绑定的 Runtime mapping generation 解析；不得按名称猜测新 authority |
+| `shadowbot_commit_batch.py` / Queue / Executor locator 读取 | `product_identity_mapping.json` 或历史 Product workbook | `CUTOVER` | JSON 改为 Runtime generation 派生 artifact并校验绑定；它不是 authority |
+| `run_automation_service.py`、`run_shadowbot_queue_services.py` | CLI/env 注入两个 workbook | `CUTOVER` | 正式 service composition 只用 Runtime gate；cutover 后忽略旧 Product/Mapping env |
+| `product_inventory_input.py`、`platform_mapping_input.py`、`workbook_repository.py` | workbook 维护 | `OFFLINE/IMPORT/EXPORT EXCEPTION` | 保留 legacy workbook parser 供受控 import/export；正常 Web 写走版本化管理 Service，Product 写不代写 inventory |
+| `compile_product_mappings.py`、`bootstrap_authoritative_inventory.py`、`clean_runtime_cutover.py` | 明确传入的离线文件 | `OFFLINE/IMPORT/DIAGNOSTIC EXCEPTION` | 只用于 preview/bootstrap/shadow compare/cutover；命令必须显式 source/hash/confirmation |
+| `evaluate_business_rules.py` 与 CLI 的文件校验/预览命令 | 明确传入的 workbook | `OFFLINE/DIAGNOSTIC EXCEPTION` | 不作为 daemon/Web/授权路径；结果不得冒充 cutover 后 Runtime authority |
+| `run_e2e_flow_tests.py`、`run_system_smoke_tests.py`、`verify_operations_web_readonly.py` 及测试 fixtures | 临时 workbook | `OFFLINE/DIAGNOSTIC EXCEPTION` | 仅测试/验收夹具；正式运行路径独立证明不读旧 workbook env |
+
+已知正式类别 Web/Manual Task、Authorization、Automation/Product Observation、Order
+mapping、Task generation、Queue/Executor/Importer、Emergency、Workflow 和
+business-rule evaluation 均已登记。实现中若发现新的正常经营 direct reader，必须先
+补入本表并分类，不能通过隐式 fallback 兼容。
 
 ## 6. Explicit Non-goals / Rejects
 
@@ -117,6 +162,10 @@ backup current Runtime
 7. shadow compare 能证明 cutover 前后相同输入得到相同 Product/Mapping 业务解释；
 8. rollback 只切 authority/read path，不删除新 evidence；
 9. Windows/Linux Core CI green。
+
+本地定向验证只使用临时 Runtime；真实 authority switch、部署、平台写和完整 CI 仍需
+分别授权。`runtime_master_data_cutover.py` 的 `--runtime-db` 无默认值，import 必须复用
+preview digest，cutover/rollback 必须提供固定确认文本。
 
 ## 8. Deliverables
 

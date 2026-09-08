@@ -7,6 +7,7 @@ from decimal import Decimal
 from uuid import uuid4
 
 from app.enums import TaskActionType, TaskOriginType, TaskStatus, TradePhase
+from app.exceptions import ValidationError
 from app.listing_identity import listing_identity_key
 from app.models import (
     ColdStorageStatus,
@@ -131,7 +132,6 @@ class TaskGenerationService:
             if (
                 generate_price_tasks
                 and product.sale_enabled
-                and product.current_stock > 0
             ):
                 matched_price_rule_ids = [
                     rule.rule_id
@@ -183,6 +183,13 @@ class TaskGenerationService:
 
             if listing_action:
                 action_type = TaskActionType(listing_action)
+                if (
+                    action_type is TaskActionType.SET_ONLINE
+                    and product.current_stock is None
+                ):
+                    raise ValidationError(
+                        f"商品 {product.internal_sku} 的库存尚未初始化，不能生成上架任务。"
+                    )
                 if not self._listing_state_allows_action(
                     action_type,
                     current_listing_state,

@@ -20,7 +20,9 @@ from app.exceptions import ValidationError
 from app.models import ExecutionLog, ReviewTask, ShadowBotExecutionAttempt, ShadowBotOperationLedger
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.notification_outbox import OutboxReviewNotificationService
+from app.services.master_data_management import MasterDataManagementService
 from app.services.runtime import RuntimeTaskService
+from app.services.runtime_master_data import RuntimeMasterDataProvider
 from app.services.shadowbot_state import (
     AttemptStatus,
     OperationStatus,
@@ -555,6 +557,7 @@ class ShadowBotExecutor:
         runner: ShadowBotTaskRunner,
         *,
         inventory_products_path: Path | None = None,
+        master_data_provider: RuntimeMasterDataProvider | None = None,
     ) -> None:
         self.repository = repository
         self.runner = runner
@@ -562,6 +565,10 @@ class ShadowBotExecutor:
             inventory_products_path
             or os.environ.get("PRA_PRODUCTS_PATH")
             or DEFAULT_INVENTORY_PRODUCTS_PATH
+        )
+        self.master_data_provider = master_data_provider or RuntimeMasterDataProvider(
+            repository,
+            products_workbook=self.inventory_products_path,
         )
         self.runtime_task_service = RuntimeTaskService(repository)
         self.notification_outbox_service = OutboxReviewNotificationService(repository)
@@ -695,6 +702,20 @@ class ShadowBotExecutor:
             }
         )
         try:
+            if request.execution_mode == EXECUTION_MODE_COMMIT:
+                authority = self.master_data_provider.authority_state()
+                if authority.authority_mode == "DB_AUTHORITY":
+                    MasterDataManagementService(
+                        self.repository
+                    ).mark_platform_side_effect(
+                        operation_id=payload.operation_id,
+                        authority_generation=authority.generation,
+                        mapping_snapshot_sha256=authority.mapping_snapshot_sha256,
+                        actor=SHADOWBOT_EXECUTOR_NAME,
+                        idempotency_key=(
+                            "shadowbot-start:" + request.execution_attempt_id
+                        ),
+                    )
             start_result = self.runner.start(runner_payload)
         except Exception as exc:
             boundary_known = isinstance(exc, ShadowBotStartBoundaryError)
@@ -782,9 +803,11 @@ class ShadowBotExecutor:
             if isinstance(first_product, dict):
                 platform_name = str(first_product.get("platform") or "").strip()
         request_payload["platform_name"] = platform_name
+        product_snapshot = self.master_data_provider.product_snapshot()
         request_payload["products"] = build_inventory_read_targets(
             platform_name,
             products_path=self.inventory_products_path,
+            products=product_snapshot.products,
         )
         normalized = normalize_multi_product_request(request_payload)
         if str(task_id or "").strip() == "":

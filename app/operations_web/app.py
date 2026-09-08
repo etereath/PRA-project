@@ -63,6 +63,7 @@ from app.services.review_resolution import (
     ReviewResolutionApplicationService,
     ReviewResolutionError,
 )
+from app.services.runtime_master_data import RuntimeMasterDataProvider
 from app.services.operations_maintenance import (
     MaintenanceReceipt,
     OperationsMaintenanceApplicationService,
@@ -195,9 +196,16 @@ class RedactingRequestHandler(WSGIRequestHandler):
 class OperationsWebApplication:
     def __init__(self, container: OperationsWebContainer) -> None:
         self.container = container
+        self.master_data = RuntimeMasterDataProvider(
+            container.runtime_repository,
+            configured_account_id=container.settings.account_id,
+            products_workbook=container.settings.paths.products_workbook,
+            platform_mappings_workbook=container.settings.paths.platform_mappings_workbook,
+        )
         self.queries = OperationsQueryService(
             container.runtime_repository,
             container.settings.paths,
+            master_data_provider=self.master_data,
         )
         inventory_alerts = InventoryAlertService(container.runtime_repository)
         self.inventory_application = InventoryApplicationService(
@@ -216,6 +224,8 @@ class OperationsWebApplication:
             container.runtime_repository,
             products_workbook=container.settings.paths.products_workbook,
             platform_mappings_workbook=platform_mappings,
+            configured_account_id=container.settings.account_id,
+            master_data_provider=self.master_data,
         )
         self.execution_authorization = ExecutionAuthorizationApplicationService(
             container.runtime_repository,
@@ -226,12 +236,17 @@ class OperationsWebApplication:
             queue_root=container.settings.paths.queue_root,
             applet_uri=container.settings.shadowbot_applet_uri,
             execution_profile=container.settings.environment,
+            configured_account_id=container.settings.account_id,
+            master_data_provider=self.master_data,
         )
         self.price_resolution = PriceExecutionResolutionApplicationService(self.execution_authorization)
         self.review_resolution = ReviewResolutionApplicationService(
             container.runtime_repository,
             container.authorization,
             products_path=container.settings.paths.products_workbook,
+            platform_mappings_path=platform_mappings,
+            configured_account_id=container.settings.account_id,
+            master_data_provider=self.master_data,
         )
         self.automation_configuration = AutomationConfigurationApplicationService(
             AutomationRepository(container.runtime_repository),
@@ -1396,6 +1411,7 @@ class OperationsWebApplication:
                     note=self._first(form, "note"),
                     resolution_payload=resolution_payload,
                     products_path=self.container.settings.paths.products_workbook,
+                    master_data_provider=self.master_data,
                 )
             except MobileReviewTransactionError as exc:
                 return Response.text(

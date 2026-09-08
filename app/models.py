@@ -31,7 +31,7 @@ class Product:
     stem_length: str
     unit: str
     base_cost: Decimal
-    current_stock: int
+    current_stock: int | None
     sale_enabled: bool
     remark: str = ""
     last_price: Decimal | None = None
@@ -298,7 +298,7 @@ class AISuggestionInput:
     product_name: str
     platform_name: str
     cost: Decimal
-    stock: int
+    stock: int | None
     last_price: Decimal | None
     features: dict[str, Any]
     time_window: str = "current_snapshot"

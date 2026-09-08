@@ -22,6 +22,7 @@ from app.enums import (
     TaskActionType,
     TaskStatus,
 )
+from app.exceptions import ValidationError
 from app.models import Product, ReviewTask, Task
 from app.operations_web.composition import OperationsWebPaths
 from app.operations_web.read_models import (
@@ -53,7 +54,6 @@ from app.repositories.operational_summary_repository import (
     OperationalSummaryRepository,
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.repositories.workbook_repository import load_products
 from app.review_policy import allowed_review_statuses, review_action_label
 from app.services.automation import (
     DAILY_TASK_GENERATION,
@@ -66,6 +66,7 @@ from app.services.automation import (
 from app.services.automation_configuration import CONFIGURABLE_JOB_TYPES
 from app.services.operational_time import OperationalTimeContext, OperationalTimeService
 from app.services.authoritative_inventory import InventoryProvider
+from app.services.runtime_master_data import RuntimeMasterDataProvider
 from app.services.notification_outbox import (
     NOTIFICATION_TYPE_TITLES,
     REVIEW_TYPE_LABELS,
@@ -185,6 +186,7 @@ class OperationsQueryService:
         runtime_repository: SQLiteRuntimeRepository,
         paths: OperationsWebPaths,
         *,
+        master_data_provider: RuntimeMasterDataProvider | None = None,
         now_provider: Callable[[], datetime] | None = None,
     ) -> None:
         self.runtime = runtime_repository
@@ -194,6 +196,11 @@ class OperationsQueryService:
         self.summaries = OperationalSummaryRepository(runtime_repository)
         self.inventory = InventoryRepository(runtime_repository)
         self.inventory_provider = InventoryProvider(self.inventory)
+        self.master_data = master_data_provider or RuntimeMasterDataProvider(
+            runtime_repository,
+            products_workbook=paths.products_workbook,
+            platform_mappings_workbook=paths.platform_mappings_workbook,
+        )
         self.now_provider = now_provider or (lambda: datetime.now(timezone.utc))
 
     def notification_drawer(self) -> NotificationDrawerReadModel:
@@ -251,7 +258,11 @@ class OperationsQueryService:
         time_result = self._time_context(now)
         products, products_error = self._load_products()
         inventory_value = (
-            sum(item.current_stock for item in products if item.sale_enabled)
+            sum(
+                item.current_stock
+                for item in products
+                if item.sale_enabled and item.current_stock is not None
+            )
             if products
             else None
         )
@@ -998,11 +1009,7 @@ class OperationsQueryService:
         if dataset == "inventory-adjustments":
             return self._inventory_transactions_table(page)
         if dataset == "mappings":
-            return _unavailable_table(
-                dataset,
-                "商品映射",
-                "商品映射目录暂不可用，请联系管理员维护商品与平台的对应关系。",
-            )
+            return self._mappings_table(page)
         if dataset == "history":
             return self._summary_table(
                 dataset,
@@ -1073,7 +1080,7 @@ class OperationsQueryService:
                 item.product_name,
                 item.grade,
                 item.stem_length,
-                _qty(item.current_stock),
+                _inventory_qty(item.current_stock),
                 "可销售" if item.sale_enabled else "停止销售",
             )
             for item in visible
@@ -1093,6 +1100,53 @@ class OperationsQueryService:
             base_path="/database",
             query={"dataset": "products"},
             state=_rows_state(rows, "当前没有商品资料"),
+        )
+
+    def _mappings_table(self, page: int) -> TableReadModel:
+        try:
+            snapshot = self.master_data.mapping_snapshot()
+        except (OSError, UnicodeError, ValueError, ValidationError):
+            return _failed_table("mappings", "商品映射")
+        start = (page - 1) * DEFAULT_PAGE_SIZE
+        selected = snapshot.mappings.records[
+            start : start + DEFAULT_PAGE_SIZE + 1
+        ]
+        visible, has_next = _visible(selected, DEFAULT_PAGE_SIZE)
+        rows = tuple(
+            (
+                item.platform_name,
+                item.account_id or "切换前未绑定",
+                item.platform_product_name,
+                item.grade,
+                item.internal_sku or "—",
+                item.mapping_status.value,
+                str(item.effective_from or "—"),
+                str(item.effective_to or "—"),
+            )
+            for item in visible
+        )
+        return self._table(
+            dataset="mappings",
+            title="商品映射",
+            columns=(
+                "平台",
+                "目标账号",
+                "平台商品",
+                "等级",
+                "内部 SKU",
+                "状态",
+                "生效时间",
+                "失效时间",
+            ),
+            rows=rows,
+            page=page,
+            has_next=has_next,
+            base_path="/database",
+            query={"dataset": "mappings"},
+            state=_rows_state(
+                rows,
+                "当前没有商品映射",
+            ),
         )
 
     def _inventory_transactions_table(self, page: int) -> TableReadModel:
@@ -1593,7 +1647,7 @@ class OperationsQueryService:
                     _qty(sold),
                     _money(average),
                     _money(amount),
-                    _qty(product.current_stock),
+                    _inventory_qty(product.current_stock),
                     QUALITY_LABELS.get(summary.quality_level.value, "质量未知")
                     if summary
                     else "销售数据待更新",
@@ -1654,7 +1708,7 @@ class OperationsQueryService:
             DetailFieldReadModel("商品", product.product_name),
             DetailFieldReadModel("等级", product.grade),
             DetailFieldReadModel("规格", product.stem_length),
-            DetailFieldReadModel("数据库库存", _qty(product.current_stock)),
+            DetailFieldReadModel("数据库库存", _inventory_qty(product.current_stock)),
             DetailFieldReadModel("基础成本", _money(product.base_cost)),
             DetailFieldReadModel("销售状态", "可销售" if product.sale_enabled else "停止销售"),
             DetailFieldReadModel("库存来源", "数据库库存"),
@@ -2010,8 +2064,11 @@ class OperationsQueryService:
 
     def _load_products(self) -> tuple[list[Product], str]:
         try:
-            products = load_products(self.paths.products_workbook)
-            return self.inventory_provider.hydrate_products(products), ""
+            snapshot = self.master_data.snapshot()
+            products = list(snapshot.products)
+            if snapshot.authority_mode == "PRE_CUTOVER":
+                products = self.inventory_provider.hydrate_products(products)
+            return products, ""
         except Exception as exc:
             return [], type(exc).__name__
 
@@ -2354,6 +2411,10 @@ def _failed_table(
 
 def _qty(value: int | None) -> str:
     return "—" if value is None else f"{value} 扎"
+
+
+def _inventory_qty(value: int | None) -> str:
+    return "NOT_INITIALIZED" if value is None else _qty(value)
 
 
 def _signed_qty(value: int) -> str:
