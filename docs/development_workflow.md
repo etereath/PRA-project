@@ -50,3 +50,22 @@
 5. 验收文档后检查暂存 diff，仅提交本轮相关文件；推送前确认 Current Status 已覆盖整批待推送改动。
 6. 推送后核对远端 PR Head，同步 PR 正文的改动、版本、验证与剩余事项；新 Head CI 按当时实际状态记录。后续 CI 结果可更新 PR 正文，下次推送前再同步状态页，不为记录自身 SHA 反复提交。
 7. 最终简述本轮结果、验证和实际提交/推送状态。合并、结束 Draft、部署和真实平台操作仍须对应授权。
+
+## 6. 新增或扩大 blocker：先提交 Proposal
+
+实现 blocker 前先写出它要避免的具体事故，并从 `Task → SKU+Action → SKU All Writes → Platform/Account Write Queue → Cross-platform System` 选择能够避免事故的最小作用域。若改动会阻断无共享风险的 SKU/action、整个平台/账号写队列、其他平台，或 READ_ONLY Observation / Recovery / RECONCILE，先停止代码和 Schema 修改，提交 **Global Queue Blocker Proposal**：
+
+```text
+Trigger:
+Concrete accident if not blocked:
+Affected platform/account:
+Why Task/SKU/action-level isolation is insufficient:
+Exactly what operations are blocked:
+Which recovery/read-only operations remain allowed:
+Automatic release condition:
+Human override/recovery path:
+Maximum expected blocking duration:
+Tests proving unrelated work is not blocked:
+```
+
+Proposal 还须标明拟使用 GQB-1、GQB-2、GQB-3 或 GQB-4，给出 evidence refs、运行期 owner、持久记录位置和重启后的释放责任。无法归入四类即属于候选第五类；未经 Owner/Reviewer 明确接受不得继续实现。接受只授权所述 blocker 合同，不自动授权真实平台写、部署或扩大其他业务范围。
