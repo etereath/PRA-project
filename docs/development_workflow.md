@@ -27,8 +27,8 @@
 1. 按治理文档确认该失败属于本轮范围，并核对 run 的 Head、workflow、job 与当前版本。
 2. 成功只读状态和必要步骤摘要；失败先读失败 job、stack 或直接相关 artifact，再读取涉及的测试与实现片段。
 3. 区分实现缺陷、测试缺陷、fixture 时间/顺序不一致、环境差异与已证实的偶发故障；先做最小诊断，再定向复现。
-4. 实现或测试缺陷：完成对应修复，跑原失败与直接回归；稳定候选按适用 Gate 验证。
-5. 外部环境故障：记录故障原因、恢复依据及源码/测试/依赖/配置版本，在相同版本上重跑。保留原失败和重跑结果，不把单次转绿当作根因证据。
+4. 实现或测试缺陷：完成对应修复，跑原失败与直接回归；稳定候选判断适用 Gate，主动执行完整 Gate 仍须遵守根级 `AGENTS.md` 的资源授权约束。用户当前请求已经明确要求相应完整验证时，复用该授权，不再次询问。
+5. 外部环境故障：记录故障原因、恢复依据及源码/测试/依赖/配置版本；可以在相同版本上重跑，但 Agent 主动重跑前必须按根级 `AGENTS.md` 重新取得授权。保留原失败和重跑结果，不把单次转绿当作根因证据。
 6. 比较复用证据所绑定的源码、测试、依赖、配置与环境，记录差异及覆盖范围，不把历史成功改写成新 Head 的结果。
 
 需要调整 CI 分层时，在对应工作流任务中实施：去除相同环境和输入下被全量覆盖的重复子集，保留具有平台差异、隔离或恢复目的的检查；本文件不改变既有触发条件或 Gate。
@@ -50,3 +50,22 @@
 5. 验收文档后检查暂存 diff，仅提交本轮相关文件；推送前确认 Current Status 已覆盖整批待推送改动。
 6. 推送后核对远端 PR Head，同步 PR 正文的改动、版本、验证与剩余事项；新 Head CI 按当时实际状态记录。后续 CI 结果可更新 PR 正文，下次推送前再同步状态页，不为记录自身 SHA 反复提交。
 7. 最终简述本轮结果、验证和实际提交/推送状态。合并、结束 Draft、部署和真实平台操作仍须对应授权。
+
+## 6. 新增或扩大 blocker：先提交 Proposal
+
+实现 blocker 前先写出它要避免的具体事故，并从 `Task → SKU+Action → SKU All Writes → Platform/Account Write Queue → Cross-platform System` 选择能够避免事故的最小作用域。若改动会阻断无共享风险的 SKU/action、整个平台/账号写队列、其他平台，或 READ_ONLY Observation / Recovery / RECONCILE，先停止代码和 Schema 修改，提交 **Global Queue Blocker Proposal**：
+
+```text
+Trigger:
+Concrete accident if not blocked:
+Affected platform/account:
+Why Task/SKU/action-level isolation is insufficient:
+Exactly what operations are blocked:
+Which recovery/read-only operations remain allowed:
+Automatic release condition:
+Human override/recovery path:
+Maximum expected blocking duration:
+Tests proving unrelated work is not blocked:
+```
+
+Proposal 还须标明拟使用 GQB-1、GQB-2、GQB-3 或 GQB-4，给出 evidence refs、运行期 owner、持久记录位置和重启后的释放责任。无法归入四类即属于候选第五类；未经 Owner/Reviewer 明确接受不得继续实现。接受只授权所述 blocker 合同，不自动授权真实平台写、部署或扩大其他业务范围。
