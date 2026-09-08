@@ -114,6 +114,10 @@ ACTION_LABELS = {
     "set_offline": "下架",
     "sync_status": "同步状态",
 }
+
+PRICE_EXECUTION_FAILURE_LABELS = {
+    "OLD_PRICE_PARSE_FAILED": "无法读取当前供货价格",
+}
 REVIEW_STATUS_LABELS = {
     "pending": "待复核",
     "approved": "已批准",
@@ -1742,6 +1746,41 @@ class OperationsQueryService:
         item = self.runtime.get_task(task_id)
         if item is None:
             return None
+        continuation = None
+        readback = None
+        if item.action_type.value == "update_price":
+            from contextlib import closing
+
+            with closing(self.runtime.connect_read()) as connection:
+                continuation = connection.execute(
+                    """SELECT c.*, b.status AS batch_status,
+                              i.status AS item_status,
+                              i.error_code AS item_error_code,
+                              i.preflight_row,
+                              i.submit_attempted,
+                              i.side_effect_state
+                       FROM execution_continuations c
+                       JOIN shadowbot_commit_batches b ON b.batch_id = c.batch_id
+                       JOIN shadowbot_commit_batch_items i ON i.batch_id = c.batch_id
+                       WHERE i.source_task_id = ?
+                       ORDER BY c.accepted_at DESC LIMIT 1""",
+                    (task_id,),
+                ).fetchone()
+                readback = connection.execute(
+                    """SELECT i.actual_price, i.readback_observed_at, i.item_execution_attempt_id,
+                              i.operation_id, b.result_id
+                       FROM shadowbot_commit_batch_items i
+                       JOIN shadowbot_commit_batches b ON b.batch_id = i.batch_id
+                       WHERE i.source_task_id = ? AND i.actual_price IS NOT NULL
+                       ORDER BY i.updated_at DESC LIMIT 1""",
+                    (task_id,),
+                ).fetchone()
+        execution_display = _price_execution_display(continuation)
+        result_detail = (
+            execution_display[0]
+            if execution_display is not None
+            else _task_result_detail(item)
+        )
         fields = (
             DetailFieldReadModel("任务", ACTION_LABELS.get(item.action_type.value, "其他任务")),
             DetailFieldReadModel("商品", item.internal_sku or "全局"),
@@ -1751,37 +1790,36 @@ class OperationsQueryService:
             DetailFieldReadModel("目标价格", _money(item.target_price)),
             DetailFieldReadModel("平台目标库存", _qty(item.target_inventory)),
             DetailFieldReadModel("创建时间", _datetime(item.created_at)),
-            DetailFieldReadModel("结果", _task_result_detail(item)),
+            DetailFieldReadModel("结果", result_detail),
         )
-        state = _task_state(item)
+        state = (
+            execution_display[3]
+            if execution_display is not None
+            else _task_state(item)
+        )
         if item.action_type.value == 'update_price':
-            from contextlib import closing
             from app.services.task_execution_coordinator import MESSAGES
-            with closing(self.runtime.connect_read()) as connection:
-                continuation = connection.execute(
-                    """SELECT c.*, b.status AS batch_status FROM execution_continuations c
-                       JOIN shadowbot_commit_batches b ON b.batch_id = c.batch_id
-                       JOIN shadowbot_commit_batch_items i ON i.batch_id = c.batch_id
-                       WHERE i.source_task_id = ? ORDER BY c.accepted_at DESC LIMIT 1""",
-                    (task_id,),
-                ).fetchone()
-                readback = connection.execute(
-                    """SELECT i.actual_price, i.readback_observed_at, i.item_execution_attempt_id,
-                              i.operation_id, b.result_id
-                       FROM shadowbot_commit_batch_items i
-                       JOIN shadowbot_commit_batches b ON b.batch_id = i.batch_id
-                       WHERE i.source_task_id = ? AND i.actual_price IS NOT NULL
-                       ORDER BY i.updated_at DESC LIMIT 1""", (task_id,),
-                ).fetchone()
             fields += (DetailFieldReadModel('预期原价格', _money(item.expected_old_price)),
                        DetailFieldReadModel('决定有效期', _datetime(item.expires_at)))
             if continuation:
                 outcome = continuation['outcome'] or 'ACCEPTED'
+                progress = (
+                    execution_display[1]
+                    if execution_display is not None
+                    else MESSAGES.get(outcome, '执行状态待核对。')
+                )
+                responsibility = (
+                    execution_display[2]
+                    if execution_display is not None
+                    else _execution_responsibility(
+                        outcome,
+                        is_closed=continuation['closed_at'] is not None,
+                    )
+                )
                 fields += (
-                    DetailFieldReadModel('执行进度', MESSAGES.get(outcome, '执行状态待核对。')),
+                    DetailFieldReadModel('执行进度', progress),
                     DetailFieldReadModel('授权批次', continuation['batch_id']),
-                    DetailFieldReadModel('当前责任方', '管理员' if outcome == 'HUMAN' else
-                        ('执行服务' if continuation['closed_at'] is None else '人工 / 已收口')),
+                    DetailFieldReadModel('当前责任方', responsibility),
                 )
             else:
                 fields += (DetailFieldReadModel('下一步', '人工预览并确认；先前操作未收口时保留本次决定。'),)
@@ -2524,6 +2562,55 @@ def _task_state(item: Task) -> StateReadModel:
     else:
         state = ReadState.INCOMPLETE
     return StateReadModel(state, TASK_STATUS_LABELS.get(value, "状态未知"), _task_result_detail(item))
+
+
+def _price_execution_display(continuation):
+    """Explain a closed execution attempt without changing the durable Task fact.
+
+    ``execution_continuations.COMPLETE`` closes one authorization lifecycle.  It
+    does not by itself prove that the business Task succeeded.  In particular,
+    a failed batch may leave the Task pending so an operator can correct the
+    cause and explicitly authorize a new attempt.
+    """
+
+    if continuation is None or continuation["closed_at"] is None:
+        return None
+    if continuation["batch_status"] not in {"FAILED", "PARTIAL"}:
+        return None
+    if continuation["item_status"] == "VERIFIED":
+        return None
+
+    error_code = str(continuation["item_error_code"] or "")
+    submit_attempted = bool(continuation["submit_attempted"])
+    side_effect_state = str(continuation["side_effect_state"] or "")
+    if error_code:
+        reason = PRICE_EXECUTION_FAILURE_LABELS.get(error_code, "平台操作未完成")
+    elif continuation["preflight_row"] is None and not submit_attempted:
+        reason = "执行准备阶段未完成"
+    else:
+        reason = "平台操作未完成"
+    if not submit_attempted and side_effect_state == "NOT_STARTED":
+        effect = "平台价格未开始修改"
+    elif side_effect_state == "NOT_APPLIED":
+        effect = "平台确认没有应用本次修改"
+    else:
+        effect = "平台结果需要人工核对"
+
+    result = f"本次执行未完成：{reason}；{effect}。"
+    progress = "本次授权执行已经结束，任务仍待重新处理。"
+    responsibility = "管理员 / 待重新处理"
+    state = StateReadModel(ReadState.INCOMPLETE, "待重新处理", result)
+    return result, progress, responsibility, state
+
+
+def _execution_responsibility(outcome: str, *, is_closed: bool) -> str:
+    if not is_closed:
+        return "管理员" if outcome == "HUMAN" else "执行服务"
+    if outcome == "RECONFIRM":
+        return "管理员 / 待重新确认"
+    if outcome == "EXPIRED":
+        return "管理员 / 待重新决定"
+    return "无需处理"
 
 
 def _task_result_detail(item: Task) -> str:

@@ -457,3 +457,9 @@ Stage Goal = NOT YET VALIDATED
 最小修复只调整 v4 COMMIT 的批次预检：`_commit_v4_prepare_product_list()` 不再复用未经筛选证明的当前商品页，而是重新进入商品管理并显式选择“上架中”，两次确认列表就绪后才读取上架中价格。单个 batch 仍只做一次完整预检，后续 item 继续复用已验证的同一窗口，不改变最终提交、写前旧价比较、UNKNOWN 或锁语义。新增回归门禁证明 v4 预检固定传入 `reuse_requested=False`；既有刷新测试继续证明选择“上架中”发生在列表就绪判断之前。
 
 定向测试 `111 passed`，覆盖 Human price journey、v4 commit pipeline / orchestration / success baseline、商品列表刷新、Executor 和 commit batch。Worker 保持 `STOPPED`；修复已通过正式同步脚本部署到 `test2`，二次 `--check` 的 7 个受控文件均为 `CURRENT`，部署验证 PASS。该修复和部署没有投递 Queue，没有执行真实平台 READ_ONLY 或 WRITE，也没有消费新的平台写授权。再次 RM1-B 前仍须取得新鲜旧价格并由负责人重新授权。
+
+### RM1-B 失败后的 Web 责任状态修复
+
+Operations Web 原先把 continuation 的 `COMPLETE` 直接显示为“人工 / 已收口”，混淆了“本次授权执行生命周期结束”和“业务任务成功完成”。现已改为联合读取 Task、batch、item、是否提交及副作用状态：对于本次 `Task=pending / batch=FAILED / item=NOT_ATTEMPTED / submit_attempted=false / side_effect_state=NOT_STARTED`，页面显示“待重新处理”，结果说明“执行准备阶段未完成；平台价格未开始修改”，当前责任方显示“管理员 / 待重新处理”。底层 Task 与历史执行事实均未改写，也未重新打开旧 continuation。
+
+本次旧结果的顶层 `OLD_PRICE_PARSE_FAILED` 没有被当时的 Importer 投影到 item 错误字段，因此 Web 不从已归档 Queue 文件反向拼接 Runtime 真值，也不把本报告中的人工诊断伪装成数据库事实；页面仅按 Runtime 可证明的阶段给出上述说明。合成用例同时覆盖错误码已持久化时显示“无法读取当前供货价格”，并确保原始页面文本不直接暴露给运营页面。Operations Web read model、相邻 Web 基础与完整 Human price journey 合计 `89 passed`；当前真实 Runtime 只读投影复核通过。Web 已重启，Worker 仍保持 `STOPPED`，本次没有执行平台 READ_ONLY 或 WRITE。

@@ -394,6 +394,89 @@ def test_detail_ownership_is_unique_and_cross_owner_routes_are_absent(read_only_
     assert _call_app(app, path="/management/product/AISHA-A-50-Z", cookie=cookie)[0] == "404 Not Found"
 
 
+@pytest.mark.parametrize(
+    ("error_code", "expected_reason"),
+    [
+        ("OLD_PRICE_PARSE_FAILED", "无法读取当前供货价格"),
+        ("", "执行准备阶段未完成"),
+    ],
+)
+def test_closed_failed_price_execution_keeps_pending_task_with_human_responsibility(
+    read_only_web,
+    error_code: str,
+    expected_reason: str,
+) -> None:
+    app, _, repository, _ = read_only_web
+    task = Task(
+        task_id="TASK-PRICE-RETRY",
+        internal_sku="AISHA-B-60-Z",
+        platform_name="蚂蚁花团",
+        action_type=TaskActionType.UPDATE_PRICE,
+        priority=10,
+        task_status=TaskStatus.PENDING,
+        target_price=Decimal("10.30"),
+        expected_old_price=Decimal("10.00"),
+        created_at=FIXED_NOW,
+        origin_type=TaskOriginType.MANUAL,
+        origin_ref_id="synthetic:failed-price-execution",
+    )
+    repository.insert_task(task)
+    timestamp = FIXED_NOW.isoformat()
+    with repository.connect_write() as connection, connection:
+        connection.execute(
+            """INSERT INTO shadowbot_commit_batches(
+                   batch_id, contract_version, execution_profile, platform_name,
+                   manifest_sha256, status, created_at, updated_at
+               ) VALUES (?, 4, 'development', ?, ?, 'FAILED', ?, ?)""",
+            ("BATCH-PRICE-RETRY", task.platform_name, "a" * 64, timestamp, timestamp),
+        )
+        connection.execute(
+            """INSERT INTO shadowbot_commit_batch_items(
+                   batch_id, source_task_id, internal_sku, expected_product_name,
+                   expected_grade, expected_old_price, target_price,
+                   item_payload_sha256, submit_attempted, status, error_code,
+                   error_message, side_effect_state, updated_at
+               ) VALUES (?, ?, ?, '艾莎', 'B级', '10.00', '10.30', ?, 0,
+                         'NOT_ATTEMPTED', ?,
+                         '供货价格无法唯一解析: 报名秒杀', 'NOT_STARTED', ?)""",
+            (
+                "BATCH-PRICE-RETRY",
+                task.task_id,
+                task.internal_sku,
+                "b" * 64,
+                error_code,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            """INSERT INTO execution_continuations(
+                   batch_id, principal_subject, idempotency_hash,
+                   envelope_sha256, envelope_json, accepted_at, closed_at,
+                   outcome, message
+               ) VALUES (?, 'admin', ?, ?, '{}', ?, ?, 'COMPLETE', ?)""",
+            (
+                "BATCH-PRICE-RETRY",
+                "c" * 64,
+                "d" * 64,
+                timestamp,
+                timestamp,
+                "执行链已收口；执行结果及平台回读见下方记录。",
+            ),
+        )
+
+    detail = app.queries.detail("task", task.task_id)
+
+    assert detail is not None
+    assert detail.state.state.value == "incomplete"
+    assert detail.state.title == "待重新处理"
+    values = {field.label: field.value for field in detail.fields}
+    assert values["状态"] == "待处理"
+    assert values["结果"] == f"本次执行未完成：{expected_reason}；平台价格未开始修改。"
+    assert values["执行进度"] == "本次授权执行已经结束，任务仍待重新处理。"
+    assert values["当前责任方"] == "管理员 / 待重新处理"
+    assert "报名秒杀" not in " ".join(values.values())
+
+
 def test_settlement_list_shows_only_current_version_and_marks_historical_detail(
     read_only_web,
 ) -> None:

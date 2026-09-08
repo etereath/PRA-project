@@ -2,9 +2,9 @@
 
 角色：Current Status；项目进度与验证状态的唯一维护页。Codex 每次推送前同步更新，包括纯文档推送；`index.md` 仅负责索引。更新于 2026-09-08。
 
-PR [#47](https://github.com/etereath/PRA-project/pull/47) 与 RM0 交付 PR [#49](https://github.com/etereath/PRA-project/pull/49) 均已合并，当前 main 为 `37523f668cc6abe204b5beaac5e5c012cf18b09f`。Task 13.7-1 Implementation Review = **PASS**，P1-47-01、P2-47-01、P2-47-02 均 **CLOSED**。代码和 RM0 记录已进入 main；RM1-A 真实 READ_ONLY 已通过。RM1-B 的首次授权尝试在平台提交前因 `OLD_PRICE_PARSE_FAILED` 失败，`SIDE EFFECT = NOT_STARTED`；列表筛选根因已完成定向修复和 `test2` 部署，但纵向写业务结果仍待重新验收。
+PR [#47](https://github.com/etereath/PRA-project/pull/47) 与 RM0 交付 PR [#49](https://github.com/etereath/PRA-project/pull/49) 均已合并，当前 main 为 `37523f668cc6abe204b5beaac5e5c012cf18b09f`。Task 13.7-1 Implementation Review = **PASS**，P1-47-01、P2-47-01、P2-47-02 均 **CLOSED**。代码和 RM0 记录已进入 main；RM1-A 真实 READ_ONLY 已通过。RM1-B 的首次授权尝试在平台提交前因 `OLD_PRICE_PARSE_FAILED` 失败，`SIDE EFFECT = NOT_STARTED`；列表筛选根因、`test2` 部署及失败后的 Web 责任状态表达均已完成定向修复，但纵向写业务结果仍待重新验收。
 
-当前下一步仍是 **Controlled Real-Machine Acceptance**。2026-09-08 已在 [RM0 环境准备与 RM1 现场记录](reports/task13_7_1_rm0_controlled_real_machine_preparation_20260907.md)完成现场整改、历史 UNKNOWN 定向核验、RM0.5、RM1-A 和一次 RM1-B 授权尝试：Runtime v18、ShadowBot 源码及 Queue/Worker 环境已对齐；旧 `WEB7E-6646…` 保持历史 UNKNOWN，但运营责任已关闭。负责人选择“蚂蚁花团供应商 / 千芳花卉”的 `AISHA-B-60-Z`、`AISHA-C-55-Z`、`AISHA-D-50-Z`，并确认平台身份采用“商品名＋等级”；对应三条 PRODUCT mapping 已通过受控工作簿流程转为 `VERIFIED`，其他 9 条保持 `DISABLED`。RM1-A 的完整上架中＋待上架快照为 `VERIFIED`。RM1-B 执行前的新鲜 READ-BEFORE 于 16:38:10 确认 B 为上架中、价格 `10.80`；随后对目标价 `10.30` 的唯一授权尝试在 v4 批次预检中把“报名秒杀”误作供货价格，返回 `OLD_PRICE_PARSE_FAILED`。item 为 `NOT_ATTEMPTED`、`submit_attempted=false`、副作用 `NOT_STARTED`，没有平台价格写入，也没有自动重试。持久授权跨 Queue Service 重启后的接管、Importer、Archive 与锁释放均正常。根因是完整扫描最后停在“待上架”，v4 快速路径仅凭结构化商品行便复用当前页；现已强制 v4 预检重新进入商品管理并显式选择“上架中”，定向测试 `111 passed`，`test2` 部署校验通过。失败后的 Web 责任状态表达仍待修复，真实写仍待新授权复验。Stage Goal 保持 **NOT YET VALIDATED**。
+当前下一步仍是 **Controlled Real-Machine Acceptance**。2026-09-08 已在 [RM0 环境准备与 RM1 现场记录](reports/task13_7_1_rm0_controlled_real_machine_preparation_20260907.md)完成现场整改、历史 UNKNOWN 定向核验、RM0.5、RM1-A 和一次 RM1-B 授权尝试：Runtime v18、ShadowBot 源码及 Queue/Worker 环境已对齐；旧 `WEB7E-6646…` 保持历史 UNKNOWN，但运营责任已关闭。负责人选择“蚂蚁花团供应商 / 千芳花卉”的 `AISHA-B-60-Z`、`AISHA-C-55-Z`、`AISHA-D-50-Z`，并确认平台身份采用“商品名＋等级”；对应三条 PRODUCT mapping 已通过受控工作簿流程转为 `VERIFIED`，其他 9 条保持 `DISABLED`。RM1-A 的完整上架中＋待上架快照为 `VERIFIED`。RM1-B 执行前的新鲜 READ-BEFORE 于 16:38:10 确认 B 为上架中、价格 `10.80`；随后对目标价 `10.30` 的唯一授权尝试在 v4 批次预检中把“报名秒杀”误作供货价格，返回 `OLD_PRICE_PARSE_FAILED`。item 为 `NOT_ATTEMPTED`、`submit_attempted=false`、副作用 `NOT_STARTED`，没有平台价格写入，也没有自动重试。持久授权跨 Queue Service 重启后的接管、Importer、Archive 与锁释放均正常。根因是完整扫描最后停在“待上架”，v4 快速路径仅凭结构化商品行便复用当前页；现已强制 v4 预检重新进入商品管理并显式选择“上架中”，定向测试 `111 passed`，`test2` 部署校验通过。失败后的 Web 投影也已按 Task、batch、item 与副作用状态显示“待重新处理 / 管理员”，不再把生命周期 `COMPLETE` 表达为业务已收口；相邻 Web 与 Human price journey 合计 `89 passed`，真实 Runtime 只读回读一致。真实写仍待新授权复验。Stage Goal 保持 **NOT YET VALIDATED**。
 
 | 项目 | 状态 | 依据/下一步 |
 |---|---|---|
@@ -24,7 +24,7 @@ PR [#47](https://github.com/etereath/PRA-project/pull/47) 与 RM0 交付 PR [#49
 | #47 合并与最终检查 | MERGED / SUCCESS | merge commit `08f4e70`；最终 Head `1011091` 的 Windows / Linux Core 均 SUCCESS |
 | Task 13.7-1 RM0 / RM0.5 | PASS WITH HISTORICAL DEBT / PREFLIGHT READY | 旧 `WEB7E-6646…` 保留审计；B/C/D 三个艾莎 SKU 已由负责人确认并完成受控 VERIFIED mapping，当前无活动执行 blocker |
 | Task 13.7-1 RM1-A | READ-BEFORE VERIFIED | `ATTEMPT-95a494700a2d4178`；B/C/D 当前价 `10.80 / 6.80 / 6.20`，均为 `online_only`；Importer ACK WRITTEN，活动 Queue=0，Worker STOPPED；未执行平台写 |
-| Task 13.7-1 RM1-B | REPAIR VERIFIED / REAL REVALIDATION WAIT | 首次授权尝试 `FAILED / NOT_STARTED`；v4 已禁止复用未经筛选证明的当前页，`111 passed` 且 `test2` 部署一致；尚未再次执行真实写 |
+| Task 13.7-1 RM1-B | REPAIR VERIFIED / REAL REVALIDATION WAIT | 首次授权尝试 `FAILED / NOT_STARTED`；v4 列表筛选和失败后 Web 责任表达均已修复，`test2` 部署一致；尚未再次执行真实写 |
 | Task 13.7-1 Stage Goal | NOT YET VALIDATED | durable continuation 跨 Queue Service 重启交接已验证，但真实写未完成；还需修复 Web 失败状态语义，并在负责人重新授权后完成纵向写旅程 |
 
 ## 13.7-1 实现与当前 RM0 验证依据
@@ -59,7 +59,7 @@ RM0.5 已完成三个测试 SKU 的负责人裁决、mapping 和活动责任预�
 
 先完成1 SKU、1次人工UPDATE_PRICE，从决定、Runtime Task、正式授权、持久交接，经既有v4/Queue/Worker/Importer到终态与平台回读，并验证重启或阻塞解除后的责任连续。详见[首切片计划](plans/task13_7_human_update_price_vertical_slice.md)与[开发Goal](plans/task13_7_first_slice_codex_goal.md)。
 
-ChatGPT 对 `ceb88a0` 的[首审 FAIL 与冻结问题](https://github.com/etereath/PRA-project/pull/47#pullrequestreview-5126336815)保留历史身份。P1、两个 P2 及测试时序修复交付后，用户于 2026-09-07 明确裁决 **Implementation Review = PASS、冻结问题全部 CLOSED**；#47 随后合入 main `08f4e70`。Controlled Real-Machine Acceptance 的 RM0 技术准备现为 PASS WITH HISTORICAL DEBT，RM1-A READ-BEFORE 已通过；RM1-B 已对 B `10.80 → 10.30` 执行一次授权尝试，但以 `FAILED / NOT_STARTED` 结束，没有平台写入。v4 列表筛选修复、定向回归和 `test2` 部署已完成；下一步是修复失败后的 Web 责任状态语义，再由负责人基于新鲜旧价格重新授权一次真实写。Stage Goal 仍未验证，必要配置和证据边界见实现、修复与 [RM0 / RM1 现场记录](reports/task13_7_1_rm0_controlled_real_machine_preparation_20260907.md)。
+ChatGPT 对 `ceb88a0` 的[首审 FAIL 与冻结问题](https://github.com/etereath/PRA-project/pull/47#pullrequestreview-5126336815)保留历史身份。P1、两个 P2 及测试时序修复交付后，用户于 2026-09-07 明确裁决 **Implementation Review = PASS、冻结问题全部 CLOSED**；#47 随后合入 main `08f4e70`。Controlled Real-Machine Acceptance 的 RM0 技术准备现为 PASS WITH HISTORICAL DEBT，RM1-A READ-BEFORE 已通过；RM1-B 已对 B `10.80 → 10.30` 执行一次授权尝试，但以 `FAILED / NOT_STARTED` 结束，没有平台写入。v4 列表筛选、失败后 Web 责任状态、定向回归和 `test2` 部署均已完成；下一步由负责人基于新鲜旧价格重新授权一次真实写。Stage Goal 仍未验证，必要配置和证据边界见实现、修复与 [RM0 / RM1 现场记录](reports/task13_7_1_rm0_controlled_real_machine_preparation_20260907.md)。
 
 PR #44 已关闭且未合并，仍作历史平行分析；有效增量已随 #45 吸收，未采纳设计不成为施工合同。Issue #41 与旧报告的阶段叙述按其历史范围读取，不重新打开已完成的 13.6。
 
