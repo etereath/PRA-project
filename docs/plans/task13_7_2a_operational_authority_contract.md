@@ -6,7 +6,7 @@
 
 本任务是 **contract / responsibility gate**，不实施平台写、不切换真实 Runtime authority、不恢复旧 13.5-7F/7G 架构。
 
-基线：`main@52f5b212a41f7a0b8d1584b6d00a037236f485e5`，旧遗产只作为候选材料读取：`a3485af6890c15c7e6590ee8000f3d04c27ec3d1`。
+基线：`main@8cb40e76840ee06481e4ffd93bd7172f3baf1607`，旧遗产只作为候选材料读取：`a3485af6890c15c7e6590ee8000f3d04c27ec3d1`。
 
 ## 2. 已冻结的产品原则
 
