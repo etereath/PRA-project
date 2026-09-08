@@ -2,9 +2,11 @@
 
 角色：Current Status；项目进度与验证状态的唯一维护页。Codex 每次推送前同步更新，包括纯文档推送；`index.md` 仅负责索引。更新于 2026-09-09。
 
-PR [#47](https://github.com/etereath/PRA-project/pull/47)、RM0 交付 PR [#49](https://github.com/etereath/PRA-project/pull/49) 与收口 PR [#50](https://github.com/etereath/PRA-project/pull/50) 均已合并，当前 main 为 `52f5b212a41f7a0b8d1584b6d00a037236f485e5`。Task 13.7-1 Implementation Review = **PASS**，P1-47-01、P2-47-01、P2-47-02 均 **CLOSED**。代码和 RM0 记录已进入 main；RM1-A 真实 READ_ONLY 已通过。RM1-B 首次授权在提交前以 `OLD_PRICE_PARSE_FAILED / NOT_STARTED` 失败，相关列表筛选、Web 责任表达及固定价格新鲜度门禁已经修复；2026-09-08 负责人重新授权后，`AISHA-B-60-Z` 已通过唯一一次真实提交由 `10.80` 调整为 `10.30`，写后独立回读、Importer、Archive、锁释放及持久 continuation 收口均为 **VERIFIED**。
+PR [#47](https://github.com/etereath/PRA-project/pull/47)、RM0 交付 PR [#49](https://github.com/etereath/PRA-project/pull/49) 与收口 PR [#50](https://github.com/etereath/PRA-project/pull/50) 均已合并；开发资源治理 PR [#56](https://github.com/etereath/PRA-project/pull/56) 也已合并，当前 main 为 `08530db148fe08544c304edec49d64ecf6430f4f`。Task 13.7-1 Implementation Review = **PASS**，P1-47-01、P2-47-01、P2-47-02 均 **CLOSED**。代码和 RM0 记录已进入 main；RM1-A 真实 READ_ONLY 已通过。RM1-B 首次授权在提交前以 `OLD_PRICE_PARSE_FAILED / NOT_STARTED` 失败，相关列表筛选、Web 责任表达及固定价格新鲜度门禁已经修复；2026-09-08 负责人重新授权后，`AISHA-B-60-Z` 已通过唯一一次真实提交由 `10.80` 调整为 `10.30`，写后独立回读、Importer、Archive、锁释放及持久 continuation 收口均为 **VERIFIED**。
 
 当前 Controlled Real-Machine Acceptance 的技术链路已经完成。PR #50 首审后保留的两个 Blocking P2 已完成代码整改：Worker 风格的提交前价格漂移失败在具备完整零副作用证据时可通过正式服务终止，终止后同 SKU 可创建新决定并进入授权；Web 以 Task 当前终态和责任为准，同时保留最近失败执行记录。生产接线合成旅程和直接依赖回归共 **88 passed**，最终 Head 的 Windows / Linux Core 均通过并已合并；本轮没有执行新的真实平台写入。下一步为负责人 Stage Goal 裁决。完整现场证据见 [RM0 环境准备与 RM1 现场记录](reports/task13_7_1_rm0_controlled_real_machine_preparation_20260907.md)：Runtime v18、ShadowBot、Queue Service 和 Worker 已对齐；旧 `WEB7E-6646…` 继续保持历史 UNKNOWN，但运营责任已关闭。RM1-A 已取得 B/C/D 的完整真实 READ-BEFORE；RM1-B 重新验收使用新 Task `TASK-MANUAL-c9b09e6c5ee2cfb64accc3b4` 和批次 `WEB7E-eb1ed34bdd4db6546ca5f218fa276176`，写前读到 `10.80`，一次提交后于 20:14 回读 `10.30`。Task、operation、item、attempt 均为成功/VERIFIED，result receipt 为 WRITTEN，锁已释放，continuation 为 COMPLETE，活动 Queue 为 0。Stage Goal 不由本次实现者自行裁决，保持 **NOT YET VALIDATED / WAIT OWNER**。
+
+Task 13.7-2A 已在 Draft PR [#52](https://github.com/etereath/PRA-project/pull/52) 形成合同候选：Product/Mapping/Rule/Inventory/Observation/Human Decision/ShadowBot identity authority matrix、GQB-1～GQB-4 最小 blocker、UNKNOWN 当前责任、`a3485af` selective salvage 和 2B/2C/2D 输入均已写入现役业务合同、目标责任矩阵与开发流程。五项 Open Decisions 已在候选中冻结为 `NOT_INITIALIZED` 库存语义、Rule workbook authority、显式 account-aware mapping identity、fact-only qualification contract 和 GQB Proposal workflow。本批仅修改文档并同步 main；未切换真实 Runtime authority、未执行平台写、未开始 2B/2C/2D 实现。2A 当前为 **CONTRACT CANDIDATE / WAIT OWNER-REVIEWER ACCEPTANCE**，下游仍受 #52 接受门禁约束。
 
 | 项目 | 状态 | 依据/下一步 |
 |---|---|---|
@@ -15,11 +17,12 @@ PR [#47](https://github.com/etereath/PRA-project/pull/47)、RM0 交付 PR [#49](
 | Task 13.6-3 | PASS | 负责人接受语义快照 `4d51f51`；PR #46 已合并，正式 AGENTS 与 Canonical 已进入 main |
 | Task 13.6 Overall | PASS | G1/G2、入口/正式AGENTS及负责人最终验收已收口；验收记录见阶段报告追加节 |
 | Task 13.7 Readiness | READY | 业务与文档交接条件通过；首条纵切计划/Goal已准备 |
+| Task 13.7-2A Authority & Continuity Contract | CONTRACT CANDIDATE / WAIT ACCEPTANCE | Draft PR #52；已完成 Authority Matrix、五项 Open Decisions、GQB/UNKNOWN 合同、legacy 分类及 2B/2C/2D 输入；未切换 Runtime authority |
 | Task 13.7-1 开工交接 | COMPLETE | Codex 已在原分支/PR 承接，没有另建计划 PR |
 | Task 13.7-1 代码实现 | 已合并 / 复核 PASS | #47 已进入 main `08f4e70`；正式人工收口及催办、目标已满足时确认结束决定、回执刷新持久状态；Schema 目标仍为 v18 |
 | Task 13.7-1 隔离旅程 | P1/P2 定向回归 PASS | P1 人工收口与后续执行、P2 零写结束及实时回执已有隔离证据；测试时序修复后的 4 个失败用例定向通过，完整门禁见下节 |
 | Windows CI 时序修复 | 已修复并验证 | `scan()` 保持整秒精度，必要时等待到旧执行停止后的下一整秒；`eb6e24b` 的 Windows / Linux Core CI 完整通过 |
-| 开发文档治理 | PR #56 P2 整改完成 / 待复审 | 根 AGENTS 已补充用户既有完整验证授权复用及高风险验证不得降级；WHY/HOW 文档已统一完整 Gate 与同 Head 重跑授权语义；草稿缩为只指向 Canonical rule 的决策记录 |
+| 开发文档治理 | MERGED | PR #56 已进入 main `08530db`；根 AGENTS 已补充用户既有完整验证授权复用及高风险验证不得降级，WHY/HOW 文档已统一完整 Gate 与同 Head 重跑授权语义 |
 | Task 13.7-1 Implementation Review | PASS | 2026-09-07 用户最终裁决；冻结问题 P1-47-01、P2-47-01、P2-47-02 全部 CLOSED，无遗留冻结问题 |
 | #47 合并与最终检查 | MERGED / SUCCESS | merge commit `08f4e70`；最终 Head `1011091` 的 Windows / Linux Core 均 SUCCESS |
 | Task 13.7-1 RM0 / RM0.5 | PASS WITH HISTORICAL DEBT / PREFLIGHT READY | 旧 `WEB7E-6646…` 保留审计；B/C/D 三个艾莎 SKU 已由负责人确认并完成受控 VERIFIED mapping，当前无活动执行 blocker |
