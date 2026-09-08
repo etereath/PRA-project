@@ -5,7 +5,9 @@ import io
 import json
 import re
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 from urllib.parse import urlencode
 from wsgiref.simple_server import WSGIRequestHandler
@@ -33,8 +35,14 @@ from app.operations_web.presenters import (
     _render_review_controls,
 )
 from app.operations_web.read_models import AutomationControlReadModel
-from app.enums import AutomationRunStatus, ReviewTaskStatus
-from app.models import ReviewTask
+from app.enums import (
+    AutomationRunStatus,
+    ReviewTaskStatus,
+    TaskActionType,
+    TaskOriginType,
+    TaskStatus,
+)
+from app.models import ReviewTask, Task, TaskStatusHistory
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.automation_repository import AutomationRepository
 from app.repositories.operational_incident_repository import (
@@ -45,7 +53,10 @@ from app.services.automation import (
     PLATFORM_TRADE_DAY_SETTLEMENT,
     ensure_default_automation_jobs,
 )
-from app.services.manual_task_orchestration import ManualTaskScopeOptions
+from app.services.manual_task_orchestration import (
+    ManualTaskRequest,
+    ManualTaskScopeOptions,
+)
 from app.services.security import (
     LoginRateLimiter,
     clear_security_audit_events,
@@ -130,14 +141,14 @@ def call_app(
     path: str,
     method: str = "GET",
     query: str = "",
-    form: dict[str, str] | None = None,
+    form: dict[str, str | list[str]] | None = None,
     json_body: dict[str, object] | None = None,
     cookie: str = "",
 ):
     encoded = (
         json.dumps(json_body, ensure_ascii=False).encode("utf-8")
         if json_body is not None
-        else urlencode(form or {}).encode("utf-8")
+        else urlencode(form or {}, doseq=True).encode("utf-8")
     )
     environ = {
         "REQUEST_METHOD": method,
@@ -467,6 +478,7 @@ def test_all_get_routes_are_zero_write_and_never_initialize_schema(operations_we
         ("/database/quality", authenticated_cookie, {"200"}),
         ("/database/product/NO-SUCH-PRODUCT", authenticated_cookie, {"404"}),
         ("/management", authenticated_cookie, {"200"}),
+        ("/management/queue", authenticated_cookie, {"200"}),
         ("/management/task/NO-SUCH-TASK", authenticated_cookie, {"404"}),
         ("/management/review/NO-SUCH-REVIEW", authenticated_cookie, {"404"}),
         ("/system", authenticated_cookie, {"200"}),
@@ -1051,9 +1063,437 @@ def test_manual_task_dialog_hides_conditional_fields_and_blocks_empty_platforms(
     ).read_text(encoding="utf-8")
 
     assert "当前没有可操作的平台商品" in content
-    assert '<button type="submit" disabled>预览任务</button>' in content
-    assert "data-inventory-field hidden" in content
+    assert '<button type="submit" disabled>生成逐项预览</button>' in content
+    assert 'name="price_value"' not in content
+    assert 'name="target_inventory"' not in content
     assert "[hidden] { display: none !important; }" in styles
+
+
+def test_manual_task_preview_requires_a_separate_final_confirmation() -> None:
+    item = SimpleNamespace(
+        item_key="sha256:item-a",
+        variety="艾莎",
+        grade="A级",
+        platform_name="蚂蚁花团供应商",
+        current_status="online",
+        current_price=Decimal("12.00"),
+        current_platform_inventory=20,
+        base_cost=Decimal("5.00"),
+        input_price_value=Decimal("13.50"),
+        target_inventory=None,
+        excluded=False,
+        blockers=(),
+        warnings=("最近一次定时商品扫描已经过期，请确认仍要继续。",),
+    )
+    preview = SimpleNamespace(
+        request=SimpleNamespace(action="SET_PRICE"),
+        items=(item,),
+        errors=(),
+        included_items=(item,),
+        preview_digest="sha256:preview",
+    )
+
+    content = _render_manual_task_controls(
+        csrf_token="csrf",
+        options=ManualTaskScopeOptions(
+            varieties=("艾莎",),
+            grades=("A级",),
+            platforms=("蚂蚁花团供应商",),
+        ),
+        preview=preview,
+        preview_token="preview-token",
+        receipt=(),
+        error="",
+        idempotency_key="manual-task-test",
+    )
+
+    assert 'data-auto-open' in content
+    assert 'action="/management/tasks/create"' in content
+    assert 'id="manual-task-create-form"' in content
+    assert 'name="item_price_values"' in content
+    assert 'value="13.50"' in content
+    assert "继续确认" in content
+    assert 'id="manual-task-final-dialog"' in content
+    assert "确认创建并立即执行？" in content
+    assert "确认执行" in content
+    assert "扫描信息需确认" in content
+    assert "但不会阻止人工任务" in content
+    assert "最近一次定时商品扫描已经过期" in content
+    assert "提醒：最近一次定时商品扫描已经过期" not in content
+    assert "预览执行影响" not in content
+
+
+def test_manual_task_preview_revalidates_editable_values_in_the_browser() -> None:
+    item = SimpleNamespace(
+        item_key="sha256:item-a",
+        variety="艾莎",
+        grade="A级",
+        platform_name="蚂蚁花团供应商",
+        current_status="online",
+        current_price=Decimal("12.00"),
+        current_platform_inventory=20,
+        base_cost=Decimal("5.00"),
+        input_price_value=Decimal("12.00"),
+        target_inventory=None,
+        excluded=False,
+        blockers=("目标价格与当前价格相同，请修改后再执行。",),
+        warnings=(),
+    )
+    preview = SimpleNamespace(
+        request=SimpleNamespace(action="SET_PRICE"),
+        items=(item,),
+        errors=(),
+        included_items=(item,),
+        preview_digest="sha256:preview",
+    )
+
+    content = _render_manual_task_controls(
+        csrf_token="csrf",
+        options=ManualTaskScopeOptions(
+            varieties=("艾莎",),
+            grades=("A级",),
+            platforms=("蚂蚁花团供应商",),
+        ),
+        preview=preview,
+        preview_token="preview-token",
+        receipt=(),
+        error="",
+        idempotency_key="manual-task-test",
+    )
+    script = (
+        Path(__file__).resolve().parents[1]
+        / "app"
+        / "operations_web"
+        / "static"
+        / "app.js"
+    ).read_text(encoding="utf-8")
+
+    assert 'data-action="SET_PRICE"' in content
+    assert 'data-current-price="12.00"' in content
+    assert 'data-base-cost="5.00"' in content
+    assert 'data-structural-blocked="0"' in content
+    assert "data-manual-task-price" in content
+    assert "data-manual-task-item-status" in content
+    assert "refreshManualTaskPreview" in script
+    assert "priceValue === currentPrice" in script
+    assert 'addEventListener(\n    "input",\n    refreshManualTaskPreview' in script
+
+
+def test_manual_task_confirmation_creates_and_submits_the_exact_preview_batch(
+    operations_web,
+    monkeypatch,
+) -> None:
+    app, container, _ = operations_web
+    _, authenticated = login(app, container)
+    session = container.sessions.get(authenticated)
+    assert session is not None and session.principal is not None
+    item_key = "sha256:item-a"
+    request = ManualTaskRequest(
+        varieties=("艾莎",),
+        grades=("A级",),
+        platforms=("蚂蚁花团供应商",),
+        action="SET_OFFLINE",
+        idempotency_key="direct-create-test",
+    )
+    preview = SimpleNamespace(
+        request=request,
+        items=(SimpleNamespace(item_key=item_key),),
+        preview_digest="sha256:original",
+    )
+    preview_token = app.control_store.put(session.principal.subject, preview)
+    calls: list[tuple[str, tuple[str, ...]]] = []
+
+    class ManualTasks:
+        @staticmethod
+        def preview(confirmed_request):
+            assert confirmed_request.excluded_item_keys == ()
+            assert confirmed_request.item_values[0].item_key == item_key
+            return SimpleNamespace(preview_digest="sha256:confirmed")
+
+        @staticmethod
+        def create(confirmed_request, **kwargs):
+            assert kwargs["expected_preview_digest"] == "sha256:confirmed"
+            return SimpleNamespace(
+                status="CREATED",
+                task_ids=("TASK-1",),
+                origin_ref_id="web-manual:test:key",
+            )
+
+    class ExecutionAuthorization:
+        @staticmethod
+        def prepare_execution(principal, task_ids, idempotency_key):
+            calls.append(("prepare", tuple(task_ids)))
+            return SimpleNamespace(
+                task_ids=tuple(task_ids),
+                confirmation_digest="sha256:execution",
+                idempotency_key=idempotency_key,
+            )
+
+        @staticmethod
+        def submit_execution(principal, task_ids, digest, idempotency_key):
+            calls.append(("submit", tuple(task_ids)))
+            return SimpleNamespace(task_ids=tuple(task_ids))
+
+    monkeypatch.setattr(app, "manual_tasks", ManualTasks())
+    monkeypatch.setattr(app, "execution_authorization", ExecutionAuthorization())
+    monkeypatch.setattr(
+        container.runtime_repository,
+        "get_task",
+        lambda task_id: SimpleNamespace(
+            task_id=task_id,
+            platform_name="蚂蚁花团供应商",
+            action_type=TaskActionType.SET_OFFLINE,
+            task_status=TaskStatus.PENDING,
+        ),
+    )
+
+    status, headers, _ = call_app(
+        app,
+        path="/management/tasks/create",
+        method="POST",
+        cookie=authenticated,
+        form={
+            "csrf_token": session.csrf_token,
+            "preview_token": preview_token,
+            "item_keys": [item_key],
+            "included_item_keys": [item_key],
+            "item_price_values": [""],
+            "item_target_inventories": [""],
+        },
+    )
+
+    assert status == "303 See Other"
+    assert header_values(headers, "Location")[0].startswith(
+        "/management?execution_receipt="
+    )
+    assert calls == [
+        ("prepare", ("TASK-1",)),
+        ("submit", ("TASK-1",)),
+    ]
+
+
+def test_task_queue_batch_cancel_is_audited_and_keeps_queue_files_unchanged(
+    operations_web,
+) -> None:
+    app, container, root = operations_web
+    repository = container.runtime_repository
+    now = datetime.now(timezone.utc)
+    pending = Task(
+        task_id="TASK-CANCEL-PENDING",
+        internal_sku="AISHA-B-60-Z",
+        platform_name="蚂蚁花团供应商",
+        action_type=TaskActionType.SET_ONLINE,
+        priority=50,
+        task_status=TaskStatus.PENDING,
+        created_at=now,
+        origin_type=TaskOriginType.MANUAL,
+        origin_ref_id="web:cancel-test",
+    )
+    failed = Task(
+        task_id="TASK-CANCEL-FAILED",
+        internal_sku="AISHA-C-55-Z",
+        platform_name="蚂蚁花团供应商",
+        action_type=TaskActionType.SET_ONLINE,
+        priority=50,
+        task_status=TaskStatus.FAILED,
+        created_at=now,
+        origin_type=TaskOriginType.AUTOMATION,
+        origin_ref_id="automation:cancel-test",
+    )
+    repository.insert_tasks([pending, failed])
+    _, authenticated = login(app, container)
+    session = container.sessions.get(authenticated)
+    assert session is not None and session.principal is not None
+    before_queue = snapshot_tree(root / "queue")
+
+    status, headers, _ = call_app(
+        app,
+        path="/management/queue/cancel",
+        method="POST",
+        cookie=authenticated,
+        form={
+            "csrf_token": session.csrf_token,
+            "task_ids": [pending.task_id, failed.task_id],
+        },
+    )
+
+    assert status == "303 See Other"
+    location = header_values(headers, "Location")[0]
+    assert location.startswith("/management/queue?cancel_receipt=")
+    assert repository.get_task(pending.task_id).task_status is TaskStatus.CANCELLED
+    assert repository.get_task(failed.task_id).task_status is TaskStatus.CANCELLED
+    for task_id in (pending.task_id, failed.task_id):
+        history = repository.list_task_status_history(task_id)
+        assert len(history) == 1
+        assert history[0].reason == "operator_batch_cancel"
+        assert history[0].changed_by == session.principal.subject
+        assert history[0].to_status is TaskStatus.CANCELLED
+    assert snapshot_tree(root / "queue") == before_queue
+
+    _, _, body = call_app(
+        app,
+        path="/management/queue",
+        query=location.partition("?")[2],
+        cookie=authenticated,
+    )
+    assert "已取消 2 项任务" in body
+
+
+def test_task_queue_batch_cancel_rejects_mixed_ineligible_set_atomically(
+    operations_web,
+) -> None:
+    app, container, _ = operations_web
+    repository = container.runtime_repository
+    now = datetime.now(timezone.utc)
+    pending = Task(
+        task_id="TASK-CANCEL-ATOMIC-PENDING",
+        internal_sku="AISHA-B-60-Z",
+        platform_name="蚂蚁花团供应商",
+        action_type=TaskActionType.SET_ONLINE,
+        priority=50,
+        task_status=TaskStatus.PENDING,
+        created_at=now,
+        origin_type=TaskOriginType.MANUAL,
+        origin_ref_id="web:cancel-atomic",
+    )
+    running = Task(
+        task_id="TASK-CANCEL-ATOMIC-RUNNING",
+        internal_sku="AISHA-C-55-Z",
+        platform_name="蚂蚁花团供应商",
+        action_type=TaskActionType.SET_ONLINE,
+        priority=50,
+        task_status=TaskStatus.RUNNING,
+        created_at=now,
+        origin_type=TaskOriginType.MANUAL,
+        origin_ref_id="web:cancel-atomic",
+    )
+    repository.insert_tasks([pending, running])
+    _, authenticated = login(app, container)
+    session = container.sessions.get(authenticated)
+    assert session is not None
+
+    status, headers, _ = call_app(
+        app,
+        path="/management/queue/cancel",
+        method="POST",
+        cookie=authenticated,
+        form={
+            "csrf_token": session.csrf_token,
+            "task_ids": [pending.task_id, running.task_id],
+        },
+    )
+
+    assert status == "303 See Other"
+    assert "cancel_error=" in header_values(headers, "Location")[0]
+    assert repository.get_task(pending.task_id).task_status is TaskStatus.PENDING
+    assert repository.get_task(running.task_id).task_status is TaskStatus.RUNNING
+    assert repository.list_task_status_history(pending.task_id) == []
+
+
+def test_task_queue_batch_cancel_rejects_task_already_in_file_queue_and_bad_csrf(
+    operations_web,
+) -> None:
+    app, container, root = operations_web
+    repository = container.runtime_repository
+    task = Task(
+        task_id="TASK-CANCEL-QUEUED",
+        internal_sku="AISHA-B-60-Z",
+        platform_name="蚂蚁花团供应商",
+        action_type=TaskActionType.SET_ONLINE,
+        priority=50,
+        task_status=TaskStatus.PENDING,
+        created_at=datetime.now(timezone.utc),
+        origin_type=TaskOriginType.MANUAL,
+        origin_ref_id="web:cancel-queued",
+    )
+    repository.insert_task(task)
+    ready = root / "queue" / "inbox" / "ATTEMPT-CANCEL-QUEUED.ready.json"
+    ready.write_text(
+        json.dumps(
+            {
+                "execution_attempt_id": "ATTEMPT-CANCEL-QUEUED",
+                "items": [{"source_task_id": task.task_id}],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    _, authenticated = login(app, container)
+    session = container.sessions.get(authenticated)
+    assert session is not None
+    before_ready = (ready.stat().st_size, ready.stat().st_mtime_ns, ready.read_bytes())
+
+    bad_status, _, _ = call_app(
+        app,
+        path="/management/queue/cancel",
+        method="POST",
+        cookie=authenticated,
+        form={"csrf_token": "invalid", "task_ids": task.task_id},
+    )
+    status, headers, _ = call_app(
+        app,
+        path="/management/queue/cancel",
+        method="POST",
+        cookie=authenticated,
+        form={"csrf_token": session.csrf_token, "task_ids": task.task_id},
+    )
+
+    assert bad_status == "403 Forbidden"
+    assert status == "303 See Other"
+    assert "cancel_error=" in header_values(headers, "Location")[0]
+    assert repository.get_task(task.task_id).task_status is TaskStatus.PENDING
+    assert repository.list_task_status_history(task.task_id) == []
+    assert (ready.stat().st_size, ready.stat().st_mtime_ns, ready.read_bytes()) == before_ready
+
+
+def test_task_queue_repository_cancellation_rolls_back_on_status_race(
+    operations_web,
+) -> None:
+    _, container, _ = operations_web
+    repository = container.runtime_repository
+    now = datetime.now(timezone.utc)
+    tasks = [
+        Task(
+            task_id=f"TASK-CANCEL-RACE-{index}",
+            internal_sku=f"AISHA-{index}-50-Z",
+            platform_name="蚂蚁花团供应商",
+            action_type=TaskActionType.SET_OFFLINE,
+            priority=50,
+            task_status=TaskStatus.PENDING,
+            created_at=now,
+            origin_type=TaskOriginType.MANUAL,
+            origin_ref_id="web:cancel-race",
+        )
+        for index in range(2)
+    ]
+    repository.insert_tasks(tasks)
+    histories = [
+        TaskStatusHistory(
+            history_id=f"HISTORY-CANCEL-RACE-{index}",
+            task_id=task.task_id,
+            from_status=(TaskStatus.PENDING if index == 0 else TaskStatus.FAILED),
+            to_status=TaskStatus.CANCELLED,
+            changed_by="admin",
+            changed_at=now,
+            reason="operator_batch_cancel",
+        )
+        for index, task in enumerate(tasks)
+    ]
+
+    with pytest.raises(ValueError, match="status changed"):
+        repository.cancel_tasks_with_histories(
+            [
+                (task.task_id, history.from_status, history)
+                for task, history in zip(tasks, histories, strict=True)
+            ],
+            result_message="任务已由运营人员取消。",
+        )
+
+    assert all(
+        repository.get_task(task.task_id).task_status is TaskStatus.PENDING
+        for task in tasks
+    )
+    assert all(repository.list_task_status_history(task.task_id) == [] for task in tasks)
 
 
 def test_operator_copy_humanizes_schedules_and_hides_internal_receipt_ids() -> None:
@@ -1114,7 +1554,7 @@ def test_static_assets_must_revalidate_after_deployment(operations_web) -> None:
     _, authenticated = login(app, container)
     _, _, page_body = call_app(app, path="/management", cookie=authenticated)
     assert '/static/app.css?v=7f' in page_body
-    assert '/static/app.js?v=7f' in page_body
+    assert '/static/app.js?v=7f2' in page_body
 
 
 def test_web_and_background_service_startup_scripts_are_independent() -> None:

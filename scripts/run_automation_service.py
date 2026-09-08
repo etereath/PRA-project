@@ -27,6 +27,7 @@ from app.services.automation import (  # noqa: E402
     AutomationService,
     ensure_default_automation_jobs,
     safe_automation_error_message,
+    ONLINE_PULSE,
 )
 from app.services.incident_automation import (  # noqa: E402
     build_incident_notification_handlers,
@@ -35,6 +36,9 @@ from app.services.incident_automation import (  # noqa: E402
 from app.services.maintenance_automation import (  # noqa: E402
     build_maintenance_handlers,
     ensure_release_backup_automation_job,
+)
+from app.services.listing_automation_runtime import (  # noqa: E402
+    build_listing_read_only_handlers,
 )
 from app.services.operational_time import (  # noqa: E402
     OperationalTimeService,
@@ -64,6 +68,9 @@ DEFAULT_SHADOWBOT_QUEUE_DIR = Path(
 )
 DEFAULT_PRICE_RULES = PROJECT_ROOT / "data" / "samples" / "price_rules.xlsx"
 DEFAULT_LISTING_RULES = PROJECT_ROOT / "data" / "samples" / "listing_rules.xlsx"
+DEFAULT_IDENTITY_MAPPING = (
+    PROJECT_ROOT / "shadowbot" / "test2" / "product_identity_mapping.json"
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -92,11 +99,35 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-runs-per-cycle", type=int, default=8)
     parser.add_argument("--max-windows-per-job", type=int, default=16)
     parser.add_argument(
+        "--read-only-scans-only",
+        action="store_true",
+        help=(
+            "Run the formal scheduler with only selected READ_ONLY scan "
+            "handlers and materialize no unrelated business runs."
+        ),
+    )
+    parser.add_argument(
         "--enable-order-read-only",
         action="store_true",
         help=(
             "Register only FULL_MARKET_SCAN order dispatch and ORDER_SCAN "
             "READ_ONLY handlers; no platform-write handler is registered."
+        ),
+    )
+    parser.add_argument(
+        "--enable-listing-read-only",
+        action="store_true",
+        help=(
+            "Register FULL_MARKET_SCAN and LISTING_STATUS_SCAN READ_ONLY "
+            "handlers by reusing the Task 13 SYNC_STATUS chain."
+        ),
+    )
+    parser.add_argument(
+        "--online-pulse-only",
+        action="store_true",
+        help=(
+            "受控验收时只注册 ONLINE_PULSE 上架中扫描；必须同时启用"
+            "只读扫描模式和商品只读扫描。"
         ),
     )
     parser.add_argument(
@@ -120,6 +151,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--shadowbot-queue-dir",
         type=Path,
         default=DEFAULT_SHADOWBOT_QUEUE_DIR,
+    )
+    parser.add_argument(
+        "--identity-mapping",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "PRA_SHADOWBOT_IDENTITY_MAPPING",
+                DEFAULT_IDENTITY_MAPPING,
+            )
+        ),
+    )
+    parser.add_argument(
+        "--applet-uri",
+        default=os.environ.get("SHADOWBOT_APPLET_URI", ""),
     )
     parser.add_argument(
         "--enable-release-backup",
@@ -225,6 +270,39 @@ def _validate_formal_rule_configuration(args: argparse.Namespace) -> dict[str, s
     )
 
 
+def _service_mode(args: argparse.Namespace) -> str:
+    listing = bool(args.enable_listing_read_only)
+    order = bool(args.enable_order_read_only)
+    incident = bool(args.enable_incident_monitoring)
+    if args.online_pulse_only:
+        return "ONLINE_PULSE_ONLY"
+    if args.read_only_scans_only:
+        if listing and order:
+            return "LISTING_ORDER_READ_ONLY_SCANS_ONLY"
+        if listing:
+            return "LISTING_READ_ONLY_SCANS_ONLY"
+        return "ORDER_READ_ONLY_SCANS_ONLY"
+    if listing and order:
+        return (
+            "LISTING_ORDER_READ_ONLY_INCIDENT_AND_SETTLEMENT"
+            if incident
+            else "LISTING_ORDER_READ_ONLY_AND_SETTLEMENT"
+        )
+    if listing:
+        return (
+            "LISTING_READ_ONLY_INCIDENT_AND_SETTLEMENT"
+            if incident
+            else "LISTING_READ_ONLY_AND_SETTLEMENT"
+        )
+    if order:
+        return (
+            "ORDER_READ_ONLY_INCIDENT_AND_SETTLEMENT"
+            if incident
+            else "ORDER_READ_ONLY_AND_SETTLEMENT"
+        )
+    return "INCIDENT_AND_SETTLEMENT" if incident else "SETTLEMENT_ONLY"
+
+
 def main() -> int:
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -241,6 +319,28 @@ def main() -> int:
     if args.enable_worker_recovery and not args.enable_incident_monitoring:
         raise ValueError(
             "--enable-worker-recovery 要求同时启用 --enable-incident-monitoring。"
+        )
+    if args.read_only_scans_only and not (
+        args.enable_listing_read_only or args.enable_order_read_only
+    ):
+        raise ValueError(
+            "--read-only-scans-only 至少需要启用一种只读扫描。"
+        )
+    if args.read_only_scans_only and (
+        args.enable_incident_monitoring
+        or args.enable_worker_recovery
+        or args.enable_release_backup
+    ):
+        raise ValueError(
+            "只读扫描模式不能同时注册异常维护、Worker 恢复或发布备份。"
+        )
+    if args.online_pulse_only and not (
+        args.read_only_scans_only
+        and args.enable_listing_read_only
+        and not args.enable_order_read_only
+    ):
+        raise ValueError(
+            "--online-pulse-only 要求仅启用商品只读扫描模式。"
         )
     if args.enable_release_backup and (
         args.release_wheel is None or args.backup_dir is None
@@ -286,20 +386,23 @@ def main() -> int:
             operational_time = OperationalTimeService(
                 policies=repository.load_operational_time_policies()
             )
-            _validate_formal_rule_configuration(args)
-            handlers = dict(
-                build_sales_settlement_handlers(
-                    runtime_repository=runtime_repository,
-                    platform_name=args.platform_name,
+            if args.read_only_scans_only:
+                handlers = {}
+            else:
+                _validate_formal_rule_configuration(args)
+                handlers = dict(
+                    build_sales_settlement_handlers(
+                        runtime_repository=runtime_repository,
+                        platform_name=args.platform_name,
+                    )
                 )
-            )
-            handlers.update(
-                build_operations_control_handlers(
-                    runtime_repository=runtime_repository,
-                    price_rules_path=args.price_rules,
-                    listing_rules_path=args.listing_rules,
+                handlers.update(
+                    build_operations_control_handlers(
+                        runtime_repository=runtime_repository,
+                        price_rules_path=args.price_rules,
+                        listing_rules_path=args.listing_rules,
+                    )
                 )
-            )
             if args.enable_order_read_only:
                 handlers.update(
                     build_order_read_only_handlers(
@@ -309,6 +412,29 @@ def main() -> int:
                         timeout_seconds=args.order_timeout_seconds,
                     )
                 )
+            if args.enable_listing_read_only:
+                mapping_path = args.identity_mapping.resolve(strict=True)
+                if mapping_path.suffix.lower() != ".json":
+                    raise ValueError(
+                        "商品状态定时扫描必须使用版本化 JSON 身份映射。"
+                    )
+                listing_handlers = dict(
+                    build_listing_read_only_handlers(
+                        runtime_repository=runtime_repository,
+                        queue_dir=args.shadowbot_queue_dir,
+                        mapping_path=mapping_path,
+                        full_market_parent_handler=handlers.get(
+                            "FULL_MARKET_SCAN"
+                        ),
+                        applet_uri=args.applet_uri,
+                        timeout_seconds=args.order_timeout_seconds,
+                    )
+                )
+                if args.online_pulse_only:
+                    listing_handlers = {
+                        ONLINE_PULSE: listing_handlers[ONLINE_PULSE]
+                    }
+                handlers.update(listing_handlers)
             if args.enable_incident_monitoring:
                 worker_recovery = (
                     build_worker_recovery_coordinator_from_environment(
@@ -365,6 +491,9 @@ def main() -> int:
                 lease_seconds=args.lease_seconds,
                 max_runs_per_cycle=args.max_runs_per_cycle,
                 max_windows_per_job=args.max_windows_per_job,
+                materialize_only_registered_handlers=(
+                    args.read_only_scans_only
+                ),
             )
             while True:
                 cycle_started_at = datetime.now(timezone.utc)
@@ -373,20 +502,7 @@ def main() -> int:
                 payload = {
                     "schema_version": "automation-heartbeat-1.0",
                     "status": "RUNNING",
-                    "mode": (
-                        "ORDER_READ_ONLY_INCIDENT_AND_SETTLEMENT"
-                        if args.enable_order_read_only
-                        and args.enable_incident_monitoring
-                        else (
-                            "ORDER_READ_ONLY_AND_SETTLEMENT"
-                            if args.enable_order_read_only
-                            else (
-                                "INCIDENT_AND_SETTLEMENT"
-                                if args.enable_incident_monitoring
-                                else "SETTLEMENT_ONLY"
-                            )
-                        )
-                    ),
+                    "mode": _service_mode(args),
                     "registered_job_types": sorted(handlers),
                     "platform_write_handlers_registered": False,
                     "worker_recovery_handler_registered": bool(

@@ -605,7 +605,50 @@ def listing_snapshot_to_observation_batch(
 ) -> ProductObservationBatchInput:
     """Adapt one validated Task 13 two-page snapshot to the v14 input."""
 
-    validate_listing_sync_snapshot(snapshot)
+    return _listing_snapshot_to_observation_batch(
+        snapshot,
+        automation_run_id=automation_run_id,
+        source_manifest_sha256=source_manifest_sha256,
+        source_result_sha256=source_result_sha256,
+        scan_type=LISTING_STATUS_SCAN,
+        operational_time=operational_time,
+    )
+
+
+def listing_online_snapshot_to_observation_batch(
+    snapshot: dict[str, object],
+    *,
+    automation_run_id: str,
+    source_manifest_sha256: str,
+    source_result_sha256: str,
+    operational_time: OperationalTimeService | None = None,
+) -> ProductObservationBatchInput:
+    """Adapt one validated online-only snapshot to the v14 input."""
+
+    return _listing_snapshot_to_observation_batch(
+        snapshot,
+        automation_run_id=automation_run_id,
+        source_manifest_sha256=source_manifest_sha256,
+        source_result_sha256=source_result_sha256,
+        scan_type=ONLINE_PULSE,
+        operational_time=operational_time,
+    )
+
+
+def _listing_snapshot_to_observation_batch(
+    snapshot: dict[str, object],
+    *,
+    automation_run_id: str,
+    source_manifest_sha256: str,
+    source_result_sha256: str,
+    scan_type: str,
+    operational_time: OperationalTimeService | None,
+) -> ProductObservationBatchInput:
+    scan_scope = (
+        "online" if scan_type == ONLINE_PULSE else "online_and_waiting"
+    )
+
+    validate_listing_sync_snapshot(snapshot, scan_scope=scan_scope)
     manifest_sha256 = source_manifest_sha256.strip().lower()
     result_sha256 = source_result_sha256.strip().lower()
     if not EVIDENCE_SHA256_RE.fullmatch(manifest_sha256):
@@ -656,7 +699,7 @@ def listing_snapshot_to_observation_batch(
         ),
         automation_run_id=automation_run_id,
         platform_name=str(snapshot["platform_name"]),
-        scan_type=LISTING_STATUS_SCAN,
+        scan_type=scan_type,
         batch_status="ACCEPTED" if snapshot_complete else "FAILED",
         scan_started_at=_parse_datetime(
             snapshot["scan_started_at"],
@@ -667,9 +710,17 @@ def listing_snapshot_to_observation_batch(
             "scan_completed_at",
         ),
         requested_scope={
-            "child_type": LISTING_STATUS_SCAN,
-            "pages": ["online", "waiting"],
-            "source_snapshot_id": snapshot["snapshot_id"],
+            "child_type": scan_type,
+            "pages": (
+                ["online"]
+                if scan_type == ONLINE_PULSE
+                else ["online", "waiting"]
+            ),
+            (
+                "source_listing_snapshot_id"
+                if scan_type == ONLINE_PULSE
+                else "source_snapshot_id"
+            ): snapshot["snapshot_id"],
             "source_manifest_sha256": manifest_sha256,
             "source_result_sha256": result_sha256,
             "source_platform_trade_date": source_trade_date,
@@ -681,7 +732,10 @@ def listing_snapshot_to_observation_batch(
         scope_complete=snapshot_complete,
         end_marker_verified=bool(
             snapshot["online_end_marker_verified"]
-            and snapshot["waiting_end_marker_verified"]
+            and (
+                scan_type == ONLINE_PULSE
+                or snapshot["waiting_end_marker_verified"]
+            )
         ),
         items=items,
         error_code=str(snapshot.get("error_code") or ""),

@@ -954,7 +954,24 @@ def test_verification_intervention_has_priority_and_short_deadline(repository):
     assert claimed.notification_id == verification.notification_id
     assert claimed.priority == 100
     assert claimed.deadline_at == now + timedelta(seconds=300)
-    assert claimed.payload["message"] == "需要验证码：蚂蚁花团供应商登录，请立即处理"
+    assert claimed.payload["message"] == (
+        "蚂蚁花团供应商登录需要验证码，请在手机端完成验证后点击“处理完毕”。"
+    )
+
+
+def test_queue_blocked_notification_uses_clear_feishu_title() -> None:
+    notification = replace(
+        _notification("N-QUEUE-BLOCKED"),
+        notification_type="task_queue_blocked",
+        payload={"message": "任务队列受阻"},
+    )
+
+    body = notification_outbox_module._build_feishu_outbox_body(
+        notification,
+        "post",
+    )
+
+    assert body["content"]["post"]["zh_cn"]["title"] == "任务队列受阻"
 
 
 def test_expired_review_message_is_business_readable_beijing_time(repository):
@@ -972,7 +989,7 @@ def test_expired_review_message_is_business_readable_beijing_time(repository):
     )
 
     assert candidate.payload["message"].splitlines() == [
-        "复核已超时：艾莎 D级价格异常待处理",
+        "人工处理已超时：艾莎 D级价格异常待处理",
         "超时时间：2026-07-17 18:00（北京时间）",
     ]
 
@@ -1072,7 +1089,7 @@ def test_feishu_worker_sends_ephemeral_mobile_review_link_without_persisting_tok
 
     assert delivered is not None and delivered.status == "SENT"
     serialized_body = json.dumps(captured["body"], ensure_ascii=False)
-    assert captured["body"]["content"]["post"]["zh_cn"]["title"] == "人工复核"
+    assert captured["body"]["content"]["post"]["zh_cn"]["title"] == "执行结果确认"
     assert (
         "https://pra.example/mobile/review/REVIEW-MOBILE-LINK?token="
         in serialized_body
@@ -1101,7 +1118,7 @@ def test_review_notification_formats_aware_deadline_as_beijing_time(
         repository
     ).create_review_task_atomically(review)[2]
 
-    assert "复核截止：2026-07-26 07:29（北京时间）" in outbox.payload[
+    assert "处理期限：2026-07-26 07:29（北京时间）" in outbox.payload[
         "message"
     ]
     assert "+00:00" not in outbox.payload["message"]
@@ -1132,10 +1149,36 @@ def test_execution_failure_review_notification_names_retry_and_cancel_results(
     ).create_review_task_atomically(review)[2]
 
     assert "可选结果：重试任务 / 取消任务" in outbox.payload["message"]
-    assert "任务组：RULE-GROUP-NOTIFY-001（2 条待复核任务）" in outbox.payload[
-        "message"
+    assert "范围：2 个商品" in outbox.payload["message"]
+    assert "RULE-GROUP-NOTIFY-001" not in outbox.payload["message"]
+    assert "SKU-A" not in outbox.payload["message"]
+
+
+def test_unknown_reconcile_notification_uses_operator_language(repository, monkeypatch):
+    monkeypatch.setenv("DEFAULT_NOTIFICATION_CHANNEL", "feishu")
+    review = _review("REVIEW-READABLE-RECONCILE")
+    review.reason = "只读 RECONCILE 仍无法确认执行结果，需要人工复核"
+    review.scope_type = "task_group"
+    review.scope_key = "MANUAL-GROUP-INTERNAL"
+    review.platform_name = "蚂蚁花团供应商"
+    review.review_payload = {
+        "review_subject": "task_group",
+        "task_group_id": "MANUAL-GROUP-INTERNAL",
+        "affected_task_count": 1,
+        "action_type": TaskActionType.SET_ONLINE.value,
+        "action_types": [TaskActionType.SET_ONLINE.value],
+    }
+
+    outbox = OutboxReviewNotificationService(
+        repository
+    ).create_review_task_atomically(review)[2]
+
+    assert outbox.payload["message"].splitlines()[:2] == [
+        "执行结果确认：自动核对后仍无法确认商品是否成功上架，请在平台检查实际状态。",
+        "范围：蚂蚁花团供应商 · 1 个商品",
     ]
-    assert "商品：SKU-A、SKU-B" in outbox.payload["message"]
+    assert "RECONCILE" not in outbox.payload["message"]
+    assert "MANUAL-GROUP" not in outbox.payload["message"]
 
 
 @pytest.mark.parametrize("lease_before_resolve", [False, True])

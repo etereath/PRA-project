@@ -32,8 +32,8 @@
 - `product_inventory_input.py` 拆分商品资料/成本/是否销售与库存调整；
 - 新花入库、盘点、损耗、人工修正和对账只创建 DB inventory transaction；
 - 新 SKU 先保存商品资料并获得零 DB 余额，再以独立幂等“新花入库”事务增加库存；
-- TaskGeneration、ListingDecision、`SET_ONLINE` 上限和库存预警只读统一 Inventory
-  Provider/Application Service；
+- TaskGeneration、ListingDecision 和库存预警只读统一 Inventory Provider/Application
+  Service；`SET_ONLINE` 平台额度与真实库存分开，不以真实库存为硬上限；
 - 禁止同时写 `products.xlsx.current_stock` 与 DB 库存；
 - 切换后的代码回滚不得把过期工作簿库存恢复成权威。
 

@@ -13,6 +13,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
+from pathlib import Path
 from urllib.parse import quote, urlencode
 
 from app.enums import (
@@ -33,9 +34,11 @@ from app.operations_web.read_models import (
     InventoryAlertControlReadModel,
     ManagementReadModel,
     MetricReadModel,
+    MobileOperationConfirmationReadModel,
     MobileReviewReadModel,
     NotificationDrawerReadModel,
     NotificationItemReadModel,
+    OperationResolutionControlReadModel,
     ReadState,
     ReviewActionReadModel,
     ReviewControlReadModel,
@@ -44,7 +47,9 @@ from app.operations_web.read_models import (
     StateReadModel,
     SystemReadModel,
     TableReadModel,
+    TaskQueueReadModel,
     TodayReadModel,
+    VarietyInventoryControlReadModel,
 )
 from app.repositories.automation_repository import AutomationRepository
 from app.repositories.inventory_repository import InventoryRepository
@@ -56,7 +61,16 @@ from app.repositories.operational_summary_repository import (
     OperationalSummaryRepository,
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.review_policy import allowed_review_statuses, review_action_label
+from app.review_display import (
+    REVIEW_TYPE_DISPLAY_LABELS,
+    review_reason_display,
+    review_scope_display,
+)
+from app.review_policy import (
+    allowed_review_statuses,
+    is_execution_failure_review,
+    review_action_label,
+)
 from app.services.automation import (
     DAILY_TASK_GENERATION,
     FULL_MARKET_SCAN,
@@ -66,10 +80,10 @@ from app.services.automation import (
     SALES_PLAN_INPUT_BUILD,
 )
 from app.services.automation_configuration import CONFIGURABLE_JOB_TYPES
+from app.services.authoritative_inventory import summarize_inventory_by_variety
 from app.services.operational_time import OperationalTimeContext, OperationalTimeService
 from app.services.notification_outbox import (
     NOTIFICATION_TYPE_TITLES,
-    REVIEW_TYPE_LABELS,
 )
 from app.services.operations_automation import validate_rule_workbooks
 from app.services.runtime import ReviewTokenService
@@ -173,6 +187,24 @@ ANALYSIS_DATASETS = (
 class _TimeContextReadResult:
     context: OperationalTimeContext | None
     state: StateReadModel
+
+
+@dataclass(frozen=True, slots=True)
+class _TaskQueueEntry:
+    source_key: str
+    source_label: str
+    stage_key: str
+    stage_label: str
+    title: str
+    scope: str
+    platform_name: str
+    detail: str
+    occurred_at: datetime
+    url: str = ""
+    dispatch_lane: int = 2
+    task_id: str = ""
+    cancellable: bool = False
+    operation_resolution: OperationResolutionControlReadModel | None = None
 
 
 class OperationsQueryService:
@@ -289,6 +321,11 @@ class OperationsQueryService:
                     "品种销售与库存",
                     time_result.state,
                 ),
+                platform_limits=_state_table(
+                    "today-platform-limits",
+                    "平台可购上限",
+                    time_result.state,
+                ),
                 todo_items=drawer.items,
                 timeline=(),
             )
@@ -344,6 +381,7 @@ class OperationsQueryService:
             products,
             products_error,
         )
+        platform_limits = self._today_platform_limit_table(products_error)
         timeline = self._today_timeline(context.platform_trade_date)
         observed = max(
             (item.updated_at for item in platform_summaries),
@@ -357,6 +395,7 @@ class OperationsQueryService:
             state=sales_state,
             metrics=metrics,
             products=product_table,
+            platform_limits=platform_limits,
             todo_items=drawer.items,
             timeline=timeline,
         )
@@ -490,6 +529,7 @@ class OperationsQueryService:
         pending_reviews = self._review_table(page=1, pending_only=True, page_size=6)
         runs = self._run_table(page=1, page_size=6)
         inventory_options: tuple[tuple[str, str, int, int], ...] = ()
+        inventory_variety_summaries: tuple[VarietyInventoryControlReadModel, ...] = ()
         inventory_receipt = None
         inventory_error = _inventory_error_state(inventory_error_code)
         try:
@@ -549,8 +589,8 @@ class OperationsQueryService:
                         ReviewControlReadModel(
                             review_task_id=review.review_task_id,
                             title=_review_type_label(review.review_type),
-                            scope=_review_scope(review),
-                            reason=review.reason or "需要人工确认",
+                            scope=self._review_scope(review),
+                            reason=self._review_reason(review),
                             actions=tuple(actions),
                         )
                     )
@@ -648,6 +688,7 @@ class OperationsQueryService:
                     version=item.version,
                 )
                 for item in self.inventory.list_alert_policies()
+                if item.scope_type == "DEFAULT"
             )
         except Exception:
             inventory_alert_options = ()
@@ -712,7 +753,21 @@ class OperationsQueryService:
                 inventory_state = StateReadModel(
                     ReadState.READY,
                     "数据库库存已启用",
-                    "每次调整都会记录调整前后数量、来源和原因。",
+                    "库存按品种汇总、按等级记录，剩余数量自动延续。",
+                )
+                policy = self.inventory.get_default_alert_policy()
+                threshold = policy.threshold_qty if policy is not None else 0
+                enabled = bool(policy is not None and policy.enabled)
+                inventory_variety_summaries = tuple(
+                    VarietyInventoryControlReadModel(
+                        variety=item.variety,
+                        current_qty=item.current_qty,
+                        grade_summary=_grade_inventory_summary(item.grade_quantities),
+                        safety_margin_qty=threshold,
+                        margin_gap=item.current_qty - threshold,
+                        alert_enabled=enabled,
+                    )
+                    for item in summarize_inventory_by_variety(products)
                 )
                 if inventory_transaction_id:
                     transaction = self.inventory.get_transaction(
@@ -746,6 +801,7 @@ class OperationsQueryService:
             pending_review_options=pending_review_options,
             automation_options=automation_options,
             inventory_alert_options=inventory_alert_options,
+            inventory_variety_summaries=inventory_variety_summaries,
             product_master_options=product_master_options,
             product_mapping_options=product_mapping_options,
             task_idempotency_key="web-task:" + secrets.token_urlsafe(18),
@@ -759,6 +815,320 @@ class OperationsQueryService:
                 "web-master-data:" + secrets.token_urlsafe(18)
             ),
         )
+
+    def task_queue(
+        self,
+        *,
+        source: str = "all",
+        stage: str = "all",
+        page: int = 1,
+    ) -> TaskQueueReadModel:
+        """Combine durable tasks with the active file queue without mutating either."""
+
+        selected_source = source if source in {"all", "manual", "automation", "emergency"} else "all"
+        selected_stage = stage if stage in {"all", "pending", "queued", "running", "results", "attention"} else "all"
+        current_page = max(1, page)
+        now = self._now()
+        entries: list[_TaskQueueEntry] = []
+        tasks_by_id: dict[str, Task] = {}
+        task_read_failed = False
+        task_results_truncated = False
+        products, _ = self._load_products()
+        product_labels = {
+            item.internal_sku: _inventory_product_label(item) for item in products
+        }
+
+        for status in (
+            TaskStatus.PENDING,
+            TaskStatus.RUNNING,
+            TaskStatus.MANUAL_REVIEW,
+            TaskStatus.FAILED,
+        ):
+            try:
+                values = (
+                    self.runtime.list_tasks(status=status, limit=501)
+                    if status in {TaskStatus.PENDING, TaskStatus.RUNNING}
+                    else self.runtime.list_task_history_page(status=status, limit=501)
+                )
+            except Exception:
+                LOGGER.exception("读取当前任务队列失败")
+                task_read_failed = True
+                continue
+            if len(values) > 500:
+                task_results_truncated = True
+            for item in values[:500]:
+                tasks_by_id[item.task_id] = item
+
+        queue_entries, represented_task_ids, queue_read_errors = _active_queue_entries(
+            self.paths.queue_root,
+            now=now,
+            get_task=lambda task_id: tasks_by_id.get(task_id)
+            or self.runtime.get_task(task_id),
+            product_labels=product_labels,
+        )
+        entries.extend(queue_entries)
+        unresolved_entries, unresolved_task_ids, unresolved_read_failed = (
+            self._unresolved_operation_queue_entries(
+                product_labels=product_labels,
+                excluded_task_ids=represented_task_ids,
+            )
+        )
+        entries.extend(unresolved_entries)
+        represented_task_ids.update(unresolved_task_ids)
+        queue_read_errors += int(unresolved_read_failed)
+        for task_id, item in tasks_by_id.items():
+            if task_id in represented_task_ids:
+                continue
+            entries.append(_task_queue_entry(item, product_labels=product_labels))
+
+        entries.sort(key=_task_queue_sort_key)
+        filtered = [
+            item
+            for item in entries
+            if (selected_source == "all" or item.source_key == selected_source)
+            and (selected_stage == "all" or item.stage_key == selected_stage)
+        ]
+        start = (current_page - 1) * DEFAULT_PAGE_SIZE
+        visible, has_next = _visible(filtered[start : start + DEFAULT_PAGE_SIZE + 1], DEFAULT_PAGE_SIZE)
+        rows = tuple(
+            (
+                item.title,
+                item.scope,
+                item.source_label,
+                item.platform_name or "—",
+                item.stage_label,
+                _queue_wait_label(now, item.occurred_at),
+                item.detail,
+            )
+            for item in visible
+        )
+        row_urls = tuple(item.url for item in visible)
+        cancellable_task_ids = tuple(
+            item.task_id if item.cancellable else "" for item in visible
+        )
+        operation_resolution_options = tuple(
+            item.operation_resolution for item in visible
+        )
+        stage_counts = {
+            key: sum(item.stage_key == key for item in entries)
+            for key in ("pending", "queued", "running", "results", "attention")
+        }
+        metrics = (
+            MetricReadModel("待发送", f"{stage_counts['pending']} 项", "已经创建，尚未进入执行队列"),
+            MetricReadModel("排队中", f"{stage_counts['queued']} 项", "等待影刀执行端领取"),
+            MetricReadModel("执行中", f"{stage_counts['running']} 项", "影刀正在处理"),
+            MetricReadModel("等待回收", f"{stage_counts['results']} 项", "执行结果等待写回数据库"),
+            MetricReadModel(
+                "需要处理",
+                f"{stage_counts['attention']} 项",
+                "失败或需要人工确认",
+                ReadState.INCOMPLETE if stage_counts["attention"] else ReadState.READY,
+            ),
+        )
+        if task_read_failed:
+            overall = StateReadModel(
+                ReadState.FAILED,
+                "任务队列读取失败",
+                "部分业务任务暂时无法显示，请联系管理员检查业务数据库。",
+            )
+        elif queue_read_errors or task_results_truncated:
+            overall = StateReadModel(
+                ReadState.INCOMPLETE,
+                "部分队列状态需要检查",
+                "当前列表仍可查看，但可能有少量任务没有完整显示。",
+            )
+        elif stage_counts["attention"]:
+            overall = StateReadModel(
+                ReadState.INCOMPLETE,
+                "有任务需要处理",
+                f"当前有 {stage_counts['attention']} 项失败或需要人工确认的任务。",
+            )
+        elif entries:
+            overall = StateReadModel(
+                ReadState.READY,
+                "任务队列运行正常",
+                "当前任务的发送、执行和结果回收状态均可查看。",
+            )
+        else:
+            overall = StateReadModel(
+                ReadState.TRUSTWORTHY_ZERO,
+                "当前没有任务排队",
+                "没有等待发送、正在执行或等待回收的任务。",
+            )
+        checked_at = _datetime(now)
+        components = (
+            ComponentReadModel("任务传递", self._queue_state(), checked_at),
+            ComponentReadModel("影刀执行端", self._worker_state(now), checked_at),
+            ComponentReadModel("执行结果回收", self._importer_state(now), checked_at),
+        )
+        table_state = (
+            StateReadModel(ReadState.READY, "当前队列", f"当前显示 {len(rows)} 项任务")
+            if rows
+            else StateReadModel(ReadState.EMPTY, "没有符合条件的任务", "可以调整筛选条件查看其他任务。")
+        )
+        table = self._table(
+            dataset="task-queue",
+            title="任务队列",
+            columns=("任务", "商品或范围", "来源", "平台", "当前阶段", "已等待", "说明"),
+            rows=rows,
+            row_urls=row_urls,
+            state=table_state,
+            page=current_page,
+            has_next=has_next,
+            base_path="/management/queue",
+            query={"source": selected_source, "stage": selected_stage},
+        )
+        return TaskQueueReadModel(
+            overall=overall,
+            metrics=metrics,
+            components=components,
+            table=table,
+            cancellable_task_ids=cancellable_task_ids,
+            operation_resolution_options=operation_resolution_options,
+            selected_source=selected_source,
+            selected_stage=selected_stage,
+        )
+
+    def _unresolved_operation_queue_entries(
+        self,
+        *,
+        product_labels: dict[str, str],
+        excluded_task_ids: set[str],
+    ) -> tuple[list[_TaskQueueEntry], set[str], bool]:
+        """Expose durable write-lock owners even if their Task was later cancelled."""
+
+        try:
+            with self.runtime.connect_read() as connection:
+                rows = connection.execute(
+                    """
+                    SELECT lock.status AS lock_status,
+                           lock.updated_at AS lock_updated_at,
+                           operation.operation_id,
+                           operation.created_at AS operation_created_at,
+                           operation.task_id,
+                           operation.platform,
+                           operation.product_identity_json,
+                           operation.action_type
+                    FROM shadowbot_write_locks AS lock
+                    JOIN shadowbot_operations AS operation
+                      ON operation.operation_id = lock.operation_id
+                    WHERE lock.status IN ('ACTIVE', 'UNKNOWN', 'REVIEW_BLOCKED')
+                    ORDER BY lock.updated_at DESC, operation.operation_id DESC
+                    """
+                ).fetchall()
+        except Exception:
+            LOGGER.exception("读取未完成平台操作失败")
+            return [], set(), True
+
+        entries: list[_TaskQueueEntry] = []
+        represented: set[str] = set()
+        for row in rows:
+            task_id = str(row["task_id"] or "").strip()
+            if task_id and task_id in excluded_task_ids:
+                continue
+            identity = _json_object(row["product_identity_json"])
+            sku = str(identity.get("internal_sku") or "").strip().upper()
+            task = self.runtime.get_task(task_id) if task_id else None
+            if task is not None:
+                source_key, source_label, dispatch_lane = _task_queue_source(task)
+            else:
+                source_key, source_label, dispatch_lane = "manual", "人工任务", 1
+            lock_status = str(row["lock_status"] or "").strip().upper()
+            action_type = str(row["action_type"] or "").strip()
+            action_label = ACTION_LABELS.get(action_type, "平台操作")
+            operation_at = (
+                _queue_datetime(row["operation_created_at"])
+                or _queue_datetime(row["lock_updated_at"])
+                or self._now()
+            )
+            operation_time = _queue_operation_time_label(operation_at)
+            if lock_status == "ACTIVE":
+                stage_key = "running"
+                stage_label = "执行中"
+                detail = (
+                    f"{operation_time} 的{action_label}操作仍在执行，"
+                    "当前阻塞该商品的新任务。"
+                )
+            elif lock_status == "REVIEW_BLOCKED":
+                stage_key = "attention"
+                stage_label = "未完成"
+                detail = (
+                    f"{operation_time} 的{action_label}操作等待人工确认平台状态，"
+                    "当前阻塞该商品的新任务。"
+                )
+            else:
+                stage_key = "attention"
+                stage_label = "未完成"
+                detail = (
+                    f"{operation_time} 的{action_label}操作尚未确认结果，"
+                    "当前阻塞该商品的新任务。"
+                )
+            scope = product_labels.get(sku, sku or "相关商品")
+            entries.append(
+                _TaskQueueEntry(
+                    source_key=source_key,
+                    source_label=source_label,
+                    stage_key=stage_key,
+                    stage_label=stage_label,
+                    title=action_label,
+                    scope=scope,
+                    platform_name=str(row["platform"] or ""),
+                    detail=detail,
+                    occurred_at=_queue_datetime(row["lock_updated_at"]) or self._now(),
+                    url=(
+                        f"/management/task/{quote(task_id, safe='')}"
+                        if task_id
+                        else ""
+                    ),
+                    dispatch_lane=dispatch_lane,
+                    task_id=task_id,
+                    cancellable=False,
+                    operation_resolution=(
+                        _operation_resolution_control(
+                            operation_id=str(row["operation_id"] or ""),
+                            action_type=action_type,
+                            action_label=action_label,
+                            scope=scope,
+                            operation_time=operation_time,
+                        )
+                        if lock_status in {"UNKNOWN", "REVIEW_BLOCKED"}
+                        else None
+                    ),
+                )
+            )
+            if task_id:
+                represented.add(task_id)
+        return entries, represented, False
+
+    def active_queue_task_ids(self) -> tuple[frozenset[str], bool]:
+        """Return task identities present in the live file queue and read completeness."""
+
+        task_ids: set[str] = set()
+        complete = True
+        locations = (
+            (self.paths.queue_root / "inbox", "*.ready.json"),
+            (self.paths.queue_root / "working", "*.request.json"),
+            (self.paths.queue_root / "results", "*.result.json"),
+        )
+        for directory, pattern in locations:
+            if not directory.is_dir():
+                complete = False
+                continue
+            try:
+                paths = sorted(directory.glob(pattern), key=_queue_artifact_sort_key)
+            except OSError:
+                complete = False
+                continue
+            if len(paths) > 100:
+                complete = False
+            for path in paths[:100]:
+                try:
+                    task_ids.update(_queue_task_ids(_read_queue_artifact(path)))
+                except FileNotFoundError:
+                    continue
+                except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                    complete = False
+        return frozenset(task_ids), complete
 
     def system(self) -> SystemReadModel:
         now = self._now()
@@ -944,20 +1314,33 @@ class OperationsQueryService:
                 if label:
                     actions.append(label)
                     action_options.append((status.value, label))
+            operation_confirmations = self._mobile_operation_confirmations(
+                review,
+                token.allowed_actions,
+            )
+            if operation_confirmations:
+                actions = []
+                action_options = []
+            state_detail = (
+                "请先在平台查看商品的实际状态，再逐项确认；确认后不会再次启动平台读取。"
+                if operation_confirmations
+                else "请选择处理方式；提交后结果会立即保存，请勿重复提交。"
+            )
             return MobileReviewReadModel(
                 state=StateReadModel(
                     ReadState.READY,
                     "等待处理",
-                    "请选择处理方式；提交后结果会立即保存，请勿重复提交。",
+                    state_detail,
                 ),
                 review_title=_mobile_review_title(review),
-                reason=review.reason or "需要人工确认",
-                scope=_review_scope(review),
+                reason=self._review_reason(review),
+                scope=self._review_scope(review),
                 deadline=_datetime(review.required_by),
                 allowed_actions=tuple(actions),
                 http_status="200 OK",
                 review_task_id=review_task_id,
                 action_options=tuple(action_options),
+                operation_confirmations=operation_confirmations,
             )
         if review is not None and (
             review.review_status is not ReviewTaskStatus.PENDING
@@ -971,8 +1354,8 @@ class OperationsQueryService:
                     "该事项已经处理，无需重复提交。",
                 ),
                 review_title=_mobile_review_title(review),
-                reason=review.resolution_note or review.reason,
-                scope=_review_scope(review),
+                reason=review.resolution_note or self._review_reason(review),
+                scope=self._review_scope(review),
                 deadline=_datetime(review.resolved_at),
                 allowed_actions=(),
                 http_status="200 OK",
@@ -995,6 +1378,50 @@ class OperationsQueryService:
             allowed_actions=(),
             http_status=status,
         )
+
+    def _mobile_operation_confirmations(
+        self,
+        review: ReviewTask,
+        token_actions: list[str],
+    ) -> tuple[MobileOperationConfirmationReadModel, ...]:
+        source_task = (
+            self.runtime.get_task(review.source_task_id)
+            if review.source_task_id
+            else None
+        )
+        if not is_execution_failure_review(review, source_task):
+            return ()
+        if not {"approved", "cancelled"}.intersection(token_actions):
+            return ()
+        rows = self.runtime.list_confirmable_shadowbot_operations_for_review(
+            review.review_task_id
+        )
+        if not rows:
+            return ()
+        products, _ = self._load_products()
+        product_labels = {
+            product.internal_sku.upper(): _inventory_product_label(product)
+            for product in products
+        }
+        controls: list[MobileOperationConfirmationReadModel] = []
+        for row in rows:
+            action_type = str(row.get("action_type") or "").strip()
+            sku = str(row.get("internal_sku") or "").strip().upper()
+            product_label = product_labels.get(sku, sku or "相关商品")
+            action_label = ACTION_LABELS.get(action_type, "平台操作")
+            applied_label, not_applied_label = _operation_confirmation_labels(
+                action_type
+            )
+            controls.append(
+                MobileOperationConfirmationReadModel(
+                    operation_id=str(row.get("operation_id") or ""),
+                    title=f"{product_label} · {action_label}",
+                    detail=_mobile_operation_target_detail(row),
+                    applied_label=applied_label,
+                    not_applied_label=not_applied_label,
+                )
+            )
+        return tuple(controls)
 
     def _business_table(
         self,
@@ -1401,10 +1828,10 @@ class OperationsQueryService:
         rows = tuple(
             (
                 _review_type_label(item.review_type),
-                _review_scope(item),
+                self._review_scope(item),
                 REVIEW_STATUS_LABELS.get(item.review_status.value, "状态未知"),
                 _datetime(item.required_by),
-                item.reason or "—",
+                self._review_reason(item),
             )
             for item in visible
         )
@@ -1613,12 +2040,27 @@ class OperationsQueryService:
         except Exception:
             sales = ()
         by_sku = {item.scope_key: item for item in sales}
+        policy = self.inventory.get_default_alert_policy()
+        safety_margin = policy.threshold_qty if policy is not None else 0
+        alert_enabled = bool(policy is not None and policy.enabled)
         rows: list[tuple[str, ...]] = []
         urls: list[str] = []
-        for product in products[:DEFAULT_PAGE_SIZE]:
-            summary = by_sku.get(product.internal_sku)
-            sold = summary.sold_qty if summary else None
-            amount = summary.transaction_amount_total if summary else None
+        for inventory in summarize_inventory_by_variety(products)[:DEFAULT_PAGE_SIZE]:
+            variety_sales = [
+                by_sku[sku]
+                for sku in inventory.internal_skus
+                if sku in by_sku
+            ]
+            sold_values = [
+                item.sold_qty for item in variety_sales if item.sold_qty is not None
+            ]
+            amount_values = [
+                item.transaction_amount_total
+                for item in variety_sales
+                if item.transaction_amount_total is not None
+            ]
+            sold = sum(sold_values) if sold_values else None
+            amount = sum(amount_values, Decimal("0")) if amount_values else None
             average = (
                 amount / Decimal(sold)
                 if amount is not None and sold not in (None, 0)
@@ -1626,27 +2068,71 @@ class OperationsQueryService:
             )
             rows.append(
                 (
-                    product.product_name,
-                    product.grade,
+                    inventory.variety,
+                    _grade_inventory_summary(inventory.grade_quantities),
                     _qty(sold),
                     _money(average),
                     _money(amount),
-                    _qty(product.current_stock),
-                    QUALITY_LABELS.get(summary.quality_level.value, "质量未知")
-                    if summary
+                    _qty(inventory.current_qty),
+                    _inventory_margin_label(
+                        inventory.current_qty,
+                        safety_margin,
+                        enabled=alert_enabled,
+                    ),
+                    _joined_labels(
+                        QUALITY_LABELS.get(item.quality_level.value, "质量未知")
+                        for item in variety_sales
+                    )
+                    if variety_sales
                     else "销售数据待更新",
                 )
             )
             urls.append(
-                f"/database/product/{quote(product.internal_sku, safe='')}?source=today"
+                f"/database/product/{quote(inventory.internal_skus[0], safe='')}?source=today"
             )
         return TableReadModel(
             dataset="today-products",
             title="品种销售与库存",
-            columns=("商品", "等级", "今日已售", "成交均价", "销售额", "数据库库存", "更新情况"),
+            columns=(
+                "品种",
+                "等级库存",
+                "今日已售",
+                "成交均价",
+                "销售额",
+                "真实库存",
+                "安全余量",
+                "更新情况",
+            ),
             rows=tuple(rows),
             row_urls=tuple(urls),
             state=_rows_state(tuple(rows), "当前没有商品资料"),
+            page_size=DEFAULT_PAGE_SIZE,
+        )
+
+    def _today_platform_limit_table(self, products_error: str) -> TableReadModel:
+        if products_error:
+            return _failed_table("today-platform-limits", "平台可购上限")
+        try:
+            values = self.runtime.list_listing_statuses(limit=101)
+        except Exception:
+            return _failed_table("today-platform-limits", "平台可购上限")
+        rows = tuple(
+            (
+                item.platform_name,
+                item.variety,
+                item.grade,
+                _qty(item.platform_stock_qty),
+                _listing_status_label(item.online_status),
+                _datetime(item.inventory_observed_at or item.updated_at),
+            )
+            for item in values[:DEFAULT_PAGE_SIZE]
+        )
+        return TableReadModel(
+            dataset="today-platform-limits",
+            title="平台可购上限",
+            columns=("平台", "品种", "等级", "可购上限", "上架状态", "更新时间"),
+            rows=rows,
+            state=_rows_state(rows, "当前没有平台库存扫描数据"),
             page_size=DEFAULT_PAGE_SIZE,
         )
 
@@ -1699,7 +2185,9 @@ class OperationsQueryService:
         ]
         related = tuple(
             (
-                f"{item.platform_name} · {_money(item.current_price)} · {_listing_status_label(item.online_status)}",
+                f"{item.platform_name} · {_money(item.current_price)} · "
+                f"平台可购上限 {_qty(item.platform_stock_qty)} · "
+                f"{_listing_status_label(item.online_status)}",
                 "/database?" + urlencode({"dataset": "prices", "platform": item.platform_name}),
             )
             for item in listings
@@ -1811,12 +2299,48 @@ class OperationsQueryService:
                 "查看已保存的复核结果",
             ),
             fields=(
-                DetailFieldReadModel("范围", _review_scope(item)),
-                DetailFieldReadModel("原因", item.reason or "—"),
+                DetailFieldReadModel("范围", self._review_scope(item)),
+                DetailFieldReadModel("原因", self._review_reason(item)),
                 DetailFieldReadModel("处理期限", _datetime(item.required_by)),
                 DetailFieldReadModel("处理结果", item.resolution_note or "—"),
                 DetailFieldReadModel("处理时间", _datetime(item.resolved_at)),
             ),
+        )
+
+    def _review_reason(self, item: ReviewTask) -> str:
+        return review_reason_display(item)
+
+    def _review_scope(self, item: ReviewTask) -> str:
+        payload = item.review_payload if isinstance(item.review_payload, dict) else {}
+        affected_ids = payload.get("affected_task_ids")
+        if not isinstance(affected_ids, list):
+            affected_ids = []
+        task_ids = [str(value).strip() for value in affected_ids if str(value).strip()]
+        if not task_ids and item.source_task_id:
+            task_ids = [item.source_task_id]
+
+        labels: list[str] = []
+        for task_id in task_ids:
+            task = self.runtime.get_task(task_id)
+            if task is None or not task.internal_sku:
+                continue
+            product = self.master_data.get_product(task.internal_sku)
+            label = (
+                f"{product.product_name} {product.grade}".strip()
+                if product is not None
+                else task.internal_sku
+            )
+            if label and label not in labels:
+                labels.append(label)
+        product_label = ""
+        if item.internal_sku:
+            product = self.master_data.get_product(item.internal_sku)
+            if product is not None:
+                product_label = f"{product.product_name} {product.grade}".strip()
+        return review_scope_display(
+            item,
+            product_label=product_label,
+            affected_product_labels=tuple(labels),
         )
 
     def _run_detail(self, run_id: str) -> DetailReadModel | None:
@@ -1863,7 +2387,7 @@ class OperationsQueryService:
     def _review_notification(self, item: ReviewTask) -> NotificationItemReadModel:
         return NotificationItemReadModel(
             title=_review_type_label(item.review_type),
-            detail=item.reason or "需要人工确认",
+            detail=self._review_reason(item),
             severity="S2",
             url=f"/management/review/{quote(item.review_task_id, safe='')}",
         )
@@ -2053,11 +2577,17 @@ class OperationsQueryService:
             return StateReadModel(ReadState.UNAVAILABLE, "任务传递暂不可用", "平台任务暂时不能发送，请联系管理员")
         counts: dict[str, int] = {}
         try:
-            for name in ("inbox", "working", "results", "archive"):
+            patterns = {
+                "inbox": "*.ready.json",
+                "working": "*.request.json",
+                "results": "*.result.json",
+                "archive": "*",
+            }
+            for name, pattern in patterns.items():
                 path = root / name
                 if not path.is_dir():
                     return StateReadModel(ReadState.UNAVAILABLE, "任务传递暂不可用", "平台任务暂时不能发送，请联系管理员")
-                counts[name] = sum(1 for item in path.iterdir() if item.is_file())
+                counts[name] = sum(1 for item in path.glob(pattern) if item.is_file())
         except OSError:
             return StateReadModel(ReadState.FAILED, "任务传递检查失败", "请联系管理员检查平台任务传递服务。")
         active = counts["inbox"] + counts["working"] + counts["results"]
@@ -2074,10 +2604,11 @@ class OperationsQueryService:
         except Exception:
             return StateReadModel(ReadState.FAILED, "执行端状态无法读取", "请使用上方恢复按钮检查影刀执行端。")
         if report.get("ok") is True:
+            updated = _queue_datetime(report.get("updated_at"))
             return StateReadModel(
                 ReadState.READY,
                 "运行中",
-                f"最近更新时间 {str(report.get('updated_at') or '刚刚')}",
+                f"最近更新于 {_datetime(updated) if updated is not None else '刚刚'}",
             )
         error_code = str(report.get("error_code") or "")
         if error_code == "WORKER_HEARTBEAT_MISSING":
@@ -2232,6 +2763,416 @@ def _visible(values: Iterable, page_size: int):
     return items[:page_size], len(items) > page_size
 
 
+def _json_object(value: object) -> dict[str, object]:
+    try:
+        parsed = json.loads(str(value or "{}"))
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _task_queue_entry(
+    item: Task,
+    *,
+    product_labels: dict[str, str],
+) -> _TaskQueueEntry:
+    source_key, source_label, dispatch_lane = _task_queue_source(item)
+    manual_review_detail = (
+        "自动核对后仍无法确认执行结果，请人工处理"
+        if "RECONCILE 仍无法确认" in str(item.result_message or "")
+        else "复核完成前不会继续执行"
+    )
+    stage_key, stage_label, detail = {
+        TaskStatus.PENDING: ("pending", "待发送", "等待选择并发送执行"),
+        TaskStatus.RUNNING: ("running", "执行中", "执行端已领取，正在等待最新进度"),
+        TaskStatus.MANUAL_REVIEW: (
+            "attention",
+            "等待人工复核",
+            manual_review_detail,
+        ),
+        TaskStatus.FAILED: (
+            "attention",
+            "执行失败",
+            "任务已停止，当前不会自动重试",
+        ),
+    }.get(item.task_status, ("attention", "需要处理", "任务当前不会继续执行"))
+    return _TaskQueueEntry(
+        source_key=source_key,
+        source_label=source_label,
+        stage_key=stage_key,
+        stage_label=stage_label,
+        title=ACTION_LABELS.get(item.action_type.value, "其他任务"),
+        scope=product_labels.get(item.internal_sku or "", item.internal_sku or "全部商品"),
+        platform_name=item.platform_name or "",
+        detail=detail,
+        occurred_at=item.updated_at or item.created_at,
+        url=f"/management/task/{quote(item.task_id, safe='')}",
+        dispatch_lane=dispatch_lane,
+        task_id=item.task_id,
+        cancellable=item.task_status in {TaskStatus.PENDING, TaskStatus.FAILED},
+    )
+
+
+def _task_queue_source(item: Task) -> tuple[str, str, int]:
+    origin = item.origin_type.value
+    if origin == "SYSTEM_EMERGENCY":
+        return "emergency", "紧急保护", 1
+    if origin == "MANUAL":
+        lane = 0 if str(item.origin_ref_id or "").startswith("incident-review:") else 2
+        label = "人工复核" if lane == 0 else "人工任务"
+        return "manual", label, lane
+    if origin == "AUTOMATION":
+        return "automation", "自动任务", 2
+    return "other", "历史任务", 2
+
+
+def _active_queue_entries(
+    queue_root: Path,
+    *,
+    now: datetime,
+    get_task: Callable[[str], Task | None],
+    product_labels: dict[str, str],
+) -> tuple[list[_TaskQueueEntry], set[str], int]:
+    entries: list[_TaskQueueEntry] = []
+    represented_task_ids: set[str] = set()
+    errors = 0
+    locations = (
+        ("queued", "排队中", queue_root / "inbox", "*.ready.json"),
+        ("running", "执行中", queue_root / "working", "*.request.json"),
+        ("results", "等待回收", queue_root / "results", "*.result.json"),
+    )
+    for stage_key, default_stage_label, directory, pattern in locations:
+        if not directory.is_dir():
+            errors += 1
+            continue
+        try:
+            paths = sorted(directory.glob(pattern), key=_queue_artifact_sort_key)
+        except OSError:
+            errors += 1
+            continue
+        if len(paths) > 100:
+            errors += 1
+        for path in paths[:100]:
+            try:
+                payload = _read_queue_artifact(path)
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                errors += 1
+                entries.append(
+                    _TaskQueueEntry(
+                        source_key="other",
+                        source_label="系统任务",
+                        stage_key="attention",
+                        stage_label="队列记录需要检查",
+                        title="平台任务",
+                        scope="范围暂不可用",
+                        platform_name="",
+                        detail="请联系管理员检查任务传递记录",
+                        occurred_at=_queue_file_time(path, now),
+                    )
+                )
+                continue
+            phase = {}
+            if stage_key == "running":
+                attempt_id = str(payload.get("execution_attempt_id") or "").strip()
+                if attempt_id:
+                    try:
+                        phase = _read_optional_queue_artifact(
+                            directory / f"{attempt_id}.phase.json"
+                        )
+                    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                        errors += 1
+            stage_label = (
+                _queue_phase_label(str(phase.get("phase") or ""))
+                if stage_key == "running"
+                else default_stage_label
+            )
+            occurred_at = _queue_artifact_time(payload, phase, path, now)
+            task_ids = _queue_task_ids(payload)
+            represented_task_ids.update(task_ids)
+            resolved_tasks: list[Task] = []
+            for task_id in task_ids:
+                try:
+                    task = get_task(task_id)
+                except Exception:
+                    errors += 1
+                    task = None
+                if task is not None:
+                    resolved_tasks.append(task)
+            if resolved_tasks:
+                for task in resolved_tasks:
+                    source_key, source_label, dispatch_lane = _task_queue_source(task)
+                    entries.append(
+                        _TaskQueueEntry(
+                            source_key=source_key,
+                            source_label=source_label,
+                            stage_key=stage_key,
+                            stage_label=stage_label,
+                            title=ACTION_LABELS.get(task.action_type.value, "其他任务"),
+                            scope=product_labels.get(
+                                task.internal_sku or "",
+                                task.internal_sku
+                                or _queue_payload_scope(payload, product_labels),
+                            ),
+                            platform_name=task.platform_name
+                            or str(payload.get("platform_name") or payload.get("platform") or ""),
+                            detail=_queue_stage_detail(stage_key, stage_label),
+                            occurred_at=occurred_at,
+                            url=f"/management/task/{quote(task.task_id, safe='')}",
+                            dispatch_lane=dispatch_lane,
+                            task_id=task.task_id,
+                            cancellable=False,
+                        )
+                    )
+                continue
+            automation_run_id = str(payload.get("automation_run_id") or "").strip()
+            entries.append(
+                _TaskQueueEntry(
+                    source_key="automation" if automation_run_id or str(payload.get("execution_mode") or "").upper() == "READ_ONLY" else "other",
+                    source_label="自动任务" if automation_run_id or str(payload.get("execution_mode") or "").upper() == "READ_ONLY" else "系统任务",
+                    stage_key=stage_key,
+                    stage_label=stage_label,
+                    title=_queue_payload_title(payload),
+                    scope=_queue_payload_scope(payload, product_labels),
+                    platform_name=str(payload.get("platform_name") or payload.get("platform") or ""),
+                    detail=_queue_stage_detail(stage_key, stage_label),
+                    occurred_at=occurred_at,
+                    url=(
+                        f"/database/run/{quote(automation_run_id, safe='')}"
+                        if automation_run_id
+                        else ""
+                    ),
+                )
+            )
+    return entries, represented_task_ids, errors
+
+
+def _read_queue_artifact(path: Path) -> dict[str, object]:
+    if path.stat().st_size > 2 * 1024 * 1024:
+        raise ValueError("queue artifact exceeds the read-only display limit")
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    if not isinstance(payload, dict):
+        raise TypeError("queue artifact must be an object")
+    return payload
+
+
+def _read_optional_queue_artifact(path: Path) -> dict[str, object]:
+    if not path.is_file():
+        return {}
+    return _read_queue_artifact(path)
+
+
+def _queue_task_ids(payload: dict[str, object]) -> tuple[str, ...]:
+    values: list[str] = []
+    items = payload.get("items")
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            value = str(item.get("source_task_id") or item.get("task_id") or "").strip()
+            if value:
+                values.append(value)
+    top_level = str(payload.get("task_id") or "").strip()
+    if top_level:
+        values.append(top_level)
+    return tuple(dict.fromkeys(values))
+
+
+def _queue_payload_title(payload: dict[str, object]) -> str:
+    action = str(payload.get("action_type") or "").lower()
+    if action in ACTION_LABELS:
+        return ACTION_LABELS[action]
+    schema = str(payload.get("schema_version") or "").lower()
+    if "order" in schema:
+        return "订单扫描"
+    if "listing" in schema or "product" in schema:
+        return "商品状态扫描"
+    if str(payload.get("execution_mode") or "").upper() == "READ_ONLY":
+        return "平台数据读取"
+    return "平台任务"
+
+
+def _queue_payload_scope(
+    payload: dict[str, object],
+    product_labels: dict[str, str],
+) -> str:
+    items = payload.get("items")
+    if isinstance(items, list) and items:
+        sku_values = tuple(
+            dict.fromkeys(
+                str(item.get("internal_sku") or "").strip()
+                for item in items
+                if isinstance(item, dict) and str(item.get("internal_sku") or "").strip()
+            )
+        )
+        if len(sku_values) == 1:
+            return product_labels.get(sku_values[0], sku_values[0])
+        if sku_values:
+            return f"{len(sku_values)} 项商品"
+    trade_date = str(
+        payload.get("requested_platform_trade_date")
+        or payload.get("platform_trade_date")
+        or ""
+    ).strip()
+    return f"销售日 {trade_date}" if trade_date else "平台范围"
+
+
+def _queue_phase_label(value: str) -> str:
+    normalized = value.strip().upper()
+    if not normalized:
+        return "执行中"
+    if normalized == "LOGIN_VERIFICATION_REQUIRED":
+        return "等待登录验证"
+    if "LOGIN" in normalized:
+        return "登录处理中"
+    if "NAVIGAT" in normalized or "OPEN" in normalized:
+        return "正在打开业务页面"
+    if "READ" in normalized or "SCAN" in normalized or "SCROLL" in normalized:
+        return "正在读取平台数据"
+    if "SUBMIT" in normalized or "CLICK" in normalized or "SAVE" in normalized:
+        return "正在执行平台操作"
+    if "RESULT" in normalized or "COMPLETE" in normalized:
+        return "正在生成执行结果"
+    return "执行中"
+
+
+def _queue_stage_detail(stage_key: str, stage_label: str) -> str:
+    if stage_key == "queued":
+        return "等待执行端领取"
+    if stage_key == "results":
+        return "结果已返回，等待写入业务记录"
+    if stage_label == "等待登录验证":
+        return "需要在平台完成登录验证后继续"
+    return "执行端正在处理"
+
+
+def _queue_artifact_time(
+    payload: dict[str, object],
+    phase: dict[str, object],
+    path: Path,
+    now: datetime,
+) -> datetime:
+    for value in (
+        phase.get("updated_at"),
+        payload.get("updated_at"),
+        payload.get("started_at"),
+        payload.get("created_at"),
+        payload.get("ended_at"),
+    ):
+        parsed = _queue_datetime(value)
+        if parsed is not None:
+            return parsed
+    return _queue_file_time(path, now)
+
+
+def _queue_datetime(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _queue_operation_time_label(value: datetime) -> str:
+    local = value.astimezone(timezone(timedelta(hours=8)))
+    return f"{local.month}月{local.day}日 {local:%H:%M}"
+
+
+def _operation_resolution_control(
+    *,
+    operation_id: str,
+    action_type: str,
+    action_label: str,
+    scope: str,
+    operation_time: str,
+) -> OperationResolutionControlReadModel:
+    applied_label, not_applied_label = _operation_confirmation_labels(action_type)
+    return OperationResolutionControlReadModel(
+        operation_id=operation_id,
+        action_label=action_label,
+        scope=scope,
+        prompt=(
+            f"请根据你在平台上看到的实际情况，确认 {operation_time} 的"
+            f"{action_label}结果。保存后会直接解除该商品的任务阻塞，不会再启动平台读取。"
+        ),
+        applied_label=applied_label,
+        not_applied_label=not_applied_label,
+    )
+
+
+def _operation_confirmation_labels(action_type: str) -> tuple[str, str]:
+    if action_type == "set_online":
+        return "已确认商品已上架", "已确认商品未上架"
+    if action_type == "set_offline":
+        return "已确认商品已下架", "已确认商品仍在上架"
+    return "已确认目标价格已生效", "已确认目标价格未生效"
+
+
+def _mobile_operation_target_detail(row: dict[str, object]) -> str:
+    action_type = str(row.get("action_type") or "").strip()
+    target_price = str(row.get("target_price") or "").strip()
+    target_inventory = row.get("target_inventory")
+    if action_type == "set_online":
+        target_parts = []
+        if target_price:
+            target_parts.append(f"售价 ¥{target_price}")
+        if target_inventory is not None and str(target_inventory).strip():
+            target_parts.append(f"平台库存 {target_inventory} 扎")
+        suffix = "，目标为" + "、".join(target_parts) if target_parts else ""
+        return "请查看平台当前状态并确认商品是否已上架" + suffix + "。"
+    if action_type == "set_offline":
+        return "请查看平台当前状态并确认商品是否已下架。"
+    if target_price:
+        return f"请查看平台当前价格并确认是否已调整为 ¥{target_price}。"
+    return "请查看平台当前状态并确认本次操作是否已生效。"
+
+
+def _queue_file_time(path: Path, now: datetime) -> datetime:
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return now
+
+
+def _queue_artifact_sort_key(path: Path) -> tuple[float, str]:
+    try:
+        return path.stat().st_mtime, path.name
+    except OSError:
+        return 0.0, path.name
+
+
+def _task_queue_sort_key(item: _TaskQueueEntry) -> tuple[object, ...]:
+    stage_rank = {
+        "running": 0,
+        "results": 1,
+        "queued": 2,
+        "pending": 3,
+        "attention": 4,
+    }.get(item.stage_key, 5)
+    moment = _sortable_datetime(item.occurred_at)
+    if item.stage_key == "attention":
+        return item.dispatch_lane, stage_rank, -moment.timestamp(), item.title, item.scope
+    return item.dispatch_lane, stage_rank, moment.timestamp(), item.title, item.scope
+
+
+def _queue_wait_label(now: datetime, occurred_at: datetime) -> str:
+    elapsed = max(timedelta(0), _age(now, occurred_at))
+    seconds = int(elapsed.total_seconds())
+    if seconds < 60:
+        return "刚刚"
+    if seconds < 3600:
+        return f"{seconds // 60} 分钟"
+    if seconds < 86400:
+        return f"{seconds // 3600} 小时"
+    return f"{seconds // 86400} 天"
+
+
 def _rows_state(rows: tuple[tuple[str, ...], ...], empty_detail: str) -> StateReadModel:
     if rows:
         return StateReadModel(ReadState.READY, "可用", f"当前显示 {len(rows)} 条")
@@ -2330,6 +3271,21 @@ def _inventory_product_label(product: Product | None) -> str:
     )
 
 
+def _grade_inventory_summary(values: tuple[tuple[str, int], ...]) -> str:
+    return " / ".join(f"{grade} {_qty(qty)}" for grade, qty in values)
+
+
+def _inventory_margin_label(current_qty: int, threshold_qty: int, *, enabled: bool) -> str:
+    if not enabled:
+        return "预警未启用"
+    gap = current_qty - threshold_qty
+    if gap > 0:
+        return f"高于 {gap} 扎"
+    if gap == 0:
+        return "已到安全余量"
+    return f"低于 {-gap} 扎"
+
+
 def _money(value: Decimal | None) -> str:
     return "—" if value is None else f"¥{value.quantize(Decimal('0.01'))}"
 
@@ -2426,7 +3382,14 @@ def _incident_status_label(value: str) -> str:
 
 
 def _incident_detail(severity: str, count: int) -> str:
-    return f"{severity} · 已出现 {count} 次"
+    level = {
+        "S0": "记录",
+        "S1": "提醒",
+        "S2": "需要关注",
+        "S3": "高风险",
+        "S4": "紧急",
+    }.get(str(severity).upper(), "需要关注")
+    return f"{level} · 已出现 {count} 次"
 
 
 def _notification_type_label(value: str) -> str:
@@ -2477,13 +3440,13 @@ def _origin_label(value: str) -> str:
 
 def _review_type_label(value: str) -> str:
     labels = {
-        **REVIEW_TYPE_LABELS,
+        **REVIEW_TYPE_DISPLAY_LABELS,
         "incident_emergency": "紧急情况复核",
         "inventory_shortage": "库存偏低复核",
         "mapping": "商品映射复核",
         "execution_failure": "执行失败复核",
     }
-    return labels.get(str(value).lower(), "人工复核")
+    return labels.get(str(value).lower(), "人工确认")
 
 
 def _mobile_review_title(item: ReviewTask) -> str:

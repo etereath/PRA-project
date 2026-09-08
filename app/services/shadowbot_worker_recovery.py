@@ -921,7 +921,7 @@ class ShadowBotWorkerRecoveryCoordinator:
             incident_id,
             notification_kind="worker_recovered",
             source_event_key=recovery.event.event_key,
-            message="执行端已恢复",
+            message="影刀执行端已恢复，可以继续处理任务。",
         )
         return ShadowBotWorkerRecoveryResult(
             incident_id=incident_id,
@@ -957,7 +957,7 @@ class ShadowBotWorkerRecoveryCoordinator:
             incident_id,
             notification_kind="worker_recovery_failed",
             source_event_key=recovery.event.event_key,
-            message="自动恢复未成功，请人工处理",
+            message="影刀执行端未能自动恢复，请打开影刀并启动执行应用。",
         )
         return self._result(
             incident_id,

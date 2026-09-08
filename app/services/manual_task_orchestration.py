@@ -30,6 +30,7 @@ from app.repositories.master_data_repository import (
     RuntimeMasterDataRepository,
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.services.listing_scan_quality import latest_listing_scan_quality
 from app.services.operational_time import OperationalTimeService
 from app.services.product_mapping import (
     CompiledProductMappings,
@@ -47,7 +48,7 @@ MANUAL_ACTIONS = frozenset({SET_PRICE, CHANGE_PRICE, SET_OFFLINE, SET_ONLINE})
 PRICE_FACT_MAX_AGE = timedelta(minutes=30)
 TASK_LIFETIME = timedelta(minutes=30)
 MAX_MANUAL_TASK_ITEMS = 50
-CONTRACT_VERSION = "task13.5-7e-manual-task-1.0"
+CONTRACT_VERSION = "task13.5-7f-manual-task-1.4"
 
 
 class ManualTaskError(ValidationError):
@@ -59,6 +60,15 @@ class ManualTaskConflictError(ManualTaskError):
 
 
 @dataclass(frozen=True, slots=True)
+class ManualTaskItemValue:
+    """Operator-entered value for one exact platform/SKU preview item."""
+
+    item_key: str
+    price_value: Decimal | None = None
+    target_inventory: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class ManualTaskRequest:
     varieties: tuple[str, ...]
     grades: tuple[str, ...]
@@ -66,6 +76,7 @@ class ManualTaskRequest:
     action: str
     price_value: Decimal | None = None
     target_inventory: int | None = None
+    item_values: tuple[ManualTaskItemValue, ...] = ()
     excluded_item_keys: tuple[str, ...] = ()
     idempotency_key: str = ""
 
@@ -87,16 +98,19 @@ class ManualTaskPreviewItem:
     platform_product_name: str
     action_type: TaskActionType
     current_price: Decimal | None
+    current_platform_inventory: int | None
     current_status: str
     real_inventory: int | None
     real_inventory_version: int | None
     base_cost: Decimal
+    input_price_value: Decimal | None
     target_price: Decimal | None
     target_inventory: int | None
     mapping_version: str
     mapping_ids: tuple[str, ...]
     price_fact_version: str
     excluded: bool
+    warnings: tuple[str, ...]
     blockers: tuple[str, ...]
 
     @property
@@ -317,6 +331,7 @@ class ManualTaskApplicationService:
             for row in open_tasks
         }
         exclusions = set(request.excluded_item_keys)
+        item_values = {item.item_key: item for item in request.item_values}
         items: list[ManualTaskPreviewItem] = []
         for platform in request.platforms:
             for product in selected_products:
@@ -330,6 +345,9 @@ class ManualTaskApplicationService:
                     open_identities=open_identities,
                     current=current,
                     exclusions=exclusions,
+                    item_value=item_values.get(
+                        _item_key(platform, product.internal_sku)
+                    ),
                 )
                 items.append(item)
 
@@ -338,13 +356,15 @@ class ManualTaskApplicationService:
         unknown_exclusions = sorted(exclusions - known_keys)
         if unknown_exclusions:
             errors.append("排除项不属于当前预览，请重新选择任务范围。")
+        unknown_item_values = sorted(set(item_values) - known_keys)
+        if unknown_item_values:
+            errors.append("逐项设置不属于当前预览，请重新选择任务范围。")
         if len(items) > MAX_MANUAL_TASK_ITEMS:
             errors.append(f"一次最多预览 {MAX_MANUAL_TASK_ITEMS} 个任务项目。")
         if not items and not errors:
             errors.append("当前范围没有可预览项目。")
         if items and all(item.excluded for item in items):
             errors.append("不能排除全部任务项目。")
-
         digest_payload = {
             "contract_version": CONTRACT_VERSION,
             "request": _request_payload(request),
@@ -377,8 +397,10 @@ class ManualTaskApplicationService:
         open_identities: set[tuple[str, str]],
         current: datetime,
         exclusions: set[str],
+        item_value: ManualTaskItemValue | None,
     ) -> ManualTaskPreviewItem:
         blockers: list[str] = []
+        warnings: list[str] = []
         mapping_records = _mapping_records_for_product(
             mappings,
             product=product,
@@ -424,32 +446,101 @@ class ManualTaskApplicationService:
                 or listing.updated_at
             )
         action_type = _task_action_type(request.action)
+        input_price_value = None
         target_price = None
         target_inventory = None
+        status_fact_fresh = _fact_is_fresh(
+            status_fact_at,
+            current,
+            self.price_fact_max_age,
+        )
 
         if request.action in {SET_PRICE, CHANGE_PRICE}:
-            if current_status != "online":
-                blockers.append("改价只允许当前上架中的商品。")
-            if not _fact_is_fresh(price_fact_at, current, self.price_fact_max_age):
-                blockers.append("当前价格记录缺失或已过期。")
+            _check_manual_status(
+                current_status=current_status,
+                status_fact_fresh=status_fact_fresh,
+                expected_status="online",
+                action_label="改价",
+                blockers=blockers,
+                warnings=warnings,
+            )
             if current_price is None:
                 blockers.append("当前价格不可用。")
-            elif request.action == SET_PRICE:
-                target_price = request.price_value
-            elif request.price_value is not None:
-                target_price = current_price + request.price_value
+            elif not _fact_is_fresh(
+                price_fact_at,
+                current,
+                self.price_fact_max_age,
+            ):
+                warnings.append("当前价格记录缺少时间或已过期，请确认仍要继续。")
+            if current_price is not None:
+                if request.action == SET_PRICE:
+                    input_price_value = (
+                        item_value.price_value
+                        if item_value is not None and item_value.price_value is not None
+                        else request.price_value
+                    )
+                    if input_price_value is None:
+                        input_price_value = current_price
+                    target_price = input_price_value
+                    if target_price == current_price:
+                        blockers.append("目标价格与当前价格相同，请修改后再执行。")
+                else:
+                    input_price_value = (
+                        item_value.price_value
+                        if item_value is not None and item_value.price_value is not None
+                        else request.price_value
+                    )
+                    if input_price_value is None:
+                        input_price_value = Decimal("0.00")
+                    target_price = current_price + input_price_value
+                    if input_price_value == 0:
+                        blockers.append("加/降价金额不能为 0。")
         elif request.action == SET_OFFLINE:
-            if current_status != "online":
-                blockers.append("下架只允许当前上架中的商品。")
-            if not _fact_is_fresh(status_fact_at, current, self.price_fact_max_age):
-                blockers.append("当前上下架状态缺失或已过期。")
+            _check_manual_status(
+                current_status=current_status,
+                status_fact_fresh=status_fact_fresh,
+                expected_status="online",
+                action_label="下架",
+                blockers=blockers,
+                warnings=warnings,
+            )
         elif request.action == SET_ONLINE:
-            if current_status != "offline":
-                blockers.append("上架只允许当前待上架商品。")
-            if not _fact_is_fresh(status_fact_at, current, self.price_fact_max_age):
-                blockers.append("当前上下架状态缺失或已过期。")
-            target_price = request.price_value
-            target_inventory = request.target_inventory
+            _check_manual_status(
+                current_status=current_status,
+                status_fact_fresh=status_fact_fresh,
+                expected_status="offline",
+                action_label="上架",
+                blockers=blockers,
+                warnings=warnings,
+            )
+            input_price_value = (
+                item_value.price_value
+                if item_value is not None and item_value.price_value is not None
+                else request.price_value
+            )
+            if input_price_value is None:
+                input_price_value = current_price
+            target_price = input_price_value
+            target_inventory = (
+                item_value.target_inventory
+                if item_value is not None and item_value.target_inventory is not None
+                else request.target_inventory
+            )
+            if target_inventory is None and listing is not None:
+                target_inventory = listing.platform_stock_qty
+
+        if listing is not None:
+            scan_quality = latest_listing_scan_quality(
+                connection,
+                platform_name=platform_name,
+                internal_sku=product.internal_sku.upper(),
+                current_status=current_status,
+                listing_source_id=listing.online_status_source_id,
+                now=current,
+                max_age=self.price_fact_max_age,
+            )
+            if not scan_quality.accepted:
+                warnings.append(_manual_scan_warning(scan_quality.reason))
 
         if target_price is not None:
             if not target_price.is_finite() or target_price <= 0:
@@ -459,8 +550,6 @@ class ManualTaskApplicationService:
         if request.action == SET_ONLINE:
             if target_inventory is None or target_inventory < 0:
                 blockers.append("上架必须填写非负平台目标库存。")
-            elif balance is not None and target_inventory > balance.current_qty:
-                blockers.append("平台目标库存不能超过数据库库存。")
 
         if (
             product.internal_sku.upper(),
@@ -475,6 +564,7 @@ class ManualTaskApplicationService:
                 (
                     str(listing.price_source_attempt_id or ""),
                     str(listing.inventory_source_attempt_id or ""),
+                    str(listing.online_status_source_id or ""),
                     _datetime_text(price_fact_at),
                     _datetime_text(status_fact_at),
                     _decimal_text(current_price),
@@ -490,16 +580,21 @@ class ManualTaskApplicationService:
             platform_product_name=platform_product_name,
             action_type=action_type,
             current_price=current_price,
+            current_platform_inventory=(
+                listing.platform_stock_qty if listing is not None else None
+            ),
             current_status=current_status,
             real_inventory=balance.current_qty if balance else None,
             real_inventory_version=balance.version if balance else None,
             base_cost=product.base_cost,
+            input_price_value=input_price_value,
             target_price=target_price,
             target_inventory=target_inventory,
             mapping_version=mappings.mapping_version,
             mapping_ids=tuple(sorted(record.mapping_id for record in mapping_records)),
             price_fact_version=_sha256_text(observed_version) if observed_version else "",
             excluded=item_key in exclusions,
+            warnings=tuple(dict.fromkeys(warnings)),
             blockers=tuple(dict.fromkeys(blockers)),
         )
 
@@ -614,6 +709,7 @@ def _normalize_request(
     grades = _normalized_values(request.grades, "等级")
     platforms = _normalized_values(request.platforms, "平台")
     exclusions = tuple(sorted({str(value).strip() for value in request.excluded_item_keys if str(value).strip()}))
+    item_values = _normalize_item_values(request.item_values, action=action)
     idempotency_key = str(request.idempotency_key or "").strip()
     if require_idempotency and not idempotency_key:
         raise ManualTaskError("本次创建请求已失效，请刷新页面后重试。")
@@ -621,7 +717,7 @@ def _normalize_request(
         raise ManualTaskError("本次创建请求无效，请刷新页面后重试。")
 
     price_value = request.price_value
-    if action in {SET_PRICE, CHANGE_PRICE, SET_ONLINE}:
+    if price_value is not None:
         try:
             price_value = Decimal(str(price_value))
         except (InvalidOperation, ValueError, TypeError) as exc:
@@ -633,20 +729,29 @@ def _normalize_request(
             raise ManualTaskError("目标价格必须大于 0。")
         if action == CHANGE_PRICE and price_value == 0:
             raise ManualTaskError("加/降价数值不能为 0。")
-    elif price_value is not None:
+    elif action == SET_OFFLINE:
+        price_value = None
+
+    if action == SET_OFFLINE and (
+        price_value is not None
+        or any(item.price_value is not None for item in item_values)
+    ):
         raise ManualTaskError("下架任务不能携带价格。")
 
     target_inventory = request.target_inventory
-    if action == SET_ONLINE:
+    if target_inventory is not None:
         if isinstance(target_inventory, bool):
             raise ManualTaskError("平台目标库存必须是非负整数。")
         try:
             target_inventory = int(target_inventory)
         except (TypeError, ValueError) as exc:
-            raise ManualTaskError("上架任务必须填写平台目标库存。") from exc
+            raise ManualTaskError("平台目标库存必须是非负整数。") from exc
         if target_inventory < 0:
             raise ManualTaskError("平台目标库存必须是非负整数。")
-    elif target_inventory is not None:
+    if action != SET_ONLINE and (
+        target_inventory is not None
+        or any(item.target_inventory is not None for item in item_values)
+    ):
         raise ManualTaskError("只有上架任务可以携带平台目标库存。")
 
     return ManualTaskRequest(
@@ -656,6 +761,7 @@ def _normalize_request(
         action=action,
         price_value=price_value,
         target_inventory=target_inventory,
+        item_values=item_values,
         excluded_item_keys=exclusions,
         idempotency_key=idempotency_key,
     )
@@ -668,6 +774,51 @@ def _normalized_values(values: Iterable[str], label: str) -> tuple[str, ...]:
     if len(normalized) > 50:
         raise ManualTaskError(f"{label}选项过多。")
     return normalized
+
+
+def _normalize_item_values(
+    values: Iterable[ManualTaskItemValue],
+    *,
+    action: str,
+) -> tuple[ManualTaskItemValue, ...]:
+    normalized: list[ManualTaskItemValue] = []
+    seen: set[str] = set()
+    for value in values:
+        item_key = str(value.item_key or "").strip()
+        if not item_key or item_key in seen:
+            raise ManualTaskError("逐项设置无效，请重新预览。")
+        seen.add(item_key)
+        price_value = value.price_value
+        if price_value is not None:
+            try:
+                price_value = Decimal(str(price_value))
+            except (InvalidOperation, ValueError, TypeError) as exc:
+                raise ManualTaskError("逐项价格必须是有效数值。") from exc
+            if not price_value.is_finite():
+                raise ManualTaskError("逐项价格必须是有限数值。")
+            price_value = price_value.quantize(Decimal("0.01"))
+            if action in {SET_PRICE, SET_ONLINE} and price_value <= 0:
+                raise ManualTaskError("逐项目标价格必须大于 0。")
+        target_inventory = value.target_inventory
+        if target_inventory is not None:
+            if isinstance(target_inventory, bool):
+                raise ManualTaskError("逐项平台库存必须是非负整数。")
+            try:
+                target_inventory = int(target_inventory)
+            except (TypeError, ValueError) as exc:
+                raise ManualTaskError("逐项平台库存必须是非负整数。") from exc
+            if target_inventory < 0:
+                raise ManualTaskError("逐项平台库存必须是非负整数。")
+        normalized.append(
+            ManualTaskItemValue(
+                item_key=item_key,
+                price_value=price_value,
+                target_inventory=target_inventory,
+            )
+        )
+    if len(normalized) > MAX_MANUAL_TASK_ITEMS:
+        raise ManualTaskError(f"一次最多设置 {MAX_MANUAL_TASK_ITEMS} 个任务项目。")
+    return tuple(sorted(normalized, key=lambda item: item.item_key))
 
 
 def _mapping_records_for_product(
@@ -708,6 +859,14 @@ def _request_payload(request: ManualTaskRequest) -> dict[str, object]:
         "action": request.action,
         "price_value": _decimal_text(request.price_value),
         "target_inventory": request.target_inventory,
+        "item_values": [
+            {
+                "item_key": item.item_key,
+                "price_value": _decimal_text(item.price_value),
+                "target_inventory": item.target_inventory,
+            }
+            for item in request.item_values
+        ],
         "excluded_item_keys": list(request.excluded_item_keys),
     }
 
@@ -726,16 +885,19 @@ def _item_payload(item: ManualTaskPreviewItem) -> dict[str, object]:
         "platform_product_name": item.platform_product_name,
         "action_type": item.action_type.value,
         "current_price": _decimal_text(item.current_price),
+        "current_platform_inventory": item.current_platform_inventory,
         "current_status": item.current_status,
         "real_inventory": item.real_inventory,
         "real_inventory_version": item.real_inventory_version,
         "base_cost": _decimal_text(item.base_cost),
+        "input_price_value": _decimal_text(item.input_price_value),
         "target_price": _decimal_text(item.target_price),
         "target_inventory": item.target_inventory,
         "mapping_version": item.mapping_version,
         "mapping_ids": list(item.mapping_ids),
         "price_fact_version": item.price_fact_version,
         "excluded": item.excluded,
+        "warnings": list(item.warnings),
         "blockers": list(item.blockers),
     }
 
@@ -762,15 +924,48 @@ def _fact_is_fresh(
     return timedelta(0) <= age <= max_age
 
 
+def _check_manual_status(
+    *,
+    current_status: str,
+    status_fact_fresh: bool,
+    expected_status: str,
+    action_label: str,
+    blockers: list[str],
+    warnings: list[str],
+) -> None:
+    if current_status not in {"online", "offline"}:
+        blockers.append("当前上下架状态不可用。")
+        return
+    if current_status != expected_status:
+        if status_fact_fresh:
+            expected_label = "上架中的" if expected_status == "online" else "待上架"
+            blockers.append(f"{action_label}只允许当前{expected_label}商品。")
+        else:
+            recorded_label = "上架中" if current_status == "online" else "待上架"
+            warnings.append(
+                f"最近记录显示商品处于{recorded_label}，但该记录已经过期；"
+                "执行端会重新核对页面状态。"
+            )
+        return
+    if not status_fact_fresh:
+        warnings.append("当前上下架状态记录缺少时间或已过期，请确认仍要继续。")
+
+
 def _preview_failure_message(preview: ManualTaskPreview) -> str:
     if preview.errors:
         return "；".join(preview.errors)
     blocked = [
-        f"{item.platform_name}/{item.variety}/{item.grade}：{'、'.join(item.blockers)}"
+        f"{item.platform_name}/{item.variety}/{item.grade}：{''.join(item.blockers)}"
         for item in preview.included_items
         if item.blockers
     ]
     return "；".join(blocked[:5]) or "当前预览没有可创建项目。"
+
+
+def _manual_scan_warning(reason: str) -> str:
+    message = str(reason or "最近一次定时商品扫描质量不足。").strip()
+    message = message.replace("请等待下一次定时扫描。", "请确认仍要继续。")
+    return message
 
 
 def _sha256_json(value: object) -> str:

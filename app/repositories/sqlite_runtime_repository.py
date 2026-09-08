@@ -4496,6 +4496,67 @@ class SQLiteRuntimeRepository:
                 ),
             )
 
+    def cancel_tasks_with_histories(
+        self,
+        updates: list[tuple[str, TaskStatus, TaskStatusHistory]],
+        *,
+        result_message: str,
+    ) -> None:
+        """Cancel an exact Task set and append every audit row atomically."""
+
+        if not updates:
+            return
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            updated_at = _datetime_to_text(datetime.now())
+            for task_id, from_status, history in updates:
+                updated = connection.execute(
+                    """
+                    UPDATE tasks
+                    SET task_status = ?,
+                        result_message = ?,
+                        updated_at = ?
+                    WHERE task_id = ? AND task_status = ?
+                    """,
+                    (
+                        TaskStatus.CANCELLED.value,
+                        result_message,
+                        updated_at,
+                        task_id,
+                        from_status.value,
+                    ),
+                ).rowcount
+                if updated != 1:
+                    raise ValueError("task status changed during batch cancellation")
+                connection.execute(
+                    """
+                    INSERT INTO task_status_history(
+                        history_id, task_id, from_status, to_status,
+                        changed_by, changed_at, reason, metadata_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        history.history_id,
+                        history.task_id,
+                        history.from_status.value
+                        if history.from_status is not None
+                        else None,
+                        history.to_status.value,
+                        history.changed_by,
+                        _datetime_to_text(history.changed_at),
+                        history.reason,
+                        _json_dump(history.metadata),
+                    ),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def insert_status_history(self, history: TaskStatusHistory) -> None:
         with closing(self.connect()) as connection, connection:
             connection.execute(
@@ -6467,6 +6528,514 @@ class SQLiteRuntimeRepository:
                 (timestamp, timestamp, operation_id),
             )
         return cursor.rowcount == 1
+
+    def list_confirmable_shadowbot_operations_for_review(
+        self,
+        review_task_id: str,
+    ) -> list[dict[str, object]]:
+        """Return unresolved platform operations owned by one Review task group."""
+
+        review = self.get_review_task(str(review_task_id or "").strip())
+        if review is None or review.review_status is not ReviewTaskStatus.PENDING:
+            return []
+        task_ids = review_source_task_ids(review)
+        if not task_ids:
+            return []
+        placeholders = ",".join("?" for _ in task_ids)
+        with closing(self.connect_read()) as connection:
+            rows = connection.execute(
+                f"""
+                SELECT operation.operation_id, operation.task_id,
+                       operation.platform, operation.product_identity_json,
+                       operation.action_type, operation.target_price,
+                       operation.target_inventory, operation.target_status,
+                       operation.expected_old_price,
+                       operation.expected_old_status,
+                       lock.status AS write_lock_status
+                FROM shadowbot_operations AS operation
+                JOIN shadowbot_write_locks AS lock
+                  ON lock.operation_id = operation.operation_id
+                WHERE operation.task_id IN ({placeholders})
+                  AND operation.resolution_status = 'UNRESOLVED'
+                  AND operation.action_type IN (
+                      'update_price', 'set_online', 'set_offline'
+                  )
+                  AND lock.status IN ('UNKNOWN', 'REVIEW_BLOCKED')
+                ORDER BY operation.created_at, operation.operation_id
+                """,
+                tuple(task_ids),
+            ).fetchall()
+        result: list[dict[str, object]] = []
+        for row in rows:
+            try:
+                identity = json.loads(str(row["product_identity_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                identity = {}
+            if not isinstance(identity, dict):
+                identity = {}
+            result.append(
+                {
+                    "operation_id": str(row["operation_id"] or ""),
+                    "task_id": str(row["task_id"] or ""),
+                    "platform": str(row["platform"] or ""),
+                    "internal_sku": str(identity.get("internal_sku") or ""),
+                    "action_type": str(row["action_type"] or ""),
+                    "target_price": row["target_price"],
+                    "target_inventory": row["target_inventory"],
+                    "target_status": row["target_status"],
+                    "expected_old_price": row["expected_old_price"],
+                    "expected_old_status": row["expected_old_status"],
+                    "write_lock_status": str(row["write_lock_status"] or ""),
+                }
+            )
+        return result
+
+    def resolve_shadowbot_operation_manually(
+        self,
+        *,
+        operation_id: str,
+        actor: str,
+        outcome: str,
+        note: str = "",
+        observed_at: datetime | None = None,
+        actor_source: str = "web",
+        review_task_id: str | None = None,
+        token_hash: str | None = None,
+    ) -> dict[str, str]:
+        """Record an operator-observed platform state and release its write fence."""
+
+        normalized_outcome = str(outcome or "").strip().upper()
+        if normalized_outcome not in {"TARGET_APPLIED", "TARGET_NOT_APPLIED"}:
+            raise ValueError("人工确认结果无效。")
+        normalized_actor = str(actor or "").strip()
+        normalized_actor_source = str(actor_source or "").strip() or "web"
+        if bool(review_task_id) != bool(token_hash):
+            raise ValueError("移动复核授权信息不完整。")
+        now_value = observed_at or datetime.now(timezone.utc)
+        if now_value.tzinfo is None or now_value.utcoffset() is None:
+            now_value = now_value.replace(tzinfo=timezone.utc)
+        else:
+            now_value = now_value.astimezone(timezone.utc)
+        now = _datetime_to_text(now_value)
+        operation_result = (
+            "VERIFIED"
+            if normalized_outcome == "TARGET_APPLIED"
+            else "NOT_APPLIED"
+        )
+
+        connection = self.connect_write()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT operation.*, lock.status AS write_lock_status,
+                       task.task_status
+                FROM shadowbot_operations AS operation
+                JOIN shadowbot_write_locks AS lock
+                  ON lock.operation_id = operation.operation_id
+                JOIN tasks AS task ON task.task_id = operation.task_id
+                WHERE operation.operation_id = ?
+                """,
+                (operation_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("需要确认的平台操作不存在或已经解除阻塞。")
+            if str(row["write_lock_status"] or "").upper() not in {
+                "UNKNOWN",
+                "REVIEW_BLOCKED",
+            }:
+                raise ValueError("该平台操作仍在执行或已经处理，请刷新页面。")
+            if str(row["resolution_status"] or "").upper() != "UNRESOLVED":
+                raise ValueError("该平台操作已经人工确认，请刷新页面。")
+
+            if token_hash is not None and review_task_id is not None:
+                token_row = connection.execute(
+                    "SELECT * FROM review_tokens WHERE token_hash = ?",
+                    (token_hash,),
+                ).fetchone()
+                if token_row is None:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.TOKEN_NOT_FOUND,
+                        "链接已失效或无权确认该平台操作",
+                    )
+                if str(token_row["review_task_id"]) != review_task_id:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.TOKEN_REVIEW_MISMATCH,
+                        "链接已失效或无权确认该平台操作",
+                    )
+                review_row = connection.execute(
+                    "SELECT * FROM review_tasks WHERE review_task_id = ?",
+                    (review_task_id,),
+                ).fetchone()
+                if review_row is None:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.REVIEW_NOT_FOUND,
+                        "链接已失效或无权确认该平台操作",
+                    )
+                expires_at = _text_to_datetime(token_row["expires_at"])
+                token_now = _timestamp_for_deadline(
+                    provided=now_value,
+                    deadline=expires_at,
+                )
+                if expires_at is not None and expires_at <= token_now:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.TOKEN_EXPIRED,
+                        "链接已失效或无权确认该平台操作",
+                    )
+                if token_row["revoked_at"] is not None:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.TOKEN_REVOKED,
+                        "链接已失效或无权确认该平台操作",
+                    )
+                if token_row["used_at"] is not None:
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.TOKEN_ALREADY_USED,
+                        "链接已失效或无权确认该平台操作",
+                    )
+                review_model = _row_to_review_task(review_row)
+                if (
+                    review_model.review_status is not ReviewTaskStatus.PENDING
+                    or review_model.review_type != "manual_review"
+                ):
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.REVIEW_ALREADY_RESOLVED,
+                        "链接已失效或无权确认该平台操作",
+                    )
+                if not {"approved", "cancelled"}.intersection(
+                    _json_list_load(token_row["allowed_actions"])
+                ):
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.ACTION_NOT_ALLOWED,
+                        "该复核链接没有确认平台状态的权限",
+                    )
+                if str(row["task_id"]) not in review_source_task_ids(review_model):
+                    raise MobileReviewTransactionError(
+                        MobileReviewErrorCode.TOKEN_REVIEW_MISMATCH,
+                        "该平台操作不属于此复核事项",
+                    )
+                normalized_actor = str(token_row["token_subject"] or "").strip()
+                normalized_actor_source = "mobile_review_token"
+                connection.execute(
+                    "UPDATE review_tokens SET last_used_at = ? WHERE token_id = ?",
+                    (now, str(token_row["token_id"])),
+                )
+            if not normalized_actor:
+                raise ValueError("人工确认人不能为空。")
+            resolved_actor = normalized_actor_source + ":" + normalized_actor
+
+            try:
+                identity = json.loads(str(row["product_identity_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("该平台操作缺少可用的商品身份。") from exc
+            if not isinstance(identity, dict):
+                raise ValueError("该平台操作缺少可用的商品身份。")
+            internal_sku = str(identity.get("internal_sku") or "").strip()
+            if not internal_sku:
+                raise ValueError("该平台操作缺少内部商品编码。")
+
+            action_type = str(row["action_type"] or "").strip()
+            target_applied = normalized_outcome == "TARGET_APPLIED"
+            actual_state = ""
+            listing_update_count = 0
+            if action_type in {"set_online", "set_offline"}:
+                actual_state = str(
+                    row["target_status"] if target_applied else row["expected_old_status"]
+                ).strip().lower()
+                price = row["target_price"] if action_type == "set_online" and target_applied else None
+                inventory = (
+                    row["target_inventory"]
+                    if action_type == "set_online" and target_applied
+                    else None
+                )
+                listing_update_count = connection.execute(
+                    """
+                    UPDATE listing_status
+                    SET online_status = ?, source = 'manual_confirmation',
+                        current_price = COALESCE(?, current_price),
+                        platform_stock_qty = COALESCE(?, platform_stock_qty),
+                        price_source = CASE WHEN ? IS NOT NULL
+                            THEN 'MANUAL_CONFIRMATION' ELSE price_source END,
+                        price_observed_at = CASE WHEN ? IS NOT NULL
+                            THEN ? ELSE price_observed_at END,
+                        price_source_attempt_id = CASE WHEN ? IS NOT NULL
+                            THEN ? ELSE price_source_attempt_id END,
+                        inventory_source = CASE WHEN ? IS NOT NULL
+                            THEN 'MANUAL_CONFIRMATION' ELSE inventory_source END,
+                        inventory_observed_at = CASE WHEN ? IS NOT NULL
+                            THEN ? ELSE inventory_observed_at END,
+                        inventory_source_attempt_id = CASE WHEN ? IS NOT NULL
+                            THEN ? ELSE inventory_source_attempt_id END,
+                        last_listing_change_at = CASE WHEN ? = 1
+                            THEN ? ELSE last_listing_change_at END,
+                        last_listing_operation_id = CASE WHEN ? = 1
+                            THEN ? ELSE last_listing_operation_id END,
+                        online_status_observed_at = ?,
+                        online_status_source_type = 'MANUAL_CONFIRMATION',
+                        online_status_source_id = ?, updated_at = ?
+                    WHERE platform_name = ? AND internal_sku = ?
+                    """,
+                    (
+                        actual_state,
+                        price,
+                        inventory,
+                        price,
+                        price,
+                        now,
+                        price,
+                        operation_id,
+                        inventory,
+                        inventory,
+                        now,
+                        inventory,
+                        operation_id,
+                        1 if target_applied else 0,
+                        now,
+                        1 if target_applied else 0,
+                        operation_id,
+                        now,
+                        operation_id,
+                        now,
+                        str(row["platform"] or ""),
+                        internal_sku,
+                    ),
+                ).rowcount
+            elif action_type == "update_price":
+                actual_state = str(
+                    row["target_price"] if target_applied else row["expected_old_price"]
+                ).strip()
+                listing_update_count = connection.execute(
+                    """
+                    UPDATE listing_status
+                    SET current_price = ?, source = 'manual_confirmation',
+                        price_source = 'MANUAL_CONFIRMATION',
+                        price_observed_at = ?, price_source_attempt_id = ?,
+                        updated_at = ?
+                    WHERE platform_name = ? AND internal_sku = ?
+                    """,
+                    (
+                        actual_state,
+                        now,
+                        operation_id,
+                        now,
+                        str(row["platform"] or ""),
+                        internal_sku,
+                    ),
+                ).rowcount
+            else:
+                raise ValueError("该平台操作类型不支持人工状态确认。")
+            if listing_update_count != 1:
+                raise ValueError("找不到对应的平台商品状态，本次没有保存人工确认。")
+
+            operation_update = connection.execute(
+                """
+                UPDATE shadowbot_operations
+                SET status = 'MANUAL_HANDLED', operation_result = ?,
+                    resolution_status = 'MANUAL_HANDLED', resolved_by = ?,
+                    resolved_at = ?, lock_owner = '', updated_at = ?
+                WHERE operation_id = ?
+                  AND resolution_status = 'UNRESOLVED'
+                """,
+                (
+                    operation_result,
+                    resolved_actor,
+                    now,
+                    now,
+                    operation_id,
+                ),
+            ).rowcount
+            lock_update = connection.execute(
+                """
+                UPDATE shadowbot_write_locks
+                SET status = 'RELEASED', released_at = ?, updated_at = ?
+                WHERE operation_id = ?
+                  AND status IN ('UNKNOWN', 'REVIEW_BLOCKED')
+                """,
+                (now, now, operation_id),
+            ).rowcount
+            if operation_update != 1 or lock_update != 1:
+                raise ValueError("平台操作状态刚刚发生变化，请刷新页面后重试。")
+
+            task_status = str(row["task_status"] or "")
+            if task_status in {TaskStatus.MANUAL_REVIEW.value, TaskStatus.RUNNING.value}:
+                next_status = (
+                    TaskStatus.SUCCESS.value
+                    if target_applied
+                    else TaskStatus.FAILED.value
+                )
+                connection.execute(
+                    """
+                    UPDATE tasks
+                    SET task_status = ?, result_message = ?, updated_at = ?
+                    WHERE task_id = ? AND task_status = ?
+                    """,
+                    (
+                        next_status,
+                        "平台状态已由运营人员确认。",
+                        now,
+                        str(row["task_id"]),
+                        task_status,
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO task_status_history(
+                        history_id, task_id, from_status, to_status,
+                        changed_by, changed_at, reason, metadata_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        "MANUAL-" + uuid4().hex[:16],
+                        str(row["task_id"]),
+                        task_status,
+                        next_status,
+                        normalized_actor,
+                        now,
+                        "manual_platform_state_confirmed",
+                        _json_dump(
+                            {
+                                "operation_id": operation_id,
+                                "outcome": normalized_outcome,
+                                "actual_state": actual_state,
+                            }
+                        ),
+                    ),
+                )
+
+            connection.execute(
+                """
+                INSERT INTO execution_logs(
+                    log_id, task_id, executor_name, start_time, end_time,
+                    success_flag, error_code, error_message, raw_output,
+                    ai_model_version, ai_summary, created_at
+                ) VALUES (?, ?, 'operations_web_manual_confirmation', ?, ?, 1,
+                          '', '', ?, '', '', ?)
+                """,
+                (
+                    "manual-platform-" + uuid4().hex[:12],
+                    str(row["task_id"]),
+                    now,
+                    now,
+                    _json_dump(
+                        {
+                            "operation_id": operation_id,
+                            "action_type": action_type,
+                            "automated_result_before_confirmation": str(
+                                row["operation_result"] or ""
+                            ),
+                            "manual_outcome": normalized_outcome,
+                            "actual_platform_state": actual_state,
+                            "manual_actor": normalized_actor,
+                            "manual_actor_source": normalized_actor_source,
+                            "manual_note": str(note or "").strip()[:500],
+                        }
+                    ),
+                    now,
+                ),
+            )
+            pending_reviews = connection.execute(
+                """
+                SELECT review_task_id, source_task_id, review_payload_json
+                FROM review_tasks
+                WHERE review_status = 'pending' AND review_type = 'manual_review'
+                ORDER BY created_at, review_task_id
+                """
+            ).fetchall()
+            for review_row in pending_reviews:
+                try:
+                    review_payload = json.loads(
+                        str(review_row["review_payload_json"] or "{}")
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    review_payload = {}
+                raw_ids = (
+                    review_payload.get("affected_task_ids")
+                    if isinstance(review_payload, dict)
+                    else None
+                )
+                affected_task_ids = [
+                    str(value).strip()
+                    for value in raw_ids or []
+                    if str(value).strip()
+                ] if isinstance(raw_ids, list) else []
+                if not affected_task_ids:
+                    fallback = str(review_row["source_task_id"] or "").strip()
+                    affected_task_ids = [fallback] if fallback else []
+                affected_task_ids = list(dict.fromkeys(affected_task_ids))
+                if str(row["task_id"]) not in affected_task_ids:
+                    continue
+                placeholders = ",".join("?" for _ in affected_task_ids)
+                unresolved_count = connection.execute(
+                    f"""
+                    SELECT COUNT(*)
+                    FROM shadowbot_operations AS operation
+                    JOIN shadowbot_write_locks AS lock
+                      ON lock.operation_id = operation.operation_id
+                    WHERE operation.task_id IN ({placeholders})
+                      AND lock.status IN ('ACTIVE', 'UNKNOWN', 'REVIEW_BLOCKED')
+                    """,
+                    tuple(affected_task_ids),
+                ).fetchone()[0]
+                manual_review_count = connection.execute(
+                    f"""
+                    SELECT COUNT(*) FROM tasks
+                    WHERE task_id IN ({placeholders})
+                      AND task_status = 'manual_review'
+                    """,
+                    tuple(affected_task_ids),
+                ).fetchone()[0]
+                if int(unresolved_count) or int(manual_review_count):
+                    continue
+                review_id = str(review_row["review_task_id"])
+                connection.execute(
+                    """
+                    UPDATE review_tasks
+                    SET review_status = 'cancelled', resolution_payload_json = ?,
+                        updated_at = ?, resolved_by = ?, resolved_at = ?,
+                        resolution_note = ?
+                    WHERE review_task_id = ? AND review_status = 'pending'
+                    """,
+                    (
+                        _json_dump(
+                            {
+                                "resolution_type": "MANUAL_PLATFORM_CONFIRMATION",
+                                "affected_task_ids": affected_task_ids,
+                                "confirmed_operation_id": operation_id,
+                            }
+                        ),
+                        now,
+                        resolved_actor,
+                        now,
+                        "平台实际状态已由运营人员确认",
+                        review_id,
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE review_tokens SET revoked_at = ?
+                    WHERE review_task_id = ? AND revoked_at IS NULL
+                    """,
+                    (now, review_id),
+                )
+                self._cancel_review_outbox_on_connection(
+                    connection,
+                    review_id,
+                    changed_at=now_value,
+                )
+            connection.commit()
+            return {
+                "operation_id": operation_id,
+                "task_id": str(row["task_id"]),
+                "action_type": action_type,
+                "operation_result": operation_result,
+                "actual_state": actual_state,
+                "internal_sku": internal_sku,
+            }
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def insert_shadowbot_execution_attempt(
         self, attempt: ShadowBotExecutionAttempt

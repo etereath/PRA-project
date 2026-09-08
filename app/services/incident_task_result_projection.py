@@ -181,14 +181,14 @@ def _insert_notification(
     notification_key = notification_kind + ":" + event_key
     notification_id = _stable_id("NOTIFY", notification_key)
     title = {
-        "incident_task_success": "处置任务已完成",
-        "incident_task_failed": "处置任务失败",
-        "incident_task_unknown": "处置结果待确认",
+        "incident_task_success": "紧急处理已完成",
+        "incident_task_failed": "紧急处理未完成",
+        "incident_task_unknown": "紧急处理结果待确认",
     }[notification_kind]
     message = {
-        "incident_task_success": "人工复核生成的处置任务已验证完成。",
-        "incident_task_failed": "人工复核生成的处置任务未完成，请继续处理。",
-        "incident_task_unknown": "平台结果尚不能确认，请按现有对账流程处理。",
+        "incident_task_success": "紧急处理已完成，平台状态已经确认。",
+        "incident_task_failed": "紧急处理未完成，请检查商品状态并重新处理。",
+        "incident_task_unknown": "暂时无法确认紧急处理结果，请在平台检查商品实际状态。",
     }[notification_kind]
     recipient_type = (
         os.getenv("DEFAULT_NOTIFICATION_RECIPIENT_TYPE", "role").strip() or "role"

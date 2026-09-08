@@ -376,6 +376,10 @@ class AutomationConfigurationApplicationService:
         expected_version: int | None,
     ):
         self._authorize(principal)
+        if str(scope_type).strip().upper() != "DEFAULT" or str(scope_key).strip() != "*":
+            raise AutomationConfigurationError(
+                "库存安全余量按品种共享，只能修改统一方案。"
+            )
         try:
             return self.inventory.save_alert_policy(
                 scope_type=scope_type,

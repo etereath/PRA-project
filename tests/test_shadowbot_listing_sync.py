@@ -5,6 +5,7 @@ from decimal import Decimal
 import hashlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,7 +19,10 @@ from app.exceptions import ValidationError
 from app.models import ListingStatus
 from app.repositories.automation_repository import AutomationRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.services.automation import AutomationExecutionContext, ONLINE_PULSE
+from app.services.listing_automation_runtime import ListingStatusScanHandler
 from app.services.operational_time import OperationalTimeService
+from app.services.product_mapping import compile_product_mapping_rows
 from app.services.shadowbot_listing_action_contract import (
     build_listing_action_request,
     compute_listing_result_hash,
@@ -35,6 +39,71 @@ from shadowbot.test2 import shadowbot_queue_worker
 
 
 PLATFORM = "蚂蚁花团供应商"
+
+
+class _AutomationListingTransport:
+    def __init__(self, queue_dir: Path) -> None:
+        self.runner = ShadowBotFileQueueRunner(queue_dir)
+        self.last_result_file_sha256 = "d" * 64
+        self.last_result_path = queue_dir / "results" / "synthetic.result.json"
+        self.wait_callback = None
+        self.archived = False
+
+    def require_worker_ready(self) -> None:
+        return None
+
+    def set_wait_callback(self, callback) -> None:
+        self.wait_callback = callback
+
+    def wait_for_published_result(
+        self,
+        request: dict,
+        *,
+        request_file_sha256: str,
+    ) -> dict:
+        assert self.wait_callback is not None
+        assert self.wait_callback() is True
+        pulse = request["scan_scope"] == "online"
+        result = _result(
+            request,
+            locations=(
+                {
+                    "SKU-ONLINE-001": "online_only",
+                    "SKU-BOTH-00001": "online_only",
+                    "SKU-DUPLICATE1": "online_only",
+                }
+                if pulse
+                else {
+                    "SKU-ONLINE-001": "online_only",
+                    "SKU-WAITING-001": "waiting_only",
+                    "SKU-BOTH-00001": "online_only",
+                    "SKU-NEITHER-01": "waiting_only",
+                    "SKU-DUPLICATE1": "online_only",
+                }
+            ),
+        )
+        if pulse:
+            snapshot = result["snapshot"]
+            snapshot["scan_completed_at"] = snapshot[
+                "online_scan_completed_at"
+            ]
+            snapshot["waiting_scan_started_at"] = snapshot[
+                "online_scan_completed_at"
+            ]
+            snapshot["waiting_scan_completed_at"] = snapshot[
+                "online_scan_completed_at"
+            ]
+            snapshot["waiting_scan_complete"] = False
+            snapshot["waiting_end_marker_verified"] = False
+        result["request_file_sha256"] = "sha256:" + request_file_sha256
+        result["result_payload_sha256"] = compute_listing_result_hash(result)
+        return result
+
+    def acknowledge_last_result(self) -> Path:
+        self.archived = True
+        archive_dir = self.runner.queue_dir / "archive" / "synthetic"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        return archive_dir
 
 
 def _mapping_file(path: Path) -> Path:
@@ -100,12 +169,14 @@ def _request(
     batch_id: str,
     attempt_id: str,
     queued: bool = True,
+    scan_scope: str = "online_and_waiting",
 ) -> dict:
     manifest = prepare_listing_sync_batch(
         repository,
         batch_id=batch_id,
         platform_name=PLATFORM,
         mapping_path=_mapping_file(tmp_path / f"{batch_id}.mapping.json"),
+        scan_scope=scan_scope,
     )
     request = build_listing_action_request(
         manifest,
@@ -477,6 +548,358 @@ def test_automation_sync_requires_bound_live_claim_and_allows_noop_replay(
 
     assert summary["status"] == "VERIFIED"
     assert replay["already_imported"] is True
+
+
+def test_listing_automation_handler_reuses_sync_import_and_archives(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    automation = AutomationRepository(repository)
+    now = datetime.now(UTC)
+    scheduled_for = datetime(2026, 7, 25, 3, 0, tzinfo=UTC)
+    parent_job = AutomationJob(
+        job_id="FULL-RUNTIME-TEST",
+        job_type="FULL_MARKET_SCAN",
+        display_name="完整扫描",
+        enabled=True,
+        schedule_kind="INTERVAL_MINUTES",
+        schedule_expression="60",
+        priority=50,
+        config={"platform_name": PLATFORM},
+    )
+    child_job = AutomationJob(
+        job_id="AUTOMATION-LISTING-STATUS-SCAN-CHILD",
+        job_type="LISTING_STATUS_SCAN",
+        display_name="商品状态扫描",
+        enabled=False,
+        schedule_kind="CHILD_ONLY",
+        schedule_expression="-",
+        priority=50,
+        config={"platform_name": PLATFORM},
+    )
+    automation.upsert_job(parent_job, now=now)
+    automation.upsert_job(child_job, now=now)
+    parent_run = automation.ensure_run(
+        job=parent_job,
+        scheduled_for=scheduled_for,
+        time_context=OperationalTimeService().classify(scheduled_for),
+        initial_status=AutomationRunStatus.SCHEDULED,
+        now=now,
+    )[0]
+    parent_claim = automation.claim_run(
+        run_id=parent_run.run_id,
+        owner_token="parent-owner",
+        now=now,
+        lease_seconds=3600,
+    )
+    assert parent_claim is not None
+    child_run, _ = automation.ensure_child_run_fenced(
+        parent_claim,
+        child_job,
+        relation_type="LISTING_STATUS_CHILD",
+        now=now,
+    )
+    assert automation.finish_run(
+        parent_claim,
+        AutomationRunOutcome(status=AutomationRunStatus.SUCCESS),
+        now=now,
+    )
+    child_claim = automation.claim_run(
+        run_id=child_run.run_id,
+        owner_token="listing-owner",
+        now=now,
+        lease_seconds=3600,
+    )
+    assert child_claim is not None
+    context = AutomationExecutionContext(
+        claim=child_claim,
+        repository=automation,
+        operational_time=OperationalTimeService(),
+        clock=lambda: datetime.now(UTC),
+        lease_seconds=3600,
+    )
+    mappings = compile_product_mapping_rows(
+        [
+            {
+                "mapping_id": f"MAP-{index}",
+                "mapping_kind": "PRODUCT",
+                "platform_name": PLATFORM,
+                "platform_product_name": name,
+                "grade": grade,
+                "internal_sku": sku,
+                "candidate_internal_sku": "",
+                "mapping_status": "VERIFIED",
+            }
+            for index, (sku, name, grade) in enumerate(
+                (
+                    ("SKU-ONLINE-001", "艾莎", "B级"),
+                    ("SKU-WAITING-001", "艾莎", "C级"),
+                    ("SKU-BOTH-00001", "卡布奇诺", "B级"),
+                    ("SKU-NEITHER-01", "卡布奇诺", "C级"),
+                    ("SKU-DUPLICATE1", "艾莎", "D级"),
+                ),
+                start=1,
+            )
+        ],
+        source_workbook_sha256="f" * 64,
+    )
+    transport = _AutomationListingTransport(tmp_path / "queue")
+    handler = ListingStatusScanHandler(
+        runtime_repository=repository,
+        transport=transport,
+        mapping_path=_mapping_file(tmp_path / "identity.json"),
+        mappings_provider=lambda: mappings,
+        applet_uri="weixin://launchapplet/test",
+        attempt_id_factory=lambda: "ATTEMPT-LISTING-RUNTIME-0001",
+    )
+
+    outcome = handler(child_run, context)
+    assert outcome.status is AutomationRunStatus.SUCCESS
+    assert outcome.event_payload["platform_write_performed"] is False
+    assert outcome.event_payload["item_count"] == 5
+    assert transport.archived is True
+    assert transport.wait_callback is None
+    with repository.connect_read() as connection:
+        batch = connection.execute(
+            """
+            SELECT batch_status, scope_complete, end_marker_verified
+            FROM product_observation_batches
+            WHERE automation_run_id = ?
+            """,
+            (child_run.run_id,),
+        ).fetchone()
+        receipt = connection.execute(
+            """
+            SELECT ack_state
+            FROM shadowbot_listing_result_receipts
+            WHERE batch_id = ?
+            """,
+            ("LISTING-BATCH-" + child_run.run_id,),
+        ).fetchone()
+    assert tuple(batch) == ("ACCEPTED", 1, 1)
+    assert receipt is not None
+    assert receipt["ack_state"] == "WRITTEN"
+
+
+def test_listing_automation_handler_archives_result_when_import_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = _AutomationListingTransport(tmp_path / "queue")
+    transport.wait_for_published_result = (  # type: ignore[method-assign]
+        lambda request, *, request_file_sha256: {"snapshot": {}}
+    )
+    manifest_sha256 = "sha256:" + "a" * 64
+    request = {
+        "manifest_sha256": manifest_sha256,
+        "execution_attempt_id": "ATTEMPT-LISTING-IMPORT-FAIL-0001",
+    }
+
+    monkeypatch.setattr(
+        "app.services.listing_automation_runtime.prepare_listing_sync_batch",
+        lambda *args, **kwargs: {
+            "batch_id": "LISTING-BATCH-IMPORT-FAIL-0001",
+            "manifest_sha256": manifest_sha256,
+        },
+    )
+    monkeypatch.setattr(
+        "app.services.listing_automation_runtime.publish_listing_sync_batch",
+        lambda *args, **kwargs: (
+            request,
+            SimpleNamespace(
+                raw_output={"request_file_sha256": "b" * 64}
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.listing_automation_runtime.import_listing_sync_result",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            ValidationError("synthetic import failure")
+        ),
+    )
+    monkeypatch.setattr(
+        "app.services.listing_automation_runtime.fail_listing_sync_batch",
+        lambda *args, **kwargs: None,
+    )
+
+    class Context:
+        claim = object()
+
+        def bind_input_manifest(self, value: str) -> None:
+            assert value == manifest_sha256
+
+        def heartbeat(self) -> bool:
+            return True
+
+    handler = ListingStatusScanHandler(
+        runtime_repository=object(),
+        transport=transport,
+        mapping_path=tmp_path / "identity.json",
+        mappings_provider=lambda: object(),
+    )
+    run = SimpleNamespace(
+        run_id="AUTO-RUN-LISTING-IMPORT-FAIL-0001",
+        job_type="LISTING_STATUS_SCAN",
+        platform_name=PLATFORM,
+    )
+
+    with pytest.raises(ValidationError, match="synthetic import failure"):
+        handler(run, Context())
+
+    assert transport.archived is True
+    assert transport.wait_callback is None
+
+
+def test_queue_importer_defers_automation_bound_listing_result(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    request = _request(
+        repository,
+        tmp_path,
+        batch_id="BATCH-AUTO-DEFER-0001",
+        attempt_id="ATTEMPT-AUTO-DEFER-0001",
+        queued=False,
+    )
+    automation, claim = _bind_automation_listing_run(repository, request)
+    importer = ShadowBotResultImporter(
+        repository,
+        ShadowBotFileQueueRunner(tmp_path / "queue"),
+        tmp_path / "queue",
+    )
+
+    assert importer._listing_sync_uses_automation_importer(  # noqa: SLF001
+        _result(request)
+    ) is True
+    assert automation.finish_run(
+        claim,
+        AutomationRunOutcome(status=AutomationRunStatus.FAILED),
+        now=datetime.now(UTC),
+    )
+    assert importer._listing_sync_uses_automation_importer(  # noqa: SLF001
+        _result(request)
+    ) is False
+
+
+def test_online_pulse_handler_uses_single_page_v14_observation(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    automation = AutomationRepository(repository)
+    now = datetime.now(UTC)
+    scheduled = datetime(2026, 7, 25, 3, 0, tzinfo=UTC)
+    job = AutomationJob(
+        job_id="ONLINE-PULSE-TEST",
+        job_type=ONLINE_PULSE,
+        display_name="上架中扫描测试",
+        enabled=True,
+        schedule_kind="INTERVAL_MINUTES",
+        schedule_expression="10",
+        priority=60,
+        config={"platform_name": PLATFORM, "catchup_policy": "LATEST_ONLY"},
+    )
+    automation.upsert_job(job, now=now)
+    run = automation.ensure_run(
+        job=job,
+        scheduled_for=scheduled,
+        time_context=OperationalTimeService().classify(scheduled),
+        initial_status=AutomationRunStatus.SCHEDULED,
+        now=now,
+    )[0]
+    claim = automation.claim_run(
+        run_id=run.run_id,
+        owner_token="online-pulse-owner",
+        now=now,
+        lease_seconds=3600,
+    )
+    assert claim is not None
+    context = AutomationExecutionContext(
+        claim=claim,
+        repository=automation,
+        operational_time=OperationalTimeService(),
+        clock=lambda: datetime.now(UTC),
+        lease_seconds=3600,
+    )
+    mappings = compile_product_mapping_rows(
+        [
+            {
+                "mapping_id": f"MAP-PULSE-{index}",
+                "mapping_kind": "PRODUCT",
+                "platform_name": PLATFORM,
+                "platform_product_name": name,
+                "grade": grade,
+                "internal_sku": sku,
+                "candidate_internal_sku": "",
+                "mapping_status": "VERIFIED",
+            }
+            for index, (sku, name, grade) in enumerate(
+                (
+                    ("SKU-ONLINE-001", "艾莎", "B级"),
+                    ("SKU-BOTH-00001", "卡布奇诺", "B级"),
+                    ("SKU-DUPLICATE1", "艾莎", "D级"),
+                ),
+                start=1,
+            )
+        ],
+        source_workbook_sha256="e" * 64,
+    )
+    handler = ListingStatusScanHandler(
+        runtime_repository=repository,
+        transport=_AutomationListingTransport(tmp_path / "pulse-queue"),
+        mapping_path=_mapping_file(tmp_path / "pulse-identity.json"),
+        mappings_provider=lambda: mappings,
+        applet_uri="weixin://launchapplet/test",
+        job_type=ONLINE_PULSE,
+        scan_scope="online",
+        attempt_id_factory=lambda: "ATTEMPT-ONLINE-PULSE-0001",
+    )
+
+    outcome = handler(run, context)
+
+    assert outcome.status is AutomationRunStatus.SUCCESS
+    assert outcome.event_payload["item_count"] == 3
+    assert outcome.event_payload["platform_write_performed"] is False
+    with repository.connect_read() as connection:
+        batch = connection.execute(
+            """
+            SELECT scan_type, requested_scope_json, scope_complete,
+                   end_marker_verified
+            FROM product_observation_batches
+            WHERE automation_run_id = ?
+            """,
+            (run.run_id,),
+        ).fetchone()
+        snapshot_count = connection.execute(
+            "SELECT COUNT(*) FROM listing_sync_snapshots"
+        ).fetchone()[0]
+    assert batch["scan_type"] == ONLINE_PULSE
+    assert json.loads(batch["requested_scope_json"])["pages"] == ["online"]
+    assert tuple(batch)[2:] == (1, 1)
+    assert snapshot_count == 0
+
+
+def test_queue_importer_also_defers_online_pulse_owner(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    request = _request(
+        repository,
+        tmp_path,
+        batch_id="BATCH-AUTO-PULSE-DEFER-0001",
+        attempt_id="ATTEMPT-AUTO-PULSE-DEFER-0001",
+        queued=False,
+    )
+    _, claim = _bind_automation_listing_run(repository, request)
+    with repository.connect_write() as connection, connection:
+        connection.execute(
+            "UPDATE automation_runs SET job_type = 'ONLINE_PULSE' WHERE run_id = ?",
+            (claim.run.run_id,),
+        )
+    importer = ShadowBotResultImporter(
+        repository,
+        ShadowBotFileQueueRunner(tmp_path / "queue"),
+        tmp_path / "queue",
+    )
+
+    assert importer._listing_sync_uses_automation_importer(  # noqa: SLF001
+        _result(request)
+    ) is True
 
 
 def test_reclaimed_automation_owner_cannot_project_authoritative_status(
@@ -954,3 +1377,12 @@ def test_worker_v5_request_and_failed_result_match_core_contract(
     )
     assert failed["snapshot"]["snapshot_complete"] is False
     assert failed["snapshot"]["items"] == []
+
+    pulse_request = _request(
+        repository,
+        tmp_path,
+        batch_id="BATCH-PULSE-WORKER-0001",
+        attempt_id="ATTEMPT-PULSE-WORKER-0001",
+        scan_scope="online",
+    )
+    shadowbot_queue_worker._v5_validate_sync_request(pulse_request)

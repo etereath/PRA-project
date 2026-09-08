@@ -144,8 +144,11 @@ Automation/回补链报告失败，并通过既有 Incident 入口记录，不�
 
 ## 8. 库存预警
 
-策略默认关闭，避免在运营人员冻结阈值前发明业务数值。管理员可设置全局默认和每 SKU
-覆盖：阈值 `0..9999`，重复提醒间隔 `30..1440` 分钟。
+运营已冻结每个品种共享 `20` 扎安全余量。预警在任一等级库存流水提交后，重新汇总该品种
+全部等级的数据库真实库存；合计小于等于安全余量时进入现有 Incident/Outbox，恢复到安全
+余量以上时关闭同一品种 Incident。管理员只能维护统一方案和重复提醒间隔，不再开放 SKU
+覆盖；v17 表中保留的 `SKU` scope 仅属于旧 Schema 兼容面，不进入当前 Web 或实际预警判断。
+平台可购上限不参与计算，预警不创建改价、上架或下架任务。
 
 - 从阈值上方降到阈值或以下：创建/重开 `INVENTORY_ANOMALY` Incident 并进入 Outbox；
 - 持续低库存：只在重复间隔到期且有新库存事务时再次通知；
@@ -159,7 +162,11 @@ Automation/回补链报告失败，并通过既有 Incident 入口记录，不�
 - 今日页、商品详情、数据库“商品与库存/库存调整流水”和销售计划回读 DB 余额；
 - 业务管理提供人工调整表单，输入 delta/source/reason，显示服务端 before/after；
 - TaskGeneration、ListingDecision、Pricing 输入在服务边界由统一 Provider 注入 DB 库存；
-- `SET_ONLINE.target_inventory` 在 7E 创建/授权时不得超过真实库存；7D 先提供唯一校验服务；
+- 数据库余额没有新流水时自动跨 PRA 交易日延续，不做每日清零，也不增加人工转结确认；
+- `SET_ONLINE.target_inventory` 是平台买家可购上限，不是销量或真实库存预留，可以高于
+  对应 SKU 的数据库库存；不同平台目标库存不得求和后当作库存占用或超售事实；
+- `20` 扎按品种作为真实剩余库存的运营安全余量，由已实现销售和数据库余额触发预警或
+  后续调整，不用于限制初始平台目标库存；
 - `products.xlsx.current_stock` 的旧编辑入口立即拒绝库存修改，7F 再删除旧页面代码。
 - 旧 Web 的拒绝判断只读取固定 canonical Runtime DB，不接受 request/session Runtime 选择；
 - 人工库存调整的业务失败统一 POST → 303 → GET，只在 URL 传 allowlist 错误码，不回显

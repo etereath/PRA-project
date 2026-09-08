@@ -13,6 +13,7 @@ import pytest
 from app.inventory_models import InventoryTransaction
 from app.models import Product
 from app.repositories.inventory_repository import InventoryRepository
+from app.repositories.master_data_repository import RuntimeMasterDataRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.operational_incident_repository import OperationalIncidentRepository
 from app.services.authoritative_inventory import (
@@ -68,6 +69,21 @@ def _products() -> list[Product]:
             sale_enabled=True,
         ),
     ]
+
+
+def _seed_runtime_products(
+    repository: SQLiteRuntimeRepository,
+    products: list[Product],
+) -> None:
+    RuntimeMasterDataRepository(repository).seed(
+        products,
+        (),
+        product_source_ref="synthetic-products",
+        product_source_sha256="sha256:" + "c" * 64,
+        mapping_source_ref="synthetic-mappings",
+        mapping_source_sha256="sha256:" + "d" * 64,
+        actor="test",
+    )
 
 
 def _bootstrap(repository: SQLiteRuntimeRepository) -> InventoryApplicationService:
@@ -698,6 +714,11 @@ def test_inventory_alert_reuses_incident_outbox_repeat_and_recovery(
     tmp_path: Path,
 ) -> None:
     repository = _repository(tmp_path)
+    products = [
+        replace_product(_products()[0], current_stock=12),
+        replace_product(_products()[1], current_stock=11),
+    ]
+    _seed_runtime_products(repository, products)
     inventory = InventoryRepository(repository)
     default_policy = inventory.get_alert_policy(internal_sku="AISHA-A-50-Z")
     assert default_policy is not None and not default_policy.enabled
@@ -705,7 +726,7 @@ def test_inventory_alert_reuses_incident_outbox_repeat_and_recovery(
         scope_type="DEFAULT",
         scope_key="*",
         enabled=True,
-        threshold_qty=10,
+        threshold_qty=20,
         repeat_interval_minutes=30,
         updated_by="admin",
         expected_version=default_policy.version,
@@ -718,7 +739,7 @@ def test_inventory_alert_reuses_incident_outbox_repeat_and_recovery(
         alert_evaluator=alerts.evaluate_transaction,
     )
     service.bootstrap(
-        [replace_product(_products()[0], current_stock=12)],
+        products,
         snapshot_sha256=SNAPSHOT_SHA256,
         runtime_snapshot_sha256=sqlite_logical_snapshot_sha256(repository),
         cutover_order_observation_batch_id=CUTOVER_BATCH_ID,
@@ -741,11 +762,13 @@ def test_inventory_alert_reuses_incident_outbox_repeat_and_recovery(
         category=IncidentCategory.INVENTORY_ANOMALY
     )
     assert len(active) == 1
-    assert active[0].subject_key == "AISHA-A-50-Z"
+    assert active[0].subject_type == "variety"
+    assert active[0].subject_key == "艾莎"
+    assert "各等级合计 20 扎" in active[0].description
     assert len(repository.list_notification_outbox()) == 1
 
     service.adjust(
-        internal_sku="AISHA-A-50-Z",
+        internal_sku="AISHA-B-50-Z",
         inventory_delta=-1,
         source_type="MANUAL_STOCKTAKE",
         reason="仍然偏低",
@@ -756,7 +779,7 @@ def test_inventory_alert_reuses_incident_outbox_repeat_and_recovery(
     assert len(repository.list_notification_outbox()) == 1
 
     service.adjust(
-        internal_sku="AISHA-A-50-Z",
+        internal_sku="AISHA-B-50-Z",
         inventory_delta=-1,
         source_type="MANUAL_STOCKTAKE",
         reason="重复提醒",
@@ -767,8 +790,8 @@ def test_inventory_alert_reuses_incident_outbox_repeat_and_recovery(
     assert len(repository.list_notification_outbox()) == 2
 
     service.adjust(
-        internal_sku="AISHA-A-50-Z",
-        inventory_delta=5,
+        internal_sku="AISHA-B-50-Z",
+        inventory_delta=3,
         source_type="NEW_FLOWER_INBOUND",
         reason="新花入库",
         actor="operator",
@@ -786,6 +809,19 @@ def test_concurrent_first_low_inventory_alert_enqueues_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repository = _repository(tmp_path)
+    _seed_runtime_products(
+        repository,
+        [replace_product(_products()[0], current_stock=9)],
+    )
+    with repository.connect_write() as connection, connection:
+        connection.execute(
+            """
+            INSERT INTO inventory_balances(
+                internal_sku, current_qty, version, last_transaction_id, updated_at
+            ) VALUES (?, 9, 1, 'INV-CONCURRENT-BASE', ?)
+            """,
+            ("AISHA-A-50-Z", NOW.isoformat()),
+        )
     inventory = InventoryRepository(repository)
     policy = inventory.get_alert_policy(internal_sku="AISHA-A-50-Z")
     inventory.save_alert_policy(

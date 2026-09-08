@@ -103,6 +103,69 @@ class ShadowBotQueueTests(unittest.TestCase):
         self.assertEqual(request["instruction_hash"], compute_multi_product_instruction_hash(request))
         self.assertEqual(request["products"][0]["item_id"], "ITEM-001")
 
+    def test_idle_importer_publishes_oldest_deferred_listing_reconcile(self) -> None:
+        repository = Mock()
+        connection = Mock()
+        connection.execute.return_value.fetchone.return_value = {
+            "operation_id": "OP-DEFERRED-RECONCILE-001",
+            "source_attempt_id": "ATTEMPT-SOURCE-COMMIT-001",
+        }
+
+        repository.connect_read.return_value = connection
+        runner = ShadowBotFileQueueRunner(self.queue_dir)
+        importer = ShadowBotResultImporter(
+            repository,
+            runner,
+            self.queue_dir,
+        )
+        source_request = {"execution_mode": "COMMIT"}
+        source_result = {"items": []}
+        published = {
+            "status": "PUBLISHED",
+            "operation_id": "OP-DEFERRED-RECONCILE-001",
+        }
+
+        with (
+            patch.object(
+                importer,
+                "_find_v4_request",
+                return_value=self.root / "source.request.json",
+            ),
+            patch.object(
+                importer,
+                "_find_v5_result",
+                return_value=self.root / "source.result.json",
+            ),
+            patch(
+                "app.services.shadowbot_queue.read_checked_queue_json",
+                side_effect=[
+                    (source_request, b"request"),
+                    (source_result, b"result"),
+                ],
+            ),
+            patch(
+                "app.services.shadowbot_queue.validate_listing_action_request"
+            ),
+            patch(
+                "app.services.shadowbot_queue.validate_listing_action_result"
+            ),
+            patch(
+                "app.services.shadowbot_listing_action_pipeline."
+                "ensure_listing_action_reconcile_attempt",
+                return_value=published,
+            ) as ensure_reconcile,
+        ):
+            event = importer._publish_next_pending_listing_reconcile()
+
+        self.assertEqual(event, published)
+        ensure_reconcile.assert_called_once_with(
+            repository,
+            runner,
+            source_request=source_request,
+            source_result=source_result,
+            operation_id="OP-DEFERRED-RECONCILE-001",
+        )
+
     def test_v2_read_result_persists_bound_inventory_observation(self) -> None:
         repository = SQLiteRuntimeRepository(self.db_path)
         repository.init_schema()

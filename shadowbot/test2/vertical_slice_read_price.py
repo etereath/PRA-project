@@ -622,6 +622,17 @@ def _remove_dynamic_page_id_constraints(value):
     return value
 
 
+def _stable_captured_selector(base_name, inferred_name):
+    """Clone a captured selector without per-session mini-program page ids."""
+    base = package.selector(base_name)
+    value = copy.deepcopy(base.__dict__["value"])
+    _remove_dynamic_page_id_constraints(value)
+    value["id"] = str(uuid.uuid4())
+    value["name"] = inferred_name
+    value["screenshot"] = ""
+    return Selector(value)
+
+
 def _as_bool(value, default=False):
     if value is None:
         return bool(default)
@@ -848,6 +859,65 @@ def _exact_acc_label_selector(label, selector_name):
     _set_path_attribute(target_node, "role", "StaticText")
     _set_path_attribute(target_node, "acc-name", label)
     return Selector(value)
+
+
+def _find_login_form_inputs(window, timeout_seconds):
+    """Locate the two visible login fields by role and visual row, not page indexes."""
+    last_candidate_count = 0
+    last_error_code = "ELEMENT_NOT_FOUND"
+    for node_name in ("input", "Edit", "TextBox", "wx-input"):
+        selector = _generic_acc_node_selector(
+            node_name,
+            "dynamic_login_form_" + node_name.lower(),
+        )
+        try:
+            candidates = list(
+                window.find_all(
+                    selector,
+                    timeout=min(max(float(timeout_seconds), 0.1), 1.0),
+                )
+                or []
+            )
+        except Exception as exc:
+            last_error_code = str(
+                getattr(exc, "code", "") or type(exc).__name__
+            )[:80]
+            continue
+
+        rows = {}
+        for candidate in candidates:
+            try:
+                bounds = _bounding_dict(candidate)
+            except Exception:
+                continue
+            if bounds["width"] < 80 or bounds["height"] < 20:
+                continue
+            center_y = bounds["y"] + (bounds["height"] / 2.0)
+            # Chrome exposes both the field wrapper and its focusable input.
+            # Their rectangles can differ by a pixel, so group by visual row.
+            row_key = int(round(center_y / 4.0)) * 4
+            rows.setdefault(row_key, []).append(candidate)
+
+        last_candidate_count = max(last_candidate_count, len(rows))
+        if len(rows) != 2:
+            continue
+        ordered_rows = [rows[key] for key in sorted(rows)]
+        return (
+            {
+                "ACCOUNT_INPUT": ordered_rows[0][-1],
+                "PASSWORD_INPUT": ordered_rows[1][-1],
+            },
+            node_name,
+        )
+
+    raise SliceError(
+        "LOGIN_FORM_STRUCTURE_UNAVAILABLE",
+        "login form did not expose exactly two visible input rows; row_count="
+        + str(last_candidate_count)
+        + "; reason_code="
+        + last_error_code,
+        retryable=False,
+    )
 
 
 def _clone_dialog_value_selector(base_name, inferred_name):
@@ -1153,6 +1223,17 @@ def _collect_ui_state_labels(window):
             elements = []
         for element in elements:
             labels.extend(_element_label(element))
+        # StaticText is the first role inspected and contains the platform's
+        # login, verification and rejection markers.  Once one of those
+        # states is conclusive, do not spend the remaining role timeouts
+        # rescanning the same login page.
+        state, _markers = _login_page_state(labels)
+        if state in {
+            "ACCOUNT_PASSWORD",
+            "VERIFICATION_REQUIRED",
+            "CREDENTIALS_REJECTED",
+        }:
+            break
     return labels
 
 
@@ -1286,25 +1367,154 @@ def _attempt_automatic_login(window, request, result, timeout_seconds, login_con
             "credential provider failed: " + type(exc).__name__,
             retryable=False,
         ) from exc
-    try:
-        if employee_mode_selector:
-            _find_element(window, employee_mode_selector, timeout_seconds).click()
-            sleep(max(float(_login_config_value(login_config, "employee_mode_wait_seconds", 1)), 0.0))
-            result.setdefault("login", {}).update(
-                {
-                    "employee_mode_clicked": True,
-                    "employee_mode_clicked_at": _now_iso(),
-                }
+    login_state = result.setdefault("login", {})
+    form_inputs_cache = None
+
+    def login_element(selector_name, step_name):
+        nonlocal form_inputs_cache
+        login_state["autofill_step"] = step_name
+        captured_error = None
+
+        # The live page exposes one exact "员工" label.  Prefer that stable
+        # business label over the old captured single-character "员" node so
+        # a stale page path cannot consume the normal element timeout first.
+        if step_name == "EMPLOYEE_MODE":
+            try:
+                exact_employee_label = _exact_acc_label_selector(
+                    "员工",
+                    "dynamic_login_employee_mode_exact_label",
+                )
+                element = _find_element(
+                    window,
+                    exact_employee_label,
+                    min(max(float(timeout_seconds), 0.1), 1.0),
+                )
+                login_state["employee_mode_selector_path"] = "EXACT_LABEL_PRIMARY"
+                return element
+            except Exception as exact_label_error:
+                captured_error = exact_label_error
+
+        try:
+            stable_selector = _stable_captured_selector(
+                selector_name,
+                "dynamic_login_" + step_name.lower(),
             )
-        _set_login_input_value(_find_element(window, account_selector, timeout_seconds), credentials.account)
-        _set_login_input_value(_find_element(window, password_selector, timeout_seconds), credentials.password)
-        _find_element(window, submit_selector, timeout_seconds).click()
-    except Exception as exc:
+            element = _find_element(
+                window,
+                stable_selector,
+                min(max(float(timeout_seconds), 0.1), 1.0)
+                if step_name == "EMPLOYEE_MODE"
+                else timeout_seconds,
+            )
+            if step_name == "EMPLOYEE_MODE":
+                login_state["employee_mode_selector_path"] = "CAPTURED_FALLBACK"
+            return element
+        except Exception as exc:
+            captured_error = exc
+
+        if step_name in {"ACCOUNT_INPUT", "PASSWORD_INPUT"}:
+            try:
+                if form_inputs_cache is None:
+                    form_inputs_cache = _find_login_form_inputs(
+                        window,
+                        timeout_seconds,
+                    )
+                input_elements, node_name = form_inputs_cache
+                login_state[step_name.lower() + "_selector_path"] = (
+                    "FORM_ROLE_FALLBACK_" + node_name.upper()
+                )
+                return input_elements[step_name]
+            except Exception as fallback_error:
+                captured_error = fallback_error
+
+        if step_name == "SUBMIT":
+            try:
+                element, _labels, node_name = _find_button_by_exact_label(
+                    window,
+                    ["登录"],
+                    timeout_seconds,
+                )
+                login_state["submit_selector_path"] = (
+                    "EXACT_LABEL_FALLBACK_" + node_name.upper()
+                )
+                return element
+            except Exception as fallback_error:
+                captured_error = fallback_error
+
+        login_state["autofill_failed_step"] = step_name
+        safe_code = str(
+            getattr(captured_error, "code", "") or type(captured_error).__name__
+        ).strip()
         raise SliceError(
             "LOGIN_AUTOFILL_FAILED",
-            "account/password login autofill failed: " + type(exc).__name__,
+            "account/password login autofill failed at "
+            + step_name
+            + "; reason_code="
+            + safe_code[:80],
+            retryable=False,
+        ) from captured_error
+
+    if employee_mode_selector:
+        employee_mode = login_element(employee_mode_selector, "EMPLOYEE_MODE")
+        try:
+            # Both the historical capture and the current accessibility tree
+            # identify a text node.  The actual mode switch belongs to its
+            # enclosing option container, so clicking the text node alone is
+            # not accepted as evidence that employee mode was selected.
+            employee_mode.parent().click()
+        except Exception as exc:
+            login_state["autofill_failed_step"] = "EMPLOYEE_MODE_CONTAINER_CLICK"
+            raise SliceError(
+                "LOGIN_AUTOFILL_FAILED",
+                "account/password login autofill failed at EMPLOYEE_MODE_CONTAINER_CLICK; reason_code="
+                + type(exc).__name__,
+                retryable=False,
+            ) from exc
+        sleep(max(float(_login_config_value(login_config, "employee_mode_wait_seconds", 1)), 0.0))
+        login_state.update(
+            {
+                "employee_mode_clicked": True,
+                "employee_mode_clicked_at": _now_iso(),
+                "employee_mode_click_target": "PARENT_CONTAINER",
+            }
+        )
+
+    account_input = login_element(account_selector, "ACCOUNT_INPUT")
+    try:
+        _set_login_input_value(account_input, credentials.account)
+    except Exception as exc:
+        login_state["autofill_failed_step"] = "ACCOUNT_INPUT_WRITE"
+        raise SliceError(
+            "LOGIN_AUTOFILL_FAILED",
+            "account/password login autofill failed at ACCOUNT_INPUT_WRITE; reason_code="
+            + str(getattr(exc, "code", "") or type(exc).__name__)[:80],
             retryable=False,
         ) from exc
+
+    password_input = login_element(password_selector, "PASSWORD_INPUT")
+    try:
+        _set_login_input_value(password_input, credentials.password)
+    except Exception as exc:
+        login_state["autofill_failed_step"] = "PASSWORD_INPUT_WRITE"
+        raise SliceError(
+            "LOGIN_AUTOFILL_FAILED",
+            "account/password login autofill failed at PASSWORD_INPUT_WRITE; reason_code="
+            + str(getattr(exc, "code", "") or type(exc).__name__)[:80],
+            retryable=False,
+        ) from exc
+
+    submit = login_element(submit_selector, "SUBMIT")
+    try:
+        submit.click()
+    except Exception as exc:
+        login_state["autofill_failed_step"] = "SUBMIT_CLICK"
+        raise SliceError(
+            "LOGIN_AUTOFILL_FAILED",
+            "account/password login autofill failed at SUBMIT_CLICK; reason_code="
+            + type(exc).__name__,
+            retryable=False,
+        ) from exc
+    login_state["autofill_step"] = "SUBMITTED"
     result.setdefault("login", {}).update(
         {
             "account_password_submitted": True,
@@ -1349,29 +1559,42 @@ def _attempt_automatic_login(window, request, result, timeout_seconds, login_con
     )
 
 
-def _recover_login_if_needed(window, request, result, timeout_seconds, login_config, credential_provider):
+def _recover_login_if_needed(
+    window,
+    request,
+    result,
+    timeout_seconds,
+    login_config,
+    credential_provider,
+    detected_state=None,
+    detected_markers=None,
+):
     # The business navigation entry is a precise positive signal that the
     # authenticated mini-program shell is already available.  Prefer this
     # bounded probe over six broad UI-state find_all scans on every request.
-    try:
-        _find_element(
-            window,
-            ELEMENTS["product_management"],
-            min(float(timeout_seconds), 0.5),
-        )
-    except SliceError:
-        result.setdefault("login", {})["check_path"] = "FULL_UI_STATE_SCAN"
-    else:
-        result.setdefault("login", {}).update(
-            {
-                "check_path": "BUSINESS_ENTRY_FAST_PATH",
-                "login_completed_at": _now_iso(),
-            }
-        )
-        return False
+    if detected_state is None:
+        try:
+            _find_element(
+                window,
+                ELEMENTS["product_management"],
+                min(float(timeout_seconds), 0.5),
+            )
+        except SliceError:
+            result.setdefault("login", {})["check_path"] = "FULL_UI_STATE_SCAN"
+        else:
+            result.setdefault("login", {}).update(
+                {
+                    "check_path": "BUSINESS_ENTRY_FAST_PATH",
+                    "login_completed_at": _now_iso(),
+                }
+            )
+            return False
 
-    labels = _collect_ui_state_labels(window)
-    state, markers = _login_page_state(labels)
+        labels = _collect_ui_state_labels(window)
+        state, markers = _login_page_state(labels)
+    else:
+        state = str(detected_state)
+        markers = list(detected_markers or [])
     if state == "ACCOUNT_PASSWORD":
         return _attempt_automatic_login(
             window, request, result, timeout_seconds, login_config, credential_provider, markers
@@ -1387,6 +1610,107 @@ def _recover_login_if_needed(window, request, result, timeout_seconds, login_con
             retryable=False,
         )
     return False
+
+
+def _recover_visible_login_after_navigation(
+    window,
+    request,
+    result,
+    timeout_seconds,
+    login_config,
+    credential_provider,
+    trigger,
+):
+    """Inspect login only at a business-navigation boundary and reuse recovery."""
+    labels = _collect_ui_state_labels(window)
+    state, markers = _login_page_state(labels)
+    login_result = result.setdefault("login", {})
+    login_result.update(
+        {
+            "check_path": str(trigger),
+            "navigation_login_state": str(state),
+            "navigation_login_checked_at": _now_iso(),
+        }
+    )
+    if state not in {
+        "ACCOUNT_PASSWORD",
+        "VERIFICATION_REQUIRED",
+        "CREDENTIALS_REJECTED",
+    }:
+        return False
+    _recover_login_if_needed(
+        window,
+        request,
+        result,
+        timeout_seconds,
+        login_config,
+        credential_provider,
+        detected_state=state,
+        detected_markers=markers,
+    )
+    result.setdefault("login", {}).update(
+        {
+            "check_path": str(trigger) + "_RECOVERED",
+            "navigation_login_state": str(state),
+            "navigation_login_checked_at": _now_iso(),
+        }
+    )
+    return True
+
+
+def _click_business_navigation_entry(
+    window,
+    selector,
+    request,
+    result,
+    timeout_seconds,
+    login_config,
+    credential_provider,
+    clicker=None,
+):
+    """Click once, detect an expired session, recover, then repeat that entry click."""
+    try:
+        target = _find_element(window, selector, timeout_seconds)
+    except SliceError as entry_error:
+        # A previous failed request may have left the app on the login page.
+        # This is a fallback for a missing business entry, not a normal
+        # pre-navigation login probe.
+        recovered = _recover_visible_login_after_navigation(
+            window,
+            request,
+            result,
+            timeout_seconds,
+            login_config,
+            credential_provider,
+            "ENTRY_MISSING_LOGIN_FALLBACK",
+        )
+        if not recovered:
+            raise entry_error
+        target = _find_element(window, selector, timeout_seconds)
+
+    if clicker is None:
+        target.click()
+    else:
+        clicker(target)
+    sleep(1)
+
+    recovered = _recover_visible_login_after_navigation(
+        window,
+        request,
+        result,
+        timeout_seconds,
+        login_config,
+        credential_provider,
+        "POST_FIRST_ACTION_LOGIN_CHECK",
+    )
+    if recovered:
+        target = _find_element(window, selector, timeout_seconds)
+        if clicker is None:
+            target.click()
+        else:
+            clicker(target)
+        sleep(1)
+    return recovered
 
 
 def _find_button_by_exact_label(window, labels, timeout_seconds):
@@ -2064,9 +2388,24 @@ def _multi_product_page_item_id(platform, name, grade, row_identity):
     return "UNMAPPED-" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
 
 
-def _refresh_for_multi_product_read(window, timeout_seconds, result):
+def _refresh_for_multi_product_read(
+    window,
+    timeout_seconds,
+    result,
+    request,
+    login_config,
+    credential_provider,
+):
     refresh = globals()["_refresh_product_list"]
-    return refresh(window, timeout_seconds, result, "BEFORE_PRODUCT_READ")
+    return refresh(
+        window,
+        timeout_seconds,
+        result,
+        "BEFORE_PRODUCT_READ",
+        request,
+        login_config,
+        credential_provider,
+    )
 
 
 def _run_multi_product_read_flow(args, request, result):
@@ -2178,7 +2517,14 @@ def _run_multi_product_read_flow(args, request, result):
         result["current_step"] = "REFRESH_PRODUCT_LIST"
         refresh_started_clock = time.time()
         try:
-            _refresh_for_multi_product_read(window, timeout_seconds, result)
+            _refresh_for_multi_product_read(
+                window,
+                timeout_seconds,
+                result,
+                request,
+                login_config,
+                credential_provider,
+            )
         except SliceError as refresh_error:
             # The mini-program can expire an otherwise valid session between
             # the initial login check and the product-list refresh.  Recover
@@ -2190,7 +2536,14 @@ def _run_multi_product_read_flow(args, request, result):
             if login_state not in {"ACCOUNT_PASSWORD", "VERIFICATION_REQUIRED"}:
                 raise refresh_error
             _recover_login_if_needed(window, request, result, timeout_seconds, login_config, credential_provider)
-            _refresh_for_multi_product_read(window, timeout_seconds, result)
+            _refresh_for_multi_product_read(
+                window,
+                timeout_seconds,
+                result,
+                request,
+                login_config,
+                credential_provider,
+            )
         read_performance["refresh_seconds"] = round(
             time.time() - refresh_started_clock,
             3,
@@ -3104,7 +3457,15 @@ def _read_price_input(element):
         return str(raw).strip()
 
 
-def _refresh_product_list(window, timeout_seconds, result, stage):
+def _refresh_product_list(
+    window,
+    timeout_seconds,
+    result,
+    stage,
+    request=None,
+    login_config=None,
+    credential_provider=None,
+):
     """Force the mini-program list to fetch current platform data before a list price read."""
     event = {
         "stage": stage,
@@ -3126,8 +3487,21 @@ def _refresh_product_list(window, timeout_seconds, result, stage):
                 retryable=True,
             )
 
-        _find_element(window, ELEMENTS["product_management"], timeout_seconds).click()
-        sleep(1)
+        if request is None:
+            _find_element(window, ELEMENTS["product_management"], timeout_seconds).click()
+            sleep(1)
+        else:
+            event["login_recovered_after_navigation"] = (
+                _click_business_navigation_entry(
+                    window,
+                    ELEMENTS["product_management"],
+                    request,
+                    result,
+                    timeout_seconds,
+                    login_config or {},
+                    credential_provider,
+                )
+            )
         _select_online_product_list(window, timeout_seconds, result)
         # Require two independent observations so the first stale WebView frame is not accepted.
         # A structured empty-list marker is also a complete, valid online page.
@@ -3187,20 +3561,21 @@ def _product_list_empty_marker_visible(window, timeout_seconds):
         "dynamic_product_list_empty_marker",
     )
     try:
-        _find_element(window, selector, min(float(timeout_seconds), 1.0))
-        return True
-    except SliceError:
+        marker = _find_element(window, selector, min(float(timeout_seconds), 1.0))
+        bounding = _bounding_dict(marker)
+        return bool(bounding["width"] > 0 and bounding["height"] > 0)
+    except (SliceError, TypeError, ValueError, KeyError):
         return False
 
 
 def _require_product_list_ready(window, timeout_seconds):
-    try:
-        _find_product_list_container(window, timeout_seconds)
-        return "PRODUCT_LIST_CONTAINER"
-    except SliceError:
-        if _product_list_empty_marker_visible(window, timeout_seconds):
-            return "EMPTY_LIST_MARKER"
-        raise
+    # A trusted empty page is a complete page state. Probe its visible marker
+    # before the potentially long captured/dynamic container fallbacks so an
+    # empty online list does not spend the full selector timeout twice.
+    if _product_list_empty_marker_visible(window, timeout_seconds):
+        return "EMPTY_LIST_MARKER"
+    _find_product_list_container(window, timeout_seconds)
+    return "PRODUCT_LIST_CONTAINER"
 
 
 def _find_product_scroll_view(window, timeout_seconds):
@@ -3369,7 +3744,16 @@ def _reuse_current_product_list(window, timeout_seconds, result, stage):
     return event
 
 
-def _prepare_product_list(window, timeout_seconds, result, stage, reuse_requested=False):
+def _prepare_product_list(
+    window,
+    timeout_seconds,
+    result,
+    stage,
+    reuse_requested=False,
+    request=None,
+    login_config=None,
+    credential_provider=None,
+):
     if reuse_requested:
         try:
             return _reuse_current_product_list(window, timeout_seconds, result, stage)
@@ -3381,7 +3765,15 @@ def _prepare_product_list(window, timeout_seconds, result, stage, reuse_requeste
                     "at": _now_iso(),
                 }
             )
-    return _refresh_product_list(window, timeout_seconds, result, stage)
+    return _refresh_product_list(
+        window,
+        timeout_seconds,
+        result,
+        stage,
+        request,
+        login_config,
+        credential_provider,
+    )
 
 
 def _open_price_dialog(
@@ -3967,7 +4359,15 @@ def _commit_v4_counts(items):
     return v4_result_counts(items)
 
 
-def _commit_v4_prepare_product_list(window, timeout_seconds, result, stage):
+def _commit_v4_prepare_product_list(
+    window,
+    timeout_seconds,
+    result,
+    stage,
+    request=None,
+    login_config=None,
+    credential_provider=None,
+):
     """Use the product-list preparation path proven by the successful queue."""
     return _prepare_product_list(
         window,
@@ -3975,6 +4375,9 @@ def _commit_v4_prepare_product_list(window, timeout_seconds, result, stage):
         result,
         stage,
         reuse_requested=True,
+        request=request,
+        login_config=login_config,
+        credential_provider=credential_provider,
     )
 
 
@@ -4108,7 +4511,15 @@ def _run_commit_batch_v4(args, request, result):
             _get_arg(args, "_login_config", {}),
             _get_arg(args, "_credential_provider", None),
         )
-        _commit_v4_prepare_product_list(window, timeout_seconds, result, "BATCH_PREFLIGHT")
+        _commit_v4_prepare_product_list(
+            window,
+            timeout_seconds,
+            result,
+            "BATCH_PREFLIGHT",
+            request,
+            _get_arg(args, "_login_config", {}),
+            _get_arg(args, "_credential_provider", None),
+        )
         page_rows, preflight = _commit_v4_scan_target_rows(
             window,
             timeout_seconds,
@@ -4786,6 +5197,12 @@ def _v5_prepare_row_for_click(
             minimum=100,
         ),
     }
+    list_viewport = {
+        "x": viewport["window_x"],
+        "y": viewport["window_y"],
+        "width": viewport["window_width"],
+        "height": viewport["window_height"],
+    }
     attempts = []
     for attempt in range(0, SINGLE_PRODUCT_MAX_SCROLL_ATTEMPTS + 1):
         if click_target == "set_online_action":
@@ -4820,14 +5237,14 @@ def _v5_prepare_row_for_click(
         )
         center_y = bounding["y"] + bounding["height"] / 2.0
         safe_top = float(viewport["window_y"]) + SINGLE_PRODUCT_CLICK_TOP_MARGIN
-        keyboard_key = "NONE"
+        scroll_direction = "none"
         if not clickable:
-            keyboard_key = "PGUP" if center_y < safe_top else "PGDN"
+            scroll_direction = "up" if center_y < safe_top else "down"
         attempts.append(
             {
                 "attempt": attempt,
                 "position": position,
-                "keyboard_key": keyboard_key,
+                "scroll_direction": scroll_direction,
                 "click_target": click_target,
                 "target_bounding": bounding,
                 "clickable": clickable,
@@ -4837,24 +5254,22 @@ def _v5_prepare_row_for_click(
             return attempts
         if attempt >= SINGLE_PRODUCT_MAX_SCROLL_ATTEMPTS:
             break
-        focus_element = _find_element(
+        if not _advance_product_list(
             window,
-            _row_field_selector(ROW_INDEX_START, "name", page_type),
             timeout_seconds,
-        )
-        focus_element.click()
-        sleep(V5_KEYBOARD_LOAD_WAIT_SECONDS)
-        window.activate()
-        window.wait_active(timeout=min(float(timeout_seconds), 3.0))
-        win32.send_keys(
-            "{" + keyboard_key + "}",
-            50,
-            False,
-            0.0,
-            True,
-            False,
-        )
-        sleep(0.3)
+            direction=scroll_direction,
+            page_type=page_type,
+            wheel_times=SINGLE_PRODUCT_SCROLL_WHEEL_TIMES,
+            settle_seconds=0.3,
+            wheel_delay_after=0.2,
+            viewport=list_viewport,
+        ):
+            raise SliceError(
+                "ELEMENT_NOT_VISIBLE",
+                "第%d个商品所在列表无法%s滚动"
+                % (position, "向上" if scroll_direction == "up" else "向下"),
+                retryable=True,
+            )
     raise SliceError(
         "ELEMENT_NOT_VISIBLE",
         "第%d个商品滚动后仍不在安全点击区域: %s"
@@ -4863,7 +5278,14 @@ def _v5_prepare_row_for_click(
     )
 
 
-def _v5_snapshot_items(request, snapshot_id, mappings, online_scan, waiting_scan):
+def _v5_snapshot_items(
+    request,
+    snapshot_id,
+    mappings,
+    online_scan,
+    waiting_scan,
+    include_mapping_only=True,
+):
     mapping_by_identity = {}
     for mapping in mappings:
         mapping_by_identity.setdefault(mapping["page_identity_key"], []).append(
@@ -4874,6 +5296,8 @@ def _v5_snapshot_items(request, snapshot_id, mappings, online_scan, waiting_scan
         ("online", online_scan),
         ("waiting", waiting_scan),
     ):
+        if scan is None:
+            continue
         for row in scan["rows"]:
             identity = contract_identity_key(
                 request["platform_name"],
@@ -4882,10 +5306,12 @@ def _v5_snapshot_items(request, snapshot_id, mappings, online_scan, waiting_scan
                 row.get("grade"),
             )
             rows_by_page[page_type].setdefault(identity, []).append(row)
+    observed_identities = (
+        set(rows_by_page["online"]) | set(rows_by_page["waiting"])
+    )
     identities = sorted(
-        set(mapping_by_identity)
-        | set(rows_by_page["online"])
-        | set(rows_by_page["waiting"])
+        observed_identities
+        | (set(mapping_by_identity) if include_mapping_only else set())
     )
     items = []
     for identity in identities:
@@ -5170,25 +5596,14 @@ def _run_listing_sync_v5(args, request, result):
         login_config = _get_arg(args, "_login_config", {})
         credential_provider = _get_arg(args, "_credential_provider", None)
         stage_timer = time.perf_counter()
-        _recover_login_if_needed(
-            window,
-            request,
-            result,
-            timeout_seconds,
-            login_config,
-            credential_provider,
-        )
-        _v5_record_timing(
-            timing_trace,
-            "login_check",
-            stage_timer,
-        )
-        stage_timer = time.perf_counter()
         _refresh_product_list(
             window,
             timeout_seconds,
             result,
             "BEFORE_LISTING_SYNC",
+            request,
+            login_config,
+            credential_provider,
         )
         _v5_record_timing(
             timing_trace,
@@ -5204,15 +5619,28 @@ def _run_listing_sync_v5(args, request, result):
             timing_trace=timing_trace,
             timing_stage="sync_online_scan",
         )
-        _select_waiting_product_list(window, timeout_seconds, result)
-        waiting_scan = _v5_scan_page(
-            window,
-            request,
-            timeout_seconds,
-            page_type="waiting",
-            targets=None,
-            timing_trace=timing_trace,
-            timing_stage="sync_waiting_scan",
+        scan_scope = str(request.get("scan_scope") or "online_and_waiting")
+        waiting_scan = None
+        if scan_scope == "online_and_waiting":
+            _select_waiting_product_list(window, timeout_seconds, result)
+            waiting_scan = _v5_scan_page(
+                window,
+                request,
+                timeout_seconds,
+                page_type="waiting",
+                targets=None,
+                timing_trace=timing_trace,
+                timing_stage="sync_waiting_scan",
+            )
+        waiting_boundary = (
+            waiting_scan["scan_started_at"]
+            if waiting_scan is not None
+            else online_scan["scan_completed_at"]
+        )
+        waiting_completed = (
+            waiting_scan["scan_completed_at"]
+            if waiting_scan is not None
+            else online_scan["scan_completed_at"]
         )
         items = _v5_snapshot_items(
             request,
@@ -5220,6 +5648,7 @@ def _run_listing_sync_v5(args, request, result):
             mappings,
             online_scan,
             waiting_scan,
+            include_mapping_only=(scan_scope == "online_and_waiting"),
         )
         completed_at = _multi_product_utc_now()
         snapshot = {
@@ -5233,21 +5662,20 @@ def _run_listing_sync_v5(args, request, result):
             "scan_completed_at": completed_at,
             "online_scan_started_at": online_scan["scan_started_at"],
             "online_scan_completed_at": online_scan["scan_completed_at"],
-            "waiting_scan_started_at": waiting_scan["scan_started_at"],
-            "waiting_scan_completed_at": waiting_scan["scan_completed_at"],
+            "waiting_scan_started_at": waiting_boundary,
+            "waiting_scan_completed_at": waiting_completed,
             "online_scan_complete": True,
-            "waiting_scan_complete": True,
+            "waiting_scan_complete": waiting_scan is not None,
             "online_end_marker_verified": True,
-            "waiting_end_marker_verified": True,
+            "waiting_end_marker_verified": waiting_scan is not None,
             "snapshot_complete": True,
             "instruction_hash": request["instruction_hash"],
             "status": "VERIFIED",
             "error_code": "",
             "evidence_manifest_sha256": sha256_json(
-                {
-                    "online": online_scan,
-                    "waiting": waiting_scan,
-                }
+                {"online": online_scan}
+                if waiting_scan is None
+                else {"online": online_scan, "waiting": waiting_scan}
             ),
             "items": items,
         }
@@ -5562,26 +5990,17 @@ def _run_listing_action_reconcile_v5(args, request, result):
             "window_prepare",
             stage_timer,
         )
-        stage_timer = time.perf_counter()
-        _recover_login_if_needed(
-            window,
-            request,
-            result,
-            timeout_seconds,
-            _get_arg(args, "_login_config", {}),
-            _get_arg(args, "_credential_provider", None),
-        )
-        _v5_record_timing(
-            timing_trace,
-            "login_check",
-            stage_timer,
-        )
+        login_config = _get_arg(args, "_login_config", {})
+        credential_provider = _get_arg(args, "_credential_provider", None)
         stage_timer = time.perf_counter()
         _refresh_product_list(
             window,
             timeout_seconds,
             result,
             "BEFORE_LISTING_RECONCILE",
+            request,
+            login_config,
+            credential_provider,
         )
         _v5_record_timing(
             timing_trace,
@@ -5833,26 +6252,17 @@ def _run_set_online_v5(args, request, result):
             "window_prepare",
             stage_timer,
         )
-        stage_timer = time.perf_counter()
-        _recover_login_if_needed(
-            window,
-            request,
-            result,
-            timeout_seconds,
-            _get_arg(args, "_login_config", {}),
-            _get_arg(args, "_credential_provider", None),
-        )
-        _v5_record_timing(
-            timing_trace,
-            "login_check",
-            stage_timer,
-        )
+        login_config = _get_arg(args, "_login_config", {})
+        credential_provider = _get_arg(args, "_credential_provider", None)
         stage_timer = time.perf_counter()
         _refresh_product_list(
             window,
             timeout_seconds,
             result,
             "BEFORE_SET_ONLINE",
+            request,
+            login_config,
+            credential_provider,
         )
         _v5_record_timing(
             timing_trace,
@@ -6413,26 +6823,17 @@ def _run_set_offline_v5(args, request, result):
             "window_prepare",
             stage_timer,
         )
-        stage_timer = time.perf_counter()
-        _recover_login_if_needed(
-            window,
-            request,
-            result,
-            timeout_seconds,
-            _get_arg(args, "_login_config", {}),
-            _get_arg(args, "_credential_provider", None),
-        )
-        _v5_record_timing(
-            timing_trace,
-            "login_check",
-            stage_timer,
-        )
+        login_config = _get_arg(args, "_login_config", {})
+        credential_provider = _get_arg(args, "_credential_provider", None)
         stage_timer = time.perf_counter()
         _refresh_product_list(
             window,
             timeout_seconds,
             result,
             "BEFORE_SET_OFFLINE",
+            request,
+            login_config,
+            credential_provider,
         )
         _v5_record_timing(
             timing_trace,
@@ -7651,21 +8052,16 @@ def _run_order_scan_v6(args, request, result):
         )
         result["applet_launch"] = launch
         sleep(0.5)
-        _recover_login_if_needed(
+        _click_business_navigation_entry(
             window,
+            ORDER_MANAGEMENT_ENTRY_SELECTOR,
             request,
             result,
             timeout_seconds,
             _get_arg(args, "_login_config", {}),
             _get_arg(args, "_credential_provider", None),
+            clicker=_order_click_element,
         )
-        entry = _find_element(
-            window,
-            ORDER_MANAGEMENT_ENTRY_SELECTOR,
-            timeout_seconds,
-        )
-        _order_click_element(entry)
-        sleep(1)
         result["current_step"] = "SELECT_ORDER_DATE"
         selected_date = _order_select_trade_date(
             window,
@@ -8135,6 +8531,9 @@ def _run_single_product_flow(args, allow_contract_dispatch=False):
                     result,
                     "BEFORE_PRICE_READ",
                     reuse_requested=reuse_product_list,
+                    request=request,
+                    login_config=login_config,
+                    credential_provider=credential_provider,
                 )
             except SliceError as exc:
                 _raise_classified_ui_error(window)
@@ -8400,7 +8799,13 @@ def _run_single_product_flow(args, allow_contract_dispatch=False):
                 current_step = "REFRESH_PRODUCT_LIST"
                 result["current_step"] = current_step
                 refresh_event = _refresh_product_list(
-                    window, timeout_seconds, result, "AFTER_SUBMIT_VERIFY"
+                    window,
+                    timeout_seconds,
+                    result,
+                    "AFTER_SUBMIT_VERIFY",
+                    request,
+                    login_config,
+                    credential_provider,
                 )
                 current_step = "LOCATE_PRODUCT"
                 result["current_step"] = current_step

@@ -197,6 +197,9 @@ def test_task13_sync_reuses_indexed_reader_with_page_specific_price_offset():
     assert sync_flow.count("targets=None") == 2
     assert 'timing_stage="sync_online_scan"' in sync_flow
     assert 'timing_stage="sync_waiting_scan"' in sync_flow
+    assert 'scan_scope == "online_and_waiting"' in sync_flow
+    assert 'waiting_scan = None' in sync_flow
+    assert '"waiting_scan_complete": waiting_scan is not None' in sync_flow
     assert '"listing_sync_total"' in sync_flow
 
 
@@ -234,7 +237,7 @@ def test_task13_sync_requires_complete_or_empty_markers_and_never_calls_write_ac
     assert "_advance_product_list" not in page_scan
     assert "_v5_reset_page_to_top" not in sync_flow
     assert '"online_end_marker_verified": True' in sync_flow
-    assert '"waiting_end_marker_verified": True' in sync_flow
+    assert '"waiting_end_marker_verified": waiting_scan is not None' in sync_flow
     for forbidden in (
         "_confirm_price_dialog",
         "_fill_target_price",

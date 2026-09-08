@@ -58,6 +58,14 @@ def _load_login_helpers(**overrides):
         "_collect_ui_state_labels": lambda _window: ["验证码"],
         "_login_page_state": lambda labels: ("VERIFICATION_REQUIRED", labels),
         "_find_element": lambda _window, _selector, _timeout: object(),
+        "_stable_captured_selector": lambda selector, _name: selector,
+        "_exact_acc_label_selector": lambda label, _name: ("exact-label", label),
+        "_find_login_form_inputs": lambda _window, _timeout: (_ for _ in ()).throw(
+            SliceError("LOGIN_FORM_STRUCTURE_UNAVAILABLE", "no safe form fallback")
+        ),
+        "_find_button_by_exact_label": lambda _window, _labels, _timeout: (_ for _ in ()).throw(
+            SliceError("ELEMENT_NOT_FOUND", "no safe submit fallback")
+        ),
         "ELEMENTS": {"product_management": "商品管理"},
         "phases": phases,
         "clock": clock,
@@ -76,6 +84,9 @@ def test_single_auto_login_submission_transitions_to_manual_verification_without
             calls.append(("submit", ""))
 
     class EmployeeModeElement:
+        def parent(self):
+            return self
+
         def click(self) -> None:
             calls.append(("employee_mode", ""))
 
@@ -129,6 +140,245 @@ def test_single_auto_login_submission_transitions_to_manual_verification_without
     assert "seller" not in repr(result)
     assert result["login"]["employee_mode_clicked"] is True
     assert result["login"]["verification_completed"] is True
+
+
+def test_auto_login_reports_failed_form_fallback_without_secret_output():
+    def stable_selector(selector, _name):
+        if selector == "password":
+            raise SliceError("ELEMENT_NOT_FOUND", "sensitive selector details")
+        return selector
+
+    namespace = _load_login_helpers(
+        _stable_captured_selector=stable_selector,
+        _find_element=lambda _window, selector, _timeout: SimpleNamespace(click=lambda: None),
+        _set_login_input_value=lambda _element, _value: None,
+    )
+    result: dict[str, object] = {}
+    try:
+        namespace["_attempt_automatic_login"](
+            object(),
+            {},
+            result,
+            1,
+            {
+                "auto_enabled": True,
+                "employee_mode_required": False,
+                "account_selector": "account",
+                "password_selector": "password",
+                "submit_selector": "submit",
+            },
+            SimpleNamespace(
+                get_login_credentials=lambda: SimpleNamespace(
+                    account="seller-secret",
+                    password="password-secret",
+                )
+            ),
+            ["登录"],
+        )
+    except SliceError as exc:
+        assert exc.code == "LOGIN_AUTOFILL_FAILED"
+        assert "PASSWORD_INPUT" in exc.message
+        assert "LOGIN_FORM_STRUCTURE_UNAVAILABLE" in exc.message
+    else:
+        raise AssertionError("expected password selector failure")
+
+    assert result["login"]["autofill_failed_step"] == "PASSWORD_INPUT"
+    assert "seller-secret" not in repr(result)
+    assert "password-secret" not in repr(result)
+    assert "sensitive selector details" not in repr(result)
+
+
+def test_auto_login_uses_exact_employee_label_when_captured_selector_is_stale():
+    calls: list[object] = []
+
+    class Clickable:
+        def parent(self):
+            calls.append("parent")
+            return self
+
+        def click(self):
+            calls.append("click")
+
+    def stable_selector(selector, _name):
+        if selector == "employee":
+            raise SliceError("ELEMENT_NOT_FOUND", "stale captured page path")
+        return selector
+
+    def find_element(_window, selector, _timeout):
+        calls.append(selector)
+        return Clickable()
+
+    namespace = _load_login_helpers(
+        _stable_captured_selector=stable_selector,
+        _exact_acc_label_selector=lambda label, _name: ("exact-label", label),
+        _find_element=find_element,
+        _set_login_input_value=lambda _element, _value: None,
+        _collect_ui_state_labels=lambda _window: ["商品管理"],
+        _login_page_state=lambda _labels: ("", []),
+    )
+    result: dict[str, object] = {}
+
+    completed = namespace["_attempt_automatic_login"](
+        object(),
+        {},
+        result,
+        1,
+        {
+            "auto_enabled": True,
+            "employee_mode_required": True,
+            "employee_mode_selector": "employee",
+            "employee_mode_wait_seconds": 0,
+            "account_selector": "account",
+            "password_selector": "password",
+            "submit_selector": "submit",
+            "post_submit_wait_seconds": 1,
+        },
+        SimpleNamespace(
+            get_login_credentials=lambda: SimpleNamespace(
+                account="seller-secret",
+                password="password-secret",
+            )
+        ),
+        ["登录"],
+    )
+
+    assert completed is True
+    assert ("exact-label", "员工") in calls
+    assert result["login"]["employee_mode_selector_path"] == "EXACT_LABEL_PRIMARY"
+    assert result["login"]["employee_mode_clicked"] is True
+    assert result["login"]["employee_mode_click_target"] == "PARENT_CONTAINER"
+    assert calls.index("parent") < calls.index("click")
+    assert "seller-secret" not in repr(result)
+    assert "password-secret" not in repr(result)
+
+
+def test_auto_login_refuses_employee_text_click_when_parent_container_is_unavailable():
+    calls: list[str] = []
+
+    class TextOnlyEmployeeElement:
+        def parent(self):
+            raise RuntimeError("no enclosing option")
+
+        def click(self):
+            calls.append("unsafe_text_click")
+
+    namespace = _load_login_helpers(
+        _find_element=lambda _window, selector, _timeout: (
+            TextOnlyEmployeeElement()
+            if selector == ("exact-label", "员工")
+            else SimpleNamespace(click=lambda: None)
+        ),
+        _set_login_input_value=lambda _element, _value: None,
+    )
+    result: dict[str, object] = {}
+
+    try:
+        namespace["_attempt_automatic_login"](
+            object(),
+            {},
+            result,
+            1,
+            {
+                "auto_enabled": True,
+                "employee_mode_required": True,
+                "employee_mode_selector": "employee",
+                "employee_mode_wait_seconds": 0,
+                "account_selector": "account",
+                "password_selector": "password",
+                "submit_selector": "submit",
+            },
+            SimpleNamespace(
+                get_login_credentials=lambda: SimpleNamespace(
+                    account="seller-secret",
+                    password="password-secret",
+                )
+            ),
+            ["登录"],
+        )
+    except SliceError as exc:
+        assert exc.code == "LOGIN_AUTOFILL_FAILED"
+        assert "EMPLOYEE_MODE_CONTAINER_CLICK" in exc.message
+    else:
+        raise AssertionError("expected employee mode container failure")
+
+    assert calls == []
+    assert result["login"]["autofill_failed_step"] == (
+        "EMPLOYEE_MODE_CONTAINER_CLICK"
+    )
+    assert "seller-secret" not in repr(result)
+    assert "password-secret" not in repr(result)
+
+
+def test_auto_login_uses_role_ordered_password_input_when_captured_selector_is_stale():
+    calls: list[tuple[str, str]] = []
+    account_element = object()
+    password_element = object()
+
+    def stable_selector(selector, _name):
+        if selector == "password":
+            raise SliceError("ELEMENT_NOT_FOUND", "stale positional password path")
+        return selector
+
+    def find_element(_window, selector, _timeout):
+        if selector == "submit":
+            return SimpleNamespace(click=lambda: calls.append(("submit", "")))
+        if selector == "商品管理":
+            return object()
+        return account_element
+
+    def native_input(element, value):
+        role = "password" if element is password_element else "account"
+        calls.append((role, value))
+
+    namespace = _load_login_helpers(
+        _stable_captured_selector=stable_selector,
+        _find_element=find_element,
+        _find_login_form_inputs=lambda _window, _timeout: (
+            {
+                "ACCOUNT_INPUT": account_element,
+                "PASSWORD_INPUT": password_element,
+            },
+            "input",
+        ),
+        _set_login_input_value=native_input,
+        _collect_ui_state_labels=lambda _window: ["商品管理"],
+        _login_page_state=lambda _labels: ("", []),
+    )
+    result: dict[str, object] = {}
+
+    completed = namespace["_attempt_automatic_login"](
+        object(),
+        {},
+        result,
+        1,
+        {
+            "auto_enabled": True,
+            "employee_mode_required": False,
+            "account_selector": "account",
+            "password_selector": "password",
+            "submit_selector": "submit",
+            "post_submit_wait_seconds": 1,
+        },
+        SimpleNamespace(
+            get_login_credentials=lambda: SimpleNamespace(
+                account="seller-secret",
+                password="password-secret",
+            )
+        ),
+        ["登录"],
+    )
+
+    assert completed is True
+    assert calls == [
+        ("account", "seller-secret"),
+        ("password", "password-secret"),
+        ("submit", ""),
+    ]
+    assert result["login"]["password_input_selector_path"] == (
+        "FORM_ROLE_FALLBACK_INPUT"
+    )
+    assert "seller-secret" not in repr(result)
+    assert "password-secret" not in repr(result)
 
 
 def test_provider_error_code_crosses_login_boundary_only_when_allowlisted():

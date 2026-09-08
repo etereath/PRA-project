@@ -319,7 +319,7 @@ class ShadowBotFileQueueRunner:
             },
         )
 
-    def archive_attempt_artifacts(self, execution_attempt_id: str) -> None:
+    def archive_attempt_artifacts(self, execution_attempt_id: str) -> Path:
         """Remove an old attempt from executable queue locations before retry."""
         archive_dir = self.queue_dir / "archive" / execution_attempt_id
         archive_dir.mkdir(parents=True, exist_ok=True)
@@ -348,6 +348,7 @@ class ShadowBotFileQueueRunner:
                 if not source.exists() and destination.exists():
                     raise ValidationError("OLD_QUEUE_ARTIFACT_CONFLICT") from exc
                 raise ValidationError("OLD_QUEUE_ARTIFACT_MISSING") from exc
+        return archive_dir
 
 
 class FileDropShadowBotTaskRunner(ShadowBotFileQueueRunner):
@@ -1245,7 +1246,7 @@ class ShadowBotExecutor:
             review_status=ReviewTaskStatus.PENDING,
             internal_sku=str(operation.product_identity.get("internal_sku") or "") or None,
             platform_name=operation.platform,
-            reason="ShadowBot is waiting for manual phone verification in the desktop mini program.",
+            reason="登录需要手机验证码，请在手机端完成验证后点击“处理完毕”。",
             review_payload={
                 "operation_id": operation.operation_id,
                 "execution_attempt_id": attempt.execution_attempt_id,

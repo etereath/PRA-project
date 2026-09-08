@@ -156,6 +156,7 @@ class AutomationSchedulePlanner:
         *,
         now: datetime,
         executable_job_types: Iterable[str] | None = None,
+        restrict_to_executable_job_types: bool = False,
     ) -> AutomationScheduleResult:
         current = _as_utc(now, "now")
         executable = frozenset(executable_job_types or ())
@@ -169,6 +170,11 @@ class AutomationSchedulePlanner:
         truncated_total = 0
 
         for job in self.repository.list_jobs(enabled_only=True):
+            if (
+                restrict_to_executable_job_types
+                and job.job_type not in executable
+            ):
+                continue
             if job.schedule_kind in {CHILD_ONLY, MANUAL_ONLY}:
                 continue
             last_scheduled_for = self.repository.latest_scheduled_for(
@@ -347,6 +353,7 @@ class AutomationService:
         lease_seconds: int = 60,
         max_runs_per_cycle: int = DEFAULT_MAX_RUNS_PER_CYCLE,
         max_windows_per_job: int = DEFAULT_MAX_WINDOWS_PER_JOB,
+        materialize_only_registered_handlers: bool = False,
     ) -> None:
         if lease_seconds < 1:
             raise ValueError("lease_seconds must be positive")
@@ -365,6 +372,9 @@ class AutomationService:
         self.owner_token = owner_token or f"automation-{uuid4().hex}"
         self.lease_seconds = lease_seconds
         self.max_runs_per_cycle = max_runs_per_cycle
+        self.materialize_only_registered_handlers = bool(
+            materialize_only_registered_handlers
+        )
         self.planner = AutomationSchedulePlanner(
             repository,
             operational_time=self.operational_time,
@@ -380,6 +390,9 @@ class AutomationService:
         scheduled = self.planner.materialize(
             now=self.clock(),
             executable_job_types=self.handlers,
+            restrict_to_executable_job_types=(
+                self.materialize_only_registered_handlers
+            ),
         )
         allowed_job_types = set(self.handlers)
 
@@ -410,25 +423,51 @@ class AutomationService:
                 clock=self.clock,
                 lease_seconds=self.lease_seconds,
             )
-            try:
-                outcome = handler(claim.run, context)
-                if not isinstance(outcome, AutomationRunOutcome):
-                    raise TypeError(
-                        "Automation handler must return "
-                        "AutomationRunOutcome"
+            current_time_context = self.operational_time.classify(
+                self.clock()
+            )
+            if (
+                claim.run.job_type in UI_JOB_TYPES
+                and claim.run.platform_trade_date
+                != current_time_context.platform_trade_date
+            ):
+                outcome = AutomationRunOutcome(
+                    status=AutomationRunStatus.MISSED,
+                    error_code="CROSS_TRADE_DATE_UI_WINDOW",
+                    error_message=(
+                        "页面任务已跨越 18:00 平台交易日边界，等待当前交易日的"
+                        "下一正常窗口。"
+                    ),
+                    event_payload={
+                        "scheduled_platform_trade_date": (
+                            claim.run.platform_trade_date.isoformat()
+                        ),
+                        "current_platform_trade_date": (
+                            current_time_context.platform_trade_date.isoformat()
+                        ),
+                        "platform_write_performed": False,
+                    },
+                )
+            else:
+                try:
+                    outcome = handler(claim.run, context)
+                    if not isinstance(outcome, AutomationRunOutcome):
+                        raise TypeError(
+                            "Automation handler must return "
+                            "AutomationRunOutcome"
+                        )
+                except TimeoutError as exc:
+                    outcome = AutomationRunOutcome(
+                        status=AutomationRunStatus.FAILED,
+                        error_code="AUTOMATION_HANDLER_TIMEOUT",
+                        error_message=safe_automation_error_message(exc),
                     )
-            except TimeoutError as exc:
-                outcome = AutomationRunOutcome(
-                    status=AutomationRunStatus.FAILED,
-                    error_code="AUTOMATION_HANDLER_TIMEOUT",
-                    error_message=safe_automation_error_message(exc),
-                )
-            except Exception as exc:
-                outcome = AutomationRunOutcome(
-                    status=AutomationRunStatus.FAILED,
-                    error_code="AUTOMATION_HANDLER_FAILED",
-                    error_message=safe_automation_error_message(exc),
-                )
+                except Exception as exc:
+                    outcome = AutomationRunOutcome(
+                        status=AutomationRunStatus.FAILED,
+                        error_code="AUTOMATION_HANDLER_FAILED",
+                        error_message=safe_automation_error_message(exc),
+                    )
             completed = self.repository.finish_run(
                 context.claim,
                 outcome,

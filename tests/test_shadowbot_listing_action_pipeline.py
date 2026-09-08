@@ -34,6 +34,7 @@ from app.services.shadowbot_listing_action_pipeline import (
     import_listing_action_result,
     propose_listing_action_batch,
     publish_listing_action_batch,
+    restore_orphaned_listing_reconcile_reviews,
 )
 from app.services.shadowbot_queue import (
     ShadowBotQueueWatchdog,
@@ -147,24 +148,28 @@ def _insert_set_online_task(
     repository: SQLiteRuntimeRepository,
     *,
     task_id: str = "TASK-SET-ONLINE-0001",
+    internal_sku: str = "SKU-WAITING-001",
+    origin_type: TaskOriginType = TaskOriginType.MANUAL,
+    target_price: Decimal = Decimal("22.00"),
+    target_inventory: int = 8,
 ) -> Task:
     now = datetime.now(UTC)
     task = Task(
         task_id=task_id,
-        internal_sku="SKU-WAITING-001",
+        internal_sku=internal_sku,
         platform_name=PLATFORM,
         action_type=TaskActionType.SET_ONLINE,
         priority=5,
         task_status=TaskStatus.PENDING,
         created_at=now,
-        origin_type=TaskOriginType.MANUAL,
+        origin_type=origin_type,
         origin_ref_id=f"test-harness:listing-action:{task_id}",
         expected_old_price=Decimal("21.00"),
-        target_price=Decimal("22.00"),
-        target_inventory=8,
+        target_price=target_price,
+        target_inventory=target_inventory,
         target_status="online",
         scope_type="sku",
-        scope_key="SKU-WAITING-001",
+        scope_key=internal_sku,
         dedupe_key="test-set-online-" + task_id.lower(),
         required_by=now + timedelta(hours=2),
         expires_at=now + timedelta(hours=2),
@@ -179,6 +184,8 @@ def _insert_set_offline_task(
     *,
     task_id: str,
     internal_sku: str,
+    task_group_id: str = "",
+    origin_type: TaskOriginType = TaskOriginType.MANUAL,
 ) -> Task:
     now = datetime.now(UTC)
     task = Task(
@@ -189,7 +196,7 @@ def _insert_set_offline_task(
         priority=5,
         task_status=TaskStatus.PENDING,
         created_at=now,
-        origin_type=TaskOriginType.MANUAL,
+        origin_type=origin_type,
         origin_ref_id=f"test-harness:listing-action:{task_id}",
         expected_old_price=Decimal("21.00"),
         target_price=None,
@@ -200,6 +207,9 @@ def _insert_set_offline_task(
         dedupe_key="test-set-offline-" + task_id.lower(),
         required_by=now + timedelta(hours=2),
         expires_at=now + timedelta(hours=2),
+        decision_trace=(
+            {"task_group_id": task_group_id} if task_group_id else {}
+        ),
         updated_at=now,
     )
     repository.insert_task(task)
@@ -322,6 +332,80 @@ def test_proposal_uses_latest_waiting_snapshot_without_persisting_batch(
             "WHERE batch_id = 'BATCH-SET-ONLINE-0001'"
         ).fetchone()[0]
     assert count == 0
+
+
+def test_manual_set_online_confirmation_does_not_use_old_scan_as_a_blocker(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    _seed_waiting_snapshot(repository, tmp_path)
+    _insert_set_online_task(
+        repository,
+        task_id="TASK-MANUAL-ONLINE-OLD-SCAN",
+        internal_sku="SKU-ONLINE-001",
+        target_price=Decimal("99.00"),
+        target_inventory=99,
+    )
+
+    proposal = propose_listing_action_batch(
+        repository,
+        batch_id="BATCH-MANUAL-ONLINE-OLD-SCAN",
+        task_ids=["TASK-MANUAL-ONLINE-OLD-SCAN"],
+        mapping_path=_mapping_file(tmp_path / "mapping-manual-online.json"),
+    )
+
+    assert proposal["publishable"] is True
+    assert proposal["gate_items"][0]["decision"] == "EXECUTE"
+    assert proposal["gate_items"][0]["manual_scan_warning_confirmed"] is True
+    assert proposal["gate_items"][0]["listing_location"] == "online_only"
+
+
+def test_automation_set_online_still_uses_scan_as_a_hard_gate(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    _seed_waiting_snapshot(repository, tmp_path)
+    _insert_set_online_task(
+        repository,
+        task_id="TASK-AUTO-ONLINE-SCAN-GATE",
+        internal_sku="SKU-ONLINE-001",
+        origin_type=TaskOriginType.AUTOMATION,
+        target_price=Decimal("99.00"),
+        target_inventory=99,
+    )
+
+    proposal = propose_listing_action_batch(
+        repository,
+        batch_id="BATCH-AUTO-ONLINE-SCAN-GATE",
+        task_ids=["TASK-AUTO-ONLINE-SCAN-GATE"],
+        mapping_path=_mapping_file(tmp_path / "mapping-auto-online.json"),
+    )
+
+    assert proposal["publishable"] is False
+    assert "LISTING_DATA_MISMATCH" in proposal["gate_items"][0]["block_reasons"]
+    assert proposal["gate_items"][0]["manual_scan_warning_confirmed"] is False
+
+
+def test_manual_set_offline_confirmation_forces_live_check_instead_of_scan_noop(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    _seed_waiting_snapshot(repository, tmp_path)
+    _insert_set_offline_task(
+        repository,
+        task_id="TASK-MANUAL-OFFLINE-OLD-SCAN",
+        internal_sku="SKU-WAITING-001",
+    )
+
+    proposal = propose_listing_action_batch(
+        repository,
+        batch_id="BATCH-MANUAL-OFFLINE-OLD-SCAN",
+        task_ids=["TASK-MANUAL-OFFLINE-OLD-SCAN"],
+        mapping_path=_mapping_file(tmp_path / "mapping-manual-offline.json"),
+    )
+
+    assert proposal["publishable"] is True
+    assert proposal["gate_items"][0]["decision"] == "EXECUTE"
+    assert proposal["gate_items"][0]["manual_scan_warning_confirmed"] is True
+    assert proposal["gate_items"][0]["listing_location"] == "waiting_only"
 
 
 def test_pending_review_task_blocks_all_listing_writes(tmp_path: Path) -> None:
@@ -1190,6 +1274,7 @@ def test_multi_offline_unknown_import_preserves_item_specific_states(
             repository,
             task_id=f"TASK-SET-OFFLINE-UNKNOWN-000{index}",
             internal_sku=sku,
+            task_group_id="TASK-GROUP-OFFLINE-UNKNOWN-0001",
         )
         task_ids.append(task.task_id)
     proposal = propose_listing_action_batch(
@@ -1218,7 +1303,7 @@ def test_multi_offline_unknown_import_preserves_item_specific_states(
     request_sha256 = hashlib.sha256(request_bytes).hexdigest()
     now = datetime.now(UTC).isoformat()
     outcomes = (
-        ("VERIFIED", "VERIFIED", True),
+        ("NEEDS_RECONCILIATION", "UNKNOWN", True),
         ("NEEDS_RECONCILIATION", "UNKNOWN", True),
         ("NOT_ATTEMPTED", "NOT_STARTED", False),
     )
@@ -1303,7 +1388,7 @@ def test_multi_offline_unknown_import_preserves_item_specific_states(
     assert [
         repository.get_task(task_id).task_status for task_id in task_ids
     ] == [
-        TaskStatus.SUCCESS,
+        TaskStatus.MANUAL_REVIEW,
         TaskStatus.MANUAL_REVIEW,
         TaskStatus.PENDING,
     ]
@@ -1336,126 +1421,161 @@ def test_multi_offline_unknown_import_preserves_item_specific_states(
     ) == [
         ("NOT_ATTEMPTED", "NOT_STARTED"),
         ("UNKNOWN", "UNKNOWN"),
-        ("VERIFIED", "VERIFIED"),
+        ("UNKNOWN", "UNKNOWN"),
     ]
     assert sorted(row["status"] for row in locks) == [
         "RELEASED",
-        "RELEASED",
+        "UNKNOWN",
         "UNKNOWN",
     ]
 
-    unknown_item = request["items"][1]
     runner = ShadowBotFileQueueRunner(queue_root)
-    runner.archive_attempt_artifacts(request["execution_attempt_id"])
-    reconcile = ensure_listing_action_reconcile_attempt(
-        repository,
-        runner,
-        source_request=request,
-        source_result=result,
-        operation_id=unknown_item["operation_id"],
+    archive_dir = runner.archive_attempt_artifacts(
+        request["execution_attempt_id"]
     )
-    assert reconcile["status"] == "PUBLISHED"
-    repeated = ensure_listing_action_reconcile_attempt(
-        repository,
-        runner,
-        source_request=request,
-        source_result=result,
-        operation_id=unknown_item["operation_id"],
-    )
-    assert repeated["status"] == "ALREADY_EXISTS"
-    reconcile_path = Path(reconcile["queue_request_path"])
-    watchdog_events = ShadowBotQueueWatchdog(
-        queue_root,
-        repository=repository,
-    ).inspect()
-    assert not any(
-        event.get("error_code") == "ORPHAN_READY_REQUEST"
-        for event in watchdog_events
-    )
-    assert reconcile_path.exists()
-    reconcile_bytes = reconcile_path.read_bytes()
-    reconcile_request = json.loads(reconcile_bytes.decode("utf-8-sig"))
-    assert reconcile_request["execution_mode"] == "RECONCILE"
-    assert reconcile_request["operation_id"] == unknown_item["operation_id"]
-    assert len(reconcile_request["items"]) == 1
-    assert "gate_summary" not in reconcile_request
-    assert "development_confirmation" not in reconcile_request
-
-    reconcile_item = reconcile_request["items"][0]
-    reconcile_output = {
-        name: reconcile_item[name]
-        for name in (
-            "source_task_id",
-            "operation_id",
-            "item_execution_attempt_id",
-            "internal_sku",
-            "item_payload_sha256",
+    assert archive_dir.is_dir()
+    unknown_items = request["items"][:2]
+    review = repository.list_review_tasks(status=ReviewTaskStatus.PENDING)[0]
+    assert review.review_payload["affected_task_ids"] == [
+        item["source_task_id"] for item in unknown_items
+    ]
+    for index, unknown_item in enumerate(unknown_items, start=1):
+        reconcile = ensure_listing_action_reconcile_attempt(
+            repository,
+            runner,
+            source_request=request,
+            source_result=result,
+            operation_id=unknown_item["operation_id"],
         )
-    } | {
-        "operation_result": "VERIFIED",
-        "detail_effect_state": "NOT_APPLIED",
-        "listing_effect_state": "VERIFIED",
-        "detail_save_clicked": False,
-        "action_confirm_clicked": False,
-        "observed_price_before_action": None,
-        "observed_inventory_before_action": None,
-        "observed_price_after_detail_save": None,
-        "observed_inventory_after_detail_save": None,
-        "actual_price": None,
-        "actual_inventory": None,
-        "detail_save_clicked_at": None,
-        "action_clicked_at": None,
-        "readback_observed_at": now,
-        "error_code": "",
-        "error_message": "",
-    }
-    reconcile_counts = v5_result_counts([reconcile_output])
-    reconcile_result = {
-        "schema_version": "shadowbot-listing-action-batch-result-1.0",
-        "contract_version": 5,
-        "action_type": "set_offline",
-        "batch_id": reconcile_request["batch_id"],
-        "execution_attempt_id": reconcile_request[
-            "execution_attempt_id"
-        ],
-        "execution_mode": "RECONCILE",
-        "manifest_sha256": reconcile_request["manifest_sha256"],
-        "instruction_hash": reconcile_request["instruction_hash"],
-        "request_file_sha256": "sha256:"
-        + hashlib.sha256(reconcile_bytes).hexdigest(),
-        "result_id": "RESULT-SET-OFFLINE-RECONCILE-0001",
-        "started_at": now,
-        "ended_at": now,
-        "items": [reconcile_output],
-        "counts": reconcile_counts,
-        **derive_v5_batch_semantics(reconcile_counts),
-        "error_code": "",
-        "error_message": "",
-        "retryable": False,
-    }
-    reconcile_result["result_payload_sha256"] = (
-        compute_listing_result_hash(reconcile_result)
-    )
-    reconciled = import_listing_action_result(
-        repository,
-        request=reconcile_request,
-        result=reconcile_result,
-        result_file_sha256="c" * 64,
-        source_result_path="offline-reconcile.result.json",
-    )
-    assert reconciled["status"] == "VERIFIED"
+        assert reconcile["status"] == "PUBLISHED"
+        repeated = ensure_listing_action_reconcile_attempt(
+            repository,
+            runner,
+            source_request=request,
+            source_result=result,
+            operation_id=unknown_item["operation_id"],
+        )
+        assert repeated["status"] == "ALREADY_EXISTS"
+        reconcile_path = Path(reconcile["queue_request_path"])
+        watchdog_events = ShadowBotQueueWatchdog(
+            queue_root,
+            repository=repository,
+        ).inspect()
+        assert not any(
+            event.get("error_code") == "ORPHAN_READY_REQUEST"
+            for event in watchdog_events
+        )
+        reconcile_bytes = reconcile_path.read_bytes()
+        reconcile_request = json.loads(reconcile_bytes.decode("utf-8-sig"))
+        assert reconcile_request["execution_mode"] == "RECONCILE"
+        assert reconcile_request["operation_id"] == unknown_item["operation_id"]
+        assert len(reconcile_request["items"]) == 1
+        assert "gate_summary" not in reconcile_request
+        assert "development_confirmation" not in reconcile_request
+
+        reconcile_item = reconcile_request["items"][0]
+        reconcile_output = {
+            name: reconcile_item[name]
+            for name in (
+                "source_task_id",
+                "operation_id",
+                "item_execution_attempt_id",
+                "internal_sku",
+                "item_payload_sha256",
+            )
+        } | {
+            "operation_result": "VERIFIED",
+            "detail_effect_state": "NOT_APPLIED",
+            "listing_effect_state": "VERIFIED",
+            "detail_save_clicked": False,
+            "action_confirm_clicked": False,
+            "observed_price_before_action": None,
+            "observed_inventory_before_action": None,
+            "observed_price_after_detail_save": None,
+            "observed_inventory_after_detail_save": None,
+            "actual_price": None,
+            "actual_inventory": None,
+            "detail_save_clicked_at": None,
+            "action_clicked_at": None,
+            "readback_observed_at": now,
+            "error_code": "",
+            "error_message": "",
+        }
+        reconcile_counts = v5_result_counts([reconcile_output])
+        reconcile_result = {
+            "schema_version": "shadowbot-listing-action-batch-result-1.0",
+            "contract_version": 5,
+            "action_type": "set_offline",
+            "batch_id": reconcile_request["batch_id"],
+            "execution_attempt_id": reconcile_request[
+                "execution_attempt_id"
+            ],
+            "execution_mode": "RECONCILE",
+            "manifest_sha256": reconcile_request["manifest_sha256"],
+            "instruction_hash": reconcile_request["instruction_hash"],
+            "request_file_sha256": "sha256:"
+            + hashlib.sha256(reconcile_bytes).hexdigest(),
+            "result_id": f"RESULT-SET-OFFLINE-RECONCILE-000{index}",
+            "started_at": now,
+            "ended_at": now,
+            "items": [reconcile_output],
+            "counts": reconcile_counts,
+            **derive_v5_batch_semantics(reconcile_counts),
+            "error_code": "",
+            "error_message": "",
+            "retryable": False,
+        }
+        reconcile_result["result_payload_sha256"] = (
+            compute_listing_result_hash(reconcile_result)
+        )
+        reconciled = import_listing_action_result(
+            repository,
+            request=reconcile_request,
+            result=reconcile_result,
+            result_file_sha256=("c" if index == 1 else "d") * 64,
+            source_result_path=f"offline-reconcile-{index}.result.json",
+        )
+        assert reconciled["status"] == "VERIFIED"
+        assert repository.get_task(
+            unknown_item["source_task_id"]
+        ).task_status == TaskStatus.SUCCESS
+        pending_reviews = repository.list_review_tasks(
+            status=ReviewTaskStatus.PENDING
+        )
+        assert len(pending_reviews) == (1 if index == 1 else 0)
+        if index == 1:
+            with repository.connect_write() as connection, connection:
+                connection.execute(
+                    """
+                    UPDATE review_tasks
+                    SET review_status = 'cancelled',
+                        resolved_by = 'system:listing_reconcile',
+                        resolved_at = ?, updated_at = ?
+                    WHERE review_task_id = ?
+                    """,
+                    (now, now, review.review_task_id),
+                )
+            assert restore_orphaned_listing_reconcile_reviews(repository) == 1
+            restored = repository.get_review_task(review.review_task_id)
+            assert restored is not None
+            assert restored.review_status is ReviewTaskStatus.PENDING
+            assert restored.source_task_id == unknown_items[1]["source_task_id"]
+            assert restored.review_payload["affected_task_ids"] == [
+                unknown_items[1]["source_task_id"]
+            ]
+        runner.archive_attempt_artifacts(
+            reconcile_request["execution_attempt_id"]
+        )
+
     assert reconciled["batch_status"] == "PARTIAL"
-    assert repository.get_task(
-        unknown_item["source_task_id"]
-    ).task_status == TaskStatus.SUCCESS
     with repository.connect_read() as connection:
-        lock = connection.execute(
+        lock_rows = connection.execute(
             """
             SELECT status FROM shadowbot_write_locks
-            WHERE operation_id = ?
+            WHERE operation_id IN (?, ?)
             """,
-            (unknown_item["operation_id"],),
-        ).fetchone()
+            tuple(item["operation_id"] for item in unknown_items),
+        ).fetchall()
         batch = connection.execute(
             """
             SELECT status, verified_count, unknown_count,
@@ -1465,21 +1585,13 @@ def test_multi_offline_unknown_import_preserves_item_specific_states(
             """,
             (request["batch_id"],),
         ).fetchone()
-        open_reviews = connection.execute(
-            """
-            SELECT COUNT(*) AS count FROM review_tasks
-            WHERE source_task_id = ? AND review_status = 'pending'
-            """,
-            (unknown_item["source_task_id"],),
-        ).fetchone()
-    assert lock["status"] == "RELEASED"
+    assert [row["status"] for row in lock_rows] == ["RELEASED", "RELEASED"]
     assert dict(batch) == {
         "status": "PARTIAL",
         "verified_count": 2,
         "unknown_count": 0,
         "not_attempted_count": 1,
     }
-    assert open_reviews["count"] == 0
 
 
 def test_partial_set_online_projects_complete_post_failure_snapshot(
@@ -1603,7 +1715,8 @@ def test_partial_set_online_projects_complete_post_failure_snapshot(
     )
     assert len(outbox) == 1
     assert outbox[0].related_task_id == task.task_id
-    assert "SKU-WAITING-001" in outbox[0].payload["message"]
+    assert "相关任务" in outbox[0].payload["message"]
+    assert "SKU-WAITING-001" not in outbox[0].payload["message"]
     assert PLATFORM in outbox[0].payload["message"]
     with repository.connect_read() as connection:
         lock = connection.execute(

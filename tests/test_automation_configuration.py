@@ -306,6 +306,24 @@ def test_inventory_alert_uses_existing_versioned_policy(configured):
     assert updated.updated_by == "operator"
 
 
+def test_inventory_alert_rejects_per_sku_override(configured):
+    _, _, service, principal = configured
+
+    with pytest.raises(
+        AutomationConfigurationError,
+        match="按品种共享",
+    ):
+        service.configure_inventory_alert(
+            principal,
+            scope_type="SKU",
+            scope_key="SKU-SYNTHETIC",
+            enabled=True,
+            threshold_qty=20,
+            repeat_interval_minutes=60,
+            expected_version=0,
+        )
+
+
 def test_settlement_rerun_is_explicit_and_idempotent(configured):
     _, automation, service, principal = configured
     job = _job_by_type(automation, PLATFORM_TRADE_DAY_SETTLEMENT)

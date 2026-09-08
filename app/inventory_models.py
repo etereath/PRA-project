@@ -81,6 +81,14 @@ class InventoryAlertPolicy:
 
 
 @dataclass(frozen=True, slots=True)
+class VarietyInventorySummary:
+    variety: str
+    current_qty: int
+    grade_quantities: tuple[tuple[str, int], ...]
+    internal_skus: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class InventoryWriteResult:
     status: str
     transaction: InventoryTransaction | None

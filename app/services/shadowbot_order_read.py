@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 import time
 from collections.abc import Callable, Mapping
@@ -227,6 +228,8 @@ class ShadowBotFileQueueOrderTransport:
         self._wait_callback: Callable[[], bool] | None = None
         self._last_attempt_id = ""
         self._last_request_sha256 = ""
+        self._last_result_file_sha256 = ""
+        self._last_result_path: Path | None = None
 
     def set_wait_callback(
         self,
@@ -239,36 +242,54 @@ class ShadowBotFileQueueOrderTransport:
         request: Mapping[str, Any],
     ) -> Mapping[str, Any]:
         request_data = dict(request)
-        if self.require_fresh_heartbeat:
-            try:
-                require_fresh_running_worker(
-                    self.queue_dir,
-                    now=_as_utc(self.clock()),
-                    heartbeat_max_age_seconds=(
-                        self.heartbeat_max_age_seconds
-                    ),
-                )
-            except ValidationError as exc:
-                raise OrderObservationError(str(exc)) from exc
-        attempt_id = str(
-            request_data.get("execution_attempt_id") or ""
-        )
+        self.require_worker_ready()
         started = self.runner.start(request_data)
-        self._last_attempt_id = attempt_id
-        self._last_request_sha256 = str(
-            started.raw_output.get("request_file_sha256") or ""
+        return self.wait_for_published_result(
+            request_data,
+            request_file_sha256=str(
+                started.raw_output.get("request_file_sha256") or ""
+            ),
         )
+
+    def require_worker_ready(self) -> None:
+        """Reuse the verified Worker heartbeat gate before any READ_ONLY publish."""
+
+        if not self.require_fresh_heartbeat:
+            return
+        try:
+            require_fresh_running_worker(
+                self.queue_dir,
+                now=_as_utc(self.clock()),
+                heartbeat_max_age_seconds=self.heartbeat_max_age_seconds,
+            )
+        except ValidationError as exc:
+            raise OrderObservationError(str(exc)) from exc
+
+    def wait_for_published_result(
+        self,
+        request: Mapping[str, Any],
+        *,
+        request_file_sha256: str,
+    ) -> Mapping[str, Any]:
+        """Wait for one request published by an existing formal publisher."""
+
+        request_data = dict(request)
+        attempt_id = str(request_data.get("execution_attempt_id") or "")
+        self._last_attempt_id = attempt_id
+        self._last_request_sha256 = str(request_file_sha256 or "")
+        self._last_result_file_sha256 = ""
         result_path = (
             self.queue_dir
             / "results"
             / f"{attempt_id}.result.json"
         )
+        self._last_result_path = result_path
         deadline = self.monotonic() + self.timeout_seconds
         next_heartbeat = self.monotonic() + 5.0
         while self.monotonic() < deadline:
             if result_path.exists():
                 try:
-                    result, _ = read_checked_queue_json(
+                    result, result_bytes = read_checked_queue_json(
                         result_path,
                         max_bytes=4 * 1024 * 1024,
                     )
@@ -285,6 +306,9 @@ class ShadowBotFileQueueOrderTransport:
                         "ShadowBot order result is bound to a different "
                         "request file"
                     )
+                self._last_result_file_sha256 = hashlib.sha256(
+                    result_bytes
+                ).hexdigest()
                 return result
             if (
                 self._wait_callback is not None
@@ -301,13 +325,24 @@ class ShadowBotFileQueueOrderTransport:
             "ShadowBot order scan timed out without a result"
         )
 
-    def acknowledge_last_result(self) -> None:
+    @property
+    def last_result_file_sha256(self) -> str:
+        return self._last_result_file_sha256
+
+    @property
+    def last_result_path(self) -> Path | None:
+        return self._last_result_path
+
+    def acknowledge_last_result(self) -> Path | None:
         if not self._last_attempt_id:
-            return
+            return None
         attempt_id = self._last_attempt_id
-        self.runner.archive_attempt_artifacts(attempt_id)
+        archive_dir = self.runner.archive_attempt_artifacts(attempt_id)
         self._last_attempt_id = ""
         self._last_request_sha256 = ""
+        self._last_result_file_sha256 = ""
+        self._last_result_path = None
+        return archive_dir
 
 def _reject_forbidden_keys(value: Any) -> None:
     if isinstance(value, Mapping):

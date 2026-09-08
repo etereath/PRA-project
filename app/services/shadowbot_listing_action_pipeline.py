@@ -181,6 +181,9 @@ def propose_listing_action_batch(
             raise ValidationError("SYSTEM_EMERGENCY 不得与其他任务混合成批。")
         if str(execution_profile).strip().lower() != "production":
             raise ValidationError("SYSTEM_EMERGENCY 只允许正式运行合同。")
+    manual_scan_warning_confirmed = bool(source_tasks) and all(
+        task.origin_type is TaskOriginType.MANUAL for task in source_tasks
+    )
     gate_items = []
     corrective_authorizations: list[dict[str, str]] = []
     with closing(repository.connect_read()) as connection:
@@ -239,18 +242,38 @@ def propose_listing_action_batch(
                     if lock["operation_id"]
                     != corrective["previous_operation_id"]
                 ]
+            gate_online_status = context["online_status"]
+            gate_listing_location = context["listing_location"]
+            gate_snapshot_valid = context["snapshot_valid"]
+            gate_online_scan_complete = context["online_scan_complete"]
+            gate_online_occurrences = context["online_occurrences"]
+            gate_observed_price = context["observed_price"]
+            gate_observed_inventory = context["observed_inventory"]
+            if manual_scan_warning_confirmed:
+                # A MANUAL Task has already shown scan quality in the Web's
+                # final confirmation.  Do not reinterpret an old snapshot as
+                # either a hard blocker or proof that the action is already
+                # applied.  Reviews and write locks remain authoritative, and
+                # the Worker still performs its live page precheck.
+                gate_online_status = "online" if action_type == "set_offline" else ""
+                gate_listing_location = None
+                gate_snapshot_valid = False
+                gate_online_scan_complete = False
+                gate_online_occurrences = 0
+                gate_observed_price = None
+                gate_observed_inventory = None
             gate = evaluate_automation_gate(
                 action_type=action_type,
                 internal_sku=item["internal_sku"],
                 gate_phase="PRE_PUBLISH",
-                online_status=context["online_status"],
-                listing_location=context["listing_location"],
-                snapshot_valid=context["snapshot_valid"],
+                online_status=gate_online_status,
+                listing_location=gate_listing_location,
+                snapshot_valid=gate_snapshot_valid,
                 fresh_sync_required=False,
-                online_scan_complete=context["online_scan_complete"],
-                online_occurrences=context["online_occurrences"],
-                observed_price=context["observed_price"],
-                observed_inventory=context["observed_inventory"],
+                online_scan_complete=gate_online_scan_complete,
+                online_occurrences=gate_online_occurrences,
+                observed_price=gate_observed_price,
+                observed_inventory=gate_observed_inventory,
                 target_price=item.get("target_price"),
                 target_inventory=item.get("target_inventory"),
                 open_reviews=reviews,
@@ -268,6 +291,7 @@ def propose_listing_action_batch(
                     "listing_location": context["listing_location"],
                     "observed_price": context["observed_price"],
                     "observed_inventory": context["observed_inventory"],
+                    "manual_scan_warning_confirmed": manual_scan_warning_confirmed,
                     "corrective_retry_review_task_id": (
                         corrective["review_task_id"]
                         if corrective is not None
@@ -1303,61 +1327,17 @@ def _import_listing_action_reconcile_result(
             ),
         )
         if outcome != "NEEDS_RECONCILIATION":
-            review_rows = connection.execute(
-                """
-                SELECT review_task_id FROM review_tasks
-                WHERE source_task_id = ? AND review_status = 'pending'
-                  AND reason LIKE ?
-                """,
-                (
-                    item["source_task_id"],
-                    "%需要唯一 RECONCILE%",
+            _close_completed_listing_reconcile_reviews(
+                connection,
+                repository=repository,
+                source_task_id=str(item["source_task_id"]),
+                reconcile_execution_attempt_id=str(
+                    request["execution_attempt_id"]
                 ),
-            ).fetchall()
-            for review_row in review_rows:
-                review_id = str(review_row["review_task_id"])
-                connection.execute(
-                    """
-                    UPDATE review_tasks
-                    SET review_status = 'cancelled',
-                        resolution_payload_json = ?, updated_at = ?,
-                        resolved_by = 'system:listing_reconcile',
-                        resolved_at = ?, resolution_note = ?
-                    WHERE review_task_id = ? AND review_status = 'pending'
-                    """,
-                    (
-                        _json_text(
-                            {
-                                "resolution_type": (
-                                    "RECONCILE_VERIFIED"
-                                    if outcome == "VERIFIED"
-                                    else "RECONCILE_NOT_APPLIED"
-                                ),
-                                "reconcile_execution_attempt_id": request[
-                                    "execution_attempt_id"
-                                ],
-                                "result_id": result_id,
-                            }
-                        ),
-                        now,
-                        now,
-                        "唯一只读 RECONCILE 已给出确定结论",
-                        review_id,
-                    ),
-                )
-                connection.execute(
-                    """
-                    UPDATE review_tokens
-                    SET revoked_at = ?
-                    WHERE review_task_id = ? AND revoked_at IS NULL
-                    """,
-                    (now, review_id),
-                )
-                repository._cancel_review_outbox_on_connection(
-                    connection,
-                    review_id,
-                    changed_at=now_value,
-                )
+                result_id=result_id,
+                now=now,
+                now_value=now_value,
+            )
         connection.commit()
     except Exception:
         if connection.in_transaction:
@@ -2254,6 +2234,223 @@ def _json_object(value: Any) -> dict[str, Any]:
     except (TypeError, ValueError, json.JSONDecodeError):
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _close_completed_listing_reconcile_reviews(
+    connection: Any,
+    *,
+    repository: SQLiteRuntimeRepository,
+    source_task_id: str,
+    reconcile_execution_attempt_id: str,
+    result_id: str,
+    now: str,
+    now_value: datetime,
+) -> None:
+    """Close a grouped review only after every affected task is determinate."""
+
+    review_rows = connection.execute(
+        """
+        SELECT review_task_id, source_task_id, review_payload_json
+        FROM review_tasks
+        WHERE review_status = 'pending'
+          AND review_type = 'manual_review'
+        ORDER BY created_at, review_task_id
+        """
+    ).fetchall()
+    for review_row in review_rows:
+        review_payload = _json_object(review_row["review_payload_json"])
+        raw_affected = review_payload.get("affected_task_ids")
+        affected_task_ids = [
+            str(task_id).strip()
+            for task_id in raw_affected or []
+            if str(task_id).strip()
+        ] if isinstance(raw_affected, list) else []
+        if not affected_task_ids:
+            fallback_task_id = str(review_row["source_task_id"] or "").strip()
+            affected_task_ids = [fallback_task_id] if fallback_task_id else []
+        affected_task_ids = list(dict.fromkeys(affected_task_ids))
+        if source_task_id not in affected_task_ids:
+            continue
+
+        placeholders = ",".join("?" for _ in affected_task_ids)
+        task_rows = connection.execute(
+            f"""
+            SELECT task_id, task_status
+            FROM tasks
+            WHERE task_id IN ({placeholders})
+            """,
+            tuple(affected_task_ids),
+        ).fetchall()
+        task_statuses = {
+            str(row["task_id"]): str(row["task_status"])
+            for row in task_rows
+        }
+        if len(task_statuses) != len(affected_task_ids) or any(
+            task_statuses.get(task_id) == TaskStatus.MANUAL_REVIEW.value
+            for task_id in affected_task_ids
+        ):
+            continue
+
+        operation_rows = connection.execute(
+            f"""
+            SELECT task_id, operation_result
+            FROM shadowbot_operations
+            WHERE task_id IN ({placeholders})
+            """,
+            tuple(affected_task_ids),
+        ).fetchall()
+        operation_results = {
+            str(row["task_id"]): str(row["operation_result"] or "")
+            for row in operation_rows
+        }
+        determinate_results = {"VERIFIED", "NOT_APPLIED"}
+        if len(operation_results) != len(affected_task_ids) or any(
+            operation_results.get(task_id) not in determinate_results
+            for task_id in affected_task_ids
+        ):
+            continue
+
+        distinct_results = set(operation_results.values())
+        resolution_type = (
+            "RECONCILE_VERIFIED"
+            if distinct_results == {"VERIFIED"}
+            else "RECONCILE_NOT_APPLIED"
+            if distinct_results == {"NOT_APPLIED"}
+            else "RECONCILE_RESOLVED"
+        )
+        review_id = str(review_row["review_task_id"])
+        connection.execute(
+            """
+            UPDATE review_tasks
+            SET review_status = 'cancelled',
+                resolution_payload_json = ?, updated_at = ?,
+                resolved_by = 'system:listing_reconcile',
+                resolved_at = ?, resolution_note = ?
+            WHERE review_task_id = ? AND review_status = 'pending'
+            """,
+            (
+                _json_text(
+                    {
+                        "resolution_type": resolution_type,
+                        "reconcile_execution_attempt_id": (
+                            reconcile_execution_attempt_id
+                        ),
+                        "result_id": result_id,
+                        "affected_task_ids": affected_task_ids,
+                        "task_outcomes": operation_results,
+                    }
+                ),
+                now,
+                now,
+                "批次内唯一只读 RECONCILE 均已给出确定结论",
+                review_id,
+            ),
+        )
+        connection.execute(
+            """
+            UPDATE review_tokens
+            SET revoked_at = ?
+            WHERE review_task_id = ? AND revoked_at IS NULL
+            """,
+            (now, review_id),
+        )
+        repository._cancel_review_outbox_on_connection(
+            connection,
+            review_id,
+            changed_at=now_value,
+        )
+
+
+def restore_orphaned_listing_reconcile_reviews(
+    repository: SQLiteRuntimeRepository,
+    *,
+    now: datetime | None = None,
+) -> int:
+    """Reopen only system-closed reviews that still contain UNKNOWN tasks."""
+
+    now_value = now or datetime.now(UTC)
+    now_text = now_value.isoformat()
+    restored_count = 0
+    connection = repository.connect_write()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        review_rows = connection.execute(
+            """
+            SELECT review_task_id, review_payload_json
+            FROM review_tasks
+            WHERE review_status = 'cancelled'
+              AND resolved_by = 'system:listing_reconcile'
+            ORDER BY updated_at, review_task_id
+            """
+        ).fetchall()
+        for review_row in review_rows:
+            review_payload = _json_object(review_row["review_payload_json"])
+            raw_affected = review_payload.get("affected_task_ids")
+            affected_task_ids = [
+                str(task_id).strip()
+                for task_id in raw_affected or []
+                if str(task_id).strip()
+            ] if isinstance(raw_affected, list) else []
+            affected_task_ids = list(dict.fromkeys(affected_task_ids))
+            if not affected_task_ids:
+                continue
+            placeholders = ",".join("?" for _ in affected_task_ids)
+            unresolved_rows = connection.execute(
+                f"""
+                SELECT tasks.task_id
+                FROM tasks
+                JOIN shadowbot_operations AS operations
+                  ON operations.task_id = tasks.task_id
+                WHERE tasks.task_id IN ({placeholders})
+                  AND tasks.task_status = 'manual_review'
+                  AND operations.status = 'NEEDS_RECONCILIATION'
+                  AND operations.operation_result = 'NEEDS_RECONCILIATION'
+                """,
+                tuple(affected_task_ids),
+            ).fetchall()
+            unresolved_set = {
+                str(row["task_id"]) for row in unresolved_rows
+            }
+            unresolved_task_ids = [
+                task_id
+                for task_id in affected_task_ids
+                if task_id in unresolved_set
+            ]
+            if not unresolved_task_ids:
+                continue
+            review_payload["task_id"] = unresolved_task_ids[0]
+            review_payload["affected_task_ids"] = unresolved_task_ids
+            review_payload["affected_task_count"] = len(unresolved_task_ids)
+            review_payload["task_status"] = TaskStatus.MANUAL_REVIEW.value
+            connection.execute(
+                """
+                UPDATE review_tasks
+                SET review_status = 'pending', source_task_id = ?, reason = ?,
+                    review_payload_json = ?, required_by = ?, updated_at = ?,
+                    resolution_payload_json = '{}', resolved_by = '',
+                    resolved_at = NULL, resolution_note = ''
+                WHERE review_task_id = ?
+                  AND review_status = 'cancelled'
+                  AND resolved_by = 'system:listing_reconcile'
+                """,
+                (
+                    unresolved_task_ids[0],
+                    "只读 RECONCILE 仍无法确认执行结果，需要人工复核",
+                    _json_text(review_payload),
+                    now_text,
+                    now_text,
+                    str(review_row["review_task_id"]),
+                ),
+            )
+            restored_count += 1
+        connection.commit()
+    except Exception:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
+    finally:
+        connection.close()
+    return restored_count
 
 
 def _json_value(value: Any) -> Any:

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from contextlib import closing
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from threading import Lock
@@ -14,7 +15,7 @@ from typing import Callable, Iterable
 from uuid import uuid4
 
 from app.automation_ui_channel import has_active_automation_ui_run
-from app.enums import ProductMappingStatus, TaskActionType, TaskStatus
+from app.enums import ProductMappingStatus, TaskActionType, TaskOriginType, TaskStatus
 from app.exceptions import ValidationError
 from app.operations_web.auth import (
     AuthorizationBackend,
@@ -25,6 +26,8 @@ from app.models import TaskStatusHistory
 from app.repositories.inventory_repository import InventoryRepository
 from app.repositories.master_data_repository import RuntimeMasterDataRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.services.listing_scan_quality import latest_listing_scan_quality
+from app.services.notification_outbox import NotificationOutboxService
 from app.services.shadowbot_commit_batch import load_identity_mapping
 from app.services.shadowbot_commit_pipeline import (
     build_task_commit_manifest,
@@ -41,7 +44,8 @@ from app.utils import utc_now
 
 AUTHORIZATION_TTL = timedelta(minutes=10)
 MAX_PREPARATIONS = 512
-CONTRACT_VERSION = "task13.5-7e-execution-authorization-1.0"
+CONTRACT_VERSION = "task13.5-7e-execution-authorization-1.2"
+LOGGER = logging.getLogger("app.services.execution_authorization")
 
 
 class ExecutionAuthorizationError(ValidationError):
@@ -54,6 +58,33 @@ class ExecutionAuthorizationForbidden(ExecutionAuthorizationError):
 
 class ExecutionAuthorizationConflict(ExecutionAuthorizationError):
     pass
+
+
+class ExecutionQueueBlocked(ExecutionAuthorizationConflict):
+    """A durable unresolved platform operation is blocking a new submission."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        blocking_operation_id: str,
+        blocking_task_id: str,
+        lock_status: str,
+        lock_updated_at: str,
+        operation_created_at: str,
+        platform_name: str,
+        product_label: str,
+        action_type: str,
+    ) -> None:
+        super().__init__(message)
+        self.blocking_operation_id = blocking_operation_id
+        self.blocking_task_id = blocking_task_id
+        self.lock_status = lock_status
+        self.lock_updated_at = lock_updated_at
+        self.operation_created_at = operation_created_at
+        self.platform_name = platform_name
+        self.product_label = product_label
+        self.action_type = action_type
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +129,10 @@ class ExecutionAuthorizationApplicationService:
         applet_uri: str,
         execution_profile: str,
         clock=None,
+        listing_scan_max_age: timedelta = timedelta(minutes=30),
+        notification_channel: str = "unconfigured",
+        notification_recipient_type: str = "role",
+        notification_recipient_ref: str = "operations",
         runner_factory: Callable[[Path], object] = ShadowBotFileQueueRunner,
         v4_prepare=prepare_task_commit_batch,
         v4_build=build_task_commit_manifest,
@@ -115,6 +150,20 @@ class ExecutionAuthorizationApplicationService:
         self.applet_uri = str(applet_uri or "").strip()
         self.execution_profile = profile
         self.clock = clock or utc_now
+        self.listing_scan_max_age = listing_scan_max_age
+        self.notification_channel = (
+            str(notification_channel or "").strip().lower() or "unconfigured"
+        )
+        self.notification_recipient_type = (
+            str(notification_recipient_type or "").strip() or "role"
+        )
+        self.notification_recipient_ref = (
+            str(notification_recipient_ref or "").strip() or "operations"
+        )
+        self.notifications = NotificationOutboxService(
+            runtime_repository,
+            clock=self.clock,
+        )
         self.runner_factory = runner_factory
         self.v4_prepare = v4_prepare
         self.v4_build = v4_build
@@ -153,7 +202,7 @@ class ExecutionAuthorizationApplicationService:
                     "本次执行请求与之前的任务不同，请刷新页面后重新预览。"
                 )
 
-        facts = self._revalidate(task_ids, current)
+        facts = self._revalidate_with_queue_notification(task_ids, current)
         action_type = TaskActionType(str(facts["action_type"]))
         batch_id = _batch_id(
             authenticated_principal.subject,
@@ -250,7 +299,7 @@ class ExecutionAuthorizationApplicationService:
             stored.state = "SUBMITTING"
 
         try:
-            facts = self._revalidate(task_ids, current)
+            facts = self._revalidate_with_queue_notification(task_ids, current)
             action_type = public.action_type
             if str(facts["action_type"]) != action_type.value:
                 raise ExecutionAuthorizationConflict("任务动作在确认前发生变化。")
@@ -493,12 +542,6 @@ class ExecutionAuthorizationApplicationService:
                 target_price = _optional_decimal(row["target_price"])
                 if target_price is not None and target_price < product.base_cost:
                     raise ExecutionAuthorizationConflict(f"任务价格低于基础成本：{task_id}")
-                if action_type is TaskActionType.SET_ONLINE:
-                    target_inventory = int(row["target_inventory"])
-                    if target_inventory > balance.current_qty:
-                        raise ExecutionAuthorizationConflict(
-                            "上架目标库存超过数据库库存，请重新设置。"
-                        )
                 pending_review = connection.execute(
                     """
                     SELECT 1 FROM review_tasks
@@ -515,26 +558,72 @@ class ExecutionAuthorizationApplicationService:
                     raise ExecutionAuthorizationConflict(f"任务仍有待处理复核：{task_id}")
                 active_locks = connection.execute(
                     """
-                    SELECT lock.status, operation.platform,
-                           operation.product_identity_json
+                    SELECT lock.status, lock.updated_at AS lock_updated_at,
+                           operation.operation_id, operation.task_id,
+                           operation.platform, operation.product_identity_json,
+                           operation.action_type, operation.created_at
                     FROM shadowbot_write_locks AS lock
                     JOIN shadowbot_operations AS operation
                       ON operation.operation_id = lock.operation_id
                     WHERE lock.status IN ('ACTIVE', 'UNKNOWN', 'REVIEW_BLOCKED')
                     """,
                 ).fetchall()
-                active_lock = any(
-                    str(row["platform"] or "") == next(iter(platforms))
-                    and str(
-                        json.loads(str(row["product_identity_json"] or "{}"))
-                        .get("internal_sku")
-                        or ""
-                    ).upper()
-                    == sku
-                    for row in active_locks
+                active_lock = next(
+                    (
+                        lock_row
+                        for lock_row in active_locks
+                        if str(lock_row["platform"] or "") == next(iter(platforms))
+                        and str(
+                            json.loads(
+                                str(lock_row["product_identity_json"] or "{}")
+                            ).get("internal_sku")
+                            or ""
+                        ).upper()
+                        == sku
+                    ),
+                    None,
                 )
-                if active_lock:
-                    raise ExecutionAuthorizationConflict(f"商品 {sku} 正在执行其他平台操作，请稍后重试。")
+                if active_lock is not None:
+                    product_label = " · ".join(
+                        value
+                        for value in (
+                            product.product_name,
+                            product.grade,
+                            product.stem_length,
+                        )
+                        if str(value or "").strip()
+                    )
+                    lock_status = str(active_lock["status"] or "").upper()
+                    action_label = {
+                        TaskActionType.UPDATE_PRICE.value: "改价",
+                        TaskActionType.SET_ONLINE.value: "上架",
+                        TaskActionType.SET_OFFLINE.value: "下架",
+                    }.get(str(active_lock["action_type"] or ""), "平台操作")
+                    operation_time = _operation_time_label(
+                        str(active_lock["created_at"] or "")
+                    )
+                    if lock_status == "ACTIVE":
+                        reason = f"{operation_time} 的{action_label}操作尚未结束"
+                    elif lock_status == "REVIEW_BLOCKED":
+                        reason = (
+                            f"{operation_time} 的{action_label}操作正在等待人工确认平台状态"
+                        )
+                    else:
+                        reason = f"{operation_time} 的{action_label}操作结果尚未确认"
+                    raise ExecutionQueueBlocked(
+                        (
+                            f"商品 {product_label or sku}：{reason}，新任务暂时无法发送。"
+                            "请到“业务管理 → 任务队列”确认平台实际状态。"
+                        ),
+                        blocking_operation_id=str(active_lock["operation_id"]),
+                        blocking_task_id=str(active_lock["task_id"]),
+                        lock_status=lock_status,
+                        lock_updated_at=str(active_lock["lock_updated_at"] or ""),
+                        operation_created_at=str(active_lock["created_at"] or ""),
+                        platform_name=str(active_lock["platform"] or ""),
+                        product_label=product_label or sku,
+                        action_type=str(active_lock["action_type"] or ""),
+                    )
 
                 identity = identity_mapping.get(sku)
                 if identity is None:
@@ -546,6 +635,21 @@ class ExecutionAuthorizationApplicationService:
                 )
                 if listing is None:
                     raise ExecutionAuthorizationConflict(f"缺少商品 {sku} 的最新平台状态。")
+                if (
+                    action_type is TaskActionType.SET_ONLINE
+                    and str(row["origin_type"] or "") != TaskOriginType.MANUAL.value
+                ):
+                    scan_quality = latest_listing_scan_quality(
+                        connection,
+                        platform_name=next(iter(platforms)),
+                        internal_sku=sku,
+                        current_status=listing.online_status,
+                        listing_source_id=listing.online_status_source_id,
+                        now=current,
+                        max_age=self.listing_scan_max_age,
+                    )
+                    if not scan_quality.accepted:
+                        raise ExecutionAuthorizationConflict(scan_quality.reason)
                 expected_old = _optional_decimal(row["expected_old_price"])
                 if (
                     action_type is TaskActionType.UPDATE_PRICE
@@ -604,6 +708,67 @@ class ExecutionAuthorizationApplicationService:
             ).hexdigest(),
             "items": item_facts,
         }
+
+    def _revalidate_with_queue_notification(
+        self,
+        task_ids: tuple[str, ...],
+        current: datetime,
+    ) -> dict[str, object]:
+        try:
+            return self._revalidate(task_ids, current)
+        except ExecutionQueueBlocked as exc:
+            self._enqueue_queue_blocked_notification(exc)
+            raise
+
+    def _enqueue_queue_blocked_notification(
+        self,
+        blocked: ExecutionQueueBlocked,
+    ) -> None:
+        action_label = {
+            TaskActionType.UPDATE_PRICE.value: "改价",
+            TaskActionType.SET_ONLINE.value: "上架",
+            TaskActionType.SET_OFFLINE.value: "下架",
+        }.get(blocked.action_type, "平台操作")
+        status_label = {
+            "ACTIVE": "尚未执行完毕",
+            "REVIEW_BLOCKED": "正在等待人工复核",
+            "UNKNOWN": "执行结果尚未确认",
+        }.get(blocked.lock_status, "仍未完成")
+        event_version = f"{blocked.lock_status}:{blocked.lock_updated_at or 'unknown'}"
+        operation_time = _operation_time_label(blocked.operation_created_at)
+        notification_key = self.notifications.notification_key(
+            "task_queue_blocked",
+            blocked.blocking_operation_id,
+            event_version,
+            self.notification_channel,
+            self.notification_recipient_ref,
+        )
+        try:
+            self.notifications.enqueue(
+                notification_type="task_queue_blocked",
+                notification_key=notification_key,
+                recipient_type=self.notification_recipient_type,
+                recipient_ref=self.notification_recipient_ref,
+                channel=self.notification_channel,
+                related_task_id=blocked.blocking_task_id or None,
+                payload={
+                    "message": (
+                        "任务队列受阻\n"
+                        f"未完成任务：{blocked.product_label} · {action_label} · {operation_time}\n"
+                        f"当前情况：{status_label}\n"
+                        "影响：同一商品的新任务暂时无法发送\n"
+                        "请在“业务管理 → 任务队列”确认平台实际状态。"
+                    ),
+                    "reason": status_label,
+                    "platform_name": blocked.platform_name,
+                },
+                priority=90,
+            )
+        except Exception:
+            LOGGER.exception(
+                "写入任务队列受阻通知失败 operation_id=%s",
+                blocked.blocking_operation_id,
+            )
 
     def _require_capability(self, principal: Principal) -> None:
         if not self.authorization.allows(principal, Capability.SUBMIT_EXECUTION):
@@ -687,6 +852,18 @@ def _parse_datetime(value: object) -> datetime | None:
     if value is None or not str(value).strip():
         return None
     return _aware_utc(datetime.fromisoformat(str(value)))
+
+
+def _operation_time_label(value: object) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "时间不明"
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return "时间不明"
+    local = _aware_utc(parsed).astimezone(timezone(timedelta(hours=8)))
+    return f"{local.month}月{local.day}日 {local:%H:%M}"
 
 
 def _datetime_text(value: datetime | None) -> str:

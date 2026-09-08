@@ -291,3 +291,255 @@ Watchdog → Worker → Importer → Archive。页面捕获 30 个商品行，�
 9 及索引容器关联。相关复验为 `19 passed`，最终完整回归为
 `1243 passed, 3 skipped, 82 subtests passed`，耗时 440.28 秒；隔离系统冒烟为
 `16 passed, 0 failed`，使用临时数据库和 mock 通知。
+
+## 13. 2026-08-28 库存与上架语义纠正
+
+人工录入真实库存后重新核对业务目标，撤销“平台目标库存不得超过真实库存”和“把各平台
+额度求和后判断超售”的旧假设。数据库库存是农场真实剩余库存，没有新流水时自动跨 PRA
+交易日延续；平台库存只是买家可购额度，可以显著高于真实库存，不形成预留或销量。`20` 扎
+按品种作为真实剩余库存接近销售边界时的运营安全余量，不从平台额度扣除，也不做等级比例
+分配。自动调整平台额度的具体策略尚未冻结，本轮不借此创建新的平台写动作。
+
+实现收口后，库存预警已从单 SKU 判断改为按 `product_name`（运营品种）汇总全部等级的
+数据库余额；Incident 以品种去重，并继续复用原有通知、重复窗口和恢复链。运营 Web 的
+今日页和人工库存调整页显示品种总库存、等级明细、`20` 扎安全余量及差额；平台扫描得到的
+可购上限在独立表中展示，不参与真实库存或预警计算。默认策略通过版本化配置服务启用，
+不直接修改平台、不创建 Task，也不新增 Schema。
+
+专项与受影响回归：`115 passed in 53.06s`，覆盖品种跨等级触发/恢复、并发去重、配置范围、
+今日页、业务管理、Web 基础、订单扫描、日结自动化和商品主数据。
+
+`SET_ONLINE` 最初在人工预览和最终执行授权使用同一最近定时扫描质量硬门禁。后续运营验收又
+发现改价、加/降价和下架没有完整沿用同一人工确认语义。现统一为：MANUAL 人工任务在最终
+确认弹窗逐项显示扫描不完整、质量不足或价格/状态事实过期提醒，操作者可确认继续；上下架
+预发布不再以旧扫描阻断或直接判定已完成，交给执行端实时页面预检。AUTOMATION 来源仍保留
+硬门禁。两类路径都只查询既有 Automation/观察事实，不创建临时 Run。
+
+订单/上架/人工任务/授权专项为 `32 passed`；受影响 Web、预测、持久化、Task 13 和
+Automation 集成为 `191 passed`；Ruff、`git diff --check`、18 个变更 Python/Markdown 文件
+的严格 UTF-8 回读通过。Web 重启后 `/health=200`、监听器 1 个，健康检查前后 canonical
+Runtime 文件大小和修改时间不变。本轮未投递真实平台任务，未操作 Worker 或 Queue。
+
+## 14. 2026-08-29 正式定时商品扫描接线与实机验收
+
+复查发现正式 Automation Service 只接入了订单子链；每小时父 Run 可以生成
+`ORDER_SCAN`，却没有执行 `LISTING_STATUS_SCAN`，不能为上架库存门禁提供新鲜平台事实。
+整改先按复用门禁盘点任务 13 资产，没有新建平台扫描协议或第二套 Worker：
+
+- `FULL_MARKET_SCAN` 组合既有订单父 Handler，并增加商品状态子 Run；
+- 商品 Handler 原样调用任务 13 v5 `prepare → publish → import`，再用既有标准转换和
+  Product Observation Importer 写入不可变观察；
+- 商品和订单共用同一文件队列等待、Worker 心跳、Automation 租约续期和归档接口；
+- 常驻 Queue Service 在有效商品子 Run 持有租约时让出结果，Run 结束或租约失效后不永久
+  延迟导入；
+- 新增显式只读扫描运行模式，只物化已注册扫描类型，避免验收时顺带执行日结或规则生成。
+
+第一次真实调度已经读完页面并导入 17 个商品观察，订单子链也成功，但商品 Run 被错误标为
+`FAILED`。根因不是页面或 Importer，而是既有归档函数完成移动后没有返回归档目录，新
+Handler 将返回的 `None` 误判为未归档。修复公共归档返回值并验证请求、结果两组 SHA-256
+后，在真实 `2026-08-29 16:10 +08:00` 每小时窗口自然重跑，结果为：
+
+- 父 `FULL_MARKET_SCAN`、商品 `LISTING_STATUS_SCAN`、订单 `ORDER_SCAN` 均为
+  `SUCCESS`；
+- 商品观察批次和订单观察批次均为 `ACCEPTED`，`scope_complete=1`、
+  `end_marker_verified=1`；当前交易日订单保持 `OPEN`；
+- 商品结果 ACK 为 `WRITTEN`，商品与订单请求/结果均进入仓库外 Archive，校验和通过；
+- 活动 `inbox/working/results` 全部为 0，新增平台操作 0、业务任务 0；
+- 验收用 Automation 进程已停止，长期 Worker 与 Queue Service 保持 `RUNNING`。
+
+运行前对 canonical v18 执行 SQLite 在线备份并通过 `integrity_check=ok`；旧的
+`T1354-ACCEPT-FULL` 验收任务只停用不删除，避免与正式小时任务重复。受影响专项最终为
+`184 passed`，另补充的租约退出回归为 `1 passed`；`compileall`、`git diff --check` 与
+修改文本严格 UTF-8 回读通过。当前 Python 环境没有 Ruff，故本轮不声称 Ruff 通过。本轮
+只读取真实页面，没有执行或注册任何平台写 Handler。当时 10 分钟 `ONLINE_PULSE` 的
+“仅上架中” profile 尚未实现，因此本节没有用完整双页扫描冒充。
+
+## 15. 2026-08-29 `ONLINE_PULSE` 仅上架中实机验收
+
+在同一任务 13 v5 扫描链上增加 `scan_scope=online` 参数，而不是新建平行 Adapter：
+
+- 继续复用同一 `SYNC_STATUS` 合同、Worker、索引读取、`END → 尾部确认 → HOME`、文件队列、
+  Automation 租约、结果 ACK 与 Archive；
+- 执行端只扫描“上架中”，不选择“待上架”；只保存出现商品的正向观察，缺席不推断下架；
+- 单页事实写入 v14 已有 `product_observation_batches/items`。只允许双页完整的
+  `listing_sync_snapshots` 不写入单页结果，因此没有伪造待上架完成状态，也没有扩 Schema；
+- 受控 `ONLINE_PULSE_ONLY` 验收模式只注册该 Handler，不物化小时完整扫描、订单、日结、
+  规则生成、复核维护或任何平台写 Handler。
+
+同步 `test2` 前发现旧生命周期记录为 `RUNNING`，但心跳已失效且影刀进程不存在；队列为空，
+因此按规则更正为 `STOPPED`，同步后核对部署哈希，再从应用列表启动长期 Worker。真实
+`2026-08-29 17:40 +08:00` 计划窗口结果为：
+
+- `ONLINE_PULSE` Run 为 `SUCCESS`，约 22 秒完成；
+- v5 请求为 `READ_ONLY / sync_status / scan_scope=online`，没有写任务项；
+- 结果为 `VERIFIED`，`online_scan_complete=true`、`online_end_marker_verified=true`，
+  `waiting_scan_complete=false`、`waiting_end_marker_verified=false`；
+- timing 只有窗口准备、登录检查、商品刷新、上架中扫描和总计，不含待上架扫描；
+- Product Observation 批次为 `ACCEPTED`，`pages=["online"]`、范围完整、尾部已确认，
+  3 项均为上架中正向观察，离线观察为 0；
+- `listing_sync_snapshots` 数量保持 2，平台操作保持 0，业务任务保持 0；
+- 请求与结果 SHA-256 均与 Archive 校验文件一致，ACK 为 `WRITTEN`，活动
+  `inbox/working/results` 均为 0，`stop.signal` 不存在，长期 Worker 心跳保持新鲜
+  `RUNNING`。
+
+部署后运行进程回读确认 Worker 实际解释器为影刀内置
+`C:\Program Files (x86)\ShadowBot\shadowbot-6.3.12\python310\python.exe`，版本
+`3.10.11`；`vertical_slice_read_price.py` 与 `shadowbot_queue_worker.py` 的源/部署 SHA-256
+分别一致。文件内容、部署哈希与真实运行成功分别核对，没有用控制台显示代替任一门禁。
+
+运行前 canonical v18 在线备份位于仓库外
+`D:\PRA_Runtime\backups\online-pulse-acceptance-20260829-1740`，`integrity_check=ok`。
+受影响的合同、Worker、Importer、Automation 和列表控制流测试为 `225 passed`，耗时
+70.74 秒；`compileall` 与 `git diff --check` 通过。第一次后台启动验收调度器时，扫描完成后
+因 `Start-Process` 参数中的 heartbeat 路径引号导致该一次性进程在写 heartbeat 时退出；随后
+使用相同参数直接执行 `--once`，确认 `ONLINE_PULSE_ONLY` 只注册 `ONLINE_PULSE`、不再创建
+重复 Run，并正常写出 `STOPPED / ONCE_COMPLETED` heartbeat。该收尾问题没有影响已经完成的
+Worker → Importer → Archive，也不是平台页面或扫描失败。
+
+最终收尾发现旧 Queue Service heartbeat 同样停在 17:21 且对应进程不存在；本轮结果已由
+Automation Handler 在有效租约内导入和归档，不受该旧服务状态影响。随后使用 canonical v18
+和同一队列重新启动常驻 Queue Service，回读 heartbeat 为新实例 `RUNNING`、周期持续递增且
+无待导入事件。交付时 Worker 与 Queue Service 均为新鲜 `RUNNING`，一次性验收 Automation
+进程为 `STOPPED`。
+
+## 16. 2026-08-30 常驻 Automation 无人值守完整周期验收
+
+本次直接使用 canonical v18 Runtime 和正式文件队列，启动
+`LISTING_ORDER_READ_ONLY_SCANS_ONLY` 常驻 Automation Service；注册范围固定为
+`ONLINE_PULSE / FULL_MARKET_SCAN / LISTING_STATUS_SCAN / ORDER_SCAN /
+PRE_CUTOFF_FULL_SCAN`，`platform_write_handlers_registered=false`。影刀 `test2` Worker 和
+Automation Service 在所有目标窗口持续常驻；Queue Service 的既有失败与恢复事实见下文。
+整个扫描过程没有人工登录、人工投递或平台写操作。
+
+常驻服务在 `2026-08-30 09:50`、`10:00` 和 `10:20 +08:00` 三个自然窗口自动完成
+`ONLINE_PULSE`。三次 Run 均为 `SUCCESS`，Product Observation 批次均为 `ACCEPTED`、
+`scope_complete=1`、`end_marker_verified=1`，活动队列在每轮完成后都回到 0。10:10 的小时窗口
+按冻结合同执行：
+
+- 父 `FULL_MARKET_SCAN` 为 `SUCCESS`；
+- 商品子 `LISTING_STATUS_SCAN` 为 `SUCCESS`，批次 `ACCEPTED`，完整读取 14 项商品事实；
+- 订单子 `ORDER_SCAN` 为 `SUCCESS`，批次 `ACCEPTED / OPEN`，当前页面为可信空页，保存 0 项
+  订单事实，不把开放交易日包装成闭市事实；
+- 同一分钟的 `ONLINE_PULSE` 被成功的完整商品扫描覆盖为 `MERGED`，没有重复操作小程序；
+- 商品与订单请求/结果均归档，请求和结果共四个 SHA-256 均与 sidecar 一致；两个结果均为
+  `READ_ONLY` 且 `side_effect_state=NOT_STARTED`；
+- 本次 Worker 启动后共归档 8 个真实只读请求，所有登录检查均走
+  `BUSINESS_ENTRY_FAST_PATH`，没有人工介入；
+- 验收期间新增 `shadowbot_operations=0`、新增业务 `tasks=0`、过期 `RUNNING` 租约为 0。
+
+验收准备时发现前一日 Queue Service 在 `2026-08-30 09:45:24 +08:00` 因一次 Windows
+`os.replace` 的 `PermissionError` 已退出；该旧实例不在本轮 10:10 Automation Handler 的
+Importer/Archive 执行路径上，因此没有造成事实丢失或活动文件残留。收尾时使用同一 v18
+Runtime 和同一队列恢复 Queue Service，新实例跨过 10:20 实际扫描并持续运行至少 450 个周期，
+心跳为 `RUNNING`、`reason` 为空、错误日志为 0 字节。
+
+交付时 Automation Service、Queue Service 和 Worker 均保持新鲜 `RUNNING`；Automation 仍为
+同一实例且错误数组为空，两个后台 stderr 均为 0 字节，`stop.signal` 不存在，
+`inbox/working/results` 全部为空。生命周期记录已更新为
+`RESIDENT_UNATTENDED_FULL_CYCLE_ACCEPTED`。本节只证明常驻只读完整周期，不授权或证明任何
+真实平台 COMMIT。
+
+## 17. 2026-08-30 Web 创建与独立授权真实下架验收
+
+管理员在新运营 Web 中按“艾莎 + B/C/D 等级 + 蚂蚁花团供应商”范围创建一次人工下架操作。
+Web 在 `2026-08-30 10:37:24 +08:00` 生成 3 个独立 Runtime Task，三者共享同一
+`web-manual` 来源引用，并分别绑定 `MANUAL_EXECUTION_AUTHORIZATION_REQUIRED`；创建任务阶段
+没有投递 Queue。管理员随后在独立执行授权阶段明确选择这 3 个 Task，系统于 10:38:03 生成
+单一 v5 `set_offline` 批次 `WEB7E-77673180ffaabd03916f7e3a7239c16a`。
+
+真实执行结果为：
+
+- 批次目标 3、`verified_count=3`，`unknown / partial / not_attempted / failed` 均为 0；
+- B/C/D 三项均从预期 `online` 到目标 `offline`，只执行上下架动作；
+  `detail_effect_state=NOT_APPLIED`、`listing_effect_state=VERIFIED`；
+- 每项均保存独立 operation、attempt、点击时间和后置回读时间，三项 operation、COMMIT attempt
+  和 Runtime Task 最终分别为 `VERIFIED / VERIFIED / success`；
+- 批次结果为 `VERIFIED`、`side_effect_state=VERIFIED`，请求与结果 SHA-256 均与 sidecar
+  一致，Importer ACK 绑定同一 execution attempt 与 batch；
+- 请求、结果、phase、ACK 和人工可读报告已进入同一 Archive 目录，活动
+  `inbox/working/results` 全部为 0；
+- 10:40 的自然 `ONLINE_PULSE` 随后为 `SUCCESS / ACCEPTED`，完整确认上架中页尾部且读取 0
+  项；该单页事实只作为与三项下架结果一致的后续观察，不用“上架中缺席”单独推断下架。
+
+验收后 Web 继续监听 `127.0.0.1:8765`，Automation、Queue Service 与 Worker 心跳均保持
+`RUNNING`，Automation 错误数组为空。本节只证明本次明确范围和单批次授权，不扩大为后续
+任意商品或动作的持续写授权。
+
+## 18. 2026-08-30 任务创建一次确认与逐项目标整改
+
+根据首次真实操作反馈，运营 Web 不再要求操作者依次完成“创建确认、再次选择 Task、执行
+影响预览、二次执行确认”。当前范围弹窗只选择品种、等级、平台和动作；服务端展开具体
+平台商品后自动弹出逐项预览。每项分别显示最近记录的平台状态、价格和平台库存，并允许
+单独修改本次价格/库存；绝对价格和上架库存默认带入最近记录，加/降价因语义为差额而默认
+为 0，必须改为非 0。
+
+操作者完成逐项预览后进入单独的小型最终确认弹窗，并只需在该窗口确认一次。Web 随后只对
+本轮明确勾选的 item key 依次调用既有
+`ManualTaskApplicationService.create()`、`prepare_execution()` 和 `submit_execution()`。
+后台的 Task、授权 digest、v4/v5 publisher、Queue、Worker、Importer 和回读门禁均未合并或
+绕过；其他 `PENDING` 不会被顺带执行。若 Task 已创建但后续授权或发布失败，Task 保留在
+“当前任务”，由原有独立授权入口恢复。
+
+修改前按用户要求停止常驻定时扫描：确认运行中 Automation Run 为 0、活动
+`inbox/working/results` 均为 0、Automation 进程为 0，并把外部 heartbeat 明确记录为
+`STOPPED / USER_REQUESTED_SCHEDULED_SCAN_STOP`。Queue Service 和影刀长期 Worker 未因本次
+停止动作而停止。
+
+验收使用 canonical Runtime 的 SQLite 在线备份建立仓库外隔离副本，并使用合成登录凭据；
+只执行范围选择和 READ_ONLY 预览，没有点击“确认并执行”，没有创建真实 Task、Queue 请求或
+平台写动作。桌面确认弹窗能分别带入两项不同价格；390×844 手机视口下改为逐项卡片，价格/
+库存输入不再隐藏在横向滚动区域。隔离 Web、临时数据库和临时队列随后已关闭并删除。
+
+专项回归覆盖人工任务编排、统一执行授权、Web Foundation/读模型以及既有 v4/v5 发布链，
+结果为 `129 passed in 48.67s`；变更 Python 文件通过 Ruff，`git diff --check` 通过。中文源码
+和 Markdown 另以显式 UTF-8 回读，不以终端显示代替文件编码检查。
+
+## 19. 2026-08-30 人工任务扫描质量提醒整改
+
+人工任务预览项新增独立 `warnings`，并进入预览摘要；改价、加/降价、上架和下架的扫描质量、
+价格事实过期及状态事实过期均不再混入 `blockers`。最终确认弹窗顶部显示“扫描信息需确认”，
+逐项列出原因并明确人工任务可以继续，执行前仍复用平台读取与旧值校验。扫描质量硬门禁在
+执行授权阶段仅适用于非 MANUAL 来源；MANUAL 上下架预发布也不再把旧扫描解释为阻断或
+`ALREADY_APPLIED`。真正缺少平台事实、映射错误、基础成本/目标值错误、未解决复核、冲突和
+写锁等安全门禁不变。错误文本的多条原因直接按中文句号衔接，避免出现 `。、`。
+
+## 20. 2026-08-30 最终确认与首次导航登录恢复整改
+
+真实上架操作暴露出两个交互/执行边界问题。第一，逐项预览曾被实现成可直接提交的确认窗口，
+导致运营者点击“确认并执行”时没有独立的最终确认提示；扫描质量提醒也停留在预览顶部。现已
+改为“逐项预览 → 小型最终确认 → 执行”：预览只编辑逐项目标，最终弹窗才逐项展示过期或低
+质量扫描提醒；提醒不阻断 MANUAL 任务，真正安全门禁保持不变。
+
+第二，Task 12 的登录快速路径曾以“点击前可见商品管理入口”作为已登录的正向信号。真实小程序
+会在点击入口后才判定会话过期并跳到登录页，因此该信号不足以证明后续页面仍可访问。上下架、
+商品扫描/对账及订单读取现统一为：第一次业务入口点击后检查登录状态，出现登录页时复用既有
+自动登录/验证码人工介入链，成功后重新点击原入口；若上次失败已使页面停在登录页，仅在入口
+不存在时走同一恢复兜底。没有新增登录实现，也没有自动重试本次失败的真实上架任务。
+
+## 21. 2026-08-30 任务队列运营视图补齐
+
+业务管理新增 `/management/queue` 二级页面，不增加一级入口、数据库表、队列、状态机或
+平台动作。页面把现有 Runtime Task 与 `inbox/working/results` 的活动制品按同一任务去重后
+组合为“待发送、排队中、执行中、等待回收、需要处理”五个运营阶段，并原样复用 Worker、
+Queue Service 和 Importer 健康查询。人工、自动和系统紧急保护可按来源筛选；紧急任务继续
+采用既有 dispatch lane 排序，完成历史仍进入数据库。
+
+后续运营复查补充了人工批量取消，但没有改变上述只读队列投影：仅未出现在活动文件队列中的
+`PENDING/FAILED` Task 显示选择框；POST 使用 `SUBMIT_EXECUTION + MANAGE_BUSINESS` 权限、
+CSRF 和二次确认，数据库在一个 `BEGIN IMMEDIATE` 事务中条件更新全部任务并追加
+`task_status_history`。任一任务已执行、进入复核、进入文件队列、状态竞争或队列读取不完整时
+整批拒绝，不删除任务、队列制品或历史。失败任务的页面说明改为“任务已停止，当前不会自动
+重试”，不再要求运营人员寻找不存在的处理入口。
+
+专项测试覆盖成功批量取消、混合状态整批零写、活动 Queue 拒绝、CSRF 拒绝和数据库竞争回滚；
+真实 Runtime 只完成界面读取和弹窗交互验收，不提交取消。
+
+队列制品只按白名单读取动作、商品、平台、来源任务、Automation Run、阶段和时间，单文件
+限制为 2 MiB；页面不显示任务内部 ID、execution attempt ID、Hash、文件路径或原始 JSON。
+并发移动导致文件消失时按正常领取处理，格式无效或数量超过展示上限时降级为“队列记录需要
+检查”，不会让页面返回 500，也不会尝试修复制品。专项测试证明 GET 前后 Runtime DB 内容
+摘要以及活动队列文件的大小、修改时间均不变。
+
+真实 canonical Runtime 的只读页面检查显示 2 项待发送、0 项排队、0 项执行、0 项等待回收、
+1 项需要处理；Worker、任务传递和结果回收均可读。浏览器已验证人工任务+需要处理组合筛选，
+桌面布局未出现技术字段。本次检查没有投递、领取、导入或重试任何真实任务。

@@ -11,6 +11,7 @@ from app.operations_web.read_models import (
     StateReadModel,
     SystemReadModel,
     TableReadModel,
+    TaskQueueReadModel,
     TodayReadModel,
 )
 from app.operations_web.rendering import html
@@ -30,6 +31,31 @@ MANUAL_ACTION_LABELS = {
 def _manual_action_label(value: object) -> str:
     raw = getattr(value, "value", value)
     return MANUAL_ACTION_LABELS.get(str(raw), "平台操作")
+
+
+def _margin_gap_label(gap: int, enabled: bool) -> str:
+    if not enabled:
+        return "预警未启用"
+    if gap > 0:
+        return f"高于安全余量 {gap} 扎"
+    if gap == 0:
+        return "已到安全余量"
+    return f"低于安全余量 {-gap} 扎"
+
+
+def _render_management_tabs(active: str) -> str:
+    tabs = (
+        ("tasks", "/management", "创建任务"),
+        ("queue", "/management/queue", "任务队列"),
+        ("reviews", "/management#reviews", "人工复核"),
+        ("automation", "/management#automation", "自动化方案"),
+        ("master-data", "/management#master-data", "商品资料"),
+    )
+    links = "".join(
+        f'<a class="{"active" if key == active else ""}" href="{href}">{label}</a>'
+        for key, href, label in tabs
+    )
+    return f'<nav class="section-tabs" aria-label="业务管理分页">{links}</nav>'
 
 
 def _trade_day_status_label(value: str) -> str:
@@ -91,6 +117,10 @@ def render_today(model: TodayReadModel) -> str:
     <section class="panel">
       <header class="panel-header"><div><h2>品种销售与库存</h2><p>今日销量、成交均价、销售额与数据库库存</p></div><a href="/database/sales-analysis">查看销售分析</a></header>
       {render_table(model.products)}
+    </section>
+    <section class="panel">
+      <header class="panel-header"><div><h2>平台可购上限</h2><p>客户在各平台最多可购买的数量；不等于真实库存或销量</p></div><a href="/database?dataset=prices">查看平台价格</a></header>
+      {render_table(model.platform_limits)}
     </section>
     <div class="two-column">
       <section class="panel"><header class="panel-header"><div><h2>需要处理</h2><p>等待人工确认的业务事项</p></div></header>{todo}</section>
@@ -191,6 +221,18 @@ def render_management(
         if model.inventory_options and model.inventory_state.state.value == "ready"
         else ""
     )
+    variety_inventory_rows = "".join(
+        f"""
+        <tr><td>{html(item.variety)}</td><td>{html(item.grade_summary)}</td><td>{item.current_qty} 扎</td><td>{item.safety_margin_qty} 扎</td><td>{html(_margin_gap_label(item.margin_gap, item.alert_enabled))}</td></tr>
+        """
+        for item in model.inventory_variety_summaries
+    )
+    variety_inventory_table = (
+        '<div class="table-wrap"><table><thead><tr><th>品种</th><th>等级明细</th><th>真实库存</th><th>安全余量</th><th>当前状态</th></tr></thead>'
+        f'<tbody>{variety_inventory_rows}</tbody></table></div>'
+        if variety_inventory_rows
+        else '<p class="empty-copy">当前没有可展示的品种库存。</p>'
+    )
     receipt = ""
     if model.inventory_receipt is not None:
         sku, before, delta, after = model.inventory_receipt
@@ -240,15 +282,215 @@ def render_management(
     )
     return f"""
     <section class="hero compact-hero">
-      <div><p class="eyebrow">业务管理</p><h1>任务、复核与自动化</h1><p>先创建任务，确认无误后再授权平台执行。</p></div>
+      <div><p class="eyebrow">业务管理</p><h1>任务、复核与自动化</h1><p>选择任务范围，逐项确认后直接发送执行。</p></div>
     </section>
-    <nav class="section-tabs" aria-label="业务管理分页"><a class="active" href="#tasks">创建任务</a><a href="#reviews">人工复核</a><a href="#automation">自动化方案</a><a href="#master-data">商品资料</a></nav>
+    {_render_management_tabs("tasks")}
     {task_controls}
-    <section class="panel"><header class="panel-header"><div><h2>人工库存调整</h2><p>输入本次增加或减少的数量，并记录来源和原因</p></div></header><div class="form-shell">{render_state(model.inventory_state)}{inventory_error}{receipt}{inventory_form}</div></section>
-    <section class="panel" id="tasks"><header class="panel-header"><div><h2>当前任务</h2><p>选择待执行任务并再次确认后，才会发送到平台</p></div></header>{execution_controls}{render_table(model.pending_tasks)}</section>
+    <section class="panel"><header class="panel-header"><div><h2>人工库存调整</h2><p>真实库存按品种汇总、按等级录入；剩余库存自动转入下一交易日</p></div></header><div class="form-shell">{render_state(model.inventory_state)}{variety_inventory_table}{inventory_error}{receipt}{inventory_form}</div></section>
+    <section class="panel" id="tasks"><header class="panel-header"><div><h2>当前任务</h2><p>这里也可继续发送其他来源或上次未成功发送的待执行任务</p></div></header>{execution_controls}{render_table(model.pending_tasks)}</section>
     <section class="panel" id="reviews"><header class="panel-header"><div><h2>人工复核</h2><p>查看原因并选择处理结果</p></div></header>{review_controls}{render_table(model.pending_reviews)}</section>
     <section class="panel" id="automation"><header class="panel-header"><div><h2>自动化方案</h2><p>设置定时扫描、日结、任务生成和库存预警</p></div></header>{automation_controls}{render_table(model.automation_runs)}</section>
     {master_data_controls}
+    """
+
+
+def render_task_queue(
+    model: TaskQueueReadModel,
+    *,
+    csrf_token: str,
+    cancellation_receipt: str = "",
+    cancellation_error: str = "",
+    operation_receipt: str = "",
+    operation_error: str = "",
+) -> str:
+    metrics = "".join(
+        f"""
+        <article class="metric state-{html(item.state.value)}">
+          <span>{html(item.label)}</span>
+          <strong>{html(item.value)}</strong>
+          <small>{html(item.note)}</small>
+        </article>
+        """
+        for item in model.metrics
+    )
+    component_rows = "".join(
+        "<tr>"
+        f"<td><strong>{html(item.name)}</strong></td>"
+        f"<td>{html(item.state.title)}</td>"
+        f"<td>{html(item.state.detail)}</td>"
+        "</tr>"
+        for item in model.components
+    )
+    source_options = (
+        ("all", "全部来源"),
+        ("manual", "人工任务"),
+        ("automation", "自动任务"),
+        ("emergency", "紧急保护"),
+    )
+    stage_options = (
+        ("all", "全部阶段"),
+        ("pending", "待发送"),
+        ("queued", "排队中"),
+        ("running", "执行中"),
+        ("results", "等待回收"),
+        ("attention", "需要处理"),
+    )
+    source_select = "".join(
+        f'<option value="{value}" {"selected" if value == model.selected_source else ""}>{label}</option>'
+        for value, label in source_options
+    )
+    stage_select = "".join(
+        f'<option value="{value}" {"selected" if value == model.selected_stage else ""}>{label}</option>'
+        for value, label in stage_options
+    )
+    feedback = ""
+    if cancellation_receipt:
+        feedback += (
+            '<div class="state-banner state-ready"><strong>任务已取消</strong>'
+            f"<p>{html(cancellation_receipt)}</p></div>"
+        )
+    if cancellation_error:
+        feedback += (
+            '<div class="state-banner state-incomplete"><strong>任务未取消</strong>'
+            f"<p>{html(cancellation_error)}</p></div>"
+        )
+    if operation_receipt:
+        feedback += (
+            '<div class="state-banner state-ready"><strong>平台状态已确认</strong>'
+            f"<p>{html(operation_receipt)}</p></div>"
+        )
+    if operation_error:
+        feedback += (
+            '<div class="state-banner state-incomplete"><strong>平台状态未保存</strong>'
+            f"<p>{html(operation_error)}</p></div>"
+        )
+    queue_table = _render_task_queue_table(
+        model,
+        csrf_token=csrf_token,
+    )
+    return f"""
+    <section class="hero compact-hero">
+      <div><p class="eyebrow">业务管理</p><h1>任务队列</h1><p>查看任务从创建、发送、执行到结果回收的当前进度。</p></div>
+    </section>
+    {_render_management_tabs("queue")}
+    {feedback}
+    {render_state(model.overall)}
+    <section class="metric-grid queue-metric-grid">{metrics}</section>
+    <section class="panel">
+      <header class="panel-header"><div><h2>执行通路</h2><p>确认任务能正常发送、执行并回收结果</p></div><a href="/system">查看系统状态</a></header>
+      <div class="table-scroll"><table><thead><tr><th>环节</th><th>当前状态</th><th>说明</th></tr></thead><tbody>{component_rows}</tbody></table></div>
+    </section>
+    <section class="panel">
+      <header class="panel-header"><div><h2>当前任务</h2><p>紧急任务按实际执行优先级排在前面</p></div><a href="/database/project?dataset=tasks">查看任务历史</a></header>
+      <form class="filterbar" method="get" action="/management/queue">
+        <label>来源<select name="source">{source_select}</select></label>
+        <label>阶段<select name="stage">{stage_select}</select></label>
+        <button class="secondary" type="submit">查看</button>
+      </form>
+      {queue_table}
+    </section>
+    """
+
+
+def _render_task_queue_table(
+    model: TaskQueueReadModel,
+    *,
+    csrf_token: str,
+) -> str:
+    table = model.table
+    if not table.columns:
+        return render_state(table.state)
+    has_cancellable = any(model.cancellable_task_ids)
+    select_all = (
+        '<input type="checkbox" data-queue-cancel-all aria-label="选择本页可取消任务">'
+        if has_cancellable
+        else "—"
+    )
+    head = (
+        f'<th scope="col" class="queue-select-column">{select_all}</th>'
+        + "".join(f'<th scope="col">{html(item)}</th>' for item in table.columns)
+        + '<th scope="col">处理</th>'
+    )
+    body_rows: list[str] = []
+    operation_dialogs: list[str] = []
+    for index, row in enumerate(table.rows):
+        url = table.row_urls[index] if index < len(table.row_urls) else ""
+        task_id = (
+            model.cancellable_task_ids[index]
+            if index < len(model.cancellable_task_ids)
+            else ""
+        )
+        selector = (
+            f'<input type="checkbox" name="task_ids" value="{html(task_id)}" '
+            'data-queue-cancel-item aria-label="选择取消此任务">'
+            if task_id
+            else "—"
+        )
+        cells = [f'<td class="queue-select-column">{selector}</td>']
+        for column_index, value in enumerate(row):
+            content = html(value)
+            if column_index == 0 and url:
+                content = f'<a href="{html(url)}">{content}</a>'
+            cells.append(f"<td>{content}</td>")
+        operation = (
+            model.operation_resolution_options[index]
+            if index < len(model.operation_resolution_options)
+            else None
+        )
+        if operation is None:
+            cells.append("<td>—</td>")
+        else:
+            dialog_id = f"operation-resolution-{index}"
+            cells.append(
+                '<td><button class="secondary compact-action" type="button" '
+                f'data-dialog-open="{html(dialog_id)}">确认平台状态</button></td>'
+            )
+            operation_dialogs.append(
+                f"""
+                <dialog id="{html(dialog_id)}" class="modal-dialog compact-dialog">
+                  <form method="post" action="/management/queue/resolve-operation">
+                    <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
+                    <input type="hidden" name="operation_id" value="{html(operation.operation_id)}">
+                    <div class="dialog-header"><div><p class="eyebrow">人工确认平台状态</p><h2>{html(operation.scope)} · {html(operation.action_label)}</h2></div><button class="secondary" type="button" data-dialog-close>关闭</button></div>
+                    <p>{html(operation.prompt)}</p>
+                    <label>备注（可选）<input name="note" maxlength="500" placeholder="例如：已在平台商品列表中核对"></label>
+                    <div class="dialog-actions operation-resolution-actions">
+                      <button class="secondary" type="submit" name="outcome" value="TARGET_NOT_APPLIED">{html(operation.not_applied_label)}</button>
+                      <button type="submit" name="outcome" value="TARGET_APPLIED">{html(operation.applied_label)}</button>
+                    </div>
+                  </form>
+                </dialog>
+                """
+            )
+        body_rows.append("<tr>" + "".join(cells) + "</tr>")
+    body = "".join(body_rows)
+    if not body:
+        body = (
+            f'<tr><td colspan="{max(1, len(table.columns) + 2)}">'
+            f"{html(table.state.detail or table.state.title)}</td></tr>"
+        )
+    disabled = "" if has_cancellable else " disabled"
+    action_note = (
+        "可选择尚未发送或执行失败且尚未重试的任务。"
+        if has_cancellable
+        else "当前没有可以人工取消的任务。"
+    )
+    operation_dialog_markup = "".join(operation_dialogs)
+    return f"""
+    <form id="queue-cancel-form" method="post" action="/management/queue/cancel">
+      <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
+      <div class="table-state">{render_state(table.state, compact=True)}</div>
+      <div class="table-scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>
+      {_render_table_pagination(table)}
+      <div class="queue-action-bar"><span>{html(action_note)}</span><button class="danger" type="button" data-queue-cancel-open{disabled}>取消所选任务</button></div>
+    </form>
+    <dialog id="queue-cancel-dialog" class="modal-dialog compact-dialog">
+      <div class="dialog-content"><h2>确认取消任务</h2>
+        <p>将取消已选择的 <strong data-queue-cancel-count>0</strong> 项任务。取消后不会发送或自动重试，记录仍会保留在任务历史中。</p>
+        <div class="dialog-actions"><button class="secondary" type="button" data-dialog-close>返回</button><button class="danger" type="submit" form="queue-cancel-form" data-queue-cancel-submit>确认取消</button></div>
+      </div>
+    </dialog>
+    {operation_dialog_markup}
     """
 
 
@@ -509,7 +751,6 @@ def _render_automation_controls(
     policy_cards = []
     for policy in model.inventory_alert_options:
         checked = " checked" if policy.enabled else ""
-        scope_label = "全部商品默认值" if policy.scope_type == "DEFAULT" else policy.scope_key
         policy_cards.append(
             f"""
             <form method="post" action="/management/automation/inventory-alert" class="alert-policy-form">
@@ -517,41 +758,11 @@ def _render_automation_controls(
               <input type="hidden" name="scope_type" value="{html(policy.scope_type)}">
               <input type="hidden" name="scope_key" value="{html(policy.scope_key)}">
               <input type="hidden" name="expected_version" value="{policy.version}">
-              <strong>{html(scope_label)}</strong>
+              <strong>每个品种共享安全余量</strong>
               <label class="toggle-label"><input name="enabled" type="checkbox" value="true"{checked}>启用预警</label>
-              <label>库存阈值<input name="threshold_qty" type="number" min="0" max="9999" value="{policy.threshold_qty}" required></label>
+              <label>安全余量（扎）<input name="threshold_qty" type="number" min="0" max="9999" value="{policy.threshold_qty}" required></label>
               <label>重复提醒（分钟）<input name="repeat_interval_minutes" type="number" min="30" max="1440" value="{policy.repeat_interval_minutes}" required></label>
               <button type="submit">保存预警</button>
-            </form>
-            """
-        )
-    sku_options = "".join(
-        f'<option value="{html(sku)}">{html(label)}</option>'
-        for sku, label, _, _ in model.inventory_options
-    )
-    if sku_options:
-        default_policy = next(
-            (
-                item
-                for item in model.inventory_alert_options
-                if item.scope_type == "DEFAULT"
-            ),
-            None,
-        )
-        threshold = default_policy.threshold_qty if default_policy else 0
-        repeat = default_policy.repeat_interval_minutes if default_policy else 60
-        policy_cards.append(
-            f"""
-            <form method="post" action="/management/automation/inventory-alert" class="alert-policy-form">
-              <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
-              <input type="hidden" name="scope_type" value="SKU">
-              <input type="hidden" name="expected_version" value="0">
-              <strong>新增商品覆盖</strong>
-              <label>商品<select name="scope_key">{sku_options}</select></label>
-              <label class="toggle-label"><input name="enabled" type="checkbox" value="true" checked>启用预警</label>
-              <label>库存阈值<input name="threshold_qty" type="number" min="0" max="9999" value="{threshold}" required></label>
-              <label>重复提醒（分钟）<input name="repeat_interval_minutes" type="number" min="30" max="1440" value="{repeat}" required></label>
-              <button type="submit">添加覆盖</button>
             </form>
             """
         )
@@ -562,7 +773,7 @@ def _render_automation_controls(
         + feedback
         + '<h3>定时方案</h3><div class="automation-control-grid">'
         + jobs
-        + '</div><h3>数据库库存预警</h3><div class="alert-policy-grid">'
+        + '</div><h3>品种库存预警</h3><p class="form-hint">每个品种的各等级真实库存合计达到安全余量时提醒；平台可购上限不参与计算。</p><div class="alert-policy-grid">'
         + policies
         + "</div></div>"
     )
@@ -589,7 +800,7 @@ def _render_manual_task_controls(
 
     receipt_html = (
         '<div class="state-banner state-ready"><strong>任务已创建</strong><p>'
-        + html(f"已创建 {len(receipt)} 个任务；如需执行，请在下方单独确认。")
+        + html(f"已创建 {len(receipt)} 个任务。")
         + "</p></div>"
         if receipt
         else ""
@@ -611,70 +822,154 @@ def _render_manual_task_controls(
         )
     preview_html = ""
     if preview is not None:
-        rows = "".join(
-            "<tr>"
-            f'<td><input type="checkbox" name="excluded_item_keys" value="{html(item.item_key)}" {"checked" if item.excluded else ""} aria-label="排除 {html(item.variety)} {html(item.grade)}"></td>'
-            f"<td>{html(item.variety)} · {html(item.grade)}</td>"
-            f"<td>{html(item.platform_name)}</td>"
-            f"<td>{html(item.current_status or '不可用')} / {html(str(item.current_price) if item.current_price is not None else '—')}</td>"
-            f"<td>{html(str(item.target_price) if item.target_price is not None else _manual_action_label(item.action_type))}</td>"
-            f"<td>{html('；'.join(item.blockers) or '可创建')}</td>"
-            "</tr>"
-            for item in preview.items
+        editable_blockers = frozenset(
+            {
+                "目标价格与当前价格相同，请修改后再执行。",
+                "加/降价金额不能为 0。",
+                "目标价格必须大于 0。",
+                "目标价格不能低于商品基础成本。",
+                "上架必须填写非负平台目标库存。",
+            }
         )
-        hidden_scope = "".join(
-            f'<input type="hidden" name="{name}" value="{html(value)}">'
-            for name, values in (
-                ("varieties", preview.request.varieties),
-                ("grades", preview.request.grades),
-                ("platforms", preview.request.platforms),
+
+        def item_inputs(item) -> str:
+            current = (
+                f"{item.current_status or '不可用'} · 价格 "
+                f"{str(item.current_price) if item.current_price is not None else '—'} · "
+                f"平台库存 {item.current_platform_inventory if item.current_platform_inventory is not None else '—'}"
             )
-            for value in values
+            price_value = (
+                str(item.input_price_value)
+                if item.input_price_value is not None
+                else ""
+            )
+            inventory_value = (
+                str(item.target_inventory)
+                if item.target_inventory is not None
+                else ""
+            )
+            if preview.request.action == "SET_OFFLINE":
+                target = (
+                    '<span>下架</span>'
+                    '<input type="hidden" name="item_price_values" value="">'
+                    '<input type="hidden" name="item_target_inventories" value="">'
+                )
+            elif preview.request.action == "CHANGE_PRICE":
+                target = (
+                    '<label class="compact-field">加/降价金额'
+                    f'<input name="item_price_values" inputmode="decimal" value="{html(price_value)}" data-manual-task-price required></label>'
+                    '<input type="hidden" name="item_target_inventories" value="">'
+                )
+            elif preview.request.action == "SET_ONLINE":
+                target = (
+                    '<div class="item-value-grid"><label class="compact-field">上架价格'
+                    f'<input name="item_price_values" inputmode="decimal" value="{html(price_value)}" data-manual-task-price required></label>'
+                    '<label class="compact-field">平台库存'
+                    f'<input name="item_target_inventories" type="number" min="0" step="1" value="{html(inventory_value)}" data-manual-task-inventory required></label></div>'
+                )
+            else:
+                target = (
+                    '<label class="compact-field">目标价格'
+                    f'<input name="item_price_values" inputmode="decimal" value="{html(price_value)}" data-manual-task-price required></label>'
+                    '<input type="hidden" name="item_target_inventories" value="">'
+                )
+            blockers = tuple(getattr(item, "blockers", ()))
+            structural_blockers = tuple(
+                blocker for blocker in blockers if blocker not in editable_blockers
+            )
+            if structural_blockers:
+                check_result = "需处理：" + "".join(structural_blockers)
+            elif blockers:
+                check_result = "需处理：" + "".join(blockers)
+            else:
+                check_result = "可执行"
+            current_price = (
+                str(item.current_price) if item.current_price is not None else ""
+            )
+            return (
+                f'<tr data-manual-task-row data-action="{html(preview.request.action)}" '
+                f'data-current-price="{html(current_price)}" '
+                f'data-base-cost="{html(str(item.base_cost))}" '
+                f'data-structural-blocked="{1 if structural_blockers else 0}">'
+                f'<td data-label="执行"><input type="hidden" name="item_keys" value="{html(item.item_key)}">'
+                f'<input type="checkbox" name="included_item_keys" value="{html(item.item_key)}" {"" if item.excluded else "checked"} data-manual-task-include aria-label="执行 {html(item.variety)} {html(item.grade)}"></td>'
+                f"<td data-label=\"商品\"><strong>{html(item.variety)} · {html(item.grade)}</strong><br><span class=\"muted\">{html(item.platform_name)}</span></td>"
+                f"<td data-label=\"最近记录\">{html(current)}</td><td data-label=\"本次目标\">{target}</td>"
+                f'<td data-label="检查结果" data-manual-task-item-status>{html(check_result)}</td>'
+                "</tr>"
+            )
+
+        rows = "".join(item_inputs(item) for item in preview.items)
+        error_summary = (
+            '<div class="state-banner state-failed"><strong>需要先处理</strong><p>'
+            + html("；".join(preview.errors))
+            + "</p></div>"
+            if preview.errors
+            else ""
         )
-        hidden_values = (
-            f'<input type="hidden" name="action" value="{html(preview.request.action)}">'
-            f'<input type="hidden" name="price_value" value="{html(str(preview.request.price_value or ""))}">'
-            f'<input type="hidden" name="target_inventory" value="{html(str(preview.request.target_inventory if preview.request.target_inventory is not None else ""))}">'
-            f'<input type="hidden" name="idempotency_key" value="{html(preview.request.idempotency_key)}">'
+        warning_items = tuple(
+            item
+            for item in preview.included_items
+            if getattr(item, "warnings", ()) and not getattr(item, "blockers", ())
         )
-        create_button = (
-            f"""
-            <form method="post" action="/management/tasks/create" class="inline-actions">
-              <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
-              <input type="hidden" name="preview_token" value="{html(preview_token)}">
-              <input type="hidden" name="preview_digest" value="{html(preview.preview_digest)}">
-              <button type="submit">创建 {len(preview.included_items)} 个任务</button>
-            </form>
-            """
-            if preview.creatable
-            else '<p class="form-hint">部分项目未通过检查，暂时不能创建任务。</p>'
+        warning_lines = "".join(
+            "<li>"
+            + html(f"{item.variety} · {item.grade} · {item.platform_name}：")
+            + html("；".join(dict.fromkeys(getattr(item, "warnings", ()))))
+            + "</li>"
+            for item in warning_items
+        )
+        final_warning = (
+            '<div class="state-banner state-warning"><strong>扫描信息需确认</strong>'
+            '<p>以下扫描记录不完整或已过期，但不会阻止人工任务。请确认仍要继续：</p>'
+            f'<ul class="compact-list">{warning_lines}</ul></div>'
+            if warning_items
+            else (
+                '<div class="state-banner state-ready"><strong>任务信息已核对</strong>'
+                '<p>未发现需要额外确认的扫描质量提醒。</p></div>'
+            )
+        )
+        preview_creatable = (
+            bool(preview.included_items)
+            and not preview.errors
+            and all(not getattr(item, "blockers", ()) for item in preview.included_items)
         )
         preview_html = f"""
-        <div class="form-shell"><h3>任务预览</h3>
-          <form method="post" action="/management/tasks/preview">
-            <input type="hidden" name="csrf_token" value="{html(csrf_token)}">{hidden_scope}{hidden_values}
-            <div class="table-scroll"><table><thead><tr><th>排除</th><th>商品</th><th>平台</th><th>当前状态</th><th>目标</th><th>检查结果</th></tr></thead><tbody>{rows}</tbody></table></div>
-            <button class="secondary" type="submit">重新预览</button>
-          </form>{create_button}
-        </div>
+        <dialog id="manual-task-confirm-dialog" class="modal-dialog wide-dialog" data-auto-open>
+          <form id="manual-task-create-form" method="post" action="/management/tasks/create" data-preview-errors="{1 if preview.errors else 0}">
+            <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
+            <input type="hidden" name="preview_token" value="{html(preview_token)}">
+            <header class="dialog-header"><div><p class="eyebrow">任务预览</p><h2>逐项确认价格与平台库存</h2><p>默认带入最近一次平台记录；只修改本次需要变化的项目。</p></div><button type="button" class="icon-button" data-dialog-close aria-label="关闭">×</button></header>
+            {error_summary}
+            <div class="table-scroll manual-preview-table"><table><thead><tr><th>执行</th><th>商品</th><th>最近记录</th><th>本次目标</th><th>检查结果</th></tr></thead><tbody>{rows}</tbody></table></div>
+            <p class="form-hint">检查逐项数值后进入最终确认；只有在最终确认窗口中确认，任务才会创建并发送。</p>
+            <footer class="dialog-actions"><button type="button" class="secondary" data-dialog-close>返回修改范围</button><button type="button" data-manual-task-final-open{' disabled' if not preview_creatable else ''}>继续确认</button></footer>
+          </form>
+        </dialog>
+        <dialog id="manual-task-final-dialog" class="modal-dialog compact-dialog">
+          <div class="dialog-content">
+            <header class="dialog-header"><div><p class="eyebrow">最终确认</p><h2>确认创建并立即执行？</h2><p>确认后将创建 <span data-manual-task-final-count>{len(preview.included_items)}</span> 项任务，并通过既有授权通道立即发送。</p></div><button type="button" class="icon-button" data-manual-task-preview-return aria-label="关闭">×</button></header>
+            {final_warning}
+            <p class="form-hint">执行端仍会读取平台页面并校验商品身份、旧值和页面状态；本提示不会替代执行安全门禁。</p>
+            <footer class="dialog-actions"><button type="button" class="secondary" data-manual-task-preview-return>返回预览</button><button type="button" data-manual-task-final-submit>确认执行</button></footer>
+          </div>
+        </dialog>
         """
 
     return f"""
-    <section class="panel"><header class="panel-header"><div><h2>创建任务</h2><p>按品种、等级和平台多选；先预览，再创建</p></div><button type="button" data-dialog-open="manual-task-dialog">打开创建窗口</button></header>
+    <section class="panel"><header class="panel-header"><div><h2>创建任务</h2><p>先选择范围，再逐项确认价格与平台库存</p></div><button type="button" data-dialog-open="manual-task-dialog">打开创建窗口</button></header>
       {receipt_html}{error_html}{preview_html}
     </section>
     <dialog id="manual-task-dialog" class="modal-dialog">
-      <form method="post" action="/management/tasks/preview" data-manual-task-form>
+      <form method="post" action="/management/tasks/preview">
         <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
         <input type="hidden" name="idempotency_key" value="{html(idempotency_key)}">
         <header class="dialog-header"><div><p class="eyebrow">创建任务</p><h2>选择任务范围</h2></div><button type="button" class="icon-button" data-dialog-close aria-label="关闭">×</button></header>
         <fieldset><legend>品种（可多选）</legend><div class="chip-row">{checks('varieties', options.varieties)}</div></fieldset>
         <fieldset><legend>等级（可多选）</legend><div class="chip-row">{checks('grades', options.grades)}</div></fieldset>
         <fieldset><legend>平台（可多选）</legend><div class="chip-row">{platform_choices}</div></fieldset>
-        <label>任务类型<select name="action" data-task-action><option value="SET_PRICE">调整价格到</option><option value="CHANGE_PRICE">加/降价</option><option value="SET_OFFLINE">下架</option><option value="SET_ONLINE">上架</option></select></label>
-        <label data-price-field><span data-price-label>目标价格</span><input name="price_value" inputmode="decimal" placeholder="请输入目标价格"></label>
-        <label data-inventory-field hidden>平台目标库存<input name="target_inventory" type="number" min="0" step="1"></label>
-        <footer class="dialog-actions"><button type="button" class="secondary" data-dialog-close>取消</button><button type="submit"{' disabled' if not platform_ready else ''}>预览任务</button></footer>
+        <label>任务类型<select name="action"><option value="SET_PRICE">调整价格到</option><option value="CHANGE_PRICE">加/降价</option><option value="SET_OFFLINE">下架</option><option value="SET_ONLINE">上架</option></select></label>
+        <footer class="dialog-actions"><button type="button" class="secondary" data-dialog-close>取消</button><button type="submit"{' disabled' if not platform_ready else ''}>生成逐项预览</button></footer>
       </form>
     </dialog>
     """
@@ -926,6 +1221,7 @@ def render_detail(model: DetailReadModel) -> str:
 
 
 def render_mobile_review(model: MobileReviewReadModel) -> str:
+    operation_block = _render_mobile_operation_confirmations(model)
     action_block = (
         _render_mobile_review_actions(model)
         if model.action_options
@@ -945,6 +1241,7 @@ def render_mobile_review(model: MobileReviewReadModel) -> str:
       <p class="eyebrow">人工复核</p><h1>{html(model.review_title)}</h1>
       {render_state(model.state)}
       <dl class="detail-grid single">{facts}</dl>
+      {operation_block}
       {action_block}
     </main>
     """
@@ -970,6 +1267,42 @@ def _render_mobile_review_actions(model: MobileReviewReadModel) -> str:
     return '<section><h2>选择处理方式</h2><div class="mobile-action-list">' + "".join(forms) + "</div></section>"
 
 
+def _render_mobile_operation_confirmations(model: MobileReviewReadModel) -> str:
+    if not model.operation_confirmations:
+        return ""
+    cards = []
+    for operation in model.operation_confirmations:
+        forms = []
+        for outcome, label, class_name in (
+            ("TARGET_NOT_APPLIED", operation.not_applied_label, "secondary"),
+            ("TARGET_APPLIED", operation.applied_label, ""),
+        ):
+            forms.append(
+                f"""
+                <form method="post" action="/mobile/review/{html(model.review_task_id)}/resolve-operation">
+                  <input type="hidden" name="operation_id" value="{html(operation.operation_id)}">
+                  <input type="hidden" name="outcome" value="{html(outcome)}">
+                  <button type="submit" class="{class_name}">{html(label)}</button>
+                </form>
+                """
+            )
+        cards.append(
+            f"""
+            <article class="mobile-operation-card">
+              <h3>{html(operation.title)}</h3>
+              <p>{html(operation.detail)}</p>
+              <div class="mobile-operation-actions">{"".join(forms)}</div>
+            </article>
+            """
+        )
+    return (
+        '<section><h2>确认平台实际状态</h2>'
+        '<div class="mobile-operation-list">'
+        + "".join(cards)
+        + "</div></section>"
+    )
+
+
 def render_table(model: TableReadModel) -> str:
     if not model.columns:
         return render_state(model.state)
@@ -987,24 +1320,27 @@ def render_table(model: TableReadModel) -> str:
     body = "".join(body_rows)
     if not body:
         body = f'<tr><td colspan="{max(1, len(model.columns))}">{html(model.state.detail or model.state.title)}</td></tr>'
-    pagination = ""
-    if model.has_previous or model.has_next:
-        previous = (
-            f'<a href="{html(model.previous_url)}">上一页</a>'
-            if model.has_previous
-            else "<span>上一页</span>"
-        )
-        following = (
-            f'<a href="{html(model.next_url)}">下一页</a>'
-            if model.has_next
-            else "<span>下一页</span>"
-        )
-        pagination = f'<nav class="pagination" aria-label="分页">{previous}<b>第 {model.page} 页</b>{following}</nav>'
     return f"""
     <div class="table-state">{render_state(model.state, compact=True)}</div>
     <div class="table-scroll"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>
-    {pagination}
+    {_render_table_pagination(model)}
     """
+
+
+def _render_table_pagination(model: TableReadModel) -> str:
+    if not (model.has_previous or model.has_next):
+        return ""
+    previous = (
+        f'<a href="{html(model.previous_url)}">上一页</a>'
+        if model.has_previous
+        else "<span>上一页</span>"
+    )
+    following = (
+        f'<a href="{html(model.next_url)}">下一页</a>'
+        if model.has_next
+        else "<span>下一页</span>"
+    )
+    return f'<nav class="pagination" aria-label="分页">{previous}<b>第 {model.page} 页</b>{following}</nav>'
 
 
 def render_state(model: StateReadModel, *, compact: bool = False) -> str:

@@ -75,6 +75,7 @@ class TodayReadModel:
     state: StateReadModel
     metrics: tuple[MetricReadModel, ...]
     products: TableReadModel
+    platform_limits: TableReadModel
     todo_items: tuple[NotificationItemReadModel, ...]
     timeline: tuple[tuple[str, str, str], ...]
 
@@ -149,6 +150,16 @@ class InventoryAlertControlReadModel:
 
 
 @dataclass(frozen=True, slots=True)
+class VarietyInventoryControlReadModel:
+    variety: str
+    current_qty: int
+    grade_summary: str
+    safety_margin_qty: int
+    margin_gap: int
+    alert_enabled: bool
+
+
+@dataclass(frozen=True, slots=True)
 class ProductMasterControlReadModel:
     internal_sku: str
     product_name: str
@@ -197,6 +208,9 @@ class ManagementReadModel:
     inventory_alert_options: tuple[InventoryAlertControlReadModel, ...] = field(
         default_factory=tuple
     )
+    inventory_variety_summaries: tuple[VarietyInventoryControlReadModel, ...] = field(
+        default_factory=tuple
+    )
     product_master_options: tuple[ProductMasterControlReadModel, ...] = field(
         default_factory=tuple
     )
@@ -207,6 +221,30 @@ class ManagementReadModel:
     execution_idempotency_key: str = ""
     automation_rerun_idempotency_key: str = ""
     master_data_idempotency_key: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class OperationResolutionControlReadModel:
+    operation_id: str
+    action_label: str
+    scope: str
+    prompt: str
+    applied_label: str
+    not_applied_label: str
+
+
+@dataclass(frozen=True, slots=True)
+class TaskQueueReadModel:
+    overall: StateReadModel
+    metrics: tuple[MetricReadModel, ...]
+    components: tuple[ComponentReadModel, ...]
+    table: TableReadModel
+    cancellable_task_ids: tuple[str, ...] = field(default_factory=tuple)
+    operation_resolution_options: tuple[
+        OperationResolutionControlReadModel | None, ...
+    ] = field(default_factory=tuple)
+    selected_source: str = "all"
+    selected_stage: str = "all"
 
 
 @dataclass(frozen=True, slots=True)
@@ -237,3 +275,15 @@ class MobileReviewReadModel:
     http_status: str
     review_task_id: str = ""
     action_options: tuple[tuple[str, str], ...] = field(default_factory=tuple)
+    operation_confirmations: tuple["MobileOperationConfirmationReadModel", ...] = (
+        field(default_factory=tuple)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class MobileOperationConfirmationReadModel:
+    operation_id: str
+    title: str
+    detail: str
+    applied_label: str
+    not_applied_label: str

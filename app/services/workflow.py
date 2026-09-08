@@ -425,7 +425,6 @@ def resolve_mobile_review(
     now: datetime | None = None,
 ) -> MobileReviewResolutionSummary:
     repository = SQLiteRuntimeRepository(db_path)
-    runtime_task_service = RuntimeTaskService(repository)
     repository.require_current_schema(operation_name="Mobile review resolution")
     token_service = ReviewTokenService(repository)
     try:
@@ -483,6 +482,41 @@ def resolve_mobile_review(
         source_task=atomic_result.source_task,
         source_task_status=atomic_result.source_task_status,
     )
+
+
+def resolve_mobile_platform_operation(
+    db_path: Path,
+    review_task_id: str,
+    raw_token: str,
+    operation_id: str,
+    outcome: str,
+    *,
+    note: str = "",
+    now: datetime | None = None,
+) -> dict[str, str]:
+    """Commit a token-authorized operator observation through the shared ledger path."""
+
+    repository = SQLiteRuntimeRepository(db_path)
+    repository.require_current_schema(
+        operation_name="飞书复核页人工确认平台状态"
+    )
+    token_hash = ReviewTokenService(repository)._hash_raw_token(raw_token)
+    try:
+        return repository.resolve_shadowbot_operation_manually(
+            operation_id=str(operation_id or "").strip(),
+            actor="",
+            actor_source="mobile_review_token",
+            outcome=str(outcome or "").strip(),
+            note=str(note or "").strip(),
+            observed_at=now,
+            review_task_id=str(review_task_id or "").strip(),
+            token_hash=token_hash,
+        )
+    except ValueError as exc:
+        raise MobileReviewTransactionError(
+            MobileReviewErrorCode.CONCURRENT_UPDATE,
+            str(exc),
+        ) from exc
 
 
 def _read_authoritative_product_cost_snapshot(

@@ -47,6 +47,13 @@ Automation UI 租约检查；为封闭自动扫描的事实提交边界，在任
 它们只能由父 handler 通过 `ensure_child_run(...)` 创建，不能被时间调度器独立触发。
 13.5-4 实现订单 Adapter 前，`ORDER_SCAN` 仅是编排边界，不代表订单采集已完成。
 
+`ONLINE_PULSE` 使用任务 13 已实机验证的同一 v5 `SYNC_STATUS`、列表物化控制流、文件队列、
+Worker、租约续期和归档接口，但把请求范围冻结为 `scan_scope=online`。执行端只进入“上架中”
+页面，完成 `END → 明确尾部 → HOME → 顶部恢复` 后结束，不进入“待上架”页面。其事实直接
+写入 v14 已有的 `product_observation_batches/items`，范围必须为 `pages=["online"]`；缺席
+商品不推断下架。任务 13 的 `listing_sync_snapshots` 仍只保存完整双页快照，不得为单页扫描
+伪造“待上架已完成”。
+
 ## 3. 计划窗口与逻辑幂等
 
 一个计划窗口的逻辑身份为：
@@ -277,6 +284,13 @@ data/runtime/automation_service/heartbeat.json
 `SCHEDULER_ONLY`；13.5-4 可通过显式 `--enable-order-read-only` 注册
 `FULL_MARKET_SCAN` 的订单子 run 派生和 `ORDER_SCAN` 只读 Handler。该模式不得注册
 平台写 Handler，父 run 成功只表示子 run 调度完成，不声明页面事实。
+
+13.5-7F 后续收口增加 `--enable-listing-read-only`：它复用任务 13 的 v5
+`SYNC_STATUS` 双页读取、Result Importer 和 Product Observation Importer，将
+`LISTING_STATUS_SCAN` 作为同一 `FULL_MARKET_SCAN` 的子 run 执行。开发与实机验收可显式
+使用 `--read-only-scans-only`；该模式仍使用正式计划窗口、父子 run、租约、单 UI 通道和
+Importer，只限制本进程物化、领取已注册的只读扫描类型，不能注册日结、规则生成、Incident
+维护、发布备份或任何平台写 Handler。它不是第二套扫描入口，也不能用来伪造手工时间窗。
 获取锁后的未处理异常必须原子写入 `FAILED` 心跳，错误文本执行与 handler 相同的路径
 脱敏；锁冲突发生在获得所有权前，因此不得覆盖现有实例的活动心跳。
 

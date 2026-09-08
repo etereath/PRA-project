@@ -225,6 +225,23 @@ class ShadowBotResultImporter:
                         "path": str(quarantined),
                     }
                 )
+        from app.services.shadowbot_listing_action_pipeline import (
+            restore_orphaned_listing_reconcile_reviews,
+        )
+
+        restored_reviews = restore_orphaned_listing_reconcile_reviews(
+            self.repository
+        )
+        if restored_reviews:
+            events.append(
+                {
+                    "status": "RECONCILE_REVIEWS_RESTORED",
+                    "restored_review_count": restored_reviews,
+                }
+            )
+        deferred_reconcile = self._publish_next_pending_listing_reconcile()
+        if deferred_reconcile is not None:
+            events.append(deferred_reconcile)
         return events
 
     def import_one(self, result_path: Path) -> dict[str, Any]:
@@ -243,6 +260,15 @@ class ShadowBotResultImporter:
                 str(data.get("action_type") or "").strip().lower()
                 == "sync_status"
             ):
+                if self._listing_sync_uses_automation_importer(data):
+                    return {
+                        "status": "DEFERRED",
+                        "error_code": (
+                            "LISTING_RESULT_REQUIRES_AUTOMATION_IMPORTER"
+                        ),
+                        "execution_attempt_id": execution_attempt_id,
+                        "path": str(result_path),
+                    }
                 return self._import_v5_listing_sync_result(
                     result_path,
                     data=data,
@@ -309,6 +335,40 @@ class ShadowBotResultImporter:
             "archive_dir": str(archive_dir),
             "inventory_events": inventory_events,
         }
+
+    def _listing_sync_uses_automation_importer(
+        self,
+        data: dict[str, Any],
+    ) -> bool:
+        """Leave a leased listing result for its owning Automation handler."""
+
+        batch_id = str(data.get("batch_id") or "").strip()
+        attempt_id = str(
+            data.get("execution_attempt_id") or ""
+        ).strip()
+        manifest_sha256 = str(
+            data.get("manifest_sha256") or ""
+        ).strip()
+        if not batch_id or not attempt_id or not manifest_sha256:
+            return False
+        with self.repository.connect_read() as connection:
+            row = connection.execute(
+                """
+                SELECT 1
+                FROM shadowbot_listing_action_batches AS batches
+                INNER JOIN automation_runs AS runs
+                    ON runs.input_manifest_sha256 = batches.manifest_sha256
+                WHERE batches.batch_id = ?
+                  AND batches.execution_attempt_id = ?
+                  AND batches.manifest_sha256 = ?
+                  AND runs.job_type IN ('LISTING_STATUS_SCAN', 'ONLINE_PULSE')
+                  AND runs.run_status = 'RUNNING'
+                  AND julianday(runs.lease_expires_at) > julianday('now')
+                LIMIT 1
+                """,
+                (batch_id, attempt_id, manifest_sha256),
+            ).fetchone()
+        return row is not None
 
     def _import_v4_commit_result(
         self,
@@ -643,6 +703,8 @@ class ShadowBotResultImporter:
                             ),
                         )
                     )
+                    if reconcile_events[-1].get("status") == "PUBLISHED":
+                        break
                 except (OSError, ValidationError, ValueError) as exc:
                     reconcile_events.append(
                         {
@@ -716,6 +778,71 @@ class ShadowBotResultImporter:
             "reconcile_events": reconcile_events,
         }
 
+    def _publish_next_pending_listing_reconcile(self) -> dict[str, Any] | None:
+        """Continue a serial v5 RECONCILE chain after the queue becomes idle."""
+
+        if any(self.paths.inbox.glob("*.ready.json")):
+            return None
+        if any(self.paths.working.glob("*.request.json")):
+            return None
+        if any(self.paths.results.glob("*.result.json")):
+            return None
+
+        connection = self.repository.connect_read()
+        try:
+            candidate = connection.execute(
+                """
+                SELECT items.operation_id,
+                       batches.execution_attempt_id AS source_attempt_id
+                FROM shadowbot_listing_action_batch_items AS items
+                JOIN shadowbot_listing_action_batches AS batches
+                  ON batches.batch_id = items.batch_id
+                JOIN shadowbot_operations AS operations
+                  ON operations.operation_id = items.operation_id
+                WHERE items.operation_result = 'NEEDS_RECONCILIATION'
+                  AND operations.status = 'NEEDS_RECONCILIATION'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM shadowbot_execution_attempts AS attempts
+                      WHERE attempts.operation_id = items.operation_id
+                        AND attempts.execution_mode = 'RECONCILE'
+                  )
+                ORDER BY items.updated_at, items.item_id
+                LIMIT 1
+                """
+            ).fetchone()
+        finally:
+            connection.close()
+        if candidate is None:
+            return None
+
+        source_attempt_id = str(candidate["source_attempt_id"] or "").strip()
+        operation_id = str(candidate["operation_id"] or "").strip()
+        try:
+            source_request_path = self._find_v4_request(source_attempt_id)
+            source_result_path = self._find_v5_result(source_attempt_id)
+            source_request, _ = read_checked_queue_json(source_request_path)
+            source_result, _ = read_checked_queue_json(source_result_path)
+            validate_listing_action_request(source_request, check_expiry=False)
+            validate_listing_action_result(source_result, request=source_request)
+            from app.services.shadowbot_listing_action_pipeline import (
+                ensure_listing_action_reconcile_attempt,
+            )
+
+            return ensure_listing_action_reconcile_attempt(
+                self.repository,
+                self.executor.runner,
+                source_request=source_request,
+                source_result=source_result,
+                operation_id=operation_id,
+            )
+        except (OSError, ValidationError, ValueError) as exc:
+            return {
+                "status": "RECONCILE_DEFERRED",
+                "operation_id": operation_id,
+                "error_message": str(exc),
+            }
+
     def _find_v4_request(self, execution_attempt_id: str) -> Path:
         candidates = (
             self.paths.working / f"{execution_attempt_id}.request.json",
@@ -727,6 +854,20 @@ class ShadowBotResultImporter:
             if candidate.exists():
                 return candidate
         raise ValidationError("RESULT_CONTRACT_INVALID: v4 source request file is missing.")
+
+    def _find_v5_result(self, execution_attempt_id: str) -> Path:
+        candidates = (
+            self.paths.results / f"{execution_attempt_id}.result.json",
+            self.paths.archive
+            / execution_attempt_id
+            / f"{execution_attempt_id}.result.json",
+        )
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        raise ValidationError(
+            "RESULT_CONTRACT_INVALID: v5 source result file is missing."
+        )
 
     def _normalize_v4_page_snapshot(
         self,

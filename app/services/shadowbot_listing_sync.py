@@ -56,6 +56,7 @@ def prepare_listing_sync_batch(
     platform_name: str,
     mapping_path: Path,
     execution_profile: str = "production",
+    scan_scope: str = "online_and_waiting",
 ) -> dict[str, Any]:
     """Create and persist one immutable v5 independent SYNC_STATUS manifest."""
 
@@ -69,6 +70,7 @@ def prepare_listing_sync_batch(
         identity_mapping=None,
         platform_name=platform_name,
         mapping_source_version=mapping_source_version(mapping_path),
+        scan_scope=scan_scope,
     )
     now = _now_text()
     with closing(repository.connect_write()) as connection, connection:
@@ -205,7 +207,7 @@ def import_listing_sync_result(
     automation_claim: AutomationRunClaim | None = None,
     failure_injector: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
-    """Atomically accept a v5 snapshot and project all derived runtime facts."""
+    """Accept one v5 result; only a complete two-page scan is projected."""
 
     validate_listing_action_request(request, check_expiry=False)
     validate_listing_action_result(
@@ -258,6 +260,16 @@ def import_listing_sync_result(
             connection,
             manifest_sha256=str(batch["manifest_sha256"]),
         )
+        if automation_binding is not None:
+            bound_job_type = str(automation_binding["job_type"])
+            expected_scope = (
+                "online" if bound_job_type == "ONLINE_PULSE"
+                else "online_and_waiting"
+            )
+            if request["scan_scope"] != expected_scope:
+                raise ValidationError(
+                    "Automation 商品扫描类型与请求范围不一致。"
+                )
         existing_receipt = connection.execute(
             """
             SELECT batch_id, result_sha256
@@ -282,6 +294,21 @@ def import_listing_sync_result(
                 platform_trade_dates=snapshot_trade_dates,
             )
             connection.rollback()
+            if request["scan_scope"] == "online":
+                return {
+                    "batch_id": batch_id,
+                    "result_id": result_id,
+                    "snapshot_id": snapshot["snapshot_id"],
+                    "status": "VERIFIED",
+                    "projected_count": 0,
+                    "anomaly_count": 0,
+                    "review_created_count": 0,
+                    "review_cleared_count": 0,
+                    "notification_created_count": 0,
+                    "notification_cancelled_count": 0,
+                    "items": [],
+                    "already_imported": True,
+                }
             return _existing_import_summary(repository, batch_id, result_id)
         if str(batch["result_id"] or ""):
             raise ValidationError("SYNC_STATUS 批次已经绑定其他 result_id。")
@@ -315,6 +342,63 @@ def import_listing_sync_result(
                 now_text,
             ),
         )
+        if request["scan_scope"] == "online":
+            if snapshot["snapshot_complete"] is not True:
+                connection.execute(
+                    """
+                    UPDATE shadowbot_listing_action_batches
+                    SET result_id = ?, status = 'FAILED', failed_count = 0,
+                        updated_at = ?
+                    WHERE batch_id = ?
+                    """,
+                    (result_id, now_text, batch_id),
+                )
+                connection.commit()
+                return {
+                    "batch_id": batch_id,
+                    "result_id": result_id,
+                    "snapshot_id": snapshot["snapshot_id"],
+                    "status": "FAILED",
+                    "projected_count": 0,
+                    "anomaly_count": 0,
+                    "review_created_count": 0,
+                    "review_cleared_count": 0,
+                    "notification_created_count": 0,
+                    "notification_cancelled_count": 0,
+                    "items": [],
+                    "already_imported": False,
+                }
+            connection.execute(
+                """
+                UPDATE shadowbot_listing_action_batches
+                SET result_id = ?, status = 'VERIFIED',
+                    batch_target_count = ?, verified_count = ?,
+                    failed_count = 0, updated_at = ?
+                WHERE batch_id = ?
+                """,
+                (
+                    result_id,
+                    len(snapshot["items"]),
+                    len(snapshot["items"]),
+                    now_text,
+                    batch_id,
+                ),
+            )
+            connection.commit()
+            return {
+                "batch_id": batch_id,
+                "result_id": result_id,
+                "snapshot_id": snapshot["snapshot_id"],
+                "status": "VERIFIED",
+                "projected_count": 0,
+                "anomaly_count": 0,
+                "review_created_count": 0,
+                "review_cleared_count": 0,
+                "notification_created_count": 0,
+                "notification_cancelled_count": 0,
+                "items": [],
+                "already_imported": False,
+            }
         _insert_snapshot(connection, batch_id, snapshot)
         if failure_injector is not None:
             failure_injector("after_snapshot_insert")
@@ -498,9 +582,10 @@ def _validate_automation_listing_sync_envelope(
         raise ValidationError(
             "Automation claim 与 SYNC_STATUS manifest 绑定不一致。"
         )
-    if str(binding["job_type"]) != "LISTING_STATUS_SCAN":
+    job_type = str(binding["job_type"])
+    if job_type not in {"LISTING_STATUS_SCAN", "ONLINE_PULSE"}:
         raise ValidationError(
-            "Automation SYNC_STATUS 只能绑定 LISTING_STATUS_SCAN。"
+            "Automation SYNC_STATUS 只能绑定商品只读扫描。"
         )
     if str(binding["platform_name"]) != platform_name:
         raise ValidationError(
@@ -516,6 +601,8 @@ def _validate_automation_listing_sync_envelope(
         raise ValidationError(
             "Automation Run 与 SYNC_STATUS 平台交易日不一致。"
         )
+    if job_type == "ONLINE_PULSE":
+        return
     parent = connection.execute(
         """
         SELECT 1
@@ -590,6 +677,24 @@ def mark_listing_sync_ack(
                 "" if written else str(error_message or "")[:1000],
                 result_id,
             ),
+        )
+
+
+def fail_listing_sync_batch(
+    repository: SQLiteRuntimeRepository,
+    *,
+    batch_id: str,
+) -> None:
+    """Close an unimported read batch after its owning handler fails."""
+
+    with closing(repository.connect_write()) as connection, connection:
+        connection.execute(
+            """
+            UPDATE shadowbot_listing_action_batches
+            SET status = 'FAILED', failed_count = 0, updated_at = ?
+            WHERE batch_id = ? AND status IN ('PREPARED', 'QUEUED')
+            """,
+            (_now_text(), str(batch_id)),
         )
 
 
@@ -1242,8 +1347,12 @@ def _insert_review_notification(
                 {
                     "review_task_id": anomaly["review_task_id"],
                     "review_type": LISTING_ANOMALY_REVIEW_TYPE,
+                    "title": "商品资料需要确认",
                     "reason": anomaly["diagnostic_message"],
-                    "message": "平台商品页面位置异常，需要人工复核。",
+                    "message": (
+                        f"商品资料需要确认：{anomaly['diagnostic_message']}\n"
+                        f"平台：{snapshot['platform_name']}"
+                    ),
                     "scope_type": "platform_listing",
                     "scope_key": anomaly["anomaly_subject_key"],
                     "snapshot_id": snapshot["snapshot_id"],
@@ -1363,6 +1472,12 @@ def _validate_snapshot_result_binding(
     for field, value in expected.items():
         if str(snapshot.get(field) or "") != str(value or ""):
             raise ValidationError(f"SYNC_STATUS snapshot {field} 绑定不一致。")
+    if request["scan_scope"] == "online":
+        if (
+            snapshot.get("online_scan_complete") is True
+            and snapshot.get("waiting_scan_complete") is not False
+        ):
+            raise ValidationError("ONLINE_PULSE 快照不得声称已扫描待上架页。")
 
 
 def _existing_import_summary(
@@ -1411,10 +1526,10 @@ def _anomaly_subject(
 def _anomaly_message(item: dict[str, Any], reason: str) -> str:
     name_grade = f"{item['product_name']} {item['grade']}".strip()
     messages = {
-        "UNMAPPED_PRODUCT": f"页面商品未映射到库存 SKU：{name_grade}",
-        "IDENTITY_MAPPING_CONFLICT": f"页面身份对应多个库存 SKU：{name_grade}",
+        "UNMAPPED_PRODUCT": f"平台商品尚未关联到系统商品：{name_grade}",
+        "IDENTITY_MAPPING_CONFLICT": f"平台商品同时关联到多个系统商品：{name_grade}",
         "ABSENT_FROM_BOTH_LISTS": f"商品在上架中和待上架两页均不存在：{name_grade}",
-        "DUPLICATE_PAGE_IDENTITY": f"商品页面身份不唯一：{name_grade}",
+        "DUPLICATE_PAGE_IDENTITY": f"平台页面存在重复商品：{name_grade}",
         "PRESENT_IN_BOTH_LISTS": f"商品同时出现在上架中和待上架：{name_grade}",
     }
     return messages[reason]

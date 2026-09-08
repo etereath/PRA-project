@@ -8,7 +8,8 @@ Review Profile：R3；真实平台执行仍沿用既有 R4 门禁
 7E 只补齐运营控制面，不新增平台动作、执行链、写锁、审批状态或 Runtime 表。正式动作仍只有
 `UPDATE_PRICE`、`SET_ONLINE`、`SET_OFFLINE`；`SYNC_STATUS` 只用于既有只读对账链。
 
-- Web 人工创建只写 Runtime Task；创建成功不写 Queue、不启动 Worker、不触碰平台。
+- 人工任务创建服务只写 Runtime Task；Web 的连续确认 Handler 在创建成功后再调用统一执行
+  授权服务，创建服务本身仍不写 Queue、不启动 Worker、不触碰平台。
 - 真实执行必须经过 `prepare_execution` 与 `submit_execution` 两阶段，并要求认证主体具有
   `SUBMIT_EXECUTION`。
 - 执行只接受明确且不重复的 Task ID；禁止“执行全部 pending”。
@@ -31,7 +32,7 @@ Review Profile：R3；真实平台执行仍沿用既有 R4 门禁
 | 商品主数据 | 原样复用 | 使用 `load_products()`；`product_name` 作为当前品种维度，`grade` 作为等级维度 |
 | 平台商品映射 | 原样复用 | 使用 `compile_product_mapping_workbook()` 及其 `VERIFIED/UNMAPPED/AMBIGUOUS/DISABLED` 语义 |
 | 当前平台价格/状态 | 参数化复用 | 从既有 `listing_status` 权威投影按平台、品种、等级唯一读取，并绑定观察时间与来源引用 |
-| 数据库真实库存 | 原样复用 | 使用 v17 `InventoryRepository`/真实库存余额；上架平台目标库存不得超过真实库存 |
+| 数据库真实库存 | 原样复用 | 使用 v17 `InventoryRepository`/真实库存余额；平台库存是独立买家可购额度，不以真实库存为硬上限 |
 | 改价执行 | 原样复用 | 继续使用 v4 `prepare_task_commit_batch()` 与 `publish_task_commit_batch()` |
 | 上下架执行 | 原样复用 | 继续使用 v5 `propose_listing_action_batch()` 与 `publish_listing_action_batch()` |
 | 优先级、Review、Automation UI 租约、共享写锁、UNKNOWN/RECONCILE | 原样复用 | 由 v4/v5 预检和发布事务再次检查；7E 不复制状态机 |
@@ -54,8 +55,8 @@ Review Profile：R3；真实平台执行仍沿用既有 R4 门禁
 - `grades[]`：至少一个等级；
 - `platforms[]`：至少一个平台；
 - `action`：`SET_PRICE`、`CHANGE_PRICE`、`SET_OFFLINE`、`SET_ONLINE`；
-- `price_value`：`SET_PRICE` 的绝对价格或 `CHANGE_PRICE` 的有符号差额；
-- `target_inventory`：只允许 `SET_ONLINE`，为非负整数；
+- `item_values[]`：按本次预览的 `item_key` 逐项提交价格；`CHANGE_PRICE` 为有符号差额；
+  `SET_ONLINE` 还可逐项提交非负平台目标库存；
 - `excluded_item_keys[]`：仅排除本次预览中的明确项目；
 - `idempotency_key`：一次创建请求的稳定键。
 
@@ -64,19 +65,30 @@ Review Profile：R3；真实平台执行仍沿用既有 R4 门禁
 
 ### 3.2 预览和创建
 
-服务端按品种 × 等级 × 平台展开有效商品，并逐项给出：SKU、平台、当前价格/状态、真实库存、
-动作、目标价格/平台库存、基础成本、映射状态、价格新鲜度和阻断原因。
+服务端按品种 × 等级 × 平台展开有效商品，并逐项给出：SKU、平台、最近记录的价格/平台库存、
+当前状态、真实库存、动作、目标价格/平台库存、基础成本、映射状态、价格新鲜度、提醒和阻断原因。
+绝对价格和上架库存默认带入最近一次平台记录；有符号加/降价默认 0，必须改为非 0 后才可
+执行。逐项设置与本轮 item key 一起进入预览摘要和幂等身份，不能在确认后换项。
 
 - `SET_PRICE`：目标价格等于输入值；
 - `CHANGE_PRICE`：目标价格等于当前价格加有符号差额，负数代表降价；
 - `SET_OFFLINE`：不携带价格或库存；
 - `SET_ONLINE`：必须同时携带目标价格和平台目标库存。
 
-目标价格必须为正且不低于商品 `base_cost`；`SET_ONLINE.target_inventory` 不得超过数据库真实
-库存。映射不唯一、价格不可用或过期、平台状态不可用、存在同身份开放任务、真实库存不可用
-均阻断该项。创建时重新生成预览并比较 `preview_digest`；任一事实变化时整批拒绝，不能部分
-创建。合法项目通过单一数据库事务写入 MANUAL Task，`origin_ref_id` 和 `dedupe_key` 绑定创建
-请求；精确重放返回同一批 Task，同键异内容拒绝。
+目标价格必须为正且不低于商品 `base_cost`；`SET_ONLINE.target_inventory` 是平台买家可购
+上限，只要求为非负整数，不以数据库真实库存为数值上限，也不与其他平台目标库存求和。
+上架预览复用最近一次到期的定时 `LISTING_STATUS_SCAN`，不为即时创建任务额外生成扫描 Run。
+Run、观察批次、范围、尾部或事实新鲜度不合格时，MANUAL 人工任务把原因作为最终确认弹窗的
+逐项提醒，允许操作者确认后继续；AUTOMATION 来源仍将其作为硬门禁。人工改价、加/降价、
+上架和下架统一遵守该规则：价格或上下架事实仅为过期时进入提醒，事实本身缺失、映射不唯一、
+平台状态实际不可用、存在同身份开放任务、真实库存不可用均继续阻断该项。创建时重新生成
+预览并比较 `preview_digest`；任一事实变化时整批拒绝，不能部分创建。合法项目通过单一数据库
+事务写入 MANUAL Task，`origin_ref_id` 和 `dedupe_key` 绑定创建请求；精确重放返回同一批
+Task，同键异内容拒绝。
+
+逐项预览不是执行确认：运营者可在预览中逐项调整价格和平台库存，随后点击“继续确认”进入
+单独的小型最终确认弹窗。扫描质量提醒只出现在该最终弹窗；只有点击“确认执行”才允许创建
+Task 并进入既有执行授权服务。
 
 ## 4. 执行授权合同
 
@@ -98,6 +110,10 @@ submit_execution(principal, exact_task_ids, confirmation_digest, idempotency_key
 - 提交必须使用同一 principal 与同一幂等键；表单 `actor`/`confirmed_by` 一律忽略。
 - Task、价格、映射、成本、真实库存、Review、优先级、写锁、Automation UI 租约或
   UNKNOWN/RECONCILE 任一变化，整批拒绝并要求重新准备。
+- 非 MANUAL 来源的 `SET_ONLINE` 最终授权继续检查“最近定时扫描质量”硬门禁；MANUAL 来源的
+  改价、加/降价、上架和下架已在最终确认弹窗显示该提醒，授权服务及上下架预发布门禁不得再
+  使用旧扫描阻断或直接判定动作已经完成，必须交给执行端实时页面预检。两类路径都只读既有
+  扫描事实，不创建临时扫描任务。
 - publisher 的 `confirmed_by` 只能是认证 principal；Queue/Importer 失败、UNKNOWN 和唯一
   RECONCILE 沿用既有恢复链。
 

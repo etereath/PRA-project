@@ -155,6 +155,17 @@ class InventoryRepository:
             ).fetchone()
         return _row_to_alert_policy(row) if row is not None else None
 
+    def get_default_alert_policy(self) -> InventoryAlertPolicy | None:
+        with closing(self.runtime_repository.connect_read()) as connection:
+            row = connection.execute(
+                """
+                SELECT *
+                FROM inventory_alert_policies
+                WHERE scope_type = 'DEFAULT' AND scope_key = '*'
+                """
+            ).fetchone()
+        return _row_to_alert_policy(row) if row is not None else None
+
     def list_alert_policies(self) -> tuple[InventoryAlertPolicy, ...]:
         with closing(self.runtime_repository.connect_read()) as connection:
             rows = connection.execute(

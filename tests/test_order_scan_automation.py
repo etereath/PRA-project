@@ -4,6 +4,9 @@ import json
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from app.adapters.mayi_huatuan_order import (
     MAYI_HUATUAN_PLATFORM,
@@ -52,6 +55,17 @@ class Reader:
 
     def read_orders_read_only(self, request):
         return self.capture
+
+
+class ArchivingReader(Reader):
+    def __init__(self, result_path: Path) -> None:
+        super().__init__()
+        self.last_result_path = result_path
+        self.archived = False
+
+    def acknowledge_last_result(self) -> None:
+        self.archived = True
+        self.last_result_path = None
 
 
 def _job(job_id: str, job_type: str, kind: str, enabled: bool):
@@ -283,3 +297,44 @@ def test_formal_runtime_composition_registers_only_read_only_order_chain(
         FullMarketScanOrderDispatchHandler,
     )
     assert isinstance(handlers[ORDER_SCAN], OrderScanHandler)
+
+
+def test_order_handler_archives_result_when_import_fails(tmp_path) -> None:
+    reader = ArchivingReader(tmp_path / "synthetic.result.json")
+
+    class FailingImporter:
+        operational_time = OperationalTimeService()
+
+        def import_batch(self, *args, **kwargs):
+            raise RuntimeError("synthetic order import failure")
+
+    class Context:
+        claim = object()
+        operational_time = OperationalTimeService()
+
+        def bind_order_scan_target_trade_date(self, value):
+            return value
+
+        def heartbeat(self) -> bool:
+            return True
+
+    run = SimpleNamespace(
+        run_id="AUTO-RUN-ORDER-IMPORT-FAIL-0001",
+        job_type=ORDER_SCAN,
+        platform_name=MAYI_HUATUAN_PLATFORM,
+        platform_trade_date=NOW.date(),
+    )
+    handler = OrderScanHandler(
+        adapter=MayiHuatuanOrderReadOnlyAdapter(
+            reader,
+            operational_time=OperationalTimeService(),
+        ),
+        importer=FailingImporter(),
+        mappings_provider=lambda: object(),
+        batch_id_factory=lambda current: f"ORDER-BATCH-{current.run_id}",
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic order import failure"):
+        handler(run, Context())
+
+    assert reader.archived is True

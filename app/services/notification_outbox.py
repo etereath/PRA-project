@@ -37,9 +37,14 @@ from app.models import (
     ReviewTask,
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.review_display import (
+    REVIEW_TYPE_DISPLAY_LABELS,
+    review_reason_display,
+    review_scope_display,
+    review_type_display_label,
+)
 from app.review_policy import (
     is_execution_failure_review,
-    review_task_group_id,
 )
 from app.services.feishu import (
     build_feishu_signature,
@@ -59,33 +64,24 @@ VERIFICATION_CANCELLED_NOTIFICATION_TYPE = "verification_code_cancelled"
 NOTIFICATION_KEY_VERSION = "v1"
 MAX_NOTIFICATION_PAYLOAD_BYTES = 16_384
 TEST_NOTIFICATION_CHANNELS = frozenset({"mock", "fake", "scripted"})
-REVIEW_TYPE_LABELS = {
-    "capacity_warning": "产能预警",
-    "labor_required": "人工用工确认",
-    "shortage_warning": "短缺预警",
-    "cold_storage_warning": "冷库预警",
-    "clearance_warning": "清库存预警",
-    "manual_price_review": "人工价格复核",
-    "below_break_even_review": "低于保本价复核",
-    "manual_review": "人工复核",
-    "emergency_protection": "价格异常处理",
-}
+REVIEW_TYPE_LABELS = dict(REVIEW_TYPE_DISPLAY_LABELS)
 NOTIFICATION_TYPE_TITLES = {
     "system_test": "通知通路测试",
-    "mobile_review_required": "价格异常，请立即处理",
-    "review_expired": "复核已超时",
+    "mobile_review_required": "需要人工处理",
+    "review_expired": "人工处理已超时",
     VERIFICATION_NOTIFICATION_TYPE: "需要验证码，请立即处理",
     VERIFICATION_COMPLETED_NOTIFICATION_TYPE: "验证码处理完毕",
     VERIFICATION_TIMEOUT_NOTIFICATION_TYPE: "验证码处理超时",
     VERIFICATION_CANCELLED_NOTIFICATION_TYPE: "验证码等待已取消",
     "incident_recovered": "异常已恢复",
     "worker_recovered": "执行端已恢复",
-    "worker_recovery_failed": "执行端恢复失败",
-    "incident_task_success": "处置任务已完成",
-    "incident_task_failed": "处置任务失败",
-    "incident_task_unknown": "处置结果待确认",
+    "worker_recovery_failed": "影刀执行端需要人工处理",
+    "incident_task_success": "紧急处理已完成",
+    "incident_task_failed": "紧急处理未完成",
+    "incident_task_unknown": "紧急处理结果待确认",
     "inventory_low": "库存偏低",
     "inventory_recovered": "库存已恢复",
+    "task_queue_blocked": "任务队列受阻",
 }
 
 
@@ -478,7 +474,7 @@ class NotificationOutboxService:
                 "review_task_id": review_task.review_task_id,
                 "review_type": review_task.review_type,
                 "title": _review_notification_title(review_task),
-                "reason": review_task.reason[:500],
+                "reason": review_reason_display(review_task)[:500],
                 "message": _review_notification_message(review_task),
                 "scope_type": review_task.scope_type,
                 "scope_key": review_task.scope_key,
@@ -513,7 +509,7 @@ class NotificationOutboxService:
         safe_payload = {
             "operation_id": operation_id,
             "execution_attempt_id": attempt_id,
-            "message": "ShadowBot 登录验证码人工接管：请在系统中查看关联操作。",
+            "message": "登录需要手机验证码，请在手机端完成验证。",
         }
         if payload:
             allowed_overrides = {"platform_name", "required_by", "verification_markers"}
@@ -757,7 +753,7 @@ class NotificationOutboxService:
                 "review_task_id": review_task.review_task_id,
                 "review_type": review_task.review_type,
                 "title": _review_notification_title(review_task),
-                "reason": review_task.reason[:500],
+                "reason": review_reason_display(review_task)[:500],
                 "message": kwargs.get("message")
                 or _review_notification_message(review_task),
                 "scope_type": review_task.scope_type,
@@ -849,7 +845,7 @@ class NotificationOutboxService:
         safe_payload = {
             "operation_id": operation_id,
             "execution_attempt_id": attempt_id,
-            "message": "ShadowBot 登录验证码人工接管：请在系统中查看关联操作。",
+            "message": "登录需要手机验证码，请在手机端完成验证。",
         }
         if payload:
             allowed_overrides = {"platform_name", "required_by", "verification_markers"}
@@ -1160,16 +1156,16 @@ class OutboxReviewNotificationService:
         timestamp = resolved_at or utc_now()
         messages = {
             ReviewTaskStatus.APPROVED: (
-                f"验证码处理完毕：{review_task.platform_name or '销售平台'}登录已恢复\n"
-                "执行端已自动确认，并继续本次任务。"
+                f"验证码处理完毕：{review_task.platform_name or '销售平台'}已恢复登录\n"
+                "系统已继续处理原任务。"
             ),
             ReviewTaskStatus.EXPIRED: (
-                f"验证码处理超时：{review_task.platform_name or '销售平台'}登录未恢复\n"
-                "本次等待已经结束，请重新发起任务。"
+                f"验证码处理超时：{review_task.platform_name or '销售平台'}仍未登录\n"
+                "原任务没有继续执行，请重新创建任务。"
             ),
             ReviewTaskStatus.CANCELLED: (
                 f"验证码等待已取消：{review_task.platform_name or '销售平台'}\n"
-                "执行端已停止等待。"
+                "原任务没有继续执行。"
             ),
         }
         notification = NotificationOutbox(
@@ -1294,31 +1290,13 @@ def _review_notification_message(review_task: ReviewTask) -> str:
     label = (
         _review_notification_title(review_task)
         if review_task.review_type == "emergency_protection"
-        else REVIEW_TYPE_LABELS.get(review_task.review_type, review_task.review_type)
+        else review_type_display_label(review_task.review_type)
     )
-    reason = review_task.reason.strip()
+    reason = review_reason_display(review_task)
     lines = [f"{label}：{reason}" if reason else label]
-    if review_task.platform_name:
-        lines.append(f"平台：{review_task.platform_name}")
-    scope = review_task.internal_sku or review_task.scope_key
-    if scope:
-        lines.append(f"对象：{scope}")
-    group_id = review_task_group_id(review_task)
-    if group_id:
-        task_count = review_task.review_payload.get("affected_task_count")
-        suffix = f"（{task_count} 条待复核任务）" if task_count else ""
-        lines.append(f"任务组：{group_id}{suffix}")
-    item_skus = list(
-        dict.fromkeys(
-            str(item.get("internal_sku") or "").strip()
-            for item in review_task.review_payload.get("items", [])
-            if isinstance(item, dict) and str(item.get("internal_sku") or "").strip()
-        )
-    )
-    if item_skus:
-        lines.append(f"商品：{'、'.join(item_skus)}")
+    lines.append(f"范围：{review_scope_display(review_task)}")
     if review_task.required_by is not None:
-        lines.append("复核截止：" + _format_beijing_datetime(review_task.required_by))
+        lines.append("处理期限：" + _format_beijing_datetime(review_task.required_by))
     if is_execution_failure_review(review_task):
         lines.append("可选结果：重试任务 / 取消任务")
     return "\n".join(lines)
@@ -1329,19 +1307,19 @@ def _review_notification_title(review_task: ReviewTask) -> str:
         if str(review_task.review_payload.get("severity") or "").upper() == "S4":
             return "极端低价，请立即处理"
         return "价格异常，请立即处理"
-    return REVIEW_TYPE_LABELS.get(review_task.review_type, "人工复核")
+    return review_type_display_label(review_task.review_type)
 
 
 def _review_expired_message(review_task: ReviewTask, timeout_at: datetime) -> str:
-    reason = review_task.reason.strip()
-    lines = [f"复核已超时：{reason}" if reason else "复核已超时，请人工处理"]
+    reason = review_reason_display(review_task)
+    lines = [f"人工处理已超时：{reason}" if reason else "人工处理已超时，请重新处理"]
     lines.append("超时时间：" + _format_beijing_datetime(timeout_at))
     return "\n".join(lines)
 
 
 def _verification_intervention_message(platform_name: object) -> str:
     platform = str(platform_name or "销售平台").strip() or "销售平台"
-    return f"需要验证码：{platform}登录，请立即处理"
+    return f"{platform}登录需要验证码，请在手机端完成验证后点击“处理完毕”。"
 
 
 def _format_beijing_datetime(value: datetime) -> str:
@@ -1587,7 +1565,7 @@ def _build_feishu_outbox_body(
                 [
                     {
                         "tag": "a",
-                        "text": "打开手机复核",
+                        "text": "打开处理页面",
                         "href": mobile_review_url,
                     }
                 ]
@@ -1600,7 +1578,7 @@ def _build_feishu_outbox_body(
                         "title": str(
                             payload.get("title")
                             or NOTIFICATION_TYPE_TITLES.get(
-                                notification.notification_type, "PRA 运营通知"
+                                notification.notification_type, "运营通知"
                             )
                         )[:200],
                         "content": content,
@@ -1609,7 +1587,7 @@ def _build_feishu_outbox_body(
             },
         }
     if mobile_review_url:
-        message = f"{message}\n打开手机复核：{mobile_review_url}"
+        message = f"{message}\n打开处理页面：{mobile_review_url}"
     return {"msg_type": "text", "content": {"text": message}}
 
 

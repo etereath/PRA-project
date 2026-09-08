@@ -384,7 +384,7 @@ class ShadowBotExecutorTests(unittest.TestCase):
         self.assertLessEqual((review.required_by - review.created_at).total_seconds(), 600)
         self.assertEqual(len(notifications), 1)
         self.assertNotIn("password", str(review.review_payload).lower())
-        self.assertIn("需要验证码：蚂蚁花团供应商登录", notifications[0].message)
+        self.assertIn("蚂蚁花团供应商登录需要验证码", notifications[0].message)
         self.assertNotIn("Please complete", notifications[0].message)
 
     def test_login_verification_handoff_queues_outbox_for_real_channel_without_sending(self) -> None:

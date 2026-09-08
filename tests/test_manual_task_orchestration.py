@@ -18,8 +18,11 @@ from app.services.manual_task_orchestration import (
     SET_PRICE,
     ManualTaskApplicationService,
     ManualTaskConflictError,
+    ManualTaskError,
+    ManualTaskItemValue,
     ManualTaskRequest,
 )
+from tests.listing_scan_support import seed_scheduled_listing_scan
 
 
 NOW = datetime(2026, 8, 13, 2, 0, tzinfo=UTC)
@@ -162,6 +165,85 @@ def test_negative_delta_creates_exact_manual_tasks_without_queue_side_effect(
     assert not queue_root.exists()
 
 
+def test_each_preview_item_accepts_its_own_price_and_defaults_to_last_recorded_value(
+    manual_service,
+) -> None:
+    service, repository, _, _ = manual_service
+    initial = service.preview(
+        ManualTaskRequest(
+            varieties=("艾莎",),
+            grades=("A级", "B级"),
+            platforms=(PLATFORM,),
+            action=SET_PRICE,
+        )
+    )
+
+    assert [item.input_price_value for item in initial.items] == [
+        Decimal("12.00"),
+        Decimal("9.00"),
+    ]
+    assert all("与当前价格相同" in "".join(item.blockers) for item in initial.items)
+
+    request = replace(
+        initial.request,
+        item_values=(
+            ManualTaskItemValue(initial.items[0].item_key, Decimal("13.50")),
+            ManualTaskItemValue(initial.items[1].item_key, Decimal("10.25")),
+        ),
+        idempotency_key="per-item-price",
+    )
+    confirmed = service.preview(request)
+    assert confirmed.creatable is True
+    result = service.create(
+        request,
+        expected_preview_digest=confirmed.preview_digest,
+        authenticated_subject="admin",
+    )
+
+    tasks = [repository.get_task(task_id) for task_id in result.task_ids]
+    assert [task.target_price for task in tasks if task is not None] == [
+        Decimal("13.50"),
+        Decimal("10.25"),
+    ]
+
+
+def test_online_item_defaults_use_last_recorded_platform_price_and_inventory(
+    manual_service,
+) -> None:
+    service, repository, _, _ = manual_service
+    _listing(
+        repository,
+        "AISHA-B-50-Z",
+        "B级",
+        Decimal("9.00"),
+        "offline",
+        observed_at=NOW + timedelta(seconds=1),
+        platform_stock_qty=37,
+    )
+    seed_scheduled_listing_scan(
+        repository,
+        platform_name=PLATFORM,
+        observed_at=NOW + timedelta(seconds=1),
+        items=(("AISHA-A-50-Z", True), ("AISHA-B-50-Z", False)),
+    )
+
+    preview = service.preview(
+        ManualTaskRequest(
+            varieties=("艾莎",),
+            grades=("B级",),
+            platforms=(PLATFORM,),
+            action=SET_ONLINE,
+        ),
+        now=NOW + timedelta(seconds=2),
+    )
+
+    assert preview.creatable is True
+    assert preview.items[0].input_price_value == Decimal("9.00")
+    assert preview.items[0].target_price == Decimal("9.00")
+    assert preview.items[0].current_platform_inventory == 37
+    assert preview.items[0].target_inventory == 37
+
+
 def test_exact_replay_returns_same_tasks_and_same_key_different_request_rejects(
     manual_service,
 ) -> None:
@@ -237,7 +319,7 @@ def test_price_change_after_preview_rejects_whole_batch(manual_service) -> None:
     assert repository.list_tasks() == []
 
 
-def test_offline_has_no_price_and_online_requires_price_and_safe_inventory(
+def test_offline_has_no_price_and_online_allows_platform_quota_above_real_inventory(
     manual_service,
 ) -> None:
     service, repository, _, _ = manual_service
@@ -261,30 +343,25 @@ def test_offline_has_no_price_and_online_requires_price_and_safe_inventory(
     assert offline_task.target_inventory is None
 
     _listing(repository, "AISHA-B-50-Z", "B级", Decimal("9.00"), "offline")
+    seed_scheduled_listing_scan(
+        repository,
+        platform_name=PLATFORM,
+        observed_at=NOW,
+        items=(("AISHA-A-50-Z", True), ("AISHA-B-50-Z", False)),
+    )
     online_request = ManualTaskRequest(
         varieties=("艾莎",),
         grades=("B级",),
         platforms=(PLATFORM,),
         action=SET_ONLINE,
         price_value=Decimal("10"),
-        target_inventory=42,
-    )
-    blocked = service.preview(online_request)
-    assert blocked.creatable is False
-    assert "不能超过数据库库存" in "".join(blocked.items[0].blockers)
-
-    allowed_request = ManualTaskRequest(
-        varieties=("艾莎",),
-        grades=("B级",),
-        platforms=(PLATFORM,),
-        action=SET_ONLINE,
-        price_value=Decimal("10"),
-        target_inventory=40,
+        target_inventory=420,
         idempotency_key="online",
     )
-    allowed = service.preview(allowed_request)
+    allowed = service.preview(online_request)
+    assert allowed.creatable is True
     created = service.create(
-        allowed_request,
+        online_request,
         expected_preview_digest=allowed.preview_digest,
         authenticated_subject="admin",
     )
@@ -292,7 +369,231 @@ def test_offline_has_no_price_and_online_requires_price_and_safe_inventory(
     assert task is not None
     assert task.action_type is TaskActionType.SET_ONLINE
     assert task.target_price == Decimal("10.00")
-    assert task.target_inventory == 40
+    assert task.target_inventory == 420
+
+
+def test_online_preview_warns_for_bad_last_scan_without_scheduling_another_scan(
+    manual_service,
+) -> None:
+    service, repository, _, _ = manual_service
+    _listing(
+        repository,
+        "AISHA-B-50-Z",
+        "B级",
+        Decimal("9.00"),
+        "offline",
+        observed_at=NOW + timedelta(seconds=1),
+        platform_stock_qty=0,
+    )
+    seed_scheduled_listing_scan(
+        repository,
+        platform_name=PLATFORM,
+        observed_at=NOW + timedelta(seconds=1),
+        items=(("AISHA-A-50-Z", True), ("AISHA-B-50-Z", False)),
+        batch_status="PARTIAL",
+        scope_complete=False,
+        end_marker_verified=False,
+    )
+    with repository.connect_read() as connection:
+        runs_before = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM automation_runs"
+            ).fetchone()[0]
+        )
+
+    preview = service.preview(
+        ManualTaskRequest(
+            varieties=("艾莎",),
+            grades=("B级",),
+            platforms=(PLATFORM,),
+            action=SET_ONLINE,
+            price_value=Decimal("10"),
+            target_inventory=400,
+        ),
+        now=NOW + timedelta(seconds=2),
+    )
+
+    assert preview.creatable is True
+    assert preview.items[0].blockers == ()
+    assert "未完成全部页面或尾部确认" in "".join(
+        preview.items[0].warnings
+    )
+    assert "确认仍要继续" in "".join(preview.items[0].warnings)
+    with repository.connect_read() as connection:
+        runs_after = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM automation_runs"
+            ).fetchone()[0]
+        )
+    assert runs_after == runs_before
+
+
+def test_stale_listing_status_warns_but_does_not_block_manual_offline(
+    manual_service,
+) -> None:
+    service, _, _, _ = manual_service
+
+    preview = service.preview(
+        ManualTaskRequest(
+            varieties=("艾莎",),
+            grades=("A级",),
+            platforms=(PLATFORM,),
+            action=SET_OFFLINE,
+        ),
+        now=NOW + timedelta(hours=1),
+    )
+
+    assert preview.creatable is True
+    assert preview.items[0].blockers == ()
+    assert "当前上下架状态记录缺少时间或已过期" in "".join(
+        preview.items[0].warnings
+    )
+    assert "尚无可用的定时商品扫描" in "".join(preview.items[0].warnings)
+
+
+@pytest.mark.parametrize(
+    ("action", "price_value", "grade", "status"),
+    [
+        (SET_PRICE, Decimal("13.00"), "A级", "online"),
+        (CHANGE_PRICE, Decimal("1.00"), "A级", "online"),
+        (SET_OFFLINE, None, "A级", "online"),
+        (SET_ONLINE, Decimal("10.00"), "B级", "offline"),
+    ],
+)
+def test_partial_scheduled_scan_is_only_a_confirmation_warning_for_every_manual_action(
+    manual_service,
+    action: str,
+    price_value: Decimal | None,
+    grade: str,
+    status: str,
+) -> None:
+    service, repository, _, _ = manual_service
+    sku = "AISHA-A-50-Z" if grade == "A级" else "AISHA-B-50-Z"
+    _listing(
+        repository,
+        sku,
+        grade,
+        Decimal("12.00") if grade == "A级" else Decimal("9.00"),
+        status,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+    seed_scheduled_listing_scan(
+        repository,
+        platform_name=PLATFORM,
+        observed_at=NOW + timedelta(seconds=1),
+        items=(("AISHA-A-50-Z", True), ("AISHA-B-50-Z", False)),
+        run_status="PARTIAL",
+        batch_status="PARTIAL",
+        scope_complete=False,
+        end_marker_verified=False,
+    )
+
+    preview = service.preview(
+        ManualTaskRequest(
+            varieties=("艾莎",),
+            grades=(grade,),
+            platforms=(PLATFORM,),
+            action=action,
+            price_value=price_value,
+            target_inventory=400 if action == SET_ONLINE else None,
+        ),
+        now=NOW + timedelta(seconds=2),
+    )
+
+    assert preview.creatable is True
+    assert preview.items[0].blockers == ()
+    assert "未完整成功" in "".join(preview.items[0].warnings)
+
+
+@pytest.mark.parametrize(
+    ("action", "price_value", "grade", "status"),
+    [
+        (SET_PRICE, Decimal("13.00"), "B级", "offline"),
+        (CHANGE_PRICE, Decimal("1.00"), "B级", "offline"),
+        (SET_OFFLINE, None, "B级", "offline"),
+        (SET_ONLINE, Decimal("13.00"), "A级", "online"),
+    ],
+)
+def test_stale_status_never_becomes_a_hard_block_for_manual_actions(
+    manual_service,
+    action: str,
+    price_value: Decimal | None,
+    grade: str,
+    status: str,
+) -> None:
+    service, repository, _, _ = manual_service
+    sku = "AISHA-A-50-Z" if grade == "A级" else "AISHA-B-50-Z"
+    _listing(
+        repository,
+        sku,
+        grade,
+        Decimal("12.00") if grade == "A级" else Decimal("9.00"),
+        status,
+        observed_at=NOW,
+    )
+
+    request = ManualTaskRequest(
+        varieties=("艾莎",),
+        grades=(grade,),
+        platforms=(PLATFORM,),
+        action=action,
+        price_value=price_value,
+        target_inventory=400 if action == SET_ONLINE else None,
+        idempotency_key="stale-manual-" + action.lower(),
+    )
+    current = NOW + timedelta(hours=1)
+    preview = service.preview(request, now=current)
+
+    assert preview.creatable is True
+    assert preview.items[0].blockers == ()
+    assert "记录已经过期" in "".join(preview.items[0].warnings)
+    if action in {SET_PRICE, CHANGE_PRICE}:
+        assert "当前价格记录缺少时间或已过期" in "".join(
+            preview.items[0].warnings
+        )
+    created = service.create(
+        request,
+        expected_preview_digest=preview.preview_digest,
+        authenticated_subject="admin",
+        now=current,
+    )
+    assert len(created.task_ids) == 1
+
+
+def test_multiple_blockers_do_not_insert_redundant_chinese_separator(
+    manual_service,
+) -> None:
+    service, repository, _, _ = manual_service
+    _listing(
+        repository,
+        "AISHA-B-50-Z",
+        "B级",
+        Decimal("9.00"),
+        "offline",
+        observed_at=NOW + timedelta(seconds=1),
+    )
+    request = ManualTaskRequest(
+        varieties=("艾莎",),
+        grades=("B级",),
+        platforms=(PLATFORM,),
+        action=SET_PRICE,
+        price_value=Decimal("3.00"),
+        idempotency_key="no-redundant-separator",
+    )
+    current = NOW + timedelta(seconds=1)
+    preview = service.preview(request, now=current)
+
+    with pytest.raises(ManualTaskError) as error:
+        service.create(
+            request,
+            expected_preview_digest=preview.preview_digest,
+            authenticated_subject="admin",
+            now=current,
+        )
+
+    message = str(error.value)
+    assert "。、" not in message
+    assert "改价只允许当前上架中的商品。目标价格不能低于商品基础成本。" in message
 
 
 def test_low_price_mapping_failure_and_open_task_conflict_are_explicit(
@@ -372,6 +673,7 @@ def _listing(
     status: str,
     *,
     observed_at: datetime = NOW,
+    platform_stock_qty: int = 20,
 ) -> None:
     repository.apply_shadowbot_inventory_observation(
         platform_name=PLATFORM,
@@ -379,8 +681,17 @@ def _listing(
         grade=grade,
         internal_sku=sku,
         observed_price=price,
-        platform_stock_qty=20,
+        platform_stock_qty=platform_stock_qty,
         online_status=status,
         observed_at=observed_at,
-        execution_attempt_id="ATTEMPT-" + sku + "-" + str(price),
+        execution_attempt_id=(
+            "ATTEMPT-"
+            + sku
+            + "-"
+            + str(price)
+            + "-"
+            + str(platform_stock_qty)
+            + "-"
+            + observed_at.isoformat()
+        ),
     )

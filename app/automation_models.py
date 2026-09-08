@@ -81,7 +81,7 @@ class AutomationRunClaim:
 
 @dataclass(frozen=True, slots=True)
 class AutomationRunOutcome:
-    """Bounded terminal result returned by an automation handler."""
+    """Bounded terminal result returned by a handler or dispatcher gate."""
 
     status: AutomationRunStatus
     output_manifest_sha256: str = ""
@@ -94,6 +94,7 @@ class AutomationRunOutcome:
             AutomationRunStatus.SUCCESS,
             AutomationRunStatus.PARTIAL,
             AutomationRunStatus.FAILED,
+            AutomationRunStatus.MISSED,
             AutomationRunStatus.SKIPPED,
             AutomationRunStatus.CANCELLED,
         }

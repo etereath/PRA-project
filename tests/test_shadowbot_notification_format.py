@@ -30,10 +30,11 @@ def test_shadowbot_login_handoff_post_uses_specialized_fields():
 
     post = body["content"]["post"]["zh_cn"]
     lines = [part["text"] for row in post["content"] for part in row]
-    assert post["title"] == "ShadowBot 登录验证码人工接管"
+    assert post["title"] == "需要完成登录验证"
     assert "平台：蚂蚁花团供应商" in lines
-    assert "执行尝试：ATTEMPT-LOGIN-1" in lines
-    assert "截止时间：2026-07-12T12:00+08:00" in lines
+    assert "处理期限：2026-07-12T12:00+08:00" in lines
+    assert "ATTEMPT-LOGIN-1" not in " ".join(lines)
+    assert "Worker" not in " ".join(lines)
     assert not any(line.startswith("业务日期：") for line in lines)
     assert not any(line.startswith("处理对象：") for line in lines)
     assert not any(line.startswith("原因：") for line in lines)

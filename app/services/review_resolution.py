@@ -31,6 +31,15 @@ class ReviewResolutionResult:
     created_task_id: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class OperationResolutionResult:
+    operation_id: str
+    action_type: str
+    operation_result: str
+    actual_state: str
+    internal_sku: str
+
+
 class ReviewResolutionApplicationService:
     """Resolve desktop Reviews without introducing a second state machine."""
 
@@ -134,6 +143,44 @@ class ReviewResolutionApplicationService:
             )
         except (MobileReviewTransactionError, ValidationError) as exc:
             raise ReviewResolutionError(str(exc)) from exc
+
+    def resolve_operation(
+        self,
+        principal: Principal,
+        *,
+        operation_id: str,
+        outcome: str,
+        note: str = "",
+    ) -> OperationResolutionResult:
+        """Accept an operator-observed platform fact without another platform read."""
+
+        if not self.authorization.allows(principal, Capability.HANDLE_REVIEW):
+            raise ReviewResolutionError("当前账号没有确认平台状态的权限。")
+        clean_id = str(operation_id or "").strip()
+        if not clean_id:
+            raise ReviewResolutionError("请选择需要确认的平台操作。")
+        clean_outcome = str(outcome or "").strip().upper()
+        if clean_outcome not in {"TARGET_APPLIED", "TARGET_NOT_APPLIED"}:
+            raise ReviewResolutionError("请选择平台上的实际状态。")
+        self.repository.require_current_schema(
+            operation_name="运营 Web 人工确认平台状态"
+        )
+        try:
+            result = self.repository.resolve_shadowbot_operation_manually(
+                operation_id=clean_id,
+                actor=principal.subject,
+                outcome=clean_outcome,
+                note=str(note or "").strip(),
+            )
+        except ValueError as exc:
+            raise ReviewResolutionError(str(exc)) from exc
+        return OperationResolutionResult(
+            operation_id=result["operation_id"],
+            action_type=result["action_type"],
+            operation_result=result["operation_result"],
+            actual_state=result["actual_state"],
+            internal_sku=result["internal_sku"],
+        )
 
     def _product_cost_snapshot(self, internal_sku: str) -> tuple[Decimal, str]:
         try:

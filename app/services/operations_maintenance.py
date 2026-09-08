@@ -183,7 +183,7 @@ class OperationsMaintenanceApplicationService:
             channel=self.notification_channel,
             payload={
                 "message": "通知测试：如果收到本消息，说明飞书通知可以正常送达。",
-                "reason": f"由系统管理员 {principal.subject} 发起，不会创建业务任务。",
+                "reason": "由系统维护页面发起，不会创建业务任务。",
                 "platform_name": self.platform_name,
             },
             priority=10,

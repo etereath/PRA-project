@@ -342,6 +342,26 @@ def test_sync_status_request_has_no_write_fields() -> None:
     assert "gate_summary" not in request
 
 
+def test_sync_status_online_scope_is_hash_bound() -> None:
+    manifest = build_listing_action_manifest(
+        batch_id="BATCH-T13-PULSE-001",
+        action_type="sync_status",
+        task_items=[],
+        identity_mapping=None,
+        platform_name=PLATFORM,
+        mapping_source_version="products-v1",
+        scan_scope="online",
+    )
+    request = _request(manifest)
+
+    validate_listing_action_request(request)
+    assert request["scan_scope"] == "online"
+    tampered = deepcopy(request)
+    tampered["scan_scope"] = "online_and_waiting"
+    with pytest.raises(ValidationError, match="HASH"):
+        validate_listing_action_request(tampered)
+
+
 def test_action_clicked_phase_is_bound_and_hashed(
     identity_mapping: dict[str, dict[str, str]],
 ) -> None:
@@ -770,6 +790,8 @@ def test_snapshot_contract_requires_two_complete_pages() -> None:
     snapshot["waiting_end_marker_verified"] = False
     with pytest.raises(ValidationError, match="COMPLETENESS"):
         validate_listing_sync_snapshot(snapshot)
+    snapshot["waiting_scan_complete"] = False
+    validate_listing_sync_snapshot(snapshot, scan_scope="online")
 
 
 def test_listing_anomaly_contract_supports_unmapped_and_multi_sku_conflict() -> None:

@@ -104,6 +104,9 @@
 | `/database/dictionary` | 字段说明 | 只读 |
 | `/database/quality` | 质量与新鲜度 | 只读 |
 | `/management` | 业务管理默认创建任务 | 受控写 |
+| `/management/queue` | 当前任务队列与执行通路 | 只读展示/受控取消 |
+| `/management/queue/cancel` | 人工批量取消未发送或停止的任务 | 受控写 |
+| `/management/queue/resolve-operation` | 人工确认平台实际状态 | Session + CSRF 限定原子写 |
 | `/management/reviews` | 人工复核 | 受控写 |
 | `/management/automation` | 固定 Automation 方案 | 受控写 |
 | `/system` | 当前运行状态 | 管理员只读/受控维护 |
@@ -115,10 +118,17 @@
 | `/logout` | 退出 | POST |
 | GET `/mobile/review/{review_task_id}?token=...` | 飞书手机复核 | Token 限定只读 |
 | POST `/mobile/review/{review_task_id}/resolve` | 提交复核结果 | Token 限定原子写 |
+| POST `/mobile/review/{review_task_id}/resolve-operation` | 在飞书落地页确认平台实际状态 | Token、Review 与任务归属限定原子写 |
 
 详情统一使用一个稳定页面：商品/销售/结算/Run/执行事实属于数据库，当前任务/Review/方案
 属于业务管理，系统故障属于系统。URL 可携带 PRA 交易日、品种、等级、平台、商品、状态和
 来源筛选，不携带 Runtime DB、工作簿、Queue 路径或凭证。
+
+执行结果无法自动确认且存在未释放平台写锁时，桌面任务队列和飞书手机复核页必须复用同一
+条人工平台状态确认服务。手机页按 Review 绑定的任务逐项展示“目标已生效/未生效”业务
+选项，不再同时展示容易混淆的“重试任务/取消任务”；每次提交必须在同一事务内校验 Token、
+Review、任务归属、Operation 和写锁，并更新既有账本。多商品复核在最后一个未确认项目处理
+完成后才关闭；人工确认本身不再发起平台读取，也不创建 ShadowBot Queue 文件。
 
 ### 4.2 通知抽屉
 
@@ -140,7 +150,7 @@
 | 销售分析 | Settlement、Order、Estimate | 纯计算/查询 | 独立 Read Model；Agent 内容未来 |
 | 即时创建任务 | Task、Mapping、Rules | 复用 Task Service | 人工范围编排和逐项预览 |
 | 加/降价 | 最新价格、UPDATE_PRICE | 参数化复用 | 服务端绝对价转换和冲突校验 |
-| 上架平台库存 | SET_ONLINE target inventory | 原样复用字段 | 与真实库存语义/上限校验 |
+| 上架平台库存 | SET_ONLINE target inventory | 原样复用字段 | 独立平台额度语义；人工任务在最终确认显示最近扫描质量提醒，自动任务继续使用硬门禁 |
 | 提交执行 | 既有 Queue/Worker/Importer | 原样执行链 | 独立授权、批次重检和 Web 调用方 |
 | 人工复核 | Review/Incident 原子服务 | 原样复用 | Web/手机 Presenter 与 PRG |
 | Automation 管理 | Job/Run/Scheduler | 原样运行时 | 固定方案版本化有限配置 |
@@ -206,8 +216,9 @@ Excel 的状态。`product_inventory_input.py` 必须拆开商品资料/成本/�
 新 SKU 先建立商品资料和零 DB 余额，再以独立、可重放的“新花入库”事务增加库存；第二步
 失败不得把工作簿 `current_stock` 当补偿权威。
 
-TaskGeneration、ListingDecision、`SET_ONLINE.target_inventory` 上限、库存预警、今日页和
-销售计划统一依赖同一库存 Provider/Service。切换后禁止 Excel/DB 双写；普通代码回滚也
+TaskGeneration、ListingDecision、库存预警、今日页和销售计划统一依赖同一库存
+Provider/Service；`SET_ONLINE.target_inventory` 作为独立平台额度保存，不以真实库存为硬
+上限。切换后禁止 Excel/DB 双写；普通代码回滚也
 不能把已经过期的工作簿库存恢复成业务权威。只有在尚无任何切换后流水时，管理员才可在
 备份/回读门禁下整体恢复切换前的工作簿与 DB；已有切换后流水时只能前向修复。
 
@@ -243,8 +254,12 @@ inventory_delta = -inventory_sales_delta
 
 ### 6.2 平台库存
 
-平台库存是特定平台买家可购上限。当前单平台的 SET_ONLINE 目标库存不得超过数据库真实
-库存；平台观察库存不覆盖真实库存。平台库存变化只有形成权威销售事实后才影响真实库存。
+平台库存是特定平台买家可购上限，不是销量、真实库存占用或预留。`SET_ONLINE` 目标库存
+可以高于数据库真实库存，不同平台额度不求和判断超售；平台观察库存也不覆盖真实库存。
+只有形成权威销售事实后才扣减真实库存。人工任务预览只读检查最近一次定时完整扫描的质量、
+范围、尾部、映射、状态与新鲜度，不额外创建扫描任务；质量或新鲜度不足只进入最终确认提醒。
+人工确认后的上下架预发布不得以旧扫描阻断或直接判定动作已经完成，最终状态由执行端实时页面
+预检确认。
 
 ### 6.3 人工任务和执行授权
 
@@ -252,14 +267,29 @@ inventory_delta = -inventory_sales_delta
 映射、价格、基础成本、库存、平台状态、冲突和任务来源。预览返回版本化事实引用；创建时
 再次检查。
 
-创建 Task 与执行授权分离：
+创建 Task 与执行授权在后台分离。Web 连续操作把“逐项预览”和“最终确认”明确分成两个界面，
+但只要求一次真正的执行确认：
 
 - 创建阶段只持久化 Task/必要 Review，不写 Queue；
-- 执行阶段要求 `SUBMIT_EXECUTION` capability、二次确认和最新事实重检；
+- 范围弹窗只选择品种、等级、平台和动作；逐项预览默认使用最近一次平台价格/库存，并允许
+  为每个具体平台商品分别修改目标值；
+- 最近定时扫描不完整、质量不足，或价格、上下架事实过期时，MANUAL 人工改价、加/降价、
+  上架和下架任务均在最终确认弹窗逐项显示醒目提醒，但不阻断创建和发送；真正缺少平台状态、
+  映射不唯一、价格或目标值不可用等仍是硬阻断；
+  AUTOMATION 来源的上架任务继续要求扫描质量门禁通过；
+- 逐项预览只用于编辑和核对，不提交任务；点击“继续确认”后打开小型最终确认弹窗，扫描质量
+  提醒只在这里显示；点击“确认执行”后 Web 依次调用创建服务和既有执行授权服务，不再次
+  要求选择同一批任务；
+- 执行阶段要求 `SUBMIT_EXECUTION` capability、短期 digest 和最新事实重检；
 - 只把本批明确任务交给既有提交服务，不扫描全部 `PENDING`；
 - 人工复核产生的改价/下架和紧急任务进入既有高优先级编排；
 - 任一 Task 失效、冲突或进入 UNKNOWN 时整批预检停止；
 - Queue/Importer 失败沿用现有恢复和唯一 RECONCILE。
+
+ShadowBot 的登录检查绑定第一次业务导航动作：先点击“商品管理”或“订单管理”，随后检查是否
+跳转登录页；若出现则复用既有自动登录/验证码人工介入链，恢复后重新点击同一入口。不得仅因
+点击前能看到业务入口就断言会话仍有效。若上一失败请求已把小程序留在登录页，只允许在业务
+入口本身不存在时使用同一登录恢复链作为兜底，不新增平行登录实现。
 
 `SUBMIT_EXECUTION` 必须由薄的 Execution Authorization Application Service 强制，不是
 Route 内的 `if capability`。服务固定为两个调用：
@@ -490,6 +520,11 @@ Runtime DB READ_ONLY 验收零写。
 8. `start_shadowbot_reconcile`、`confirm_shadowbot_manual_handled` 迁到正式服务；
 9. 删除 `save_listing_status` 直写投影；
 10. 完成逐 CLI 正式归宿矩阵。
+11. 在业务管理增加任务队列只读页，组合 `PENDING/RUNNING/FAILED/MANUAL_REVIEW`
+    Task 与既有 `inbox/working/results` 阶段；按人工、自动和紧急来源筛选，已完成历史仍进入
+    数据库，不展示 Queue 路径、Hash 或原始 JSON。队列页只允许批量取消尚未进入文件队列的
+    `PENDING/FAILED` Task：整批条件更新并写 `task_status_history`，任何任务状态变化、活动队列
+    命中、队列读取不完整、权限或 CSRF 失败都必须整批零写；不删除 Task 或历史记录。
 
 门禁：创建任务零平台副作用；普通 `PENDING` 不自动执行；提交执行只处理明确批次；预览后
 价格/库存/映射变化必须拒绝；伪造 form actor、digest 重放/换批、Route 直调 publisher 和

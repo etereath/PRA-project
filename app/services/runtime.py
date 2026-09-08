@@ -35,13 +35,18 @@ from app.models import (
     TaskStatusHistory,
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
+from app.review_display import (
+    REVIEW_TYPE_DISPLAY_LABELS,
+    review_reason_display,
+    review_scope_display,
+    review_type_display_label,
+)
 from app.review_policy import (
     allowed_review_statuses,
     is_execution_failure_review,
     retry_task_deadline,
     review_business_decision,
     review_source_task_ids,
-    review_task_group_id,
     task_group_id,
 )
 from app.services.execution import ExecutionSimulationService
@@ -118,18 +123,9 @@ def _deadline_has_passed(deadline: datetime, now: datetime) -> bool:
 FEISHU_WEBHOOK_URL_REQUIRED = "FEISHU_WEBHOOK_URL is required for feishu notification"
 FEISHU_TOKEN_URL_CREATION_FAILED = "mobile_review_url creation failed"
 FEISHU_MESSAGE_TYPE_INVALID = "FEISHU_MESSAGE_TYPE must be 'post' or 'text'"
-FEISHU_POST_REVIEW_LINK_TEXT = "👉 点击处理复核"
+FEISHU_POST_REVIEW_LINK_TEXT = "打开处理页面"
 
-FEISHU_REVIEW_TYPE_LABELS = {
-    "manual_review": "人工复核",
-    "manual_price_review": "人工价格复核",
-    "below_break_even_review": "低于保本价复核",
-    "labor_required": "临时工确认",
-    "capacity_warning": "产能预警",
-    "shortage_warning": "短缺预警",
-    "cold_storage_warning": "冷库预警",
-    "clearance_warning": "清库存预警",
-}
+FEISHU_REVIEW_TYPE_LABELS = dict(REVIEW_TYPE_DISPLAY_LABELS)
 
 FEISHU_SCOPE_TYPE_LABELS = {
     "global": "全局事项",
@@ -139,6 +135,13 @@ FEISHU_SCOPE_TYPE_LABELS = {
     "task": "单个任务",
     "system": "系统",
 }
+
+
+@dataclass(frozen=True, slots=True)
+class TaskCancellationResult:
+    requested_count: int
+    cancelled_task_ids: tuple[str, ...]
+    already_cancelled_count: int = 0
 
 
 class RuntimeTaskService:
@@ -245,6 +248,72 @@ class RuntimeTaskService:
 
     def list_status_history(self, task_id: str) -> list[TaskStatusHistory]:
         return self.repository.list_task_status_history(task_id)
+
+    def cancel_tasks(
+        self,
+        task_ids: list[str] | tuple[str, ...],
+        *,
+        changed_by: str,
+    ) -> TaskCancellationResult:
+        normalized = tuple(
+            dict.fromkeys(str(task_id or "").strip() for task_id in task_ids)
+        )
+        normalized = tuple(task_id for task_id in normalized if task_id)
+        if not normalized:
+            raise ValidationError("请至少选择一项可以取消的任务。")
+        if len(normalized) > 100:
+            raise ValidationError("一次最多取消 100 项任务。")
+
+        eligible: list[Task] = []
+        already_cancelled = 0
+        for task_id in normalized:
+            task = self.repository.get_task(task_id)
+            if task is None:
+                raise ValidationError("部分任务不存在，请刷新页面后重试。")
+            if task.task_status is TaskStatus.CANCELLED:
+                already_cancelled += 1
+                continue
+            if task.task_status not in {TaskStatus.PENDING, TaskStatus.FAILED}:
+                raise ValidationError(
+                    "部分任务已经进入执行或复核流程，不能从当前队列取消。"
+                )
+            eligible.append(task)
+
+        changed_at = datetime.now()
+        updates = [
+            (
+                task.task_id,
+                task.task_status,
+                TaskStatusHistory(
+                    history_id=f"CANCEL-{uuid4().hex[:16]}",
+                    task_id=task.task_id,
+                    from_status=task.task_status,
+                    to_status=TaskStatus.CANCELLED,
+                    changed_by=changed_by,
+                    changed_at=changed_at,
+                    reason="operator_batch_cancel",
+                    metadata={
+                        "requested_count": len(normalized),
+                        "interface": "operations_web_task_queue",
+                    },
+                ),
+            )
+            for task in eligible
+        ]
+        try:
+            self.repository.cancel_tasks_with_histories(
+                updates,
+                result_message="任务已由运营人员取消。",
+            )
+        except ValueError as exc:
+            raise ValidationError(
+                "任务状态刚刚发生变化，本次没有取消任何任务，请刷新后重试。"
+            ) from exc
+        return TaskCancellationResult(
+            requested_count=len(normalized),
+            cancelled_task_ids=tuple(task.task_id for task in eligible),
+            already_cancelled_count=already_cancelled,
+        )
 
     def get_task(self, task_id: str) -> Task | None:
         return self.repository.get_task(task_id)
@@ -1823,11 +1892,9 @@ def _build_feishu_review_notification_payload(
         else "-",
         "scope_type": review_task.scope_type,
         "scope_key": review_task.scope_key,
-        "scope_label": _feishu_scope_label(
-            review_task.scope_type, review_task.scope_key
-        ),
+        "scope_label": review_scope_display(review_task),
         "required_by": _format_feishu_datetime(review_task.required_by),
-        "reason": _truncate_for_feishu(review_task.reason, 200),
+        "reason": _truncate_for_feishu(review_reason_display(review_task), 200),
         "mobile_review_url": mobile_review_url,
     }
 
@@ -1840,11 +1907,10 @@ def _build_feishu_review_notification_text_body(
     if values.get("notification_kind") == "shadowbot_login_verification":
         text = "\n".join(
             [
-                str(values.get("title") or "ShadowBot 登录验证码人工接管"),
+                "需要完成登录验证",
                 f"平台：{values.get('platform_name') or '-'}",
-                f"执行尝试：{values.get('execution_attempt_id') or '-'}",
-                f"截止时间：{values.get('required_by') or '-'}",
-                str(values.get("action") or "请在已打开的小程序中完成手机验证码。"),
+                f"处理期限：{values.get('required_by') or '-'}",
+                "请在手机端完成验证码后点击“处理完毕”。",
             ]
         )
     else:
@@ -1860,23 +1926,24 @@ def _build_feishu_review_notification_post_body(
     payload: dict[str, object] | None,
 ) -> dict[str, object]:
     values = payload or {}
-    title = str(values.get("title") or "PRA 复核通知")
+    title = (
+        "需要完成登录验证"
+        if values.get("notification_kind") == "shadowbot_login_verification"
+        else str(values.get("title") or "需要人工处理")
+    )
     if values.get("notification_kind") == "shadowbot_login_verification":
         content: list[list[dict[str, str]]] = [
             [{"tag": "text", "text": f"平台：{values.get('platform_name') or '-'}"}],
             [
                 {
                     "tag": "text",
-                    "text": f"执行尝试：{values.get('execution_attempt_id') or '-'}",
+                    "text": f"处理期限：{values.get('required_by') or '-'}",
                 }
             ],
-            [{"tag": "text", "text": f"截止时间：{values.get('required_by') or '-'}"}],
             [
                 {
                     "tag": "text",
-                    "text": str(
-                        values.get("action") or "请在已打开的小程序中完成手机验证码。"
-                    ),
+                    "text": "请在手机端完成验证码后点击“处理完毕”。",
                 }
             ],
         ]
@@ -1886,13 +1953,13 @@ def _build_feishu_review_notification_post_body(
         }
     if values.get("system_test"):
         content: list[list[dict[str, str]]] = [
-            [{"tag": "text", "text": "说明：这是由 /system 手动触发的测试消息。"}],
-            [{"tag": "text", "text": "说明：不关联任何复核任务，不包含手机复核链接。"}],
+            [{"tag": "text", "text": "说明：这是由系统维护页面发起的测试消息。"}],
+            [{"tag": "text", "text": "不会创建任务，也不需要人工处理。"}],
             [{"tag": "text", "text": f"触发时间：{values.get('triggered_at') or '-'}"}],
             [
                 {
                     "tag": "text",
-                    "text": f"当前通知模式：{values.get('notification_mode') or 'feishu'}",
+                    "text": f"通知通道：{values.get('notification_mode') or '飞书'}",
                 }
             ],
         ]
@@ -1922,10 +1989,10 @@ def _build_feishu_review_notification_post_body(
     reason = _truncate_for_feishu(values.get("reason") or log.message, 200)
     mobile_review_url = str(values.get("mobile_review_url") or "")
     content: list[list[dict[str, str]]] = [
-        [{"tag": "text", "text": f"需要处理：{review_type_label}"}],
-        [{"tag": "text", "text": f"业务日期：{trade_date}"}],
-        [{"tag": "text", "text": f"处理对象：{scope_label}"}],
-        [{"tag": "text", "text": f"截止时间：{required_by}"}],
+        [{"tag": "text", "text": f"事项：{review_type_label}"}],
+        [{"tag": "text", "text": f"销售日：{trade_date}"}],
+        [{"tag": "text", "text": f"范围：{scope_label}"}],
+        [{"tag": "text", "text": f"处理期限：{required_by}"}],
         [{"tag": "text", "text": f"原因：{reason}"}],
     ]
     if mobile_review_url:
@@ -1956,14 +2023,14 @@ def _build_feishu_review_notification_text(
 ) -> str:
     trade_date = review_task.trade_date.isoformat() if review_task.trade_date else "-"
     required_by = _format_feishu_datetime(review_task.required_by)
-    reason = _truncate_for_feishu(review_task.reason, 200)
+    reason = _truncate_for_feishu(review_reason_display(review_task), 200)
     return "\n".join(
         [
-            "PRA 复核通知",
-            f"需要处理：{_feishu_review_type_label(review_task.review_type)}",
-            f"业务日期：{trade_date}",
-            f"处理对象：{_feishu_scope_label(review_task.scope_type, review_task.scope_key)}",
-            f"截止时间：{required_by}",
+            "需要人工处理",
+            f"事项：{_feishu_review_type_label(review_task.review_type)}",
+            f"销售日：{trade_date}",
+            f"范围：{review_scope_display(review_task)}",
+            f"处理期限：{required_by}",
             f"原因：{reason}",
             f"{FEISHU_POST_REVIEW_LINK_TEXT}：{mobile_review_url}",
         ]
@@ -1971,11 +2038,11 @@ def _build_feishu_review_notification_text(
 
 
 def _feishu_review_type_label(review_type: str) -> str:
-    return FEISHU_REVIEW_TYPE_LABELS.get(review_type, review_type)
+    return review_type_display_label(review_type)
 
 
 def _feishu_scope_label(scope_type: str, scope_key: str | None) -> str:
-    return f"{FEISHU_SCOPE_TYPE_LABELS.get(scope_type, scope_type)}：{scope_key or '-'}"
+    return FEISHU_SCOPE_TYPE_LABELS.get(scope_type, "相关业务")
 
 
 def _format_feishu_datetime(value: datetime | None) -> str:
@@ -1997,20 +2064,14 @@ def _truncate_for_feishu(value: object, max_length: int) -> str:
 def _build_review_notification_message(review_task: ReviewTask) -> str:
     trade_date = review_task.trade_date.isoformat() if review_task.trade_date else "-"
     required_by = _format_feishu_datetime(review_task.required_by)
-    reason = (review_task.reason or "-").strip()
+    reason = review_reason_display(review_task)
     if len(reason) > 80:
         reason = f"{reason[:77]}..."
     message = (
-        f"{_feishu_review_type_label(review_task.review_type)} | 业务日期={trade_date} | "
-        f"对象={_feishu_scope_label(review_task.scope_type, review_task.scope_key)} | "
-        f"截止时间={required_by} | 原因={reason}"
+        f"{_feishu_review_type_label(review_task.review_type)} | 销售日={trade_date} | "
+        f"范围={review_scope_display(review_task)} | "
+        f"处理期限={required_by} | 原因={reason}"
     )
-    group_id = review_task_group_id(review_task)
-    if group_id:
-        message = (
-            f"{message} | 任务组={group_id} | "
-            f"待复核任务数={review_task.review_payload.get('affected_task_count', '-')}"
-        )
     if is_execution_failure_review(review_task):
         message = f"{message} | 可选结果=重试任务/取消任务"
     return message
@@ -2022,7 +2083,7 @@ def _build_expired_review_notification_message(
     trade_date = review_task.trade_date.isoformat() if review_task.trade_date else "-"
     required_by = _format_feishu_datetime(review_task.required_by)
     return (
-        f"{_feishu_review_type_label(review_task.review_type)} 已过期 | 业务日期={trade_date} | "
-        f"对象={_feishu_scope_label(review_task.scope_type, review_task.scope_key)} | "
-        f"截止时间={required_by} | 过期处理时间={_format_feishu_datetime(timeout_at)}"
+        f"{_feishu_review_type_label(review_task.review_type)}已超时 | 销售日={trade_date} | "
+        f"范围={review_scope_display(review_task)} | "
+        f"处理期限={required_by} | 超时处理时间={_format_feishu_datetime(timeout_at)}"
     )

@@ -458,12 +458,14 @@ def _v5_validate_request(request):
     )
     if execution_mode not in allowed_modes:
         raise ValueError("LISTING_ACTION_EXECUTION_MODE_INVALID")
-    expected_scope = (
-        "online_and_waiting"
-        if action_type in {"sync_status", "set_online"}
-        else "online"
+    allowed_scopes = (
+        {"online", "online_and_waiting"}
+        if action_type == "sync_status"
+        else {"online_and_waiting"}
+        if action_type == "set_online"
+        else {"online"}
     )
-    if request.get("scan_scope") != expected_scope:
+    if request.get("scan_scope") not in allowed_scopes:
         raise ValueError("LISTING_ACTION_SCAN_SCOPE_INVALID")
     items = request.get("items")
     if action_type == "sync_status":

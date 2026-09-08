@@ -54,10 +54,15 @@
   `checkpoint/pre-task13-5-7-web-rewrite-20260807`。新 Web 直接替代当前
   `app/web.py` 页面架构；后台只复用既有领域 Service，不得恢复“先统一所有 CLI、
   脚本和 Automation 入口再开始 Web”的扩大化前置门禁。
-- 13.5-7D 切换完成后，Runtime DB 库存余额和不可变流水是唯一真实库存权威；
+- 13.5-7D 切换完成后，Runtime DB 库存余额和不可变流水是唯一真实库存权威；余额没有
+  新流水时自动跨 PRA 交易日延续，不每日清零，也不要求人工确认转结；
   `products.xlsx.current_stock` 只允许作为一次性 bootstrap 输入和历史快照，不得继续
-  作为可编辑业务库存，也不得与 DB 双写。TaskGeneration、ListingDecision、上架库存
-  上限和库存预警必须读取同一个库存 Provider/Application Service。
+  作为可编辑业务库存，也不得与 DB 双写。TaskGeneration、ListingDecision 和库存预警
+  必须读取同一个库存 Provider/Application Service。平台库存只代表买家可购上限，不是
+  销量、真实库存占用或预留；平台目标库存可以高于真实库存，不得把各平台额度相加后作为
+  超售判断。库存预警统一按品种汇总各等级真实库存，以 `20` 扎为共享安全余量，不允许
+  SKU 单独覆盖，也不创建平台任务。上架预览和最终授权只读检查最近一次定时商品扫描质量，
+  不额外创建扫描任务。
 - Web 的普通平台执行必须经过 Service 层 `SUBMIT_EXECUTION` 授权，绑定已认证主体、明确
   `task_ids` 和本轮重检 digest；Route 不得直接调用 Queue/Runner，也不得扫描全部
   `PENDING`。系统维护 Route 同样不得成为通用脚本 Runner，长耗时动作必须调用受控的

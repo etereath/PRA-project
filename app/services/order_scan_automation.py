@@ -90,6 +90,18 @@ class OrderScanHandler:
             )
             if callable(acknowledge):
                 acknowledge()
+        except Exception:
+            acknowledge = getattr(
+                reader,
+                "acknowledge_last_result",
+                None,
+            )
+            if (
+                callable(acknowledge)
+                and getattr(reader, "last_result_path", None) is not None
+            ):
+                acknowledge()
+            raise
         finally:
             if callable(set_wait_callback):
                 set_wait_callback(None)

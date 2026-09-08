@@ -26,6 +26,7 @@ from app.services.product_observation import (
     ProductObservationImporter,
     ProductObservationInput,
     _result_content_sha256,
+    listing_online_snapshot_to_observation_batch,
     listing_snapshot_to_observation_batch,
     product_observation_batch_from_payload,
 )
@@ -1728,6 +1729,38 @@ def test_task13_complete_snapshot_adapts_both_pages_to_v14_items(
         match="canonical snapshot conversion",
     ):
         importer.import_batch(tampered)
+
+
+def test_online_snapshot_adapts_without_negative_listing_facts(tmp_path) -> None:
+    repository, importer = _importer(tmp_path)
+    snapshot = _listing_snapshot(snapshot_id="SNAPSHOT-PULSE-ADAPTER-1")
+    snapshot["scan_completed_at"] = snapshot["online_scan_completed_at"]
+    snapshot["waiting_scan_started_at"] = snapshot["online_scan_completed_at"]
+    snapshot["waiting_scan_completed_at"] = snapshot["online_scan_completed_at"]
+    snapshot["waiting_scan_complete"] = False
+    snapshot["waiting_end_marker_verified"] = False
+    item = snapshot["items"][0]
+    item["waiting_occurrences"] = 0
+    item["listing_location"] = "online_only"
+    item["waiting_row_identities"] = []
+    item["waiting_observed_price"] = None
+    item["waiting_observed_inventory"] = None
+    item["waiting_observed_at"] = None
+    item["diagnostic_code"] = ""
+    manifest_sha256 = "sha256:" + "4" * 64
+    result_sha256 = "5" * 64
+    batch = listing_online_snapshot_to_observation_batch(
+        snapshot,
+        automation_run_id="run-pulse-scan-1",
+        source_manifest_sha256=manifest_sha256,
+        source_result_sha256=result_sha256,
+    )
+    imported = importer.import_batch(batch)
+
+    assert batch.scan_type == ONLINE_PULSE
+    assert batch.requested_scope["pages"] == ["online"]
+    assert imported.item_count == 1
+    assert all(observation.observed_online for observation in batch.items)
 
 
 def _accepted_listing_batch_with_changed_unrelated_mapping(

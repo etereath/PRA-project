@@ -50,7 +50,9 @@ from app.services.operational_time import (
 )
 from scripts.run_automation_service import (
     ProcessFileLock,
+    _service_mode,
     automation_service_lock_path,
+    build_parser,
 )
 
 
@@ -692,6 +694,47 @@ def test_merge_never_crosses_platform_trade_date_cutoff(
     assert result.merged_run_ids == ()
     assert pulse.run_status is AutomationRunStatus.SCHEDULED
     assert pre_cutoff.run_status is AutomationRunStatus.SCHEDULED
+
+
+def test_ui_run_crossing_trade_date_is_missed_before_handler(
+    repository: AutomationRepository,
+) -> None:
+    scheduled_for = datetime(2026, 7, 29, 9, 55, tzinfo=timezone.utc)
+    now = datetime(2026, 7, 29, 10, 5, tzinfo=timezone.utc)
+    job = _store_job(
+        repository,
+        _job(
+            job_id="FULL-CROSS-TRADE-DATE",
+            job_type=FULL_MARKET_SCAN,
+            minutes=60,
+        ),
+        now=scheduled_for,
+    )
+    run = _ensure_run(
+        repository,
+        job,
+        scheduled_for=scheduled_for,
+    )
+    handler_called = False
+
+    def handler(run, context):
+        nonlocal handler_called
+        handler_called = True
+        return AutomationRunOutcome(status=AutomationRunStatus.SUCCESS)
+
+    cycle = AutomationService(
+        repository,
+        handlers={FULL_MARKET_SCAN: handler},
+        clock=MutableClock(now),
+        materialize_only_registered_handlers=True,
+    ).run_cycle()
+
+    stored = repository.get_run(run.run_id)
+    assert handler_called is False
+    assert cycle.completed_run_ids == (run.run_id,)
+    assert stored is not None
+    assert stored.run_status is AutomationRunStatus.MISSED
+    assert stored.error_code == "CROSS_TRADE_DATE_UI_WINDOW"
 
 
 def test_long_sleep_is_bounded_to_prevent_task_storm(
@@ -2357,6 +2400,57 @@ def test_once_cli_writes_stopped_heartbeat_and_default_jobs(
     stored_jobs = AutomationRepository(runtime_repository).list_jobs()
     assert len(stored_jobs) == 10
     assert stored_jobs[0].display_name
+
+
+def test_read_only_scan_mode_materializes_only_registered_scan_jobs(
+    repository: AutomationRepository,
+) -> None:
+    now = datetime(2026, 7, 29, 7, 12, tzinfo=timezone.utc)
+    ensure_default_automation_jobs(
+        repository,
+        platform_name=PLATFORM,
+        now=now,
+    )
+    service = AutomationService(
+        repository,
+        handlers={
+            FULL_MARKET_SCAN: lambda run, context: AutomationRunOutcome(
+                status=AutomationRunStatus.SUCCESS
+            )
+        },
+        clock=lambda: now,
+        materialize_only_registered_handlers=True,
+    )
+
+    cycle = service.run_cycle()
+
+    assert cycle.completed_run_ids
+    runs = repository.list_runs()
+    assert {run.job_type for run in runs} == {FULL_MARKET_SCAN}
+
+
+def test_read_only_scan_cli_mode_is_explicit() -> None:
+    args = build_parser().parse_args(
+        [
+            "--read-only-scans-only",
+            "--enable-listing-read-only",
+            "--enable-order-read-only",
+        ]
+    )
+
+    assert _service_mode(args) == "LISTING_ORDER_READ_ONLY_SCANS_ONLY"
+
+
+def test_online_pulse_acceptance_cli_mode_is_explicit() -> None:
+    args = build_parser().parse_args(
+        [
+            "--read-only-scans-only",
+            "--enable-listing-read-only",
+            "--online-pulse-only",
+        ]
+    )
+
+    assert _service_mode(args) == "ONLINE_PULSE_ONLY"
 
 
 def test_cli_failure_after_lock_writes_redacted_failed_heartbeat(

@@ -8,7 +8,7 @@ import logging
 import re
 import secrets
 from http.cookies import SimpleCookie
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from socketserver import ThreadingMixIn
@@ -29,6 +29,7 @@ from app.operations_web.presenters import (
     render_mobile_review,
     render_notification_drawer,
     render_system,
+    render_task_queue,
     render_today,
 )
 from app.operations_web.queries import OperationsQueryService
@@ -54,6 +55,7 @@ from app.services.automation_configuration import (
 from app.services.manual_task_orchestration import (
     ManualTaskApplicationService,
     ManualTaskError,
+    ManualTaskItemValue,
     ManualTaskRequest,
 )
 from app.services.master_data_management import (
@@ -70,9 +72,13 @@ from app.services.operations_maintenance import (
     OperationsMaintenanceError,
 )
 from app.services.security import LOGIN_RATE_LIMITER, record_security_event
-from app.exceptions import MobileReviewTransactionError
+from app.services.runtime import RuntimeTaskService
+from app.exceptions import MobileReviewTransactionError, ValidationError
 from app.mobile_review_http import mobile_review_http_status
-from app.services.workflow import resolve_mobile_review
+from app.services.workflow import (
+    resolve_mobile_platform_operation,
+    resolve_mobile_review,
+)
 
 
 LOGGER = logging.getLogger("app.operations_web")
@@ -103,6 +109,7 @@ PROTECTED_ROUTES: dict[str, tuple[str, Capability]] = {
     "/today": ("今日", Capability.VIEW_TODAY),
     "/database": ("数据库", Capability.VIEW_DATABASE),
     "/management": ("业务管理", Capability.MANAGE_BUSINESS),
+    "/management/queue": ("任务队列", Capability.MANAGE_BUSINESS),
     "/system": ("系统", Capability.VIEW_SYSTEM),
     "/system/notifications": ("通知通路", Capability.SYSTEM_ADMIN),
     "/system/data": ("数据与备份", Capability.SYSTEM_ADMIN),
@@ -212,6 +219,8 @@ class OperationsWebApplication:
         self.manual_tasks = ManualTaskApplicationService(
             container.runtime_repository,
         )
+        self.task_service = RuntimeTaskService(container.runtime_repository)
+        self.task_action_lock = Lock()
         self.master_data_management = MasterDataManagementService(
             container.runtime_repository,
         )
@@ -222,6 +231,7 @@ class OperationsWebApplication:
             queue_root=container.settings.paths.queue_root,
             applet_uri=container.settings.shadowbot_applet_uri,
             execution_profile=container.settings.environment,
+            notification_channel=container.settings.notification_channel,
         )
         self.review_resolution = ReviewResolutionApplicationService(
             container.runtime_repository,
@@ -342,6 +352,16 @@ class OperationsWebApplication:
             if method != "POST":
                 return self._method_not_allowed("POST")
             return self._manual_task_create(environ)
+
+        if path == "/management/queue/cancel":
+            if method != "POST":
+                return self._method_not_allowed("POST")
+            return self._task_queue_cancel(environ)
+
+        if path == "/management/queue/resolve-operation":
+            if method != "POST":
+                return self._method_not_allowed("POST")
+            return self._operation_resolution(environ)
 
         if path == "/management/executions/prepare":
             if method != "POST":
@@ -585,6 +605,36 @@ class OperationsWebApplication:
                     trade_date=self._optional_date(self._first(query, "trade_date")),
                     platform_name=self._first(query, "platform").strip(),
                 )
+            )
+        elif path == "/management/queue":
+            subject = session.principal.subject
+            content = render_task_queue(
+                self.queries.task_queue(
+                    source=self._first(query, "source"),
+                    stage=self._first(query, "stage"),
+                    page=self._page_number(self._first(query, "page")),
+                ),
+                csrf_token=session.csrf_token,
+                cancellation_receipt=self._control_message(
+                    query,
+                    "cancel_receipt",
+                    subject,
+                ),
+                cancellation_error=self._control_message(
+                    query,
+                    "cancel_error",
+                    subject,
+                ),
+                operation_receipt=self._control_message(
+                    query,
+                    "operation_receipt",
+                    subject,
+                ),
+                operation_error=self._control_message(
+                    query,
+                    "operation_error",
+                    subject,
+                ),
             )
         elif path == "/management":
             subject = session.principal.subject
@@ -1017,11 +1067,19 @@ class OperationsWebApplication:
         session, form, denied = self._management_write_context(
             environ,
             route="/management/tasks/create",
-            capability=Capability.MANAGE_BUSINESS,
+            capability=Capability.SUBMIT_EXECUTION,
         )
         if denied is not None:
             return denied
         assert session is not None and session.principal is not None
+        if not self.container.authorization.allows(
+            session.principal,
+            Capability.MANAGE_BUSINESS,
+        ):
+            return Response.text(
+                "403 Forbidden",
+                "当前账号没有创建任务的权限。",
+            )
         preview_token = self._first(form, "preview_token")
         preview = self.control_store.get(preview_token, session.principal.subject)
         if preview is None or not hasattr(preview, "request"):
@@ -1030,29 +1088,207 @@ class OperationsWebApplication:
                 "task_error",
                 "任务预览已失效，请重新预览。",
             )
+        created_task_ids: tuple[str, ...] = ()
         try:
+            request = self._manual_task_request_from_preview(form, preview)
+            confirmed_preview = self.manual_tasks.preview(request)
             result = self.manual_tasks.create(
-                preview.request,
-                expected_preview_digest=self._first(form, "preview_digest"),
+                request,
+                expected_preview_digest=confirmed_preview.preview_digest,
                 authenticated_subject=session.principal.subject,
+            )
+            created_task_ids = result.task_ids
+            pending_task_ids = []
+            for task_id in result.task_ids:
+                task = self.container.runtime_repository.get_task(task_id)
+                if task is None:
+                    raise ManualTaskError("任务创建结果不完整，未发送平台执行。")
+                if task.task_status.value == "pending":
+                    pending_task_ids.append(task_id)
+            submissions = self._submit_manual_task_groups(
+                session.principal,
+                tuple(pending_task_ids),
+                origin_ref_id=result.origin_ref_id,
             )
         except ManualTaskError as exc:
             return self._control_error_redirect(
                 session.principal.subject,
-                "task_error",
-                str(exc),
+                "execution_error" if created_task_ids else "task_error",
+                (
+                    str(exc)
+                    + (
+                        " 已创建的任务会保留在“当前任务”中，可检查后再次发送。"
+                        if created_task_ids
+                        else ""
+                    )
+                ),
+            )
+        except ExecutionAuthorizationError as exc:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "execution_error",
+                str(exc)
+                + " 已创建的任务会保留在“当前任务”中，可检查后再次发送。",
             )
         except Exception:
             return self._control_error_redirect(
                 session.principal.subject,
-                "task_error",
-                "任务创建失败，本次没有创建任何任务。",
+                "execution_error",
+                "创建或发送失败；请检查“当前任务”和系统状态后再操作。",
             )
         token = self.control_store.put(
             session.principal.subject,
-            result.task_ids,
+            (
+                str(len(submissions)),
+                str(sum(len(item.task_ids) for item in submissions)),
+            ),
         )
-        return self._management_redirect("task_receipt", token)
+        return self._management_redirect("execution_receipt", token)
+
+    def _submit_manual_task_groups(
+        self,
+        principal,
+        task_ids: tuple[str, ...],
+        *,
+        origin_ref_id: str,
+    ) -> tuple[object, ...]:
+        if not task_ids:
+            return ()
+        groups: dict[tuple[str, str], list[str]] = {}
+        for task_id in task_ids:
+            task = self.container.runtime_repository.get_task(task_id)
+            if task is None:
+                raise ManualTaskError("待发送任务不完整，请刷新页面后重试。")
+            key = (task.platform_name, task.action_type.value)
+            groups.setdefault(key, []).append(task_id)
+
+        preparations = []
+        for index, ((platform_name, action_type), group_task_ids) in enumerate(
+            sorted(groups.items()),
+            start=1,
+        ):
+            semantic = "|".join(
+                (origin_ref_id, platform_name, action_type, str(index))
+            )
+            idempotency_key = (
+                "web-direct-execution:"
+                + hashlib.sha256(semantic.encode("utf-8")).hexdigest()[:40]
+            )
+            preparations.append(
+                self.execution_authorization.prepare_execution(
+                    principal,
+                    tuple(group_task_ids),
+                    idempotency_key,
+                )
+            )
+
+        with self.task_action_lock:
+            return tuple(
+                self.execution_authorization.submit_execution(
+                    principal,
+                    preparation.task_ids,
+                    preparation.confirmation_digest,
+                    preparation.idempotency_key,
+                )
+                for preparation in preparations
+            )
+
+    def _task_queue_cancel(self, environ) -> Response:
+        session, form, denied = self._management_write_context(
+            environ,
+            route="/management/queue/cancel",
+            capability=Capability.SUBMIT_EXECUTION,
+        )
+        if denied is not None:
+            return denied
+        assert session is not None and session.principal is not None
+        if not self.container.authorization.allows(
+            session.principal,
+            Capability.MANAGE_BUSINESS,
+        ):
+            return Response.text(
+                "403 Forbidden",
+                "当前账号没有取消任务的权限。",
+            )
+        try:
+            task_ids = self._many(form, "task_ids")
+            with self.task_action_lock:
+                active_task_ids, queue_complete = self.queries.active_queue_task_ids()
+                if not queue_complete:
+                    raise ValidationError(
+                        "当前执行队列无法完整核对，本次没有取消任何任务。"
+                    )
+                if active_task_ids.intersection(task_ids):
+                    raise ValidationError(
+                        "部分任务已经进入执行队列，不能取消；本次没有取消任何任务。"
+                    )
+                result = self.task_service.cancel_tasks(
+                    task_ids,
+                    changed_by=session.principal.subject,
+                )
+            if result.cancelled_task_ids:
+                message = f"已取消 {len(result.cancelled_task_ids)} 项任务。"
+            else:
+                message = "所选任务已经取消，无需重复操作。"
+            token = self.control_store.put(session.principal.subject, message)
+            return self._queue_redirect("cancel_receipt", token)
+        except ValidationError as exc:
+            token = self.control_store.put(
+                session.principal.subject,
+                str(exc) or "任务未取消，请刷新页面后重试。",
+            )
+            return self._queue_redirect("cancel_error", token)
+        except Exception:
+            LOGGER.exception("批量取消任务失败")
+            token = self.control_store.put(
+                session.principal.subject,
+                "任务取消失败，本次没有改变任何任务。",
+            )
+            return self._queue_redirect("cancel_error", token)
+
+    def _operation_resolution(self, environ) -> Response:
+        session, form, denied = self._management_write_context(
+            environ,
+            route="/management/queue/resolve-operation",
+            capability=Capability.HANDLE_REVIEW,
+        )
+        if denied is not None:
+            return denied
+        assert session is not None and session.principal is not None
+        try:
+            with self.task_action_lock:
+                result = self.review_resolution.resolve_operation(
+                    session.principal,
+                    operation_id=self._first(form, "operation_id"),
+                    outcome=self._first(form, "outcome"),
+                    note=self._first(form, "note"),
+                )
+            action_label = {
+                "set_online": "上架",
+                "set_offline": "下架",
+                "update_price": "改价",
+            }.get(result.action_type, "平台操作")
+            outcome_label = (
+                "目标已生效"
+                if result.operation_result == "VERIFIED"
+                else "目标未生效"
+            )
+            message = f"{result.internal_sku} 的{action_label}结果已记录为“{outcome_label}”，相关任务阻塞已解除。"
+            token = self.control_store.put(session.principal.subject, message)
+            return self._queue_redirect("operation_receipt", token)
+        except ReviewResolutionError as exc:
+            token = self.control_store.put(
+                session.principal.subject,
+                str(exc) or "平台状态未保存，请刷新页面后重试。",
+            )
+            return self._queue_redirect("operation_error", token)
+        except Exception:
+            LOGGER.exception("人工确认平台状态失败")
+            token = self.control_store.put(
+                session.principal.subject,
+                "平台状态确认失败，本次没有改变操作账本或任务锁。",
+            )
+            return self._queue_redirect("operation_error", token)
 
     def _execution_prepare(self, environ) -> Response:
         session, form, denied = self._management_write_context(
@@ -1094,12 +1330,13 @@ class OperationsWebApplication:
             return denied
         assert session is not None and session.principal is not None
         try:
-            result = self.execution_authorization.submit_execution(
-                session.principal,
-                self._many(form, "task_ids"),
-                self._first(form, "confirmation_digest"),
-                self._first(form, "idempotency_key"),
-            )
+            with self.task_action_lock:
+                result = self.execution_authorization.submit_execution(
+                    session.principal,
+                    self._many(form, "task_ids"),
+                    self._first(form, "confirmation_digest"),
+                    self._first(form, "idempotency_key"),
+                )
         except ExecutionAuthorizationError as exc:
             return self._control_error_redirect(
                 session.principal.subject,
@@ -1328,6 +1565,54 @@ class OperationsWebApplication:
             idempotency_key=self._first(form, "idempotency_key"),
         )
 
+    def _manual_task_request_from_preview(self, form, preview) -> ManualTaskRequest:
+        expected_keys = tuple(item.item_key for item in preview.items)
+        submitted_keys = tuple(self._many(form, "item_keys"))
+        if submitted_keys != expected_keys or len(set(submitted_keys)) != len(
+            submitted_keys
+        ):
+            raise ManualTaskError("任务项目在预览后发生变化，请重新预览。")
+        included_keys = set(self._many(form, "included_item_keys"))
+        if not included_keys or not included_keys.issubset(set(expected_keys)):
+            raise ManualTaskError("至少保留一个要执行的任务项目。")
+        price_values = self._many(form, "item_price_values")
+        inventory_values = self._many(form, "item_target_inventories")
+        if not (
+            len(price_values) == len(expected_keys)
+            and len(inventory_values) == len(expected_keys)
+        ):
+            raise ManualTaskError("逐项价格或库存不完整，请重新预览。")
+
+        item_values = []
+        for item_key, price_raw, inventory_raw in zip(
+            expected_keys,
+            price_values,
+            inventory_values,
+            strict=True,
+        ):
+            price_text = str(price_raw or "").strip()
+            inventory_text = str(inventory_raw or "").strip()
+            item_values.append(
+                ManualTaskItemValue(
+                    item_key=item_key,
+                    price_value=(Decimal(price_text) if price_text else None),
+                    target_inventory=(
+                        int(inventory_text) if inventory_text else None
+                    ),
+                )
+            )
+        return replace(
+            preview.request,
+            price_value=None,
+            target_inventory=None,
+            item_values=tuple(item_values),
+            excluded_item_keys=tuple(
+                item_key
+                for item_key in expected_keys
+                if item_key not in included_keys
+            ),
+        )
+
     def _control_error_redirect(
         self,
         subject: str,
@@ -1358,6 +1643,20 @@ class OperationsWebApplication:
         )
 
     @staticmethod
+    def _queue_redirect(field: str, token: str) -> Response:
+        return Response.text(
+            "303 See Other",
+            "",
+            headers=[
+                (
+                    "Location",
+                    "/management/queue?" + field + "=" + quote(token, safe=""),
+                ),
+                ("Cache-Control", "no-store"),
+            ],
+        )
+
+    @staticmethod
     def _inventory_error_redirect(error_code: str) -> Response:
         return Response.text(
             "303 See Other",
@@ -1373,6 +1672,11 @@ class OperationsWebApplication:
         parts = tail.split("/") if tail else []
         valid_get = method == "GET" and len(parts) == 1 and bool(unquote(parts[0]).strip())
         valid_post = method == "POST" and len(parts) == 2 and parts[1] == "resolve"
+        valid_operation_post = (
+            method == "POST"
+            and len(parts) == 2
+            and parts[1] == "resolve-operation"
+        )
         if valid_get:
             query = parse_qs(str(environ.get("QUERY_STRING", "")), keep_blank_values=True)
             review_task_id = unquote(parts[0]).strip()
@@ -1388,7 +1692,7 @@ class OperationsWebApplication:
                 content=render_mobile_review(model),
             )
             headers = [("Cache-Control", "no-store")]
-            if raw_token and model.action_options:
+            if raw_token and (model.action_options or model.operation_confirmations):
                 headers.append(
                     (
                         "Set-Cookie",
@@ -1400,6 +1704,46 @@ class OperationsWebApplication:
                 body,
                 content_type="text/html; charset=utf-8",
                 headers=headers,
+            )
+        if valid_operation_post:
+            review_task_id = unquote(parts[0]).strip()
+            form = self._parse_form(environ)
+            query = parse_qs(str(environ.get("QUERY_STRING", "")), keep_blank_values=True)
+            raw_token = (
+                self._first(query, "token")
+                or self._mobile_review_cookie(environ, review_task_id)
+                or self._first(form, "token")
+            )
+            try:
+                resolve_mobile_platform_operation(
+                    self.container.settings.paths.runtime_db,
+                    review_task_id,
+                    raw_token,
+                    self._first(form, "operation_id"),
+                    self._first(form, "outcome"),
+                    note=self._first(form, "note"),
+                )
+            except MobileReviewTransactionError as exc:
+                return Response.text(
+                    mobile_review_http_status(exc.code),
+                    "平台状态未确认：" + str(exc),
+                    headers=[("Cache-Control", "no-store")],
+                )
+            except Exception:
+                return Response.text(
+                    "503 Service Unavailable",
+                    "平台状态确认失败，本次没有保存部分结果，请稍后重试。",
+                    headers=[("Cache-Control", "no-store")],
+                )
+            location = (
+                "/mobile/review/"
+                + quote(review_task_id, safe="")
+                + "?result=operation-confirmed"
+            )
+            return Response.text(
+                "303 See Other",
+                "",
+                headers=[("Location", location), ("Cache-Control", "no-store")],
             )
         if valid_post:
             review_task_id = unquote(parts[0]).strip()

@@ -411,7 +411,7 @@ class RuntimePersistenceTests(unittest.TestCase):
         )
         payload = {
             "review_type": "manual_review",
-            "review_type_label": "人工复核",
+            "review_type_label": "执行结果确认",
             "trade_date": "2026-05-05",
             "scope_type": "global",
             "scope_key": "mobile_review_test",
@@ -433,10 +433,10 @@ class RuntimePersistenceTests(unittest.TestCase):
         body = captured["body"]
         self.assertEqual(body["msg_type"], "post")
         post = body["content"]["post"]["zh_cn"]
-        self.assertEqual(post["title"], "PRA 复核通知")
+        self.assertEqual(post["title"], "需要人工处理")
         flattened = [part for row in post["content"] for part in row]
-        self.assertIn({"tag": "a", "text": "👉 点击处理复核", "href": payload["mobile_review_url"]}, flattened)
-        self.assertTrue(any("人工复核" in part.get("text", "") for part in flattened))
+        self.assertIn({"tag": "a", "text": "打开处理页面", "href": payload["mobile_review_url"]}, flattened)
+        self.assertTrue(any("执行结果确认" in part.get("text", "") for part in flattened))
 
     def test_feishu_sender_uses_specialized_shadowbot_login_handoff_layout(self) -> None:
         captured: dict[str, object] = {}
@@ -487,11 +487,12 @@ class RuntimePersistenceTests(unittest.TestCase):
 
         self.assertEqual(result.send_status, NotificationSendStatus.SUCCESS.value)
         post = captured["body"]["content"]["post"]["zh_cn"]
-        self.assertEqual(post["title"], "ShadowBot 登录验证码人工接管")
+        self.assertEqual(post["title"], "需要完成登录验证")
         lines = [part["text"] for row in post["content"] for part in row]
         self.assertIn("平台：蚂蚁花团供应商", lines)
-        self.assertIn("执行尝试：ATTEMPT-LOGIN-1", lines)
-        self.assertIn("截止时间：2026-07-12T12:00+08:00", lines)
+        self.assertIn("处理期限：2026-07-12T12:00+08:00", lines)
+        self.assertNotIn("ATTEMPT-LOGIN-1", " ".join(lines))
+        self.assertNotIn("Worker", " ".join(lines))
         self.assertFalse(any(line.startswith("业务日期：") for line in lines))
         self.assertFalse(any(line.startswith("处理对象：") for line in lines))
         self.assertFalse(any(line.startswith("原因：") for line in lines))
@@ -592,7 +593,9 @@ class RuntimePersistenceTests(unittest.TestCase):
         self.assertEqual(logs[0].related_task_id, source.task_id)
         self.assertEqual(logs[0].send_status, NotificationSendStatus.PENDING.value)
         self.assertIsNone(logs[0].sent_at)
-        self.assertIn("产能预警", logs[0].message)
+        self.assertIn("包装产能确认", logs[0].message)
+        self.assertIn("包装产能需要确认", logs[0].message)
+        self.assertNotIn("needs manual review", logs[0].message)
         self.assertNotIn("decision_trace", logs[0].message)
 
     def test_repeated_review_business_event_returns_existing_without_notification_error(self) -> None:
@@ -931,7 +934,7 @@ class RuntimePersistenceTests(unittest.TestCase):
             ["CANCELLED", "PENDING"],
         )
         self.assertIn(
-            "复核截止：2026-07-26 08:30（北京时间）",
+            "处理期限：2026-07-26 08:30（北京时间）",
             outbox[-1].payload["message"],
         )
 

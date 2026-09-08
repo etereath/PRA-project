@@ -6,10 +6,12 @@ from datetime import datetime, timedelta, timezone
 from app.enums import IncidentCategory, IncidentStatus
 from app.inventory_models import InventoryAlertResult, InventoryTransaction
 from app.repositories.inventory_repository import InventoryRepository
+from app.repositories.master_data_repository import RuntimeMasterDataRepository
 from app.repositories.operational_incident_repository import OperationalIncidentRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.incident_management import IncidentDetection, IncidentManagementService
 from app.services.notification_outbox import NotificationOutboxService
+from app.services.authoritative_inventory import summarize_inventory_by_variety
 
 
 class InventoryAlertService:
@@ -17,6 +19,7 @@ class InventoryAlertService:
 
     def __init__(self, runtime_repository: SQLiteRuntimeRepository) -> None:
         self.inventory = InventoryRepository(runtime_repository)
+        self.master_data = RuntimeMasterDataRepository(runtime_repository)
         self.incident_service = IncidentManagementService(runtime_repository)
         self.incidents = OperationalIncidentRepository(runtime_repository)
         self.outbox = NotificationOutboxService(runtime_repository)
@@ -25,14 +28,28 @@ class InventoryAlertService:
         self,
         transaction: InventoryTransaction,
     ) -> InventoryAlertResult:
-        policy = self.inventory.get_alert_policy(
-            internal_sku=transaction.internal_sku
+        products = self.master_data.list_products()
+        product = next(
+            (
+                item
+                for item in products
+                if item.internal_sku == transaction.internal_sku
+            ),
+            None,
         )
+        if product is None:
+            raise RuntimeError("库存流水对应的商品主数据不存在")
+        summary = next(
+            item
+            for item in summarize_inventory_by_variety(products)
+            if item.variety == product.product_name
+        )
+        policy = self.inventory.get_default_alert_policy()
         if policy is None or not policy.enabled:
             return InventoryAlertResult(
                 "DISABLED",
                 transaction.internal_sku,
-                transaction.inventory_after,
+                summary.current_qty,
                 policy.threshold_qty if policy is not None else None,
             )
         active = next(
@@ -42,17 +59,17 @@ class InventoryAlertService:
                     category=IncidentCategory.INVENTORY_ANOMALY
                 )
                 if item.source_type == "INVENTORY_ALERT"
-                and item.subject_type == "internal_sku"
-                and item.subject_key == transaction.internal_sku
+                and item.subject_type == "variety"
+                and item.subject_key == summary.variety
             ),
             None,
         )
-        if transaction.inventory_after > policy.threshold_qty:
+        if summary.current_qty > policy.threshold_qty:
             if active is None:
                 return InventoryAlertResult(
                     "ABOVE_THRESHOLD",
                     transaction.internal_sku,
-                    transaction.inventory_after,
+                    summary.current_qty,
                     policy.threshold_qty,
                 )
             event_key = f"inventory-alert-recovered:{transaction.transaction_id}"
@@ -70,14 +87,14 @@ class InventoryAlertService:
                 incident_id=result.incident.incident_id,
                 event_key=event_key,
                 message=(
-                    f"库存已恢复：{transaction.internal_sku} 当前 "
-                    f"{transaction.inventory_after} 扎，高于阈值 {policy.threshold_qty} 扎。"
+                    f"库存已恢复：{summary.variety}品种当前共 "
+                    f"{summary.current_qty} 扎，高于安全余量 {policy.threshold_qty} 扎。"
                 ),
             )
             return InventoryAlertResult(
                 "RECOVERED",
                 transaction.internal_sku,
-                transaction.inventory_after,
+                summary.current_qty,
                 policy.threshold_qty,
                 result.incident.incident_id,
                 notification.notification_id,
@@ -91,7 +108,7 @@ class InventoryAlertService:
             return InventoryAlertResult(
                 "BELOW_THRESHOLD_SUPPRESSED",
                 transaction.internal_sku,
-                transaction.inventory_after,
+                summary.current_qty,
                 policy.threshold_qty,
                 active.incident_id,
             )
@@ -105,18 +122,21 @@ class InventoryAlertService:
                 source_ref_id=transaction.transaction_id,
                 severity="S2",
                 blocks_finalization=False,
-                subject_type="internal_sku",
-                subject_key=transaction.internal_sku,
-                title="真实库存偏低",
+                subject_type="variety",
+                subject_key=summary.variety,
+                title=f"{summary.variety}库存接近安全余量",
                 description=(
-                    f"当前 {transaction.inventory_after} 扎，预警阈值 "
+                    f"该品种各等级合计 {summary.current_qty} 扎，安全余量 "
                     f"{policy.threshold_qty} 扎。"
                 ),
                 occurred_at=transaction.recorded_at,
                 reason="LOW_REAL_INVENTORY",
                 payload={
-                    "current_qty": transaction.inventory_after,
+                    "variety": summary.variety,
+                    "current_qty": summary.current_qty,
                     "threshold_qty": policy.threshold_qty,
+                    "grade_quantities": dict(summary.grade_quantities),
+                    "trigger_internal_sku": transaction.internal_sku,
                     "policy_key": policy.policy_key,
                     "policy_version": policy.version,
                 },
@@ -132,14 +152,14 @@ class InventoryAlertService:
                 policy.repeat_interval_minutes,
             ),
             message=(
-                f"库存偏低：{transaction.internal_sku} 当前 "
-                f"{transaction.inventory_after} 扎，阈值 {policy.threshold_qty} 扎。"
+                f"库存接近安全余量：{summary.variety}品种当前共 "
+                f"{summary.current_qty} 扎，安全余量 {policy.threshold_qty} 扎。"
             ),
         )
         return InventoryAlertResult(
             "REPEATED" if result.incident.occurrence_count > 1 else "DETECTED",
             transaction.internal_sku,
-            transaction.inventory_after,
+            summary.current_qty,
             policy.threshold_qty,
             result.incident.incident_id,
             notification.notification_id,

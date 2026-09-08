@@ -99,6 +99,7 @@ def build_listing_action_manifest(
     identity_mapping: Mapping[str, Mapping[str, str]] | None,
     platform_name: str,
     mapping_source_version: str,
+    scan_scope: str | None = None,
 ) -> dict[str, Any]:
     _validate_id(batch_id, "batch_id")
     action = _action_type(action_type)
@@ -112,7 +113,11 @@ def build_listing_action_manifest(
             raise ValidationError("SYNC_STATUS 不允许携带任务商品项。")
         items: list[dict[str, Any]] = []
         execution_mode = "READ_ONLY"
-        scan_scope = "online_and_waiting"
+        resolved_scan_scope = str(
+            scan_scope or "online_and_waiting"
+        ).strip()
+        if resolved_scan_scope not in {"online", "online_and_waiting"}:
+            raise ValidationError("LISTING_ACTION_SCAN_SCOPE_INVALID")
     else:
         items = _build_write_items(
             batch_id=batch_id,
@@ -122,7 +127,7 @@ def build_listing_action_manifest(
             platform_name=platform,
         )
         execution_mode = "COMMIT"
-        scan_scope = (
+        resolved_scan_scope = (
             "online_and_waiting" if action == "set_online" else "online"
         )
     manifest = {
@@ -133,7 +138,7 @@ def build_listing_action_manifest(
         "execution_mode": execution_mode,
         "platform_name": platform,
         "mapping_source_version": mapping_version,
-        "scan_scope": scan_scope,
+        "scan_scope": resolved_scan_scope,
         "items": items,
     }
     manifest["manifest_sha256"] = _manifest_sha256(manifest)
@@ -181,12 +186,14 @@ def validate_listing_action_manifest(manifest: dict[str, Any]) -> None:
         manifest.get("mapping_source_version"),
         "mapping_source_version",
     )
-    expected_scope = (
-        "online_and_waiting"
-        if action in {"set_online", "sync_status"}
-        else "online"
+    allowed_scopes = (
+        {"online", "online_and_waiting"}
+        if action == "sync_status"
+        else {"online_and_waiting"}
+        if action == "set_online"
+        else {"online"}
     )
-    if manifest.get("scan_scope") != expected_scope:
+    if manifest.get("scan_scope") not in allowed_scopes:
         raise ValidationError("LISTING_ACTION_SCAN_SCOPE_INVALID")
     items = manifest.get("items")
     if action == "sync_status":
@@ -573,12 +580,14 @@ def validate_listing_action_request(
     )
     if execution_mode not in allowed_modes:
         raise ValidationError("LISTING_ACTION_EXECUTION_MODE_INVALID")
-    expected_scope = (
-        "online_and_waiting"
-        if action in {"set_online", "sync_status"}
-        else "online"
+    allowed_scopes = (
+        {"online", "online_and_waiting"}
+        if action == "sync_status"
+        else {"online_and_waiting"}
+        if action == "set_online"
+        else {"online"}
     )
-    if request.get("scan_scope") != expected_scope:
+    if request.get("scan_scope") not in allowed_scopes:
         raise ValidationError("LISTING_ACTION_SCAN_SCOPE_INVALID")
     items = request.get("items")
     if action == "sync_status":
@@ -708,7 +717,7 @@ def validate_listing_action_request(
         "execution_mode": execution_mode,
         "platform_name": platform,
         "mapping_source_version": request["mapping_source_version"],
-        "scan_scope": expected_scope,
+        "scan_scope": request["scan_scope"],
         "items": [
             {name: item.get(name) for name in _WRITE_ITEM_FIELDS if name != "item_execution_attempt_id" and name in item}
             for item in items
@@ -1190,7 +1199,14 @@ def validate_listing_action_result(
         if str(result.get("execution_mode") or "").upper() != "READ_ONLY":
             raise ValidationError("LISTING_ACTION_EXECUTION_MODE_INVALID")
         snapshot = result.get("snapshot")
-        validate_listing_sync_snapshot(snapshot)
+        validate_listing_sync_snapshot(
+            snapshot,
+            scan_scope=(
+                str(request.get("scan_scope") or "online_and_waiting")
+                if request is not None
+                else "online_and_waiting"
+            ),
+        )
         for field_name in (
             "execution_attempt_id",
             "instruction_hash",
@@ -1284,7 +1300,11 @@ def validate_listing_action_result(
         raise ValidationError("LISTING_ACTION_RESULT_HASH_MISMATCH")
 
 
-def validate_listing_sync_snapshot(snapshot: dict[str, Any] | None) -> None:
+def validate_listing_sync_snapshot(
+    snapshot: dict[str, Any] | None,
+    *,
+    scan_scope: str = "online_and_waiting",
+) -> None:
     if not isinstance(snapshot, dict):
         raise ValidationError("LISTING_SYNC_SNAPSHOT_INVALID")
     allowed = {
@@ -1370,12 +1390,25 @@ def validate_listing_sync_snapshot(snapshot: dict[str, Any] | None) -> None:
         <= scan_completed
     ):
         raise ValidationError("LISTING_SYNC_SNAPSHOT_TIME_ORDER_INVALID")
-    complete_flags = (
-        snapshot.get("online_scan_complete") is True,
-        snapshot.get("waiting_scan_complete") is True,
-        snapshot.get("online_end_marker_verified") is True,
-        snapshot.get("waiting_end_marker_verified") is True,
-    )
+    if scan_scope == "online_and_waiting":
+        complete_flags = (
+            snapshot.get("online_scan_complete") is True,
+            snapshot.get("waiting_scan_complete") is True,
+            snapshot.get("online_end_marker_verified") is True,
+            snapshot.get("waiting_end_marker_verified") is True,
+        )
+    elif scan_scope == "online":
+        if (
+            snapshot.get("waiting_scan_complete") is not False
+            or snapshot.get("waiting_end_marker_verified") is not False
+        ):
+            raise ValidationError("LISTING_SYNC_SNAPSHOT_SCOPE_INVALID")
+        complete_flags = (
+            snapshot.get("online_scan_complete") is True,
+            snapshot.get("online_end_marker_verified") is True,
+        )
+    else:
+        raise ValidationError("LISTING_ACTION_SCAN_SCOPE_INVALID")
     if snapshot.get("snapshot_complete") != all(complete_flags):
         raise ValidationError("LISTING_SYNC_SNAPSHOT_COMPLETENESS_INVALID")
     if not _SHA256_RE.fullmatch(str(snapshot.get("instruction_hash") or "")):

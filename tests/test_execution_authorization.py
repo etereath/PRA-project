@@ -26,6 +26,7 @@ from app.services.execution_authorization import (
     ExecutionAuthorizationApplicationService,
     ExecutionAuthorizationConflict,
     ExecutionAuthorizationForbidden,
+    ExecutionQueueBlocked,
 )
 from app.services.shadowbot_commit_batch import build_commit_request
 from app.services.shadowbot_listing_action_contract import (
@@ -33,6 +34,7 @@ from app.services.shadowbot_listing_action_contract import (
     build_listing_action_manifest,
     build_listing_action_request,
 )
+from tests.listing_scan_support import seed_scheduled_listing_scan
 
 
 NOW = datetime(2099, 8, 13, 2, 0, tzinfo=UTC)
@@ -240,6 +242,7 @@ def execution_setup(tmp_path: Path):
         queue_root=tmp_path / "queue",
         applet_uri="weixin://launchapplet/?app_id=synthetic",
         execution_profile="development",
+        notification_channel="fake",
         clock=lambda: NOW,
         runner_factory=lambda path: SimpleNamespace(path=path),
         v4_publish=fake_v4_publish,
@@ -390,6 +393,156 @@ def test_set_offline_uses_existing_v5_propose_and_publish(execution_setup) -> No
     )
 
 
+def test_set_online_authorization_allows_platform_quota_above_real_inventory(
+    execution_setup,
+) -> None:
+    service, repository, calls = execution_setup
+    mapping_version = RuntimeMasterDataRepository(
+        repository
+    ).compiled_mappings().mapping_version
+    _listing(
+        repository,
+        "AISHA-B-50-Z",
+        "B级",
+        Decimal("9"),
+        "offline",
+        platform_stock_qty=0,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+    seed_scheduled_listing_scan(
+        repository,
+        platform_name=PLATFORM,
+        observed_at=NOW + timedelta(seconds=1),
+        items=(("AISHA-A-50-Z", True), ("AISHA-B-50-Z", False)),
+    )
+    repository.insert_tasks(
+        [
+            _task(
+                "TASK-ONLINE-B",
+                "AISHA-B-50-Z",
+                "B级",
+                TaskActionType.SET_ONLINE,
+                mapping_version,
+                target_price=Decimal("10"),
+                target_inventory=400,
+                target_status="online",
+            )
+        ]
+    )
+
+    prepared = service.prepare_execution(
+        _admin(),
+        ["TASK-ONLINE-B"],
+        "auth-online",
+        now=NOW + timedelta(seconds=2),
+    )
+    assert prepared.action_type is TaskActionType.SET_ONLINE
+    assert calls == []
+
+
+def test_set_online_authorization_allows_manual_task_with_partial_scheduled_scan(
+    execution_setup,
+) -> None:
+    service, repository, calls = execution_setup
+    mapping_version = RuntimeMasterDataRepository(
+        repository
+    ).compiled_mappings().mapping_version
+    _listing(
+        repository,
+        "AISHA-B-50-Z",
+        "B级",
+        Decimal("9"),
+        "offline",
+        platform_stock_qty=0,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+    seed_scheduled_listing_scan(
+        repository,
+        platform_name=PLATFORM,
+        observed_at=NOW + timedelta(seconds=1),
+        items=(("AISHA-A-50-Z", True), ("AISHA-B-50-Z", False)),
+        run_status="PARTIAL",
+        batch_status="PARTIAL",
+        scope_complete=False,
+        end_marker_verified=False,
+    )
+    repository.insert_tasks(
+        [
+            _task(
+                "TASK-ONLINE-B-PARTIAL",
+                "AISHA-B-50-Z",
+                "B级",
+                TaskActionType.SET_ONLINE,
+                mapping_version,
+                target_price=Decimal("10"),
+                target_inventory=400,
+                target_status="online",
+            )
+        ]
+    )
+
+    prepared = service.prepare_execution(
+        _admin(),
+        ["TASK-ONLINE-B-PARTIAL"],
+        "auth-online-partial",
+        now=NOW + timedelta(seconds=2),
+    )
+    assert prepared.action_type is TaskActionType.SET_ONLINE
+    assert calls == []
+
+
+def test_set_online_authorization_still_rejects_automation_task_with_partial_scan(
+    execution_setup,
+) -> None:
+    service, repository, calls = execution_setup
+    mapping_version = RuntimeMasterDataRepository(
+        repository
+    ).compiled_mappings().mapping_version
+    _listing(
+        repository,
+        "AISHA-B-50-Z",
+        "B级",
+        Decimal("9"),
+        "offline",
+        platform_stock_qty=0,
+        observed_at=NOW + timedelta(seconds=1),
+    )
+    seed_scheduled_listing_scan(
+        repository,
+        platform_name=PLATFORM,
+        observed_at=NOW + timedelta(seconds=1),
+        items=(("AISHA-A-50-Z", True), ("AISHA-B-50-Z", False)),
+        run_status="PARTIAL",
+        batch_status="PARTIAL",
+        scope_complete=False,
+        end_marker_verified=False,
+    )
+    repository.insert_tasks(
+        [
+            _task(
+                "TASK-ONLINE-B-AUTOMATION-PARTIAL",
+                "AISHA-B-50-Z",
+                "B级",
+                TaskActionType.SET_ONLINE,
+                mapping_version,
+                target_price=Decimal("10"),
+                target_inventory=400,
+                target_status="online",
+                origin_type=TaskOriginType.AUTOMATION,
+            )
+        ]
+    )
+
+    with pytest.raises(ExecutionAuthorizationConflict, match="未完整成功"):
+        service.prepare_execution(
+            _admin(),
+            ["TASK-ONLINE-B-AUTOMATION-PARTIAL"],
+            "auth-online-automation-partial",
+            now=NOW + timedelta(seconds=2),
+        )
+    assert calls == []
+
+
 def test_prepare_idempotency_replays_same_batch_and_rejects_other_tasks(
     execution_setup,
 ) -> None:
@@ -401,6 +554,49 @@ def test_prepare_idempotency_replays_same_batch_and_rejects_other_tasks(
 
     with pytest.raises(ExecutionAuthorizationConflict, match="与之前的任务不同"):
         service.prepare_execution(admin, ["TASK-OFFLINE-B"], "same-auth")
+
+
+def test_unresolved_operation_blocks_submission_and_enqueues_one_notification(
+    execution_setup,
+) -> None:
+    service, repository, calls = execution_setup
+    mapping_version = RuntimeMasterDataRepository(
+        repository
+    ).compiled_mappings().mapping_version
+    old_task = _task(
+        "TASK-OLD-UNKNOWN-A",
+        "AISHA-A-50-Z",
+        "A级",
+        TaskActionType.UPDATE_PRICE,
+        mapping_version,
+        expected_old_price=Decimal("8.00"),
+        target_price=Decimal("9.00"),
+    )
+    old_task.task_status = TaskStatus.CANCELLED
+    old_task.result_message = "自动对账后仍无法确认改价结果。"
+    repository.insert_task(old_task)
+    _seed_unknown_write_lock(
+        repository,
+        task_id=old_task.task_id,
+        internal_sku=old_task.internal_sku,
+    )
+
+    with pytest.raises(
+        ExecutionQueueBlocked,
+        match="8月13日 10:00 的改价操作结果尚未确认",
+    ):
+        service.prepare_execution(_admin(), ["TASK-PRICE-A"], "blocked-once")
+    with pytest.raises(ExecutionQueueBlocked):
+        service.prepare_execution(_admin(), ["TASK-PRICE-A"], "blocked-retry")
+
+    assert calls == []
+    notifications = repository.list_notification_outbox()
+    assert len(notifications) == 1
+    assert notifications[0].notification_type == "task_queue_blocked"
+    assert notifications[0].related_task_id == old_task.task_id
+    assert notifications[0].channel == "fake"
+    assert notifications[0].payload["message"].startswith("任务队列受阻\n")
+    assert "艾莎 · A级 · 50cm · 改价" in notifications[0].payload["message"]
 
 
 def _admin() -> Principal:
@@ -419,7 +615,9 @@ def _task(
     *,
     expected_old_price: Decimal | None = None,
     target_price: Decimal | None = None,
+    target_inventory: int | None = None,
     target_status: str | None = None,
+    origin_type: TaskOriginType = TaskOriginType.MANUAL,
 ) -> Task:
     return Task(
         task_id=task_id,
@@ -431,11 +629,12 @@ def _task(
         created_at=NOW,
         expected_old_price=expected_old_price,
         target_price=target_price,
+        target_inventory=target_inventory,
         target_status=target_status,
         pricing_source=(PricingSource.MANUAL_OVERRIDE if target_price else None),
         decision_trace={"mapping_version": mapping_version, "grade": grade},
         required_by=NOW + timedelta(hours=1),
-        origin_type=TaskOriginType.MANUAL,
+        origin_type=origin_type,
         origin_ref_id="synthetic:" + task_id,
         expires_at=NOW + timedelta(hours=1),
         updated_at=NOW,
@@ -460,6 +659,9 @@ def _listing(
     grade: str,
     price: Decimal,
     status: str,
+    *,
+    platform_stock_qty: int = 20,
+    observed_at: datetime = NOW,
 ) -> None:
     repository.apply_shadowbot_inventory_observation(
         platform_name=PLATFORM,
@@ -467,8 +669,99 @@ def _listing(
         grade=grade,
         internal_sku=sku,
         observed_price=price,
-        platform_stock_qty=20,
+        platform_stock_qty=platform_stock_qty,
         online_status=status,
-        observed_at=NOW,
-        execution_attempt_id="ATTEMPT-" + sku,
+        observed_at=observed_at,
+        execution_attempt_id=(
+            "ATTEMPT-"
+            + sku
+            + "-"
+            + str(platform_stock_qty)
+            + "-"
+            + observed_at.isoformat()
+        ),
     )
+
+
+def _seed_unknown_write_lock(
+    repository: SQLiteRuntimeRepository,
+    *,
+    task_id: str,
+    internal_sku: str,
+) -> None:
+    operation_id = "OP-OLD-UNKNOWN-A"
+    attempt_id = "ATTEMPT-OLD-UNKNOWN-A"
+    batch_id = "BATCH-OLD-UNKNOWN-A"
+    now = NOW.isoformat()
+    with repository.connect_write() as connection:
+        connection.execute(
+            """
+            INSERT INTO shadowbot_operations(
+                operation_id, task_id, platform, product_identity_json,
+                action_type, expected_old_price, target_price, status,
+                operation_result, resolution_status, lock_owner,
+                approved_payload_hash, approved_payload_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'update_price', '8.00', '9.00',
+                      'NEEDS_RECONCILIATION', 'NEEDS_RECONCILIATION',
+                      'UNRESOLVED', ?, 'sha256:approved', '{}', ?, ?)
+            """,
+            (
+                operation_id,
+                task_id,
+                PLATFORM,
+                json.dumps({"internal_sku": internal_sku}, ensure_ascii=False),
+                attempt_id,
+                now,
+                now,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO shadowbot_execution_attempts(
+                execution_attempt_id, operation_id, execution_mode,
+                shadowbot_run_id, status, side_effect_state, started_at,
+                instruction_hash, request_file_sha256, queue_request_path,
+                ended_at, raw_output_json
+            ) VALUES (?, ?, 'COMMIT', 'RUN-OLD-UNKNOWN-A', 'UNKNOWN',
+                      'UNKNOWN', ?, 'sha256:instruction', 'sha256:request',
+                      'queue/old-unknown-a.json', ?, '{}')
+            """,
+            (attempt_id, operation_id, now, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO shadowbot_commit_batches(
+                batch_id, contract_version, execution_profile, platform_name,
+                manifest_sha256, instruction_hash, execution_attempt_id,
+                result_id, status, created_at, updated_at
+            ) VALUES (?, 4, 'production', ?, 'sha256:manifest',
+                      'sha256:instruction', ?, 'RESULT-OLD-UNKNOWN-A',
+                      'UNKNOWN', ?, ?)
+            """,
+            (batch_id, PLATFORM, attempt_id, now, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO shadowbot_batch_registry(
+                batch_id, batch_type, contract_version, platform_name, created_at
+            ) VALUES (?, 'update_price', 4, ?, ?)
+            """,
+            (batch_id, PLATFORM, now),
+        )
+        connection.execute(
+            """
+            INSERT INTO shadowbot_write_locks(
+                write_identity_key, operation_id, item_execution_attempt_id,
+                batch_id, status, acquired_at, released_at, updated_at
+            ) VALUES (?, ?, ?, ?, 'UNKNOWN', ?, NULL, ?)
+            """,
+            (
+                f"{PLATFORM}|sku:{internal_sku}",
+                operation_id,
+                attempt_id,
+                batch_id,
+                now,
+                now,
+            ),
+        )
+        connection.commit()

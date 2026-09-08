@@ -10,12 +10,11 @@ from uuid import uuid4
 
 from app.enums import DataQualityLevel, FactSource, ProductMappingStatus
 from app.inventory_models import (
-    InventoryAuthorityState,
-    InventoryBalance,
     InventoryBootstrapResult,
     InventorySalesBatchResult,
     InventoryTransaction,
     InventoryWriteResult,
+    VarietyInventorySummary,
 )
 from app.models import Product
 from app.repositories.automation_repository import AutomationRepository
@@ -48,6 +47,37 @@ MANUAL_INVENTORY_SOURCE_TYPES = frozenset(
     }
 )
 CUTOVER_ORDER_SNAPSHOT_MAX_AGE = timedelta(minutes=10)
+
+
+def summarize_inventory_by_variety(
+    products: Iterable[Product],
+) -> tuple[VarietyInventorySummary, ...]:
+    """Group authoritative grade balances by the business variety name."""
+
+    grouped: dict[str, list[Product]] = {}
+    for product in products:
+        variety = product.product_name.strip()
+        if not variety:
+            raise InventoryAuthorityError("商品缺少品种名称，无法汇总库存")
+        grouped.setdefault(variety, []).append(product)
+    return tuple(
+        VarietyInventorySummary(
+            variety=variety,
+            current_qty=sum(item.current_stock for item in items),
+            grade_quantities=tuple(
+                (item.grade, item.current_stock)
+                for item in sorted(
+                    items,
+                    key=lambda value: (value.grade, value.internal_sku),
+                )
+            ),
+            internal_skus=tuple(
+                item.internal_sku
+                for item in sorted(items, key=lambda value: value.internal_sku)
+            ),
+        )
+        for variety, items in sorted(grouped.items())
+    )
 
 
 def sqlite_logical_snapshot_sha256(

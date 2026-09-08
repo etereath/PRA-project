@@ -179,7 +179,7 @@ def test_order_anchor_collection_removes_only_the_repeated_grade_index():
     assert 'ORDER_ROW_SELECTOR_TEMPLATES["order_created_at"]' not in helper_source
 
 
-def test_v5_waiting_row_scroll_probes_before_adaptive_keyboard_navigation():
+def test_v5_waiting_row_scroll_reuses_verified_product_list_scroller():
     source = FLOW_PATH.read_text(encoding="utf-8")
     tree = ast.parse(source)
     helper = next(
@@ -191,14 +191,16 @@ def test_v5_waiting_row_scroll_probes_before_adaptive_keyboard_navigation():
     helper_source = ast.get_source_segment(source, helper)
 
     boundary_at = helper_source.index("_price_element_in_clickable_view(")
-    focus_at = helper_source.index("focus_element.click()")
-    send_key_at = helper_source.index('"{" + keyboard_key + "}"')
+    scroll_at = helper_source.index("_advance_product_list(")
 
-    assert boundary_at < focus_at < send_key_at
-    assert '"PGUP" if center_y < safe_top else "PGDN"' in helper_source
-    assert '"keyboard_key": keyboard_key' in helper_source
+    assert boundary_at < scroll_at
+    assert '"up" if center_y < safe_top else "down"' in helper_source
+    assert '"scroll_direction": scroll_direction' in helper_source
+    assert "wheel_times=SINGLE_PRODUCT_SCROLL_WHEEL_TIMES" in helper_source
+    assert "viewport=list_viewport" in helper_source
     assert "required_page_downs" not in helper_source
-    assert "_advance_product_list(" not in helper_source
+    assert "focus_element.click()" not in helper_source
+    assert "win32.send_keys(" not in helper_source
 
 
 def test_v5_row_scroll_probes_the_actual_listing_action_button():

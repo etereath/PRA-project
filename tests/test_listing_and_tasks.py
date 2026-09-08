@@ -214,6 +214,28 @@ class ListingAndTaskTests(unittest.TestCase):
             },
         )
 
+    def test_platform_target_inventory_is_not_capped_by_real_inventory(self) -> None:
+        generator = TaskGenerationService(
+            pricing_service=PricingService(ai_provider=NullAISuggestionProvider()),
+            listing_service=ListingService(),
+        )
+        platform_name = "测试平台"
+        identity = listing_identity_key(platform_name, "online", "A")
+
+        tasks = generator.generate(
+            [self.products[0]],
+            self.price_rules,
+            self.listing_rules,
+            platform_name=platform_name,
+            platform_observations={identity: (Decimal("15"), 120)},
+            platform_listing_states={identity: "offline"},
+        )
+
+        online_task = next(
+            task for task in tasks if task.action_type is TaskActionType.SET_ONLINE
+        )
+        self.assertEqual(online_task.target_inventory, 120)
+
     def test_direct_set_offline_strategy_generates_set_offline_task(self) -> None:
         generator = TaskGenerationService(
             pricing_service=PricingService(ai_provider=NullAISuggestionProvider()),
