@@ -1,157 +1,141 @@
 # Task 13.7-2C — Qualified Observation & Listing READ_ONLY Selective Salvage
 
-## 1. Goal
+## 1. Goal and accepted baseline
 
-在 Task 13.7-2A Authority Contract 接受后，把“当前平台观察是否足以作为经营事实”的判断抽成正式、可复用的 qualification 能力，并选择性复用 `a3485af` 中 `listing_scan_quality.py` 与 `listing_automation_runtime.py` 的成熟资产。
+本任务以 `main@0b1135787ac33c3c6c96531f874924418924bb8a`、业务合同 §23.3 和 PR #54 最新审核交接为基线。Task 13.7-2A / 2B 已进入当前 `main`，不再保留 workbook authority 作为 DB_AUTHORITY 下的兼容回退。
 
-本任务只建立 READ_ONLY observation production path 与 qualification contract，不执行平台写，不直接关闭 UNKNOWN、不决定 Queue blocker scope；后者由 Task 13.7-2D 依据 2A policy 完成。
+目标是建立“当前平台观察是否足以作为经营事实”的正式资格判断，并把既有 `SYNC_STATUS` READ_ONLY 链路接入 Automation Run 与不可变 `ProductObservation`。本任务不执行平台写、不关闭 UNKNOWN、不设置或释放 global blocker，也不推断历史写操作的因果。
 
-## 2. Dependency Gate
+## 2. Frozen public contract
 
-开始实现前必须读取 2A 最终接受版本，至少冻结：
+Qualification 结果固定分为两个互不覆盖的维度：
 
-- Platform/account/SKU identity；
-- Product/Mapping authority 来源；
-- qualified observation 的公共输出字段；
-- GQB-2 Observation Blindness 的定义与最小作用域；
-- READ_ONLY recovery 在 global blocker 下必须保持可用。
+1. `operating_fact_qualified`：观察的内容、来源、身份、覆盖、时间和当前 Mapping authority 是否足以作为经营事实。
+2. `delivery_archive_healthy`：结果文件 ACK、归档及相关证据投递是否健康。
 
-如果 13.7-2B 尚未完成，可用现有 mapping source 做兼容实现，但不得把 workbook source 固化成新公共合同；最终接线必须能切到 2B 的 Runtime Mapping authority。
+ACK、归档或通知失败本身不得抹除已提交的可信不可变观察；只有该失败导致身份、内容或来源完整性不可验证时，才会令经营事实不合格。
 
-## 3. Legacy Assets to Salvage
-
-### `a3485af:app/services/listing_scan_quality.py`
-
-可复用的核心检查：
-
-- 最近 due scheduled run；
-- run terminal success；
-- observation batch identity；
-- scope_complete；
-- end_marker_verified；
-- scan_completed_at freshness；
-- source snapshot binding；
-- SKU mapping uniqueness/VERIFIED；
-- listing projection 与 source snapshot 的一致性。
-
-### `a3485af:app/services/listing_automation_runtime.py`
-
-可复用的生产接线：
+稳定结果至少包含：
 
 ```text
-Automation Run
-→ existing SYNC_STATUS READ_ONLY
-→ file Queue / Worker
-→ immutable listing snapshot
-→ ProductObservationImporter
-→ ACK / Archive
-→ Automation Run outcome
-```
-
-必须继续复用现有 Queue/Worker/Importer、heartbeat、lease、result hash/ACK；不新建第二套扫描 daemon。
-
-## 4. Qualification Contract
-
-Qualification 只回答“这份观察是什么、质量如何、覆盖什么”，不直接决定是否阻断经营。
-
-建议公共结果至少包含：
-
-```text
-qualified: bool
+schema_version
+operating_fact_qualified
+fact_reason_codes[]
+delivery_archive_healthy
+delivery_reason_codes[]
 platform_name
 account_id
-internal_sku / scope
+internal_sku
+platform_product_identity_digest
+authority_mode
+authority_generation
+mapping_snapshot_sha256
+mapping_version
+provider
 observation_type
 source_run_id
 observation_batch_id
 source_snapshot_id
-observed_at / scan_completed_at
-freshness
+source_manifest_sha256
+source_result_sha256
+observation_content_sha256
+qualification_sha256
+observed_at
+scan_completed_at
+fresh_until
 scope_complete
 end_marker_verified
-identity_match
-mapping_version / mapping_refs
-quality_reason
 ```
 
-必要时增加 provider capability / mode，但不要提前建设 selector DSL 或配置中心。
+`qualification_sha256` 对上述决定性字段做规范化摘要，供 PR #55 在不重写本任务规则的情况下验证引用。
 
-### 核心原则
+## 3. Candidate selection
 
-- quality evaluator 输出事实，不自行发明 global blocker；
-- 单 SKU qualification 失败默认只影响该 SKU/相关 action；
-- 平台级主 Provider 与可信 fallback 均失效，才可能由 2D/Health policy 升级 GQB-2；
-- `qualified=false` 不等于 UNKNOWN execution；
-- 新 observation 可以比历史 execution 更晚，但不能因此反推旧 click 的精确因果。
+- 选择目标平台、账号和 SKU 下最新的合格候选，而不是要求数据库物理上只有一个批次。
+- 历史 `FAILED`、`SUPERSEDED`、不完整、过期及 retry/recovery 批次可以共存，不得永久污染后续有效观察。
+- retry/recovery 成功产生的新观察可以成为当前候选。
+- 同一最新完成时刻若存在内容或来源不同的多个合格候选，必须以 `AMBIGUOUS_CURRENT_CANDIDATES` fail closed。
+- SKU 隔离：一个 SKU 不合格不改变其他 SKU 的资格结果。
+- Qualification 仅返回事实，不创建 Review、不写 blocker、不改变 Automation 或 execution 状态。
 
-## 5. Queue-OPS-02R Handoff
+## 4. Identity and authority binding
 
-本任务必须让 2D 可以可靠判断：
+- 身份必须绑定 `platform_name + account_id + platform_product_identity_digest`，并包含 `internal_sku`、Mapping authority generation/snapshot/version 及证据引用。
+- DB_AUTHORITY 下只读取当前 Runtime Mapping authority；缺少配置账号、authority generation 漂移、snapshot digest 漂移或无法唯一解析时 fail closed，禁止 workbook fallback。
+- 配置的 `account_id` 只是目标账号，不是活动登录会话证明；本任务不声称已验证活动会话。
+- 接受时的 authority/identity binding 写入不可变 observation scope；资格读取时再与当前 Runtime authority 对照。
+
+## 5. Production READ_ONLY path
+
+唯一生产路径为：
 
 ```text
-observation happened after execution stopped boundary
-+ identity/scope/source qualified
-+ no active submit responsibility
+Automation Run
+→ existing SYNC_STATUS READ_ONLY
+→ existing Queue / Worker
+→ immutable listing snapshot
+→ ProductObservationImporter
+→ evidence ACK / Archive
+→ Automation outcome
 ```
 
-并提供结构化 evidence ref/digest，使 2D 能实现：
+- 复用现有 Job/Run/Event、Queue/Worker/Importer、heartbeat、lease、result hash 与 ACK；不增加 scheduler、daemon、queue 或状态机。
+- `FULL_MARKET_SCAN` / `PRE_CUTOFF_FULL_SCAN` 只负责产生现有 `LISTING_STATUS_SCAN` 子 Run；子 handler 执行上述链路。
+- 不注册任何平台写 handler。历史 UNKNOWN 停放不构成 READ_ONLY blanket gate；实际 UI channel 仍服从既有互斥和租约。
+- 不可变观察成功提交后，后续归档失败记录为 delivery/archive 不健康，并使本次 Automation outcome 明确反映交付失败，但不会回滚或否认经营事实。
+
+## 6. PR #55 handoff
+
+PR #55 只能消费本任务返回的结构化结果与引用，并自行验证：
 
 ```text
-Historical execution = UNKNOWN
-Current qualified platform fact = observed value
-Old one-shot business responsibility = CLOSED
-Current write eligibility = RELEASED
+scan_completed_at / observed_at strictly after stopped boundary
++ exact platform/account/product identity
++ provider/freshness/scope/end-marker qualified
++ one unique current qualified candidate
++ immutable source/content/qualification refs
 ```
 
-本任务本身不得执行上述 closure。
+这些字段不证明活动登录账号、不证明当前没有 submit responsibility，也不允许反推旧 click 的精确因果；对应判断仍属于 PR #55。
 
-## 6. Listing Automation Requirements
+## 7. Legacy selective salvage
 
-1. Light/Listing scan 必须是 READ_ONLY，结果声明 `platform_write_performed=false` 或等价 side-effect proof。
-2. 使用既有 Automation Run/Job/Event，不能再建独立 scheduler。
-3. 使用既有 Queue/Worker/Importer/ACK/Archive，单个 handler 异常不得拖垮其他 Automation/Importer/Watchdog。
-4. READ_ONLY 与 write/reconcile 共享 UI channel 时保持串行，但“存在历史 UNKNOWN”不等于“UI 当前被占用”。
-5. recovery/read-only 在 GQB 场景下默认仍允许被调度。
-6. 结果必须能绑定 account/platform/product identity，未来第二平台不返工公共合同。
+| Legacy asset | Decision | Current adaptation |
+|---|---|---|
+| `listing_scan_quality.py` complete/end-marker/fresh/source checks | ADAPTED | 改为结构化 reason code、账号/权威/身份绑定及双维度结果 |
+| `len(batches) == 1` | REJECTED | 改为最新合格候选选择；仅同一时刻冲突候选 fail closed |
+| run 必须 `SUCCESS` | REJECTED | 资格依赖不可变事实完整性；交付失败可令 run `PARTIAL` 而不抹除事实 |
+| `listing_automation_runtime.py` Automation→Queue→Importer→ACK/Archive | ADAPTED | 对齐当前 claim、Runtime Mapping authority 和现有 SYNC_STATUS API |
+| 新 daemon/scheduler/queue/state machine | REJECTED | 复用既有 Automation 与单 Worker 文件队列 |
+| “等待下一次定时扫描”作为唯一恢复 | REJECTED | 允许显式 READ_ONLY retry/recovery 产生新候选 |
 
-## 7. Required Adaptations vs Legacy
+## 8. Verification scope
 
-- 旧 `len(batches) == 1` 等过度严格条件需按当前 retry/recovery 语义重审；不能因为合法 retry 有多 batch 就永久视为不可用。
-- “请等待下一次定时扫描”不能成为固定恢复策略；允许 Recovery Calibration / explicit READ_ONLY 产生合格新事实。
-- freshness 由 provider capability/observation contract 决定，不硬编码成所有动作统一 30 分钟。
-- mapping identity 增加 `account_id`，接 2B Runtime authority 后不得读旧 workbook。
-- 单 SKU observation failure 不直接升平台 S4/GQB-2。
+定向验证覆盖：
 
-## 8. Explicit Non-goals
+1. complete + end-marker + fresh + exact account/identity/authority → qualified；
+2. incomplete、缺尾标、stale、identity/authority mismatch → 对应结构化不合格；
+3. ACK/archive failure 不抹除已提交事实，并单独报告 delivery 不健康；
+4. 历史失败/retry 不污染最新有效候选；同刻冲突候选 fail closed；
+5. SKU 隔离；
+6. DB_AUTHORITY 无 workbook fallback；
+7. 历史 UNKNOWN 停放期间 READ_ONLY 仍走真实 Automation/Queue/Worker/Importer 接线；
+8. 交给 PR #55 的时间、身份和摘要引用可独立复核。
 
-- 不实现 Queue-OPS-01/03/04；
-- 不自动 release UNKNOWN write lock；
-- 不新增 Agent controller；
-- 不实现 CurrentTradeDaySalesObservation / Closing / purchase_sequence；
-- 不恢复旧 Settlement/Summary authority；
-- 不执行真实平台写；
-- 不把 qualification 结果直接映射为 Review/global stop。
+完整 pytest、全仓 Ruff/Mypy、完整冒烟及主动 CI 重跑仍受单独授权门禁约束。
 
-## 9. Verification
+## 9. Explicit non-goals
 
-至少覆盖：
-
-1. scheduled listing READ_ONLY 走同一 Automation/Queue/Worker/Importer wiring；
-2. complete + end-marker + fresh + identity matched → qualified；
-3. incomplete/tail missing/stale/mapping mismatch → structured unqualified，而不是伪成功；
-4.合法 retry/recovery 后能选择最新合格 observation，不被旧失败 batch 永久污染；
-5.单 SKU unqualified 不阻止其他 SKU qualified；
-6. UNKNOWN 停放期间普通 READ_ONLY 仍可产生 observation；
-7. observation ref/digest 可被 2D 在 stopped boundary 后验证；
-8. GQB 恢复场景下 READ_ONLY 不被 blanket gate 封死；
-9. Windows/Linux Core CI green。
+- 不实现 PR #55 / Queue-OPS 的关闭或释放逻辑；
+- 不释放 UNKNOWN，不创建 Controller，不修改 Closing、当日销量或 purchase sequence；
+- 不执行真实平台写、部署或实机验收；
+- 不把 qualification 直接映射为 Review、global stop 或任何写权限。
 
 ## 10. Deliverables
 
-- 当前版 `ObservationQualification` / `ListingScanQuality` Service；
+- 当前版 `ListingScanQuality` / observation qualification Service；
 - Automation listing READ_ONLY production handler；
-- qualification read model/diagnostic output；
-- 与 2B mapping authority 的可切换接线；
-- tests/fixtures 选择性吸收 `a3485af:tests/listing_scan_support.py` 等资产；
-- 文档说明 legacy `REUSED / ADAPTED / REJECTED`；
-- 向 13.7-2D 提供稳定 qualified-observation interface。
+- Runtime Mapping authority 与不可变 account/identity binding；
+- 结构化 qualification diagnostic 及稳定 PR #55 interface；
+- 直接风险对应的定向测试；
+- 本文的 legacy `REUSED / ADAPTED / REJECTED` 记录。
