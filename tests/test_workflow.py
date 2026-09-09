@@ -107,14 +107,14 @@ class WorkflowTests(unittest.TestCase):
 
     def test_generate_tasks_returns_summary_and_counts(self) -> None:
         summary = generate_tasks_from_sources(self.inputs)
-        self.assertEqual(len(summary.tasks), 5)
-        self.assertEqual(summary.task_counts["update_price"], 2)
+        self.assertEqual(len(summary.tasks), 4)
+        self.assertEqual(summary.task_counts["update_price"], 1)
         self.assertEqual(summary.task_counts["set_offline"], 2)
         self.assertTrue(summary.output_written)
 
     def test_preview_tasks_does_not_write_output(self) -> None:
         preview = preview_tasks_from_sources(self.inputs)
-        self.assertEqual(len(preview.tasks), 5)
+        self.assertEqual(len(preview.tasks), 4)
         self.assertFalse(preview.output_written)
         self.assertIsNone(preview.output_path)
 
@@ -323,10 +323,7 @@ class WorkflowTests(unittest.TestCase):
             rule_type="price",
             rule_id="RULE-VALID",
         )
-        self.assertEqual(
-            [task.internal_sku for task in preview.tasks],
-            ["SKU-001", "SKU-002"],
-        )
+        self.assertEqual([task.internal_sku for task in preview.tasks], ["SKU-001"])
 
     def test_selected_rule_uses_concrete_rule_platform_and_shared_group_metadata(self) -> None:
         _write_workbook(
@@ -418,7 +415,7 @@ class WorkflowTests(unittest.TestCase):
 
     def test_simulate_execution_writes_logs_and_updates_tasks(self) -> None:
         summary = generate_tasks_from_sources(self.inputs)
-        self.assertEqual(len(summary.tasks), 5)
+        self.assertEqual(len(summary.tasks), 4)
 
         logs_output = Path(self.temp_dir.name) / "execution_logs.xlsx"
         updated_tasks_output = Path(self.temp_dir.name) / "executed_tasks.xlsx"
@@ -431,8 +428,8 @@ class WorkflowTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(len(execution.logs), 5)
-        self.assertEqual(execution.success_count, 5)
+        self.assertEqual(len(execution.logs), 4)
+        self.assertEqual(execution.success_count, 4)
         self.assertTrue(logs_output.exists())
         self.assertTrue(updated_tasks_output.exists())
         self.assertTrue(all(task.task_status.value == "success" for task in execution.tasks))

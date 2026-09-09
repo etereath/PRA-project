@@ -199,6 +199,12 @@ class RuntimeMasterDataProvider:
                     "internal_sku": sku,
                     "expected_product_name": record.platform_product_name,
                     "expected_grade": record.grade,
+                    "platform_product_identity_json": (
+                        record.platform_product_identity_json
+                    ),
+                    "platform_product_identity_digest": (
+                        record.platform_product_identity_digest
+                    ),
                     "status": "active",
                 }
             )

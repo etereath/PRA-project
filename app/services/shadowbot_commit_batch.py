@@ -7,6 +7,11 @@ from pathlib import Path
 from typing import Any
 
 from app.exceptions import ValidationError
+from app.platform_product_identity import (
+    PlatformProductIdentityError,
+    canonical_identity_json,
+    identity_digest,
+)
 from app.repositories.workbook_repository import load_products
 from app.shadowbot_contract_primitives import (
     canonical_positive_price,
@@ -68,6 +73,7 @@ def load_identity_mapping(path: Path, *, expected_platform_name: str = "") -> di
     if expected_platform and normalize_text(mapping_platform) != normalize_text(expected_platform):
         raise ValidationError("SKU 映射平台与任务平台不一致。")
     mapping: dict[str, dict[str, str]] = {}
+    runtime_derived = str(raw.get("authority") or "").strip() == "runtime_db_derived"
     for index, row in enumerate(rows, start=1):
         if not isinstance(row, dict):
             raise ValidationError(f"SKU 映射第 {index} 项不是对象。")
@@ -76,10 +82,31 @@ def load_identity_mapping(path: Path, *, expected_platform_name: str = "") -> di
             raise ValidationError(f"SKU 映射重复：{internal_sku}")
         if str(row.get("status") or "active").strip().lower() != "active":
             continue
-        mapping[internal_sku] = {
+        mapped_identity = {
             "expected_product_name": _required_text(row, "expected_product_name"),
             "expected_grade": _required_text(row, "expected_grade"),
         }
+        identity_json = str(row.get("platform_product_identity_json") or "").strip()
+        identity_sha = str(row.get("platform_product_identity_digest") or "").strip()
+        if runtime_derived or identity_json or identity_sha:
+            if not identity_json or not identity_sha:
+                raise ValidationError(
+                    f"SKU 映射第 {index} 项缺少完整平台商品身份。"
+                )
+            try:
+                canonical = canonical_identity_json(identity_json)
+                calculated = identity_digest(canonical)
+            except PlatformProductIdentityError as exc:
+                raise ValidationError(
+                    f"SKU 映射第 {index} 项平台商品身份无效。"
+                ) from exc
+            if identity_json != canonical or identity_sha != calculated:
+                raise ValidationError(
+                    f"SKU 映射第 {index} 项平台商品身份摘要不匹配。"
+                )
+            mapped_identity["platform_product_identity_json"] = canonical
+            mapped_identity["platform_product_identity_digest"] = calculated
+        mapping[internal_sku] = mapped_identity
     if not mapping:
         raise ValidationError("SKU 映射中没有启用项。")
     return mapping
@@ -144,6 +171,11 @@ def build_commit_manifest(
             "expected_old_price": old_price,
             "target_price": target_price,
         }
+        identity_sha = str(
+            identity.get("platform_product_identity_digest") or ""
+        ).strip()
+        if identity_sha:
+            item["platform_product_identity_digest"] = identity_sha
         item["item_payload_sha256"] = _sha256(_item_manifest_payload(normalized_platform, item))
         item["item_id"] = _stable_id(
             "ITEM",
@@ -439,6 +471,7 @@ def _validate_items(
         "item_execution_attempt_id",
         "write_identity_key",
         "page_identity_key",
+        "platform_product_identity_digest",
     }
     seen_item_ids: set[str] = set()
     seen_task_ids: set[str] = set()
@@ -494,6 +527,11 @@ def _validate_items(
         seen_identities.add(identity)
         _price(item.get("expected_old_price"), "expected_old_price")
         _price(item.get("target_price"), "target_price")
+        identity_sha = str(
+            item.get("platform_product_identity_digest") or ""
+        ).strip()
+        if identity_sha and not re.fullmatch(r"sha256:[0-9a-f]{64}", identity_sha):
+            raise ValidationError("COMMIT item 平台商品身份摘要无效。")
         supplied_hash = str(item.get("item_payload_sha256") or "")
         expected_hash = _sha256(_item_manifest_payload(platform_name, item))
         if not _SHA256_RE.fullmatch(supplied_hash) or supplied_hash != expected_hash:
@@ -542,7 +580,7 @@ def _validate_items(
 
 
 def _item_manifest_payload(platform_name: str, item: dict[str, Any]) -> dict[str, str]:
-    return {
+    payload = {
         "platform_name": str(platform_name or "").strip(),
         "source_task_id": str(item.get("source_task_id") or "").strip(),
         "internal_sku": str(item.get("internal_sku") or "").strip().upper(),
@@ -553,6 +591,10 @@ def _item_manifest_payload(platform_name: str, item: dict[str, Any]) -> dict[str
         "expected_old_price": _price(item.get("expected_old_price"), "expected_old_price"),
         "target_price": _price(item.get("target_price"), "target_price"),
     }
+    identity_sha = str(item.get("platform_product_identity_digest") or "").strip()
+    if identity_sha:
+        payload["platform_product_identity_digest"] = identity_sha
+    return payload
 
 
 def _manifest_sha256(platform_name: str, items: list[dict[str, Any]]) -> str:

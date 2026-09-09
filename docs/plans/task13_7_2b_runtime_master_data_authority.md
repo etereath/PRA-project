@@ -80,7 +80,11 @@ Web / Manual Task / Authorization / Automation / Observation / Order mapping
 - ShadowBot `product_identity_mapping.json` 在 cutover 后只能由 Runtime mapping
   generation 生成/同步为 derived locator artifact；部署流程只可补充 UI-only
   locator 字段。artifact 必须绑定 authority generation、mapping digest 和自身
-  digest，不能独立维护业务映射、成为 authority 或提供 fallback。
+  digest；每个执行目标同时携带 canonical identity JSON/digest，授权复核和执行
+  manifest 都按该 digest 绑定，不能退化为显示名+等级 authority。
+  canonical identity 必须递归规范化并至少包含 `schema_version`、`identity_type`、
+  `components`；legacy workbook 行在 import 时显式转换为该版本结构。
+  locator 不能独立维护业务映射、成为 authority 或提供 fallback。
   当前派生文件额外保存 `artifact_payload_sha256`，执行授权同时核对文件字节
   digest；同一账号若无法生成唯一平台/SKU locator，则 fail closed，不猜测目标。
 
@@ -95,8 +99,8 @@ backup current Runtime
 → additive schema migration
 → import Product/Mapping into current-schema candidate copy
 → validate hashes / mapping compile / identity uniqueness
-→ shadow compare with current Excel-derived behavior
-→ explicit owner cutover
+→ audited shadow compare with current Excel-derived behavior
+→ explicit owner cutover bound to the successful compare receipt
 → 全部正式 Runtime consumers 同 gate 切读
 → Excel runtime reads disabled
 ```
@@ -107,7 +111,10 @@ rollback 只允许让全部正式 consumers 原子恢复到同一个已验证 au
 后若已经发生新的 authoritative Product/Mapping mutation，或发生依赖新 mapping
 的真实平台副作用，禁止静默回退到旧工作簿；此时只能 forward correction，或由
 负责人执行显式 maintenance/re-cutover。任何回退都不得删除新 evidence、历史
-generation 或 continuation。
+generation 或 continuation。首次 compare 不匹配时通过 `refresh-preview → refresh`
+审计化替换 PRE_CUTOVER candidate；rollback 后旧 compare receipt 自动失效，若
+workbook 已变更，必须先 refresh，再用当前 candidate、workbook hash 和 account
+bindings 生成新的成功 compare receipt，才能 re-cutover。
 
 ## 5. Direct-reader Inventory 与切源处置
 
@@ -156,16 +163,18 @@ business-rule evaluation 均已登记。实现中若发现新的正常经营 dir
 1. additive migration 不破坏现有 v18 continuation 和 #47～#50 账本；
 2. one-time import/seed 幂等，source hash/版本可回读；
 3. mapping 含 account scope，单账号冲突不污染其他账号；
-4. Product/Mapping Web 写入 expected_version 冲突 fail safely；
+4. Product/Mapping Web 写入保留认证 capability、actor、idempotency 与 expected_version，冲突 fail safely；
 5. VERIFIED / UNMAPPED / AMBIGUOUS / DISABLED 解析与当前 compiler 一致；
 6. current consumers 全部切到 Runtime authority 后，修改 Excel 不再悄悄改变运行结果；
-7. shadow compare 能证明 cutover 前后相同输入得到相同 Product/Mapping 业务解释；
-8. rollback 只切 authority/read path，不删除新 evidence；
-9. Windows/Linux Core CI green。
+7. shadow compare 能证明 cutover 前后相同输入得到相同 Product/Mapping 业务解释，cutover 必须消费当前成功 receipt；
+8. compare mismatch 可审计 refresh candidate，rollback 后 workbook 变化不能复用旧 candidate/receipt；
+9. rollback 只切 authority/read path，不删除新 evidence；
+10. Windows/Linux Core CI green。
 
 本地定向验证只使用临时 Runtime；真实 authority switch、部署、平台写和完整 CI 仍需
 分别授权。`runtime_master_data_cutover.py` 的 `--runtime-db` 无默认值，import 必须复用
-preview digest，cutover/rollback 必须提供固定确认文本。
+preview digest；shadow compare 必须提供 actor/idempotency key；cutover 必须重读当前
+workbook/account bindings 并提供成功 receipt，cutover/rollback 必须提供固定确认文本。
 
 ## 8. Deliverables
 

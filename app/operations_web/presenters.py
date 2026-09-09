@@ -212,6 +212,14 @@ def render_management(
     review_error: str = "",
     automation_receipt: str = "",
     automation_error: str = "",
+    master_data_state=None,
+    master_data_products=(),
+    master_data_mappings=(),
+    master_data_receipt=None,
+    master_data_error: str = "",
+    master_data_idempotency_seed: str = "",
+    default_platform_name: str = "",
+    default_account_id: str = "",
 ) -> str:
     inventory_options = "".join(
         f'<option value="{html(sku)}" data-qty="{qty}" data-version="{version}">'
@@ -278,16 +286,219 @@ def render_management(
         receipt=automation_receipt,
         error=automation_error,
     )
+    master_data_controls = _render_master_data_controls(
+        csrf_token=csrf_token,
+        state=master_data_state,
+        products=master_data_products,
+        mappings=master_data_mappings,
+        receipt=master_data_receipt,
+        error=master_data_error,
+        idempotency_seed=master_data_idempotency_seed,
+        default_platform_name=default_platform_name,
+        default_account_id=default_account_id,
+    )
     return f"""
     <section class="hero compact-hero">
       <div><p class="eyebrow">业务管理</p><h1>任务、复核与自动化</h1><p>先创建任务，确认无误后再授权平台执行。</p></div>
     </section>
     <nav class="section-tabs" aria-label="业务管理分页"><a class="active" href="#tasks">创建任务</a><a href="#reviews">人工复核</a><a href="#automation">自动化方案</a></nav>
     {task_controls}
+    {master_data_controls}
     <section class="panel"><header class="panel-header"><div><h2>人工库存调整</h2><p>输入本次增加或减少的数量，并记录来源和原因</p></div></header><div class="form-shell">{render_state(model.inventory_state)}{inventory_error}{receipt}{inventory_form}</div></section>
     <section class="panel" id="tasks"><header class="panel-header"><div><h2>当前任务</h2><p>选择待执行任务并再次确认后，才会发送到平台</p></div></header>{execution_controls}{render_table(model.pending_tasks)}</section>
     <section class="panel" id="reviews"><header class="panel-header"><div><h2>人工复核</h2><p>查看原因并选择处理结果</p></div></header>{review_controls}{render_table(model.pending_reviews)}</section>
     <section class="panel" id="automation"><header class="panel-header"><div><h2>自动化方案</h2><p>设置定时扫描、日结、任务生成和库存预警</p></div></header>{automation_controls}{render_table(model.automation_runs)}</section>
+    """
+
+
+def _render_master_data_controls(
+    *,
+    csrf_token: str,
+    state,
+    products,
+    mappings,
+    receipt,
+    error: str,
+    idempotency_seed: str,
+    default_platform_name: str,
+    default_account_id: str,
+) -> str:
+    feedback = ""
+    if receipt is not None and hasattr(receipt, "entity_type"):
+        feedback += (
+            '<div class="state-banner state-ready"><strong>主数据已更新</strong>'
+            f'<p>{html(receipt.entity_type)} · {html(receipt.entity_id)} · '
+            f'版本 {html(receipt.version)} · generation '
+            f'{html(receipt.authority_generation)}</p></div>'
+        )
+    if error:
+        feedback += (
+            '<div class="state-banner state-failed"><strong>主数据未修改</strong>'
+            f'<p>{html(error)}</p></div>'
+        )
+    if state is None or getattr(state, "authority_mode", "") != "DB_AUTHORITY":
+        return (
+            '<section class="panel" id="master-data"><header class="panel-header">'
+            '<div><h2>商品与平台映射</h2><p>Runtime authority 启用后在此维护</p>'
+            f'</div></header><div class="form-shell">{feedback}</div></section>'
+        )
+
+    product_forms = []
+    for record in products:
+        product = record.product
+        product_forms.append(
+            _product_master_form(
+                csrf_token=csrf_token,
+                operation="update",
+                key=f"{idempotency_seed}:product:{product.internal_sku}:{record.version}",
+                expected_version=record.version,
+                internal_sku=product.internal_sku,
+                product_name=product.product_name,
+                grade=product.grade,
+                stem_length=product.stem_length,
+                unit=product.unit,
+                base_cost=product.base_cost,
+                sale_enabled=product.sale_enabled,
+                remark=product.remark,
+            )
+        )
+    product_forms.append(
+        _product_master_form(
+            csrf_token=csrf_token,
+            operation="create",
+            key=f"{idempotency_seed}:product:create",
+        )
+    )
+
+    mapping_forms = []
+    for record in mappings:
+        mapping_forms.append(
+            _mapping_master_form(
+                csrf_token=csrf_token,
+                operation="update",
+                key=f"{idempotency_seed}:mapping:{record.mapping_id}:{record.version}",
+                expected_version=record.version,
+                mapping_id=record.mapping_id,
+                platform_name=record.platform_name,
+                account_id=record.account_id,
+                identity_json=record.platform_product_identity_json,
+                platform_product_name=record.platform_product_name,
+                grade=record.grade,
+                mapping_status=record.mapping_status,
+                internal_sku=record.internal_sku or "",
+                candidate_internal_skus=", ".join(record.candidate_internal_skus),
+                effective_from=record.effective_from or "",
+                effective_to=record.effective_to or "",
+                remark=record.remark,
+            )
+        )
+    mapping_forms.append(
+        _mapping_master_form(
+            csrf_token=csrf_token,
+            operation="create",
+            key=f"{idempotency_seed}:mapping:create",
+            platform_name=default_platform_name,
+            account_id=default_account_id,
+        )
+    )
+    return f"""
+    <section class="panel" id="master-data">
+      <header class="panel-header"><div><h2>商品与平台映射</h2><p>当前 Runtime generation {html(state.generation)}；商品与库存账本分开维护</p></div></header>
+      <div class="form-shell">{feedback}<h3>商品主数据</h3>{''.join(product_forms)}<h3>平台映射</h3>{''.join(mapping_forms)}</div>
+    </section>
+    """
+
+
+def _product_master_form(
+    *,
+    csrf_token: str,
+    operation: str,
+    key: str,
+    expected_version: int | str = "",
+    internal_sku: str = "",
+    product_name: str = "",
+    grade: str = "",
+    stem_length: str = "",
+    unit: str = "扎",
+    base_cost: object = "",
+    sale_enabled: bool = True,
+    remark: str = "",
+) -> str:
+    readonly = " readonly" if operation == "update" else ""
+    title = f"更新 {internal_sku}" if operation == "update" else "新增商品"
+    enabled_options = (
+        '<option value="true" selected>允许销售</option><option value="false">停售</option>'
+        if sale_enabled
+        else '<option value="true">允许销售</option><option value="false" selected>停售</option>'
+    )
+    return f"""
+    <details class="review-control-card"><summary>{html(title)}</summary>
+      <form method="post" action="/management/master-data/products">
+        <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
+        <input type="hidden" name="operation" value="{html(operation)}">
+        <input type="hidden" name="idempotency_key" value="{html(key)}">
+        <input type="hidden" name="expected_version" value="{html(expected_version)}">
+        <label>内部 SKU<input name="internal_sku" value="{html(internal_sku)}" required{readonly}></label>
+        <label>商品名称<input name="product_name" value="{html(product_name)}" required></label>
+        <label>等级<input name="grade" value="{html(grade)}" required></label>
+        <label>枝长<input name="stem_length" value="{html(stem_length)}" required></label>
+        <label>单位<input name="unit" value="{html(unit)}" required></label>
+        <label>基础成本<input name="base_cost" value="{html(base_cost)}" inputmode="decimal" required></label>
+        <label>销售状态<select name="sale_enabled">{enabled_options}</select></label>
+        <label>备注<input name="remark" value="{html(remark)}"></label>
+        <button type="submit">{html(title)}</button>
+      </form>
+    </details>
+    """
+
+
+def _mapping_master_form(
+    *,
+    csrf_token: str,
+    operation: str,
+    key: str,
+    expected_version: int | str = "",
+    mapping_id: str = "",
+    platform_name: str = "",
+    account_id: str = "",
+    identity_json: str = "",
+    platform_product_name: str = "",
+    grade: str = "",
+    mapping_status: str = "VERIFIED",
+    internal_sku: str = "",
+    candidate_internal_skus: str = "",
+    effective_from: str = "",
+    effective_to: str = "",
+    remark: str = "",
+) -> str:
+    readonly = " readonly" if operation == "update" else ""
+    title = f"更新 {mapping_id}" if operation == "update" else "新增平台映射"
+    options = "".join(
+        f'<option value="{value}"{(" selected" if value == mapping_status else "")}>{value}</option>'
+        for value in ("VERIFIED", "UNMAPPED", "AMBIGUOUS", "DISABLED")
+    )
+    return f"""
+    <details class="review-control-card"><summary>{html(title)}</summary>
+      <form method="post" action="/management/master-data/mappings">
+        <input type="hidden" name="csrf_token" value="{html(csrf_token)}">
+        <input type="hidden" name="operation" value="{html(operation)}">
+        <input type="hidden" name="idempotency_key" value="{html(key)}">
+        <input type="hidden" name="expected_version" value="{html(expected_version)}">
+        <label>映射 ID<input name="mapping_id" value="{html(mapping_id)}" required{readonly}></label>
+        <label>平台<input name="platform_name" value="{html(platform_name)}" required></label>
+        <label>账号 ID<input name="account_id" value="{html(account_id)}" required></label>
+        <label>Canonical identity JSON<textarea name="platform_product_identity_json" required>{html(identity_json)}</textarea></label>
+        <label>平台商品名<input name="platform_product_name" value="{html(platform_product_name)}" required></label>
+        <label>等级<input name="grade" value="{html(grade)}" required></label>
+        <label>状态<select name="mapping_status">{options}</select></label>
+        <label>确认 SKU<input name="internal_sku" value="{html(internal_sku)}"></label>
+        <label>候选 SKU（逗号分隔）<input name="candidate_internal_skus" value="{html(candidate_internal_skus)}"></label>
+        <label>生效时间<input name="effective_from" value="{html(effective_from)}" placeholder="ISO-8601"></label>
+        <label>失效时间<input name="effective_to" value="{html(effective_to)}" placeholder="ISO-8601"></label>
+        <label>备注<input name="remark" value="{html(remark)}"></label>
+        <button type="submit">{html(title)}</button>
+      </form>
+    </details>
     """
 
 

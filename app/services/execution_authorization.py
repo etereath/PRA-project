@@ -719,6 +719,9 @@ class ExecutionAuthorizationApplicationService:
                     grade=identity["expected_grade"],
                     observed_at=current,
                     account_id=master_data_snapshot.account_id,
+                    platform_product_identity_digest=str(
+                        identity.get("platform_product_identity_digest") or ""
+                    ),
                 )
                 if (
                     resolution.mapping_status is not ProductMappingStatus.VERIFIED
@@ -744,6 +747,9 @@ class ExecutionAuthorizationApplicationService:
                         "listing_updated_at": _datetime_text(listing.updated_at),
                         "listing_price_observed_at": _datetime_text(listing.price_observed_at),
                         "listing_price_source_attempt_id": listing.price_source_attempt_id,
+                        "platform_product_identity_digest": str(
+                            identity.get("platform_product_identity_digest") or ""
+                        ),
                     }
                 )
 

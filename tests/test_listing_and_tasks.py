@@ -172,11 +172,6 @@ class ListingAndTaskTests(unittest.TestCase):
                     TaskActionType.SET_OFFLINE,
                     "当前商品未上架，无需重复下架",
                 ),
-                (
-                    "SKU-OFFLINE",
-                    TaskActionType.UPDATE_PRICE,
-                    "当前商品未上架，改价任务已忽略",
-                ),
             },
         )
 
@@ -268,7 +263,7 @@ class ListingAndTaskTests(unittest.TestCase):
         )
         self.assertEqual(ignored, [])
 
-    def test_uninitialized_inventory_does_not_blanket_block_price_task(self) -> None:
+    def test_uninitialized_inventory_does_not_expand_automatic_price_strategy(self) -> None:
         generator = TaskGenerationService(
             pricing_service=PricingService(ai_provider=NullAISuggestionProvider()),
             listing_service=ListingService(),
@@ -291,8 +286,7 @@ class ListingAndTaskTests(unittest.TestCase):
             platform_name="测试平台",
         )
 
-        self.assertEqual(len(tasks), 1)
-        self.assertIs(tasks[0].action_type, TaskActionType.UPDATE_PRICE)
+        self.assertEqual(tasks, [])
 
     def test_set_online_reads_latest_platform_price_and_inventory(self) -> None:
         generator = TaskGenerationService(

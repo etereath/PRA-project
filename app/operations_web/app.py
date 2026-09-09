@@ -50,6 +50,7 @@ from app.services.execution_authorization import (
 from app.services.price_execution_resolution import PriceExecutionResolutionApplicationService
 from app.repositories.automation_repository import AutomationRepository
 from app.repositories.inventory_repository import InventoryRepository
+from app.repositories.master_data_repository import RuntimeMasterDataError
 from app.services.automation_configuration import (
     AutomationConfigurationApplicationService,
     AutomationConfigurationError,
@@ -63,6 +64,7 @@ from app.services.review_resolution import (
     ReviewResolutionApplicationService,
     ReviewResolutionError,
 )
+from app.services.master_data_management import MasterDataManagementService
 from app.services.runtime_master_data import RuntimeMasterDataProvider
 from app.services.operations_maintenance import (
     MaintenanceReceipt,
@@ -201,6 +203,9 @@ class OperationsWebApplication:
             configured_account_id=container.settings.account_id,
             products_workbook=container.settings.paths.products_workbook,
             platform_mappings_workbook=container.settings.paths.platform_mappings_workbook,
+        )
+        self.master_data_management = MasterDataManagementService(
+            container.runtime_repository
         )
         self.queries = OperationsQueryService(
             container.runtime_repository,
@@ -343,6 +348,16 @@ class OperationsWebApplication:
             if method != "POST":
                 return self._method_not_allowed("POST")
             return self._inventory_adjustment(environ)
+
+        if path == "/management/master-data/products":
+            if method != "POST":
+                return self._method_not_allowed("POST")
+            return self._master_data_product_write(environ)
+
+        if path == "/management/master-data/mappings":
+            if method != "POST":
+                return self._method_not_allowed("POST")
+            return self._master_data_mapping_write(environ)
 
         if path == "/management/tasks/preview":
             if method != "POST":
@@ -651,6 +666,30 @@ class OperationsWebApplication:
                 task_scope_options = self.manual_tasks.scope_options()
             except Exception:
                 task_scope_options = None
+            try:
+                master_data_state = self.master_data_management.repository.authority_state()
+                if master_data_state.authority_mode == "DB_AUTHORITY":
+                    master_data_products = (
+                        self.master_data_management.repository.list_product_records()
+                    )
+                    master_data_mappings = (
+                        self.master_data_management.repository.list_mapping_records()
+                    )
+                    master_data_error = ""
+                else:
+                    master_data_products = ()
+                    master_data_mappings = ()
+                    master_data_error = (
+                        "Runtime 商品与平台映射尚未切换，日常维护入口暂不可用。"
+                    )
+            except Exception:
+                master_data_state = None
+                master_data_products = ()
+                master_data_mappings = ()
+                master_data_error = "Runtime 商品与平台映射暂不可读取。"
+            master_data_receipt = self.control_store.get(
+                self._first(query, "master_data_receipt"), subject
+            )
             content = render_management(
                 self.queries.management(
                     inventory_transaction_id=self._first(
@@ -708,6 +747,19 @@ class OperationsWebApplication:
                     "automation_error",
                     subject,
                 ),
+                master_data_state=master_data_state,
+                master_data_products=master_data_products,
+                master_data_mappings=master_data_mappings,
+                master_data_receipt=master_data_receipt,
+                master_data_error=(
+                    self._control_message(query, "master_data_error", subject)
+                    or master_data_error
+                ),
+                master_data_idempotency_seed=(
+                    "web-master-data:" + secrets.token_urlsafe(18)
+                ),
+                default_platform_name=self.container.settings.platform_name,
+                default_account_id=self.container.settings.account_id,
             )
         elif path.startswith("/system"):
             receipt_value = self.control_store.get(
@@ -929,6 +981,104 @@ class OperationsWebApplication:
             "",
             headers=[("Location", location), ("Cache-Control", "no-store")],
         )
+
+    def _master_data_product_write(self, environ) -> Response:
+        session, form, denied = self._management_write_context(
+            environ,
+            route="/management/master-data/products",
+            capability=Capability.MANAGE_BUSINESS,
+        )
+        if denied is not None:
+            return denied
+        try:
+            operation = self._first(form, "operation").strip().lower()
+            values = {
+                "internal_sku": self._first(form, "internal_sku"),
+                "product_name": self._first(form, "product_name"),
+                "grade": self._first(form, "grade"),
+                "stem_length": self._first(form, "stem_length"),
+                "unit": self._first(form, "unit"),
+                "base_cost": Decimal(self._first(form, "base_cost")),
+                "sale_enabled": self._first(form, "sale_enabled") == "true",
+                "remark": self._first(form, "remark"),
+                "actor": session.principal.subject,
+                "idempotency_key": self._first(form, "idempotency_key"),
+            }
+            if operation == "create":
+                receipt = self.master_data_management.create_product(**values)
+            elif operation == "update":
+                receipt = self.master_data_management.update_product(
+                    **values,
+                    expected_version=int(self._first(form, "expected_version")),
+                )
+            else:
+                raise RuntimeMasterDataError("不支持的商品主数据操作。")
+        except (RuntimeMasterDataError, InvalidOperation, ValueError) as exc:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "master_data_error",
+                str(exc) or "商品主数据未修改。",
+            )
+        token = self.control_store.put(session.principal.subject, receipt)
+        return self._management_redirect("master_data_receipt", token)
+
+    def _master_data_mapping_write(self, environ) -> Response:
+        session, form, denied = self._management_write_context(
+            environ,
+            route="/management/master-data/mappings",
+            capability=Capability.MANAGE_BUSINESS,
+        )
+        if denied is not None:
+            return denied
+        try:
+            identity = json.loads(
+                self._first(form, "platform_product_identity_json")
+            )
+            if not isinstance(identity, dict):
+                raise RuntimeMasterDataError("平台商品 identity 必须是 JSON 对象。")
+            candidates = tuple(
+                value.strip().upper()
+                for value in re.split(
+                    r"[,，\n]", self._first(form, "candidate_internal_skus")
+                )
+                if value.strip()
+            )
+            operation = self._first(form, "operation").strip().lower()
+            values = {
+                "mapping_id": self._first(form, "mapping_id"),
+                "platform_name": self._first(form, "platform_name"),
+                "account_id": self._first(form, "account_id"),
+                "platform_product_identity": identity,
+                "platform_product_name": self._first(
+                    form, "platform_product_name"
+                ),
+                "grade": self._first(form, "grade"),
+                "mapping_status": self._first(form, "mapping_status"),
+                "internal_sku": self._first(form, "internal_sku") or None,
+                "candidate_internal_skus": candidates,
+                "effective_from": self._first(form, "effective_from") or None,
+                "effective_to": self._first(form, "effective_to") or None,
+                "remark": self._first(form, "remark"),
+                "actor": session.principal.subject,
+                "idempotency_key": self._first(form, "idempotency_key"),
+            }
+            if operation == "create":
+                receipt = self.master_data_management.create_mapping(**values)
+            elif operation == "update":
+                receipt = self.master_data_management.update_mapping(
+                    **values,
+                    expected_version=int(self._first(form, "expected_version")),
+                )
+            else:
+                raise RuntimeMasterDataError("不支持的平台映射操作。")
+        except (json.JSONDecodeError, RuntimeMasterDataError, ValueError) as exc:
+            return self._control_error_redirect(
+                session.principal.subject,
+                "master_data_error",
+                str(exc) or "平台映射未修改。",
+            )
+        token = self.control_store.put(session.principal.subject, receipt)
+        return self._management_redirect("master_data_receipt", token)
 
     def _manual_task_preview(self, environ) -> Response:
         session, form, denied = self._management_write_context(

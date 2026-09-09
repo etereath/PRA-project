@@ -132,6 +132,8 @@ class TaskGenerationService:
             if (
                 generate_price_tasks
                 and product.sale_enabled
+                and product.current_stock is not None
+                and product.current_stock > 0
             ):
                 matched_price_rule_ids = [
                     rule.rule_id

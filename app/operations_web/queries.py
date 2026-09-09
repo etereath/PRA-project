@@ -2064,7 +2064,7 @@ class OperationsQueryService:
 
     def _load_products(self) -> tuple[list[Product], str]:
         try:
-            snapshot = self.master_data.snapshot()
+            snapshot = self.master_data.product_snapshot()
             products = list(snapshot.products)
             if snapshot.authority_mode == "PRE_CUTOVER":
                 products = self.inventory_provider.hydrate_products(products)

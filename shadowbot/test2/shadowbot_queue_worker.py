@@ -277,7 +277,7 @@ def _v4_price(value, name):
 
 
 def _v4_item_payload(platform_name, item):
-    return {
+    payload = {
         "platform_name": str(platform_name or "").strip(),
         "source_task_id": str(item.get("source_task_id") or "").strip(),
         "internal_sku": str(item.get("internal_sku") or "").strip().upper(),
@@ -288,6 +288,10 @@ def _v4_item_payload(platform_name, item):
         "expected_old_price": _v4_price(item.get("expected_old_price"), "expected_old_price"),
         "target_price": _v4_price(item.get("target_price"), "target_price"),
     }
+    identity_digest = str(item.get("platform_product_identity_digest") or "").strip()
+    if identity_digest:
+        payload["platform_product_identity_digest"] = identity_digest
+    return payload
 
 
 def _v4_manifest_hash(platform_name, items):

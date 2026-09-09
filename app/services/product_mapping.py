@@ -13,6 +13,12 @@ from uuid import uuid4
 
 from app.enums import ProductMappingStatus
 from app.exceptions import ValidationError
+from app.platform_product_identity import (
+    PlatformProductIdentityError,
+    canonical_identity_json,
+    identity_digest,
+    legacy_workbook_identity,
+)
 from app.repositories.workbook_repository import load_table_records
 
 
@@ -89,6 +95,7 @@ class CompiledProductMappings:
         observed_at: datetime,
         account_id: str = "",
         platform_product_identity: Mapping[str, object] | str | None = None,
+        platform_product_identity_digest: str = "",
     ) -> ProductMappingResolution:
         identity_key = (
             normalize_mapping_text(platform_name),
@@ -96,11 +103,19 @@ class CompiledProductMappings:
             normalize_mapping_text(grade),
         )
         normalized_account = str(account_id or "").strip()
-        product_identity_digest = (
-            _identity_digest(platform_product_identity)
-            if platform_product_identity is not None
-            else ""
-        )
+        supplied_digest = str(platform_product_identity_digest or "").strip()
+        if supplied_digest and platform_product_identity is not None:
+            raise ProductMappingError(
+                "provide platform_product_identity or its digest, not both"
+            )
+        if supplied_digest and not re.fullmatch(r"sha256:[0-9a-f]{64}", supplied_digest):
+            raise ProductMappingError("platform_product_identity_digest is invalid")
+        product_identity_digest = supplied_digest
+        if platform_product_identity is not None:
+            try:
+                product_identity_digest = identity_digest(platform_product_identity)
+            except PlatformProductIdentityError as exc:
+                raise ProductMappingError(str(exc)) from exc
         matches = tuple(
             record
             for record in self.records
@@ -250,9 +265,7 @@ def compile_product_mapping_rows(
         for record in sorted(
             records,
             key=lambda record: (
-                record.authority_identity_key
-                if record.account_id
-                else record.identity_key,
+                record.authority_identity_key,
                 record.effective_from or datetime.min.replace(
                     tzinfo=timezone.utc
                 ),
@@ -369,19 +382,20 @@ def _record_from_row(
             "later than effective_from"
         )
     account_id = str(row.get("account_id") or "").strip()
-    identity_json = _canonical_identity_json(
-        row.get("platform_product_identity_json")
-        or {
-            key: value
-            for key, value in {
-                "platform_product_id": row.get("platform_product_id"),
-                "platform_product_name": platform_product_name,
-                "grade": grade,
-            }.items()
-            if str(value or "").strip()
-        }
-    )
-    calculated_identity_digest = _identity_digest(identity_json)
+    identity_input = row.get("platform_product_identity_json")
+    if not identity_input:
+        identity_input = legacy_workbook_identity(
+            platform_product_id=row.get("platform_product_id"),
+            normalized_platform_product_name=normalized_name,
+            normalized_grade=normalize_mapping_text(grade),
+        )
+    try:
+        identity_json = canonical_identity_json(identity_input)
+        calculated_identity_digest = identity_digest(identity_json)
+    except PlatformProductIdentityError as exc:
+        raise ProductMappingError(
+            f"platform_mappings row {row_number}: {exc}"
+        ) from exc
     supplied_identity_digest = str(
         row.get("platform_product_identity_digest") or ""
     ).strip()
@@ -425,11 +439,7 @@ def _validate_records(records: list[ProductMappingRecord]) -> None:
     for index, left in enumerate(verified):
         for right in verified[index + 1 :]:
             if (
-                (
-                    left.authority_identity_key == right.authority_identity_key
-                    if left.account_id or right.account_id
-                    else left.identity_key == right.identity_key
-                )
+                left.authority_identity_key == right.authority_identity_key
                 and left.internal_sku != right.internal_sku
                 and _ranges_overlap(left, right)
             ):
@@ -497,37 +507,6 @@ def _candidate_skus(
     return tuple(
         sorted({str(item).strip().upper() for item in parsed if str(item).strip()})
     )
-
-
-def _canonical_identity_json(value: object) -> str:
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError as exc:
-            raise ProductMappingError(
-                "platform_product_identity_json must be valid JSON"
-            ) from exc
-    elif isinstance(value, Mapping):
-        parsed = dict(value)
-    else:
-        raise ProductMappingError("platform_product_identity must be an object")
-    if not isinstance(parsed, dict):
-        raise ProductMappingError("platform_product_identity must be an object")
-    normalized = {
-        str(key).strip(): str(item).strip()
-        for key, item in parsed.items()
-        if str(key).strip() and str(item).strip()
-    }
-    if not normalized:
-        raise ProductMappingError("platform_product_identity must not be empty")
-    return json.dumps(
-        normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
-
-
-def _identity_digest(value: object) -> str:
-    canonical = _canonical_identity_json(value)
-    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _required_text(

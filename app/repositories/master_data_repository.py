@@ -16,6 +16,11 @@ from decimal import Decimal
 from typing import TYPE_CHECKING, Iterable, Mapping
 
 from app.models import Product
+from app.platform_product_identity import (
+    PlatformProductIdentityError,
+    canonical_identity_json as _canonical_identity_json,
+    identity_digest as _identity_digest,
+)
 from app.services.product_mapping import (
     CompiledProductMappings,
     compile_product_mapping_rows,
@@ -139,8 +144,9 @@ SCHEMA_V19_SQL = (
         event_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
         event_id TEXT NOT NULL UNIQUE CHECK (trim(event_id) <> ''),
         event_type TEXT NOT NULL CHECK (event_type IN (
-            'IMPORT', 'CUTOVER', 'PRODUCT_MUTATION', 'MAPPING_MUTATION',
-            'PLATFORM_SIDE_EFFECT', 'ROLLBACK', 'RECUTOVER'
+            'IMPORT', 'CANDIDATE_REFRESH', 'SHADOW_COMPARE', 'CUTOVER',
+            'PRODUCT_MUTATION', 'MAPPING_MUTATION', 'PLATFORM_SIDE_EFFECT',
+            'ROLLBACK', 'RECUTOVER'
         )),
         authority_generation INTEGER NOT NULL CHECK (authority_generation >= 1),
         actor TEXT NOT NULL CHECK (trim(actor) <> ''),
@@ -446,32 +452,17 @@ class RuntimeMasterDataRepository:
 
 
 def canonical_identity_json(value: Mapping[str, object] | str) -> str:
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-        except json.JSONDecodeError as exc:
-            raise RuntimeMasterDataError(
-                "platform_product_identity_json must be canonical JSON."
-            ) from exc
-    else:
-        parsed = dict(value)
-    if not isinstance(parsed, dict) or not parsed:
-        raise RuntimeMasterDataError("platform_product_identity must be a non-empty object.")
-    normalized = {
-        str(key).strip(): str(item).strip()
-        for key, item in parsed.items()
-        if str(key).strip() and str(item).strip()
-    }
-    if not normalized:
-        raise RuntimeMasterDataError("platform_product_identity has no usable fields.")
-    return json.dumps(
-        normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
+    try:
+        return _canonical_identity_json(value)
+    except PlatformProductIdentityError as exc:
+        raise RuntimeMasterDataError(str(exc)) from exc
 
 
 def identity_digest(value: Mapping[str, object] | str) -> str:
-    canonical = canonical_identity_json(value)
-    return "sha256:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    try:
+        return _identity_digest(value)
+    except PlatformProductIdentityError as exc:
+        raise RuntimeMasterDataError(str(exc)) from exc
 
 
 def _rows_sha256(rows: Iterable[object]) -> str:

@@ -49,6 +49,14 @@ class MasterDataShadowComparison:
     product_count: int
     mapping_count: int
     differences: tuple[str, ...]
+    authority_generation: int
+    product_snapshot_sha256: str
+    mapping_snapshot_sha256: str
+    products_workbook_sha256: str
+    mappings_workbook_sha256: str
+    account_bindings_sha256: str
+    receipt_sha256: str
+    event_sequence: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +111,76 @@ class MasterDataManagementService:
         actor: str,
         idempotency_key: str,
     ) -> MasterDataWriteReceipt:
+        return self._write_workbook_candidate(
+            products_workbook=products_workbook,
+            platform_mappings_workbook=platform_mappings_workbook,
+            account_id_by_platform=account_id_by_platform,
+            expected_request_sha256=expected_request_sha256,
+            actor=actor,
+            idempotency_key=idempotency_key,
+            refresh=False,
+        )
+
+    def preview_candidate_refresh(
+        self,
+        *,
+        products_workbook: Path,
+        platform_mappings_workbook: Path,
+        account_id_by_platform: Mapping[str, str],
+    ) -> MasterDataImportPreview:
+        products, mappings, products_sha, mappings_sha = _read_workbooks(
+            products_workbook,
+            platform_mappings_workbook,
+            account_id_by_platform,
+        )
+        payload = _import_payload(
+            products,
+            mappings,
+            products_sha,
+            mappings_sha,
+            account_id_by_platform,
+            operation="CANDIDATE_REFRESH",
+        )
+        return MasterDataImportPreview(
+            product_count=len(products),
+            mapping_count=len(mappings),
+            account_ids=tuple(sorted(set(account_id_by_platform.values()))),
+            products_workbook_sha256=products_sha,
+            mappings_workbook_sha256=mappings_sha,
+            request_sha256=_payload_sha256(payload),
+        )
+
+    def refresh_candidate_from_workbooks(
+        self,
+        *,
+        products_workbook: Path,
+        platform_mappings_workbook: Path,
+        account_id_by_platform: Mapping[str, str],
+        expected_request_sha256: str,
+        actor: str,
+        idempotency_key: str,
+    ) -> MasterDataWriteReceipt:
+        return self._write_workbook_candidate(
+            products_workbook=products_workbook,
+            platform_mappings_workbook=platform_mappings_workbook,
+            account_id_by_platform=account_id_by_platform,
+            expected_request_sha256=expected_request_sha256,
+            actor=actor,
+            idempotency_key=idempotency_key,
+            refresh=True,
+        )
+
+    def _write_workbook_candidate(
+        self,
+        *,
+        products_workbook: Path,
+        platform_mappings_workbook: Path,
+        account_id_by_platform: Mapping[str, str],
+        expected_request_sha256: str,
+        actor: str,
+        idempotency_key: str,
+        refresh: bool,
+    ) -> MasterDataWriteReceipt:
         health = self.runtime.check_schema_health()
         if not health.ok:
             raise RuntimeMasterDataError(
@@ -116,8 +194,14 @@ class MasterDataManagementService:
             platform_mappings_workbook,
             account_id_by_platform,
         )
+        operation = "CANDIDATE_REFRESH" if refresh else "IMPORT"
         payload = _import_payload(
-            products, mappings, products_sha, mappings_sha, account_id_by_platform
+            products,
+            mappings,
+            products_sha,
+            mappings_sha,
+            account_id_by_platform,
+            operation=operation,
         )
         request_sha = _payload_sha256(payload)
         if request_sha != str(expected_request_sha256 or "").strip():
@@ -129,25 +213,38 @@ class MasterDataManagementService:
             )
             if replay:
                 connection.rollback()
-                return self._receipt("REPLAYED", "IMPORT", normalized_key, 1)
+                return self._receipt("REPLAYED", operation, normalized_key, 1)
             state = self.repository.authority_state(connection=connection)
-            if state.authority_mode != "PRE_CUTOVER" or state.generation != 0:
+            if state.authority_mode != "PRE_CUTOVER":
                 raise RuntimeMasterDataError(
-                    "Initial workbook import requires an empty PRE_CUTOVER candidate."
+                    "Workbook candidate writes require PRE_CUTOVER authority."
                 )
-            if connection.execute("SELECT 1 FROM product_catalog LIMIT 1").fetchone():
-                raise RuntimeMasterDataError("Runtime Product candidate is not empty.")
-            if connection.execute(
+            has_products = connection.execute(
+                "SELECT 1 FROM product_catalog LIMIT 1"
+            ).fetchone() is not None
+            has_mappings = connection.execute(
                 "SELECT 1 FROM platform_product_mappings LIMIT 1"
-            ).fetchone():
-                raise RuntimeMasterDataError("Runtime Mapping candidate is not empty.")
-            generation = 1
+            ).fetchone() is not None
+            if refresh:
+                if state.generation < 1 or not has_products or not has_mappings:
+                    raise RuntimeMasterDataError(
+                        "Candidate refresh requires an existing PRE_CUTOVER candidate."
+                    )
+                connection.execute("DELETE FROM platform_product_mappings")
+                connection.execute("DELETE FROM product_catalog")
+                generation = state.generation + 1
+            else:
+                if state.generation != 0 or has_products or has_mappings:
+                    raise RuntimeMasterDataError(
+                        "Initial workbook import requires an empty PRE_CUTOVER candidate."
+                    )
+                generation = 1
             now = utc_text()
             for product in products:
                 _insert_product(
                     connection,
                     product,
-                    source_type="WORKBOOK_IMPORT",
+                    source_type=operation,
                     source_ref="products-workbook:" + products_sha,
                     source_sha256=products_sha,
                     version=1,
@@ -160,7 +257,7 @@ class MasterDataManagementService:
                 _insert_mapping(
                     connection,
                     mapping,
-                    source_type="WORKBOOK_IMPORT",
+                    source_type=operation,
                     source_ref="platform-mappings-workbook:" + mappings_sha,
                     source_sha256=mappings_sha,
                     version=1,
@@ -181,19 +278,23 @@ class MasterDataManagementService:
             )
             _insert_event(
                 connection,
-                event_type="IMPORT",
+                event_type=operation,
                 generation=generation,
                 actor=normalized_actor,
                 idempotency_key=normalized_key,
                 request_sha256=request_sha,
-                source_ref="controlled-workbook-import",
+                source_ref=(
+                    "controlled-candidate-refresh"
+                    if refresh
+                    else "controlled-workbook-import"
+                ),
                 payload=payload,
                 created_at=now,
             )
             connection.commit()
         return MasterDataWriteReceipt(
             "APPLIED",
-            "IMPORT",
+            operation,
             normalized_key,
             1,
             generation,
@@ -207,10 +308,14 @@ class MasterDataManagementService:
         products_workbook: Path,
         platform_mappings_workbook: Path,
         account_id_by_platform: Mapping[str, str],
+        actor: str,
+        idempotency_key: str,
     ) -> MasterDataShadowComparison:
         """Compare business semantics without treating workbook inventory as Product."""
 
-        products, mappings, _, _ = _read_workbooks(
+        normalized_actor = _required_text(actor, "actor")
+        normalized_key = _required_text(idempotency_key, "idempotency_key")
+        products, mappings, products_sha, mappings_sha = _read_workbooks(
             products_workbook,
             platform_mappings_workbook,
             account_id_by_platform,
@@ -218,27 +323,89 @@ class MasterDataManagementService:
         expected_products = {
             _product_business_tuple(product) for product in products
         }
-        actual_products = {
-            _product_business_tuple(product)
-            for product in self.repository.list_products()
-        }
         expected_mappings = {
             _mapping_business_tuple(record) for record in mappings
         }
-        actual_mappings = {
-            _mapping_business_tuple(record)
-            for record in self.repository.list_mapping_records()
-        }
-        differences: list[str] = []
-        if expected_products != actual_products:
-            differences.append("PRODUCT_SEMANTICS_DIFFER")
-        if expected_mappings != actual_mappings:
-            differences.append("MAPPING_SEMANTICS_DIFFER")
+        account_bindings = _normalized_account_bindings(account_id_by_platform)
+        account_bindings_sha = _payload_sha256(account_bindings)
+        with self.runtime.connect_write() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            state = self.repository.authority_state(connection=connection)
+            if state.authority_mode != "PRE_CUTOVER" or state.generation < 1:
+                raise RuntimeMasterDataError(
+                    "Shadow compare requires an imported PRE_CUTOVER candidate."
+                )
+            actual_products = {
+                _product_business_tuple(product)
+                for product in self.repository.list_products(connection=connection)
+            }
+            actual_mappings = {
+                _mapping_business_tuple(record)
+                for record in self.repository.list_mapping_records(
+                    connection=connection
+                )
+            }
+            product_digest = self.repository.product_snapshot_sha256(
+                connection=connection
+            )
+            mapping_digest = self.repository.mapping_snapshot_sha256(
+                connection=connection
+            )
+            differences: list[str] = []
+            if expected_products != actual_products:
+                differences.append("PRODUCT_SEMANTICS_DIFFER")
+            if expected_mappings != actual_mappings:
+                differences.append("MAPPING_SEMANTICS_DIFFER")
+            payload = {
+                "operation": "SHADOW_COMPARE",
+                "matched": not differences,
+                "differences": differences,
+                "authority_generation": state.generation,
+                "product_snapshot_sha256": product_digest,
+                "mapping_snapshot_sha256": mapping_digest,
+                "products_workbook_sha256": products_sha,
+                "mappings_workbook_sha256": mappings_sha,
+                "account_bindings": account_bindings,
+                "account_bindings_sha256": account_bindings_sha,
+            }
+            receipt_sha = _payload_sha256(payload)
+            replay = _event_replay(
+                connection, normalized_actor, normalized_key, receipt_sha
+            )
+            if replay:
+                row = connection.execute(
+                    "SELECT event_sequence FROM master_data_authority_events "
+                    "WHERE actor = ? AND idempotency_key = ?",
+                    (normalized_actor, normalized_key),
+                ).fetchone()
+                event_sequence = int(row["event_sequence"])
+                connection.rollback()
+            else:
+                event_sequence = _insert_event(
+                    connection,
+                    event_type="SHADOW_COMPARE",
+                    generation=state.generation,
+                    actor=normalized_actor,
+                    idempotency_key=normalized_key,
+                    request_sha256=receipt_sha,
+                    source_ref="controlled-workbook-shadow-compare",
+                    payload=payload,
+                    created_at=utc_text(),
+                )
+                connection.commit()
         return MasterDataShadowComparison(
             matched=not differences,
             product_count=len(actual_products),
             mapping_count=len(actual_mappings),
             differences=tuple(differences),
+            authority_generation=state.generation,
+            product_snapshot_sha256=product_digest,
+            mapping_snapshot_sha256=mapping_digest,
+            products_workbook_sha256=products_sha,
+            mappings_workbook_sha256=mappings_sha,
+            account_bindings_sha256=account_bindings_sha,
+            receipt_sha256=receipt_sha,
+            event_sequence=event_sequence,
         )
 
     def activate_runtime_authority(
@@ -246,6 +413,10 @@ class MasterDataManagementService:
         *,
         expected_product_snapshot_sha256: str,
         expected_mapping_snapshot_sha256: str,
+        products_workbook: Path,
+        platform_mappings_workbook: Path,
+        account_id_by_platform: Mapping[str, str],
+        expected_shadow_compare_receipt_sha256: str,
         actor: str,
         idempotency_key: str,
         confirmation: str,
@@ -254,10 +425,24 @@ class MasterDataManagementService:
             raise RuntimeMasterDataError("Explicit Runtime authority confirmation is missing.")
         normalized_actor = _required_text(actor, "actor")
         normalized_key = _required_text(idempotency_key, "idempotency_key")
+        _, _, products_sha, mappings_sha = _read_workbooks(
+            products_workbook,
+            platform_mappings_workbook,
+            account_id_by_platform,
+        )
+        account_bindings = _normalized_account_bindings(account_id_by_platform)
+        receipt_sha = _required_text(
+            expected_shadow_compare_receipt_sha256,
+            "expected_shadow_compare_receipt_sha256",
+        )
         payload = {
             "operation": "CUTOVER",
             "product_snapshot_sha256": expected_product_snapshot_sha256,
             "mapping_snapshot_sha256": expected_mapping_snapshot_sha256,
+            "shadow_compare_receipt_sha256": receipt_sha,
+            "products_workbook_sha256": products_sha,
+            "mappings_workbook_sha256": mappings_sha,
+            "account_bindings": account_bindings,
         }
         request_sha = _payload_sha256(payload)
         with self.runtime.connect_write() as connection:
@@ -295,6 +480,51 @@ class MasterDataManagementService:
                 "SELECT 1 FROM platform_product_mappings LIMIT 1"
             ).fetchone():
                 raise RuntimeMasterDataError("Mapping candidate must not be empty.")
+            compare_row = connection.execute(
+                "SELECT event_sequence, authority_generation, payload_json "
+                "FROM master_data_authority_events "
+                "WHERE event_type = 'SHADOW_COMPARE' AND request_sha256 = ? "
+                "ORDER BY event_sequence DESC LIMIT 1",
+                (receipt_sha,),
+            ).fetchone()
+            if compare_row is None:
+                raise RuntimeMasterDataError(
+                    "Cutover requires a successful shadow-compare receipt."
+                )
+            try:
+                compare_payload = json.loads(str(compare_row["payload_json"]))
+            except json.JSONDecodeError as exc:
+                raise RuntimeMasterDataError(
+                    "Shadow-compare receipt payload is invalid."
+                ) from exc
+            last_rollback = connection.execute(
+                "SELECT max(event_sequence) AS event_sequence "
+                "FROM master_data_authority_events WHERE event_type = 'ROLLBACK'"
+            ).fetchone()
+            last_rollback_sequence = int(last_rollback["event_sequence"] or 0)
+            expected_compare = {
+                "operation": "SHADOW_COMPARE",
+                "matched": True,
+                "differences": [],
+                "authority_generation": state.generation,
+                "product_snapshot_sha256": product_digest,
+                "mapping_snapshot_sha256": mapping_digest,
+                "products_workbook_sha256": products_sha,
+                "mappings_workbook_sha256": mappings_sha,
+                "account_bindings": account_bindings,
+            }
+            if (
+                int(compare_row["authority_generation"]) != state.generation
+                or int(compare_row["event_sequence"]) <= last_rollback_sequence
+                or _payload_sha256(compare_payload) != receipt_sha
+                or any(
+                    compare_payload.get(key) != value
+                    for key, value in expected_compare.items()
+                )
+            ):
+                raise RuntimeMasterDataError(
+                    "Shadow-compare receipt is stale or does not match current sources."
+                )
             now = utc_text()
             is_recutover = connection.execute(
                 "SELECT 1 FROM master_data_authority_events "
@@ -1041,18 +1271,29 @@ def _import_payload(
     products_sha: str,
     mappings_sha: str,
     account_id_by_platform: Mapping[str, str],
+    *,
+    operation: str = "IMPORT",
 ) -> dict[str, object]:
     return {
-        "operation": "IMPORT",
+        "operation": operation,
         "product_count": len(products),
         "mapping_count": len(mappings),
         "products_workbook_sha256": products_sha,
         "mappings_workbook_sha256": mappings_sha,
-        "account_bindings": sorted(
-            (str(platform).strip(), str(account).strip())
-            for platform, account in account_id_by_platform.items()
-        ),
+        "account_bindings": _normalized_account_bindings(account_id_by_platform),
     }
+
+
+def _normalized_account_bindings(
+    account_id_by_platform: Mapping[str, str],
+) -> list[list[str]]:
+    return [
+        [str(platform).strip(), str(account).strip()]
+        for platform, account in sorted(
+            account_id_by_platform.items(),
+            key=lambda item: (str(item[0]).strip(), str(item[1]).strip()),
+        )
+    ]
 
 
 def _insert_product(

@@ -32,18 +32,29 @@ def build_parser() -> argparse.ArgumentParser:
     preview = subparsers.add_parser("preview")
     _add_import_sources(preview)
 
+    refresh_preview = subparsers.add_parser("refresh-preview")
+    _add_import_sources(refresh_preview)
+
     import_command = subparsers.add_parser("import")
     _add_import_sources(import_command)
     _add_actor_and_key(import_command)
     import_command.add_argument("--expected-request-sha256", required=True)
 
+    refresh = subparsers.add_parser("refresh")
+    _add_import_sources(refresh)
+    _add_actor_and_key(refresh)
+    refresh.add_argument("--expected-request-sha256", required=True)
+
     compare = subparsers.add_parser("shadow-compare")
     _add_import_sources(compare)
+    _add_actor_and_key(compare)
 
     cutover = subparsers.add_parser("cutover")
+    _add_import_sources(cutover)
     _add_actor_and_key(cutover)
     cutover.add_argument("--expected-product-snapshot-sha256", required=True)
     cutover.add_argument("--expected-mapping-snapshot-sha256", required=True)
+    cutover.add_argument("--expected-shadow-compare-receipt-sha256", required=True)
     cutover.add_argument("--confirmation", required=True, help=CUTOVER_CONFIRMATION)
 
     rollback = subparsers.add_parser("rollback")
@@ -69,8 +80,23 @@ def main(argv: list[str] | None = None) -> int:
             platform_mappings_workbook=args.platform_mappings,
             account_id_by_platform=_accounts(args.account),
         )
+    elif args.command == "refresh-preview":
+        result = service.preview_candidate_refresh(
+            products_workbook=args.products,
+            platform_mappings_workbook=args.platform_mappings,
+            account_id_by_platform=_accounts(args.account),
+        )
     elif args.command == "import":
         result = service.import_from_workbooks(
+            products_workbook=args.products,
+            platform_mappings_workbook=args.platform_mappings,
+            account_id_by_platform=_accounts(args.account),
+            expected_request_sha256=args.expected_request_sha256,
+            actor=args.actor,
+            idempotency_key=args.idempotency_key,
+        )
+    elif args.command == "refresh":
+        result = service.refresh_candidate_from_workbooks(
             products_workbook=args.products,
             platform_mappings_workbook=args.platform_mappings,
             account_id_by_platform=_accounts(args.account),
@@ -83,11 +109,19 @@ def main(argv: list[str] | None = None) -> int:
             products_workbook=args.products,
             platform_mappings_workbook=args.platform_mappings,
             account_id_by_platform=_accounts(args.account),
+            actor=args.actor,
+            idempotency_key=args.idempotency_key,
         )
     elif args.command == "cutover":
         result = service.activate_runtime_authority(
             expected_product_snapshot_sha256=args.expected_product_snapshot_sha256,
             expected_mapping_snapshot_sha256=args.expected_mapping_snapshot_sha256,
+            products_workbook=args.products,
+            platform_mappings_workbook=args.platform_mappings,
+            account_id_by_platform=_accounts(args.account),
+            expected_shadow_compare_receipt_sha256=(
+                args.expected_shadow_compare_receipt_sha256
+            ),
             actor=args.actor,
             idempotency_key=args.idempotency_key,
             confirmation=args.confirmation,

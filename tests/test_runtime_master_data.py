@@ -5,12 +5,14 @@ import json
 
 import pytest
 
+from app.exceptions import ValidationError
 from app.repositories.master_data_repository import (
     RuntimeMasterDataError,
     RuntimeMasterDataRepository,
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.repositories.workbook_repository import save_table_records
+from app.repositories.workbook_repository import load_products, save_table_records
+from app.platform_product_identity import PLATFORM_PRODUCT_IDENTITY_SCHEMA_VERSION
 from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION
 from app.services.master_data_management import (
     CUTOVER_CONFIRMATION,
@@ -18,6 +20,10 @@ from app.services.master_data_management import (
     MasterDataManagementService,
 )
 from app.services.runtime_master_data import RuntimeMasterDataProvider
+from app.services.shadowbot_commit_batch import (
+    build_commit_manifest,
+    load_identity_mapping,
+)
 
 
 PLATFORM = "测试平台"
@@ -92,6 +98,35 @@ def _import_candidate(runtime, products, mappings):
     return service, preview, receipt
 
 
+def _activate_candidate(
+    service,
+    imported,
+    products,
+    mappings,
+    *,
+    cutover_key="cutover-1",
+):
+    comparison = service.shadow_compare_workbooks(
+        products_workbook=products,
+        platform_mappings_workbook=mappings,
+        account_id_by_platform={PLATFORM: ACCOUNT},
+        actor="owner",
+        idempotency_key="compare:" + cutover_key,
+    )
+    assert comparison.matched
+    return service.activate_runtime_authority(
+        expected_product_snapshot_sha256=imported.product_snapshot_sha256,
+        expected_mapping_snapshot_sha256=imported.mapping_snapshot_sha256,
+        products_workbook=products,
+        platform_mappings_workbook=mappings,
+        account_id_by_platform={PLATFORM: ACCOUNT},
+        expected_shadow_compare_receipt_sha256=comparison.receipt_sha256,
+        actor="owner",
+        idempotency_key=cutover_key,
+        confirmation=CUTOVER_CONFIRMATION,
+    )
+
+
 def test_v19_additive_schema_preserves_v18_history_and_starts_pre_cutover(tmp_path):
     runtime = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
     runtime.init_schema()
@@ -130,6 +165,8 @@ def test_import_keeps_inventory_uninitialized_and_mapping_account_scoped(tmp_pat
         products_workbook=products,
         platform_mappings_workbook=mappings,
         account_id_by_platform={PLATFORM: ACCOUNT},
+        actor="tester",
+        idempotency_key="compare-1",
     )
     assert comparison.matched
     assert comparison.differences == ()
@@ -151,13 +188,7 @@ def test_cutover_disables_workbook_fallback_and_binds_runtime_digests(tmp_path):
     runtime.init_schema()
     products, mappings = _sources(tmp_path)
     service, _, imported = _import_candidate(runtime, products, mappings)
-    service.activate_runtime_authority(
-        expected_product_snapshot_sha256=imported.product_snapshot_sha256,
-        expected_mapping_snapshot_sha256=imported.mapping_snapshot_sha256,
-        actor="owner",
-        idempotency_key="cutover-1",
-        confirmation=CUTOVER_CONFIRMATION,
-    )
+    _activate_candidate(service, imported, products, mappings)
     products.unlink()
     mappings.unlink()
 
@@ -181,13 +212,7 @@ def test_rollback_is_blocked_after_authoritative_product_mutation(tmp_path):
     runtime.init_schema()
     products, mappings = _sources(tmp_path)
     service, _, imported = _import_candidate(runtime, products, mappings)
-    service.activate_runtime_authority(
-        expected_product_snapshot_sha256=imported.product_snapshot_sha256,
-        expected_mapping_snapshot_sha256=imported.mapping_snapshot_sha256,
-        actor="owner",
-        idempotency_key="cutover-1",
-        confirmation=CUTOVER_CONFIRMATION,
-    )
+    _activate_candidate(service, imported, products, mappings)
     created = service.create_product(
         internal_sku="SKU-NEW",
         product_name="卡布奇诺",
@@ -217,13 +242,7 @@ def test_safe_rollback_before_new_mutation_is_explicit_and_idempotent(tmp_path):
     runtime.init_schema()
     products, mappings = _sources(tmp_path)
     service, _, imported = _import_candidate(runtime, products, mappings)
-    service.activate_runtime_authority(
-        expected_product_snapshot_sha256=imported.product_snapshot_sha256,
-        expected_mapping_snapshot_sha256=imported.mapping_snapshot_sha256,
-        actor="owner",
-        idempotency_key="cutover-1",
-        confirmation=CUTOVER_CONFIRMATION,
-    )
+    _activate_candidate(service, imported, products, mappings)
     first = service.rollback_to_workbook_authority(
         actor="owner",
         idempotency_key="rollback-1",
@@ -237,12 +256,12 @@ def test_safe_rollback_before_new_mutation_is_explicit_and_idempotent(tmp_path):
     assert first.status == "APPLIED"
     assert replay.status == "REPLAYED"
     assert RuntimeMasterDataRepository(runtime).authority_state().authority_mode == "PRE_CUTOVER"
-    recutover = service.activate_runtime_authority(
-        expected_product_snapshot_sha256=imported.product_snapshot_sha256,
-        expected_mapping_snapshot_sha256=imported.mapping_snapshot_sha256,
-        actor="owner",
-        idempotency_key="recutover-1",
-        confirmation=CUTOVER_CONFIRMATION,
+    recutover = _activate_candidate(
+        service,
+        imported,
+        products,
+        mappings,
+        cutover_key="recutover-1",
     )
     assert recutover.status == "APPLIED"
     with pytest.raises(RuntimeMasterDataError, match="no longer matches"):
@@ -253,18 +272,195 @@ def test_safe_rollback_before_new_mutation_is_explicit_and_idempotent(tmp_path):
         )
 
 
+def test_cutover_rejects_mismatch_then_accepts_audited_candidate_refresh(tmp_path):
+    runtime = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
+    runtime.init_schema()
+    products, mappings = _sources(tmp_path)
+    service, _, imported = _import_candidate(runtime, products, mappings)
+    rows = load_products(products)
+    changed = rows[0]
+    save_table_records(
+        "products",
+        products,
+        [
+            {
+                "internal_sku": changed.internal_sku,
+                "product_name": changed.product_name,
+                "grade": changed.grade,
+                "stem_length": changed.stem_length,
+                "unit": changed.unit,
+                "base_cost": "11.25",
+                "current_stock": str(changed.current_stock),
+                "sale_enabled": "true",
+                "last_price": "",
+                "recommended_price": "",
+                "remark": changed.remark,
+                "feature_season": "",
+                "feature_color": "",
+            }
+        ],
+    )
+    mismatch = service.shadow_compare_workbooks(
+        products_workbook=products,
+        platform_mappings_workbook=mappings,
+        account_id_by_platform={PLATFORM: ACCOUNT},
+        actor="owner",
+        idempotency_key="compare-mismatch",
+    )
+    assert not mismatch.matched
+    with pytest.raises(RuntimeMasterDataError, match="stale|successful"):
+        service.activate_runtime_authority(
+            expected_product_snapshot_sha256=imported.product_snapshot_sha256,
+            expected_mapping_snapshot_sha256=imported.mapping_snapshot_sha256,
+            products_workbook=products,
+            platform_mappings_workbook=mappings,
+            account_id_by_platform={PLATFORM: ACCOUNT},
+            expected_shadow_compare_receipt_sha256=mismatch.receipt_sha256,
+            actor="owner",
+            idempotency_key="cutover-mismatch",
+            confirmation=CUTOVER_CONFIRMATION,
+        )
+
+    preview = service.preview_candidate_refresh(
+        products_workbook=products,
+        platform_mappings_workbook=mappings,
+        account_id_by_platform={PLATFORM: ACCOUNT},
+    )
+    refreshed = service.refresh_candidate_from_workbooks(
+        products_workbook=products,
+        platform_mappings_workbook=mappings,
+        account_id_by_platform={PLATFORM: ACCOUNT},
+        expected_request_sha256=preview.request_sha256,
+        actor="owner",
+        idempotency_key="refresh-1",
+    )
+    assert refreshed.authority_generation == 2
+    comparison = service.shadow_compare_workbooks(
+        products_workbook=products,
+        platform_mappings_workbook=mappings,
+        account_id_by_platform={PLATFORM: ACCOUNT},
+        actor="owner",
+        idempotency_key="compare-refreshed",
+    )
+    assert comparison.matched
+    result = service.activate_runtime_authority(
+        expected_product_snapshot_sha256=refreshed.product_snapshot_sha256,
+        expected_mapping_snapshot_sha256=refreshed.mapping_snapshot_sha256,
+        products_workbook=products,
+        platform_mappings_workbook=mappings,
+        account_id_by_platform={PLATFORM: ACCOUNT},
+        expected_shadow_compare_receipt_sha256=comparison.receipt_sha256,
+        actor="owner",
+        idempotency_key="cutover-refreshed",
+        confirmation=CUTOVER_CONFIRMATION,
+    )
+    assert result.status == "APPLIED"
+
+
+def test_rollback_requires_fresh_compare_and_refresh_after_workbook_change(tmp_path):
+    runtime = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
+    runtime.init_schema()
+    products, mappings = _sources(tmp_path)
+    service, _, imported = _import_candidate(runtime, products, mappings)
+    initial_compare = service.shadow_compare_workbooks(
+        products_workbook=products,
+        platform_mappings_workbook=mappings,
+        account_id_by_platform={PLATFORM: ACCOUNT},
+        actor="owner",
+        idempotency_key="compare-initial",
+    )
+    service.activate_runtime_authority(
+        expected_product_snapshot_sha256=imported.product_snapshot_sha256,
+        expected_mapping_snapshot_sha256=imported.mapping_snapshot_sha256,
+        products_workbook=products,
+        platform_mappings_workbook=mappings,
+        account_id_by_platform={PLATFORM: ACCOUNT},
+        expected_shadow_compare_receipt_sha256=initial_compare.receipt_sha256,
+        actor="owner",
+        idempotency_key="cutover-initial",
+        confirmation=CUTOVER_CONFIRMATION,
+    )
+    service.rollback_to_workbook_authority(
+        actor="owner",
+        idempotency_key="rollback-initial",
+        confirmation=ROLLBACK_CONFIRMATION,
+    )
+    changed = load_products(products)[0]
+    save_table_records(
+        "products",
+        products,
+        [
+            {
+                "internal_sku": changed.internal_sku,
+                "product_name": changed.product_name,
+                "grade": changed.grade,
+                "stem_length": changed.stem_length,
+                "unit": changed.unit,
+                "base_cost": "12.00",
+                "current_stock": str(changed.current_stock),
+                "sale_enabled": "true",
+                "last_price": "",
+                "recommended_price": "",
+                "remark": changed.remark,
+                "feature_season": "",
+                "feature_color": "",
+            }
+        ],
+    )
+
+    with pytest.raises(RuntimeMasterDataError, match="stale"):
+        service.activate_runtime_authority(
+            expected_product_snapshot_sha256=imported.product_snapshot_sha256,
+            expected_mapping_snapshot_sha256=imported.mapping_snapshot_sha256,
+            products_workbook=products,
+            platform_mappings_workbook=mappings,
+            account_id_by_platform={PLATFORM: ACCOUNT},
+            expected_shadow_compare_receipt_sha256=initial_compare.receipt_sha256,
+            actor="owner",
+            idempotency_key="recutover-stale",
+            confirmation=CUTOVER_CONFIRMATION,
+        )
+    refresh_preview = service.preview_candidate_refresh(
+        products_workbook=products,
+        platform_mappings_workbook=mappings,
+        account_id_by_platform={PLATFORM: ACCOUNT},
+    )
+    refreshed = service.refresh_candidate_from_workbooks(
+        products_workbook=products,
+        platform_mappings_workbook=mappings,
+        account_id_by_platform={PLATFORM: ACCOUNT},
+        expected_request_sha256=refresh_preview.request_sha256,
+        actor="owner",
+        idempotency_key="refresh-after-rollback",
+    )
+    comparison = service.shadow_compare_workbooks(
+        products_workbook=products,
+        platform_mappings_workbook=mappings,
+        account_id_by_platform={PLATFORM: ACCOUNT},
+        actor="owner",
+        idempotency_key="compare-after-rollback",
+    )
+    assert comparison.matched
+    recutover = service.activate_runtime_authority(
+        expected_product_snapshot_sha256=refreshed.product_snapshot_sha256,
+        expected_mapping_snapshot_sha256=refreshed.mapping_snapshot_sha256,
+        products_workbook=products,
+        platform_mappings_workbook=mappings,
+        account_id_by_platform={PLATFORM: ACCOUNT},
+        expected_shadow_compare_receipt_sha256=comparison.receipt_sha256,
+        actor="owner",
+        idempotency_key="recutover-fresh",
+        confirmation=CUTOVER_CONFIRMATION,
+    )
+    assert recutover.authority_generation == 2
+
+
 def test_mapping_write_is_account_scoped_and_rejects_overlapping_conflict(tmp_path):
     runtime = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
     runtime.init_schema()
     products, mappings = _sources(tmp_path)
     service, _, imported = _import_candidate(runtime, products, mappings)
-    service.activate_runtime_authority(
-        expected_product_snapshot_sha256=imported.product_snapshot_sha256,
-        expected_mapping_snapshot_sha256=imported.mapping_snapshot_sha256,
-        actor="owner",
-        idempotency_key="cutover-1",
-        confirmation=CUTOVER_CONFIRMATION,
-    )
+    _activate_candidate(service, imported, products, mappings)
     service.create_product(
         internal_sku="SKU-002",
         product_name="艾莎",
@@ -278,9 +474,9 @@ def test_mapping_write_is_account_scoped_and_rejects_overlapping_conflict(tmp_pa
         idempotency_key="product-create-2",
     )
     identity = {
-        "platform_product_id": "platform-product-1",
-        "platform_product_name": "艾莎",
-        "grade": "A级",
+        "schema_version": PLATFORM_PRODUCT_IDENTITY_SCHEMA_VERSION,
+        "identity_type": "stable_platform_product_id",
+        "components": {"platform_product_id": "platform-product-1"},
     }
     other_account = service.create_mapping(
         mapping_id="MAP-OTHER-ACCOUNT",
@@ -315,13 +511,7 @@ def test_runtime_mapping_derives_generation_bound_shadowbot_locator(tmp_path):
     runtime.init_schema()
     products, mappings = _sources(tmp_path)
     service, _, imported = _import_candidate(runtime, products, mappings)
-    service.activate_runtime_authority(
-        expected_product_snapshot_sha256=imported.product_snapshot_sha256,
-        expected_mapping_snapshot_sha256=imported.mapping_snapshot_sha256,
-        actor="owner",
-        idempotency_key="cutover-1",
-        confirmation=CUTOVER_CONFIRMATION,
-    )
+    _activate_candidate(service, imported, products, mappings)
     locator = tmp_path / "runtime" / "shadowbot-locator.json"
     provider = RuntimeMasterDataProvider(
         runtime,
@@ -340,14 +530,40 @@ def test_runtime_mapping_derives_generation_bound_shadowbot_locator(tmp_path):
     assert payload["authority_generation"] == 1
     assert payload["mapping_snapshot_sha256"] == imported.mapping_snapshot_sha256
     assert payload["artifact_payload_sha256"].startswith("sha256:")
-    assert payload["mappings"] == [
-        {
-            "expected_grade": "A级",
-            "expected_product_name": "艾莎",
-            "internal_sku": "SKU-001",
-            "status": "active",
-        }
-    ]
+    assert payload["mappings"][0]["expected_grade"] == "A级"
+    assert payload["mappings"][0]["expected_product_name"] == "艾莎"
+    assert payload["mappings"][0]["internal_sku"] == "SKU-001"
+    assert payload["mappings"][0]["status"] == "active"
+    assert payload["mappings"][0]["platform_product_identity_digest"].startswith(
+        "sha256:"
+    )
+    assert json.loads(
+        payload["mappings"][0]["platform_product_identity_json"]
+    )["components"] == {"platform_product_id": "platform-product-1"}
+    execution_mapping = load_identity_mapping(locator)
+    manifest = build_commit_manifest(
+        batch_id="BATCH-RUNTIME-IDENTITY",
+        task_items=[
+            {
+                "source_task_id": "TASK-RUNTIME-IDENTITY",
+                "internal_sku": "SKU-001",
+                "expected_old_price": "10.00",
+                "target_price": "11.00",
+            }
+        ],
+        identity_mapping=execution_mapping,
+        platform_name=PLATFORM,
+    )
+    assert manifest["items"][0]["platform_product_identity_digest"] == (
+        payload["mappings"][0]["platform_product_identity_digest"]
+    )
+    payload["mappings"][0]["platform_product_identity_digest"] = "sha256:" + "0" * 64
+    locator.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValidationError, match="身份摘要不匹配"):
+        load_identity_mapping(locator)
 
 
 def test_product_update_requires_expected_version_and_keeps_inventory_separate(
@@ -357,13 +573,7 @@ def test_product_update_requires_expected_version_and_keeps_inventory_separate(
     runtime.init_schema()
     products, mappings = _sources(tmp_path)
     service, _, imported = _import_candidate(runtime, products, mappings)
-    service.activate_runtime_authority(
-        expected_product_snapshot_sha256=imported.product_snapshot_sha256,
-        expected_mapping_snapshot_sha256=imported.mapping_snapshot_sha256,
-        actor="owner",
-        idempotency_key="cutover-1",
-        confirmation=CUTOVER_CONFIRMATION,
-    )
+    _activate_candidate(service, imported, products, mappings)
 
     receipt = service.update_product(
         internal_sku="SKU-001",
@@ -406,13 +616,7 @@ def test_platform_side_effect_boundary_blocks_workbook_rollback(tmp_path):
     runtime.init_schema()
     products, mappings = _sources(tmp_path)
     service, _, imported = _import_candidate(runtime, products, mappings)
-    service.activate_runtime_authority(
-        expected_product_snapshot_sha256=imported.product_snapshot_sha256,
-        expected_mapping_snapshot_sha256=imported.mapping_snapshot_sha256,
-        actor="owner",
-        idempotency_key="cutover-1",
-        confirmation=CUTOVER_CONFIRMATION,
-    )
+    _activate_candidate(service, imported, products, mappings)
     state = RuntimeMasterDataRepository(runtime).authority_state()
 
     service.mark_platform_side_effect(
