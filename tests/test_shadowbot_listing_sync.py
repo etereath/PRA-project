@@ -13,12 +13,22 @@ from app.automation_models import (
     AutomationRunClaim,
     AutomationRunOutcome,
 )
-from app.enums import AutomationRunStatus, ReviewTaskStatus
+from app.enums import (
+    AutomationRunStatus,
+    ReviewTaskStatus,
+    TaskActionType,
+    TaskOriginType,
+    TaskStatus,
+)
 from app.exceptions import ValidationError
-from app.models import ListingStatus
+from app.models import ListingStatus, ShadowBotOperationLedger, Task
 from app.repositories.automation_repository import AutomationRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.operational_time import OperationalTimeService
+from app.services.automation import AutomationExecutionContext
+from app.services.listing_automation_runtime import ListingStatusScanHandler
+from app.services.product_mapping import compile_product_mapping_rows
+from app.services.runtime_master_data import RuntimeMappingSnapshot
 from app.services.shadowbot_listing_action_contract import (
     build_listing_action_request,
     compute_listing_result_hash,
@@ -954,3 +964,241 @@ def test_worker_v5_request_and_failed_result_match_core_contract(
     )
     assert failed["snapshot"]["snapshot_complete"] is False
     assert failed["snapshot"]["items"] == []
+
+
+class _ListingRuntimeMasterData:
+    configured_account_id = "ACCOUNT-1"
+
+    def __init__(self, mappings) -> None:
+        self.snapshot = RuntimeMappingSnapshot(
+            authority_mode="PRE_CUTOVER",
+            authority_generation=0,
+            account_id=self.configured_account_id,
+            mappings=mappings,
+            mapping_snapshot_sha256="sha256:" + "9" * 64,
+        )
+
+    def ensure_shadowbot_locator(self, path: Path) -> Path:
+        assert path.is_file()
+        return path
+
+    def mapping_snapshot(self) -> RuntimeMappingSnapshot:
+        return self.snapshot
+
+
+class _ListingRuntimeTransport:
+    def __init__(self, queue_dir: Path, *, archive_fails: bool) -> None:
+        self.runner = ShadowBotFileQueueRunner(queue_dir)
+        self.last_result_file_sha256 = "d" * 64
+        self.last_result_path = queue_dir / "results" / "synthetic.json"
+        self.wait_callback = None
+        self.archive_fails = archive_fails
+
+    def require_worker_ready(self) -> None:
+        return None
+
+    def set_wait_callback(self, callback) -> None:
+        self.wait_callback = callback
+
+    def wait_for_published_result(
+        self,
+        request: dict,
+        *,
+        request_file_sha256: str,
+    ) -> dict:
+        assert self.wait_callback is not None
+        assert self.wait_callback() is True
+        result = _result(
+            request,
+            locations={
+                "SKU-ONLINE-001": "online_only",
+                "SKU-WAITING-001": "waiting_only",
+                "SKU-BOTH-00001": "online_only",
+                "SKU-NEITHER-01": "waiting_only",
+                "SKU-DUPLICATE1": "online_only",
+            },
+        )
+        result["request_file_sha256"] = "sha256:" + request_file_sha256
+        result["result_payload_sha256"] = compute_listing_result_hash(result)
+        return result
+
+    def acknowledge_last_result(self) -> Path:
+        if self.archive_fails:
+            raise OSError("synthetic archive failure")
+        archive_dir = self.runner.queue_dir / "archive" / "synthetic"
+        archive_dir.mkdir(parents=True, exist_ok=True)
+        return archive_dir
+
+
+@pytest.mark.parametrize(
+    ("archive_fails", "expected_status", "expected_ack"),
+    [
+        (False, AutomationRunStatus.SUCCESS, "WRITTEN"),
+        (True, AutomationRunStatus.PARTIAL, "FAILED"),
+    ],
+)
+def test_listing_automation_uses_formal_read_only_pipeline_and_separates_archive(
+    tmp_path: Path,
+    archive_fails: bool,
+    expected_status: AutomationRunStatus,
+    expected_ack: str,
+) -> None:
+    repository = _repository(tmp_path)
+    automation = AutomationRepository(repository)
+    now = datetime.now(UTC)
+    scheduled = datetime(2026, 7, 25, 3, 0, tzinfo=UTC)
+    parent_job = AutomationJob(
+        job_id="FULL-LISTING-RUNTIME",
+        job_type="FULL_MARKET_SCAN",
+        display_name="完整扫描",
+        enabled=True,
+        schedule_kind="INTERVAL_MINUTES",
+        schedule_expression="60",
+        priority=50,
+        config={"platform_name": PLATFORM},
+    )
+    child_job = AutomationJob(
+        job_id="AUTOMATION-LISTING-STATUS-SCAN-CHILD",
+        job_type="LISTING_STATUS_SCAN",
+        display_name="商品状态扫描",
+        enabled=False,
+        schedule_kind="CHILD_ONLY",
+        schedule_expression="-",
+        priority=50,
+        config={"platform_name": PLATFORM},
+    )
+    automation.upsert_job(parent_job, now=now)
+    automation.upsert_job(child_job, now=now)
+    parent_run = automation.ensure_run(
+        job=parent_job,
+        scheduled_for=scheduled,
+        time_context=OperationalTimeService().classify(scheduled),
+        initial_status=AutomationRunStatus.SCHEDULED,
+        now=now,
+    )[0]
+    parent_claim = automation.claim_run(
+        run_id=parent_run.run_id,
+        owner_token="listing-parent-owner",
+        now=now,
+        lease_seconds=3600,
+    )
+    assert parent_claim is not None
+    child_run, _ = automation.ensure_child_run_fenced(
+        parent_claim,
+        child_job,
+        relation_type="LISTING_STATUS_CHILD",
+        now=now,
+    )
+    assert automation.finish_run(
+        parent_claim,
+        AutomationRunOutcome(status=AutomationRunStatus.SUCCESS),
+        now=now,
+    )
+    repository.insert_task(
+        Task(
+            task_id=f"TASK-PARKED-{archive_fails}",
+            internal_sku="SKU-ONLINE-001",
+            platform_name=PLATFORM,
+            action_type=TaskActionType.UPDATE_PRICE,
+            priority=1,
+            task_status=TaskStatus.PENDING,
+            created_at=now,
+            origin_type=TaskOriginType.MANUAL,
+            origin_ref_id="test:parked-unknown",
+            target_price=Decimal("21.00"),
+            dedupe_key=f"TASK-PARKED-{archive_fails}",
+        )
+    )
+    repository.insert_shadowbot_operation(
+        ShadowBotOperationLedger(
+            operation_id=f"OP-PARKED-{archive_fails}",
+            task_id=f"TASK-PARKED-{archive_fails}",
+            platform=PLATFORM,
+            product_identity={"internal_sku": "SKU-ONLINE-001"},
+            expected_old_price=Decimal("20.00"),
+            target_price=Decimal("21.00"),
+            status="NEEDS_RECONCILIATION",
+            created_at=now,
+            updated_at=now,
+        )
+    )
+    child_claim = automation.claim_run(
+        run_id=child_run.run_id,
+        owner_token="listing-child-owner",
+        now=now,
+        lease_seconds=3600,
+    )
+    assert child_claim is not None
+    context = AutomationExecutionContext(
+        claim=child_claim,
+        repository=automation,
+        operational_time=OperationalTimeService(),
+        clock=lambda: datetime.now(UTC),
+        lease_seconds=3600,
+    )
+    mappings = compile_product_mapping_rows(
+        [
+            {
+                "mapping_id": f"MAP-{index}",
+                "mapping_kind": "PRODUCT",
+                "platform_name": PLATFORM,
+                "platform_product_name": name,
+                "grade": grade,
+                "internal_sku": sku,
+                "candidate_internal_sku": "",
+                "mapping_status": "VERIFIED",
+                "account_id": "ACCOUNT-1",
+            }
+            for index, (sku, name, grade) in enumerate(
+                (
+                    ("SKU-ONLINE-001", "艾莎", "B级"),
+                    ("SKU-WAITING-001", "艾莎", "C级"),
+                    ("SKU-BOTH-00001", "卡布奇诺", "B级"),
+                    ("SKU-NEITHER-01", "卡布奇诺", "C级"),
+                    ("SKU-DUPLICATE1", "艾莎", "D级"),
+                ),
+                start=1,
+            )
+        ],
+        source_workbook_sha256="f" * 64,
+    )
+    locator = _mapping_file(tmp_path / "identity.json")
+    transport = _ListingRuntimeTransport(
+        tmp_path / "queue",
+        archive_fails=archive_fails,
+    )
+    handler = ListingStatusScanHandler(
+        runtime_repository=repository,
+        transport=transport,
+        mapping_path=locator,
+        master_data=_ListingRuntimeMasterData(mappings),
+        applet_uri="weixin://launchapplet/test",
+    )
+
+    outcome = handler(child_run, context)
+
+    assert outcome.status is expected_status
+    assert outcome.event_payload["platform_write_performed"] is False
+    assert outcome.event_payload["delivery_archive_healthy"] is (
+        not archive_fails
+    )
+    assert transport.wait_callback is None
+    with repository.connect_read() as connection:
+        observation = connection.execute(
+            """
+            SELECT batch_status, scope_complete, end_marker_verified
+            FROM product_observation_batches
+            WHERE automation_run_id = ?
+            """,
+            (child_run.run_id,),
+        ).fetchone()
+        receipt = connection.execute(
+            """
+            SELECT ack_state
+            FROM shadowbot_listing_result_receipts
+            WHERE batch_id = ?
+            """,
+            ("LISTING-BATCH-" + child_run.run_id,),
+        ).fetchone()
+    assert tuple(observation) == ("ACCEPTED", 1, 1)
+    assert receipt["ack_state"] == expected_ack
