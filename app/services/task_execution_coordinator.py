@@ -153,6 +153,12 @@ class TaskExecutionCoordinator:
             return self._note(batch_id, 'RECONFIRM', now, close=True)
         profile = self.service.execution_profile
         try:
+            self.service.mark_platform_side_effect_boundary(
+                operation_id=batch_id,
+                facts=facts,
+                actor="execution_coordinator",
+                idempotency_key="v4-publish:" + batch_id,
+            )
             self.service.v4_publish(
                 self.runtime, self.service.runner_factory(self.service.queue_root),
                 manifest=manifest, execution_profile=profile,

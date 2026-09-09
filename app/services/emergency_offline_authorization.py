@@ -23,6 +23,7 @@ from app.repositories.sqlite_runtime_repository import (
     _row_to_task,
 )
 from app.services.emergency_offline_shadow import EmergencyOfflineShadowService
+from app.services.runtime_master_data import RuntimeMasterDataProvider
 from app.shadowbot_contract_primitives import contract_identity_key
 
 EMERGENCY_JOB_TYPE = "SYSTEM_EMERGENCY_SET_OFFLINE"
@@ -46,12 +47,18 @@ class EmergencyOfflineAuthorizationResult:
 class EmergencyOfflineAuthorizationService:
     """The only service allowed to create a SYSTEM_EMERGENCY task."""
 
-    def __init__(self, runtime_repository: SQLiteRuntimeRepository) -> None:
+    def __init__(
+        self,
+        runtime_repository: SQLiteRuntimeRepository,
+        *,
+        master_data_provider: RuntimeMasterDataProvider | None = None,
+    ) -> None:
         self.runtime_repository = runtime_repository
-        self.shadow = EmergencyOfflineShadowService(runtime_repository)
-        self.product_cost_reader = (
-            EmergencyOfflineShadowService._read_authoritative_base_cost
+        self.shadow = EmergencyOfflineShadowService(
+            runtime_repository,
+            master_data_provider=master_data_provider,
         )
+        self.product_cost_reader = self.shadow._read_authoritative_base_cost
 
     def authorize(
         self,

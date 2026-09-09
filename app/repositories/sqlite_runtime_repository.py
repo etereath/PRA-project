@@ -80,6 +80,7 @@ from app.runtime_schema import (
 )
 from app.utils import serialize_decimal, utc_now
 from app.repositories.execution_continuation_repository import SCHEMA_V18_SQL
+from app.repositories.master_data_repository import SCHEMA_V19_SQL
 
 TERMINAL_TASK_STATUSES = ("success", "skipped", "cancelled", "expired")
 
@@ -3308,6 +3309,10 @@ class SQLiteRuntimeRepository:
             requires_v18_migration = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'execution_continuations'"
             ).fetchone() is None
+            requires_v19_migration = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'master_data_authority_state'"
+            ).fetchone() is None
             requires_runtime_migration = (
                 requires_v13_migration
                 or requires_v14_migration
@@ -3315,6 +3320,7 @@ class SQLiteRuntimeRepository:
                 or requires_v16_migration
                 or requires_v17_migration
                 or requires_v18_migration
+                or requires_v19_migration
             )
             if requires_v13_migration or requires_v15_migration:
                 connection.execute("PRAGMA foreign_keys = OFF")
@@ -3408,6 +3414,7 @@ class SQLiteRuntimeRepository:
                     16: "versioned emergency offline policies for shadow evaluation",
                     17: "authoritative real inventory balances, immutable ledger, sales baselines, and alert policies",
                     18: "durable v4 execution authorization continuation",
+                    19: "account-aware Runtime Product and Platform Mapping authority",
                 }
                 for statement in SCHEMA_V6_SQL:
                     connection.execute(statement)
@@ -3513,7 +3520,26 @@ class SQLiteRuntimeRepository:
                     connection.execute(statement)
                 for statement in SCHEMA_V18_SQL:
                     connection.execute(statement)
+                for statement in SCHEMA_V19_SQL:
+                    connection.execute(statement)
                 now_text = _datetime_to_text(datetime.now())
+                connection.execute(
+                    """
+                    INSERT INTO master_data_authority_state(
+                        authority_key, authority_mode, generation,
+                        product_snapshot_sha256, mapping_snapshot_sha256,
+                        cutover_generation, cutover_event_sequence,
+                        cutover_at, cutover_by, updated_at
+                    )
+                    SELECT 'PRODUCT_MAPPING', 'PRE_CUTOVER', 0,
+                           '', '', NULL, NULL, NULL, '', ?
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM master_data_authority_state
+                        WHERE authority_key = 'PRODUCT_MAPPING'
+                    )
+                    """,
+                    (now_text,),
+                )
                 connection.execute(
                     """
                     INSERT INTO inventory_authority_state(

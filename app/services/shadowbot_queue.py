@@ -17,7 +17,6 @@ from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.automation_repository import (
     read_order_scan_target_trade_date,
 )
-from app.repositories.workbook_repository import load_products
 from app.services.shadowbot_executor import (
     EXECUTION_MODE_COMMIT,
     SIDE_EFFECT_NOT_APPLIED,
@@ -30,6 +29,7 @@ from app.services.shadowbot_executor import (
     ShadowBotTaskRunner,
     shadowbot_result_contract_from_data,
 )
+from app.services.runtime_master_data import RuntimeMasterDataProvider
 from app.services.shadowbot_product_read import (
     DEFAULT_INVENTORY_PRODUCTS_PATH,
     MAX_RESULT_BYTES,
@@ -197,15 +197,25 @@ class ShadowBotResultImporter:
         queue_dir: Path,
         *,
         inventory_products_path: Path | None = None,
+        master_data_provider: RuntimeMasterDataProvider | None = None,
     ) -> None:
         self.repository = repository
-        self.executor = ShadowBotExecutor(repository, runner)
-        self.paths = ShadowBotQueuePaths(queue_dir)
         self.inventory_products_path = Path(
             inventory_products_path
             or os.environ.get("PRA_PRODUCTS_PATH")
             or DEFAULT_INVENTORY_PRODUCTS_PATH
         )
+        self.master_data_provider = master_data_provider or RuntimeMasterDataProvider(
+            repository,
+            products_workbook=self.inventory_products_path,
+        )
+        self.executor = ShadowBotExecutor(
+            repository,
+            runner,
+            inventory_products_path=self.inventory_products_path,
+            master_data_provider=self.master_data_provider,
+        )
+        self.paths = ShadowBotQueuePaths(queue_dir)
         self.paths.ensure()
 
     def import_available(self) -> list[dict[str, Any]]:
@@ -878,7 +888,7 @@ class ShadowBotResultImporter:
         inventory_by_identity: dict[tuple[str, str, str], Any] = {}
         ambiguous_inventory_identities: set[tuple[str, str, str]] = set()
         try:
-            inventory_products = load_products(self.inventory_products_path)
+            inventory_products = self.master_data_provider.product_snapshot().products
         except (OSError, UnicodeError, ValidationError, ValueError) as exc:
             raise ValidationError(
                 f"INVENTORY_MAPPING_SOURCE_INVALID: {self.inventory_products_path}"

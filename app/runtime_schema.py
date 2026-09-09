@@ -13,7 +13,7 @@ import sqlite3
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-LATEST_RUNTIME_SCHEMA_VERSION = 18
+LATEST_RUNTIME_SCHEMA_VERSION = 19
 RUNTIME_SCHEMA_VERSIONS = tuple(range(1, LATEST_RUNTIME_SCHEMA_VERSION + 1))
 
 REQUIRED_RUNTIME_TABLES = frozenset(
@@ -68,6 +68,10 @@ REQUIRED_RUNTIME_TABLES = frozenset(
         "inventory_transactions",
         "inventory_sales_baselines",
         "inventory_alert_policies",
+        "master_data_authority_state",
+        "product_catalog",
+        "platform_product_mappings",
+        "master_data_authority_events",
     }
 )
 
@@ -88,6 +92,51 @@ V18_REQUIRED_COLUMNS = {
     "execution_continuations": (
         "batch_id", "principal_subject", "idempotency_hash", "envelope_sha256",
         "envelope_json", "accepted_at", "closed_at", "outcome", "message",
+    ),
+}
+
+V19_REQUIRED_COLUMNS = {
+    "master_data_authority_state": (
+        "authority_key", "authority_mode", "generation",
+        "product_snapshot_sha256", "mapping_snapshot_sha256",
+        "cutover_generation", "cutover_event_sequence", "cutover_at",
+        "cutover_by", "updated_at",
+    ),
+    "product_catalog": (
+        "internal_sku", "product_name", "grade", "stem_length", "unit",
+        "base_cost", "sale_enabled", "remark", "source_type", "source_ref",
+        "source_sha256", "version", "authority_generation", "created_at",
+        "updated_at",
+    ),
+    "platform_product_mappings": (
+        "mapping_id", "platform_name", "account_id",
+        "platform_product_identity_json", "platform_product_identity_digest",
+        "platform_product_name", "normalized_platform_product_name", "grade",
+        "internal_sku", "candidate_internal_skus_json", "mapping_status",
+        "effective_from", "effective_to", "last_verified_at", "remark",
+        "source_type", "source_ref", "source_sha256", "version",
+        "authority_generation", "created_at", "updated_at",
+    ),
+    "master_data_authority_events": (
+        "event_sequence", "event_id", "event_type", "authority_generation", "actor",
+        "idempotency_key", "request_sha256", "source_ref", "payload_json",
+        "created_at",
+    ),
+}
+
+V19_INDEX_SPECS = {
+    "ix_product_catalog_scope": (
+        "product_name", "grade", "sale_enabled", "internal_sku",
+    ),
+    "ix_platform_product_mappings_identity": (
+        "platform_name", "account_id", "platform_product_identity_digest",
+        "mapping_status", "effective_from", "effective_to",
+    ),
+    "ix_platform_product_mappings_sku": (
+        "internal_sku", "platform_name", "account_id", "mapping_status",
+    ),
+    "ix_master_data_authority_events_generation": (
+        "authority_generation", "event_type", "created_at",
     ),
 }
 
@@ -1126,6 +1175,7 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
             **V16_REQUIRED_COLUMNS,
             **V17_REQUIRED_COLUMNS,
             **V18_REQUIRED_COLUMNS,
+            **V19_REQUIRED_COLUMNS,
         }.items():
             if table not in tables:
                 continue
@@ -1197,6 +1247,7 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
                 _check_v17_constraints(connection, constraint_errors)
             )
             missing_index_names.update(_check_v18_constraints(connection, constraint_errors))
+            missing_index_names.update(_check_v19_constraints(connection, constraint_errors))
         missing_indexes = tuple(sorted(missing_index_names))
 
         ok = not (
@@ -1232,6 +1283,7 @@ def inspect_runtime_schema(connection: sqlite3.Connection) -> RuntimeSchemaHealt
                     | frozenset(V13_INDEX_SPECS)
                     | frozenset(V14_INDEX_SPECS)
                     | frozenset(V15_INDEX_SPECS)
+                    | frozenset(V19_INDEX_SPECS)
                 )
             ),
             constraint_errors=(),
@@ -2158,6 +2210,41 @@ def _check_v18_constraints(connection, errors):
     if tuple(str(c[2]) for c in index) != ('closed_at', 'accepted_at'):
         return ('ix_execution_continuations_open',)
     return ()
+
+
+def _check_v19_constraints(connection, errors):
+    missing_indexes: list[str] = []
+    for name, expected_columns in V19_INDEX_SPECS.items():
+        rows = connection.execute(f"PRAGMA index_info('{name}')").fetchall()
+        if not rows:
+            missing_indexes.append(name)
+            continue
+        actual_columns = tuple(str(row[2]) for row in rows)
+        if actual_columns != expected_columns:
+            errors.append(
+                f"{name} columns expected {expected_columns}, actual {actual_columns}"
+            )
+    state = connection.execute(
+        "SELECT authority_mode, generation FROM master_data_authority_state "
+        "WHERE authority_key = 'PRODUCT_MAPPING'"
+    ).fetchone()
+    if state is None:
+        errors.append("master-data authority singleton is missing")
+    elif str(state[0]) not in {"PRE_CUTOVER", "DB_AUTHORITY"} or int(state[1]) < 0:
+        errors.append("master-data authority singleton is invalid")
+    for trigger_name in (
+        "master_data_authority_events_no_update",
+        "master_data_authority_events_no_delete",
+    ):
+        trigger = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            (trigger_name,),
+        ).fetchone()
+        if trigger is None or "master data authority event is immutable" not in str(
+            trigger[0] or ""
+        ):
+            errors.append("missing trigger " + trigger_name)
+    return tuple(missing_indexes)
 
 
 def _check_v17_constraints(

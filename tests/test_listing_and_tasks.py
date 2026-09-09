@@ -263,6 +263,31 @@ class ListingAndTaskTests(unittest.TestCase):
         )
         self.assertEqual(ignored, [])
 
+    def test_uninitialized_inventory_does_not_expand_automatic_price_strategy(self) -> None:
+        generator = TaskGenerationService(
+            pricing_service=PricingService(ai_provider=NullAISuggestionProvider()),
+            listing_service=ListingService(),
+        )
+        product = Product(
+            internal_sku="SKU-NOT-INITIALIZED",
+            product_name="new product",
+            grade="A",
+            stem_length="60cm",
+            unit="bundle",
+            base_cost=Decimal("10"),
+            current_stock=None,
+            sale_enabled=True,
+        )
+
+        tasks = generator.generate(
+            [product],
+            self.price_rules,
+            [],
+            platform_name="测试平台",
+        )
+
+        self.assertEqual(tasks, [])
+
     def test_set_online_reads_latest_platform_price_and_inventory(self) -> None:
         generator = TaskGenerationService(
             pricing_service=PricingService(
