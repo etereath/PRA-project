@@ -21,6 +21,7 @@ from app.repositories.automation_repository import (
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.operational_time import OperationalTimeService
+from app.services.runtime_master_data import RuntimeMasterDataProvider
 from app.services.shadowbot_executor import (
     ShadowBotFileQueueRunner,
     ShadowBotStartBoundaryError,
@@ -62,6 +63,10 @@ def prepare_listing_sync_batch(
     profile = str(execution_profile or "").strip().lower()
     if profile not in {"development", "production"}:
         raise ValidationError("execution_profile 必须是 development 或 production。")
+    RuntimeMasterDataProvider(
+        repository,
+        configured_account_id=os.environ.get("PRA_ACCOUNT_ID", ""),
+    ).ensure_shadowbot_locator(mapping_path)
     manifest = build_listing_action_manifest(
         batch_id=batch_id,
         action_type="sync_status",

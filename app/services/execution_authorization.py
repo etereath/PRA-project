@@ -27,8 +27,8 @@ from app.repositories.execution_continuation_repository import (
     ExecutionContinuationRepository, digest_json,
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.repositories.workbook_repository import load_products
-from app.services.product_mapping import compile_product_mapping_workbook
+from app.services.runtime_master_data import RuntimeMasterDataProvider
+from app.services.master_data_management import MasterDataManagementService
 from app.services.shadowbot_commit_batch import load_identity_mapping
 from app.services.shadowbot_commit_pipeline import (
     build_task_commit_manifest,
@@ -134,6 +134,8 @@ class ExecutionAuthorizationApplicationService:
         queue_root: Path,
         applet_uri: str,
         execution_profile: str,
+        configured_account_id: str = "",
+        master_data_provider: RuntimeMasterDataProvider | None = None,
         clock=None,
         runner_factory: Callable[[Path], object] = ShadowBotFileQueueRunner,
         v4_prepare=prepare_task_commit_batch,
@@ -149,6 +151,12 @@ class ExecutionAuthorizationApplicationService:
         self.authorization = authorization
         self.products_workbook = Path(products_workbook)
         self.platform_mappings_workbook = Path(platform_mappings_workbook)
+        self.master_data = master_data_provider or RuntimeMasterDataProvider(
+            runtime_repository,
+            configured_account_id=configured_account_id,
+            products_workbook=self.products_workbook,
+            platform_mappings_workbook=self.platform_mappings_workbook,
+        )
         self.shadowbot_identity_mapping = Path(shadowbot_identity_mapping)
         self.queue_root = Path(queue_root)
         self.applet_uri = str(applet_uri or "").strip()
@@ -390,6 +398,12 @@ class ExecutionAuthorizationApplicationService:
                 str(latest_payload.get("required_confirmation") or "")
                 if development_confirmation else ""
             )
+            self.mark_platform_side_effect_boundary(
+                operation_id=public.batch_id,
+                facts=facts,
+                actor="execution_authorization",
+                idempotency_key="v5-publish:" + public.batch_id,
+            )
             request, start = self.v5_publish(
                 self.runtime, runner, proposal=latest_payload, applet_uri=self.applet_uri,
                 confirmation_text=confirmation_text, confirmed_by=confirmed_by,
@@ -407,6 +421,29 @@ class ExecutionAuthorizationApplicationService:
             task_ids=task_ids,
             outcome="DISPATCHED",
             message="已投递平台执行，请查看任务详情获取当前结果。",
+        )
+
+    def mark_platform_side_effect_boundary(
+        self,
+        *,
+        operation_id: str,
+        facts: dict[str, object],
+        actor: str,
+        idempotency_key: str,
+    ) -> None:
+        state = self.master_data.authority_state()
+        if state.authority_mode != "DB_AUTHORITY":
+            return
+        generation = int(facts.get("master_data_authority_generation") or -1)
+        mapping_digest = str(
+            facts.get("master_data_mapping_snapshot_sha256") or ""
+        )
+        MasterDataManagementService(self.runtime).mark_platform_side_effect(
+            operation_id=operation_id,
+            authority_generation=generation,
+            mapping_snapshot_sha256=mapping_digest,
+            actor=actor,
+            idempotency_key=idempotency_key,
         )
 
     def refresh_submission_result(self, principal: Principal, receipt: ExecutionSubmissionResult) -> ExecutionSubmissionResult:
@@ -523,17 +560,27 @@ class ExecutionAuthorizationApplicationService:
         *,
         allow_already_applied: bool = False,
     ) -> dict[str, object]:
-        products_bytes = self.products_workbook.read_bytes()
-        products = load_products(self.products_workbook)
-        if self.products_workbook.read_bytes() != products_bytes:
-            raise ExecutionAuthorizationConflict("商品资料刚刚发生变化，请重新预览。")
+        try:
+            master_data_snapshot = self.master_data.snapshot()
+            self.master_data.ensure_shadowbot_locator(
+                self.shadowbot_identity_mapping
+            )
+        except (OSError, UnicodeError, ValueError, ValidationError) as exc:
+            raise ExecutionAuthorizationConflict(
+                "商品或平台对应关系暂不可用，请重新预览。"
+            ) from exc
+        products = master_data_snapshot.products
         product_by_sku = {product.internal_sku.upper(): product for product in products}
-        mapping_bytes = self.platform_mappings_workbook.read_bytes()
-        mappings = compile_product_mapping_workbook(self.platform_mappings_workbook)
-        if self.platform_mappings_workbook.read_bytes() != mapping_bytes:
-            raise ExecutionAuthorizationConflict("商品与平台的对应关系刚刚发生变化，请重新预览。")
+        mappings = master_data_snapshot.mappings
         shadowbot_mapping_bytes = self.shadowbot_identity_mapping.read_bytes()
         identity_mapping = load_identity_mapping(self.shadowbot_identity_mapping)
+        if master_data_snapshot.authority_mode == "DB_AUTHORITY":
+            _validate_locator_authority_binding(
+                self.shadowbot_identity_mapping,
+                account_id=master_data_snapshot.account_id,
+                authority_generation=master_data_snapshot.authority_generation,
+                mapping_snapshot_sha256=master_data_snapshot.mapping_snapshot_sha256,
+            )
         inventory = self.inventory
 
         with closing(self.runtime.connect_read()) as connection:
@@ -671,6 +718,10 @@ class ExecutionAuthorizationApplicationService:
                     platform_product_name=identity["expected_product_name"],
                     grade=identity["expected_grade"],
                     observed_at=current,
+                    account_id=master_data_snapshot.account_id,
+                    platform_product_identity_digest=str(
+                        identity.get("platform_product_identity_digest") or ""
+                    ),
                 )
                 if (
                     resolution.mapping_status is not ProductMappingStatus.VERIFIED
@@ -696,6 +747,9 @@ class ExecutionAuthorizationApplicationService:
                         "listing_updated_at": _datetime_text(listing.updated_at),
                         "listing_price_observed_at": _datetime_text(listing.price_observed_at),
                         "listing_price_source_attempt_id": listing.price_source_attempt_id,
+                        "platform_product_identity_digest": str(
+                            identity.get("platform_product_identity_digest") or ""
+                        ),
                     }
                 )
 
@@ -704,8 +758,15 @@ class ExecutionAuthorizationApplicationService:
         return {
             "action_type": action_type.value,
             "platform_name": next(iter(platforms)),
-            "products_sha256": hashlib.sha256(products_bytes).hexdigest(),
+            "products_sha256": master_data_snapshot.product_snapshot_sha256,
             "platform_mapping_version": mappings.mapping_version,
+            "master_data_authority_generation": (
+                master_data_snapshot.authority_generation
+            ),
+            "master_data_mapping_snapshot_sha256": (
+                master_data_snapshot.mapping_snapshot_sha256
+            ),
+            "target_account_id": master_data_snapshot.account_id,
             "shadowbot_mapping_sha256": hashlib.sha256(
                 shadowbot_mapping_bytes
             ).hexdigest(),
@@ -778,6 +839,44 @@ class ExecutionAuthorizationApplicationService:
                 (stored.public.principal_subject, stored.public.idempotency_key),
                 None,
             )
+
+
+def _validate_locator_authority_binding(
+    path: Path,
+    *,
+    account_id: str,
+    authority_generation: int,
+    mapping_snapshot_sha256: str,
+) -> None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ExecutionAuthorizationConflict(
+            "影刀执行定位资料不可用，请先重新同步。"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ExecutionAuthorizationConflict("影刀执行定位资料缺少 authority 绑定。")
+    claimed_payload_digest = str(payload.get("artifact_payload_sha256") or "")
+    digest_payload = dict(payload)
+    digest_payload.pop("artifact_payload_sha256", None)
+    actual_payload_digest = "sha256:" + hashlib.sha256(
+        json.dumps(
+            digest_payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    if (
+        str(payload.get("account_id") or "").strip() != account_id
+        or int(payload.get("authority_generation") or -1) != authority_generation
+        or str(payload.get("mapping_snapshot_sha256") or "").strip()
+        != mapping_snapshot_sha256
+        or claimed_payload_digest != actual_payload_digest
+    ):
+        raise ExecutionAuthorizationConflict(
+            "影刀执行定位资料与当前账号或 Runtime mapping generation 不一致。"
+        )
 
 
 def _exact_task_ids(values: Iterable[str]) -> tuple[str, ...]:

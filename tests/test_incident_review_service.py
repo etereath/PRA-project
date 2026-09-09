@@ -1429,7 +1429,7 @@ def test_workflow_rereads_authoritative_product_base_cost_for_incident_review(
     assert result.source_task.target_price == Decimal("10.00")
     assert result.source_task.decision_trace["base_cost"] == "10.00"
     assert str(result.source_task.decision_trace["base_cost_source_ref"]).startswith(
-        "products.xlsx:sha256:"
+        "pre_cutover:product:generation:0:sha256:"
     )
 
 

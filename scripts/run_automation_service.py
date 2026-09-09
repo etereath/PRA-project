@@ -85,6 +85,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="蚂蚁花团供应商",
     )
     parser.add_argument(
+        "--account-id",
+        default=os.environ.get("PRA_ACCOUNT_ID", ""),
+        help="Configured target account for account-scoped Product Mapping reads.",
+    )
+    parser.add_argument(
         "--heartbeat",
         type=Path,
         default=DEFAULT_HEARTBEAT_PATH,
@@ -303,6 +308,7 @@ def main() -> int:
                         runtime_repository=runtime_repository,
                         queue_dir=args.shadowbot_queue_dir,
                         mapping_workbook=args.platform_mappings,
+                        configured_account_id=args.account_id,
                         operational_time=operational_time,
                         timeout_seconds=args.order_timeout_seconds,
                     )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from contextlib import closing
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -55,6 +56,7 @@ from app.services.shadowbot_listing_sync import (
     _project_online_status,
     mapping_source_version,
 )
+from app.services.runtime_master_data import RuntimeMasterDataProvider
 from app.shadowbot_contract_primitives import canonical_positive_price
 from app.shadowbot_listing_contract import (
     V5_GATE_SUMMARY_SCHEMA_VERSION,
@@ -161,6 +163,10 @@ def propose_listing_action_batch(
             selected_task_ids=[task.task_id for task in source_tasks],
             platform_name=platform_name,
         )
+    RuntimeMasterDataProvider(
+        repository,
+        configured_account_id=os.environ.get("PRA_ACCOUNT_ID", ""),
+    ).ensure_shadowbot_locator(mapping_path)
     mapping = load_identity_mapping(mapping_path)
     manifest = build_listing_action_manifest(
         batch_id=batch_id,

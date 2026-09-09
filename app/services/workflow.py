@@ -73,6 +73,7 @@ from app.services.runtime import (
     RuntimeTaskService,
 )
 from app.services.task_generation import TaskGenerationService
+from app.services.runtime_master_data import RuntimeMasterDataProvider
 from app.shadowbot_contract_primitives import canonical_positive_price
 from app.shadowbot_listing_contract import canonical_nonnegative_inventory
 
@@ -421,6 +422,7 @@ def resolve_mobile_review(
     note: str = "",
     resolution_payload: dict[str, object] | None = None,
     products_path: Path | None = None,
+    master_data_provider: RuntimeMasterDataProvider | None = None,
     now: datetime | None = None,
 ) -> MobileReviewResolutionSummary:
     repository = SQLiteRuntimeRepository(db_path)
@@ -444,25 +446,33 @@ def resolve_mobile_review(
         and review_task.review_type == "emergency_protection"
         and review_status in {ReviewTaskStatus.ADJUSTED, ReviewTaskStatus.APPROVED}
     ):
-        if products_path is None:
+        if products_path is None and master_data_provider is None:
             raise MobileReviewTransactionError(
                 MobileReviewErrorCode.CONCURRENT_UPDATE,
                 "商品主数据不可用，已阻止创建平台任务",
             )
-        emergency_base_cost, emergency_base_cost_source_ref = (
-            _read_authoritative_product_cost_snapshot(
-                products_path,
-                internal_sku=str(review_task.internal_sku or ""),
+        provider = master_data_provider or RuntimeMasterDataProvider(
+            repository, products_workbook=products_path
+        )
+        try:
+            emergency_base_cost, emergency_base_cost_source_ref = (
+                provider.product_cost_snapshot(str(review_task.internal_sku or ""))
             )
-        )
-    snapshot_verifier = (
-        lambda: _read_authoritative_product_cost_snapshot(
-            products_path,
-            internal_sku=str(review_task.internal_sku or ""),
-        )
-        if products_path is not None
-        else None
-    )
+        except (OSError, ValueError, ValidationError) as exc:
+            raise MobileReviewTransactionError(
+                MobileReviewErrorCode.CONCURRENT_UPDATE,
+                "商品主数据不可用，已阻止创建平台任务",
+            ) from exc
+    snapshot_verifier = None
+    if products_path is not None or master_data_provider is not None:
+        def snapshot_verifier():
+            provider = master_data_provider or RuntimeMasterDataProvider(
+                repository,
+                products_workbook=products_path,
+            )
+            return provider.product_cost_snapshot(
+                str(review_task.internal_sku or "")
+            )
     atomic_result = repository.resolve_mobile_review_atomic(
         review_task_id=review_task_id,
         token_hash=token_hash,
@@ -1052,11 +1062,16 @@ def _load_inventory_aware_products(
     products_path: Path,
     runtime_db_path: Path | None,
 ) -> list[Product]:
-    products = load_products(products_path)
     if runtime_db_path is None:
-        return products
+        return load_products(products_path)
     runtime = SQLiteRuntimeRepository(runtime_db_path)
-    return InventoryProvider(InventoryRepository(runtime)).hydrate_products(products)
+    snapshot = RuntimeMasterDataProvider(
+        runtime, products_workbook=products_path
+    ).product_snapshot()
+    products = list(snapshot.products)
+    if snapshot.authority_mode == "PRE_CUTOVER":
+        return InventoryProvider(InventoryRepository(runtime)).hydrate_products(products)
+    return products
 
 
 def _load_current_platform_prices(
