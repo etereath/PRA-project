@@ -231,6 +231,9 @@ def test_rollback_is_blocked_after_authoritative_product_mutation(tmp_path):
     ).inventory_status == "NOT_INITIALIZED"
     with pytest.raises(RuntimeMasterDataError, match="forward correction"):
         service.rollback_to_workbook_authority(
+            products_workbook=products,
+            platform_mappings_workbook=mappings,
+            account_id_by_platform={PLATFORM: ACCOUNT},
             actor="owner",
             idempotency_key="rollback-1",
             confirmation=ROLLBACK_CONFIRMATION,
@@ -244,11 +247,17 @@ def test_safe_rollback_before_new_mutation_is_explicit_and_idempotent(tmp_path):
     service, _, imported = _import_candidate(runtime, products, mappings)
     _activate_candidate(service, imported, products, mappings)
     first = service.rollback_to_workbook_authority(
+        products_workbook=products,
+        platform_mappings_workbook=mappings,
+        account_id_by_platform={PLATFORM: ACCOUNT},
         actor="owner",
         idempotency_key="rollback-1",
         confirmation=ROLLBACK_CONFIRMATION,
     )
     replay = service.rollback_to_workbook_authority(
+        products_workbook=products,
+        platform_mappings_workbook=mappings,
+        account_id_by_platform={PLATFORM: ACCOUNT},
         actor="owner",
         idempotency_key="rollback-1",
         confirmation=ROLLBACK_CONFIRMATION,
@@ -266,10 +275,58 @@ def test_safe_rollback_before_new_mutation_is_explicit_and_idempotent(tmp_path):
     assert recutover.status == "APPLIED"
     with pytest.raises(RuntimeMasterDataError, match="no longer matches"):
         service.rollback_to_workbook_authority(
+            products_workbook=products,
+            platform_mappings_workbook=mappings,
+            account_id_by_platform={PLATFORM: ACCOUNT},
             actor="owner",
             idempotency_key="rollback-1",
             confirmation=ROLLBACK_CONFIRMATION,
         )
+
+
+def test_rollback_rejects_workbook_source_drift_and_keeps_runtime_authority(tmp_path):
+    runtime = SQLiteRuntimeRepository(tmp_path / "runtime.sqlite3")
+    runtime.init_schema()
+    products, mappings = _sources(tmp_path)
+    service, _, imported = _import_candidate(runtime, products, mappings)
+    _activate_candidate(service, imported, products, mappings)
+    changed = load_products(products)[0]
+    save_table_records(
+        "products",
+        products,
+        [
+            {
+                "internal_sku": changed.internal_sku,
+                "product_name": changed.product_name,
+                "grade": changed.grade,
+                "stem_length": changed.stem_length,
+                "unit": changed.unit,
+                "base_cost": "12.00",
+                "current_stock": str(changed.current_stock),
+                "sale_enabled": "true",
+                "last_price": "",
+                "recommended_price": "",
+                "remark": changed.remark,
+                "feature_season": "",
+                "feature_color": "",
+            }
+        ],
+    )
+
+    with pytest.raises(RuntimeMasterDataError, match="source changed"):
+        service.rollback_to_workbook_authority(
+            products_workbook=products,
+            platform_mappings_workbook=mappings,
+            account_id_by_platform={PLATFORM: ACCOUNT},
+            actor="owner",
+            idempotency_key="rollback-drifted-source",
+            confirmation=ROLLBACK_CONFIRMATION,
+        )
+
+    assert (
+        RuntimeMasterDataRepository(runtime).authority_state().authority_mode
+        == "DB_AUTHORITY"
+    )
 
 
 def test_cutover_rejects_mismatch_then_accepts_audited_candidate_refresh(tmp_path):
@@ -381,6 +438,9 @@ def test_rollback_requires_fresh_compare_and_refresh_after_workbook_change(tmp_p
         confirmation=CUTOVER_CONFIRMATION,
     )
     service.rollback_to_workbook_authority(
+        products_workbook=products,
+        platform_mappings_workbook=mappings,
+        account_id_by_platform={PLATFORM: ACCOUNT},
         actor="owner",
         idempotency_key="rollback-initial",
         confirmation=ROLLBACK_CONFIRMATION,
@@ -629,6 +689,9 @@ def test_platform_side_effect_boundary_blocks_workbook_rollback(tmp_path):
 
     with pytest.raises(RuntimeMasterDataError, match="forward correction"):
         service.rollback_to_workbook_authority(
+            products_workbook=products,
+            platform_mappings_workbook=mappings,
+            account_id_by_platform={PLATFORM: ACCOUNT},
             actor="owner",
             idempotency_key="rollback-after-write",
             confirmation=ROLLBACK_CONFIRMATION,

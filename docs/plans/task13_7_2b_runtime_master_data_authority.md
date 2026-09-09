@@ -114,7 +114,10 @@ rollback 只允许让全部正式 consumers 原子恢复到同一个已验证 au
 generation 或 continuation。首次 compare 不匹配时通过 `refresh-preview → refresh`
 审计化替换 PRE_CUTOVER candidate；rollback 后旧 compare receipt 自动失效，若
 workbook 已变更，必须先 refresh，再用当前 candidate、workbook hash 和 account
-bindings 生成新的成功 compare receipt，才能 re-cutover。
+bindings 生成新的成功 compare receipt，才能 re-cutover。rollback 本身也必须
+重读当前 Product/Mapping workbook 和 account bindings，并与当前
+`cutover_event_sequence` 指向的已验证 CUTOVER/RECUTOVER source binding 完全匹配；
+任何漂移均 fail closed 并保持 `DB_AUTHORITY`。
 
 ## 5. Direct-reader Inventory 与切源处置
 
@@ -167,14 +170,15 @@ business-rule evaluation 均已登记。实现中若发现新的正常经营 dir
 5. VERIFIED / UNMAPPED / AMBIGUOUS / DISABLED 解析与当前 compiler 一致；
 6. current consumers 全部切到 Runtime authority 后，修改 Excel 不再悄悄改变运行结果；
 7. shadow compare 能证明 cutover 前后相同输入得到相同 Product/Mapping 业务解释，cutover 必须消费当前成功 receipt；
-8. compare mismatch 可审计 refresh candidate，rollback 后 workbook 变化不能复用旧 candidate/receipt；
+8. compare mismatch 可审计 refresh candidate；rollback 前 workbook/account binding 漂移必须拒绝并保持 DB authority，rollback 后 workbook 变化不能复用旧 candidate/receipt；
 9. rollback 只切 authority/read path，不删除新 evidence；
 10. Windows/Linux Core CI green。
 
 本地定向验证只使用临时 Runtime；真实 authority switch、部署、平台写和完整 CI 仍需
 分别授权。`runtime_master_data_cutover.py` 的 `--runtime-db` 无默认值，import 必须复用
 preview digest；shadow compare 必须提供 actor/idempotency key；cutover 必须重读当前
-workbook/account bindings 并提供成功 receipt，cutover/rollback 必须提供固定确认文本。
+workbook/account bindings 并提供成功 receipt，rollback 也必须重读并校验它们与
+cutover evidence 一致；cutover/rollback 必须提供固定确认文本。
 
 ## 8. Deliverables
 

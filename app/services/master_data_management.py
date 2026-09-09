@@ -554,6 +554,9 @@ class MasterDataManagementService:
     def rollback_to_workbook_authority(
         self,
         *,
+        products_workbook: Path,
+        platform_mappings_workbook: Path,
+        account_id_by_platform: Mapping[str, str],
         actor: str,
         idempotency_key: str,
         confirmation: str,
@@ -562,7 +565,18 @@ class MasterDataManagementService:
             raise RuntimeMasterDataError("Explicit workbook rollback confirmation is missing.")
         normalized_actor = _required_text(actor, "actor")
         normalized_key = _required_text(idempotency_key, "idempotency_key")
-        payload = {"operation": "ROLLBACK_TO_WORKBOOK"}
+        _, _, products_sha, mappings_sha = _read_workbooks(
+            products_workbook,
+            platform_mappings_workbook,
+            account_id_by_platform,
+        )
+        account_bindings = _normalized_account_bindings(account_id_by_platform)
+        payload = {
+            "operation": "ROLLBACK_TO_WORKBOOK",
+            "products_workbook_sha256": products_sha,
+            "mappings_workbook_sha256": mappings_sha,
+            "account_bindings": account_bindings,
+        }
         request_sha = _payload_sha256(payload)
         with self.runtime.connect_write() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -583,6 +597,40 @@ class MasterDataManagementService:
                 or state.cutover_event_sequence is None
             ):
                 raise RuntimeMasterDataError("Runtime authority is not active.")
+            cutover_row = connection.execute(
+                "SELECT event_type, request_sha256, payload_json "
+                "FROM master_data_authority_events WHERE event_sequence = ?",
+                (state.cutover_event_sequence,),
+            ).fetchone()
+            if cutover_row is None or str(cutover_row["event_type"]) not in {
+                "CUTOVER",
+                "RECUTOVER",
+            }:
+                raise RuntimeMasterDataError(
+                    "Rollback requires the verified cutover source binding."
+                )
+            try:
+                cutover_payload = json.loads(str(cutover_row["payload_json"]))
+            except json.JSONDecodeError as exc:
+                raise RuntimeMasterDataError(
+                    "Verified cutover source binding is invalid."
+                ) from exc
+            if _payload_sha256(cutover_payload) != str(cutover_row["request_sha256"]):
+                raise RuntimeMasterDataError(
+                    "Verified cutover source binding is invalid."
+                )
+            if any(
+                cutover_payload.get(key) != value
+                for key, value in {
+                    "products_workbook_sha256": products_sha,
+                    "mappings_workbook_sha256": mappings_sha,
+                    "account_bindings": account_bindings,
+                }.items()
+            ):
+                raise RuntimeMasterDataError(
+                    "Rollback source changed after cutover; keep Runtime authority active "
+                    "and use explicit maintenance/re-cutover."
+                )
             irreversible = connection.execute(
                 "SELECT event_type FROM master_data_authority_events "
                 "WHERE event_sequence > ? AND event_type IN "

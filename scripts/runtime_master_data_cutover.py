@@ -58,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     cutover.add_argument("--confirmation", required=True, help=CUTOVER_CONFIRMATION)
 
     rollback = subparsers.add_parser("rollback")
+    _add_import_sources(rollback)
     _add_actor_and_key(rollback)
     rollback.add_argument("--confirmation", required=True, help=ROLLBACK_CONFIRMATION)
 
@@ -128,6 +129,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     elif args.command == "rollback":
         result = service.rollback_to_workbook_authority(
+            products_workbook=args.products,
+            platform_mappings_workbook=args.platform_mappings,
+            account_id_by_platform=_accounts(args.account),
             actor=args.actor,
             idempotency_key=args.idempotency_key,
             confirmation=args.confirmation,
