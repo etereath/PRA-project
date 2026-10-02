@@ -246,7 +246,7 @@ class ShadowBotFileQueueRunner:
             elif is_order_scan:
                 normalize_order_scan_request(payload)
             else:
-                _validate_queue_request(payload)
+                validate_queue_request(payload)
             execution_attempt_id = str(payload["execution_attempt_id"])
             instruction_hash = (
                 compute_multi_product_instruction_hash(payload)
@@ -1872,7 +1872,11 @@ def _reject_fault_injection(payload: dict[str, Any]) -> None:
         raise ValidationError("UNSAFE_TEST_PARAMETER_REJECTED: fault_injection is not allowed by production Executor.")
 
 
-def _validate_queue_request(payload: dict[str, Any]) -> None:
+def validate_queue_request(
+    payload: dict[str, Any],
+    *,
+    check_expiry: bool = True,
+) -> None:
     _reject_fault_injection(payload)
     required = (
         "task_id",
@@ -1901,7 +1905,7 @@ def _validate_queue_request(payload: dict[str, Any]) -> None:
         raise ValidationError("ShadowBot queue expires_at must be ISO-8601.") from exc
     if expires_at.tzinfo is None:
         raise ValidationError("ShadowBot queue expires_at must include a timezone.")
-    if expires_at <= utc_now():
+    if check_expiry and expires_at <= utc_now():
         raise ValidationError("ShadowBot queue request has expired.")
 
 

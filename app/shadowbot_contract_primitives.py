@@ -11,6 +11,7 @@ import hashlib
 import json
 import re
 import unicodedata
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 
 
@@ -30,6 +31,9 @@ ORDER_SCAN_DEFAULT_LIMITS = {
     "max_scrolls": 100,
     "max_seconds": 300,
 }
+QUEUE_STOP_FENCE_SCHEMA_VERSION = "shadowbot-queue-stop-fence-1.0"
+QUEUE_STOP_FENCE_PROOF_TYPE = "QUEUE_REQUEST_QUARANTINED"
+_RAW_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 ORDER_SCAN_HARD_LIMITS = {
     "max_rows": 2000,
     "max_scrolls": 500,
@@ -154,6 +158,60 @@ def canonical_json_bytes(payload, default=None):
 def sha256_json(payload, prefixed=True, default=None):
     digest = hashlib.sha256(canonical_json_bytes(payload, default=default)).hexdigest()
     return ("sha256:" + digest) if prefixed else digest
+
+
+def queue_stop_fence_sha256(proof):
+    payload = {key: value for key, value in proof.items() if key != "proof_sha256"}
+    return sha256_json(payload)
+
+
+def validate_queue_stop_fence(
+    proof,
+    *,
+    execution_attempt_id="",
+    operation_id="",
+    source_execution_attempt_id="",
+    instruction_hash="",
+):
+    if not isinstance(proof, dict):
+        raise ValueError("QUEUE_STOP_FENCE_INVALID")
+    if (
+        proof.get("schema_version") != QUEUE_STOP_FENCE_SCHEMA_VERSION
+        or proof.get("proof_type") != QUEUE_STOP_FENCE_PROOF_TYPE
+        or proof.get("execution_mode") != "RECONCILE"
+        or proof.get("worker_lock_acquired") is not True
+    ):
+        raise ValueError("QUEUE_STOP_FENCE_INVALID")
+    expected = {
+        "execution_attempt_id": execution_attempt_id,
+        "operation_id": operation_id,
+        "source_execution_attempt_id": source_execution_attempt_id,
+        "instruction_hash": instruction_hash,
+    }
+    if any(value and str(proof.get(key) or "") != value for key, value in expected.items()):
+        raise ValueError("QUEUE_STOP_FENCE_BINDING_MISMATCH")
+    if not all(str(proof.get(key) or "") for key in expected):
+        raise ValueError("QUEUE_STOP_FENCE_BINDING_MISSING")
+    request_sha256 = str(proof.get("request_file_sha256") or "").lower()
+    if not _RAW_SHA256_RE.fullmatch(request_sha256):
+        raise ValueError("QUEUE_STOP_FENCE_REQUEST_HASH_INVALID")
+    locations = proof.get("quarantined_request_locations")
+    if (
+        not isinstance(locations, list)
+        or not locations
+        or any(location not in {"INBOX", "WORKING"} for location in locations)
+        or locations != sorted(set(locations))
+    ):
+        raise ValueError("QUEUE_STOP_FENCE_LOCATIONS_INVALID")
+    try:
+        fenced_at = datetime.fromisoformat(str(proof.get("fenced_at") or ""))
+    except ValueError as exc:
+        raise ValueError("QUEUE_STOP_FENCE_TIME_INVALID") from exc
+    if fenced_at.tzinfo is None or fenced_at.utcoffset() is None:
+        raise ValueError("QUEUE_STOP_FENCE_TIME_INVALID")
+    if str(proof.get("proof_sha256") or "") != queue_stop_fence_sha256(proof):
+        raise ValueError("QUEUE_STOP_FENCE_DIGEST_MISMATCH")
+    return proof
 
 
 def normalize_order_scan_request(request):
