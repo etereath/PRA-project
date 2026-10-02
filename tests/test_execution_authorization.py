@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 
 from app.enums import (
     PricingSource,
@@ -28,6 +28,7 @@ from app.repositories.workbook_repository import (
 )
 from app.services.execution_authorization import (
     ExecutionAuthorizationApplicationService,
+    ExecutionAuthorizationBlocked,
     ExecutionAuthorizationConflict,
     ExecutionAuthorizationForbidden,
 )
@@ -413,7 +414,7 @@ def test_digest_cannot_be_swapped_between_principal_or_task_batch(
         )
 
 
-def test_inventory_change_after_prepare_invalidates_whole_batch(
+def test_unrelated_execution_facts_do_not_change_price_authorization(
     execution_setup,
 ) -> None:
     service, repository, calls = execution_setup
@@ -421,17 +422,117 @@ def test_inventory_change_after_prepare_invalidates_whole_batch(
     prepared = service.prepare_execution(admin, ["TASK-PRICE-A"], "auth-drift")
     with repository.connect_write() as connection:
         connection.execute(
-            "UPDATE inventory_balances SET current_qty = 71, version = 2 WHERE internal_sku = ?",
+            "DELETE FROM inventory_balances WHERE internal_sku = ?",
             ("AISHA-A-50-Z",),
         )
+        connection.execute(
+            """
+            UPDATE inventory_authority_state
+            SET authority_mode = 'PRE_CUTOVER',
+                bootstrap_snapshot_sha256 = NULL,
+                bootstrap_runtime_snapshot_sha256 = NULL,
+                bootstrap_sales_watermark_date = NULL,
+                bootstrap_idempotency_key = NULL,
+                bootstrap_completed_at = NULL,
+                bootstrap_completed_by = NULL
+            """
+        )
+        connection.execute(
+            "UPDATE listing_status SET price_observed_at = ?, "
+            "price_source_attempt_id = ? WHERE internal_sku = ?",
+            (
+                (NOW + timedelta(seconds=1)).isoformat(),
+                "ATTEMPT-REFRESHED-A",
+                "AISHA-A-50-Z",
+            ),
+        )
         connection.commit()
+    workbook = load_workbook(service.platform_mappings_workbook)
+    sheet = workbook["data"]
+    headers = [cell.value for cell in sheet[1]]
+    sheet.cell(row=3, column=headers.index("remark") + 1).value = "unrelated B edit"
+    workbook.save(service.platform_mappings_workbook)
 
-    with pytest.raises(ExecutionAuthorizationConflict, match="发生变化"):
+    submitted = service.submit_execution(
+        admin,
+        ["TASK-PRICE-A"],
+        prepared.confirmation_digest,
+        "auth-drift",
+    )
+    assert submitted.batch_id == prepared.batch_id
+    assert calls == []
+
+
+def test_update_price_ignores_other_action_review_but_blocks_own_review(
+    execution_setup,
+) -> None:
+    service, repository, _ = execution_setup
+    with repository.connect_write() as connection:
+        connection.execute(
+            """
+            INSERT INTO review_tasks(
+              review_task_id, scope_type, scope_key, source_task_id,
+              review_type, review_status, internal_sku, platform_name,
+              created_at, updated_at
+            ) VALUES (?, 'task', ?, ?, 'manual_review', 'pending', ?, ?, ?, ?)
+            """,
+            (
+                "REVIEW-OTHER-ACTION",
+                "TASK-OFFLINE-B",
+                "TASK-OFFLINE-B",
+                "AISHA-A-50-Z",
+                PLATFORM,
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+    prepared = service.prepare_execution(
+        _admin(), ["TASK-PRICE-A"], "review-isolation"
+    )
+    assert prepared.action_type is TaskActionType.UPDATE_PRICE
+
+    with repository.connect_write() as connection:
+        connection.execute(
+            """
+            INSERT INTO review_tasks(
+              review_task_id, scope_type, scope_key, source_task_id,
+              review_type, review_status, internal_sku, platform_name,
+              created_at, updated_at
+            ) VALUES (?, 'task', ?, ?, 'manual_review', 'pending', ?, ?, ?, ?)
+            """,
+            (
+                "REVIEW-OWN-PRICE",
+                "TASK-PRICE-A",
+                "TASK-PRICE-A",
+                "AISHA-A-50-Z",
+                PLATFORM,
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+    with pytest.raises(ExecutionAuthorizationBlocked):
+        service.prepare_execution(_admin(), ["TASK-PRICE-A"], "review-own")
+
+
+def test_relevant_sku_mapping_change_still_invalidates_authorization(
+    execution_setup,
+) -> None:
+    service, _, calls = execution_setup
+    prepared = service.prepare_execution(
+        _admin(), ["TASK-PRICE-A"], "relevant-mapping"
+    )
+    workbook = load_workbook(service.platform_mappings_workbook)
+    sheet = workbook["data"]
+    headers = [cell.value for cell in sheet[1]]
+    sheet.cell(row=2, column=headers.index("mapping_id") + 1).value = "MAP-A-NEW"
+    workbook.save(service.platform_mappings_workbook)
+
+    with pytest.raises(ExecutionAuthorizationConflict):
         service.submit_execution(
-            admin,
+            _admin(),
             ["TASK-PRICE-A"],
             prepared.confirmation_digest,
-            "auth-drift",
+            "relevant-mapping",
         )
     assert calls == []
 
@@ -500,7 +601,13 @@ def _task(
         target_price=target_price,
         target_status=target_status,
         pricing_source=(PricingSource.MANUAL_OVERRIDE if target_price else None),
-        decision_trace={"mapping_version": mapping_version, "grade": grade},
+        decision_trace={
+            "mapping_version": mapping_version,
+            "mapping_ids": [
+                "MAP-A" if sku == "AISHA-A-50-Z" else "MAP-B"
+            ],
+            "grade": grade,
+        },
         required_by=NOW + timedelta(hours=1),
         origin_type=TaskOriginType.MANUAL,
         origin_ref_id="synthetic:" + task_id,

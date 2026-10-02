@@ -830,8 +830,8 @@ def _render_execution_controls(
             f'<input type="hidden" name="task_ids" value="{html(task_id)}">'
             for task_id in preparation.task_ids
         )
-        action_label = '平台观察已满足目标，无需改价；仅确认结束本次决定' if preparation.resolution_only else _manual_action_label(preparation.action_type)
-        button_label = '确认结束本次决定' if preparation.resolution_only else '确认并发送执行'
+        action_label = '平台观察已满足目标，无需改价；仅确认结束本次决定' if preparation.already_applied else _manual_action_label(preparation.action_type)
+        button_label = '确认结束本次决定' if preparation.already_applied else '确认并发送执行'
         confirmation = f"""
         <div class="state-banner state-incomplete"><strong>请二次确认</strong><p>{html(preparation.platform_name)} · {preparation.item_count} 项 · {html(action_label)}；请在 {html(preparation.expires_at.strftime('%H:%M'))} 前确认</p></div>
         <form method="post" action="/management/executions/submit" class="inline-actions">
