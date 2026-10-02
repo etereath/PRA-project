@@ -52,6 +52,13 @@ CHILD_PARENT_CLAIM_STATUSES = frozenset(
 )
 COVERAGE_CANDIDATE = "COVERAGE_CANDIDATE"
 LISTING_STATUS_SCAN = "LISTING_STATUS_SCAN"
+UNKNOWN_TOLERANT_LISTING_READ_JOB_TYPES = frozenset(
+    {
+        "FULL_MARKET_SCAN",
+        "PRE_CUTOFF_FULL_SCAN",
+        LISTING_STATUS_SCAN,
+    }
+)
 ORDER_SCAN = "ORDER_SCAN"
 PLATFORM_TRADE_DAY_SETTLEMENT = "PLATFORM_TRADE_DAY_SETTLEMENT"
 SALES_PLAN_INPUT_BUILD = "SALES_PLAN_INPUT_BUILD"
@@ -1585,7 +1592,15 @@ class AutomationRepository:
                 claimable_types = tuple(
                     job_type
                     for job_type in allowed
-                    if not blocker or job_type not in ui_types
+                    if (
+                        not blocker
+                        or job_type not in ui_types
+                        or (
+                            blocker == "UNKNOWN_OR_RECONCILE_ACTIVE"
+                            and job_type
+                            in UNKNOWN_TOLERANT_LISTING_READ_JOB_TYPES
+                        )
+                    )
                 )
                 claim = _claim_next_connection(
                     connection,
@@ -2444,7 +2459,12 @@ def _claim_specific_run_connection(
     if str(row["job_type"]) in frozenset(ui_job_types):
         if has_pending_urgent_incident_task(connection):
             return None
-        if _active_ui_blocker_connection(connection):
+        blocker = _active_ui_blocker_connection(connection)
+        if blocker and not (
+            blocker == "UNKNOWN_OR_RECONCILE_ACTIVE"
+            and str(row["job_type"])
+            in UNKNOWN_TOLERANT_LISTING_READ_JOB_TYPES
+        ):
             return None
         if has_active_automation_ui_run(
             connection,
@@ -2462,6 +2482,16 @@ def _claim_specific_run_connection(
 
 
 def _active_ui_blocker_connection(connection) -> str:
+    active_write = connection.execute(
+        """
+        SELECT 1
+        FROM shadowbot_write_locks
+        WHERE status = 'ACTIVE'
+        LIMIT 1
+        """
+    ).fetchone()
+    if active_write is not None:
+        return "AUTHORIZED_WRITE_ACTIVE"
     unknown = connection.execute(
         """
         SELECT 1
@@ -2475,16 +2505,6 @@ def _active_ui_blocker_connection(connection) -> str:
     ).fetchone()
     if unknown is not None:
         return "UNKNOWN_OR_RECONCILE_ACTIVE"
-    active_write = connection.execute(
-        """
-        SELECT 1
-        FROM shadowbot_write_locks
-        WHERE status = 'ACTIVE'
-        LIMIT 1
-        """
-    ).fetchone()
-    if active_write is not None:
-        return "AUTHORIZED_WRITE_ACTIVE"
     return ""
 
 

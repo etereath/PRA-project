@@ -26,6 +26,8 @@ from app.runtime_schema import LATEST_RUNTIME_SCHEMA_VERSION  # noqa: E402
 from app.services.automation import (  # noqa: E402
     AutomationHeartbeatStore,
     AutomationService,
+    FULL_MARKET_SCAN,
+    PRE_CUTOFF_FULL_SCAN,
     ensure_default_automation_jobs,
     safe_automation_error_message,
 )
@@ -36,6 +38,9 @@ from app.services.incident_automation import (  # noqa: E402
 from app.services.maintenance_automation import (  # noqa: E402
     build_maintenance_handlers,
     ensure_release_backup_automation_job,
+)
+from app.services.listing_automation_runtime import (  # noqa: E402
+    build_listing_read_only_handlers,
 )
 from app.services.operational_time import (  # noqa: E402
     OperationalTimeService,
@@ -66,6 +71,9 @@ DEFAULT_PLATFORM_MAPPINGS = PROJECT_ROOT / "data" / "samples" / "platform_mappin
 DEFAULT_PRODUCTS = PROJECT_ROOT / "data" / "samples" / "products.xlsx"
 DEFAULT_PRICE_RULES = PROJECT_ROOT / "data" / "samples" / "price_rules.xlsx"
 DEFAULT_LISTING_RULES = PROJECT_ROOT / "data" / "samples" / "listing_rules.xlsx"
+DEFAULT_LISTING_LOCATOR = (
+    PROJECT_ROOT / "shadowbot" / "test2" / "product_identity_mapping.json"
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -107,6 +115,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--enable-listing-read-only",
+        action="store_true",
+        help=(
+            "Register full-scan listing child dispatch and the existing "
+            "SYNC_STATUS READ_ONLY handler; no platform-write handler is "
+            "registered."
+        ),
+    )
+    parser.add_argument(
         "--enable-incident-monitoring",
         action="store_true",
         help=(
@@ -127,6 +144,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--shadowbot-queue-dir",
         type=Path,
         default=DEFAULT_SHADOWBOT_QUEUE_DIR,
+    )
+    parser.add_argument(
+        "--listing-locator",
+        type=Path,
+        default=DEFAULT_LISTING_LOCATOR,
+        help=(
+            "ShadowBot SYNC_STATUS locator artifact path. DB authority "
+            "materializes a generation-bound JSON locator at this path."
+        ),
     )
     parser.add_argument(
         "--enable-release-backup",
@@ -310,6 +336,23 @@ def main() -> int:
                         mapping_workbook=args.platform_mappings,
                         configured_account_id=args.account_id,
                         operational_time=operational_time,
+                        timeout_seconds=args.order_timeout_seconds,
+                    )
+                )
+            if args.enable_listing_read_only:
+                handlers.update(
+                    build_listing_read_only_handlers(
+                        runtime_repository=runtime_repository,
+                        queue_dir=args.shadowbot_queue_dir,
+                        locator_path=args.listing_locator,
+                        configured_account_id=args.account_id,
+                        platform_mappings_workbook=args.platform_mappings,
+                        full_market_parent_handler=handlers.get(
+                            FULL_MARKET_SCAN
+                        ),
+                        pre_cutoff_parent_handler=handlers.get(
+                            PRE_CUTOFF_FULL_SCAN
+                        ),
                         timeout_seconds=args.order_timeout_seconds,
                     )
                 )

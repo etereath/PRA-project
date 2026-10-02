@@ -84,6 +84,17 @@ class ProductObservationImportResult:
 
 
 @dataclass(frozen=True, slots=True)
+class ProductObservationMappingContext:
+    """Frozen authority identity accepted with one listing observation."""
+
+    authority_mode: str
+    authority_generation: int
+    mapping_snapshot_sha256: str
+    mapping_version: str
+    locator_artifact_sha256: str
+
+
+@dataclass(frozen=True, slots=True)
 class _ListingSnapshotSourceValidation:
     mapping_identity_sha256: str
     source_identities: tuple[ListingObservationSourceIdentity, ...]
@@ -184,6 +195,7 @@ class ProductObservationImporter:
                         "automation run"
                     )
                 source_validation = None
+                mapping_context = None
                 if normalized.scan_type == LISTING_STATUS_SCAN:
                     source_validation = _validate_listing_snapshot_source(
                         connection,
@@ -196,6 +208,45 @@ class ProductObservationImporter:
                             **normalized.requested_scope,
                             "validated_mapping_identity_sha256": (
                                 source_validation.mapping_identity_sha256
+                            ),
+                        },
+                    )
+                    mapping_context = _listing_mapping_context_from_scope(
+                        normalized.requested_scope
+                    )
+
+                resolved_items = tuple(
+                    self._resolve_items(
+                        normalized.platform_name,
+                        normalized.items,
+                    )
+                )
+                if source_validation is not None:
+                    _validate_resolved_listing_identities(
+                        source_identities=(
+                            source_validation.source_identities
+                        ),
+                        resolved_items=resolved_items,
+                    )
+                accepted_mapping_version = self.mappings.mapping_version
+                if (
+                    mapping_context is not None
+                    and mapping_context.mapping_version
+                    != accepted_mapping_version
+                ):
+                    raise ProductObservationError(
+                        "mapping authority context does not match imported mappings"
+                    )
+                if mapping_context is not None:
+                    normalized = replace(
+                        normalized,
+                        requested_scope={
+                            **normalized.requested_scope,
+                            "accepted_identity_bindings": (
+                                _accepted_listing_identity_bindings(
+                                    resolved_items=resolved_items,
+                                    mappings=self.mappings,
+                                )
                             ),
                         },
                     )
@@ -240,20 +291,6 @@ class ProductObservationImporter:
                         "content"
                     )
 
-                resolved_items = tuple(
-                    self._resolve_items(
-                        normalized.platform_name,
-                        normalized.items,
-                    )
-                )
-                if source_validation is not None:
-                    _validate_resolved_listing_identities(
-                        source_identities=(
-                            source_validation.source_identities
-                        ),
-                        resolved_items=resolved_items,
-                    )
-                accepted_mapping_version = self.mappings.mapping_version
                 normalized = replace(
                     normalized,
                     requested_scope={
@@ -479,6 +516,8 @@ class ProductObservationImporter:
         self,
         platform_name: str,
         items: Iterable[ProductObservationInput],
+        *,
+        account_id: str = "",
     ) -> Iterable[dict[str, object]]:
         for item in items:
             context = self.operational_time.classify(item.observed_at)
@@ -487,6 +526,7 @@ class ProductObservationImporter:
                 platform_product_name=item.platform_product_name,
                 grade=item.grade,
                 observed_at=item.observed_at,
+                account_id=account_id,
             )
             yield {
                 "internal_sku": resolution.internal_sku,
@@ -511,6 +551,7 @@ class ProductObservationImporter:
                 "candidate_internal_skus": (
                     resolution.candidate_internal_skus
                 ),
+                "mapping_ids": resolution.mapping_ids,
                 "evidence_sha256": item.evidence_sha256,
             }
 
@@ -602,6 +643,7 @@ def listing_snapshot_to_observation_batch(
     source_manifest_sha256: str,
     source_result_sha256: str,
     operational_time: OperationalTimeService | None = None,
+    mapping_authority: ProductObservationMappingContext | None = None,
 ) -> ProductObservationBatchInput:
     """Adapt one validated Task 13 two-page snapshot to the v14 input."""
 
@@ -650,6 +692,30 @@ def listing_snapshot_to_observation_batch(
     )
 
     snapshot_complete = bool(snapshot["snapshot_complete"])
+    requested_scope: dict[str, object] = {
+        "child_type": LISTING_STATUS_SCAN,
+        "pages": ["online", "waiting"],
+        "source_snapshot_id": snapshot["snapshot_id"],
+        "source_execution_attempt_id": snapshot["execution_attempt_id"],
+        "source_manifest_sha256": manifest_sha256,
+        "source_result_sha256": result_sha256,
+        "source_platform_trade_date": source_trade_date,
+        "source_conversion_sha256": source_conversion_sha256,
+        "source_mapping_identity_sha256": (
+            source_mapping_identity_sha256
+        ),
+    }
+    if mapping_authority is not None:
+        mapping_context_payload = _mapping_context_payload(
+            mapping_authority
+        )
+        if str(snapshot.get("mapping_source_version") or "") != str(
+            mapping_context_payload["locator_artifact_sha256"]
+        ):
+            raise ProductObservationError(
+                "listing snapshot does not match mapping authority locator"
+            )
+        requested_scope["mapping_authority"] = mapping_context_payload
     return ProductObservationBatchInput(
         observation_batch_id=(
             f"product-observation-{snapshot['snapshot_id']}"
@@ -666,18 +732,7 @@ def listing_snapshot_to_observation_batch(
             snapshot["scan_completed_at"],
             "scan_completed_at",
         ),
-        requested_scope={
-            "child_type": LISTING_STATUS_SCAN,
-            "pages": ["online", "waiting"],
-            "source_snapshot_id": snapshot["snapshot_id"],
-            "source_manifest_sha256": manifest_sha256,
-            "source_result_sha256": result_sha256,
-            "source_platform_trade_date": source_trade_date,
-            "source_conversion_sha256": source_conversion_sha256,
-            "source_mapping_identity_sha256": (
-                source_mapping_identity_sha256
-            ),
-        },
+        requested_scope=requested_scope,
         scope_complete=snapshot_complete,
         end_marker_verified=bool(
             snapshot["online_end_marker_verified"]
@@ -691,6 +746,210 @@ def listing_snapshot_to_observation_batch(
             else "Task 13 listing snapshot was incomplete"
         ),
     )
+
+
+def _mapping_context_payload(
+    context: ProductObservationMappingContext,
+) -> dict[str, object]:
+    normalized = _normalize_listing_mapping_context(context)
+    return {
+        "authority_mode": normalized.authority_mode,
+        "authority_generation": normalized.authority_generation,
+        "mapping_snapshot_sha256": normalized.mapping_snapshot_sha256,
+        "mapping_version": normalized.mapping_version,
+        "locator_artifact_sha256": normalized.locator_artifact_sha256,
+    }
+
+
+def _listing_mapping_context_from_scope(
+    scope: dict[str, object],
+) -> ProductObservationMappingContext | None:
+    raw = scope.get("mapping_authority")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ProductObservationError(
+            "requested_scope.mapping_authority must be an object"
+        )
+    allowed = {
+        "authority_mode",
+        "authority_generation",
+        "mapping_snapshot_sha256",
+        "mapping_version",
+        "locator_artifact_sha256",
+    }
+    # Old immutable scopes may retain the v19 compatibility field.
+    if set(raw) - {"account_id"} != allowed:
+        raise ProductObservationError(
+            "requested_scope.mapping_authority has invalid fields"
+        )
+    generation = raw.get("authority_generation")
+    if isinstance(generation, bool) or not isinstance(generation, int):
+        raise ProductObservationError(
+            "mapping authority_generation must be an integer"
+        )
+    return _normalize_listing_mapping_context(
+        ProductObservationMappingContext(
+            authority_mode=str(raw.get("authority_mode") or ""),
+            authority_generation=generation,
+            mapping_snapshot_sha256=str(
+                raw.get("mapping_snapshot_sha256") or ""
+            ),
+            mapping_version=str(raw.get("mapping_version") or ""),
+            locator_artifact_sha256=str(
+                raw.get("locator_artifact_sha256") or ""
+            ),
+        )
+    )
+
+
+def _normalize_listing_mapping_context(
+    context: ProductObservationMappingContext,
+) -> ProductObservationMappingContext:
+    authority_mode = str(context.authority_mode or "").strip().upper()
+    if authority_mode not in {"PRE_CUTOVER", "DB_AUTHORITY"}:
+        raise ProductObservationError("mapping authority_mode is invalid")
+    generation = context.authority_generation
+    if (
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 0
+    ):
+        raise ProductObservationError(
+            "mapping authority_generation must be non-negative"
+        )
+    if authority_mode == "DB_AUTHORITY" and generation < 1:
+        raise ProductObservationError(
+            "DB_AUTHORITY mapping context requires a positive generation"
+        )
+    mapping_snapshot_sha256 = str(
+        context.mapping_snapshot_sha256 or ""
+    ).strip().lower()
+    locator_artifact_sha256 = str(
+        context.locator_artifact_sha256 or ""
+    ).strip().lower()
+    mapping_version = str(context.mapping_version or "").strip().lower()
+    if (
+        not EVIDENCE_SHA256_RE.fullmatch(mapping_snapshot_sha256)
+        or not EVIDENCE_SHA256_RE.fullmatch(locator_artifact_sha256)
+        or not RAW_SHA256_RE.fullmatch(mapping_version)
+    ):
+        raise ProductObservationError(
+            "mapping authority digests are invalid"
+        )
+    return ProductObservationMappingContext(
+        authority_mode=authority_mode,
+        authority_generation=generation,
+        mapping_snapshot_sha256=mapping_snapshot_sha256,
+        mapping_version=mapping_version,
+        locator_artifact_sha256=locator_artifact_sha256,
+    )
+
+
+def _accepted_listing_identity_bindings(
+    *,
+    resolved_items: Iterable[dict[str, object]],
+    mappings: CompiledProductMappings,
+) -> list[dict[str, object]]:
+    records_by_id = {record.mapping_id: record for record in mappings.records}
+    bindings: list[dict[str, object]] = []
+    for item in resolved_items:
+        mapping_ids = tuple(str(value) for value in item["mapping_ids"])
+        matched_records = tuple(
+            records_by_id[mapping_id]
+            for mapping_id in mapping_ids
+            if mapping_id in records_by_id
+        )
+        identity_digests = {
+            record.platform_product_identity_digest
+            for record in matched_records
+            if record.platform_product_identity_digest
+            and record.internal_sku == item["internal_sku"]
+        }
+        bindings.append(
+            {
+                "evidence_sha256": item["evidence_sha256"],
+                "internal_sku": item["internal_sku"],
+                "mapping_ids": list(mapping_ids),
+                "platform_product_identity_digest": (
+                    next(iter(identity_digests))
+                    if len(identity_digests) == 1
+                    else ""
+                ),
+            }
+        )
+    return sorted(
+        bindings,
+        key=lambda item: str(item["evidence_sha256"]),
+    )
+
+
+def _listing_acquisition_source(
+    connection,
+    *,
+    snapshot_id: str,
+    execution_attempt_id: str,
+):
+    """Read the existing acquisition ledger, independent of parent/ACK state."""
+    source = connection.execute(
+        """
+        SELECT snapshots.*, batches.manifest_sha256,
+               batches.status AS source_batch_status,
+               batches.action_type AS source_action_type,
+               batches.platform_name AS source_platform_name,
+               batches.execution_attempt_id AS batch_attempt_id,
+               batches.instruction_hash AS batch_instruction_hash,
+               batches.result_id AS batch_result_id,
+               receipts.execution_attempt_id AS receipt_attempt_id,
+               receipts.instruction_hash AS receipt_instruction_hash,
+               receipts.manifest_sha256 AS receipt_manifest_sha256,
+               receipts.result_sha256, receipts.ack_state
+        FROM listing_sync_snapshots AS snapshots
+        INNER JOIN shadowbot_listing_action_batches AS batches
+            ON batches.batch_id = snapshots.batch_id
+        INNER JOIN shadowbot_listing_result_receipts AS receipts
+            ON receipts.result_id = snapshots.result_id
+           AND receipts.batch_id = snapshots.batch_id
+        WHERE snapshots.snapshot_id = ?
+        """,
+        (snapshot_id,),
+    ).fetchone()
+    if source is None:
+        return None, ("SOURCE_EVIDENCE_MISSING",)
+    reasons = []
+    if not execution_attempt_id or any(
+        str(source[key]) != execution_attempt_id
+        for key in ("execution_attempt_id", "batch_attempt_id", "receipt_attempt_id")
+    ):
+        reasons.append("SOURCE_ATTEMPT_MISMATCH")
+    if (
+        str(source["source_batch_status"]) != "VERIFIED"
+        or str(source["status"]) != "VERIFIED"
+        or not all(
+            source[key]
+            for key in (
+                "snapshot_complete",
+                "online_scan_complete",
+                "waiting_scan_complete",
+                "online_end_marker_verified",
+                "waiting_end_marker_verified",
+            )
+        )
+    ):
+        reasons.append("SOURCE_ACQUISITION_INCOMPLETE")
+    if (
+        str(source["source_action_type"]) != "sync_status"
+        or str(source["source_platform_name"]) != str(source["platform_name"])
+        or str(source["batch_result_id"]) != str(source["result_id"])
+        or str(source["manifest_sha256"]) != str(source["receipt_manifest_sha256"])
+        or not EVIDENCE_SHA256_RE.fullmatch(str(source["instruction_hash"]))
+        or any(
+            str(source[key]) != str(source["instruction_hash"])
+            for key in ("batch_instruction_hash", "receipt_instruction_hash")
+        )
+    ):
+        reasons.append("SOURCE_INTEGRITY_MISMATCH")
+    return source, tuple(reasons)
 
 
 def _validate_listing_snapshot_source(
@@ -726,23 +985,14 @@ def _validate_listing_snapshot_source(
         raise ProductObservationError(
             "LISTING_STATUS_SCAN requires immutable snapshot source binding"
         )
-    source = connection.execute(
-        """
-        SELECT snapshots.*, batches.manifest_sha256,
-               receipts.result_sha256
-        FROM listing_sync_snapshots AS snapshots
-        INNER JOIN shadowbot_listing_action_batches AS batches
-            ON batches.batch_id = snapshots.batch_id
-        INNER JOIN shadowbot_listing_result_receipts AS receipts
-            ON receipts.result_id = snapshots.result_id
-           AND receipts.batch_id = snapshots.batch_id
-        WHERE snapshots.snapshot_id = ?
-        """,
-        (snapshot_id,),
-    ).fetchone()
-    if source is None:
+    source, acquisition_reasons = _listing_acquisition_source(
+        connection,
+        snapshot_id=snapshot_id,
+        execution_attempt_id=str(scope.get("source_execution_attempt_id") or ""),
+    )
+    if acquisition_reasons:
         raise ProductObservationError(
-            "LISTING_STATUS_SCAN source snapshot does not exist"
+            "LISTING_STATUS_SCAN " + ", ".join(acquisition_reasons)
         )
     run_manifest = str(run["input_manifest_sha256"] or "").strip().lower()
     if (
@@ -1333,6 +1583,7 @@ def _normalize_requested_scope(
     requested_scope: dict[str, object],
 ) -> dict[str, object]:
     reserved_fields = {
+        "accepted_identity_bindings",
         "accepted_mapping_version",
         "validated_mapping_identity_sha256",
     }
