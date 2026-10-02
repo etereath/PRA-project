@@ -389,7 +389,7 @@ class OperationsWebApplication:
                 return self._method_not_allowed("POST")
             return self._review_resolve(environ)
 
-        if path in {"/management/price-resolutions/claim", "/management/price-resolutions/resolve"}:
+        if path == "/management/price-resolutions/resolve":
             if method != "POST":
                 return self._method_not_allowed("POST")
             return self._price_resolution(environ, path)
@@ -1239,12 +1239,9 @@ class OperationsWebApplication:
             return Response.text('404 Not Found', '未找到人工改价复核。')
         location = '/management/task/' + quote(review.source_task_id, safe='')
         try:
-            if path.endswith('/claim'):
-                self.price_resolution.claim(session.principal, review_id=review_id)
-            else:
-                self.price_resolution.resolve(session.principal, review_id=review_id,
-                    **{key: self._first(form, key) for key in
-                       ('evidence_id', 'evidence_digest', 'conclusion', 'idempotency_key', 'note')})
+            self.price_resolution.resolve(session.principal, review_id=review_id,
+                **{key: self._first(form, key) for key in
+                   ('idempotency_key', 'note')})
         except ValidationError as exc:
             token = self.control_store.put(session.principal.subject, str(exc))
             location += '?price_resolution_error=' + quote(token, safe='')
