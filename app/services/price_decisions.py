@@ -40,10 +40,25 @@ def record_price_supersession(connection, tasks, *, subject: str, now: datetime)
             (task.internal_sku, task.platform_name, task.task_id),
         ).fetchall()
         for old in rows:
+            # A price change does not withdraw a listing decision. SET_ONLINE
+            # carries price and listing targets; SET_OFFLINE ends that sale.
+            replaces_dimension = (
+                task.action_type.value != 'update_price'
+                or old['action_type'] == 'update_price'
+            )
+            ordinary_manual = (
+                old['origin_type'] == 'MANUAL'
+                and str(old['origin_ref_id']).startswith('web-manual:')
+            )
+            automation_price_before_offline = (
+                old['origin_type'] == 'AUTOMATION'
+                and old['action_type'] == 'update_price'
+                and task.action_type.value == 'set_offline'
+            )
             replaceable = (
                 old['task_status'] == 'pending'
-                and old['origin_type'] == 'MANUAL'
-                and str(old['origin_ref_id']).startswith('web-manual:')
+                and replaces_dimension
+                and (ordinary_manual or automation_price_before_offline)
                 and not has_published_responsibility(connection, old['task_id'])
             )
             if not replaceable:

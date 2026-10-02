@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 from openpyxl import Workbook
 
-from app.enums import TaskActionType, TaskStatus
+from app.enums import TaskActionType, TaskOriginType, TaskStatus
+from app.models import Task
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import (
     PLATFORM_MAPPING_HEADERS,
@@ -422,11 +423,12 @@ def _decision(service, *, action=SET_PRICE, key='old', grade='A级'):
     return result.task_ids[0]
 
 
-@pytest.mark.parametrize('old_action,new_action', [
-    (SET_PRICE, SET_OFFLINE), (SET_OFFLINE, SET_PRICE), (SET_ONLINE, SET_OFFLINE),
+@pytest.mark.parametrize('old_action,new_action,superseded', [
+    (SET_PRICE, SET_OFFLINE, True), (SET_OFFLINE, SET_PRICE, False),
+    (SET_ONLINE, SET_PRICE, False), (SET_ONLINE, SET_OFFLINE, True),
 ])
 def test_sales_decision_supersedes_unpublished_other_action_atomically(
-    manual_service, old_action, new_action,
+    manual_service, old_action, new_action, superseded,
 ):
     service, repository, _, _ = manual_service
     if old_action == SET_ONLINE:
@@ -434,13 +436,48 @@ def test_sales_decision_supersedes_unpublished_other_action_atomically(
     old = _decision(service, action=old_action)
     _listing(repository, 'AISHA-A-50-Z', 'A级', Decimal('12.00'), 'online')
     new = _decision(service, action=new_action, key='new')
-    assert repository.get_task(old).task_status is TaskStatus.CANCELLED
+    assert repository.get_task(old).task_status is (
+        TaskStatus.CANCELLED if superseded else TaskStatus.PENDING
+    )
     assert repository.get_task(new).task_status is TaskStatus.PENDING
-    assert repository.get_task(new).decision_trace['predecessor_task_ids'] == []
+    assert repository.get_task(new).decision_trace['predecessor_task_ids'] == ([] if superseded else [old])
     assert _decision(service, action=new_action, key='new') == new
     with repository.connect_read() as connection:
         history = connection.execute('SELECT * FROM task_status_history WHERE task_id = ?', (old,)).fetchall()
-        assert len(history) == 1 and history[0]['to_status'] == 'cancelled'
+        if superseded:
+            assert len(history) == 1 and history[0]['to_status'] == 'cancelled'
+        else:
+            assert not history
+        assert connection.execute('SELECT COUNT(*) FROM shadowbot_execution_attempts').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('origin,ref,superseded', [
+    ('AUTOMATION', 'task-generation:test', True),
+    ('SYSTEM_EMERGENCY', 'emergency:test', False),
+    ('MANUAL', 'incident-review:test', False),
+])
+def test_human_offline_supersedes_only_normal_automation_price(manual_service, origin, ref, superseded):
+    service, repository, _, _ = manual_service
+    old = 'TASK-ORIGIN-FIXTURE'
+    task = Task(
+        task_id=old, internal_sku='AISHA-A-50-Z', platform_name=PLATFORM,
+        action_type=(TaskActionType.SET_OFFLINE if origin == 'SYSTEM_EMERGENCY' else TaskActionType.UPDATE_PRICE),
+        priority=1, task_status=TaskStatus.PENDING, created_at=NOW,
+        origin_type=TaskOriginType(origin), origin_ref_id=ref,
+    )
+    if origin == 'SYSTEM_EMERGENCY':
+        # Seed an existing emergency record; this test does not authorize or
+        # exercise emergency creation, which has its own dedicated service.
+        with repository.connect_write() as connection:
+            repository._insert_tasks_on_connection(connection, [task])
+    else:
+        repository.insert_tasks([task])
+    new = _decision(service, action=SET_OFFLINE, key='new')
+    assert repository.get_task(old).task_status is (
+        TaskStatus.CANCELLED if superseded else TaskStatus.PENDING
+    )
+    assert repository.get_task(new).decision_trace['predecessor_task_ids'] == ([] if superseded else [old])
+    with repository.connect_read() as connection:
         assert connection.execute('SELECT COUNT(*) FROM shadowbot_execution_attempts').fetchone()[0] == 0
 
 

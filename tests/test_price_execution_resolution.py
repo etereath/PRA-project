@@ -27,7 +27,7 @@ from tests.test_human_price_journey import (
     run_cycle,
 )
 from tests.test_shadowbot_listing_sync import _result, _item
-from app.enums import TaskStatus
+from app.enums import TaskOriginType, TaskStatus
 from app.exceptions import ValidationError
 from app.operations_web.auth import Principal, Capability
 from app.services.price_execution_resolution import PriceExecutionResolutionApplicationService
@@ -408,10 +408,23 @@ def test_saved_offline_decision_authorizes_after_unknown_close_without_recreatio
                                   (u.batch,)).fetchone()[0] == 'UNKNOWN'
 
 
-def test_offline_decision_preserves_published_price_and_expiry_cannot_end_it(journey):
+def price_decision_with_origin(j, origin):
+    if origin == 'MANUAL':
+        return decide(j)
+    task = replace(
+        j.runtime.get_task('TASK-PRICE-A'), task_id='TASK-AUTOMATION-PRICE',
+        task_status=TaskStatus.PENDING, origin_type=TaskOriginType.AUTOMATION,
+        origin_ref_id='task-generation:test', dedupe_key='',
+    )
+    assert j.runtime.insert_tasks([task]) == 1
+    return task.task_id
+
+
+@pytest.mark.parametrize('origin', ['MANUAL', 'AUTOMATION'])
+def test_offline_decision_preserves_published_price_and_expiry_cannot_end_it(journey, origin):
     from app.services.runtime import RuntimeTaskService
     j = journey
-    old = decide(j)
+    old = price_decision_with_origin(j, origin)
     accepted = accept(j, old)
     coordinator, importer, watchdog = rebuild(j)
     run_cycle(importer, watchdog, coordinator=coordinator)
@@ -433,17 +446,28 @@ def test_offline_decision_preserves_published_price_and_expiry_cannot_end_it(jou
     assert j.runtime.get_task(old).task_status == old_task.task_status
 
 
-def test_offline_supersession_or_expiry_closes_unpublished_handoff(journey):
+@pytest.mark.parametrize('origin', ['MANUAL', 'AUTOMATION'])
+def test_offline_supersession_or_expiry_closes_unpublished_handoff(journey, origin):
     from app.services.runtime import RuntimeTaskService
     j = journey
-    old = decide(j)
+    old = price_decision_with_origin(j, origin)
     accept(j, old)
-    offline_decision(j)
+    offline = offline_decision(j)
     assert j.runtime.get_task(old).task_status is TaskStatus.CANCELLED
+    assert j.service._revalidate((offline,), seed.NOW)['action_type'] == 'set_offline'
     coordinator, importer, watchdog = rebuild(j)
     assert not run_cycle(importer, watchdog, coordinator=coordinator)
     assert not list(j.service.queue_root.glob('inbox/*.ready.json'))
+    # Creating another price decision must retain the pending offline decision.
     next_price = decide(j, '14', 'next-price')
+    assert j.runtime.get_task(offline).task_status is TaskStatus.PENDING
+    with pytest.raises(ExecutionAuthorizationBlocked, match='尚未收口'):
+        accept(j, next_price, 'blocked-next-auth')
+    # Explicitly end the offline decision before the independent expiry check.
+    RuntimeTaskService(j.runtime).change_status(
+        task_id=offline, to_status=TaskStatus.CANCELLED, changed_by='admin',
+        reason='explicit_offline_withdrawal',
+    )
     accept(j, next_price, 'next-auth')
     with j.runtime.connect_write() as connection:
         connection.execute('UPDATE tasks SET expires_at = ? WHERE task_id = ?',

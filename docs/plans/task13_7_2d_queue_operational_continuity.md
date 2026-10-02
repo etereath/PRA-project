@@ -320,9 +320,9 @@ SKU-A predecessor/UNKNOWN/Review
 
 Reviewer 首轮围绕 2D-01、2D-02 与 AC-01～AC-07 审查，不重新打开 S1/S2 已关闭设计，也不扩展到 S3。
 
-## 15. 本地实现与验证交接（2026-10-03）
+## 15. 实现与验证交接（2026-10-03）
 
-基线：同步 `main@9da3392b4a8cc65f6847a58c016f18a1db14da15`，本地 merge commit 为 `69082747e1a111f28f0277366f826b63bf03b816`。保持 Draft；尚未推送，当前实现没有自动 CI URL，不引用上游 CI 作为本轮证明。
+基线：同步 `main@9da3392b4a8cc65f6847a58c016f18a1db14da15`，merge commit 为 `69082747e1a111f28f0277366f826b63bf03b816`。首版 `aa4c463c261076d521914bce1fc9eed0fa83e7c3` 已推送，[Core CI #37058739581](https://github.com/etereath/PRA-project/actions/runs/37058739581) Windows / Linux 均 SUCCESS。PR 保持 Draft；该旧 Head 的审查 FAIL 与本轮修复交接见下方，不将旧 CI 当作整改 Head 证明。
 
 生产修改为 `manual_task_orchestration.py`、`price_decisions.py`、`execution_authorization.py`、`operations_web/queries.py` 和 `services/runtime.py`。新增决定与 supersession/history 原子提交；复用 `predecessor_task_ids`，不自动执行后继。`execution_authorization.py` 只调整等待提示适用于全部销售决定。未新增持久字段、状态、表或 Service，未修改 Schema、Queue/Worker 协议或 qualification。
 
@@ -332,7 +332,7 @@ Reviewer 首轮围绕 2D-01、2D-02 与 AC-01～AC-07 审查，不重新打开 S
 
 | AC | 生产路径 | 测试函数 / 当前证据 |
 |---|---|---|
-| AC-01 | Manual create → Task insert → record_price_supersession → close_price_authorizations | `test_sales_decision_supersedes_unpublished_other_action_atomically`；`test_offline_supersession_or_expiry_closes_unpublished_handoff`；原子失败由 `test_supersession_history_failure_rolls_back_new_and_old_decisions` 覆盖 |
+| AC-01 | Manual create → Task insert → record_price_supersession → close_price_authorizations | `test_sales_decision_supersedes_unpublished_other_action_atomically` 已修正为新改价保留旧上下架决定；`test_human_offline_supersedes_only_normal_automation_price` 覆盖普通自动化来源及保护 Emergency/Incident；`test_offline_supersession_or_expiry_closes_unpublished_handoff` 覆盖 MANUAL/AUTOMATION 未发布交接关闭及旧下架阻止新改价授权；原子失败由 `test_supersession_history_failure_rolls_back_new_and_old_decisions` 覆盖 |
 | AC-02 | 同事务保存 predecessor → ExecutionAuthorization._revalidate | `test_offline_decision_preserves_published_price_and_expiry_cannot_end_it` 已通过；UNKNOWN 分支在 AC-03 中已走过保存及授权拒绝 |
 | AC-03 | S1 resolve → historical UNKNOWN 保留 → 原后继正常 v5 prepare/submit | `test_saved_offline_decision_authorizes_after_unknown_close_without_recreation` 经用户授权追加复跑通过；原已保存下架决定经正式 v5 publisher 投递到隔离测试队列，旧批次仍为 UNKNOWN |
 | AC-04 | ordinary listing READ_ONLY → Worker → Importer | 既有 `test_web_human_closure_restart_and_new_authorized_price` 本轮通过；AC-03 也复用相同 scan 路径 |
@@ -340,6 +340,12 @@ Reviewer 首轮围绕 2D-01、2D-02 与 AC-01～AC-07 审查，不重新打开 S
 | AC-06 | 正式 Task transition / 事务到期 → Current Queue pending 查询 | `test_terminal_history_leaves_current_queue_and_does_not_block_new_decision` 四种终态通过；`test_expiry_history_failure_rolls_back_task_transition` 通过；既有 Runtime 两个到期用例通过 |
 | AC-07 | SKU/platform predecessor 查询与现有授权范围 | AC-03 旅程内 SKU-B 决定可保存并独立 prepare；使用现有改价事实，经用户授权追加复跑通过 |
 
-本轮限定四个测试文件：`test_manual_task_orchestration.py`、`test_execution_authorization.py` 的直接测试，`test_price_execution_resolution.py` 四个旅程，以及 `test_runtime_persistence.py` 两个到期用例。首轮 31 passed / 2 failed（53.62 秒）；第一次定向重跑 2 passed / 1 failed（21.17 秒）；新增到期回滚用例 1 passed（1.26 秒）；补充到期交接 outcome 断言后该用例 1 passed（2.47 秒）。首次失败为新增夹具的观察来源标识及固定时钟，第二次失败为 SKU-B 没有 v5 所需扫描；均保留失败记录。用户明确允许追加复跑后，执行 `python -m pytest -q tests/test_price_execution_resolution.py::test_saved_offline_decision_authorizes_after_unknown_close_without_recreation --tb=short --no-header`，结果 1 passed（19.13 秒），AC-03/07 待验证项已关闭。当前为 LOCAL IMPLEMENTED / TARGETED PASS；没有完整 pytest、完整 smoke、全仓静态检查或主动 CI 重跑，定向结果不替代完整 Gate。目标文件 Ruff、严格 UTF-8 与 diff 检查通过。
+首版历史验证限定四个测试文件：`test_manual_task_orchestration.py`、`test_execution_authorization.py` 的直接测试，`test_price_execution_resolution.py` 四个旅程，以及 `test_runtime_persistence.py` 两个到期用例。首轮 31 passed / 2 failed（53.62 秒）；第一次定向重跑 2 passed / 1 failed（21.17 秒）；新增到期回滚用例 1 passed（1.26 秒）；补充到期交接 outcome 断言后该用例 1 passed（2.47 秒）。首次失败为新增夹具的观察来源标识及固定时钟，第二次失败为 SKU-B 没有 v5 所需扫描；均保留失败记录。用户明确允许追加复跑后，执行 `python -m pytest -q tests/test_price_execution_resolution.py::test_saved_offline_decision_authorizes_after_unknown_close_without_recreation --tb=short --no-header`，结果 1 passed（19.13 秒）。这些结果未发现错误的跨维度替代预期，不能关闭后续 P1-55-01。
 
-真实 Runtime、真实平台、部署和小程序未验证；合成适配器及临时目录证据不能替代实机证据。后续固定实现 Head 与自动 CI 以获准推送后的 PR 为准。
+### P1-55-01 / P2-55-01 冻结整改
+
+[首审](https://github.com/etereath/PRA-project/pull/55#issuecomment-5960916192)判定旧 Head 的 Implementation Review FAIL；本轮只整改这两项，审查问题仍待 Reviewer 复核。生产增量仅在 `price_decisions.py`：新改价只覆盖价格维度，保留已有上下架决定为 predecessor；新下架可在无发布责任时替代普通 AUTOMATION 改价。原有零副作用判断、事务、已发布保护和 Emergency/Incident 来源边界均保留，没有新表、字段、状态或 Service。
+
+原有测试错误地接受 `SET_OFFLINE → SET_PRICE` 自动取消，且未覆盖 AUTOMATION 来源；本轮修正该预期并扩展相同夹具，验证保存后仍被 predecessor 阻止、自动化未发布交接关闭、自动化已发布责任保留。四个文件内的 AC-01～07 直接回归先得到 **24 passed / 5 failed（33.60 秒）**；五个来源夹具违反数据库不可变来源约束，修正为创建时携带来源后各复跑一次，**5 passed（4.47 秒）**，29 个定向用例已有通过证据。状态页已记录真实推送、绑定 Head 的 CI 及审查状态。目标文件 Ruff、严格 UTF-8 和 diff 检查通过；未运行本地全量或主动重跑 CI，新 Head 自动 CI 以 PR 为准。
+
+真实 Runtime、真实平台、部署和小程序未验证；合成适配器及临时目录证据不能替代实机证据。固定实现 Head 与自动 CI 以 PR 为准，不自行宣告审查问题关闭或 Stage Goal 通过。
