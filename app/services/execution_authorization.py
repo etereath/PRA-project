@@ -612,15 +612,6 @@ class ExecutionAuthorizationApplicationService:
                 raise ExecutionAuthorizationBlocked(
                     "平台状态正在更新，暂不能提交执行，请稍后重试。"
                 )
-            inventory_required = connection.execute(
-                "SELECT 1 FROM tasks WHERE task_id IN ("
-                + ",".join("?" for _ in task_ids)
-                + ") AND action_type <> ? LIMIT 1",
-                (*task_ids, TaskActionType.UPDATE_PRICE.value),
-            ).fetchone()
-            authority = inventory.get_authority_state(connection=connection)
-            if inventory_required is not None and authority.authority_mode != "DB_AUTHORITY":
-                raise ExecutionAuthorizationConflict("库存资料正在维护，暂不能提交执行。")
             rows = connection.execute(
                 "SELECT * FROM tasks WHERE task_id IN ("
                 + ",".join("?" for _ in task_ids)
@@ -662,17 +653,9 @@ class ExecutionAuthorizationApplicationService:
                     if action_type is TaskActionType.UPDATE_PRICE
                     else inventory.get_balance(sku, connection=connection)
                 )
-                if action_type is not TaskActionType.UPDATE_PRICE and balance is None:
-                    raise ExecutionAuthorizationConflict(f"数据库库存中缺少商品：{sku}")
                 target_price = _optional_decimal(row["target_price"])
                 if target_price is not None and target_price < product.base_cost:
                     raise ExecutionAuthorizationConflict(f"任务价格低于基础成本：{task_id}")
-                if action_type is TaskActionType.SET_ONLINE:
-                    target_inventory = int(row["target_inventory"])
-                    if target_inventory > balance.current_qty:
-                        raise ExecutionAuthorizationConflict(
-                            "上架目标库存超过数据库库存，请重新设置。"
-                        )
                 pending_review = connection.execute(
                     """
                     SELECT 1 FROM review_tasks

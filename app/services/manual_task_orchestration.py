@@ -358,10 +358,7 @@ class ManualTaskApplicationService:
         products = snapshot.products
         products_sha256 = snapshot.product_snapshot_sha256.removeprefix("sha256:")
         mappings = snapshot.mappings
-        authority = self.inventory.get_authority_state(connection=connection)
         errors: list[str] = []
-        if authority.authority_mode != "DB_AUTHORITY":
-            errors.append("库存资料正在维护，暂不能创建任务。")
 
         wanted_varieties = {normalize_mapping_text(value) for value in request.varieties}
         wanted_grades = {normalize_mapping_text(value) for value in request.grades}
@@ -385,7 +382,6 @@ class ManualTaskApplicationService:
                     product=product,
                     platform_name=platform,
                     mappings=mappings,
-                    authority_mode=authority.authority_mode,
                     current=current,
                     exclusions=exclusions,
                 )
@@ -431,7 +427,6 @@ class ManualTaskApplicationService:
         product: Product,
         platform_name: str,
         mappings: CompiledProductMappings,
-        authority_mode: str,
         current: datetime,
         exclusions: set[str],
     ) -> ManualTaskPreviewItem:
@@ -465,8 +460,6 @@ class ManualTaskApplicationService:
             blockers.append("最新平台状态与当前商品不一致。")
 
         balance = self.inventory.get_balance(product.internal_sku, connection=connection)
-        if authority_mode == "DB_AUTHORITY" and balance is None:
-            blockers.append("数据库库存中缺少该商品。")
 
         current_price = listing.current_price if listing is not None else None
         current_status = str(listing.online_status or "").strip().lower() if listing else ""
@@ -517,9 +510,7 @@ class ManualTaskApplicationService:
                 blockers.append("目标价格不能低于商品基础成本。")
         if request.action == SET_ONLINE:
             if target_inventory is None or target_inventory < 0:
-                blockers.append("上架必须填写非负平台目标库存。")
-            elif balance is not None and target_inventory > balance.current_qty:
-                blockers.append("平台目标库存不能超过数据库库存。")
+                blockers.append("上架必须填写非负平台目标可售量。")
 
         item_key = _item_key(platform_name, product.internal_sku)
         observed_version = ""
@@ -702,15 +693,15 @@ def _normalize_request(
     target_inventory = request.target_inventory
     if action == SET_ONLINE:
         if isinstance(target_inventory, bool):
-            raise ManualTaskError("平台目标库存必须是非负整数。")
+            raise ManualTaskError("平台目标可售量必须是非负整数。")
         try:
             target_inventory = int(target_inventory)
         except (TypeError, ValueError) as exc:
-            raise ManualTaskError("上架任务必须填写平台目标库存。") from exc
+            raise ManualTaskError("上架任务必须填写平台目标可售量。") from exc
         if target_inventory < 0:
-            raise ManualTaskError("平台目标库存必须是非负整数。")
+            raise ManualTaskError("平台目标可售量必须是非负整数。")
     elif target_inventory is not None:
-        raise ManualTaskError("只有上架任务可以携带平台目标库存。")
+        raise ManualTaskError("只有上架任务可以携带平台目标可售量。")
 
     return ManualTaskRequest(
         varieties=varieties,
@@ -790,8 +781,7 @@ def _item_payload(item: ManualTaskPreviewItem) -> dict[str, object]:
         "action_type": item.action_type.value,
         "current_price": _decimal_text(item.current_price),
         "current_status": item.current_status,
-        "real_inventory": item.real_inventory,
-        "real_inventory_version": item.real_inventory_version,
+        # Physical stock is informational, not part of the sales decision.
         "base_cost": _decimal_text(item.base_cost),
         "target_price": _decimal_text(item.target_price),
         "target_inventory": item.target_inventory,

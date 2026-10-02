@@ -798,7 +798,7 @@ def _render_manual_task_controls(
         <fieldset><legend>平台（可多选）</legend><div class="chip-row">{platform_choices}</div></fieldset>
         <label>任务类型<select name="action" data-task-action><option value="SET_PRICE">调整价格到</option><option value="CHANGE_PRICE">加/降价</option><option value="SET_OFFLINE">下架</option><option value="SET_ONLINE">上架</option></select></label>
         <label data-price-field><span data-price-label>目标价格</span><input name="price_value" inputmode="decimal" placeholder="请输入目标价格"></label>
-        <label data-inventory-field hidden>平台目标库存<input name="target_inventory" type="number" min="0" step="1"></label>
+        <label data-inventory-field hidden>平台目标可售量<input name="target_inventory" type="number" min="0" step="1"></label>
         <footer class="dialog-actions"><button type="button" class="secondary" data-dialog-close>取消</button><button type="submit"{' disabled' if not platform_ready else ''}>预览任务</button></footer>
       </form>
     </dialog>

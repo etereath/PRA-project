@@ -85,6 +85,14 @@ This dated block supersedes the older Task 13.7-S1 table row above.
 
 PR #55 已同步 `main@9da3392`，实现 2D-01 / 2D-02：三种人工销售决定复用 Task/history/predecessor，在同一事务中先保存新决定。新改价只替代旧改价，不默示撤回旧上下架决定；人工下架可安全替代未发布的普通 AUTOMATION 改价。已发布责任保留且阻止相关后继授权，SYSTEM_EMERGENCY / Incident 优先级不改。现有到期服务在事务内检查执行责任，Current Queue 读取正式收口可安全过期的 PENDING，并关闭未发布授权交接。没有新增持久字段、状态、表或 Service。
 
-当前为 **REMEDIATION IMPLEMENTED / TARGETED PASS / WAIT RE-REVIEW**。首版 `aa4c463c261076d521914bce1fc9eed0fa83e7c3` 已推送，绑定该 Head 的 [Core CI #37058739581](https://github.com/etereath/PRA-project/actions/runs/37058739581) Windows / Linux 均 SUCCESS；随后[限定审查](https://github.com/etereath/PRA-project/pull/55#issuecomment-5960916192)判定 Implementation Review FAIL，冻结 P1-55-01（替代业务维度/来源策略）及 P2-55-01（状态页过时）。本轮完成对应实现、错误测试预期和状态记录整改；仍等待 Reviewer 复核，不由实现者关闭审查问题或改写 Stage Goal。
+当前为 **MERGED**。PR #55 已于 2026-10-03（Asia/Shanghai）合入 main `23190a1eb76cc59f2f7942e1b2f32d872fcfe721`，不再是待合并任务。历史首版 `aa4c463c261076d521914bce1fc9eed0fa83e7c3` 的 [Core CI #37058739581](https://github.com/etereath/PRA-project/actions/runs/37058739581) Windows / Linux 均 SUCCESS，但[限定首审](https://github.com/etereath/PRA-project/pull/55#issuecomment-5960916192)曾判定 Implementation Review FAIL，冻结 P1-55-01（替代业务维度/来源策略）及 P2-55-01（状态页过时）。整改提交 `617c94eb66750cd465d964ab600929e4aa11e790` 已完成对应实现、错误测试预期和状态记录修正并随 #55 合并；本段记录合并事实，不代替负责人 Stage Goal 裁决。
 
 本轮仅运行四个文件内的 AC-01～07 直接回归：**24 passed / 5 failed（33.60 秒）**；五项均因新增夹具试图修改不可变 Task 来源被拒绝，改为创建时携带正确来源后，五项各复跑一次，**5 passed（4.47 秒）**。29 个定向用例已有通过证据，目标文件 Ruff、严格 UTF-8 和 diff 检查通过。没有本地全量回归或主动 CI 重跑，未部署或操作真实平台。旧 Head CI 不替代整改 Head 的自动 CI，推送后的即时 Head/CI 以 [PR #55](https://github.com/etereath/PRA-project/pull/55) 为准。范围、AC 路径及历史验证记录见[2D 计划](plans/task13_7_2d_queue_operational_continuity.md#15-实现与验证交接2026-10-03)。
+
+## Task 13.7-3A Exposure 语义解耦（2026-10-03）
+
+[Issue #60](https://github.com/etereath/PRA-project/issues/60) / Draft [PR #61](https://github.com/etereath/PRA-project/pull/61)：**IMPLEMENTED / TARGETED PASS / WAIT REVIEW & CI**。基于包含 #55 的 `main@23190a1`，移除 Manual preview 和 Execution Authorization 中的 physical inventory authority/balance 必需条件及 Exposure 上限；实物库存继续作为可选参考，其变化不再使销售决定预览摘要失效。平台目标可售量由 Human 决定，映射、当前状态、新鲜度、成本底线、Review、predecessor、锁、有效期和既有 v5 写安全链保留。
+
+已在临时 Runtime 完成“实物 20、Exposure 50”从 preview/create、正式授权及 v5 发布到结果导入的隔离旅程，并覆盖 balance 缺失和 authority 维护。请求目标、operation/attempt、写前 20、写后/回读 50 及回读时刻保留；实物库存 balance、transactions、authority 前后完全相同。另覆盖维护且无 balance 时的 SET_OFFLINE，以及原有门禁和 UNKNOWN/唯一 RECONCILE。四个测试文件内定向验证 **59 passed（24.00 秒）**；早期最小旅程曾为 1 passed / 1 failed（2.24 秒），失败是维护夹具未清除 PRE_CUTOVER 所要求的 bootstrap 字段，已修正并在上述回归中通过。目标文件 Ruff、严格 UTF-8 和 diff 检查通过。
+
+没有新增持久字段、状态、表或 Service，没有修改 v5/Worker/Queue 协议、Schema 或实物库存账本实现。未执行全量回归、部署、Runtime cutover 或真实平台/Exposure 写；新实现 CI 必须绑定实际提交，不引用 #55 的 CI 作为证明。EXP-01～07 对应路径及验证边界见[3A 计划](plans/task13_7_3a_exposure_semantics.md#11-实现与定向验证交接2026-10-03)；即时 Head/CI 以 PR 为准。
