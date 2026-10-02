@@ -31,6 +31,7 @@ from app.enums import TaskStatus
 from app.exceptions import ValidationError
 from app.operations_web.auth import Principal, Capability
 from app.services.price_execution_resolution import PriceExecutionResolutionApplicationService
+from app.services.execution_authorization import ExecutionAuthorizationConflict
 from app.services.listing_scan_quality import ListingScanQuality
 from app.services.shadowbot_executor import (
     ShadowBotFileQueueRunner,
@@ -334,13 +335,19 @@ def test_web_human_closure_restart_and_new_authorized_price(unknown, monkeypatch
     status, _, body = call_app(app, path='/management/task/' + u.old, cookie=cookie)
     assert status == '200 OK' and '人工处置已记录' in body and '人工核验完成' in body
     j.service.clock = lambda: datetime.now(UTC)
-    accept(j, new, 'new-auth')
+    with pytest.raises(ExecutionAuthorizationConflict):
+        j.service.prepare_execution(seed._admin(), [new], 'new-auth')
+    assert j.runtime.get_task(new).expected_old_price == Decimal('12')
+    replacement = decide(j, '15', 'replacement-after-human-close')
+    assert j.runtime.get_task(new).task_status is TaskStatus.CANCELLED
+    assert j.runtime.get_task(replacement).expected_old_price == Decimal('14')
+    accept(j, replacement, 'new-auth')
     coordinator, importer, watchdog = rebuild(j)
     assert run_cycle(importer, watchdog, coordinator=coordinator)[-1]['status'] == 'TRACKING'
     state, result = platform_worker(j, monkeypatch, price='14.00')
     assert state['writes'] == 1 and result['status'] == 'VERIFIED'
     run_cycle(importer, watchdog, coordinator=coordinator)
-    assert j.runtime.get_task(new).task_status is TaskStatus.SUCCESS
+    assert j.runtime.get_task(replacement).task_status is TaskStatus.SUCCESS
     assert j.runtime.get_listing_status(seed.PLATFORM, '艾莎', 'A级').current_price == Decimal('15')
 
 
