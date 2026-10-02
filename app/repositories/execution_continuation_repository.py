@@ -71,12 +71,30 @@ class ExecutionContinuationRepository:
                 raise ValidationError('Authorization batch changed before acceptance')
             if datetime.fromisoformat(envelope['expires_at']) <= now:
                 raise ValidationError('Authorization expired before acceptance')
+            authorization_items = {
+                item['task_id']: item
+                for item in envelope['authorization_identity']['items']
+            }
+            if set(authorization_items) != {
+                fact['task_id'] for fact in envelope['facts']['items']
+            }:
+                raise ValidationError('Authorization task scope changed before acceptance')
             for fact in envelope['facts']['items']:
                 task = connection.execute(
                     'SELECT * FROM tasks WHERE task_id = ?', (fact['task_id'],),
                 ).fetchone()
-                if (task is None or task['task_status'] != 'pending'
-                        or task['updated_at'] != fact['task_updated_at']):
+                identity = authorization_items.get(fact['task_id'])
+                if (
+                    task is None
+                    or identity is None
+                    or task['task_status'] != 'pending'
+                    or not _task_matches_identity(
+                        task,
+                        identity,
+                        envelope['authorization_identity']['platform_name'],
+                        envelope['authorization_identity']['action_type'],
+                    )
+                ):
                     raise ValidationError('Task changed before acceptance')
                 active = connection.execute(
                     """SELECT 1 FROM execution_continuations c
@@ -106,7 +124,9 @@ class ExecutionContinuationRepository:
                      envelope['principal_subject'], now.isoformat(), json.dumps({
                          'batch_id': batch_id, 'confirmation_digest': envelope['confirmation_digest'],
                          'capability': envelope['capability'],
-                         'resolution_only': bool(envelope.get('resolution_only')),
+                         'authorization_identity_sha256': digest_json(
+                             envelope['authorization_identity']
+                         ),
                      }, ensure_ascii=False)),
                 )
 
@@ -172,6 +192,15 @@ class ExecutionContinuationRepository:
                     (item['write_identity_key'],)).fetchone():
                 raise ValidationError('No-write closure is blocked by published work')
         for fact in facts:
+            qualification = fact.get('qualification') or {}
+            if (
+                qualification.get('operating_fact_qualified') is not True
+                or not qualification.get('qualification_sha256')
+                or qualification.get('observed_price') is None
+                or Decimal(str(qualification.get('observed_price')))
+                != Decimal(str(fact['target_price']))
+            ):
+                raise ValidationError('No-write closure lacks qualified evidence')
             row = connection.execute(
                 'SELECT t.task_status, t.updated_at AS task_updated_at, l.current_price, l.online_status, '
                 'l.price_observed_at, l.price_source_attempt_id FROM tasks t JOIN listing_status l '
@@ -190,3 +219,24 @@ class ExecutionContinuationRepository:
 def _utc_timestamp(value):
     parsed = datetime.fromisoformat(value)
     return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed.astimezone(UTC)
+
+
+def _task_matches_identity(task, identity, platform_name, action_type) -> bool:
+    return bool(
+        str(task['platform_name'] or '') == str(platform_name)
+        and str(task['action_type']) == str(action_type)
+        and str(task['internal_sku'] or '').upper()
+        == str(identity['internal_sku']).upper()
+        and _decimal_text(task['expected_old_price'])
+        == str(identity['expected_old_price'])
+        and _decimal_text(task['target_price']) == str(identity['target_price'])
+        and task['target_inventory'] == identity['target_inventory']
+        and str(task['target_status'] or '') == str(identity['target_status'])
+        and str(task['expires_at'] or '') == str(identity['task_expires_at'])
+    )
+
+
+def _decimal_text(value) -> str:
+    if value is None or str(value).strip() == '':
+        return ''
+    return f"{Decimal(str(value)):.2f}"

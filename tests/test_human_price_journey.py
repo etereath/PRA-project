@@ -79,6 +79,20 @@ def rebuild(journey):
     return coordinator, importer, ShadowBotQueueWatchdog(old.queue_root, repository=journey.runtime)
 
 
+def qualified_listing(journey, price):
+    listing = journey.runtime.get_listing_status(seed.PLATFORM, '艾莎', 'A级')
+    values = {
+        'operating_fact_qualified': True,
+        'observed_online': True,
+        'observed_price': f'{Decimal(price):.2f}',
+        'source_execution_attempt_id': listing.price_source_attempt_id,
+        'observed_at': listing.price_observed_at.isoformat(),
+        'platform_product_identity_digest': '',
+        'qualification_sha256': 'sha256:' + 'b' * 64,
+    }
+    return types.SimpleNamespace(**values, as_dict=lambda: dict(values))
+
+
 def platform_worker(journey, monkeypatch, *, price='12.00', fail_after_click=False):
     """Load the full production flow with only its Windows/UI adapter removed."""
     source = Path('shadowbot/test2/vertical_slice_read_price.py')
@@ -208,6 +222,10 @@ def test_external_change_or_already_completed_has_no_write(journey, price, outco
     accept(journey, task)
     seed._listing(journey.runtime, 'AISHA-A-50-Z', 'A级', Decimal(price), 'online')
     coordinator, importer, watchdog = rebuild(journey)
+    if outcome == 'ALREADY_APPLIED':
+        coordinator.service.listing_quality.latest = (
+            lambda **kwargs: qualified_listing(journey, price)
+        )
     assert run_cycle(importer, watchdog, coordinator=coordinator)[-1]['status'] == outcome
     assert not list(journey.service.queue_root.glob('inbox/*.ready.json'))
 
@@ -287,16 +305,23 @@ def test_published_old_decision_finishes_then_new_correction_requires_confirmati
     run_cycle(importer, watchdog, coordinator=coordinator)
     # New readback is later than the fixture's initial clock.
     journey.service.clock = lambda: datetime.now(UTC)
-    p = journey.service.prepare_execution(seed._admin(), [new], 'correction')
-    assert journey.runtime.get_task(new).expected_old_price == Decimal('13')
+    with pytest.raises(ExecutionAuthorizationConflict):
+        journey.service.prepare_execution(seed._admin(), [new], 'correction')
+    assert journey.runtime.get_task(new).expected_old_price == Decimal('12')
+    replacement = decide(journey, '14', 'replacement-after-fact-change')
+    assert journey.runtime.get_task(new).task_status is TaskStatus.CANCELLED
+    assert journey.runtime.get_task(replacement).expected_old_price == Decimal('13')
+    p = journey.service.prepare_execution(seed._admin(), [replacement], 'correction')
     assert not list(journey.service.queue_root.glob('inbox/*.ready.json'))
-    journey.service.submit_execution(seed._admin(), [new], p.confirmation_digest, 'correction')
+    journey.service.submit_execution(
+        seed._admin(), [replacement], p.confirmation_digest, 'correction'
+    )
     coordinator, importer, watchdog = rebuild(journey)
     assert run_cycle(importer, watchdog, coordinator=coordinator)[-1]['status'] == 'TRACKING'
     state, result = platform_worker(journey, monkeypatch, price='13.00')
     assert state['writes'] == 1 and result['status'] == 'VERIFIED'
     run_cycle(importer, watchdog, coordinator=coordinator)
-    assert journey.runtime.get_task(new).task_status is TaskStatus.SUCCESS
+    assert journey.runtime.get_task(replacement).task_status is TaskStatus.SUCCESS
 
 
 @pytest.mark.parametrize('published', [False, True])

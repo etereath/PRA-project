@@ -73,3 +73,10 @@ PR #44 已关闭且未合并，仍作历史平行分析；有效增量已随 #45
 历史证据：[G1](reports/task13_6_1_g1_business_baseline_review_20260906.md)、[G2](reports/task13_6_2_g2_architecture_handoff_review_20260906.md)、[增量 G2](reports/task13_6_2_g2_incremental_parallel_absorption_review_20260906.md)。旧报告中的“next 13.6-2 / merge #45”只代表当时状态。
 
 完整旧进展时间线保存在[收口前状态页](https://github.com/etereath/PRA-project/blob/08041bfe25a7f31f032564a2abca35e5eb5f5330/docs/project_current_status.md)，不再作为当前施工方向。
+# Task 13.7 S1/S2 current implementation status (2026-10-02)
+
+This dated block supersedes the older Task 13.7-S1 table row above.
+
+- Task 13.7-S1 UNKNOWN / Human Recovery simplification: **MERGED / CI SUCCESS**. PR #58 merged as `40ca0bad34248ec095204f3d2379bf90adf80271`; Windows/Linux Core run `37017589339` succeeded. This records the repository state only and does not authorize runtime cutover or closing a real UNKNOWN.
+- Task 13.7-S2 Decision / Authorization simplification: **LOCAL IMPLEMENTED / TARGETED PASS** on isolated branch `codex/task13-7-s2-decision-authorization`, based on the fixed S1 merge SHA above. A currently qualified target observation may close the pending one-shot atomically as `ALREADY_APPLIED` without creating or publishing a batch; ordinary execution authorization now binds business decision identity while current execution facts are still revalidated at execution time. No push, PR, deployment, runtime cutover, or real platform action has occurred.
+- S2 validation is intentionally targeted under the repository verification budget. The exact commands, counts, fixed local commit, and review bundle are recorded in the S2 handoff manifest after the local commit is created.
