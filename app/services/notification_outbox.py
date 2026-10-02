@@ -990,7 +990,8 @@ class NotificationOutboxService:
 
         review = self.repository.get_review_task(notification.related_review_task_id)
         if review is not None and review.review_type == "price_execution_unknown":
-            # This review requires a signed-in owner and persisted platform evidence.
+            # This todo requires a signed-in authorized administrator; the
+            # backend selects and validates the persisted platform evidence.
             return notification, ""
         token_service = ReviewTokenService(self.repository)
         existing_tokens = self.repository.list_review_tokens_by_review_task_id(

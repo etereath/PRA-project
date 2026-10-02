@@ -10,8 +10,6 @@ from uuid import uuid4
 
 from app.enums import DataQualityLevel, FactSource
 from app.inventory_models import (
-    InventoryAuthorityState,
-    InventoryBalance,
     InventoryBootstrapResult,
     InventorySalesBatchResult,
     InventoryTransaction,
@@ -146,6 +144,15 @@ class InventoryApplicationService:
             normalized_products
         ):
             raise ValueError("库存切换商品编码不能重复")
+        missing_inventory = [
+            item.internal_sku
+            for item in normalized_products
+            if item.current_stock is None
+        ]
+        if missing_inventory:
+            raise ValueError(
+                "库存切换商品缺少明确初始库存：" + "、".join(missing_inventory)
+            )
         _require_prefixed_sha256(snapshot_sha256, "snapshot_sha256")
         _require_prefixed_sha256(
             runtime_snapshot_sha256,

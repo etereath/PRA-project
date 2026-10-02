@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -17,7 +18,6 @@ from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.automation_repository import (
     read_order_scan_target_trade_date,
 )
-from app.repositories.workbook_repository import load_products
 from app.services.shadowbot_executor import (
     EXECUTION_MODE_COMMIT,
     SIDE_EFFECT_NOT_APPLIED,
@@ -28,8 +28,11 @@ from app.services.shadowbot_executor import (
     STATUS_START_UNKNOWN,
     ShadowBotExecutor,
     ShadowBotTaskRunner,
+    compute_instruction_hash,
     shadowbot_result_contract_from_data,
+    validate_queue_request,
 )
+from app.services.runtime_master_data import RuntimeMasterDataProvider
 from app.services.shadowbot_product_read import (
     DEFAULT_INVENTORY_PRODUCTS_PATH,
     MAX_RESULT_BYTES,
@@ -50,10 +53,14 @@ from app.services.shadowbot_listing_action_contract import (
 )
 from app.shadowbot_contract_primitives import (
     ORDER_SCAN_CONTRACT_VERSION,
+    QUEUE_STOP_FENCE_PROOF_TYPE,
+    QUEUE_STOP_FENCE_SCHEMA_VERSION,
     build_order_scan_failure_result,
     build_v4_recovery_result,
     normalize_order_scan_request,
     sha256_json,
+    queue_stop_fence_sha256,
+    validate_queue_stop_fence,
 )
 
 
@@ -174,6 +181,10 @@ class ShadowBotQueuePaths:
     def heartbeat(self) -> Path:
         return self.root / "heartbeat.json"
 
+    @property
+    def request_fences(self) -> Path:
+        return self.root / "control" / "request_fences"
+
     def ensure(self) -> None:
         for path in (
             self.inbox,
@@ -181,6 +192,7 @@ class ShadowBotQueuePaths:
             self.results,
             self.archive,
             self.quarantine,
+            self.request_fences,
             self.evidence,
             self.control,
         ):
@@ -197,15 +209,25 @@ class ShadowBotResultImporter:
         queue_dir: Path,
         *,
         inventory_products_path: Path | None = None,
+        master_data_provider: RuntimeMasterDataProvider | None = None,
     ) -> None:
         self.repository = repository
-        self.executor = ShadowBotExecutor(repository, runner)
-        self.paths = ShadowBotQueuePaths(queue_dir)
         self.inventory_products_path = Path(
             inventory_products_path
             or os.environ.get("PRA_PRODUCTS_PATH")
             or DEFAULT_INVENTORY_PRODUCTS_PATH
         )
+        self.master_data_provider = master_data_provider or RuntimeMasterDataProvider(
+            repository,
+            products_workbook=self.inventory_products_path,
+        )
+        self.executor = ShadowBotExecutor(
+            repository,
+            runner,
+            inventory_products_path=self.inventory_products_path,
+            master_data_provider=self.master_data_provider,
+        )
+        self.paths = ShadowBotQueuePaths(queue_dir)
         self.paths.ensure()
 
     def import_available(self) -> list[dict[str, Any]]:
@@ -878,7 +900,7 @@ class ShadowBotResultImporter:
         inventory_by_identity: dict[tuple[str, str, str], Any] = {}
         ambiguous_inventory_identities: set[tuple[str, str, str]] = set()
         try:
-            inventory_products = load_products(self.inventory_products_path)
+            inventory_products = self.master_data_provider.product_snapshot().products
         except (OSError, UnicodeError, ValidationError, ValueError) as exc:
             raise ValidationError(
                 f"INVENTORY_MAPPING_SOURCE_INVALID: {self.inventory_products_path}"
@@ -1205,6 +1227,48 @@ class ShadowBotLoginVerificationMonitor:
         return events
 
 
+@contextmanager
+def _try_worker_stop_lock(lock_path: Path):
+    """Acquire the same process lock held by QueueWorker for its whole lifetime."""
+
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    stream = lock_path.open("a+b")
+    locked = False
+    try:
+        if lock_path.stat().st_size == 0:
+            stream.write(b"0")
+            stream.flush()
+        stream.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locked = True
+        except OSError:
+            pass
+        yield locked
+    finally:
+        if locked:
+            try:
+                stream.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        stream.close()
+
+
 class ShadowBotQueueWatchdog:
     """Classify stale workers and working attempts. It never imports result files."""
 
@@ -1225,7 +1289,8 @@ class ShadowBotQueueWatchdog:
     def inspect(self, *, now: datetime | None = None) -> list[dict[str, Any]]:
         current = now or datetime.now(UTC)
         heartbeat_stale = self._heartbeat_stale(current)
-        events = self._inspect_inbox_integrity()
+        events = self._fence_stopped_reconcile_requests(current)
+        events.extend(self._inspect_inbox_integrity())
         if not heartbeat_stale:
             self._last_heartbeat_alert_key = ""
             return events
@@ -1269,6 +1334,225 @@ class ShadowBotQueueWatchdog:
                     )
                     self._last_heartbeat_alert_key = alert_key
         return events
+
+    def _fence_stopped_reconcile_requests(
+        self,
+        now: datetime,
+    ) -> list[dict[str, Any]]:
+        if self.repository is None:
+            return []
+        with self.repository.connect_read() as connection:
+            candidates = connection.execute(
+                """
+                SELECT DISTINCT a.*, o.lock_owner,
+                       i.item_execution_attempt_id AS source_attempt_id
+                FROM shadowbot_execution_attempts a
+                JOIN shadowbot_operations o
+                  ON o.operation_id = a.operation_id
+                JOIN shadowbot_commit_batch_items i
+                  ON i.operation_id = a.operation_id
+                JOIN shadowbot_commit_batches b
+                  ON b.batch_id = i.batch_id
+                JOIN execution_continuations c
+                  ON c.batch_id = b.batch_id
+                WHERE a.execution_mode = 'RECONCILE'
+                  AND a.status NOT IN ('STARTING', 'RUNNING')
+                  AND a.ended_at IS NOT NULL
+                  AND o.lock_owner = ''
+                  AND o.status IN ('NEEDS_RECONCILIATION', 'MANUAL_REVIEW')
+                  AND b.status = 'UNKNOWN'
+                  AND c.closed_at IS NULL
+                ORDER BY a.execution_attempt_id
+                """
+            ).fetchall()
+        if not candidates:
+            return []
+        with _try_worker_stop_lock(self.paths.control / "worker.lock") as stopped:
+            if not stopped:
+                return []
+            events = []
+            for candidate in candidates:
+                event = self._fence_one_reconcile_request(candidate, now)
+                if event is not None:
+                    events.append(event)
+            return events
+
+    def _fence_one_reconcile_request(self, attempt, now: datetime):
+        attempt_id = str(attempt["execution_attempt_id"])
+        with self.repository.connect_read() as connection:
+            attempt = connection.execute(
+                """
+                SELECT a.*, o.lock_owner, o.status AS operation_status,
+                       i.item_execution_attempt_id AS source_attempt_id
+                FROM shadowbot_execution_attempts a
+                JOIN shadowbot_operations o
+                  ON o.operation_id = a.operation_id
+                JOIN shadowbot_commit_batch_items i
+                  ON i.operation_id = a.operation_id
+                WHERE a.execution_attempt_id = ?
+                """,
+                (attempt_id,),
+            ).fetchone()
+        if (
+            attempt is None
+            or str(attempt["execution_mode"]) != "RECONCILE"
+            or str(attempt["status"]) in {"STARTING", "RUNNING"}
+            or not attempt["ended_at"]
+            or str(attempt["lock_owner"] or "")
+            or str(attempt["operation_status"])
+            not in {"NEEDS_RECONCILIATION", "MANUAL_REVIEW"}
+        ):
+            return None
+        raw = json.loads(str(attempt["raw_output_json"] or "{}"))
+        if raw.get("lease", {}).get("active") is True:
+            return None
+        if raw.get("queue_phase") == "RESULT_WRITTEN":
+            return None
+        source_attempt_id = str(raw.get("source_execution_attempt_id") or "")
+        if source_attempt_id != str(attempt["source_attempt_id"] or ""):
+            return None
+        if (self.paths.results / f"{attempt_id}.result.json").exists():
+            return None
+
+        marker_path = self.paths.request_fences / f"{attempt_id}.fence.json"
+        if marker_path.exists():
+            try:
+                proof, _ = read_checked_queue_json(marker_path)
+                validate_queue_stop_fence(
+                    proof,
+                    execution_attempt_id=attempt_id,
+                    operation_id=str(attempt["operation_id"]),
+                    source_execution_attempt_id=source_attempt_id,
+                    instruction_hash=str(attempt["instruction_hash"]),
+                )
+            except (OSError, ValidationError, ValueError, json.JSONDecodeError):
+                return {
+                    "status": "RETRY_PENDING",
+                    "error_code": "QUEUE_STOP_FENCE_INVALID",
+                    "execution_attempt_id": attempt_id,
+                }
+        else:
+            try:
+                request_sources = self._bound_reconcile_request_sources(
+                    attempt,
+                    source_attempt_id=source_attempt_id,
+                )
+            except (OSError, ValidationError, ValueError, json.JSONDecodeError):
+                return {
+                    "status": "RETRY_PENDING",
+                    "error_code": "QUEUE_STOP_FENCE_REQUEST_CONFLICT",
+                    "execution_attempt_id": attempt_id,
+                }
+            if not request_sources:
+                return None
+            digests = {item[2] for item in request_sources}
+            if len(digests) != 1:
+                return None
+            proof = {
+                "schema_version": QUEUE_STOP_FENCE_SCHEMA_VERSION,
+                "proof_type": QUEUE_STOP_FENCE_PROOF_TYPE,
+                "execution_attempt_id": attempt_id,
+                "operation_id": str(attempt["operation_id"]),
+                "source_execution_attempt_id": source_attempt_id,
+                "execution_mode": "RECONCILE",
+                "instruction_hash": str(attempt["instruction_hash"]),
+                "request_file_sha256": next(iter(digests)),
+                "quarantined_request_locations": sorted(
+                    {item[0] for item in request_sources}
+                ),
+                "worker_lock_acquired": True,
+                "fenced_at": now.astimezone(UTC).isoformat(),
+            }
+            proof["proof_sha256"] = queue_stop_fence_sha256(proof)
+            marker_content = _json_bytes(proof)
+            _atomic_write(
+                marker_path.with_suffix(marker_path.suffix + ".sha256"),
+                (hashlib.sha256(marker_content).hexdigest() + "\n").encode("ascii"),
+            )
+            _atomic_write(marker_path, marker_content)
+
+        try:
+            request_sources = self._bound_reconcile_request_sources(
+                attempt,
+                source_attempt_id=source_attempt_id,
+                expected_request_sha256=str(proof["request_file_sha256"]),
+            )
+        except (OSError, ValidationError, ValueError, json.JSONDecodeError):
+            return {
+                "status": "RETRY_PENDING",
+                "error_code": "QUEUE_STOP_FENCE_REQUEST_CONFLICT",
+                "execution_attempt_id": attempt_id,
+            }
+        quarantine_dir = self.paths.quarantine / "request_fences" / attempt_id
+        quarantine_dir.mkdir(parents=True, exist_ok=True)
+        active_paths = [item[1] for item in request_sources]
+        active_paths.extend(
+            path
+            for path in (
+                self.paths.inbox / f"{attempt_id}.ready.json.sha256",
+                self.paths.working / f"{attempt_id}.request.json.sha256",
+                self.paths.working / f"{attempt_id}.phase.json",
+            )
+            if path.exists()
+        )
+        for source in active_paths:
+            os.replace(source, quarantine_dir / source.name)
+
+        if not self.repository.record_shadowbot_queue_stop_fence(
+            attempt_id,
+            proof=proof,
+        ):
+            return {
+                "status": "RETRY_PENDING",
+                "error_code": "QUEUE_STOP_FENCE_PERSIST_FAILED",
+                "execution_attempt_id": attempt_id,
+                "proof_sha256": proof["proof_sha256"],
+            }
+        return {
+            "status": "REQUEST_FENCED",
+            "execution_attempt_id": attempt_id,
+            "proof_sha256": proof["proof_sha256"],
+            "fenced_at": proof["fenced_at"],
+        }
+
+    def _bound_reconcile_request_sources(
+        self,
+        attempt,
+        *,
+        source_attempt_id: str,
+        expected_request_sha256: str = "",
+    ) -> list[tuple[str, Path, str]]:
+        attempt_id = str(attempt["execution_attempt_id"])
+        sources = []
+        for location, path in (
+            ("INBOX", self.paths.inbox / f"{attempt_id}.ready.json"),
+            ("WORKING", self.paths.working / f"{attempt_id}.request.json"),
+        ):
+            if not path.exists():
+                continue
+            request, content = read_checked_queue_json(path)
+            validate_queue_request(request, check_expiry=False)
+            if str(request.get("instruction_hash") or "") != compute_instruction_hash(
+                request
+            ):
+                raise ValidationError(
+                    "QUEUE_STOP_FENCE_INSTRUCTION_HASH_MISMATCH"
+                )
+            digest = hashlib.sha256(content).hexdigest()
+            if (
+                str(request.get("execution_attempt_id") or "") != attempt_id
+                or str(request.get("operation_id") or "")
+                != str(attempt["operation_id"])
+                or str(request.get("execution_mode") or "") != "RECONCILE"
+                or str(request.get("instruction_hash") or "")
+                != str(attempt["instruction_hash"])
+                or str(request.get("source_execution_attempt_id") or "")
+                != source_attempt_id
+                or (expected_request_sha256 and digest != expected_request_sha256)
+            ):
+                raise ValidationError("QUEUE_STOP_FENCE_REQUEST_BINDING_MISMATCH")
+            sources.append((location, path, digest))
+        return sources
 
     def _inspect_inbox_integrity(self) -> list[dict[str, Any]]:
         if self.repository is None:
@@ -1414,6 +1698,15 @@ class ShadowBotQueueWatchdog:
                             reason = "ORPHAN_READY_REQUEST"
                             target_root = self.paths.quarantine
                         elif attempt.ended_at is not None:
+                            attempt_payload = dict(attempt.raw_output)
+                            if (
+                                not attempt_payload.get("result_file_sha256")
+                                and not attempt_payload.get("queue_stop_fence")
+                            ):
+                                # A terminal DB row is not proof that the
+                                # worker released this request.  The stopped
+                                # worker lock + durable request fence owns it.
+                                continue
                             reason = "STALE_TERMINAL_READY_REQUEST"
                             target_root = self.paths.archive / attempt_id
                             target_root.mkdir(parents=True, exist_ok=True)
@@ -1538,6 +1831,51 @@ class ShadowBotQueueWatchdog:
                         reason = "ORPHAN_READY_REQUEST"
                         target_root = self.paths.quarantine
                     else:
+                        validate_queue_request(request, check_expiry=False)
+                        if str(
+                            request.get("instruction_hash") or ""
+                        ) != compute_instruction_hash(request):
+                            raise ValidationError(
+                                "QUEUE_REQUEST_INSTRUCTION_HASH_MISMATCH"
+                            )
+                    if attempt is not None and attempt.execution_mode == "RECONCILE":
+                        attempt_payload = dict(attempt.raw_output)
+                        if (
+                            attempt.operation_id
+                            != str(request.get("operation_id") or "")
+                            or attempt.instruction_hash
+                            != str(request.get("instruction_hash") or "")
+                            or str(
+                                attempt_payload.get(
+                                    "source_execution_attempt_id"
+                                )
+                                or ""
+                            )
+                            != str(
+                                request.get("source_execution_attempt_id")
+                                or ""
+                            )
+                        ):
+                            reason = "ORPHAN_READY_REQUEST"
+                            target_root = self.paths.quarantine
+                        elif attempt.ended_at is not None:
+                            if (
+                                not attempt_payload.get("result_file_sha256")
+                                and not attempt_payload.get("queue_stop_fence")
+                            ):
+                                # Keep published UNKNOWN work in place until
+                                # the Queue worker lock and durable fence prove
+                                # it cannot still be consumed.
+                                continue
+                            reason = "STALE_TERMINAL_READY_REQUEST"
+                            target_root = self.paths.archive / attempt_id
+                            target_root.mkdir(parents=True, exist_ok=True)
+                        elif attempt.status in {"STARTING", "RUNNING"}:
+                            continue
+                        else:
+                            reason = "FROZEN_READY_REQUEST"
+                            target_root = self.paths.quarantine
+                    elif attempt is not None:
                         operation = self.repository.get_shadowbot_operation(attempt.operation_id)
                         if operation is not None and operation.status in {"VERIFIED", "MANUAL_HANDLED"}:
                             reason = "STALE_TERMINAL_READY_REQUEST"

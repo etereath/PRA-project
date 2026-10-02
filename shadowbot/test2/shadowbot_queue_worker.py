@@ -41,6 +41,7 @@ try:
         normalize_order_scan_request,
         order_scan_instruction_hash,
         sha256_json,
+        validate_queue_stop_fence,
         v4_result_counts,
         v4_result_item_skeleton,
         v5_result_counts,
@@ -61,6 +62,7 @@ except ImportError:
             normalize_order_scan_request,
             order_scan_instruction_hash,
             sha256_json,
+            validate_queue_stop_fence,
             v4_result_counts,
             v4_result_item_skeleton,
             v5_result_counts,
@@ -80,6 +82,7 @@ except ImportError:
             normalize_order_scan_request,
             order_scan_instruction_hash,
             sha256_json,
+            validate_queue_stop_fence,
             v4_result_counts,
             v4_result_item_skeleton,
             v5_result_counts,
@@ -277,7 +280,7 @@ def _v4_price(value, name):
 
 
 def _v4_item_payload(platform_name, item):
-    return {
+    payload = {
         "platform_name": str(platform_name or "").strip(),
         "source_task_id": str(item.get("source_task_id") or "").strip(),
         "internal_sku": str(item.get("internal_sku") or "").strip().upper(),
@@ -288,6 +291,10 @@ def _v4_item_payload(platform_name, item):
         "expected_old_price": _v4_price(item.get("expected_old_price"), "expected_old_price"),
         "target_price": _v4_price(item.get("target_price"), "target_price"),
     }
+    identity_digest = str(item.get("platform_product_identity_digest") or "").strip()
+    if identity_digest:
+        payload["platform_product_identity_digest"] = identity_digest
+    return payload
 
 
 def _v4_manifest_hash(platform_name, items):
@@ -1067,6 +1074,7 @@ class QueueWorker:
         self.quarantine = self.root / "quarantine"
         self.evidence = self.root / "evidence"
         self.control = self.root / "control"
+        self.request_fences = self.control / "request_fences"
         self.heartbeat = self.root / "heartbeat.json"
         self.heartbeat_error_log = self.control / "heartbeat_errors.jsonl"
         self.stop_signal = self.control / "stop.signal"
@@ -1091,7 +1099,7 @@ class QueueWorker:
         self._heartbeat_last_error = ""
         self._heartbeat_last_error_at = ""
         self._heartbeat_thread_restarts = 0
-        for path in (self.inbox, self.working, self.results, self.archive, self.quarantine, self.evidence, self.control):
+        for path in (self.inbox, self.working, self.results, self.archive, self.quarantine, self.evidence, self.control, self.request_fences):
             path.mkdir(parents=True, exist_ok=True)
 
     def run(self):
@@ -1199,6 +1207,12 @@ class QueueWorker:
                 request = json.loads(request_bytes.decode("utf-8-sig"))
                 self._validate_request(request)
                 attempt_id = str(request["execution_attempt_id"])
+                fence_error = self._request_fence_error(
+                    request,
+                    request_sha256,
+                )
+                if fence_error:
+                    raise ValueError(fence_error)
                 working_request = self.working / (attempt_id + ".request.json")
                 working_checksum = working_request.with_suffix(working_request.suffix + ".sha256")
                 os.replace(str(request_path), str(working_request))
@@ -1219,6 +1233,38 @@ class QueueWorker:
                 else:
                     self._quarantine_request(request_path, checksum_path, str(exc))
         return None
+
+    def _request_fence_error(self, request, request_sha256):
+        attempt_id = str(request.get("execution_attempt_id") or "")
+        if not attempt_id:
+            return "REQUEST_FENCE_INVALID"
+        marker_path = self.request_fences / (attempt_id + ".fence.json")
+        if not marker_path.exists():
+            return ""
+        try:
+            content = marker_path.read_bytes()
+            checksum_path = marker_path.with_suffix(marker_path.suffix + ".sha256")
+            if (
+                not checksum_path.exists()
+                or checksum_path.read_text(encoding="ascii").strip().lower()
+                != hashlib.sha256(content).hexdigest()
+            ):
+                return "REQUEST_FENCE_INVALID"
+            proof = json.loads(content.decode("utf-8-sig"))
+            validate_queue_stop_fence(
+                proof,
+                execution_attempt_id=attempt_id,
+                operation_id=str(request.get("operation_id") or ""),
+                source_execution_attempt_id=str(
+                    request.get("source_execution_attempt_id") or ""
+                ),
+                instruction_hash=str(request.get("instruction_hash") or ""),
+            )
+            if str(proof.get("request_file_sha256") or "") != request_sha256:
+                return "REQUEST_FENCE_INVALID"
+        except (OSError, UnicodeDecodeError, ValueError, json.JSONDecodeError):
+            return "REQUEST_FENCE_INVALID"
+        return "REQUEST_DURABLY_FENCED"
 
     def _validate_request(self, request):
         fault_injection = str(request.get("fault_injection") or "").strip()

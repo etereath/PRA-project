@@ -29,6 +29,7 @@ from app.services.shadowbot_executor import (
     ShadowBotStartBoundaryError,
     ShadowBotStartResult,
 )
+from app.services.runtime_master_data import RuntimeMasterDataProvider
 from app.shadowbot_contract_primitives import (
     canonical_positive_price,
     derive_v4_batch_semantics,
@@ -135,6 +136,10 @@ def build_task_commit_manifest(
             selected_task_ids=ids,
             platform_name=platform_name,
         )
+    RuntimeMasterDataProvider(
+        repository,
+        configured_account_id=os.environ.get("PRA_ACCOUNT_ID", ""),
+    ).ensure_shadowbot_locator(mapping_path)
     mapping = load_identity_mapping(mapping_path, expected_platform_name=platform_name)
     manifest = build_commit_manifest(
         batch_id=batch_id,

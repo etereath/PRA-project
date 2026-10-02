@@ -21,6 +21,7 @@ from app.repositories.automation_repository import (
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.operational_time import OperationalTimeService
+from app.services.runtime_master_data import RuntimeMasterDataProvider
 from app.services.shadowbot_executor import (
     ShadowBotFileQueueRunner,
     ShadowBotStartBoundaryError,
@@ -56,12 +57,22 @@ def prepare_listing_sync_batch(
     platform_name: str,
     mapping_path: Path,
     execution_profile: str = "production",
+    configured_account_id: str = "",
+    master_data_provider: RuntimeMasterDataProvider | None = None,
 ) -> dict[str, Any]:
     """Create and persist one immutable v5 independent SYNC_STATUS manifest."""
 
     profile = str(execution_profile or "").strip().lower()
     if profile not in {"development", "production"}:
         raise ValidationError("execution_profile 必须是 development 或 production。")
+    provider = master_data_provider or RuntimeMasterDataProvider(
+        repository,
+        configured_account_id=(
+            configured_account_id
+            or os.environ.get("PRA_ACCOUNT_ID", "")
+        ),
+    )
+    provider.ensure_shadowbot_locator(mapping_path)
     manifest = build_listing_action_manifest(
         batch_id=batch_id,
         action_type="sync_status",
@@ -590,6 +601,24 @@ def mark_listing_sync_ack(
                 "" if written else str(error_message or "")[:1000],
                 result_id,
             ),
+        )
+
+
+def fail_listing_sync_batch(
+    repository: SQLiteRuntimeRepository,
+    *,
+    batch_id: str,
+) -> None:
+    """Close an unimported READ_ONLY batch after its handler fails."""
+
+    with closing(repository.connect_write()) as connection, connection:
+        connection.execute(
+            """
+            UPDATE shadowbot_listing_action_batches
+            SET status = 'FAILED', failed_count = 0, updated_at = ?
+            WHERE batch_id = ? AND status IN ('PREPARED', 'QUEUED')
+            """,
+            (_now_text(), str(batch_id)),
         )
 
 

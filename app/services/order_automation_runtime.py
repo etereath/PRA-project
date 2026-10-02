@@ -23,7 +23,7 @@ from app.services.order_scan_automation import (
     FullMarketScanOrderDispatchHandler,
     OrderScanHandler,
 )
-from app.services.product_mapping import compile_product_mapping_workbook
+from app.services.runtime_master_data import RuntimeMasterDataProvider
 from app.services.shadowbot_order_read import (
     ShadowBotFileQueueOrderTransport,
     ShadowBotOrderPageReader,
@@ -36,6 +36,7 @@ def build_order_read_only_handlers(
     runtime_repository: SQLiteRuntimeRepository,
     queue_dir: Path,
     mapping_workbook: Path,
+    configured_account_id: str = "",
     operational_time: OperationalTimeService | None = None,
     timeout_seconds: float = 330.0,
     target_trade_date: Callable[[AutomationRun], date] | None = None,
@@ -57,6 +58,11 @@ def build_order_read_only_handlers(
             runtime_repository
         ).evaluate_transaction,
     )
+    master_data = RuntimeMasterDataProvider(
+        runtime_repository,
+        configured_account_id=configured_account_id,
+        platform_mappings_workbook=Path(mapping_workbook),
+    )
 
     def refresh_settlement_and_inventory(**kwargs):
         results = settlement_service.refresh_after_order_import(**kwargs)
@@ -76,9 +82,7 @@ def build_order_read_only_handlers(
             runtime_repository,
             operational_time=time_service,
         ),
-        mappings_provider=lambda: compile_product_mapping_workbook(
-            Path(mapping_workbook)
-        ),
+        mappings_provider=lambda: master_data.mapping_snapshot().mappings,
         batch_id_factory=lambda run: f"ORDER-BATCH-{run.run_id}",
         target_trade_date=(
             target_trade_date

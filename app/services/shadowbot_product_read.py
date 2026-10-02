@@ -139,24 +139,28 @@ def build_inventory_read_targets(
     platform_name: str,
     *,
     products_path: Path = DEFAULT_INVENTORY_PRODUCTS_PATH,
+    products: Iterable[Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Build READ_ONLY identity hints from 商品资料与库存录入."""
 
     normalized_platform = str(platform_name or "").strip()
     if not normalized_platform:
         raise ProductReadContractError("INPUT_INVALID: platform_name is required.")
-    try:
-        products = load_products(Path(products_path))
-    except (OSError, UnicodeError, ValidationError, ValueError) as exc:
-        raise ProductReadContractError(
-            f"INVENTORY_MAPPING_SOURCE_INVALID: {products_path}"
-        ) from exc
-    if not products:
+    if products is None:
+        try:
+            source_products = load_products(Path(products_path))
+        except (OSError, UnicodeError, ValidationError, ValueError) as exc:
+            raise ProductReadContractError(
+                f"INVENTORY_MAPPING_SOURCE_INVALID: {products_path}"
+            ) from exc
+    else:
+        source_products = list(products)
+    if not source_products:
         raise ProductReadContractError("INVENTORY_MAPPING_SOURCE_EMPTY")
 
     targets: list[dict[str, Any]] = []
     seen_page_identities: dict[tuple[str, str, str], str] = {}
-    for product in products:
+    for product in source_products:
         identity = listing_identity_key(
             normalized_platform,
             product.product_name,

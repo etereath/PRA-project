@@ -15,7 +15,7 @@ from app.operations_web.auth import (
 )
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.review_policy import allowed_review_statuses
-from app.services.workflow import _read_authoritative_product_cost_snapshot
+from app.services.runtime_master_data import RuntimeMasterDataProvider
 
 
 class ReviewResolutionError(ValueError):
@@ -38,10 +38,19 @@ class ReviewResolutionApplicationService:
         authorization: AuthorizationBackend,
         *,
         products_path: Path,
+        platform_mappings_path: Path | None = None,
+        configured_account_id: str = "",
+        master_data_provider: RuntimeMasterDataProvider | None = None,
     ) -> None:
         self.repository = repository
         self.authorization = authorization
         self.products_path = products_path
+        self.master_data = master_data_provider or RuntimeMasterDataProvider(
+            repository,
+            configured_account_id=configured_account_id,
+            products_workbook=products_path,
+            platform_mappings_workbook=platform_mappings_path,
+        )
 
     def resolve(
         self,
@@ -94,15 +103,13 @@ class ReviewResolutionApplicationService:
                     ReviewTaskStatus.APPROVED,
                 }:
                     base_cost, base_cost_source_ref = (
-                        _read_authoritative_product_cost_snapshot(
-                            self.products_path,
-                            internal_sku=str(review.internal_sku or ""),
+                        self.master_data.product_cost_snapshot(
+                            str(review.internal_sku or "")
                         )
                     )
                 def verifier() -> tuple[Decimal, str]:
-                    return _read_authoritative_product_cost_snapshot(
-                        self.products_path,
-                        internal_sku=str(review.internal_sku or ""),
+                    return self.master_data.product_cost_snapshot(
+                        str(review.internal_sku or "")
                     )
                 resolved, created_task = (
                     self.repository.resolve_authenticated_incident_review_atomic(

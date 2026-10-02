@@ -1,10 +1,12 @@
 # PRA 当前阶段与验证状态
 
-角色：Current Status；项目进度与验证状态的唯一维护页。Codex 每次推送前同步更新，包括纯文档推送；`index.md` 仅负责索引。更新于 2026-09-09。
+角色：Current Status；项目进度与验证状态的唯一维护页。仅在阶段、范围、blocker 或验证结论发生实质变化时更新；即时 Head/CI 以 GitHub 为准，`index.md` 仅负责索引。更新于 2026-10-02。
 
-PR [#47](https://github.com/etereath/PRA-project/pull/47) 与 RM0 交付 PR [#49](https://github.com/etereath/PRA-project/pull/49) 均已合并，当前 main 为 `37523f668cc6abe204b5beaac5e5c012cf18b09f`。Task 13.7-1 Implementation Review = **PASS**，P1-47-01、P2-47-01、P2-47-02 均 **CLOSED**。代码和 RM0 记录已进入 main；RM1-A 真实 READ_ONLY 已通过。RM1-B 首次授权在提交前以 `OLD_PRICE_PARSE_FAILED / NOT_STARTED` 失败，相关列表筛选、Web 责任表达及固定价格新鲜度门禁已经修复；2026-09-08 负责人重新授权后，`AISHA-B-60-Z` 已通过唯一一次真实提交由 `10.80` 调整为 `10.30`，写后独立回读、Importer、Archive、锁释放及持久 continuation 收口均为 **VERIFIED**。
+PR [#47](https://github.com/etereath/PRA-project/pull/47)、RM0 交付 PR [#49](https://github.com/etereath/PRA-project/pull/49)、收口 PR [#50](https://github.com/etereath/PRA-project/pull/50)、Authority Contract PR [#52](https://github.com/etereath/PRA-project/pull/52)、Runtime Product/Mapping Authority PR [#53](https://github.com/etereath/PRA-project/pull/53) 与开发资源治理 PR [#56](https://github.com/etereath/PRA-project/pull/56) 均已合并。2026-09-09 PR #54 已同步 current `main@0b1135787ac33c3c6c96531f874924418924bb8a` 并开始 Task 13.7-2C。Task 13.7-1 Implementation Review = **PASS**，P1-47-01、P2-47-01、P2-47-02 均 **CLOSED**。代码和 RM0 记录已进入 main；RM1-A 真实 READ_ONLY 已通过。RM1-B 首次授权在提交前以 `OLD_PRICE_PARSE_FAILED / NOT_STARTED` 失败，相关列表筛选、Web 责任表达及固定价格新鲜度门禁已经修复；2026-09-08 负责人重新授权后，`AISHA-B-60-Z` 已通过唯一一次真实提交由 `10.80` 调整为 `10.30`，写后独立回读、Importer、Archive、锁释放及持久 continuation 收口均为 **VERIFIED**。
 
-当前 Controlled Real-Machine Acceptance 的技术链路已经完成。PR #50 首审后保留的两个 Blocking P2 已完成代码整改：Worker 风格的提交前价格漂移失败在具备完整零副作用证据时可通过正式服务终止，终止后同 SKU 可创建新决定并进入授权；Web 以 Task 当前终态和责任为准，同时保留最近失败执行记录。生产接线合成旅程和直接依赖回归共 **88 passed**，Ruff 与 diff 检查通过；本轮没有执行新的真实平台写入。下一步为最新 Head CI、Reviewer 复审及负责人 Stage Goal 裁决。完整现场证据见 [RM0 环境准备与 RM1 现场记录](reports/task13_7_1_rm0_controlled_real_machine_preparation_20260907.md)：Runtime v18、ShadowBot、Queue Service 和 Worker 已对齐；旧 `WEB7E-6646…` 继续保持历史 UNKNOWN，但运营责任已关闭。RM1-A 已取得 B/C/D 的完整真实 READ-BEFORE；RM1-B 重新验收使用新 Task `TASK-MANUAL-c9b09e6c5ee2cfb64accc3b4` 和批次 `WEB7E-eb1ed34bdd4db6546ca5f218fa276176`，写前读到 `10.80`，一次提交后于 20:14 回读 `10.30`。Task、operation、item、attempt 均为成功/VERIFIED，result receipt 为 WRITTEN，锁已释放，continuation 为 COMPLETE，活动 Queue 为 0。Stage Goal 不由本次实现者自行裁决，保持 **NOT YET VALIDATED / WAIT OWNER**。
+当前 Controlled Real-Machine Acceptance 的技术链路已经完成。PR #50 首审后保留的两个 Blocking P2 已完成代码整改：Worker 风格的提交前价格漂移失败在具备完整零副作用证据时可通过正式服务终止，终止后同 SKU 可创建新决定并进入授权；Web 以 Task 当前终态和责任为准，同时保留最近失败执行记录。生产接线合成旅程和直接依赖回归共 **88 passed**，最终 Head 的 Windows / Linux Core 均通过并已合并；本轮没有执行新的真实平台写入。下一步为负责人 Stage Goal 裁决。完整现场证据见 [RM0 环境准备与 RM1 现场记录](reports/task13_7_1_rm0_controlled_real_machine_preparation_20260907.md)：Runtime v18、ShadowBot、Queue Service 和 Worker 已对齐；旧 `WEB7E-6646…` 继续保持历史 UNKNOWN，但运营责任已关闭。RM1-A 已取得 B/C/D 的完整真实 READ-BEFORE；RM1-B 重新验收使用新 Task `TASK-MANUAL-c9b09e6c5ee2cfb64accc3b4` 和批次 `WEB7E-eb1ed34bdd4db6546ca5f218fa276176`，写前读到 `10.80`，一次提交后于 20:14 回读 `10.30`。Task、operation、item、attempt 均为成功/VERIFIED，result receipt 为 WRITTEN，锁已释放，continuation 为 COMPLETE，活动 Queue 为 0。Stage Goal 不由本次实现者自行裁决，保持 **NOT YET VALIDATED / WAIT OWNER**。
+
+Task 13.7-2A / 2B 已分别随 PR [#52](https://github.com/etereath/PRA-project/pull/52) / [#53](https://github.com/etereath/PRA-project/pull/53) 合并。2026-10-02，PR [#54](https://github.com/etereath/PRA-project/pull/54) 已从固定 Head `ec9812c2853401d25f615d8bb60b559665151c3a` 合入 main `81430482b1d3bbe2a4d901b25761875d4943aa34`，五组整改及其证据边界保持不变：source acquisition/attempt lineage、新鲜度按 SKU observed-at 计算、PREPARED 后发布前异常收口、移除 account/session/page identity 公共 qualification 语义、以当前 SKU 的相关 mapping identity/IDs 取代共享 generation 相等门禁。此前报告的两个直接测试文件及四个一级依赖用例合计 **87 passed（21.10 秒）**，固定 Head 的 Windows / Linux Core CI 成功；该结果未在 S1 开发中重新作为独立全量审计运行。
 
 | 项目 | 状态 | 依据/下一步 |
 |---|---|---|
@@ -15,17 +17,21 @@ PR [#47](https://github.com/etereath/PRA-project/pull/47) 与 RM0 交付 PR [#49
 | Task 13.6-3 | PASS | 负责人接受语义快照 `4d51f51`；PR #46 已合并，正式 AGENTS 与 Canonical 已进入 main |
 | Task 13.6 Overall | PASS | G1/G2、入口/正式AGENTS及负责人最终验收已收口；验收记录见阶段报告追加节 |
 | Task 13.7 Readiness | READY | 业务与文档交接条件通过；首条纵切计划/Goal已准备 |
+| Task 13.7-2A Authority & Continuity Contract | ACCEPTED / MERGED | PR #52 已合入 current main `a2a0b65`；2B 上游门禁已解除，未因此自动切换真实 Runtime authority |
+| Task 13.7-2B Runtime Product/Mapping Authority | MERGED | PR #53 已进入 main `0b11357`；真实 Runtime cutover/部署/平台写不因代码合并自动授权 |
+| Task 13.7-2C Qualified Observation / Listing READ_ONLY | MERGED / REVIEW PASS | PR #54 固定 Head `ec9812c` 已通过限定复核并合入 main `8143048`；Windows / Linux Core CI 成功；不把 87 passed 当作本轮独立重跑 |
+| Task 13.7-S1 UNKNOWN / Human Recovery 简化 | LOCAL IMPLEMENTED / TARGETED PASS | 基于 `main@8143048` 的隔离本地分支；停止证明只接受已导入终态结果、Executor 持久化的 `START_FAILED + published=false + 无 run/request 身份` 明确未发布边界，或在 Worker 全生命周期锁已取得、DB lease/owner 再核验后生成的 checksummed Queue fence/quarantine 证明；Worker 在 claim 前校验该 attempt-bound fence，重现请求不可再消费；拒绝 timeout/lease expiry/无 owner/未读到文件单独解锁；后端选择 stopped boundary 后最新 qualified observation，任一有 HANDLE_REVIEW 权限的管理员可零平台写终止旧 one-shot；移除认领/转交/提醒升级、证据 ID/digest 与恢复分类选择；未 push、merge、部署或关闭真实 UNKNOWN，不进入 S2/#55 |
 | Task 13.7-1 开工交接 | COMPLETE | Codex 已在原分支/PR 承接，没有另建计划 PR |
 | Task 13.7-1 代码实现 | 已合并 / 复核 PASS | #47 已进入 main `08f4e70`；正式人工收口及催办、目标已满足时确认结束决定、回执刷新持久状态；Schema 目标仍为 v18 |
 | Task 13.7-1 隔离旅程 | P1/P2 定向回归 PASS | P1 人工收口与后续执行、P2 零写结束及实时回执已有隔离证据；测试时序修复后的 4 个失败用例定向通过，完整门禁见下节 |
 | Windows CI 时序修复 | 已修复并验证 | `scan()` 保持整秒精度，必要时等待到旧执行停止后的下一整秒；`eb6e24b` 的 Windows / Linux Core CI 完整通过 |
-| 开发文档治理 | 职责调整完成 | AGENTS 已精简，网页审核材料已原样归档；治理文档只定义 WHY / WHEN，执行参考承接 HOW，索引移除进度；每次推送前同步本页 |
+| 开发文档治理 | MERGED | PR #56 已进入 main `08530db`；根 AGENTS 已补充用户既有完整验证授权复用及高风险验证不得降级，WHY/HOW 文档已统一完整 Gate 与同 Head 重跑授权语义 |
 | Task 13.7-1 Implementation Review | PASS | 2026-09-07 用户最终裁决；冻结问题 P1-47-01、P2-47-01、P2-47-02 全部 CLOSED，无遗留冻结问题 |
 | #47 合并与最终检查 | MERGED / SUCCESS | merge commit `08f4e70`；最终 Head `1011091` 的 Windows / Linux Core 均 SUCCESS |
 | Task 13.7-1 RM0 / RM0.5 | PASS WITH HISTORICAL DEBT / PREFLIGHT READY | 旧 `WEB7E-6646…` 保留审计；B/C/D 三个艾莎 SKU 已由负责人确认并完成受控 VERIFIED mapping，当前无活动执行 blocker |
 | Task 13.7-1 RM1-A | READ-BEFORE VERIFIED | `ATTEMPT-95a494700a2d4178`；B/C/D 当前价 `10.80 / 6.80 / 6.20`，均为 `online_only`；Importer ACK WRITTEN，活动 Queue=0，Worker STOPPED；未执行平台写 |
 | Task 13.7-1 RM1-B | VERIFIED | `AISHA-B-60-Z` 写前 `10.80`，唯一一次平台提交后独立回读 `10.30`；Task / operation / item / attempt、Importer、Archive、锁和 continuation 全部收口 |
-| PR #50 首审整改 | 已修复 / 待最新 Head CI 与复审 | 零副作用 `FAILED / NOT_ATTEMPTED` 可正式终止；terminal Task 优先于历史执行投影，历史失败记录仍保留；直接依赖回归 88 passed，未新增真实平台写 |
+| PR #50 首审整改 | MERGED / CI SUCCESS | 零副作用 `FAILED / NOT_ATTEMPTED` 可正式终止；terminal Task 优先于历史执行投影，历史失败记录仍保留；最终 Windows / Linux Core 通过，未新增真实平台写 |
 | Task 13.7-1 Stage Goal | NOT YET VALIDATED / WAIT OWNER | RM1 技术验收证据已完成；等待负责人确认阶段业务验收结论，不由实现者自行宣告 |
 
 ## 13.7-1 实现与当前 RM0 验证依据
@@ -67,3 +73,10 @@ PR #44 已关闭且未合并，仍作历史平行分析；有效增量已随 #45
 历史证据：[G1](reports/task13_6_1_g1_business_baseline_review_20260906.md)、[G2](reports/task13_6_2_g2_architecture_handoff_review_20260906.md)、[增量 G2](reports/task13_6_2_g2_incremental_parallel_absorption_review_20260906.md)。旧报告中的“next 13.6-2 / merge #45”只代表当时状态。
 
 完整旧进展时间线保存在[收口前状态页](https://github.com/etereath/PRA-project/blob/08041bfe25a7f31f032564a2abca35e5eb5f5330/docs/project_current_status.md)，不再作为当前施工方向。
+# Task 13.7 S1/S2 current implementation status (2026-10-02)
+
+This dated block supersedes the older Task 13.7-S1 table row above.
+
+- Task 13.7-S1 UNKNOWN / Human Recovery simplification: **MERGED / CI SUCCESS**. PR #58 merged as `40ca0bad34248ec095204f3d2379bf90adf80271`; Windows/Linux Core run `37017589339` succeeded. This records the repository state only and does not authorize runtime cutover or closing a real UNKNOWN.
+- Task 13.7-S2 Decision / Authorization simplification: **LOCAL IMPLEMENTED / TARGETED PASS** on isolated branch `codex/task13-7-s2-decision-authorization`, based on the fixed S1 merge SHA above. A currently qualified target observation may close the pending one-shot atomically as `ALREADY_APPLIED` without creating or publishing a batch; ordinary execution authorization now binds business decision identity while current execution facts are still revalidated at execution time. No push, PR, deployment, runtime cutover, or real platform action has occurred.
+- S2 validation is intentionally targeted under the repository verification budget. The exact commands, counts, fixed local commit, and review bundle are recorded in the S2 handoff manifest after the local commit is created.

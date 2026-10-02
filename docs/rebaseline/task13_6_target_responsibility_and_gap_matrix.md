@@ -1,6 +1,6 @@
 # PRA 目标职责与 13.7 实现交接
 
-角色：Canonical / Accepted Target Architecture and Handoff。承接已合并 PR #45 的原 G2 与增量吸收，IG-01～IG-11 在本文统一维护。此为目标职责，不代表生产已实现。业务语义见[业务合同](../business_contract.md)，代码现状见[实现图](task13_6_current_implementation_map.md)，阶段许可见[状态页](../project_current_status.md)。
+角色：Canonical / Accepted Target Architecture and Handoff。承接已合并 PR #45 的原 G2 与增量吸收，IG-01～IG-13 在本文统一维护。此为目标职责，不代表生产已实现。业务语义见[业务合同](../business_contract.md)，代码现状见[实现图](task13_6_current_implementation_map.md)，阶段许可见[状态页](../project_current_status.md)。
 
 ## 1. 责任与宿主
 
@@ -15,12 +15,41 @@
 | UI 副作用、结果和超时 | 既有 v4/v5、Queue、Worker、Importer、Watchdog | 保持写前读取/旧值比较/写后确认和唯一 RECONCILE |
 | 定期 Observation/Closing/恢复校准 | Automation Service | READ_ONLY 排程与资源协调；不成为普通销售写 Controller |
 | Observation Health | Automation 侧 ObservationHealthService | provider/cadence/fallback/recovery；Incident 严重度不授予平台写权限 |
+| Product Master | 13.7-2B 后的 Runtime DB + 版本化管理 Service | cutover 前仍由 `products.xlsx` 负责；不复制实物库存、不隐式回退工作簿 |
+| Platform Product Mapping | 13.7-2B 后的 Runtime DB + 版本化管理 Service | 显式 `platform_name/account_id/platform_product_identity/internal_sku`；cutover 前仍由工作簿编译结果负责 |
+| Price / Listing Rules | 本阶段继续由各自 workbook authority | 绑定规范化规则集 digest；未来迁库另做独立 cutover，不与 Product/Mapping 机械捆绑 |
+| Qualified Observation | 13.7-2C qualification contract；事实 owner 仍是 immutable evidence | 输出 quality/freshness/scope/identity/source refs，不自行决定 blocker |
 | 当前 Commitment | 当前事实 selector/projection | provider/evidence/scope/freshness 可追踪；新累计事实替换旧 current，不相加 |
 | Supply | 统一供给事实选择责任 | 同日最高阶段覆盖，Carryover 独立；不为三个 stage 建三个子系统 |
 | 实物库存 | 现有唯一 DB Inventory authority | Exposure 不写实物；physical/accounting event 契约另行明确 |
 | Review/通知 | 既有 Review/Token/Outbox | 按类型区别授权、Closing S2、Observation 与价格保护，复用通道 |
+| ShadowBot identity mapping | 既有 Executor/部署配置 | cutover 后由 Runtime mapping generation 生成/同步为 derived locator，部署只补 UI-only 字段；绑定 generation/digest，不是独立 authority 或 fallback |
+| blocker enforcement | 既有 Authorization / Coordinator / Observation Health / Queue 宿主 | 使用共同结构化 scope/category；不新建平行 Queue、Review 状态机或 blocker daemon |
 
 逻辑责任不等于必须新建表、类或状态机。先审计 Task/origin/history、v4/v5 batch、operation、execution_attempt、receipt、Automation Event 的承载能力。
+
+### 1.1 Authority cutover 输入
+
+| 对象 | 13.7-2A 冻结输入 | cutover owner、触发与完成证据 |
+|---|---|---|
+| Product Master | 新 SKU 只建立版本化商品身份；缺少库存事实显示 `NOT_INITIALIZED`，不得自动建立 0 balance | 2B 实施者；additive schema、受控 import、shadow compare 后，全部正式 Runtime consumers 同 gate 读 DB snapshot/version |
+| Platform Mapping | configured target `account_id` 由负责人/部署配置显式提供；active session binding 由 Adapter/Executor/登录链另行证明；唯一性为同一 platform/account/product identity 与有效期内最多一个 VERIFIED SKU | 2B 实施者；切换证据包括 direct-reader inventory、旧新解析逐项对比、identity/mapping generation、derived locator digest、target/session binding contract 与 rollback 演练 |
+| Price / Listing Rules | 继续 workbook authority，Task/评估绑定规范化规则集 digest；本批不迁 DB | 现有 Operations Web / Automation owner；未来迁库另立任务，不因 2B 合入而切源 |
+| Physical Inventory | 既有 DB ledger 唯一 authority；Product Master 不写 balance | Inventory Application；初始化/入库分别保留 actor/source/idempotency，缺失不是 0 |
+| Observation | immutable evidence 是历史事实，qualified projection 是可失效的当前事实 | 2C 实施者；Operating fact qualification 覆盖 scope/identity/completeness/time/source integrity，Evidence delivery/archive health 单列；ACK/archive 局部失败不机械否定可验证事实 |
+| Human Decision / execution | 决定、授权、continuation、执行事实分层 | 2D 实施者复用 #47～#50 链；新决定先记录，已跨副作用边界者按最小范围收口，不恢复 create 后自动 submit |
+
+2B 开工先枚举 Product/Mapping 的全部生产 direct readers，并把 Web/Manual Task/Authorization/Automation/Observation/Order mapping/Task generation/Queue/Executor/Importer/Emergency/Workflow/business-rule evaluation 等实际路径逐项标为 `CUTOVER` 或明确的 `OFFLINE/IMPORT/EXPORT/DIAGNOSTIC EXCEPTION`。切换后正式路径不得依赖旧 workbook 环境变量；例外不得进入正常运行 authority 或成为 fallback。
+
+Product/Mapping 回滚只允许把所有正式 consumers 原子恢复到一个已验证 authority。旧工作簿可作显式 import/export、离线诊断、history/rollback 工具；ShadowBot locator 是绑定 Runtime authority generation/digest 的派生执行 artifact。cutover 后若已有新的 authoritative master-data mutation 或依赖新 mapping 的平台副作用，则禁止静默回到旧 authority，改用 forward correction 或负责人显式维护/re-cutover。
+
+### 1.2 Blocker owner 与作用域
+
+Authorization 对新写、Coordinator 对 continuation/UNKNOWN、Observation Health 对 provider/account health 分别消费同一结构化 qualification/blocker context；运行期记录必须含 category、evidence refs、精确 scope、blocked/allowed operations、owner、自动释放条件和人工恢复路径。Review 使用已有 `blocked_actions`，不得再以“同 SKU+platform 任意 pending Review”建立平行 blanket gate。
+
+真实写前必须把 configured target account 与 active session binding evidence 区分并核对，连同 internal SKU、platform product identity、authority/mapping generation 和 locator artifact digest 进入 authorization/execution identity evidence。无法证明或 mismatch 时按 GQB-4 停止受影响账号全部新写，保留安全的 identity-calibration READ_ONLY/diagnostics，且不记录凭据或冻结无关账号。
+
+作用域只能按 `Task → SKU+Action → SKU All Writes → Platform/Account Write Queue → Cross-platform System` 逐级证明。platform/account 全队列仅允许 GQB-1 Critical Business Risk、GQB-2 Observation Blindness、GQB-3 Critical Control Plane Failure、GQB-4 Side-effect/Identity Integrity Failure；仍应保留安全的 READ_ONLY、Recovery Calibration、唯一 RECONCILE、Health/diagnostics 与人工恢复。新增第五类或阻断无共享风险对象前必须先提交并获得接受的 Global Queue Blocker Proposal。
 
 ## 2. 三条主要旅程与恢复
 
@@ -35,12 +64,14 @@ Human decision → 持久 one-shot Intent → Task → 人工 prepare/submit →
 | PENDING、尚未最终授权 | Human/Web；显式 prepare/submit | 内存 preparation 可过期；用户可重新确认、取消、替代，业务有效期可终止 |
 | 最终确认后 | 持久交接事实与 Coordinator | 审计与发布之间崩溃也能判断下一步；查 batch/operation/attempt/Queue/receipt，不能盲重发 |
 | blocker、result pending | Coordinator 协同既有组件；周期重评估/导入 | 重启从持久 continuation 恢复；明确继续、重新确认、人工处置或终止 |
-| UNKNOWN | 既有唯一 RECONCILE，Coordinator 跟踪 | 不做第二次猜测写；只读对账与人工结论收口，再处理最新 Intent |
+| UNKNOWN | 既有唯一 RECONCILE，Coordinator 跟踪 | 不做第二次猜测写；若仍不能判定历史副作用，允许 stopped boundary 后的 qualified READ_ONLY 结束旧 one-shot 当前责任但保留 historical UNKNOWN；否则交人工 fallback |
 | terminal | Importer/既有账本投影，Coordinator 完成业务衔接 | 保存结果与回读；不因旧目标未持续维持而自动重开 one-shot Intent |
 
 ### Observation 与 Health
 
 Automation 根据 versioned capability 和当前页面模式选 Provider → READ_ONLY Adapter → immutable evidence → current selector/Web → Health。Light Scan 持续观察 price/exposure/status；冻结期用 CurrentTradeDaySalesObservation，订单页 rollover 后用 current-order Provider。证据可信度、粒度和 freshness 分开。
+
+Qualification 同时输出 Operating fact trust 与 Evidence delivery/archive health，但两者不得互相替代。历史失败、superseded、retry/recovery batch 可以共存；selector 按正式 run/attempt、scope、完成状态、时间和 identity 选择唯一 current qualified candidate。合法 retry 成功可接管 current；多份候选同时合格且冲突才 fail closed，不拼接或静默合并。
 
 S1 首次超 cadence；S2 主直接校准缺失但有可信 fallback；S3 无足够可信校准立即请求 Recovery Calibration。排队/合法 UI 资源等待保持 S3/RECOVERING；真正平台级恢复失败才 S4。单 SKU 故障不直接升平台 S4。风险动作规则见业务合同；Observation S4 没有 Emergency S4 自动下架权限。
 
@@ -65,6 +96,8 @@ Closing 需要 quantity、amount、order_created_at、purchase_sequence 及品�
 | IG-09 | Current Operating State/Commitment authority 生效时，Today/Quality/相关 Web 当前销售读模型同 gate 切换；旧 Summary 仅历史/legacy 展示 |
 | IG-10 | Platform capability 的 timezone、cutoff、订单 rollover、历史读取、实时 Provider、cadence、Closing offset、effective range/version/source 可追踪；复用 TimePolicy，不因此建配置中心或 selector DSL |
 | IG-11 | 14-B facade 只读/受控调用已存在的确定性接口，不成为 13.7 observation/execution/recovery owner 或前置依赖 |
+| IG-12 | Product/Mapping 从工作簿迁 Runtime DB 采用 additive schema、account-aware identity、shadow compare 和 explicit cutover；全部正式 Runtime consumers 同 gate 切换并逐项登记离线例外，无隐式 fallback；Product 新增不自动制造 0 库存事实 |
+| IG-13 | blocker 采用可证明的最小作用域；platform/account 全队列只允许 GQB-1～4，并保留安全恢复/READ_ONLY；第五类必须先经 Global Queue Blocker Proposal 接受 |
 
 原始依据：[G2](../reports/task13_6_2_g2_architecture_handoff_review_20260906.md)、[增量 G2](../reports/task13_6_2_g2_incremental_parallel_absorption_review_20260906.md)。原平行分析补充是采纳历史，不是另一个现役合同。
 
@@ -82,6 +115,9 @@ Closing 需要 quantity、amount、order_created_at、purchase_sequence 及品�
 | Daily Closing、成功锁定、retry/S2/admin maintenance | MISSING / ADAPT | 13.7；复用读取/Job/Event/Review，不包装旧 Settlement 生命周期 |
 | Daily Supply / Carryover | MISSING / ADAPT | 13.7；复用 HarvestForecast/录入资产，最高 stage 选择 |
 | DB physical inventory ledger | REUSE | 13.7 保留唯一实物 authority；不得被 Exposure 替代 |
+| `a3485af` Runtime Master Data repository/service/version/idempotency | ADAPT | 13.7-2B；重做 migration、account identity 与 Product/Inventory 分离，禁止整体 cherry-pick和空库 replacement |
+| `a3485af` listing qualification / READ_ONLY 接线 | ADAPT | 13.7-2C；拆分 Operating fact trust 与 ACK/archive health，按唯一 current candidate 选择合法 retry；不自行升级 global blocker；接 2B mapping snapshot |
+| `a3485af` Queue Read Model / structured blocker presentation | ADAPT | 13.7-2D；Current Queue 与 History 分离，重写 blanket blocker/cancel policy |
 | Settlement-driven sales baseline | ADAPT / CUTOVER RISK | 13.7 IG-05；并未 blanket retire 所有可能的 sales-driven accounting |
 | 20:00 seller day、旧 Settlement→Plan→DailyTask/普通订单导入强耦合 | RETIRE / 局部 ADAPT | 13.7 authority cutover 后再考虑物理删字段；保留历史证据 |
 | Incident infrastructure | REUSE | 13.7 Health/Closing 新类别；现有价格 Emergency 权限继续独立 |
@@ -107,7 +143,7 @@ IG-05 的库存记账事件选择是明确保留给 13.7 的实现契约；未�
 
 第一条纵切：1 SKU + 一次人工 UPDATE_PRICE，从 Intent/Task、Human Authorization、durable handoff，经既有 v4/Queue/Worker/Importer 到 terminal 与平台回读；至少覆盖 final-confirmation crash 或 restart/blocked recovery。若既有 Watchdog/Importer 已完整处理某段，Coordinator 只持久发现和投影，不复制其逻辑。
 
-随后按依赖扩展 Exposure、先复用 rollover 后订单 Provider 的 Commitment、冻结期 Provider、Closing、Supply、Observation Health。存在 authority 重叠的路径先 shadow，验收后显式 cutover；不能因“旧链最后退役”让两套 authority 同时经营。Web 随切片接入，不最后才第一次联调。
+随后先以 13.7-2A 冻结 authority/continuity 合同；2B Runtime Product/Mapping 与 2C Qualified Observation 可并行实现但均受 2A 接受门禁约束，2D Queue Continuity 以 2A 为准并消费 2B identity 与 2C qualification。再按依赖扩展 Exposure、rollover 后订单 Provider 的 Commitment、冻结期 Provider、Closing、Supply、Observation Health。存在 authority 重叠的路径先 shadow，验收后显式 cutover；不能因“旧链最后退役”让两套 authority 同时经营。Web 随切片接入，不最后才第一次联调。
 
 两处 Exposure/实物上限校验在相关 Exposure 行为受本切片影响时调整；不因它们是已知 gap，就要求纯 UPDATE_PRICE 首条纵切无条件同时完成 Exposure 改造。也不为所有 13.7 开发前置要求完成后续 Provider 或库存 cutover 的全部门槛。
 

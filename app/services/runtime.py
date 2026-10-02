@@ -456,7 +456,7 @@ class ReviewTaskService:
         if review_task is None:
             raise ValidationError(f"review task not found: {review_task_id}")
         if review_task.review_type == "price_execution_unknown":
-            raise ValidationError("请登录经营管理，凭平台核验记录提交人工结论。")
+            raise ValidationError("请登录经营管理，由系统核验停止证明和最新合格观察后终止旧 one-shot。")
         if review_task.review_status != ReviewTaskStatus.PENDING:
             raise ValidationError(f"review task already handled: {review_task_id}")
         self._validate_transition(review_task.review_status, status)
@@ -803,13 +803,9 @@ class ReviewTaskService:
             return summary
         for review in pending_reviews:
             if review.review_type == "price_execution_unknown":
-                from app.services.price_execution_resolution import renew_price_execution_review
-                try:
-                    if renew_price_execution_review(self.repository, review, now=cutoff):
-                        summary.renewed_review_tasks += 1
-                        summary.notification_logs_created += 1
-                except Exception as exc:
-                    summary.errors.append(f"{review.review_task_id}: {type(exc).__name__}: {exc}")
+                # UNKNOWN recovery is a simple administrator todo.  It has no
+                # owner, transfer, reminder or escalation lifecycle.
+                summary.skipped_review_tasks += 1
                 continue
             source_task = (
                 self.runtime_task_service.get_task(review.source_task_id)

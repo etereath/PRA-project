@@ -16,6 +16,7 @@ from app.enums import AutomationRunStatus
 from app.repositories.automation_repository import AutomationRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.product_mapping import compile_product_mapping_rows
+from app.services.listing_scan_quality import ListingScanQualityService
 from app.services.product_observation import (
     LISTING_STATUS_SCAN,
     ONLINE_PULSE,
@@ -25,10 +26,14 @@ from app.services.product_observation import (
     ProductObservationImportResult,
     ProductObservationImporter,
     ProductObservationInput,
+    ProductObservationMappingContext,
     _result_content_sha256,
     listing_snapshot_to_observation_batch,
     product_observation_batch_from_payload,
 )
+from app.services.runtime_master_data import RuntimeMappingSnapshot, RuntimeMasterDataProvider
+from app.repositories.workbook_repository import save_table_records
+from app.services.master_data_management import CUTOVER_CONFIRMATION, MasterDataManagementService
 from app.services.operational_time import (
     OperationalTimePolicy,
     OperationalTimeService,
@@ -2079,3 +2084,646 @@ def test_listing_snapshot_freezes_ambiguous_candidate_identity(
                 ).fetchone()[0]
                 == 0
             )
+
+
+class _StaticMappingAuthority:
+    def __init__(self, snapshot: RuntimeMappingSnapshot) -> None:
+        self.snapshot = snapshot
+
+    def mapping_snapshot(
+        self,
+        *,
+        account_id: str | None = None,
+    ) -> RuntimeMappingSnapshot:
+        assert account_id in {None, self.snapshot.account_id}
+        return self.snapshot
+
+
+def _qualified_mappings(*, platform_product_id: str = ""):
+    return compile_product_mapping_rows(
+        [
+            {
+                **_mapping_row("MAP-AISHA-A", "艾莎", "A", "AISHA-A"),
+                "account_id": "ACCOUNT-1",
+                "platform_product_id": platform_product_id,
+            }
+        ],
+        source_workbook_sha256="7" * 64,
+    )
+
+
+def _runtime_mapping_snapshot(mappings) -> RuntimeMappingSnapshot:
+    return RuntimeMappingSnapshot(
+        authority_mode="DB_AUTHORITY",
+        authority_generation=7,
+        account_id="ACCOUNT-1",
+        mappings=mappings,
+        mapping_snapshot_sha256="sha256:" + "9" * 64,
+    )
+
+
+def _import_qualified_listing(
+    repository: SQLiteRuntimeRepository,
+    mappings,
+    *,
+    run_id: str,
+    snapshot_id: str,
+    digest_character: str,
+    terminal_status: str = "SUCCESS",
+    ack_state: str = "WRITTEN",
+    scope_complete: bool = True,
+    end_marker_verified: bool = True,
+    product_name: str = "艾莎",
+    internal_sku: str = "AISHA-A",
+    snapshot_updates: dict | None = None,
+    mapping_snapshot: RuntimeMappingSnapshot | None = None,
+) -> ProductObservationImportResult:
+    snapshot = _listing_snapshot(
+        snapshot_id=snapshot_id,
+        product_name=product_name,
+        internal_sku=internal_sku,
+        affected_internal_skus=(internal_sku,),
+    )
+    manifest_sha256 = "sha256:" + digest_character * 64
+    snapshot.update(snapshot_updates or {})
+    result_sha256 = digest_character * 64
+    _seed_listing_snapshot_source(
+        repository,
+        snapshot=snapshot,
+        manifest_sha256=manifest_sha256,
+        result_sha256=result_sha256,
+        run_id=run_id,
+    )
+    mapping_snapshot = mapping_snapshot or _runtime_mapping_snapshot(mappings)
+    batch = listing_snapshot_to_observation_batch(
+        snapshot,
+        automation_run_id=run_id,
+        source_manifest_sha256=manifest_sha256,
+        source_result_sha256=result_sha256,
+        mapping_authority=ProductObservationMappingContext(
+            authority_mode=mapping_snapshot.authority_mode,
+            authority_generation=mapping_snapshot.authority_generation,
+            mapping_snapshot_sha256=(
+                mapping_snapshot.mapping_snapshot_sha256
+            ),
+            mapping_version=mappings.mapping_version,
+            locator_artifact_sha256=str(
+                snapshot["mapping_source_version"]
+            ),
+        ),
+    )
+    if not scope_complete or not end_marker_verified:
+        batch = replace(
+            batch,
+            batch_status="PARTIAL",
+            scope_complete=scope_complete,
+            end_marker_verified=end_marker_verified,
+            error_code="SCAN_SCOPE_INCOMPLETE",
+            error_message="synthetic incomplete observation",
+        )
+    result = _ClaimingProductObservationImporter(
+        repository,
+        mappings=mappings,
+        clock=lambda: TEST_NOW,
+    ).import_batch(batch, claim=_stored_claim(repository, run_id))
+    with closing(repository.connect_write()) as connection:
+        connection.execute(
+            "UPDATE automation_runs SET run_status = ? WHERE run_id = ?",
+            (terminal_status, run_id),
+        )
+        connection.execute(
+            """
+            UPDATE shadowbot_listing_result_receipts
+            SET ack_state = ?
+            WHERE result_id = ?
+            """,
+            (ack_state, snapshot["result_id"]),
+        )
+        connection.commit()
+    return result
+
+
+def _listing_quality_service(
+    repository: SQLiteRuntimeRepository,
+    mappings,
+    *,
+    now: datetime = datetime(
+        2026, 7, 29, 9, 10, tzinfo=timezone.utc
+    ),
+) -> ListingScanQualityService:
+    snapshot = _runtime_mapping_snapshot(mappings)
+    return ListingScanQualityService(
+        repository,
+        clock=lambda: now,
+        master_data=_StaticMappingAuthority(snapshot),
+    )
+
+
+def test_listing_fact_survives_ack_failure(tmp_path) -> None:
+    repository = _repository_with_run(tmp_path)
+    mappings = _qualified_mappings()
+    imported = _import_qualified_listing(
+        repository,
+        mappings,
+        run_id="run-listing-scan-1",
+        snapshot_id="SNAPSHOT-QUALIFIED-1",
+        digest_character="d",
+        terminal_status="PARTIAL",
+        ack_state="FAILED",
+    )
+
+    quality = _listing_quality_service(repository, mappings).latest(
+        platform_name=PLATFORM,
+        internal_sku="AISHA-A",
+    )
+
+    assert quality.operating_fact_qualified is True
+    assert quality.fact_reason_codes == ()
+    assert quality.delivery_archive_healthy is False
+    assert quality.delivery_reason_codes == (
+        "EVIDENCE_ACK_FAILED", "AUTOMATION_LIFECYCLE_PARTIAL",
+    )
+    assert quality.authority_generation == 7
+    assert quality.observation_batch_id == imported.observation_batch_id
+    assert quality.platform_product_identity_digest == (
+        mappings.records[0].platform_product_identity_digest
+    )
+    assert quality.qualification_sha256.startswith("sha256:")
+    assert {"account_id", "active_session_verified", "page_identity_key"}.isdisjoint(
+        quality.as_dict()
+    )
+    assert quality.source_execution_attempt_id == "ATTEMPT-SNAPSHOT-QUALIFIED-1"
+    assert quality.evaluated_at == "2026-07-29T09:10:00+00:00"
+    with closing(repository.connect_read()) as connection:
+        stored_scope = json.loads(
+            str(
+                connection.execute(
+                    """
+                    SELECT requested_scope_json
+                    FROM product_observation_batches
+                    WHERE observation_batch_id = ?
+                    """,
+                    (imported.observation_batch_id,),
+                ).fetchone()["requested_scope_json"]
+            )
+        )
+    binding = stored_scope["accepted_identity_bindings"][0]
+    assert "account_id" not in stored_scope["mapping_authority"]
+    assert {"account_id", "page_identity_key"}.isdisjoint(binding)
+    assert binding["internal_sku"] == "AISHA-A"
+    assert binding["mapping_ids"] == ["MAP-AISHA-A"]
+    assert binding["platform_product_identity_digest"] == (
+        mappings.records[0].platform_product_identity_digest
+    )
+
+
+def test_listing_quality_uses_valid_retry_and_rejects_current_conflict(
+    tmp_path,
+) -> None:
+    selection_path = tmp_path / "selection"
+    selection_path.mkdir()
+    selection_repository = _repository_with_run(selection_path)
+    mappings = _qualified_mappings()
+    first = _import_qualified_listing(
+        selection_repository,
+        mappings,
+        run_id="run-listing-scan-1",
+        snapshot_id="SNAPSHOT-RETRY-1",
+        digest_character="d",
+    )
+    _import_qualified_listing(
+        selection_repository,
+        mappings,
+        run_id="run-listing-scan-2",
+        snapshot_id="SNAPSHOT-RETRY-2",
+        digest_character="e",
+        terminal_status="PARTIAL",
+        scope_complete=False,
+        end_marker_verified=False,
+    )
+    selected = _listing_quality_service(
+        selection_repository,
+        mappings,
+    ).latest(
+        platform_name=PLATFORM,
+        internal_sku="AISHA-A",
+    )
+    assert selected.operating_fact_qualified is True
+    assert selected.observation_batch_id == first.observation_batch_id
+
+    conflict_path = tmp_path / "conflict"
+    conflict_path.mkdir()
+    conflict_repository = _repository_with_run(conflict_path)
+    _import_qualified_listing(
+        conflict_repository,
+        mappings,
+        run_id="run-listing-scan-1",
+        snapshot_id="SNAPSHOT-CONFLICT-1",
+        digest_character="d",
+    )
+    _import_qualified_listing(
+        conflict_repository,
+        mappings,
+        run_id="run-listing-scan-2",
+        snapshot_id="SNAPSHOT-CONFLICT-2",
+        digest_character="e",
+    )
+    conflict = _listing_quality_service(
+        conflict_repository,
+        mappings,
+    ).latest(
+        platform_name=PLATFORM,
+        internal_sku="AISHA-A",
+    )
+    assert conflict.operating_fact_qualified is False
+    assert conflict.fact_reason_codes == ("AMBIGUOUS_CURRENT_CANDIDATES",)
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_reason"),
+    [
+        ("end_marker", "END_MARKER_NOT_VERIFIED"),
+        ("identity", "PRODUCT_IDENTITY_MISMATCH"),
+        ("stale", "OBSERVATION_STALE"),
+        ("batch_attempt", "SOURCE_ATTEMPT_MISMATCH"),
+        ("receipt_attempt", "SOURCE_ATTEMPT_MISMATCH"),
+        ("acquiring", "SOURCE_ACQUISITION_INCOMPLETE"),
+        ("receipt_instruction", "SOURCE_INTEGRITY_MISMATCH"),
+    ],
+)
+def test_listing_quality_returns_structured_unqualified_reasons(
+    tmp_path,
+    mutation: str,
+    expected_reason: str,
+) -> None:
+    repository = _repository_with_run(tmp_path)
+    mappings = _qualified_mappings()
+    _import_qualified_listing(
+        repository,
+        mappings,
+        run_id="run-listing-scan-1",
+        snapshot_id="SNAPSHOT-UNQUALIFIED-1",
+        digest_character="d",
+        terminal_status=("PARTIAL" if mutation == "end_marker" else "SUCCESS"),
+        end_marker_verified=mutation != "end_marker",
+    )
+    now = datetime(2026, 7, 29, 9, 10, tzinfo=timezone.utc)
+    current_mappings = mappings
+    if mutation == "identity":
+        current_mappings = _qualified_mappings(
+            platform_product_id="CURRENT-PLATFORM-PRODUCT-1"
+        )
+    elif mutation == "stale":
+        now = datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc)
+    mutations = {
+        "batch_attempt": "UPDATE shadowbot_listing_action_batches SET execution_attempt_id = 'wrong-attempt'",
+        "receipt_attempt": "UPDATE shadowbot_listing_result_receipts SET execution_attempt_id = 'wrong-attempt'",
+        "acquiring": "UPDATE shadowbot_listing_action_batches SET status = 'RUNNING'",
+        "receipt_instruction": "UPDATE shadowbot_listing_result_receipts SET instruction_hash = 'sha256:' || ?",
+    }
+    if mutation in mutations:
+        with closing(repository.connect_write()) as connection, connection:
+            connection.execute(
+                mutations[mutation],
+                ("f" * 64,) if mutation == "receipt_instruction" else (),
+            )
+
+    quality = _listing_quality_service(
+        repository,
+        current_mappings,
+        now=now,
+    ).latest(
+        platform_name=PLATFORM,
+        internal_sku="AISHA-A",
+    )
+    assert quality.operating_fact_qualified is False
+    assert expected_reason in quality.fact_reason_codes
+
+
+def test_listing_quality_isolated_by_sku(tmp_path) -> None:
+    repository = _repository_with_run(tmp_path)
+    mappings = compile_product_mapping_rows(
+        [
+            {
+                **_mapping_row("MAP-AISHA-A", "艾莎", "A", "AISHA-A"),
+                "account_id": "ACCOUNT-1",
+            },
+            {
+                **_mapping_row("MAP-ROSE-A", "玫瑰", "A", "ROSE-A"),
+                "account_id": "ACCOUNT-1",
+            },
+        ],
+        source_workbook_sha256="7" * 64,
+    )
+    _import_qualified_listing(
+        repository,
+        mappings,
+        run_id="run-listing-scan-1",
+        snapshot_id="SNAPSHOT-SKU-ISOLATION-1",
+        digest_character="d",
+        terminal_status="PARTIAL",
+        scope_complete=False,
+        end_marker_verified=False,
+    )
+    _import_qualified_listing(
+        repository,
+        mappings,
+        run_id="run-listing-scan-2",
+        snapshot_id="SNAPSHOT-SKU-ISOLATION-2",
+        digest_character="e",
+        product_name="玫瑰",
+        internal_sku="ROSE-A",
+    )
+    service = _listing_quality_service(repository, mappings)
+
+    assert (
+        service.latest(
+            platform_name=PLATFORM,
+            internal_sku="AISHA-A",
+        ).operating_fact_qualified
+        is False
+    )
+    assert (
+        service.latest(
+            platform_name=PLATFORM,
+            internal_sku="ROSE-A",
+        ).operating_fact_qualified
+        is True
+    )
+
+
+def test_listing_quality_reports_incomplete_source_without_observation_item(
+    tmp_path,
+) -> None:
+    repository = _repository_with_run(tmp_path)
+    mappings = _qualified_mappings()
+    snapshot = _listing_snapshot(snapshot_id="SNAPSHOT-INCOMPLETE-SOURCE")
+    snapshot.update(
+        {
+            "online_scan_complete": False,
+            "waiting_scan_complete": False,
+            "online_end_marker_verified": False,
+            "waiting_end_marker_verified": False,
+            "snapshot_complete": False,
+            "status": "FAILED",
+            "error_code": "END_MARKER_NOT_VERIFIED",
+            "items": [],
+        }
+    )
+    _seed_listing_snapshot_source(
+        repository,
+        snapshot=snapshot,
+        manifest_sha256="sha256:" + "d" * 64,
+        result_sha256="e" * 64,
+    )
+    _set_run_status(
+        repository,
+        run_id="run-listing-scan-1",
+        run_status="FAILED",
+    )
+
+    quality = _listing_quality_service(repository, mappings).latest(
+        platform_name=PLATFORM,
+        internal_sku="AISHA-A",
+    )
+
+    assert quality.operating_fact_qualified is False
+    assert "SOURCE_SCAN_INCOMPLETE" in quality.fact_reason_codes
+    assert "END_MARKER_NOT_VERIFIED" in quality.fact_reason_codes
+    assert quality.source_snapshot_id == "SNAPSHOT-INCOMPLETE-SOURCE"
+    assert quality.observation_batch_id == ""
+
+
+def test_listing_quality_does_not_refresh_old_sku_at_scan_completion(tmp_path):
+    repository = _repository_with_run(tmp_path)
+    mappings = _qualified_mappings()
+    _import_qualified_listing(
+        repository,
+        mappings,
+        run_id="run-listing-scan-1",
+        snapshot_id="SNAPSHOT-LONG-SCAN",
+        digest_character="d",
+        snapshot_updates={
+            "scan_completed_at": "2026-07-29T09:35:00+00:00",
+            "waiting_scan_completed_at": "2026-07-29T09:35:00+00:00",
+        },
+    )
+    quality = _listing_quality_service(
+        repository,
+        mappings,
+        now=datetime(2026, 7, 29, 9, 40, tzinfo=timezone.utc),
+    ).latest(platform_name=PLATFORM, internal_sku="AISHA-A")
+    assert quality.observed_at == "2026-07-29T09:00:01+00:00"
+    assert quality.scan_completed_at == "2026-07-29T09:35:00+00:00"
+    assert quality.fresh_until == "2026-07-29T09:30:01+00:00"
+    assert quality.fact_reason_codes == ("OBSERVATION_STALE",)
+
+
+@pytest.mark.parametrize(
+    ("ack_state", "run_status", "lifecycle_reason"),
+    [
+        (state, "RUNNING", "AUTOMATION_LIFECYCLE_PENDING")
+        for state in ("PENDING", "WRITTEN", "FAILED")
+    ]
+    + [("WRITTEN", "FAILED", "AUTOMATION_LIFECYCLE_FAILED")],
+)
+def test_listing_quality_accepts_acquired_fact_before_parent_finishes(
+    tmp_path, ack_state, run_status, lifecycle_reason
+):
+    repository = _repository_with_run(tmp_path)
+    mappings = _qualified_mappings()
+    _import_qualified_listing(
+        repository,
+        mappings,
+        run_id="run-listing-scan-1",
+        snapshot_id="SNAPSHOT-ACQUIRED",
+        digest_character="d",
+        terminal_status=run_status,
+        ack_state=ack_state,
+    )
+    quality = _listing_quality_service(repository, mappings).latest(
+        platform_name=PLATFORM,
+        internal_sku="AISHA-A",
+    )
+    assert quality.operating_fact_qualified
+    assert not quality.delivery_archive_healthy
+    assert lifecycle_reason in quality.delivery_reason_codes
+
+
+def test_listing_import_rejects_observation_bound_to_another_attempt(tmp_path):
+    repository = _repository_with_run(tmp_path)
+    snapshot = _listing_snapshot(snapshot_id="SNAPSHOT-ATTEMPT-BINDING")
+    _seed_listing_snapshot_source(
+        repository,
+        snapshot=snapshot,
+        manifest_sha256="sha256:" + "d" * 64,
+        result_sha256="e" * 64,
+    )
+    batch = listing_snapshot_to_observation_batch(
+        snapshot,
+        automation_run_id="run-listing-scan-1",
+        source_manifest_sha256="sha256:" + "d" * 64,
+        source_result_sha256="e" * 64,
+    )
+    wrong = replace(
+        batch,
+        requested_scope={
+            **batch.requested_scope,
+            "source_execution_attempt_id": "another-attempt",
+        },
+    )
+    importer = _ClaimingProductObservationImporter(
+        repository,
+        mappings=_qualified_mappings(),
+        clock=lambda: TEST_NOW,
+    )
+    with pytest.raises(ProductObservationError, match="SOURCE_ATTEMPT_MISMATCH"):
+        importer.import_batch(
+            wrong, claim=_stored_claim(repository, "run-listing-scan-1")
+        )
+    with closing(repository.connect_read()) as connection:
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM product_observation_batches"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_listing_quality_tracks_relevant_mapping_not_shared_generation(tmp_path):
+    repository = _repository_with_run(tmp_path)
+    products_path = tmp_path / "products.xlsx"
+    mappings_path = tmp_path / "mappings.xlsx"
+    product_rows = [
+        dict(
+            internal_sku=sku,
+            product_name=name,
+            grade="A",
+            stem_length="60cm",
+            unit="扎",
+            base_cost="10",
+            current_stock="0",
+            sale_enabled="true",
+        )
+        for sku, name in (("AISHA-A", "艾莎"), ("ROSE-A", "玫瑰"))
+    ]
+    mapping_rows = [
+        _mapping_row(
+            "MAP-" + row["internal_sku"], row["product_name"], "A", row["internal_sku"]
+        )
+        for row in product_rows
+    ]
+    save_table_records("products", products_path, product_rows)
+    save_table_records("platform_mappings", mappings_path, mapping_rows)
+    service = MasterDataManagementService(repository)
+    sources = dict(
+        products_workbook=products_path,
+        platform_mappings_workbook=mappings_path,
+        account_id_by_platform={PLATFORM: "ACCOUNT-1"},
+    )
+    preview = service.preview_workbook_import(**sources)
+    imported = service.import_from_workbooks(
+        **sources,
+        expected_request_sha256=preview.request_sha256,
+        actor="tester",
+        idempotency_key="qualification-import",
+    )
+    compared = service.shadow_compare_workbooks(
+        **sources,
+        actor="tester",
+        idempotency_key="qualification-compare",
+    )
+    service.activate_runtime_authority(
+        **sources,
+        expected_product_snapshot_sha256=imported.product_snapshot_sha256,
+        expected_mapping_snapshot_sha256=imported.mapping_snapshot_sha256,
+        expected_shadow_compare_receipt_sha256=compared.receipt_sha256,
+        actor="tester",
+        idempotency_key="qualification-cutover",
+        confirmation=CUTOVER_CONFIRMATION,
+    )
+    provider = RuntimeMasterDataProvider(repository, configured_account_id="ACCOUNT-1")
+    original = provider.mapping_snapshot()
+    _import_qualified_listing(
+        repository,
+        original.mappings,
+        mapping_snapshot=original,
+        run_id="run-listing-scan-1",
+        snapshot_id="SNAPSHOT-SIBLING",
+        digest_character="d",
+        internal_sku="ROSE-A",
+        product_name="玫瑰",
+    )
+    quality_service = ListingScanQualityService(
+        repository,
+        master_data=provider,
+        clock=lambda: datetime(2026, 7, 29, 9, 10, tzinfo=timezone.utc),
+    )
+
+    def current():
+        return quality_service.latest(platform_name=PLATFORM, internal_sku="ROSE-A")
+
+    assert current().operating_fact_qualified
+    service.update_product(
+        internal_sku="AISHA-A",
+        product_name="艾莎",
+        grade="A",
+        stem_length="60cm",
+        unit="扎",
+        base_cost=Decimal("10"),
+        sale_enabled=True,
+        remark="note changed",
+        expected_version=1,
+        actor="tester",
+        idempotency_key="unrelated-product",
+    )
+    assert (
+        provider.mapping_snapshot().authority_generation > original.authority_generation
+    )
+    assert current().operating_fact_qualified
+
+    def change_mapping(sku, *, version, identity, key):
+        record = next(
+            r
+            for r in provider.mapping_snapshot().mappings.records
+            if r.internal_sku == sku
+        )
+        service.update_mapping(
+            mapping_id=record.mapping_id,
+            platform_name=PLATFORM,
+            account_id="ACCOUNT-1",
+            platform_product_identity=identity
+            or json.loads(record.platform_product_identity_json),
+            platform_product_name=record.platform_product_name,
+            grade=record.grade,
+            mapping_status="VERIFIED",
+            internal_sku=sku,
+            remark="mapping note changed",
+            expected_version=version,
+            actor="tester",
+            idempotency_key=key,
+        )
+
+    change_mapping("AISHA-A", version=1, identity=None, key="unrelated-mapping")
+    assert (
+        provider.mapping_snapshot().mapping_snapshot_sha256
+        != original.mapping_snapshot_sha256
+    )
+    assert current().operating_fact_qualified
+    # Even this SKU's annotation is not its product identity.
+    change_mapping("ROSE-A", version=1, identity=None, key="same-sku-note")
+    assert current().operating_fact_qualified
+    from app.platform_product_identity import PLATFORM_PRODUCT_IDENTITY_SCHEMA_VERSION
+
+    change_mapping(
+        "ROSE-A",
+        version=2,
+        key="relevant-identity",
+        identity={
+            "schema_version": PLATFORM_PRODUCT_IDENTITY_SCHEMA_VERSION,
+            "identity_type": "stable_platform_product_id",
+            "components": {"platform_product_id": "replacement-rose"},
+        },
+    )
+    assert not current().operating_fact_qualified
+    assert "PRODUCT_IDENTITY_MISMATCH" in current().fact_reason_codes

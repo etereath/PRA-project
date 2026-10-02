@@ -20,7 +20,9 @@ from app.exceptions import ValidationError
 from app.models import ExecutionLog, ReviewTask, ShadowBotExecutionAttempt, ShadowBotOperationLedger
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.notification_outbox import OutboxReviewNotificationService
+from app.services.master_data_management import MasterDataManagementService
 from app.services.runtime import RuntimeTaskService
+from app.services.runtime_master_data import RuntimeMasterDataProvider
 from app.services.shadowbot_state import (
     AttemptStatus,
     OperationStatus,
@@ -244,7 +246,7 @@ class ShadowBotFileQueueRunner:
             elif is_order_scan:
                 normalize_order_scan_request(payload)
             else:
-                _validate_queue_request(payload)
+                validate_queue_request(payload)
             execution_attempt_id = str(payload["execution_attempt_id"])
             instruction_hash = (
                 compute_multi_product_instruction_hash(payload)
@@ -319,7 +321,7 @@ class ShadowBotFileQueueRunner:
             },
         )
 
-    def archive_attempt_artifacts(self, execution_attempt_id: str) -> None:
+    def archive_attempt_artifacts(self, execution_attempt_id: str) -> Path:
         """Remove an old attempt from executable queue locations before retry."""
         archive_dir = self.queue_dir / "archive" / execution_attempt_id
         archive_dir.mkdir(parents=True, exist_ok=True)
@@ -348,6 +350,7 @@ class ShadowBotFileQueueRunner:
                 if not source.exists() and destination.exists():
                     raise ValidationError("OLD_QUEUE_ARTIFACT_CONFLICT") from exc
                 raise ValidationError("OLD_QUEUE_ARTIFACT_MISSING") from exc
+        return archive_dir
 
 
 class FileDropShadowBotTaskRunner(ShadowBotFileQueueRunner):
@@ -555,6 +558,7 @@ class ShadowBotExecutor:
         runner: ShadowBotTaskRunner,
         *,
         inventory_products_path: Path | None = None,
+        master_data_provider: RuntimeMasterDataProvider | None = None,
     ) -> None:
         self.repository = repository
         self.runner = runner
@@ -562,6 +566,10 @@ class ShadowBotExecutor:
             inventory_products_path
             or os.environ.get("PRA_PRODUCTS_PATH")
             or DEFAULT_INVENTORY_PRODUCTS_PATH
+        )
+        self.master_data_provider = master_data_provider or RuntimeMasterDataProvider(
+            repository,
+            products_workbook=self.inventory_products_path,
         )
         self.runtime_task_service = RuntimeTaskService(repository)
         self.notification_outbox_service = OutboxReviewNotificationService(repository)
@@ -695,6 +703,20 @@ class ShadowBotExecutor:
             }
         )
         try:
+            if request.execution_mode == EXECUTION_MODE_COMMIT:
+                authority = self.master_data_provider.authority_state()
+                if authority.authority_mode == "DB_AUTHORITY":
+                    MasterDataManagementService(
+                        self.repository
+                    ).mark_platform_side_effect(
+                        operation_id=payload.operation_id,
+                        authority_generation=authority.generation,
+                        mapping_snapshot_sha256=authority.mapping_snapshot_sha256,
+                        actor=SHADOWBOT_EXECUTOR_NAME,
+                        idempotency_key=(
+                            "shadowbot-start:" + request.execution_attempt_id
+                        ),
+                    )
             start_result = self.runner.start(runner_payload)
         except Exception as exc:
             boundary_known = isinstance(exc, ShadowBotStartBoundaryError)
@@ -782,9 +804,11 @@ class ShadowBotExecutor:
             if isinstance(first_product, dict):
                 platform_name = str(first_product.get("platform") or "").strip()
         request_payload["platform_name"] = platform_name
+        product_snapshot = self.master_data_provider.product_snapshot()
         request_payload["products"] = build_inventory_read_targets(
             platform_name,
             products_path=self.inventory_products_path,
+            products=product_snapshot.products,
         )
         normalized = normalize_multi_product_request(request_payload)
         if str(task_id or "").strip() == "":
@@ -1848,7 +1872,11 @@ def _reject_fault_injection(payload: dict[str, Any]) -> None:
         raise ValidationError("UNSAFE_TEST_PARAMETER_REJECTED: fault_injection is not allowed by production Executor.")
 
 
-def _validate_queue_request(payload: dict[str, Any]) -> None:
+def validate_queue_request(
+    payload: dict[str, Any],
+    *,
+    check_expiry: bool = True,
+) -> None:
     _reject_fault_injection(payload)
     required = (
         "task_id",
@@ -1877,7 +1905,7 @@ def _validate_queue_request(payload: dict[str, Any]) -> None:
         raise ValidationError("ShadowBot queue expires_at must be ISO-8601.") from exc
     if expires_at.tzinfo is None:
         raise ValidationError("ShadowBot queue expires_at must include a timezone.")
-    if expires_at <= utc_now():
+    if check_expiry and expires_at <= utc_now():
         raise ValidationError("ShadowBot queue request has expired.")
 
 

@@ -11,8 +11,12 @@ def v17_database(tmp_path):
     runtime = SQLiteRuntimeRepository(tmp_path / 'runtime.sqlite3')
     runtime.init_schema()
     with closing(runtime.connect_write()) as connection, connection:
+        connection.execute('DROP TABLE master_data_authority_events')
+        connection.execute('DROP TABLE platform_product_mappings')
+        connection.execute('DROP TABLE product_catalog')
+        connection.execute('DROP TABLE master_data_authority_state')
         connection.execute('DROP TABLE execution_continuations')
-        connection.execute('DELETE FROM runtime_schema_migrations WHERE schema_version = 18')
+        connection.execute('DELETE FROM runtime_schema_migrations WHERE schema_version >= 18')
         connection.execute("UPDATE inventory_authority_state SET version = 7")
     return runtime
 

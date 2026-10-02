@@ -27,14 +27,13 @@ from app.models import Product, Task
 from app.repositories.automation_repository import AutomationRepository
 from app.repositories.inventory_repository import InventoryRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
-from app.repositories.workbook_repository import load_products
 from app.services.operational_time import OperationalTimeService
 from app.services.product_mapping import (
     CompiledProductMappings,
     ProductMappingRecord,
-    compile_product_mapping_workbook,
     normalize_mapping_text,
 )
+from app.services.runtime_master_data import RuntimeMasterDataProvider
 from app.utils import utc_now
 
 
@@ -140,20 +139,29 @@ class ManualTaskApplicationService:
         *,
         products_workbook: Path,
         platform_mappings_workbook: Path,
+        configured_account_id: str = "",
+        master_data_provider: RuntimeMasterDataProvider | None = None,
         clock=None,
         listing_status_fact_max_age: timedelta = LISTING_STATUS_FACT_MAX_AGE,
     ) -> None:
         self.runtime = runtime_repository
         self.products_workbook = Path(products_workbook)
         self.platform_mappings_workbook = Path(platform_mappings_workbook)
+        self.master_data = master_data_provider or RuntimeMasterDataProvider(
+            runtime_repository,
+            configured_account_id=configured_account_id,
+            products_workbook=self.products_workbook,
+            platform_mappings_workbook=self.platform_mappings_workbook,
+        )
         self.clock = clock or utc_now
         self.listing_status_fact_max_age = listing_status_fact_max_age
         self.inventory = InventoryRepository(runtime_repository)
 
     def scope_options(self, *, now: datetime | None = None) -> ManualTaskScopeOptions:
         observed_at = _aware_utc(now or self.clock())
-        products, _ = self._load_products_snapshot()
-        mappings = self._load_mappings_snapshot()
+        snapshot = self._load_master_data_snapshot()
+        products = snapshot.products
+        mappings = snapshot.mappings
         platforms = {
             record.platform_name
             for record in mappings.records
@@ -346,8 +354,10 @@ class ManualTaskApplicationService:
         request: ManualTaskRequest,
         current: datetime,
     ) -> ManualTaskPreview:
-        products, products_sha256 = self._load_products_snapshot()
-        mappings = self._load_mappings_snapshot()
+        snapshot = self._load_master_data_snapshot()
+        products = snapshot.products
+        products_sha256 = snapshot.product_snapshot_sha256.removeprefix("sha256:")
+        mappings = snapshot.mappings
         authority = self.inventory.get_authority_state(connection=connection)
         errors: list[str] = []
         if authority.authority_mode != "DB_AUTHORITY":
@@ -650,28 +660,19 @@ class ManualTaskApplicationService:
         )
 
     def _load_products_snapshot(self) -> tuple[list[Product], str]:
-        try:
-            before = self.products_workbook.read_bytes()
-            products = load_products(self.products_workbook)
-            after = self.products_workbook.read_bytes()
-        except (OSError, UnicodeError, ValueError) as exc:
-            raise ManualTaskError("商品资料暂不可用，请稍后重试。") from exc
-        if before != after:
-            raise ManualTaskConflictError("商品资料刚刚发生变化，请重新预览。")
-        return products, hashlib.sha256(before).hexdigest()
+        snapshot = self._load_master_data_snapshot()
+        return list(snapshot.products), snapshot.product_snapshot_sha256.removeprefix(
+            "sha256:"
+        )
 
     def _load_mappings_snapshot(self) -> CompiledProductMappings:
+        return self._load_master_data_snapshot().mappings
+
+    def _load_master_data_snapshot(self):
         try:
-            before = self.platform_mappings_workbook.read_bytes()
-            compiled = compile_product_mapping_workbook(
-                self.platform_mappings_workbook
-            )
-            after = self.platform_mappings_workbook.read_bytes()
+            return self.master_data.snapshot()
         except (OSError, UnicodeError, ValueError, ValidationError) as exc:
-            raise ManualTaskError("商品与平台的对应关系暂不可用，请稍后重试。") from exc
-        if before != after:
-            raise ManualTaskConflictError("商品与平台的对应关系刚刚发生变化，请重新预览。")
-        return compiled
+            raise ManualTaskError("商品或平台对应关系暂不可用，请稍后重试。") from exc
 
     def _verify_workbook_hashes(
         self,
@@ -679,12 +680,10 @@ class ManualTaskApplicationService:
         products_sha256: str,
         mapping_source_sha256: str,
     ) -> None:
-        if hashlib.sha256(self.products_workbook.read_bytes()).hexdigest() != products_sha256:
+        snapshot = self._load_master_data_snapshot()
+        if snapshot.product_snapshot_sha256.removeprefix("sha256:") != products_sha256:
             raise ManualTaskConflictError("商品资料在任务创建期间发生变化，请重新预览。")
-        if (
-            hashlib.sha256(self.platform_mappings_workbook.read_bytes()).hexdigest()
-            != mapping_source_sha256
-        ):
+        if snapshot.mappings.source_workbook_sha256 != mapping_source_sha256:
             raise ManualTaskConflictError("商品与平台的对应关系发生变化，请重新预览。")
 
 

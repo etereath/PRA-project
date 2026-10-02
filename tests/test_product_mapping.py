@@ -7,6 +7,11 @@ from datetime import datetime, timezone
 import pytest
 
 from app.enums import ProductMappingStatus
+from app.platform_product_identity import (
+    PLATFORM_PRODUCT_IDENTITY_SCHEMA_VERSION,
+    canonical_identity_json,
+    identity_digest,
+)
 from app.services.product_mapping import (
     ProductMappingError,
     compile_product_mapping_rows,
@@ -259,3 +264,87 @@ def test_immutable_json_records_source_hash_and_uses_stable_utf8(
     assert payload["records"][0]["platform_product_name"] == "艾莎"
     assert hashlib.sha256(raw).hexdigest() == first.mapping_version
     assert normalize_mapping_text(" ＡIＳＨＡ　玫瑰 ") == "aisha 玫瑰"
+
+
+def test_nested_identity_digest_is_independent_of_object_key_order() -> None:
+    first = {
+        "schema_version": PLATFORM_PRODUCT_IDENTITY_SCHEMA_VERSION,
+        "identity_type": "adapter_composite",
+        "components": {
+            "catalog": {"region": "cn", "id": "123"},
+            "variant": "A",
+        },
+    }
+    second = {
+        "components": {
+            "variant": "A",
+            "catalog": {"id": "123", "region": "cn"},
+        },
+        "identity_type": "adapter_composite",
+        "schema_version": PLATFORM_PRODUCT_IDENTITY_SCHEMA_VERSION,
+    }
+
+    assert canonical_identity_json(first) == canonical_identity_json(second)
+    assert identity_digest(first) == identity_digest(second)
+
+
+def test_explicit_identity_requires_version_type_and_components() -> None:
+    row = _row(
+        "MAP-INVALID-IDENTITY",
+        product_name="艾莎",
+        grade="A级",
+        status="VERIFIED",
+        sku="SKU-001",
+    )
+    row["platform_product_identity_json"] = json.dumps(
+        {"platform_product_id": "legacy-flat-shape"}
+    )
+
+    with pytest.raises(ProductMappingError, match="schema_version"):
+        compile_product_mapping_rows(
+            [row],
+            source_workbook_sha256="1" * 64,
+        )
+
+
+def test_same_display_name_with_distinct_stable_ids_resolves_separately() -> None:
+    first = _row(
+        "MAP-STABLE-1",
+        product_name="艾莎",
+        grade="A级",
+        status="VERIFIED",
+        sku="SKU-001",
+    )
+    first["platform_product_id"] = "stable-1"
+    second = _row(
+        "MAP-STABLE-2",
+        product_name="艾莎",
+        grade="A级",
+        status="VERIFIED",
+        sku="SKU-002",
+    )
+    second["platform_product_id"] = "stable-2"
+    compiled = compile_product_mapping_rows(
+        [first, second],
+        source_workbook_sha256="f" * 64,
+    )
+
+    resolutions = [
+        compiled.resolve(
+            platform_name="蚂蚁花团供应商",
+            platform_product_name="艾莎",
+            grade="A级",
+            observed_at=OBSERVED_AT,
+            platform_product_identity=record.platform_product_identity_json,
+        )
+        for record in compiled.records
+    ]
+
+    assert {item.internal_sku for item in resolutions} == {"SKU-001", "SKU-002"}
+    fallback = compiled.resolve(
+        platform_name="蚂蚁花团供应商",
+        platform_product_name="艾莎",
+        grade="A级",
+        observed_at=OBSERVED_AT,
+    )
+    assert fallback.mapping_status is ProductMappingStatus.AMBIGUOUS

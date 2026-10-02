@@ -18,12 +18,12 @@ from app.repositories.workbook_repository import (
     load_cold_storage_statuses,
     load_harvest_forecasts,
     load_listing_rules,
-    load_products,
 )
 from app.services.capacity_planning import CapacityPlanningService
 from app.services.authoritative_inventory import InventoryProvider
 from app.services.listing import ListingService
 from app.services.runtime import ReviewTaskService, RuntimeTaskService
+from app.services.runtime_master_data import RuntimeMasterDataProvider
 from app.utils import utc_now
 
 
@@ -685,10 +685,15 @@ class BusinessRuleRunner:
             active_plans = [plan for plan in plans if plan.trade_date == context.trade_date and plan.active]
             if len(active_plans) == 1:
                 capacity_plan = active_plans[0]
-        if context.products_path.exists():
+        product_snapshot = RuntimeMasterDataProvider(
+            self.repository,
+            products_workbook=context.products_path,
+        ).product_snapshot()
+        products = list(product_snapshot.products)
+        if product_snapshot.authority_mode == "PRE_CUTOVER":
             products = InventoryProvider(
                 InventoryRepository(self.repository)
-            ).hydrate_products(load_products(context.products_path))
+            ).hydrate_products(products)
         if context.listing_rules_path.exists():
             listing_rules = load_listing_rules(context.listing_rules_path)
         if context.cold_storage_status_path.exists():

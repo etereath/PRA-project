@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run ShadowBot result importer and queue watchdog")
     parser.add_argument("--runtime-db", type=Path, default=Path(os.environ.get('PRA_RUNTIME_DB') or DEFAULT_RUNTIME_DB))
     parser.add_argument("--products", type=Path, default=Path(os.environ.get('PRA_PRODUCTS_WORKBOOK') or DEFAULT_INVENTORY_PRODUCTS_PATH))
+    parser.add_argument("--account-id", default=os.environ.get("PRA_ACCOUNT_ID", ""))
     parser.add_argument("--queue-dir", type=Path, default=None)
     parser.add_argument("--poll-seconds", type=float, default=3.0)
     parser.add_argument("--stale-seconds", type=int, default=30)
@@ -156,7 +157,9 @@ def run_cycle(
     return events
 
 
-def build_execution_coordinator(repository, importer, *, products, queue_dir):
+def build_execution_coordinator(
+    repository, importer, *, products, queue_dir, configured_account_id=""
+):
     """Use the same fixed workbook/identity settings as Operations Web."""
     profile = os.environ.get('PRA_ENV', 'production').strip().lower()
     if profile not in {'development', 'production'}:
@@ -170,6 +173,7 @@ def build_execution_coordinator(repository, importer, *, products, queue_dir):
                                        or PROJECT_ROOT / 'shadowbot/test2/product_identity_mapping.json'),
         queue_root=queue_dir, applet_uri=os.environ.get('SHADOWBOT_APPLET_URI', ''),
         execution_profile=profile,
+        configured_account_id=configured_account_id,
     )
     return TaskExecutionCoordinator(service, executor=importer.executor)
 
@@ -232,7 +236,13 @@ def main() -> int:
         queue_dir,
         inventory_products_path=args.products,
     )
-    coordinator = build_execution_coordinator(repository, importer, products=args.products, queue_dir=queue_dir)
+    coordinator = build_execution_coordinator(
+        repository,
+        importer,
+        products=args.products,
+        queue_dir=queue_dir,
+        configured_account_id=args.account_id,
+    )
     login_monitor = ShadowBotLoginVerificationMonitor(repository, runner, queue_dir)
     watchdog = ShadowBotQueueWatchdog(
         queue_dir,

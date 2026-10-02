@@ -55,6 +55,10 @@ class ListingService:
             ListingStrategy.SET_OFFLINE,
         }:
             return ListingAction.SET_OFFLINE
+        if product.current_stock is None:
+            raise ValidationError(
+                f"商品 {product.internal_sku} 的库存尚未初始化，不能评估库存相关上下架规则。"
+            )
         if rule.listing_strategy == ListingStrategy.ALLOW_ONLINE:
             return ListingAction.SET_ONLINE
         if rule.listing_strategy == ListingStrategy.STOCK_BELOW_OFFLINE and product.current_stock <= threshold:

@@ -70,6 +70,7 @@ from app.review_policy import (
     review_business_decision,
     review_source_task_ids,
 )
+from app.shadowbot_contract_primitives import validate_queue_stop_fence
 from app.runtime_schema import (
     LATEST_RUNTIME_SCHEMA_VERSION,
     V14_APPEND_ONLY_TABLES,
@@ -80,6 +81,7 @@ from app.runtime_schema import (
 )
 from app.utils import serialize_decimal, utc_now
 from app.repositories.execution_continuation_repository import SCHEMA_V18_SQL
+from app.repositories.master_data_repository import SCHEMA_V19_SQL
 
 TERMINAL_TASK_STATUSES = ("success", "skipped", "cancelled", "expired")
 
@@ -3308,6 +3310,10 @@ class SQLiteRuntimeRepository:
             requires_v18_migration = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'execution_continuations'"
             ).fetchone() is None
+            requires_v19_migration = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'master_data_authority_state'"
+            ).fetchone() is None
             requires_runtime_migration = (
                 requires_v13_migration
                 or requires_v14_migration
@@ -3315,6 +3321,7 @@ class SQLiteRuntimeRepository:
                 or requires_v16_migration
                 or requires_v17_migration
                 or requires_v18_migration
+                or requires_v19_migration
             )
             if requires_v13_migration or requires_v15_migration:
                 connection.execute("PRAGMA foreign_keys = OFF")
@@ -3408,6 +3415,7 @@ class SQLiteRuntimeRepository:
                     16: "versioned emergency offline policies for shadow evaluation",
                     17: "authoritative real inventory balances, immutable ledger, sales baselines, and alert policies",
                     18: "durable v4 execution authorization continuation",
+                    19: "account-aware Runtime Product and Platform Mapping authority",
                 }
                 for statement in SCHEMA_V6_SQL:
                     connection.execute(statement)
@@ -3513,7 +3521,26 @@ class SQLiteRuntimeRepository:
                     connection.execute(statement)
                 for statement in SCHEMA_V18_SQL:
                     connection.execute(statement)
+                for statement in SCHEMA_V19_SQL:
+                    connection.execute(statement)
                 now_text = _datetime_to_text(datetime.now())
+                connection.execute(
+                    """
+                    INSERT INTO master_data_authority_state(
+                        authority_key, authority_mode, generation,
+                        product_snapshot_sha256, mapping_snapshot_sha256,
+                        cutover_generation, cutover_event_sequence,
+                        cutover_at, cutover_by, updated_at
+                    )
+                    SELECT 'PRODUCT_MAPPING', 'PRE_CUTOVER', 0,
+                           '', '', NULL, NULL, NULL, '', ?
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM master_data_authority_state
+                        WHERE authority_key = 'PRODUCT_MAPPING'
+                    )
+                    """,
+                    (now_text,),
+                )
                 connection.execute(
                     """
                     INSERT INTO inventory_authority_state(
@@ -5162,7 +5189,7 @@ class SQLiteRuntimeRepository:
                 if review_row["review_type"] == "price_execution_unknown":
                     raise MobileReviewTransactionError(
                         MobileReviewErrorCode.ACTION_NOT_ALLOWED_FOR_REVIEW_TYPE,
-                        "请登录经营管理，凭平台核验记录提交人工结论。",
+                        "请登录经营管理，由系统核验停止证明和最新合格观察后终止旧 one-shot。",
                     )
 
                 expires_at = (
@@ -6785,6 +6812,74 @@ class SQLiteRuntimeRepository:
             and expires_at is not None
             and expires_at > now
         )
+
+    def record_shadowbot_queue_stop_fence(
+        self,
+        execution_attempt_id: str,
+        *,
+        proof: dict[str, Any],
+    ) -> bool:
+        """Persist Queue-owned request isolation after rechecking the DB fence."""
+
+        connection = self.connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT a.*, o.lock_owner, o.status AS operation_status
+                FROM shadowbot_execution_attempts a
+                JOIN shadowbot_operations o ON o.operation_id = a.operation_id
+                WHERE a.execution_attempt_id = ?
+                """,
+                (execution_attempt_id,),
+            ).fetchone()
+            if (
+                row is None
+                or str(row["execution_mode"]) != "RECONCILE"
+                or str(row["status"]) in {"STARTING", "RUNNING"}
+                or not row["ended_at"]
+                or str(row["lock_owner"] or "")
+                or str(row["operation_status"])
+                not in {"NEEDS_RECONCILIATION", "MANUAL_REVIEW"}
+            ):
+                connection.rollback()
+                return False
+            raw = _json_load(row["raw_output_json"])
+            lease = raw.get("lease") if isinstance(raw.get("lease"), dict) else {}
+            if lease.get("active") is True:
+                connection.rollback()
+                return False
+            source_attempt_id = str(raw.get("source_execution_attempt_id") or "")
+            try:
+                validated = validate_queue_stop_fence(
+                    proof,
+                    execution_attempt_id=execution_attempt_id,
+                    operation_id=str(row["operation_id"]),
+                    source_execution_attempt_id=source_attempt_id,
+                    instruction_hash=str(row["instruction_hash"]),
+                )
+            except ValueError:
+                connection.rollback()
+                return False
+            existing = raw.get("queue_stop_fence")
+            if existing is not None and existing != validated:
+                connection.rollback()
+                return False
+            raw["queue_stop_fence"] = validated
+            updated = connection.execute(
+                """
+                UPDATE shadowbot_execution_attempts
+                SET raw_output_json = ?
+                WHERE execution_attempt_id = ?
+                  AND status NOT IN ('STARTING', 'RUNNING')
+                  AND ended_at IS NOT NULL
+                """,
+                (_json_dump(raw), execution_attempt_id),
+            )
+            connection.commit()
+            return updated.rowcount == 1
+        finally:
+            connection.close()
 
     def complete_shadowbot_attempt_with_lease(
         self,

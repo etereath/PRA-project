@@ -20,6 +20,7 @@ from app.services.automation import (
     AutomationHandler,
 )
 from app.services.runtime import ReviewTaskService
+from app.services.runtime_master_data import RuntimeMasterDataProvider
 from app.services.workflow import (
     WorkflowInputs,
     generate_tasks_from_sources,
@@ -112,7 +113,12 @@ class DailyTaskGenerationAutomationHandler:
         ):
             raise ValueError("Daily task generation source_allowlist is invalid")
 
-        paths = [self.products_path]
+        master_data = RuntimeMasterDataProvider(
+            self.runtime_repository,
+            products_workbook=self.products_path,
+        )
+        product_snapshot_before = master_data.product_snapshot()
+        paths: list[Path] = []
         if "PRICE_RULES" in sources:
             paths.append(self.price_rules_path)
         if "LISTING_RULES" in sources:
@@ -126,6 +132,11 @@ class DailyTaskGenerationAutomationHandler:
             "seller_operation_date": run.seller_operation_date.isoformat(),
             "time_policy_version": run.time_policy_version,
             "source_allowlist": sorted(sources),
+            "product_authority": {
+                "mode": product_snapshot_before.authority_mode,
+                "generation": product_snapshot_before.authority_generation,
+                "snapshot_sha256": product_snapshot_before.product_snapshot_sha256,
+            },
             "files": {
                 path.name: "sha256:" + hashlib.sha256(content).hexdigest()
                 for path, content in before.items()
@@ -146,6 +157,11 @@ class DailyTaskGenerationAutomationHandler:
         after = {path: path.read_bytes() for path in paths}
         if after != before:
             raise RuntimeError("Daily task generation input changed during evaluation")
+        product_snapshot_after = master_data.product_snapshot()
+        if product_snapshot_after != product_snapshot_before:
+            raise RuntimeError(
+                "Daily task generation Product authority changed during evaluation"
+            )
         allowed_actions = set()
         if "PRICE_RULES" in sources:
             allowed_actions.add(TaskActionType.UPDATE_PRICE)

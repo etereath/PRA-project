@@ -48,6 +48,7 @@ class OperationsWebSettings:
     paths: OperationsWebPaths
     shadowbot_applet_uri: str = ""
     platform_name: str = "蚂蚁花团供应商"
+    account_id: str = ""
     notification_channel: str = "feishu"
 
     @classmethod
@@ -134,6 +135,7 @@ class OperationsWebSettings:
                 source.get("PRA_PLATFORM_NAME", "蚂蚁花团供应商").strip()
                 or "蚂蚁花团供应商"
             ),
+            account_id=source.get("PRA_ACCOUNT_ID", "").strip(),
             notification_channel=(
                 source.get("DEFAULT_NOTIFICATION_CHANNEL", "feishu").strip().lower()
                 or "feishu"

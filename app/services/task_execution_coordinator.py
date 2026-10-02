@@ -11,13 +11,13 @@ import json
 import sqlite3
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal
 
 from app.exceptions import ValidationError
 from app.enums import TaskStatus
 from app.repositories.execution_continuation_repository import digest_json
 from app.services.execution_authorization import (
     ExecutionAuthorizationBlocked, ExecutionAuthorizationConflict,
+    _authorization_identity,
 )
 from app.services.shadowbot_commit_batch import validate_request
 from app.services.shadowbot_executor import ShadowBotStartBoundaryError
@@ -143,16 +143,36 @@ class TaskExecutionCoordinator:
             return self._note(batch_id, 'BLOCKED', now)
         except (ExecutionAuthorizationConflict, ValidationError):
             return self._note(batch_id, 'RECONFIRM', now, close=True)
-        if all(Decimal(i['listing_price']) == Decimal(i['target_price']) for i in facts['items']):
+        qualified_target = self.service._qualified_target_observations(facts)
+        if qualified_target is not None:
             return self._note(batch_id, 'ALREADY_APPLIED', now, close=True, task_status='skipped',
-                              evidence={'platform_observation': facts['items']})
+                              evidence={'platform_observation': qualified_target})
+        # Old persisted S1 envelopes remain non-write authority. New S2
+        # target-satisfied decisions never create a continuation.
         if envelope.get('resolution_only'):
             return self._note(batch_id, 'RECONFIRM', now, close=True)
-        if (_semantic_facts(facts) != _semantic_facts(envelope['facts'])
+        authorization_identity = envelope.get('authorization_identity')
+        decision_changed = (
+            _authorization_identity(
+                facts,
+                datetime.fromisoformat(envelope['expires_at']),
+            ) != authorization_identity
+            if authorization_identity is not None
+            else _legacy_semantic_facts(facts)
+            != _legacy_semantic_facts(envelope['facts'])
+        )
+        if (
+                decision_changed
                 or manifest['manifest_sha256'] != batch['manifest_sha256']):
             return self._note(batch_id, 'RECONFIRM', now, close=True)
         profile = self.service.execution_profile
         try:
+            self.service.mark_platform_side_effect_boundary(
+                operation_id=batch_id,
+                facts=facts,
+                actor="execution_coordinator",
+                idempotency_key="v4-publish:" + batch_id,
+            )
             self.service.v4_publish(
                 self.runtime, self.service.runner_factory(self.service.queue_root),
                 manifest=manifest, execution_profile=profile,
@@ -192,13 +212,25 @@ class TaskExecutionCoordinator:
         return self._note(batch['batch_id'], 'TRACKING', now)
 
 
-def _semantic_facts(facts):
+def _legacy_semantic_facts(facts):
+    """Preserve already-accepted pre-S2 continuation semantics."""
     result = dict(facts)
-    result['items'] = [{k: v for k, v in item.items()
-                        if k not in {'task_updated_at', 'listing_updated_at',
-                                     'listing_price_observed_at', 'listing_price_source_attempt_id',
-                                     'real_inventory', 'real_inventory_version'}}
-                       for item in facts['items']]
+    result['items'] = [
+        {
+            key: value
+            for key, value in item.items()
+            if key
+            not in {
+                'task_updated_at',
+                'listing_updated_at',
+                'listing_price_observed_at',
+                'listing_price_source_attempt_id',
+                'real_inventory',
+                'real_inventory_version',
+            }
+        }
+        for item in facts['items']
+    ]
     return result
 
 

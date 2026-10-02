@@ -38,11 +38,15 @@ from app.operations_web.queries import (
 from app.repositories.operational_summary_repository import OperationalSummaryRepository
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import PRODUCT_HEADERS
-from app.repositories.workbook_repository import load_products
+from app.repositories.workbook_repository import load_products, save_table_records
 from app.repositories.inventory_repository import InventoryRepository
 from app.services.authoritative_inventory import (
     InventoryApplicationService,
     sqlite_logical_snapshot_sha256,
+)
+from app.services.master_data_management import (
+    CUTOVER_CONFIRMATION,
+    MasterDataManagementService,
 )
 from app.services.runtime import ReviewTokenService
 from app.services.operational_time import OperationalTimePolicy
@@ -924,6 +928,162 @@ def test_management_inventory_adjustment_is_csrf_fenced_prg_and_db_only(
     assert status == "200 OK"
     assert "库存调整未完成" in body
     assert "调整值、来源或调整后库存不符合要求" in body
+
+
+def test_management_master_data_entry_is_authenticated_versioned_and_db_only(
+    read_only_web,
+) -> None:
+    app, container, repository, tmp_path = read_only_web
+    products = tmp_path / "products.xlsx"
+    mappings = tmp_path / "platform_mappings.xlsx"
+    save_table_records(
+        "platform_mappings",
+        mappings,
+        [
+            {
+                "mapping_id": "MAP-WEB-001",
+                "mapping_kind": "PRODUCT",
+                "platform_name": "测试平台",
+                "platform_product_id": "stable-web-001",
+                "platform_product_name": "艾莎",
+                "normalized_platform_product_name": "",
+                "grade": "A级",
+                "internal_sku": "AISHA-A-50-Z",
+                "candidate_internal_sku": "",
+                "search_keyword": "艾莎",
+                "mapping_status": "VERIFIED",
+                "effective_from": "",
+                "effective_to": "",
+                "last_verified_at": "",
+                "remark": "",
+            }
+        ],
+    )
+    service = MasterDataManagementService(repository)
+    preview = service.preview_workbook_import(
+        products_workbook=products,
+        platform_mappings_workbook=mappings,
+        account_id_by_platform={"测试平台": "account-web"},
+    )
+    imported = service.import_from_workbooks(
+        products_workbook=products,
+        platform_mappings_workbook=mappings,
+        account_id_by_platform={"测试平台": "account-web"},
+        expected_request_sha256=preview.request_sha256,
+        actor="bootstrap",
+        idempotency_key="web-master-import",
+    )
+    comparison = service.shadow_compare_workbooks(
+        products_workbook=products,
+        platform_mappings_workbook=mappings,
+        account_id_by_platform={"测试平台": "account-web"},
+        actor="bootstrap",
+        idempotency_key="web-master-compare",
+    )
+    service.activate_runtime_authority(
+        expected_product_snapshot_sha256=imported.product_snapshot_sha256,
+        expected_mapping_snapshot_sha256=imported.mapping_snapshot_sha256,
+        products_workbook=products,
+        platform_mappings_workbook=mappings,
+        account_id_by_platform={"测试平台": "account-web"},
+        expected_shadow_compare_receipt_sha256=comparison.receipt_sha256,
+        actor="bootstrap",
+        idempotency_key="web-master-cutover",
+        confirmation=CUTOVER_CONFIRMATION,
+    )
+    cookie = _login(app, container)
+    session = container.sessions.get(cookie)
+    assert session is not None
+
+    status, _, body = _call_app(app, path="/management", cookie=cookie)
+    assert status == "200 OK"
+    assert "商品与平台映射" in body
+    assert "AISHA-A-50-Z" in body
+    assert "MAP-WEB-001" in body
+
+    product_form = {
+        "csrf_token": session.csrf_token,
+        "operation": "update",
+        "idempotency_key": "web-product-update-1",
+        "expected_version": "1",
+        "internal_sku": "AISHA-A-50-Z",
+        "product_name": "艾莎",
+        "grade": "A级",
+        "stem_length": "50cm",
+        "unit": "扎",
+        "base_cost": "11.80",
+        "sale_enabled": "true",
+        "remark": "Web 成本修正",
+    }
+    denied_form = dict(product_form, csrf_token="invalid")
+    status, _, _ = _call_app(
+        app,
+        path="/management/master-data/products",
+        method="POST",
+        cookie=cookie,
+        form=denied_form,
+    )
+    assert status == "403 Forbidden"
+    assert service.repository.get_product_record("AISHA-A-50-Z").version == 1
+    status, headers, _ = _call_app(
+        app,
+        path="/management/master-data/products",
+        method="POST",
+        cookie=cookie,
+        form=product_form,
+    )
+    assert status == "303 See Other"
+    assert _header(headers, "Location").startswith(
+        "/management?master_data_receipt="
+    )
+    product_record = service.repository.get_product_record("AISHA-A-50-Z")
+    assert product_record is not None
+    assert product_record.version == 2
+    assert product_record.product.base_cost == Decimal("11.80")
+    assert product_record.inventory_status == "NOT_INITIALIZED"
+
+    mapping_record = service.repository.list_mapping_records()[0]
+    mapping_form = {
+        "csrf_token": session.csrf_token,
+        "operation": "update",
+        "idempotency_key": "web-mapping-update-1",
+        "expected_version": "1",
+        "mapping_id": mapping_record.mapping_id,
+        "platform_name": mapping_record.platform_name,
+        "account_id": mapping_record.account_id,
+        "platform_product_identity_json": (
+            mapping_record.platform_product_identity_json
+        ),
+        "platform_product_name": mapping_record.platform_product_name,
+        "grade": mapping_record.grade,
+        "mapping_status": mapping_record.mapping_status,
+        "internal_sku": mapping_record.internal_sku or "",
+        "candidate_internal_skus": "",
+        "effective_from": "",
+        "effective_to": "",
+        "remark": "Web 映射复核",
+    }
+    status, _, _ = _call_app(
+        app,
+        path="/management/master-data/mappings",
+        method="POST",
+        cookie=cookie,
+        form=mapping_form,
+    )
+    assert status == "303 See Other"
+    assert service.repository.list_mapping_records()[0].version == 2
+    with repository.connect_read() as connection:
+        actors = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT actor FROM master_data_authority_events "
+                "WHERE event_type IN ('PRODUCT_MUTATION', 'MAPPING_MUTATION')"
+            ).fetchall()
+        }
+        assert actors == {"admin"}
+        assert connection.execute(
+            "SELECT count(*) FROM inventory_balances"
+        ).fetchone()[0] == 0
 
 
 def _write_products(path: Path) -> None:
