@@ -647,7 +647,7 @@ class ExecutionAuthorizationApplicationService:
                 row = rows_by_id[task_id]
                 from app.services.price_decisions import unresolved_predecessors
                 if unresolved_predecessors(connection, task_id):
-                    raise ExecutionAuthorizationBlocked("先前操作尚未收口；新的价格决定已保留。")
+                    raise ExecutionAuthorizationBlocked("先前操作尚未收口；新的销售决定已保留。")
                 if str(row["task_status"]) != TaskStatus.PENDING.value:
                     raise ExecutionAuthorizationConflict("所选任务已不在待执行状态，请刷新列表。")
                 expires_at = _parse_datetime(row["expires_at"])

@@ -265,13 +265,13 @@ class ManualTaskApplicationService:
             ]
             from app.services.price_decisions import record_price_supersession
 
-            record_price_supersession(connection, tasks, subject=subject, now=current)
             SQLiteRuntimeRepository._validate_tasks_for_insert(tasks)
             inserted = SQLiteRuntimeRepository._insert_tasks_on_connection(connection, tasks)
             if inserted != len(tasks):
                 raise ManualTaskConflictError(
                     "任务身份与现有开放任务冲突，未创建任何任务。"
                 )
+            record_price_supersession(connection, tasks, subject=subject, now=current)
             self._verify_workbook_hashes(
                 products_sha256=preview.products_sha256,
                 mapping_source_sha256=preview.mapping_version.split(":", 1)[0],
@@ -375,20 +375,6 @@ class ManualTaskApplicationService:
         if not selected_products:
             errors.append("所选品种和等级没有可销售商品。")
 
-        open_tasks = connection.execute(
-            """
-            SELECT internal_sku, platform_name FROM tasks
-            WHERE task_status IN ('pending', 'running', 'manual_review')
-              AND action_type IN ('update_price', 'set_online', 'set_offline')
-            """
-        ).fetchall()
-        open_identities = {
-            (
-                str(row["internal_sku"] or "").strip().upper(),
-                normalize_mapping_text(row["platform_name"]),
-            )
-            for row in open_tasks
-        }
         exclusions = set(request.excluded_item_keys)
         items: list[ManualTaskPreviewItem] = []
         for platform in request.platforms:
@@ -400,7 +386,6 @@ class ManualTaskApplicationService:
                     platform_name=platform,
                     mappings=mappings,
                     authority_mode=authority.authority_mode,
-                    open_identities=open_identities,
                     current=current,
                     exclusions=exclusions,
                 )
@@ -447,7 +432,6 @@ class ManualTaskApplicationService:
         platform_name: str,
         mappings: CompiledProductMappings,
         authority_mode: str,
-        open_identities: set[tuple[str, str]],
         current: datetime,
         exclusions: set[str],
     ) -> ManualTaskPreviewItem:
@@ -536,12 +520,6 @@ class ManualTaskApplicationService:
                 blockers.append("上架必须填写非负平台目标库存。")
             elif balance is not None and target_inventory > balance.current_qty:
                 blockers.append("平台目标库存不能超过数据库库存。")
-
-        if request.action not in {SET_PRICE, CHANGE_PRICE} and (
-            product.internal_sku.upper(),
-            normalize_mapping_text(platform_name),
-        ) in open_identities:
-            blockers.append("该商品与平台已有开放任务。")
 
         item_key = _item_key(platform_name, product.internal_sku)
         observed_version = ""

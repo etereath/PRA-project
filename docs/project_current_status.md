@@ -1,6 +1,6 @@
 # PRA 当前阶段与验证状态
 
-角色：Current Status；项目进度与验证状态的唯一维护页。仅在阶段、范围、blocker 或验证结论发生实质变化时更新；即时 Head/CI 以 GitHub 为准，`index.md` 仅负责索引。更新于 2026-10-02。
+角色：Current Status；项目进度与验证状态的唯一维护页。仅在阶段、范围、blocker 或验证结论发生实质变化时更新；即时 Head/CI 以 GitHub 为准，`index.md` 仅负责索引。更新于 2026-10-03。
 
 PR [#47](https://github.com/etereath/PRA-project/pull/47)、RM0 交付 PR [#49](https://github.com/etereath/PRA-project/pull/49)、收口 PR [#50](https://github.com/etereath/PRA-project/pull/50)、Authority Contract PR [#52](https://github.com/etereath/PRA-project/pull/52)、Runtime Product/Mapping Authority PR [#53](https://github.com/etereath/PRA-project/pull/53) 与开发资源治理 PR [#56](https://github.com/etereath/PRA-project/pull/56) 均已合并。2026-09-09 PR #54 已同步 current `main@0b1135787ac33c3c6c96531f874924418924bb8a` 并开始 Task 13.7-2C。Task 13.7-1 Implementation Review = **PASS**，P1-47-01、P2-47-01、P2-47-02 均 **CLOSED**。代码和 RM0 记录已进入 main；RM1-A 真实 READ_ONLY 已通过。RM1-B 首次授权在提交前以 `OLD_PRICE_PARSE_FAILED / NOT_STARTED` 失败，相关列表筛选、Web 责任表达及固定价格新鲜度门禁已经修复；2026-09-08 负责人重新授权后，`AISHA-B-60-Z` 已通过唯一一次真实提交由 `10.80` 调整为 `10.30`，写后独立回读、Importer、Archive、锁释放及持久 continuation 收口均为 **VERIFIED**。
 
@@ -78,5 +78,13 @@ PR #44 已关闭且未合并，仍作历史平行分析；有效增量已随 #45
 This dated block supersedes the older Task 13.7-S1 table row above.
 
 - Task 13.7-S1 UNKNOWN / Human Recovery simplification: **MERGED / CI SUCCESS**. PR #58 merged as `40ca0bad34248ec095204f3d2379bf90adf80271`; Windows/Linux Core run `37017589339` succeeded. This records the repository state only and does not authorize runtime cutover or closing a real UNKNOWN.
-- Task 13.7-S2 Decision / Authorization simplification: **LOCAL IMPLEMENTED / TARGETED PASS** on isolated branch `codex/task13-7-s2-decision-authorization`, based on the fixed S1 merge SHA above. A currently qualified target observation may close the pending one-shot atomically as `ALREADY_APPLIED` without creating or publishing a batch; ordinary execution authorization now binds business decision identity while current execution facts are still revalidated at execution time. No push, PR, deployment, runtime cutover, or real platform action has occurred.
+- Task 13.7-S2 Decision / Authorization simplification: **MERGED**. PR #59 merged as `9da3392b4a8cc65f6847a58c016f18a1db14da15` on 2026-10-03 (Asia/Shanghai). A currently qualified target observation may close the pending one-shot atomically as `ALREADY_APPLIED` without creating or publishing a batch; ordinary execution authorization binds business decision identity while current execution facts are revalidated at execution time. The merge does not authorize deployment, runtime cutover, or real platform action.
 - S2 validation is intentionally targeted under the repository verification budget. The exact commands, counts, fixed local commit, and review bundle are recorded in the S2 handoff manifest after the local commit is created.
+
+## Task 13.7-2D 审查整改（2026-10-03）
+
+PR #55 已同步 `main@9da3392`，实现 2D-01 / 2D-02：三种人工销售决定复用 Task/history/predecessor，在同一事务中先保存新决定。新改价只替代旧改价，不默示撤回旧上下架决定；人工下架可安全替代未发布的普通 AUTOMATION 改价。已发布责任保留且阻止相关后继授权，SYSTEM_EMERGENCY / Incident 优先级不改。现有到期服务在事务内检查执行责任，Current Queue 读取正式收口可安全过期的 PENDING，并关闭未发布授权交接。没有新增持久字段、状态、表或 Service。
+
+当前为 **REMEDIATION IMPLEMENTED / TARGETED PASS / WAIT RE-REVIEW**。首版 `aa4c463c261076d521914bce1fc9eed0fa83e7c3` 已推送，绑定该 Head 的 [Core CI #37058739581](https://github.com/etereath/PRA-project/actions/runs/37058739581) Windows / Linux 均 SUCCESS；随后[限定审查](https://github.com/etereath/PRA-project/pull/55#issuecomment-5960916192)判定 Implementation Review FAIL，冻结 P1-55-01（替代业务维度/来源策略）及 P2-55-01（状态页过时）。本轮完成对应实现、错误测试预期和状态记录整改；仍等待 Reviewer 复核，不由实现者关闭审查问题或改写 Stage Goal。
+
+本轮仅运行四个文件内的 AC-01～07 直接回归：**24 passed / 5 failed（33.60 秒）**；五项均因新增夹具试图修改不可变 Task 来源被拒绝，改为创建时携带正确来源后，五项各复跑一次，**5 passed（4.47 秒）**。29 个定向用例已有通过证据，目标文件 Ruff、严格 UTF-8 和 diff 检查通过。没有本地全量回归或主动 CI 重跑，未部署或操作真实平台。旧 Head CI 不替代整改 Head 的自动 CI，推送后的即时 Head/CI 以 [PR #55](https://github.com/etereath/PRA-project/pull/55) 为准。范围、AC 路径及历史验证记录见[2D 计划](plans/task13_7_2d_queue_operational_continuity.md#15-实现与验证交接2026-10-03)。
