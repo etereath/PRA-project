@@ -7,6 +7,7 @@ import json
 import os
 import secrets
 import time
+from contextlib import closing
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -186,26 +187,40 @@ class RuntimeTaskService:
     ) -> int:
         """Move overdue pending tasks to expired and record an audit history row."""
 
+        from app.services.price_decisions import (
+            close_price_authorizations,
+            has_published_responsibility,
+        )
+
         current = now or datetime.now()
         expired_count = 0
-        for task in self.repository.list_tasks(status=TaskStatus.PENDING):
-            if task.action_type in MANUAL_INTERVENTION_ACTIONS:
-                continue
-            deadline = task.expires_at or task.required_by
-            if deadline is None or not _deadline_has_passed(deadline, current):
-                continue
-            self.change_status(
-                task_id=task.task_id,
-                to_status=TaskStatus.EXPIRED,
-                changed_by=changed_by,
-                reason="required_by_deadline_passed",
-                metadata={
-                    "deadline": deadline.isoformat(),
-                    "detected_at": current.isoformat(),
-                },
-                result_message="任务已超过截止时间，系统自动标记为过期。",
-            )
-            expired_count += 1
+        # Serialize with authorization/publication: do not expire a stale read
+        # of PENDING after a publisher has accepted responsibility for it.
+        with closing(self.repository.connect_write()) as connection, connection:
+            connection.execute('BEGIN IMMEDIATE')
+            rows = connection.execute("SELECT * FROM tasks WHERE task_status = 'pending'").fetchall()
+            for task in rows:
+                if TaskActionType(task['action_type']) in MANUAL_INTERVENTION_ACTIONS:
+                    continue
+                deadline_text = task['expires_at'] or task['required_by']
+                if not deadline_text or not _deadline_has_passed(datetime.fromisoformat(deadline_text), current):
+                    continue
+                if has_published_responsibility(connection, task['task_id']):
+                    continue
+                connection.execute(
+                    """UPDATE tasks SET task_status = 'expired', updated_at = ?,
+                       result_message = '任务已超过截止时间，系统自动标记为过期。'
+                       WHERE task_id = ?""",
+                    (current.isoformat(), task['task_id']),
+                )
+                close_price_authorizations(connection, task['task_id'], now=current, outcome='EXPIRED')
+                connection.execute(
+                    """INSERT INTO task_status_history VALUES
+                       (?, ?, 'pending', 'expired', ?, ?, 'required_by_deadline_passed', ?)""",
+                    (uuid4().hex[:12], task['task_id'], changed_by, current.isoformat(),
+                     json.dumps({'deadline': deadline_text, 'detected_at': current.isoformat()})),
+                )
+                expired_count += 1
         return expired_count
 
     def change_status(

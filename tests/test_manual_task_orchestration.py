@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -8,7 +9,7 @@ from pathlib import Path
 import pytest
 from openpyxl import Workbook
 
-from app.enums import TaskActionType
+from app.enums import TaskActionType, TaskStatus
 from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.repositories.workbook_repository import (
     PLATFORM_MAPPING_HEADERS,
@@ -407,6 +408,99 @@ def test_exclusion_allows_valid_subset_but_unknown_exclusion_rejects(
     )
     assert unknown.creatable is False
     assert "排除项不属于当前预览" in "".join(unknown.errors)
+
+
+def _decision(service, *, action=SET_PRICE, key='old', grade='A级'):
+    request = ManualTaskRequest(
+        varieties=('艾莎',), grades=(grade,), platforms=(PLATFORM,),
+        action=action, price_value=Decimal('13') if action != SET_OFFLINE else None,
+        target_inventory=20 if action == SET_ONLINE else None, idempotency_key=key,
+    )
+    preview = service.preview(request)
+    result = service.create(request, expected_preview_digest=preview.preview_digest,
+                            authenticated_subject='admin')
+    return result.task_ids[0]
+
+
+@pytest.mark.parametrize('old_action,new_action', [
+    (SET_PRICE, SET_OFFLINE), (SET_OFFLINE, SET_PRICE), (SET_ONLINE, SET_OFFLINE),
+])
+def test_sales_decision_supersedes_unpublished_other_action_atomically(
+    manual_service, old_action, new_action,
+):
+    service, repository, _, _ = manual_service
+    if old_action == SET_ONLINE:
+        _listing(repository, 'AISHA-A-50-Z', 'A级', Decimal('12.00'), 'offline')
+    old = _decision(service, action=old_action)
+    _listing(repository, 'AISHA-A-50-Z', 'A级', Decimal('12.00'), 'online')
+    new = _decision(service, action=new_action, key='new')
+    assert repository.get_task(old).task_status is TaskStatus.CANCELLED
+    assert repository.get_task(new).task_status is TaskStatus.PENDING
+    assert repository.get_task(new).decision_trace['predecessor_task_ids'] == []
+    assert _decision(service, action=new_action, key='new') == new
+    with repository.connect_read() as connection:
+        history = connection.execute('SELECT * FROM task_status_history WHERE task_id = ?', (old,)).fetchall()
+        assert len(history) == 1 and history[0]['to_status'] == 'cancelled'
+        assert connection.execute('SELECT COUNT(*) FROM shadowbot_execution_attempts').fetchone()[0] == 0
+
+
+def test_supersession_history_failure_rolls_back_new_and_old_decisions(manual_service):
+    service, repository, _, _ = manual_service
+    old = _decision(service)
+    with repository.connect_write() as connection:
+        connection.execute("""CREATE TRIGGER fail_supersession BEFORE INSERT ON task_status_history
+            BEGIN SELECT RAISE(ABORT, 'synthetic history failure'); END""")
+    with pytest.raises(sqlite3.IntegrityError, match='synthetic history failure'):
+        _decision(service, action=SET_OFFLINE, key='new')
+    assert repository.get_task(old).task_status is TaskStatus.PENDING
+    assert [t.task_id for t in repository.list_tasks()] == [old]
+
+
+def test_expiry_history_failure_rolls_back_task_transition(manual_service):
+    from app.services.runtime import RuntimeTaskService
+
+    service, repository, _, _ = manual_service
+    old = _decision(service)
+    with repository.connect_write() as connection:
+        connection.execute('UPDATE tasks SET expires_at = ? WHERE task_id = ?',
+                           ((NOW - timedelta(seconds=1)).isoformat(), old))
+        connection.execute("""CREATE TRIGGER fail_expiry BEFORE INSERT ON task_status_history
+            BEGIN SELECT RAISE(ABORT, 'synthetic expiry history failure'); END""")
+    with pytest.raises(sqlite3.IntegrityError, match='synthetic expiry history failure'):
+        RuntimeTaskService(repository).expire_overdue_pending_tasks(now=NOW)
+    assert repository.get_task(old).task_status is TaskStatus.PENDING
+
+
+@pytest.mark.parametrize('terminal', ['success', 'skipped', 'cancelled', 'expired'])
+def test_terminal_history_leaves_current_queue_and_does_not_block_new_decision(manual_service, terminal):
+    from app.operations_web.composition import OperationsWebPaths
+    from app.operations_web.queries import OperationsQueryService
+    from app.services.price_decisions import unresolved_predecessors
+    from app.services.runtime import RuntimeTaskService
+
+    service, repository, products, mappings = manual_service
+    old = _decision(service)
+    runtime = RuntimeTaskService(repository)
+    if terminal == 'expired':
+        with repository.connect_write() as connection:
+            connection.execute('UPDATE tasks SET expires_at = ? WHERE task_id = ?',
+                               ((NOW - timedelta(seconds=1)).isoformat(), old))
+    else:
+        if terminal == 'success':
+            runtime.change_status(task_id=old, to_status=TaskStatus.RUNNING, changed_by='test')
+        runtime.change_status(task_id=old, to_status=TaskStatus(terminal), changed_by='test')
+    query = OperationsQueryService(repository, OperationsWebPaths(
+        runtime_db=repository.db_path, products_workbook=products,
+        platform_mappings_workbook=mappings, price_rules_workbook=products,
+        listing_rules_workbook=products, queue_root=products.parent / 'queue',
+    ), now_provider=lambda: NOW)
+    assert not query.management().pending_task_options
+    assert repository.get_task(old).task_status is TaskStatus(terminal)
+    assert runtime.list_status_history(old)[-1].to_status is TaskStatus(terminal)
+    assert runtime.expire_overdue_pending_tasks(now=NOW) == 0
+    new = _decision(service, action=SET_OFFLINE, key='new')
+    with repository.connect_read() as connection:
+        assert not unresolved_predecessors(connection, new)
 
 
 def _mapping(mapping_id: str, sku: str, product_name: str, grade: str):

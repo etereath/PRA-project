@@ -319,3 +319,27 @@ SKU-A predecessor/UNKNOWN/Review
 - 未核验真实环境项
 
 Reviewer 首轮围绕 2D-01、2D-02 与 AC-01～AC-07 审查，不重新打开 S1/S2 已关闭设计，也不扩展到 S3。
+
+## 15. 本地实现与验证交接（2026-10-03）
+
+基线：同步 `main@9da3392b4a8cc65f6847a58c016f18a1db14da15`，本地 merge commit 为 `69082747e1a111f28f0277366f826b63bf03b816`。保持 Draft；尚未推送，当前实现没有自动 CI URL，不引用上游 CI 作为本轮证明。
+
+生产修改为 `manual_task_orchestration.py`、`price_decisions.py`、`execution_authorization.py`、`operations_web/queries.py` 和 `services/runtime.py`。新增决定与 supersession/history 原子提交；复用 `predecessor_task_ids`，不自动执行后继。`execution_authorization.py` 只调整等待提示适用于全部销售决定。未新增持久字段、状态、表或 Service，未修改 Schema、Queue/Worker 协议或 qualification。
+
+扩展 `services/runtime.py` 的直接依据：原到期服务在事务外读取 PENDING 后直接过期，未检查 publication/operation/attempt/lock；Web Current Queue 又绕开了这个已有服务。现在由原 `RuntimeTaskService.expire_overdue_pending_tasks()` 在一个写事务中核验并记录 EXPIRED/history，关闭未发布 continuation；已有 workflow 到期入口及 Web 当前任务读取触发，失败整笔回滚，下次读取/既有 workflow 再处理。已发布对象仍交由原执行、对账与人工恢复 owner，不能仅因超时结束责任。
+
+测试仅扩展现有临时 Runtime 与真实 Queue/Worker/Importer 夹具；新用例防止跨动作新决定丢失、错误取消已发布责任、到期与历史不原子，以及 UNKNOWN 关闭后强迫重建后继。没有新增测试框架。
+
+| AC | 生产路径 | 测试函数 / 当前证据 |
+|---|---|---|
+| AC-01 | Manual create → Task insert → record_price_supersession → close_price_authorizations | `test_sales_decision_supersedes_unpublished_other_action_atomically`；`test_offline_supersession_or_expiry_closes_unpublished_handoff`；原子失败由 `test_supersession_history_failure_rolls_back_new_and_old_decisions` 覆盖 |
+| AC-02 | 同事务保存 predecessor → ExecutionAuthorization._revalidate | `test_offline_decision_preserves_published_price_and_expiry_cannot_end_it` 已通过；UNKNOWN 分支在 AC-03 中已走过保存及授权拒绝 |
+| AC-03 | S1 resolve → historical UNKNOWN 保留 → 原后继正常 v5 prepare/submit | `test_saved_offline_decision_authorizes_after_unknown_close_without_recreation` 经用户授权追加复跑通过；原已保存下架决定经正式 v5 publisher 投递到隔离测试队列，旧批次仍为 UNKNOWN |
+| AC-04 | ordinary listing READ_ONLY → Worker → Importer | 既有 `test_web_human_closure_restart_and_new_authorized_price` 本轮通过；AC-03 也复用相同 scan 路径 |
+| AC-05 | ExecutionAuthorization Review action scope | 既有 `test_update_price_ignores_other_action_review_but_blocks_own_review` 本轮通过 |
+| AC-06 | 正式 Task transition / 事务到期 → Current Queue pending 查询 | `test_terminal_history_leaves_current_queue_and_does_not_block_new_decision` 四种终态通过；`test_expiry_history_failure_rolls_back_task_transition` 通过；既有 Runtime 两个到期用例通过 |
+| AC-07 | SKU/platform predecessor 查询与现有授权范围 | AC-03 旅程内 SKU-B 决定可保存并独立 prepare；使用现有改价事实，经用户授权追加复跑通过 |
+
+本轮限定四个测试文件：`test_manual_task_orchestration.py`、`test_execution_authorization.py` 的直接测试，`test_price_execution_resolution.py` 四个旅程，以及 `test_runtime_persistence.py` 两个到期用例。首轮 31 passed / 2 failed（53.62 秒）；第一次定向重跑 2 passed / 1 failed（21.17 秒）；新增到期回滚用例 1 passed（1.26 秒）；补充到期交接 outcome 断言后该用例 1 passed（2.47 秒）。首次失败为新增夹具的观察来源标识及固定时钟，第二次失败为 SKU-B 没有 v5 所需扫描；均保留失败记录。用户明确允许追加复跑后，执行 `python -m pytest -q tests/test_price_execution_resolution.py::test_saved_offline_decision_authorizes_after_unknown_close_without_recreation --tb=short --no-header`，结果 1 passed（19.13 秒），AC-03/07 待验证项已关闭。当前为 LOCAL IMPLEMENTED / TARGETED PASS；没有完整 pytest、完整 smoke、全仓静态检查或主动 CI 重跑，定向结果不替代完整 Gate。目标文件 Ruff、严格 UTF-8 与 diff 检查通过。
+
+真实 Runtime、真实平台、部署和小程序未验证；合成适配器及临时目录证据不能替代实机证据。后续固定实现 Head 与自动 CI 以获准推送后的 PR 为准。

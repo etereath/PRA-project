@@ -71,7 +71,7 @@ from app.services.notification_outbox import (
     NOTIFICATION_TYPE_TITLES,
     REVIEW_TYPE_LABELS,
 )
-from app.services.runtime import ReviewTokenService, TERMINAL_TASK_STATUSES
+from app.services.runtime import ReviewTokenService, RuntimeTaskService, TERMINAL_TASK_STATUSES
 from app.services.shadowbot_worker_health import (
     build_shadowbot_worker_health_report,
 )
@@ -1351,6 +1351,7 @@ class OperationsQueryService:
     ) -> TableReadModel:
         try:
             if pending_only:
+                RuntimeTaskService(self.runtime).expire_overdue_pending_tasks(now=self._now())
                 values = self.runtime.list_tasks(
                     status=TaskStatus.PENDING,
                     limit=page_size + 1,

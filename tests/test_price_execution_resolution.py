@@ -31,7 +31,8 @@ from app.enums import TaskStatus
 from app.exceptions import ValidationError
 from app.operations_web.auth import Principal, Capability
 from app.services.price_execution_resolution import PriceExecutionResolutionApplicationService
-from app.services.execution_authorization import ExecutionAuthorizationConflict
+from app.services.execution_authorization import ExecutionAuthorizationBlocked, ExecutionAuthorizationConflict
+from app.services.manual_task_orchestration import ManualTaskRequest
 from app.services.listing_scan_quality import ListingScanQuality
 from app.services.shadowbot_executor import (
     ShadowBotFileQueueRunner,
@@ -357,6 +358,104 @@ def test_historical_result_is_not_classified_from_current_price(unknown, monkeyp
     assert result['historical_side_effect'] == 'UNKNOWN'
     assert result['conclusion'] == 'OLD_ONE_SHOT_TERMINATED'
     assert unknown.j.runtime.get_task(unknown.old).task_status is TaskStatus.SKIPPED
+
+
+def offline_decision(j, key='offline', grade='A级'):
+    request = ManualTaskRequest(varieties=('艾莎',), grades=(grade,), platforms=(seed.PLATFORM,),
+                                action='SET_OFFLINE', idempotency_key=key)
+    preview = j.manual.preview(request)
+    return j.manual.create(request, expected_preview_digest=preview.preview_digest,
+                           authenticated_subject='admin').task_ids[0]
+
+
+def test_saved_offline_decision_authorizes_after_unknown_close_without_recreation(unknown, monkeypatch):
+    from app.services.shadowbot_listing_action_pipeline import (
+        propose_listing_action_batch, publish_listing_action_batch,
+    )
+    u, j = unknown, unknown.j
+    j.manual.clock = j.service.clock = lambda: datetime.now(UTC)
+    old_task = j.runtime.get_task(u.old)
+    new = offline_decision(j)
+    assert j.runtime.get_task(u.old) == old_task
+    assert j.runtime.get_task(new).decision_trace['predecessor_task_ids'] == [u.old]
+    with pytest.raises(ExecutionAuthorizationBlocked, match='尚未收口'):
+        j.service.prepare_execution(seed._admin(), [new], 'offline-auth')
+    sibling_request = ManualTaskRequest(
+        varieties=('艾莎',), grades=('B级',), platforms=(seed.PLATFORM,),
+        action='SET_PRICE', price_value=Decimal('10'), idempotency_key='sibling',
+    )
+    sibling_preview = j.manual.preview(sibling_request)
+    sibling = j.manual.create(sibling_request, expected_preview_digest=sibling_preview.preview_digest,
+                               authenticated_subject='admin').task_ids[0]
+    j.service.v5_propose = propose_listing_action_batch
+    assert j.service.prepare_execution(seed._admin(), [sibling], 'sibling-auth').task_ids == (sibling,)
+    # Ordinary READ_ONLY goes through the file Worker while UNKNOWN is parked.
+    scan(u, monkeypatch)
+    u.service.resolve(reviewer(), **request_for(u))
+    assert j.runtime.get_task(new).task_status is TaskStatus.PENDING
+    with j.runtime.connect_read() as connection:
+        assert connection.execute('SELECT status FROM shadowbot_commit_batches WHERE batch_id = ?',
+                                  (u.batch,)).fetchone()[0] == 'UNKNOWN'
+    prepared = j.service.prepare_execution(seed._admin(), [new], 'offline-auth')
+    assert prepared.task_ids == (new,)
+    assert j.runtime.get_task(u.old).task_status is TaskStatus.SKIPPED
+    j.service.v5_publish = publish_listing_action_batch
+    submitted = j.service.submit_execution(seed._admin(), [new], prepared.confirmation_digest, 'offline-auth')
+    assert submitted.outcome == 'DISPATCHED'
+    assert submitted.task_ids == (new,)
+    with j.runtime.connect_read() as connection:
+        assert connection.execute('SELECT status FROM shadowbot_commit_batches WHERE batch_id = ?',
+                                  (u.batch,)).fetchone()[0] == 'UNKNOWN'
+
+
+def test_offline_decision_preserves_published_price_and_expiry_cannot_end_it(journey):
+    from app.services.runtime import RuntimeTaskService
+    j = journey
+    old = decide(j)
+    accepted = accept(j, old)
+    coordinator, importer, watchdog = rebuild(j)
+    run_cycle(importer, watchdog, coordinator=coordinator)
+    old_task = j.runtime.get_task(old)
+    with j.runtime.connect_read() as connection:
+        before = dict(connection.execute('SELECT * FROM shadowbot_commit_batches WHERE batch_id = ?',
+                                         (accepted.batch_id,)).fetchone())
+    new = offline_decision(j)
+    assert j.runtime.get_task(old) == old_task
+    with j.runtime.connect_read() as connection:
+        assert dict(connection.execute('SELECT * FROM shadowbot_commit_batches WHERE batch_id = ?',
+                                       (accepted.batch_id,)).fetchone()) == before
+    with pytest.raises(ExecutionAuthorizationBlocked, match='尚未收口'):
+        j.service.prepare_execution(seed._admin(), [new], 'offline-auth')
+    with j.runtime.connect_write() as connection:
+        connection.execute('UPDATE tasks SET expires_at = ? WHERE task_id = ?',
+                           ((seed.NOW - timedelta(seconds=1)).isoformat(), old))
+    assert RuntimeTaskService(j.runtime).expire_overdue_pending_tasks(now=seed.NOW) == 0
+    assert j.runtime.get_task(old).task_status == old_task.task_status
+
+
+def test_offline_supersession_or_expiry_closes_unpublished_handoff(journey):
+    from app.services.runtime import RuntimeTaskService
+    j = journey
+    old = decide(j)
+    accept(j, old)
+    offline_decision(j)
+    assert j.runtime.get_task(old).task_status is TaskStatus.CANCELLED
+    coordinator, importer, watchdog = rebuild(j)
+    assert not run_cycle(importer, watchdog, coordinator=coordinator)
+    assert not list(j.service.queue_root.glob('inbox/*.ready.json'))
+    next_price = decide(j, '14', 'next-price')
+    accept(j, next_price, 'next-auth')
+    with j.runtime.connect_write() as connection:
+        connection.execute('UPDATE tasks SET expires_at = ? WHERE task_id = ?',
+                           ((seed.NOW - timedelta(seconds=1)).isoformat(), next_price))
+    assert RuntimeTaskService(j.runtime).expire_overdue_pending_tasks(now=seed.NOW) == 1
+    assert j.runtime.get_task(next_price).task_status is TaskStatus.EXPIRED
+    with j.runtime.connect_read() as connection:
+        assert connection.execute("""SELECT c.outcome FROM execution_continuations c
+            JOIN shadowbot_commit_batch_items i ON i.batch_id = c.batch_id
+            WHERE i.source_task_id = ?""", (next_price,)).fetchone()[0] == 'EXPIRED'
+    assert not run_cycle(importer, watchdog, coordinator=coordinator)
+    assert not list(j.service.queue_root.glob('inbox/*.ready.json'))
 
 
 def test_explicit_not_published_boundary_allows_incomplete_reconcile_but_timeout_does_not(
