@@ -1,212 +1,321 @@
-# Task 13.7-2D — Queue Operational Continuity
+# Task 13.7-2D — Queue Operational Continuity Lite
 
 ## 1. Goal
 
-实现 Issue #51 已冻结的 Queue Operational Continuity 原则，使旧 Task、Review、UNKNOWN、历史失败和局部数据异常只阻断能够证明存在真实事故风险的最小经营范围，并复用 13.7-1 已验证的 Human Authorization / durable continuation / Coordinator / v4-v5 / Queue / Worker / Importer / RECONCILE 基线。
+在已合并 #54、#58（S1）和 #59（S2）的基础上，本任务只解决两个仍存在的经营连续性问题：
 
-本任务依赖 Task 13.7-2A 的 authority/blocker contract，并优先复用 Task 13.7-2B 的 Runtime Product/Mapping authority、Task 13.7-2C 的 qualified observation interface。
+1. 新的有效人工销售决定必须先被记录，不能因为同 SKU / 平台存在旧开放 Task 就在创建阶段 blanket 拒绝。
+2. 已经结束当前经营责任的历史对象必须退出 Current Queue / blocker 语义，保留完整历史但不继续占据当前经营资格。
 
-## 2. Dependency Gate
+一句话目标：
 
-- 2A 未接受：只允许现状审计/测试设计，不先改 global blocker policy。
-- 2B 未完成：Queue-OPS-01/03/04 可在不绑定新 mapping Schema 的部分先做，但最终 identity gate 必须接 current authority。
-- 2C 未完成：Queue-OPS-02R 只能做接口/fixture，不能用临时扫描 stub 伪造 stage completion。
+> 任何新的有效人工销售决定都必须能够先保存；旧执行只在其真实副作用责任范围内阻止新执行，旧责任正式结束后新决定自然恢复资格；历史对象继续留存，但不继续拥有当前经营 blocker 权力。
 
-## 3. Scope
+本任务不重新设计 UNKNOWN、Authorization、Queue 或 Review。S1/S2 已完成的减法作为现役基线复用。
 
-### Queue-OPS-01 — New Human Decision Must Survive Old Open Task
+## 2. 开工基线
 
-当前旧逻辑仍可能出现：同 SKU+platform 有开放 `update_price/set_online/set_offline` Task → 拒绝新的非价格 Human decision。
+开始编码前：
 
-目标：
+1. 读取当前根 AGENTS.md 与 docs/owner_product_boundary.md。
+2. 将本 PR 分支同步到最新 main。规划冻结时 main 为 9da3392b4a8cc65f6847a58c016f18a1db14da15（PR #59 merge）。
+3. 以同步后的实际 main 为代码真值，不从本计划恢复旧实现。
+4. 保持 PR Draft；不 merge、不部署、不执行真实平台写。
 
-```text
-new Human decision / Task recorded first
-        ↓
-old work has not crossed side-effect boundary
-        → supersede / cancel old responsibility
-old work has crossed side-effect boundary
-        → keep new decision, wait for narrow closure
-        → re-evaluate against current platform fact
-```
+Task Type：Integration / Bugfix
+Review Profile：R3
 
-要求：
+本轮不改变 authority、Runtime Schema、Queue protocol、Worker protocol 或平台事实定义。
 
-- “已有开放 Task”只能是 scheduling condition，不是 blanket decision rejection；
-- 风险降低动作（尤其 SET_OFFLINE）不得仅因无副作用历史 pending UPDATE_PRICE 被拒绝；
-- 已提交/ACTIVE/UNKNOWN 的旧执行仍按副作用边界收口，不允许新决定导致第二次不安全写。
+## 3. 已完成能力，不重复施工
 
-### Queue-OPS-02R — Qualified Observation Auto-Closure
+以下旧 #55 内容已经由 #54 / S1 / S2 完成或收缩，本 PR 只做直接回归：
 
-保留现有唯一 RECONCILE。RECONCILE 无法确定历史副作用后，普通 READ_ONLY 继续产生当前事实。
+- Qualified Observation 已进入正式 current fact。
+- UNKNOWN 可在唯一 RECONCILE 后停放，同时 ordinary READ_ONLY 可以继续。
+- S1 已提供 stopped UNKNOWN 的安全人工零写终止。
+- S2 已将 UPDATE_PRICE 的 Review blocker 收窄到相关 Task / same SKU + same action。
+- S2 已解除纯 UPDATE_PRICE 对无关 Inventory maintenance 的依赖。
+- S2 已删除正常路径 resolution_only continuation。
+- S2 已把 authorization business identity 与执行期事实重新验证分离。
+- S2 已停止静默修改旧 one-shot 的 expected_old_price。
 
-当同时满足：
+不要为这些能力再创建第二套实现。
 
-- 原 execution 已有可证明 stopped boundary；
-- 无 STARTING/RUNNING attempt；
-- 无 submit 正在发生；
-- qualified observation 明确晚于 stopped boundary；
-- platform/account/SKU identity 唯一匹配；
-- observation 满足 2C qualification；
-- 无其他真实活动写责任；
+## 4. Scope A — 2D-01 New Human Decision Admission / Supersession
 
-允许自动结束旧 one-shot responsibility。
+### 4.1 当前已证实问题
 
-Owner 已冻结：
+当前 ManualTaskApplicationService._preview_on_connection() 仍会把同 SKU + platform 的开放 UPDATE_PRICE / SET_ONLINE / SET_OFFLINE 投影成 open_identities，并对非价格动作直接加入“该商品与平台已有开放任务”。
 
-```text
-new qualified READ_ONLY current != old target
-→ old one-shot decision = terminal / stale
-→ do not retry / do not continue old write
-→ historical side-effect remains UNKNOWN
-→ release current write blocker
-→ future decision is newly created and normally authorized
-```
+因此仍可能出现：
 
-`current == target` 也可以结束旧 responsibility，只表示当前目标满足，不反推历史 click 因果。
+旧 UPDATE_PRICE pending
+→ 管理者形成新的 SET_OFFLINE
+→ 新决定在创建 Task 前被拒绝
 
-禁止把普通 READ_ONLY 直接改写成旧 operation `VERIFIED/NOT_APPLIED` 历史事实。
+这违反现役合同“新有效 Intent / Task 先记录，旧 Task 只影响 scheduling / execution”的原则。
 
-### Queue-OPS-03 — Review Must Be Action-scoped
+### 4.2 目标行为
 
-统一使用现有 `blocked_actions` / review context/action gate 思路：
+new Human Decision
+→ persist new Task first
+→ evaluate old responsibility
 
-- Review 只阻断它声明的 action；
-- malformed/scope 不可信可以 fail closed，但只扩大到能证明必要的最小范围；
-- 不得“同 SKU+platform 任意 pending Review → 三种销售写全挡”；
-- 不新增平行 Review 状态机。
+旧工作尚未跨副作用边界：
 
-### Queue-OPS-04 — Current Queue vs History
+old pending + no published/active side-effect responsibility
+→ old Task cancelled/superseded
+→ new Task remains PENDING
+→ zero old platform write
 
-Current Queue 只包含仍承担当前经营责任的对象。
+旧工作已经跨副作用边界：
 
-- expired / cancelled / safely terminated / completed Task 保留完整 history，但退出 current work surface；
-- 历史 pending 若已超过 TTL 或已具备安全终止证据，应通过正式 service 收口；
-- 不允许直接 SQL 清队列；
-- Operations Web 可选择性复用 `a3485af` 的 TaskQueueReadModel/Query/Presenter/UI，但 current responsibility 由当前 main 领域状态决定。
+old QUEUED / RUNNING / UNKNOWN / RECONCILE / active write responsibility
+→ preserve old execution/history
+→ persist new Task
+→ new Task waits behind narrow predecessor/write responsibility
+→ after old responsibility closes, new Task can be prepared normally
 
-## 4. Global Queue Blocker Whitelist
+禁止：
 
-未经新的 Owner/Reviewer 裁决，只允许：
+- 删除或假装取消已经可能产生副作用的旧 execution。
+- 因旧 execution 未结束而拒绝记录新的经营决定。
+- 自动执行新 Task。
+- 自动把新 Task 的目标写回旧 Task。
+- 为此新建 Intent 表、dependency 表或 blocker 表。
 
-1. GQB-1 Platform-level Critical Business Risk；
-2. GQB-2 Observation Blindness；
-3. GQB-3 Critical Control Plane Failure；
-4. GQB-4 Side-effect / Identity Integrity Failure。
+### 4.3 优先复用
 
-### Global block 默认仍允许
+优先复用：
 
-- READ_ONLY Observation；
-- Recovery Calibration；
-- unique RECONCILE；
-- Health / diagnostics；
-- necessary human verification；
-- 已证明安全的恢复动作。
+- tasks / Task history
+- decision_trace.predecessor_task_ids
+- record_price_supersession()
+- unresolved_predecessors()
+- operation / attempt / write lock / continuation
+- 现有 cancel / expire / supersede service
 
-### 默认不得升级 global 的对象
+允许对 app/services/price_decisions.py 做窄扩展，但不要发展成通用 workflow graph。
 
-- 单 SKU UNKNOWN / Review / mapping ambiguity；
-- 单 Task failed/expired；
-- OLD_PRICE_CHANGED / submit 前 NOT_STARTED；
-- historical pending；
-- 单 SKU observation incomplete；
-- 单次 READ_ONLY failure；
-- 单 continuation / Worker request failure；
-- 单 SKU Inventory/Exposure 数据异常；
-- historical audit unresolved。
+## 5. Scope B — 2D-02 Current Responsibility vs History
 
-## 5. Legacy Assets to Salvage Carefully
+Current Queue / current blocker 只由仍承担当前经营责任的对象组成。
 
-可复用：
+以下终态继续保留完整历史，但不得继续作为当前经营 blocker：
 
-- `a3485af` Task Queue Read Model / filter / presenter/UI；
-- structured `ExecutionQueueBlocked` context/notification pattern；
-- Review reason 展示翻译层；
-- batch cancellation 的 UI/事务/history 形式；
-- per-item task controls（若当前范围需要）。
+- SUCCESS
+- SKIPPED
+- CANCELLED
+- EXPIRED
+- 已具备正式安全终止语义的 terminal failure
 
-不得复用旧 policy：
+当前 Operations Web 已通过 list_tasks(status=PENDING) 形成当前任务列表，因此：
 
-- create Task 后自动 prepare+submit；
-- `PENDING/FAILED` status alone 决定可取消；
-- Queue 文件无法完整核对就 blanket 禁止所有取消；
-- 人工直接声明 TARGET_APPLIED/TARGET_NOT_APPLIED 作为当前标准机器 closure；
-- pending Review blanket block；
-- Inventory DB_AUTHORITY/balance blanket block。
+- 不从历史分支引入新的 TaskQueueReadModel 体系。
+- 不新增 current_responsibility 字段或 CurrentQueue 表。
+- 不通过 UI 过滤掩盖仍为 pending 的数据库对象。
+- 需要退出 current responsibility 时，复用正式 Task transition / cancel / expire / supersede。
 
-## 6. Structured Blocker Contract
+重点检查 pending Task 已超过 expires_at 时，是否能由已有正式 owner 收口为 EXPIRED 并退出 blocker，而不是只在页面隐藏。
 
-建议保留 typed blocker/context，但作用域由当前 policy 决定。至少可表达：
+## 6. 只做回归、不新增实现的能力
 
-```text
-blocker_type
-scope_level
-platform_name
-account_id
-internal_sku
-blocked_actions
-source_task / operation / review / observation refs
-reason_code
-recovery_actions_allowed
-automatic_release_condition
-owner
-```
+### AC-03 dependency: S1 closure restores eligibility
 
-不要为了这个结构新建独立 blocker 状态机；优先从现有 Task/Review/lock/continuation/Automation/Health 事实投影。
+证明同一正式 Runtime：
 
-## 7. Global Blocker Proposal Gate
+old UNKNOWN
+→ S1 zero-write human close
+→ historical UNKNOWN preserved
+→ old one-shot current responsibility closed
+→ previously saved new Task can prepare/authorize normally
 
-除 GQB-1～4 外，Codex 若准备新增能够阻断无关 SKU/action、整个 platform/account、READ_ONLY 或其他共享范围的 blocker，必须停止施工并先报告：
+如果已经保存的新 Task 可以继续，不要求用户再创建第三个 Task。
 
-```text
-Trigger
-Concrete accident if not blocked
-Affected platform/account
-Why smaller scope is insufficient
-Exactly what is blocked
-Recovery/read-only still allowed
-Automatic release condition
-Human recovery path
-Maximum expected blocking duration
-Tests proving unrelated work remains available
-```
+### UNKNOWN READ_ONLY
 
-未经明确接受不得实现第五类 global blocker。
+证明单 SKU UNKNOWN / MANUAL_REVIEW 不阻止 ordinary listing READ_ONLY。
 
-## 8. Explicit Non-goals
+不要新增 UNKNOWN auto-closure。
 
-- 不实现 Queue-OPS-05 Exposure/Inventory 解耦；后续 SET_ONLINE/Exposure 切片单独处理；
-- 不重写 Coordinator；
-- 不新增第二 Queue、dispatcher、daemon；
-- 不改 Current Sales Commitment / Closing / Supply authority；
-- 不实现 purchase_sequence；
-- 不新增自动 Sales Agent；
-- 不用本任务重新设计 Product/Mapping Schema（服从 2B）；
-- 不执行未经单独授权的真实平台写。
+### Review action scope
 
-## 9. Verification
+证明 unrelated Review 不单独阻断 UPDATE_PRICE；现有 same-SKU write responsibility / write lock 仍按真实风险阻断。
 
-至少证明：
+### Sibling isolation
 
-1. 单 SKU UNKNOWN 不阻止其他 SKU Human decision；
-2. UNKNOWN 停放期间 ordinary READ_ONLY 可继续；
-3. stopped UNKNOWN + 2C qualified observation 能结束旧 one-shot responsibility，historical side-effect 不被改写；
-4. `current != target` 时旧决定 terminal，不自动重试，随后新决定可正常预览/授权；
-5. Review 只阻断声明的 action；
-6. 无副作用旧 pending 不阻止新的风险降低 Human decision；
-7. terminal/expired/safely-terminated Task 不再占据 Current Queue；
-8. GQB 不阻止明确允许的 Recovery READ_ONLY；
-9. 单 continuation/Worker request 异常不拖垮 sibling work / Importer / Watchdog / Review / Outbox；
-10. account/platform blocker 默认不传播到另一个 account/platform；
-11. UNKNOWN、已提交、active side-effect responsibility 仍保持 fail closed；
-12. Windows/Linux Core CI green。
+SKU-A 的 predecessor / UNKNOWN / Review 不得无理由阻止 SKU-B 的新决定和安全操作。
 
-## 10. Deliverables
+## 7. 明确取消的旧 #55 施工内容
 
-- Queue-OPS-01/02R/03/04 implementation；
-- Current Queue read model/workbench 最小更新；
-- structured blocker projection/notification（若确有必要）；
-- developer-facing business contract / responsibility / workflow 更新；
-- Issue #51 验收矩阵逐项对应测试；
-- selective salvage 记录：从 `a3485af` 复用了什么、拒绝了什么；
-- 不把 Queue-OPS-05 或后续 Exposure work 偷带入本 PR。
+### 7.1 Queue-OPS-02R 自动 UNKNOWN closure
+
+取消施工。
+
+S1 的“stopped boundary + qualified observation + 任一有权限管理员一次零写终止”已经满足当前家庭农场规模。
+
+只有未来真实使用证明人工处置频率成为明确运营负担时，才重新评估自动 closure。
+
+### 7.2 Global Queue Blocker framework
+
+Issue #51 的最小 blocker 原则继续作为治理约束，但本 PR：
+
+- 不实现 GQB Service。
+- 不新增 typed blocker framework。
+- 不新增 blocker 状态机。
+- 不新增 global blocker persistence。
+- 不使用 account_id blocker scope。
+- 不实现多平台 blocker propagation。
+
+如果实现中发现 Task/SKU/action 范围无法避免一个具体当前事故，先报告 Boundary Conflict / blocker proposal，不直接扩建。
+
+### 7.3 Structured Blocker Contract
+
+旧计划中的 blocker_type、scope_level、account_id、recovery_actions_allowed、automatic_release_condition、owner 等结构不施工。
+
+如 UI 需要 blocker 原因，优先投影既有 Task / Review / lock / operation 事实，不增加持久模型。
+
+## 8. 近期残留复杂度的处理
+
+### OD-58-RESID-01
+
+PriceExecutionResolutionApplicationService.is_resolved() 仍要求固定 price_execution_human_resolved history。
+
+本 PR 默认不改。只有定向旅程实际证明“责任已正式结束，但该历史格式使新决定继续被 blocker”时，才作为 2D 直接修复；否则留后续 retirement。
+
+### OD-59-RESID-01
+
+execution_profile / queue_root / applet_uri_sha256 仍属于旧 continuation context。
+
+本 PR不改、不扩散，不得升级成环境身份认证、page/session identity 或新 blocker。
+
+### OD-59-COMPAT-01
+
+legacy resolution_only guards 继续保留 pre-S2 envelope 防写兼容。本 PR 不删除。
+
+## 9. 预计生产改动范围
+
+优先限制在：
+
+- app/services/manual_task_orchestration.py
+- app/services/price_decisions.py
+
+只有实际断点证明需要时才修改：
+
+- app/services/execution_authorization.py
+- app/operations_web/queries.py
+
+原则上本 PR 不应修改：
+
+- app/runtime_schema.py
+- app/services/shadowbot_queue.py
+- shadowbot/test2/shadowbot_queue_worker.py
+- app/shadowbot_contract_primitives.py
+- app/services/listing_scan_quality.py
+
+若认为必须触及这些区域，先在 PR 说明：
+
+> 当前 2D 的哪个具体事故无法由现有 Task / predecessor / operation / write-lock / continuation 机制解决？
+
+在得到明确依据前不要扩张。
+
+## 10. 冻结验收情景
+
+### AC-01 — old pending replaced by new risk-reducing decision
+
+old pending UPDATE_PRICE
++ new SET_OFFLINE
+→ new Task created
+→ replaceable old Task formally cancelled/superseded
+→ zero old platform write
+
+### AC-02 — old side-effect responsibility does not reject new decision
+
+old UPDATE_PRICE RUNNING/UNKNOWN
++ new SET_OFFLINE
+→ new Task still created
+→ old execution/history unchanged
+→ new Task cannot execute until relevant old responsibility closes
+
+### AC-03 — closure restores eligibility
+
+old UNKNOWN
+→ S1 human zero-write close
+→ historical UNKNOWN preserved
+→ previously saved new Task can prepare/authorize
+
+### AC-04 — UNKNOWN does not block READ_ONLY
+
+single-SKU UNKNOWN
+→ listing READ_ONLY succeeds
+
+### AC-05 — Review stays action-scoped
+
+SET_OFFLINE-only Review
+→ UPDATE_PRICE not blocked by that Review alone
+
+### AC-06 — terminal history does not own Current Queue
+
+SKIPPED / CANCELLED / EXPIRED / SUCCESS
+→ remains in history
+→ absent from current responsibility/blocker
+
+### AC-07 — sibling SKU isolation
+
+SKU-A predecessor/UNKNOWN/Review
+→ does not block SKU-B decision
+
+## 11. Verification Budget
+
+开发阶段：
+
+- 只运行修改模块和上述直接旅程。
+- 优先扩展现有 test_manual_task_orchestration.py、价格 journey / authorization fixtures。
+- 不因本计划重跑 #54/S1/S2 全量测试。
+- 不主动运行完整 pytest、完整 smoke、全仓 Ruff 或重复 CI，除非用户明确授权或 AGENTS 的扩大验证门禁被触发。
+
+推送后由 GitHub 自动触发的 Core CI 可读取作为 Merge Gate；不要主动重跑已绿的同 Head CI。
+
+## 12. Explicit Non-goals
+
+本 PR 不做：
+
+- UNKNOWN 自动 closure
+- 新 Global Queue Blocker framework
+- account_id / session / page identity
+- 新表、Schema migration、CurrentQueue 表
+- 第二 Queue、dispatcher、daemon
+- Queue stop-fence 泛化
+- 新 recovery state machine
+- Exposure / SET_ONLINE 库存语义整改
+- Closing / Supply / Commitment
+- Product/Mapping migration retirement
+- S3 工程退役
+- 微信小程序
+- 第二平台实现
+- Agent Sales Controller
+- 部署或真实平台操作
+
+## 13. Deliverables
+
+1. 2D-01 decision admission / narrow supersession implementation。
+2. 2D-02 current responsibility cleanup，仅在现有机制确有断点时做最小修改。
+3. AC-01～AC-07 的定向测试 / 直接回归。
+4. PR 正文记录实际复用、修改路径、测试结果与未验证项。
+5. 若发现范围外结构性问题，记录后停止扩张，不顺手建设新框架。
+
+## 14. Review Handoff
+
+提交审核时给出：
+
+- 固定 Head SHA
+- 实际 changed files
+- 每个 AC 对应的生产路径和测试函数
+- 是否新增任何持久字段/状态/Service（预期为否）
+- 定向测试结果
+- 自动 CI URL / Windows / Linux 状态（若已触发）
+- 明确未执行 merge、deployment、real platform operation
+- 未核验真实环境项
+
+Reviewer 首轮围绕 2D-01、2D-02 与 AC-01～AC-07 审查，不重新打开 S1/S2 已关闭设计，也不扩展到 S3。
