@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import hashlib
@@ -27,6 +28,7 @@ from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.operational_time import OperationalTimeService
 from app.services.automation import AutomationExecutionContext
 from app.services.listing_automation_runtime import ListingStatusScanHandler
+from app.services.listing_scan_quality import ListingScanQualityService
 from app.services.product_mapping import compile_product_mapping_rows
 from app.services.runtime_master_data import RuntimeMappingSnapshot
 from app.services.shadowbot_listing_action_contract import (
@@ -1030,19 +1032,11 @@ class _ListingRuntimeTransport:
         return archive_dir
 
 
-@pytest.mark.parametrize(
-    ("archive_fails", "expected_status", "expected_ack"),
-    [
-        (False, AutomationRunStatus.SUCCESS, "WRITTEN"),
-        (True, AutomationRunStatus.PARTIAL, "FAILED"),
-    ],
-)
-def test_listing_automation_uses_formal_read_only_pipeline_and_separates_archive(
+def _listing_runtime_case(
     tmp_path: Path,
-    archive_fails: bool,
-    expected_status: AutomationRunStatus,
-    expected_ack: str,
-) -> None:
+    *,
+    archive_fails: bool = False,
+):
     repository = _repository(tmp_path)
     automation = AutomationRepository(repository)
     now = datetime.now(UTC)
@@ -1174,14 +1168,31 @@ def test_listing_automation_uses_formal_read_only_pipeline_and_separates_archive
         master_data=_ListingRuntimeMasterData(mappings),
         applet_uri="weixin://launchapplet/test",
     )
+    return repository, child_run, context, handler, transport
 
+
+@pytest.mark.parametrize(
+    ("archive_fails", "expected_status", "expected_ack"),
+    [
+        (False, AutomationRunStatus.SUCCESS, "WRITTEN"),
+        (True, AutomationRunStatus.PARTIAL, "FAILED"),
+    ],
+)
+def test_listing_automation_uses_formal_read_only_pipeline_and_separates_archive(
+    tmp_path: Path,
+    archive_fails: bool,
+    expected_status: AutomationRunStatus,
+    expected_ack: str,
+) -> None:
+    repository, child_run, context, handler, transport = _listing_runtime_case(
+        tmp_path,
+        archive_fails=archive_fails,
+    )
     outcome = handler(child_run, context)
 
     assert outcome.status is expected_status
     assert outcome.event_payload["platform_write_performed"] is False
-    assert outcome.event_payload["delivery_archive_healthy"] is (
-        not archive_fails
-    )
+    assert outcome.event_payload["delivery_archive_healthy"] is (not archive_fails)
     assert transport.wait_callback is None
     with repository.connect_read() as connection:
         observation = connection.execute(
@@ -1202,3 +1213,92 @@ def test_listing_automation_uses_formal_read_only_pipeline_and_separates_archive
         ).fetchone()
     assert tuple(observation) == ("ACCEPTED", 1, 1)
     assert receipt["ack_state"] == expected_ack
+    quality = ListingScanQualityService(
+        repository,
+        master_data=handler.master_data,
+        clock=lambda: datetime(2026, 7, 25, 3, 10, tzinfo=UTC),
+    ).latest(platform_name=PLATFORM, internal_sku="SKU-ONLINE-001")
+    assert quality.operating_fact_qualified, quality.fact_reason_codes
+    assert "AUTOMATION_LIFECYCLE_PENDING" in quality.delivery_reason_codes
+    if archive_fails:
+        assert "EVIDENCE_ACK_FAILED" in quality.delivery_reason_codes
+
+
+@pytest.mark.parametrize(
+    "failure_stage", ["mapping", "locator", "context", "input_manifest", "callback"]
+)
+def test_listing_prepublication_failure_closes_batch_and_allows_fresh_retry(
+    tmp_path,
+    monkeypatch,
+    failure_stage,
+):
+    repository, run, context, handler, transport = _listing_runtime_case(tmp_path)
+
+    def fail(*args, **kwargs):
+        raise ValueError("injected pre-publication failure")
+
+    with monkeypatch.context() as patch:
+        if failure_stage == "mapping":
+            patch.setattr(handler.master_data, "mapping_snapshot", fail)
+        elif failure_stage == "locator":
+            patch.setattr(
+                "app.services.listing_automation_runtime._validate_locator_binding",
+                fail,
+            )
+        elif failure_stage == "context":
+            patch.setattr(
+                handler.master_data,
+                "snapshot",
+                replace(
+                    handler.master_data.snapshot,
+                    mapping_snapshot_sha256="invalid",
+                ),
+            )
+        elif failure_stage == "input_manifest":
+            patch.setattr(AutomationExecutionContext, "bind_input_manifest", fail)
+        else:
+            original = transport.set_wait_callback
+            patch.setattr(
+                transport,
+                "set_wait_callback",
+                lambda callback: fail() if callback else original(None),
+            )
+        with pytest.raises(ValueError):
+            handler(run, context)
+
+    with repository.connect_read() as connection:
+        batch = connection.execute(
+            "SELECT status, execution_attempt_id FROM shadowbot_listing_action_batches WHERE batch_id = ?",
+            ("LISTING-BATCH-" + run.run_id,),
+        ).fetchone()
+        assert batch["status"] == "FAILED"
+        assert not batch["execution_attempt_id"]
+        assert (
+            connection.execute(
+                "SELECT COUNT(*) FROM listing_sync_snapshots"
+            ).fetchone()[0]
+            == 0
+        )
+    assert not list(transport.runner.queue_dir.rglob("*.json"))
+    assert transport.wait_callback is None
+    assert context.repository.finish_run(
+        context.claim,
+        AutomationRunOutcome(status=AutomationRunStatus.FAILED),
+        now=datetime.now(UTC),
+    )
+    # Retry is a fresh existing Automation child, not a second recovery state machine.
+    automation, claim = _bind_automation_listing_run(
+        repository,
+        {"batch_id": "RETRY-CLEANUP-NEW"},
+        bind_manifest=False,
+    )
+    retry_context = AutomationExecutionContext(
+        claim=claim,
+        repository=automation,
+        operational_time=OperationalTimeService(),
+        clock=lambda: datetime.now(UTC),
+        lease_seconds=3600,
+    )
+    outcome = handler(claim.run, retry_context)
+    assert outcome.status is AutomationRunStatus.SUCCESS
+    assert outcome.event_payload["platform_write_performed"] is False

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from collections import defaultdict
 from contextlib import closing
@@ -16,7 +17,10 @@ from app.repositories.sqlite_runtime_repository import SQLiteRuntimeRepository
 from app.services.product_observation import (
     ProductObservationBatchInput,
     ProductObservationInput,
+    ProductObservationError,
+    _listing_acquisition_source,
     _result_content_sha256,
+    _validate_listing_snapshot_source,
 )
 from app.services.runtime_master_data import (
     RuntimeMappingSnapshot,
@@ -25,7 +29,7 @@ from app.services.runtime_master_data import (
 
 
 LISTING_SCAN_QUALIFICATION_SCHEMA_VERSION = (
-    "listing-scan-qualification-1.0"
+    "listing-scan-qualification-2.0"
 )
 LISTING_SCAN_PROVIDER = "SHADOWBOT_SYNC_STATUS"
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
@@ -42,7 +46,6 @@ class ListingScanQuality:
     delivery_archive_healthy: bool
     delivery_reason_codes: tuple[str, ...]
     platform_name: str
-    account_id: str
     internal_sku: str
     platform_product_identity_digest: str
     authority_mode: str
@@ -54,6 +57,7 @@ class ListingScanQuality:
     source_run_id: str
     observation_batch_id: str
     source_snapshot_id: str
+    source_execution_attempt_id: str
     source_manifest_sha256: str
     source_result_sha256: str
     observation_content_sha256: str
@@ -61,12 +65,12 @@ class ListingScanQuality:
     observed_at: str
     scan_completed_at: str
     fresh_until: str
+    evaluated_at: str
     scope_complete: bool
     end_marker_verified: bool
     observed_online: bool | None = None
     observed_price: str | None = None
     observed_inventory: int | None = None
-    active_session_verified: bool = False
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -86,7 +90,6 @@ class ListingScanQualityService:
         self,
         repository: SQLiteRuntimeRepository,
         *,
-        configured_account_id: str,
         max_age: timedelta = timedelta(minutes=30),
         clock: Callable[[], datetime] | None = None,
         master_data: RuntimeMasterDataProvider | None = None,
@@ -94,12 +97,11 @@ class ListingScanQualityService:
         if max_age <= timedelta(0):
             raise ValueError("max_age must be positive")
         self.repository = repository
-        self.configured_account_id = str(configured_account_id or "").strip()
         self.max_age = max_age
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.master_data = master_data or RuntimeMasterDataProvider(
             repository,
-            configured_account_id=self.configured_account_id,
+            configured_account_id=os.environ.get("PRA_ACCOUNT_ID", ""),
         )
 
     def latest(
@@ -110,23 +112,20 @@ class ListingScanQualityService:
     ) -> ListingScanQuality:
         platform = str(platform_name or "").strip()
         sku = str(internal_sku or "").strip().upper()
-        account_id = self.configured_account_id
-        if not platform or not account_id or not sku:
+        now = _as_utc(self.clock())
+        if not platform or not sku:
             return _empty_quality(
                 platform_name=platform,
-                account_id=account_id,
+                evaluated_at=now,
                 internal_sku=sku,
                 fact_reason_codes=("INVALID_QUALIFICATION_SCOPE",),
             )
-        now = _as_utc(self.clock())
         try:
-            mapping_snapshot = self.master_data.mapping_snapshot(
-                account_id=account_id
-            )
+            mapping_snapshot = self.master_data.mapping_snapshot()
         except (RuntimeMasterDataError, ValueError):
             return _empty_quality(
                 platform_name=platform,
-                account_id=account_id,
+                evaluated_at=now,
                 internal_sku=sku,
                 fact_reason_codes=("MAPPING_AUTHORITY_UNAVAILABLE",),
             )
@@ -134,7 +133,6 @@ class ListingScanQualityService:
             record
             for record in mapping_snapshot.mappings.records
             if record.platform_name == platform
-            and record.account_id == account_id
             and record.internal_sku == sku
             and record.mapping_status is ProductMappingStatus.VERIFIED
             and record.is_effective_at(now)
@@ -149,7 +147,7 @@ class ListingScanQualityService:
         if not current_records or len(identity_digests) != 1:
             return _empty_quality(
                 platform_name=platform,
-                account_id=account_id,
+                evaluated_at=now,
                 internal_sku=sku,
                 mapping_snapshot=mapping_snapshot,
                 fact_reason_codes=("CURRENT_MAPPING_NOT_UNIQUE",),
@@ -163,6 +161,7 @@ class ListingScanQualityService:
             rows = connection.execute(
                 """
                 SELECT batches.*, items.*, runs.run_status,
+                       runs.platform_trade_date AS run_platform_trade_date,
                        runs.input_manifest_sha256
                 FROM product_observation_batches AS batches
                 INNER JOIN product_observation_items AS items
@@ -195,7 +194,6 @@ class ListingScanQualityService:
             source_failure = self._latest_source_failure(
                 connection,
                 platform_name=platform,
-                account_id=account_id,
                 internal_sku=sku,
                 now=now,
                 mapping_snapshot=mapping_snapshot,
@@ -220,7 +218,7 @@ class ListingScanQualityService:
                 ).quality
             return _empty_quality(
                 platform_name=platform,
-                account_id=account_id,
+                evaluated_at=now,
                 internal_sku=sku,
                 mapping_snapshot=mapping_snapshot,
                 platform_product_identity_digest=identity_digest,
@@ -235,7 +233,7 @@ class ListingScanQualityService:
         if len({candidate.conflict_identity for candidate in newest}) > 1:
             return _empty_quality(
                 platform_name=platform,
-                account_id=account_id,
+                evaluated_at=now,
                 internal_sku=sku,
                 mapping_snapshot=mapping_snapshot,
                 platform_product_identity_digest=identity_digest,
@@ -248,7 +246,6 @@ class ListingScanQualityService:
         connection,
         *,
         platform_name: str,
-        account_id: str,
         internal_sku: str,
         now: datetime,
         mapping_snapshot: RuntimeMappingSnapshot,
@@ -282,7 +279,6 @@ class ListingScanQualityService:
         if source is None:
             return None
         completed_at = _parse_utc(str(source["scan_completed_at"]))
-        fresh_until = completed_at + self.max_age
         scope_complete = bool(source["snapshot_complete"])
         end_marker_verified = bool(
             source["online_end_marker_verified"]
@@ -297,8 +293,6 @@ class ListingScanQualityService:
             fact_reasons.append("SOURCE_SNAPSHOT_NOT_VERIFIED")
         if completed_at > now:
             fact_reasons.append("OBSERVATION_FROM_FUTURE")
-        if now > fresh_until:
-            fact_reasons.append("OBSERVATION_STALE")
         ack_state = str(source["ack_state"] or "")
         delivery_reasons = (
             ()
@@ -313,7 +307,6 @@ class ListingScanQualityService:
                 delivery_archive_healthy=not delivery_reasons,
                 delivery_reason_codes=delivery_reasons,
                 platform_name=platform_name,
-                account_id=account_id,
                 internal_sku=internal_sku,
                 platform_product_identity_digest=identity_digest,
                 authority_mode=mapping_snapshot.authority_mode,
@@ -327,13 +320,15 @@ class ListingScanQualityService:
                 source_run_id=str(source["run_id"] or ""),
                 observation_batch_id="",
                 source_snapshot_id=str(source["snapshot_id"]),
+                source_execution_attempt_id=str(source["execution_attempt_id"]),
                 source_manifest_sha256=str(source["manifest_sha256"]),
                 source_result_sha256=str(source["result_sha256"]),
                 observation_content_sha256="",
                 qualification_sha256="",
                 observed_at="",
                 scan_completed_at=_datetime_text(completed_at),
-                fresh_until=_datetime_text(fresh_until),
+                fresh_until="",
+                evaluated_at=_datetime_text(now),
                 scope_complete=scope_complete,
                 end_marker_verified=end_marker_verified,
             )
@@ -369,7 +364,7 @@ class ListingScanQualityService:
             fact_reasons.append("END_MARKER_NOT_VERIFIED")
         completed_at = _parse_utc(str(row["scan_completed_at"]))
         observed_at = _parse_utc(str(row["observed_at"]))
-        fresh_until = completed_at + self.max_age
+        fresh_until = observed_at + self.max_age
         if completed_at > now or observed_at > now:
             fact_reasons.append("OBSERVATION_FROM_FUTURE")
         if now > fresh_until:
@@ -395,9 +390,10 @@ class ListingScanQualityService:
         mapping_version = str(
             scope.get("accepted_mapping_version") or ""
         )
+        observation_batch = None
         try:
             expected_content_sha256 = _result_content_sha256(
-                ProductObservationBatchInput(
+                observation_batch := ProductObservationBatchInput(
                     observation_batch_id=str(row["observation_batch_id"]),
                     automation_run_id=str(row["automation_run_id"]),
                     platform_name=str(row["platform_name"]),
@@ -443,23 +439,15 @@ class ListingScanQualityService:
         if not isinstance(mapping_context, dict) or (
             str(mapping_context.get("authority_mode") or "")
             != mapping_snapshot.authority_mode
-            or mapping_context.get("authority_generation")
-            != mapping_snapshot.authority_generation
-            or str(mapping_context.get("account_id") or "")
-            != mapping_snapshot.account_id
-            or str(mapping_context.get("mapping_snapshot_sha256") or "")
-            != mapping_snapshot.mapping_snapshot_sha256
-            or str(mapping_context.get("mapping_version") or "")
-            != mapping_snapshot.mappings.mapping_version
+            or str(mapping_context.get("mapping_version") or "") != mapping_version
+            or not SHA256_RE.fullmatch(
+                str(mapping_context.get("mapping_snapshot_sha256") or "")
+            )
             or not SHA256_RE.fullmatch(
                 str(mapping_context.get("locator_artifact_sha256") or "")
             )
         ):
             fact_reasons.append("MAPPING_AUTHORITY_MISMATCH")
-        if mapping_version != (
-            mapping_snapshot.mappings.mapping_version
-        ):
-            fact_reasons.append("MAPPING_VERSION_MISMATCH")
 
         bindings = scope.get("accepted_identity_bindings")
         matching_bindings = (
@@ -469,8 +457,6 @@ class ListingScanQualityService:
                 if isinstance(binding, dict)
                 and str(binding.get("evidence_sha256") or "")
                 == str(row["evidence_sha256"])
-                and str(binding.get("page_identity_key") or "")
-                == str(row["page_identity_key"])
             ]
             if isinstance(bindings, list)
             else []
@@ -486,9 +472,7 @@ class ListingScanQualityService:
                 else ()
             )
             if (
-                str(binding.get("account_id") or "")
-                != mapping_snapshot.account_id
-                or str(binding.get("internal_sku") or "").upper()
+                str(binding.get("internal_sku") or "").upper()
                 != str(row["internal_sku"]).upper()
                 or str(
                     binding.get("platform_product_identity_digest") or ""
@@ -502,55 +486,51 @@ class ListingScanQualityService:
         source_manifest_sha256 = str(
             scope.get("source_manifest_sha256") or ""
         )
-        source_result_sha256 = str(
-            scope.get("source_result_sha256") or ""
+        source_result_sha256 = str(scope.get("source_result_sha256") or "")
+        source, acquisition_reasons = _listing_acquisition_source(
+            connection,
+            snapshot_id=source_snapshot_id,
+            execution_attempt_id=str(scope.get("source_execution_attempt_id") or ""),
         )
-        source = connection.execute(
-            """
-            SELECT snapshots.status AS snapshot_status,
-                   snapshots.snapshot_complete,
-                   snapshots.scan_completed_at AS source_completed_at,
-                   batches.status AS source_batch_status,
-                   batches.manifest_sha256,
-                   receipts.result_sha256,
-                   receipts.ack_state
-            FROM listing_sync_snapshots AS snapshots
-            INNER JOIN shadowbot_listing_action_batches AS batches
-              ON batches.batch_id = snapshots.batch_id
-            INNER JOIN shadowbot_listing_result_receipts AS receipts
-              ON receipts.result_id = snapshots.result_id
-             AND receipts.batch_id = snapshots.batch_id
-            WHERE snapshots.snapshot_id = ?
-            """,
-            (source_snapshot_id,),
-        ).fetchone()
+        fact_reasons.extend(acquisition_reasons)
         if source is None:
-            fact_reasons.append("SOURCE_EVIDENCE_MISSING")
             ack_state = "MISSING"
         else:
             ack_state = str(source["ack_state"] or "")
             if (
-                str(source["snapshot_status"]) != "VERIFIED"
-                or int(source["snapshot_complete"]) != 1
-                or str(source["source_batch_status"]) != "VERIFIED"
-                or str(source["manifest_sha256"])
-                != source_manifest_sha256
-                or str(source["result_sha256"])
-                != source_result_sha256
-                or str(row["input_manifest_sha256"])
-                != source_manifest_sha256
-                or str(source["source_completed_at"])
-                != str(row["scan_completed_at"])
+                str(source["manifest_sha256"]) != source_manifest_sha256
+                or str(source["result_sha256"]) != source_result_sha256
+                or str(row["input_manifest_sha256"]) != source_manifest_sha256
+                or str(source["scan_completed_at"]) != str(row["scan_completed_at"])
                 or not SHA256_RE.fullmatch(source_manifest_sha256)
                 or not RAW_SHA256_RE.fullmatch(source_result_sha256)
             ):
                 fact_reasons.append("SOURCE_INTEGRITY_MISMATCH")
+            if observation_batch is not None and not acquisition_reasons:
+                try:
+                    _validate_listing_snapshot_source(
+                        connection,
+                        observation_batch,
+                        run={
+                            "input_manifest_sha256": row["input_manifest_sha256"],
+                            "platform_trade_date": row["run_platform_trade_date"],
+                        },
+                    )
+                except (ProductObservationError, ValueError, TypeError):
+                    fact_reasons.append("SOURCE_INTEGRITY_MISMATCH")
 
         delivery_reasons = (
             ()
             if ack_state == "WRITTEN"
             else (f"EVIDENCE_ACK_{ack_state or 'UNKNOWN'}",)
         )
+        run_status = str(row["run_status"])
+        if run_status != "SUCCESS":
+            delivery_reasons += (
+                "AUTOMATION_LIFECYCLE_PENDING"
+                if run_status in {"SCHEDULED", "RUNNING"}
+                else f"AUTOMATION_LIFECYCLE_{run_status}",
+            )
         quality = ListingScanQuality(
             schema_version=LISTING_SCAN_QUALIFICATION_SCHEMA_VERSION,
             operating_fact_qualified=not fact_reasons,
@@ -558,20 +538,20 @@ class ListingScanQualityService:
             delivery_archive_healthy=not delivery_reasons,
             delivery_reason_codes=delivery_reasons,
             platform_name=str(row["platform_name"]),
-            account_id=mapping_snapshot.account_id,
             internal_sku=str(row["internal_sku"]),
             platform_product_identity_digest=identity_digest,
             authority_mode=mapping_snapshot.authority_mode,
             authority_generation=mapping_snapshot.authority_generation,
-            mapping_snapshot_sha256=(
-                mapping_snapshot.mapping_snapshot_sha256
-            ),
+            mapping_snapshot_sha256=(mapping_snapshot.mapping_snapshot_sha256),
             mapping_version=mapping_snapshot.mappings.mapping_version,
             provider=LISTING_SCAN_PROVIDER,
             observation_type="LISTING_STATUS_SCAN",
             source_run_id=str(row["automation_run_id"]),
             observation_batch_id=str(row["observation_batch_id"]),
             source_snapshot_id=source_snapshot_id,
+            source_execution_attempt_id=str(
+                scope.get("source_execution_attempt_id") or ""
+            ),
             source_manifest_sha256=source_manifest_sha256,
             source_result_sha256=source_result_sha256,
             observation_content_sha256=str(row["content_sha256"]),
@@ -579,6 +559,7 @@ class ListingScanQualityService:
             observed_at=_datetime_text(observed_at),
             scan_completed_at=_datetime_text(completed_at),
             fresh_until=_datetime_text(fresh_until),
+            evaluated_at=_datetime_text(now),
             scope_complete=bool(row["scope_complete"]),
             end_marker_verified=bool(row["end_marker_verified"]),
             observed_online=bool(row["observed_online"]),
@@ -604,7 +585,7 @@ class ListingScanQualityService:
 def _empty_quality(
     *,
     platform_name: str,
-    account_id: str,
+    evaluated_at: datetime,
     internal_sku: str,
     fact_reason_codes: tuple[str, ...],
     mapping_snapshot: RuntimeMappingSnapshot | None = None,
@@ -617,7 +598,6 @@ def _empty_quality(
         delivery_archive_healthy=False,
         delivery_reason_codes=("NO_SELECTED_DELIVERY_EVIDENCE",),
         platform_name=platform_name,
-        account_id=account_id,
         internal_sku=internal_sku,
         platform_product_identity_digest=(
             platform_product_identity_digest
@@ -643,6 +623,7 @@ def _empty_quality(
         source_run_id="",
         observation_batch_id="",
         source_snapshot_id="",
+        source_execution_attempt_id="",
         source_manifest_sha256="",
         source_result_sha256="",
         observation_content_sha256="",
@@ -650,6 +631,7 @@ def _empty_quality(
         observed_at="",
         scan_completed_at="",
         fresh_until="",
+        evaluated_at=_datetime_text(evaluated_at),
         scope_complete=False,
         end_marker_verified=False,
     )

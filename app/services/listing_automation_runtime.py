@@ -22,6 +22,7 @@ from app.services.automation import (
 from app.services.product_observation import (
     ProductObservationImporter,
     ProductObservationMappingContext,
+    _normalize_listing_mapping_context,
     listing_snapshot_to_observation_batch,
 )
 from app.services.product_mapping import CompiledProductMappings
@@ -124,36 +125,34 @@ class ListingStatusScanHandler:
             configured_account_id=self.master_data.configured_account_id,
             master_data_provider=self.master_data,
         )
-        mapping_snapshot = self.master_data.mapping_snapshot()
-        _validate_locator_binding(
-            self.mapping_path,
-            manifest=manifest,
-            authority_mode=mapping_snapshot.authority_mode,
-            authority_generation=mapping_snapshot.authority_generation,
-            account_id=mapping_snapshot.account_id,
-            platform_name=run.platform_name,
-            mapping_snapshot_sha256=(
-                mapping_snapshot.mapping_snapshot_sha256
-            ),
-            mappings=mapping_snapshot.mappings,
-        )
-        mapping_context = ProductObservationMappingContext(
-            authority_mode=mapping_snapshot.authority_mode,
-            authority_generation=mapping_snapshot.authority_generation,
-            account_id=mapping_snapshot.account_id,
-            mapping_snapshot_sha256=(
-                mapping_snapshot.mapping_snapshot_sha256
-            ),
-            mapping_version=mapping_snapshot.mappings.mapping_version,
-            locator_artifact_sha256=str(
-                manifest["mapping_source_version"]
-            ),
-        )
-        context.bind_input_manifest(str(manifest["manifest_sha256"]))
-        self.transport.set_wait_callback(context.heartbeat)
         imported_result_id = ""
         observation_imported = False
+        result_received = False
         try:
+            # prepare() has committed: every following failure needs an owner
+            # and terminal cleanup, including all pre-publication validation.
+            mapping_snapshot = self.master_data.mapping_snapshot()
+            _validate_locator_binding(
+                self.mapping_path,
+                manifest=manifest,
+                authority_mode=mapping_snapshot.authority_mode,
+                authority_generation=mapping_snapshot.authority_generation,
+                account_id=mapping_snapshot.account_id,
+                platform_name=run.platform_name,
+                mapping_snapshot_sha256=mapping_snapshot.mapping_snapshot_sha256,
+                mappings=mapping_snapshot.mappings,
+            )
+            mapping_context = _normalize_listing_mapping_context(
+                ProductObservationMappingContext(
+                    authority_mode=mapping_snapshot.authority_mode,
+                    authority_generation=mapping_snapshot.authority_generation,
+                    mapping_snapshot_sha256=mapping_snapshot.mapping_snapshot_sha256,
+                    mapping_version=mapping_snapshot.mappings.mapping_version,
+                    locator_artifact_sha256=str(manifest["mapping_source_version"]),
+                )
+            )
+            context.bind_input_manifest(str(manifest["manifest_sha256"]))
+            self.transport.set_wait_callback(context.heartbeat)
             request, started = publish_listing_sync_batch(
                 self.runtime_repository,
                 self.transport.runner,
@@ -174,6 +173,7 @@ class ListingStatusScanHandler:
             )
             result_sha256 = self.transport.last_result_file_sha256
             result_path = self.transport.last_result_path
+            result_received = True
             summary = import_listing_sync_result(
                 self.runtime_repository,
                 request=request,
@@ -235,7 +235,6 @@ class ListingStatusScanHandler:
                 "source_snapshot_id": summary["snapshot_id"],
                 "item_count": imported.item_count,
                 "mapping_version": imported.mapping_version,
-                "account_id": mapping_snapshot.account_id,
                 "authority_generation": (
                     mapping_snapshot.authority_generation
                 ),
@@ -267,7 +266,7 @@ class ListingStatusScanHandler:
                 )
             archive_dir = None
             archive_error = ""
-            if self.transport.last_result_path is not None:
+            if result_received and self.transport.last_result_path is not None:
                 archive_dir, archive_error = self._archive_result()
             if imported_result_id:
                 mark_listing_sync_ack(

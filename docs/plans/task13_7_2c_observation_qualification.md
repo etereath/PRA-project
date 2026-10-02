@@ -2,7 +2,7 @@
 
 ## 1. Goal and accepted baseline
 
-本任务以 `main@0b1135787ac33c3c6c96531f874924418924bb8a`、业务合同 §23.3 和 PR #54 最新审核交接为基线。Task 13.7-2A / 2B 已进入当前 `main`，不再保留 workbook authority 作为 DB_AUTHORITY 下的兼容回退。
+本轮以 `main@616888a073c070989753a9bf74b2b8093fc01af2`、[Owner Product Boundary](../owner_product_boundary.md) §7 和 PR #54 更新后的正文为边界，集中整改 P2-54-01/02/03、R0-54-01/02。#52、#53、#57 已合并；旧 account-aware / active-session / page-identity 审核要求不再适用。DB_AUTHORITY 不回退 workbook authority。
 
 目标是建立“当前平台观察是否足以作为经营事实”的正式资格判断，并把既有 `SYNC_STATUS` READ_ONLY 链路接入 Automation Run 与不可变 `ProductObservation`。本任务不执行平台写、不关闭 UNKNOWN、不设置或释放 global blocker，也不推断历史写操作的因果。
 
@@ -24,7 +24,6 @@ fact_reason_codes[]
 delivery_archive_healthy
 delivery_reason_codes[]
 platform_name
-account_id
 internal_sku
 platform_product_identity_digest
 authority_mode
@@ -36,6 +35,7 @@ observation_type
 source_run_id
 observation_batch_id
 source_snapshot_id
+source_execution_attempt_id
 source_manifest_sha256
 source_result_sha256
 observation_content_sha256
@@ -43,15 +43,16 @@ qualification_sha256
 observed_at
 scan_completed_at
 fresh_until
+evaluated_at
 scope_complete
 end_marker_verified
 ```
 
-`qualification_sha256` 对上述决定性字段做规范化摘要，供 PR #55 在不重写本任务规则的情况下验证引用。
+公共 schema 为 `listing-scan-qualification-2.0`。`qualification_sha256` 对结果（含 `evaluated_at`）做规范化摘要，供后续消费者验证引用。公共 scope/result/selector 不含 account/session/page identity 维度；底层旧 `page_identity_key` 仍参与原有内容完整性校验，不代表页面认证。
 
 ## 3. Candidate selection
 
-- 选择目标平台、账号和 SKU 下最新的合格候选，而不是要求数据库物理上只有一个批次。
+- 选择目标平台和 SKU 下最新的合格候选，而不是要求数据库物理上只有一个批次。
 - 历史 `FAILED`、`SUPERSEDED`、不完整、过期及 retry/recovery 批次可以共存，不得永久污染后续有效观察。
 - retry/recovery 成功产生的新观察可以成为当前候选。
 - 同一最新完成时刻若存在内容或来源不同的多个合格候选，必须以 `AMBIGUOUS_CURRENT_CANDIDATES` fail closed。
@@ -60,10 +61,11 @@ end_marker_verified
 
 ## 4. Identity and authority binding
 
-- 身份必须绑定 `platform_name + account_id + platform_product_identity_digest`，并包含 `internal_sku`、Mapping authority generation/snapshot/version 及证据引用。
-- DB_AUTHORITY 下只读取当前 Runtime Mapping authority；缺少配置账号、authority generation 漂移、snapshot digest 漂移或无法唯一解析时 fail closed，禁止 workbook fallback。
-- 配置的 `account_id` 只是目标账号，不是活动登录会话证明；本任务不声称已验证活动会话。
-- 接受时的 authority/identity binding 写入不可变 observation scope；资格读取时再与当前 Runtime authority 对照。
+- 商品定位为 `platform_name + platform_product_identity → internal_sku`。接受时冻结该 SKU 的 mapping IDs、商品 identity digest 和证据引用，资格读取时与当前有效 VERIFIED mapping 对照。
+- 共享 authority generation、全局 snapshot digest、mapping version 用作溯源和内部完整性证据，不以跨时刻全局相等作为 SKU 的资格门禁。无关 Product、其他 SKU mapping 或备注修改不会单独令旧事实失效；目标 SKU 的相关 mapping IDs/identity 变化则 fail closed。
+- DB_AUTHORITY 只读取 Runtime Mapping authority；v19 `account_id` 由既有 provider/locator 兼容边界吸收，不成为公共 qualification scope 或操作者新增配置要求，不做删列 migration。
+- immutable scope 绑定 `source_execution_attempt_id`。Importer 和 qualification 共用既有 snapshot/batch/receipt 校验，核对 attempt、instruction、manifest、result、源采集完成状态及 canonical content。缺少可验证的 attempt 绑定时结构化拒绝，历史记录不重写。
+- `fresh_until = observed_at + max_age`；`scan_completed_at` 只证明覆盖完成。结果带 `evaluated_at`；没有 SKU observation 的源失败诊断不生成虚假的 fresh-until。
 
 ## 5. Production READ_ONLY path
 
@@ -83,26 +85,28 @@ Automation Run
 - `FULL_MARKET_SCAN` / `PRE_CUTOFF_FULL_SCAN` 只负责产生现有 `LISTING_STATUS_SCAN` 子 Run；子 handler 执行上述链路。
 - 不注册任何平台写 handler。历史 UNKNOWN 停放不构成 READ_ONLY blanket gate；实际 UI channel 仍服从既有互斥和租约。
 - 不可变观察成功提交后，后续归档失败记录为 delivery/archive 不健康，并使本次 Automation outcome 明确反映交付失败，但不会回滚或否认经营事实。
+- 源采集 batch 已 VERIFIED、snapshot/receipt/immutable import 已完整成立时，即使 Automation Run 仍 RUNNING，事实也可 qualified；未完成父流程收尾只在 delivery/lifecycle 维度表达。
+- `prepare_listing_sync_batch()` 成功后的 mapping/locator/context/input-manifest/callback/publish 前失败，统一走既有 `fail_listing_sync_batch()` 收口。未发布请求为零 Queue 写、零平台写；fresh retry 使用新的既有 Automation child，不新增恢复状态机。
 
-## 6. PR #55 handoff
+## 6. 后续消费者边界
 
-PR #55 只能消费本任务返回的结构化结果与引用，并自行验证：
+本轮只提供结构化结果与引用。#55 按 Owner Product Boundary 保持后置，不在本 PR 实施其 Queue-OPS 或 blocker 逻辑。后续涉及 stopped boundary 的消费者须独立验证：
 
 ```text
 scan_completed_at / observed_at strictly after stopped boundary
-+ exact platform/account/product identity
++ exact platform/product identity
 + provider/freshness/scope/end-marker qualified
 + one unique current qualified candidate
 + immutable source/content/qualification refs
 ```
 
-这些字段不证明活动登录账号、不证明当前没有 submit responsibility，也不允许反推旧 click 的精确因果；对应判断仍属于 PR #55。
+这些字段不证明当前没有 submit responsibility，也不允许反推旧 click 的精确因果；historical UNKNOWN 保持原状。
 
 ## 7. Legacy selective salvage
 
 | Legacy asset | Decision | Current adaptation |
 |---|---|---|
-| `listing_scan_quality.py` complete/end-marker/fresh/source checks | ADAPTED | 改为结构化 reason code、账号/权威/身份绑定及双维度结果 |
+| `listing_scan_quality.py` complete/end-marker/fresh/source checks | ADAPTED | SKU observed-at freshness、acquisition attempt/商品身份绑定及双维度结果 |
 | `len(batches) == 1` | REJECTED | 改为最新合格候选选择；仅同一时刻冲突候选 fail closed |
 | run 必须 `SUCCESS` | REJECTED | 资格依赖不可变事实完整性；交付失败可令 run `PARTIAL` 而不抹除事实 |
 | `listing_automation_runtime.py` Automation→Queue→Importer→ACK/Archive | ADAPTED | 对齐当前 claim、Runtime Mapping authority 和现有 SYNC_STATUS API |
@@ -113,14 +117,14 @@ scan_completed_at / observed_at strictly after stopped boundary
 
 定向验证覆盖：
 
-1. complete + end-marker + fresh + exact account/identity/authority → qualified；
-2. incomplete、缺尾标、stale、identity/authority mismatch → 对应结构化不合格；
+1. acquisition complete + snapshot/receipt/observation attempt 一致 + end-marker + fresh + relevant product identity → qualified；
+2. 未完成采集、attempt mismatch、缺尾标、observed-at stale、相关 identity mismatch → 对应结构化不合格；
 3. ACK/archive failure 不抹除已提交事实，并单独报告 delivery 不健康；
 4. 历史失败/retry 不污染最新有效候选；同刻冲突候选 fail closed；
-5. SKU 隔离；
+5. 真实 Runtime Product/Mapping 变更中，无关 SKU/备注不连坐，相关 identity 改变则拒绝旧事实；
 6. DB_AUTHORITY 无 workbook fallback；
 7. 历史 UNKNOWN 停放期间 READ_ONLY 仍走真实 Automation/Queue/Worker/Importer 接线；
-8. 交给 PR #55 的时间、身份和摘要引用可独立复核。
+8. PREPARED 后发布前异常 terminal cleanup、零 Queue 写及 fresh retry；公共结果与新 scope 不含 account/session/page identity requirement。
 
 完整 pytest、全仓 Ruff/Mypy、完整冒烟及主动 CI 重跑仍受单独授权门禁约束。
 
@@ -135,7 +139,7 @@ scan_completed_at / observed_at strictly after stopped boundary
 
 - 当前版 `ListingScanQuality` / observation qualification Service；
 - Automation listing READ_ONLY production handler；
-- Runtime Mapping authority 与不可变 account/identity binding；
-- 结构化 qualification diagnostic 及稳定 PR #55 interface；
+- 当前 SKU 的 Runtime Mapping identity 与不可变 source attempt binding；
+- 结构化 qualification diagnostic 及可验证引用；
 - 直接风险对应的定向测试；
 - 本文的 legacy `REUSED / ADAPTED / REJECTED` 记录。
