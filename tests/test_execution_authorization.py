@@ -609,9 +609,8 @@ def test_human_exposure_authorization_v5_readback_preserves_physical_ledger(tmp_
     from app.services.manual_task_orchestration import ManualTaskApplicationService, ManualTaskRequest
     from app.services.shadowbot_executor import ShadowBotFileQueueRunner
     from app.services.shadowbot_listing_action_pipeline import propose_listing_action_batch, publish_listing_action_batch
-    from app.services.shadowbot_listing_action_contract import compute_listing_result_hash
+    from app.services.shadowbot_listing_action_contract import compute_listing_result_hash, validate_listing_action_request
     from app.services.shadowbot_queue import ShadowBotResultImporter
-    from shadowbot.test2 import shadowbot_queue_worker
     from tests.test_shadowbot_listing_action_pipeline import _write_result
 
     monkeypatch.setattr(sys.modules[__name__], 'NOW', datetime.now(UTC))
@@ -654,7 +653,7 @@ def test_human_exposure_authorization_v5_readback_preserves_physical_ledger(tmp_
     path = service.queue_root / 'inbox' / (receipt.execution_attempt_id + '.ready.json')
     raw = path.read_bytes()
     published = json.loads(raw.decode('utf-8'))
-    shadowbot_queue_worker._v5_validate_request(published)
+    validate_listing_action_request(published)
     assert published['items'][0]['target_inventory'] == 50
     result = _write_result(published, request_file_sha256=hashlib.sha256(raw).hexdigest())
     result['items'][0].update(observed_inventory_before_action=20,

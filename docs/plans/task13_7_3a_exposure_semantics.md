@@ -270,7 +270,7 @@ Reviewer should limit first review to 3A semantics and direct regressions; do no
 
 ## 11. 实现与定向验证交接（2026-10-03）
 
-基线为 `main@23190a1eb76cc59f2f7942e1b2f32d872fcfe721`，计划分支起点 `06423a26338b7eb807cc3daea7c59fa04338f9bb` 已包含该 main。保持 Draft；本地实现没有触发新的自动 CI，待推送后按实际 Head 读取，不借用上游结果。
+基线为 `main@23190a1eb76cc59f2f7942e1b2f32d872fcfe721`，计划分支起点 `06423a26338b7eb807cc3daea7c59fa04338f9bb` 已包含该 main。首版实现 `27f243e11e7e7ab062b56a508ce9530be7580a84` 已推送，CI 及 P2-61-01 整改见下节。保持 Draft，按实际 Head 读取 CI，不借用上游结果。
 
 生产修改仅三个文件：
 
@@ -298,4 +298,10 @@ python -m pytest -q tests/test_manual_task_orchestration.py tests/test_execution
 
 目标文件 Ruff、严格 UTF-8 回读和 diff 检查通过。未运行本地全量 pytest、完整 smoke、全仓静态检查或主动 CI 重跑；没有新增持久字段、状态、表、Service 或 schema migration，没有修改 v5/Queue/Worker 协议或库存 ledger 实现。
 
-证据边界：正式服务、临时 SQLite、v5 文件请求、Worker 请求校验、结果 Importer 和账本比较是真实代码；平台采集/点击/回读由既有结果夹具代替，没有操作真实浏览器或平台。Worker 中断与唯一 RECONCILE 通过既有定向回归验证，不把合成结果当作实机验收。负责人审查、实际 Head 的 CI、部署与真实 Exposure 调整不由本次本地验证替代。
+证据边界：正式服务、临时 SQLite、v5 文件请求、公共 contract 校验、结果 Importer 和账本比较是真实代码；平台采集/点击/回读由既有结果夹具代替，没有操作真实浏览器或平台。Worker 中断与唯一 RECONCILE 通过既有定向回归验证，不把合成结果当作实机验收。负责人审查、实际 Head 的 CI、部署与真实 Exposure 调整不由本次本地验证替代。
+
+### P2-61-01 跨平台测试导入整改
+
+首版 [Core CI #37098257178](https://github.com/etereath/PRA-project/actions/runs/37098257178) 的 Windows 成功，Linux 失败：三个 Exposure 参数导入 Worker 时缺少 `msvcrt`。修复仅涉及测试：跨平台旅程调用现有 `validate_listing_action_request()`；`test_shadowbot_listing_action_pipeline.py` 和 `test_shadowbot_listing_sync.py` 的 Worker 导入延后至各自专项测试，防止复用纯结果夹具时隐式加载 Windows 模块。不修改 Worker、Queue protocol 或生产架构。
+
+在 Windows 新进程中通过导入拦截器禁止任何 `shadowbot_queue_worker` 导入，定向执行 Exposure 三参数，结果 **3 passed（4.01 秒）**；原 Worker 请求校验/结果用例 **2 passed（1.59 秒）**。目标文件 Ruff、严格 UTF-8 和 diff 检查通过。该证据证明直接和间接 Worker 依赖已消除，不等同真实 Linux 执行；新 Head 的自动 CI 仍需单独确认，旧 Head 的 Linux 失败保留，不主动重跑旧 CI。
