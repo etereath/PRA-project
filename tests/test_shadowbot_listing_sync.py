@@ -43,7 +43,6 @@ from app.services.shadowbot_listing_sync import (
 from app.services.shadowbot_executor import ShadowBotFileQueueRunner
 from app.services.shadowbot_queue import ShadowBotResultImporter
 from app.services.workflow import _load_latest_platform_observations
-from shadowbot.test2 import shadowbot_queue_worker
 
 
 PLATFORM = "蚂蚁花团供应商"
@@ -938,6 +937,8 @@ def test_file_queue_import_writes_human_report_and_ack(tmp_path: Path) -> None:
 def test_worker_v5_request_and_failed_result_match_core_contract(
     tmp_path: Path,
 ) -> None:
+    from shadowbot.test2 import shadowbot_queue_worker
+
     repository = _repository(tmp_path)
     request = _request(
         repository,

@@ -45,7 +45,6 @@ from app.shadowbot_listing_contract import (
     derive_v5_batch_semantics,
     v5_result_counts,
 )
-from shadowbot.test2 import shadowbot_queue_worker
 from tests.test_shadowbot_listing_sync import (
     PLATFORM,
     _item,
@@ -1003,6 +1002,8 @@ def test_approved_retry_atomically_transfers_review_blocked_lock(
 def test_publish_and_import_verified_set_online(
     tmp_path: Path,
 ) -> None:
+    from shadowbot.test2 import shadowbot_queue_worker
+
     repository = _repository(tmp_path)
     _seed_waiting_snapshot(repository, tmp_path)
     _insert_set_online_task(repository)

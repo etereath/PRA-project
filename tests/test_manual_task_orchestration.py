@@ -23,6 +23,7 @@ from app.services.manual_task_orchestration import (
     SET_PRICE,
     ManualTaskApplicationService,
     ManualTaskConflictError,
+    ManualTaskError,
     ManualTaskRequest,
 )
 
@@ -296,7 +297,7 @@ def test_price_change_after_preview_rejects_whole_batch(manual_service) -> None:
     assert repository.list_tasks() == []
 
 
-def test_offline_has_no_price_and_online_requires_price_and_safe_inventory(
+def test_offline_has_no_price_and_online_exposure_may_exceed_physical_inventory(
     manual_service,
 ) -> None:
     service, repository, _, _ = manual_service
@@ -320,17 +321,8 @@ def test_offline_has_no_price_and_online_requires_price_and_safe_inventory(
     assert offline_task.target_inventory is None
 
     _listing(repository, "AISHA-B-50-Z", "B级", Decimal("9.00"), "offline")
-    online_request = ManualTaskRequest(
-        varieties=("艾莎",),
-        grades=("B级",),
-        platforms=(PLATFORM,),
-        action=SET_ONLINE,
-        price_value=Decimal("10"),
-        target_inventory=42,
-    )
-    blocked = service.preview(online_request)
-    assert blocked.creatable is False
-    assert "不能超过数据库库存" in "".join(blocked.items[0].blockers)
+    with repository.connect_write() as connection:
+        connection.execute("UPDATE inventory_balances SET current_qty = 20 WHERE internal_sku = 'AISHA-B-50-Z'")
 
     allowed_request = ManualTaskRequest(
         varieties=("艾莎",),
@@ -338,10 +330,11 @@ def test_offline_has_no_price_and_online_requires_price_and_safe_inventory(
         platforms=(PLATFORM,),
         action=SET_ONLINE,
         price_value=Decimal("10"),
-        target_inventory=40,
+        target_inventory=50,
         idempotency_key="online",
     )
     allowed = service.preview(allowed_request)
+    assert allowed.creatable and allowed.items[0].real_inventory == 20
     created = service.create(
         allowed_request,
         expected_preview_digest=allowed.preview_digest,
@@ -351,7 +344,57 @@ def test_offline_has_no_price_and_online_requires_price_and_safe_inventory(
     assert task is not None
     assert task.action_type is TaskActionType.SET_ONLINE
     assert task.target_price == Decimal("10.00")
-    assert task.target_inventory == 40
+    assert task.target_inventory == 50
+
+
+@pytest.mark.parametrize('action', [SET_PRICE, SET_OFFLINE, SET_ONLINE])
+@pytest.mark.parametrize('change', ['maintenance', 'missing_balance'])
+def test_physical_inventory_changes_do_not_invalidate_sales_preview(manual_service, action, change):
+    service, repository, _, _ = manual_service
+    if action == SET_ONLINE:
+        _listing(repository, 'AISHA-A-50-Z', 'A级', Decimal('12.00'), 'offline')
+    request = ManualTaskRequest(
+        varieties=('艾莎',), grades=('A级',), platforms=(PLATFORM,), action=action,
+        price_value=None if action == SET_OFFLINE else Decimal('13'),
+        target_inventory=100 if action == SET_ONLINE else None, idempotency_key='stock-independent',
+    )
+    before = service.preview(request)
+    assert before.creatable
+    with repository.connect_write() as connection:
+        if change == 'maintenance':
+            connection.execute("""UPDATE inventory_authority_state SET authority_mode = 'PRE_CUTOVER',
+                bootstrap_snapshot_sha256 = NULL, bootstrap_runtime_snapshot_sha256 = NULL,
+                bootstrap_sales_watermark_date = NULL, bootstrap_idempotency_key = NULL,
+                bootstrap_completed_at = NULL, bootstrap_completed_by = NULL""")
+            connection.execute('UPDATE inventory_balances SET current_qty = 1, version = version + 1')
+        else:
+            connection.execute('DELETE FROM inventory_balances')
+    after = service.preview(request)
+    assert after.creatable and after.preview_digest == before.preview_digest
+    created = service.create(request, expected_preview_digest=before.preview_digest, authenticated_subject='admin')
+    assert repository.get_task(created.task_ids[0]).task_status is TaskStatus.PENDING
+
+
+@pytest.mark.parametrize('failure', ['wrong_status', 'stale_status', 'below_cost', 'negative_exposure'])
+def test_online_safety_gates_remain_without_physical_inventory(manual_service, failure):
+    service, repository, _, _ = manual_service
+    with repository.connect_write() as connection:
+        connection.execute('DELETE FROM inventory_balances')
+    if failure != 'wrong_status':
+        _listing(repository, 'AISHA-A-50-Z', 'A级', Decimal('12.00'), 'offline')
+    if failure == 'stale_status':
+        service.clock = lambda: NOW + timedelta(days=1)
+    request = ManualTaskRequest(varieties=('艾莎',), grades=('A级',), platforms=(PLATFORM,),
+        action=SET_ONLINE, price_value=Decimal('4') if failure == 'below_cost' else Decimal('13'),
+        target_inventory=-1 if failure == 'negative_exposure' else 100, idempotency_key='unsafe')
+    if failure == 'negative_exposure':
+        with pytest.raises(ManualTaskError):
+            service.preview(request)
+    else:
+        preview = service.preview(request)
+        assert not preview.creatable
+        expected = {'wrong_status': '待上架', 'stale_status': '已过期', 'below_cost': '基础成本'}[failure]
+        assert expected in ''.join(preview.items[0].blockers)
 
 
 def test_low_price_mapping_failure_and_open_task_conflict_are_explicit(

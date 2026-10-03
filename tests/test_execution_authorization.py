@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -569,6 +570,165 @@ def test_prepare_idempotency_replays_same_batch_and_rejects_other_tasks(
 
     with pytest.raises(ExecutionAuthorizationConflict, match="与之前的任务不同"):
         service.prepare_execution(admin, ["TASK-OFFLINE-B"], "same-auth")
+
+
+def _sales_snapshot(service, repository, *, online):
+    from app.services.shadowbot_listing_sync import prepare_listing_sync_batch, import_listing_sync_result
+    from app.services.shadowbot_listing_action_contract import compute_listing_result_hash
+    from tests.test_shadowbot_listing_sync import _result, _item
+
+    manifest = prepare_listing_sync_batch(repository, batch_id='BATCH-EXPOSURE-SCAN',
+        platform_name=PLATFORM, mapping_path=service.shadowbot_identity_mapping)
+    request = build_listing_action_request(manifest, execution_profile='production',
+        execution_attempt_id='ATTEMPT-EXPOSURE-SCAN', applet_uri=service.applet_uri)
+    with repository.connect_write() as connection:
+        connection.execute("""UPDATE shadowbot_listing_action_batches SET status = 'QUEUED',
+            instruction_hash = ?, execution_attempt_id = ? WHERE batch_id = ?""",
+            (request['instruction_hash'], request['execution_attempt_id'], request['batch_id']))
+    now = datetime.now(UTC).isoformat()
+    result = _result(request, scan_started_at=now)
+    snapshot = result['snapshot']
+    for key in snapshot:
+        if key.endswith('_at'):
+            snapshot[key] = now
+    item = _item(snapshot_id=snapshot['snapshot_id'], suffix='0001', sku='AISHA-A-50-Z',
+                 name='艾莎', grade='A级', location='online_only' if online else 'waiting_only')
+    prefix = 'online' if online else 'waiting'
+    item.update({prefix + '_observed_at': now, prefix + '_observed_inventory': 20})
+    snapshot['items'] = [item]
+    result['ended_at'] = now
+    result['result_payload_sha256'] = compute_listing_result_hash(result)
+    import_listing_sync_result(repository, request=request, result=result,
+        result_file_sha256='a' * 64, source_result_path='synthetic-exposure-scan.result.json')
+
+
+@pytest.mark.parametrize('inventory_state', ['present', 'missing', 'maintenance'])
+def test_human_exposure_authorization_v5_readback_preserves_physical_ledger(tmp_path, monkeypatch, inventory_state):
+    import hashlib
+    import sys
+    from app.services.manual_task_orchestration import ManualTaskApplicationService, ManualTaskRequest
+    from app.services.shadowbot_executor import ShadowBotFileQueueRunner
+    from app.services.shadowbot_listing_action_pipeline import propose_listing_action_batch, publish_listing_action_batch
+    from app.services.shadowbot_listing_action_contract import compute_listing_result_hash, validate_listing_action_request
+    from app.services.shadowbot_queue import ShadowBotResultImporter
+    from tests.test_shadowbot_listing_action_pipeline import _write_result
+
+    monkeypatch.setattr(sys.modules[__name__], 'NOW', datetime.now(UTC))
+    service, repository, _ = execution_setup.__wrapped__(tmp_path)
+    service.clock = lambda: datetime.now(UTC)
+    service.runner_factory = ShadowBotFileQueueRunner
+    service.v5_propose = propose_listing_action_batch
+    service.v5_publish = publish_listing_action_batch
+    with repository.connect_write() as connection:
+        connection.execute("UPDATE tasks SET task_status = 'cancelled'")
+        connection.execute('UPDATE inventory_balances SET current_qty = 20')
+        if inventory_state == 'missing':
+            connection.execute('DELETE FROM inventory_balances')
+        elif inventory_state == 'maintenance':
+            connection.execute("""UPDATE inventory_authority_state SET authority_mode = 'PRE_CUTOVER',
+                bootstrap_snapshot_sha256 = NULL, bootstrap_runtime_snapshot_sha256 = NULL,
+                bootstrap_sales_watermark_date = NULL, bootstrap_idempotency_key = NULL,
+                bootstrap_completed_at = NULL, bootstrap_completed_by = NULL""")
+    _sales_snapshot(service, repository, online=False)
+    def physical_ledger():
+        with repository.connect_read() as connection:
+            return {table: [tuple(row) for row in connection.execute('SELECT * FROM ' + table)]
+                    for table in ('inventory_balances', 'inventory_transactions', 'inventory_authority_state')}
+    before = physical_ledger()
+    manual = ManualTaskApplicationService(repository, products_workbook=service.products_workbook,
+        platform_mappings_workbook=service.platform_mappings_workbook, clock=service.clock)
+    request = ManualTaskRequest(varieties=('艾莎',), grades=('A级',), platforms=(PLATFORM,),
+        action='SET_ONLINE', price_value=Decimal('22'), target_inventory=50, idempotency_key='exposure-50')
+    preview = manual.preview(request)
+    assert preview.creatable
+    created = manual.create(request, expected_preview_digest=preview.preview_digest, authenticated_subject='admin')
+    prepared = service.prepare_execution(_admin(), created.task_ids, 'authorize-exposure-50')
+    receipt = service.submit_execution(_admin(), created.task_ids, prepared.confirmation_digest, 'authorize-exposure-50')
+    # The published operation still excludes a second same-SKU platform write.
+    competing = replace(repository.get_task(created.task_ids[0]), task_id='TASK-COMPETING-EXPOSURE',
+        task_status=TaskStatus.PENDING, dedupe_key='', origin_ref_id='synthetic:competing-exposure')
+    repository.insert_tasks([competing])
+    with pytest.raises(ExecutionAuthorizationBlocked, match='正在执行其他平台操作'):
+        service.prepare_execution(_admin(), [competing.task_id], 'competing-exposure')
+    path = service.queue_root / 'inbox' / (receipt.execution_attempt_id + '.ready.json')
+    raw = path.read_bytes()
+    published = json.loads(raw.decode('utf-8'))
+    validate_listing_action_request(published)
+    assert published['items'][0]['target_inventory'] == 50
+    result = _write_result(published, request_file_sha256=hashlib.sha256(raw).hexdigest())
+    result['items'][0].update(observed_inventory_before_action=20,
+        observed_inventory_after_detail_save=50, actual_inventory=50)
+    result['result_payload_sha256'] = compute_listing_result_hash(result)
+    result_path = service.queue_root / 'results' / (receipt.execution_attempt_id + '.result.json')
+    result_bytes = json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+    result_path.write_bytes(result_bytes)
+    result_path.with_suffix('.json.sha256').write_text(hashlib.sha256(result_bytes).hexdigest() + '\n', encoding='ascii')
+    importer = ShadowBotResultImporter(repository, ShadowBotFileQueueRunner(service.queue_root), service.queue_root)
+    event = importer.import_one(result_path)
+    assert event['summary']['status'] == 'VERIFIED'
+    assert repository.get_task(created.task_ids[0]).task_status is TaskStatus.SUCCESS
+    assert repository.get_listing_status(PLATFORM, '艾莎', 'A级').platform_stock_qty == 50
+    with repository.connect_read() as connection:
+        operation = connection.execute('SELECT * FROM shadowbot_operations WHERE task_id = ?', created.task_ids).fetchone()
+        assert operation['target_inventory'] == 50 and operation['status'] == 'VERIFIED'
+        attempt = connection.execute('SELECT * FROM shadowbot_execution_attempts WHERE operation_id = ?',
+                                     (operation['operation_id'],)).fetchone()
+        evidence = json.loads(attempt['raw_output_json'])
+        assert evidence['observed_inventory_before_action'] == 20
+        assert evidence['observed_inventory_after_detail_save'] == evidence['actual_inventory'] == 50
+        assert evidence['readback_observed_at']
+        assert attempt['status'] == 'VERIFIED' and attempt['ended_at']
+    assert physical_ledger() == before
+
+
+def test_inventory_maintenance_and_missing_balance_allow_offline_authorization(execution_setup):
+    from app.services.manual_task_orchestration import ManualTaskApplicationService, ManualTaskRequest
+    service, repository, calls = execution_setup
+    with repository.connect_write() as connection:
+        connection.execute("UPDATE tasks SET task_status = 'cancelled'")
+        connection.execute('DELETE FROM inventory_balances')
+        connection.execute("""UPDATE inventory_authority_state SET authority_mode = 'PRE_CUTOVER',
+            bootstrap_snapshot_sha256 = NULL, bootstrap_runtime_snapshot_sha256 = NULL,
+            bootstrap_sales_watermark_date = NULL, bootstrap_idempotency_key = NULL,
+            bootstrap_completed_at = NULL, bootstrap_completed_by = NULL""")
+    manual = ManualTaskApplicationService(repository, products_workbook=service.products_workbook,
+        platform_mappings_workbook=service.platform_mappings_workbook, clock=service.clock)
+    request = ManualTaskRequest(varieties=('艾莎',), grades=('B级',), platforms=(PLATFORM,),
+                                action='SET_OFFLINE', idempotency_key='offline-maintenance')
+    preview = manual.preview(request)
+    assert preview.creatable
+    created = manual.create(request, expected_preview_digest=preview.preview_digest, authenticated_subject='admin')
+    prepared = service.prepare_execution(_admin(), created.task_ids, 'offline-maintenance')
+    service.submit_execution(_admin(), created.task_ids, prepared.confirmation_digest, 'offline-maintenance')
+    assert calls[0][0] == 'v5'
+
+
+@pytest.mark.parametrize('failure', ['predecessor', 'expired_task', 'expired_authorization'])
+def test_offline_authorization_safety_remains_without_balance(execution_setup, failure):
+    service, repository, _ = execution_setup
+    task_id = 'TASK-OFFLINE-B'
+    with repository.connect_write() as connection:
+        connection.execute('DELETE FROM inventory_balances')
+    if failure == 'expired_authorization':
+        prepared = service.prepare_execution(_admin(), [task_id], 'expiry')
+        service.clock = lambda: prepared.expires_at + timedelta(seconds=1)
+        with pytest.raises(ExecutionAuthorizationConflict):
+            service.submit_execution(_admin(), [task_id], prepared.confirmation_digest, 'expiry')
+        return
+    if failure == 'predecessor':
+        old = replace(repository.get_task(task_id), task_id='TASK-PREDECESSOR', dedupe_key='')
+        repository.insert_tasks([old])
+        with repository.connect_write() as connection:
+            connection.execute('UPDATE tasks SET decision_trace_json = ? WHERE task_id = ?',
+                (json.dumps({'predecessor_task_ids': [old.task_id]}), task_id))
+        error, message = ExecutionAuthorizationBlocked, '尚未收口'
+    else:
+        with repository.connect_write() as connection:
+            connection.execute('UPDATE tasks SET expires_at = ? WHERE task_id = ?',
+                               ((NOW - timedelta(seconds=1)).isoformat(), task_id))
+        error, message = ExecutionAuthorizationConflict, '已过期'
+    with pytest.raises(error, match=message):
+        service.prepare_execution(_admin(), [task_id], 'blocked')
 
 
 def _admin() -> Principal:
