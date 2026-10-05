@@ -1,8 +1,8 @@
 # PRA 当前阶段与验证状态
 
-## 旁路：锦成供应商平台探索（2026-10-05）
+## 旁路：锦成与寻梦供应商平台探索（2026-10-05）
 
-Draft [PR #68](https://github.com/etereath/PRA-project/pull/68)，分支 `codex/jincheng-platform-discovery`，基于 `main@aaa9349`：**首轮只读探索完成 / 接入未实现**。实际访问“锦成入驻商家”的22组页面/查询路径，商品列表从首批20行补载至21行并核对可见终点；确认供货价/平台售价/结算价、售罄与下架、送货日与下单自然日的区别，以及历史查询、异常、代卖/代配、扫码、行情与营销入口。收益权限、商品库及开票前置限制已证实；成交明细缺少明确终点，不能宣称完整采集通过；HTTP API、真实写和正式导入未验证。无生产 Adapter、Runtime/Queue/Worker 变更，不推进主任务实机验收。脱敏证据矩阵、既有能力复用和后续交接见[探索记录](reports/jincheng_platform_discovery_20261005.md)；文档仅做编码、链接和差异检查，自动 CI 以 PR 实际 Head 为准。
+Draft [PR #68](https://github.com/etereath/PRA-project/pull/68)，分支 `codex/jincheng-platform-discovery`，基于 `main@aaa9349`：**两平台首轮只读探索完成 / 接入未实现**。用户明确以影刀 / ShadowBot 界面自动化为主线，官方 HTTP API 不作为前置条件。[锦成记录](reports/jincheng_platform_discovery_20261005.md)覆盖22组路径、商品补载及终点、多种价格/日期语义；收益权限、商品库、开票前置限制已证实，成交明细缺少明确终点。[寻梦记录](reports/xunmeng_platform_discovery_20261005.md)覆盖24组路径，商品与普通订单均见明确终点，历史场次含前晚订单并与送货聚合核对；发现加载零值/临时空态、库存与代卖设置同面板、补货自动上架、统计月份与代卖历史列表范围不同等边界。正式完整采集、真实写和导入仍未验证；无生产 Adapter、Runtime/Queue/Worker 变更，不推进主任务实机验收。文档仅做编码、链接、脱敏和差异检查，自动 CI 以 PR 实际 Head 为准。
 
 角色：Current Status；项目进度与验证状态的唯一维护页。仅在阶段、范围、blocker 或验证结论发生实质变化时更新；即时 Head/CI 以 GitHub 为准，`index.md` 仅负责索引。更新于 2026-10-03。
 
