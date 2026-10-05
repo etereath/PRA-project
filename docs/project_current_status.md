@@ -2,7 +2,7 @@
 
 ## 旁路：锦成供应商平台探索（2026-10-05）
 
-负责人要求在主任务等待实机期间启动独立探索。基于 `main@aaa9349` 的 `codex/jincheng-platform-discovery` 只读取已登录的“锦成入驻商家”小程序，记录商品、订单、履约、统计与结算入口和接入缺口；不推进主任务实机验收、不改 Runtime、不执行真实平台写。首轮已确认页面结构可读、商品多价格及状态重叠语义；HTTP API 未确认。详见[探索记录](reports/jincheng_platform_discovery_20261005.md)。
+Draft [PR #68](https://github.com/etereath/PRA-project/pull/68)，分支 `codex/jincheng-platform-discovery`，基于 `main@aaa9349`：**首轮只读探索完成 / 接入未实现**。实际访问“锦成入驻商家”的22组页面/查询路径，商品列表从首批20行补载至21行并核对可见终点；确认供货价/平台售价/结算价、售罄与下架、送货日与下单自然日的区别，以及历史查询、异常、代卖/代配、扫码、行情与营销入口。收益权限、商品库及开票前置限制已证实；成交明细缺少明确终点，不能宣称完整采集通过；HTTP API、真实写和正式导入未验证。无生产 Adapter、Runtime/Queue/Worker 变更，不推进主任务实机验收。脱敏证据矩阵、既有能力复用和后续交接见[探索记录](reports/jincheng_platform_discovery_20261005.md)；文档仅做编码、链接和差异检查，自动 CI 以 PR 实际 Head 为准。
 
 角色：Current Status；项目进度与验证状态的唯一维护页。仅在阶段、范围、blocker 或验证结论发生实质变化时更新；即时 Head/CI 以 GitHub 为准，`index.md` 仅负责索引。更新于 2026-10-03。
 
