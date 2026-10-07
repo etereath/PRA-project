@@ -2,7 +2,9 @@
 
 ## 旁路：锦成与寻梦供应商平台探索（2026-10-05）
 
-Draft [PR #68](https://github.com/etereath/PRA-project/pull/68)，分支 `codex/jincheng-platform-discovery`，基于 `main@aaa9349`：**两平台首轮只读探索完成 / 接入未实现**。用户明确以影刀 / ShadowBot 界面自动化为主线，官方 HTTP API 不作为前置条件。[锦成记录](reports/jincheng_platform_discovery_20261005.md)覆盖22组路径、商品补载及终点、多种价格/日期语义；收益权限、商品库、开票前置限制已证实，成交明细缺少明确终点。[寻梦记录](reports/xunmeng_platform_discovery_20261005.md)覆盖24组路径，商品与普通订单均见明确终点，历史场次含前晚订单并与送货聚合核对；发现加载零值/临时空态、库存与代卖设置同面板、补货自动上架、统计月份与代卖历史列表范围不同等边界。正式完整采集、真实写和导入仍未验证；无生产 Adapter、Runtime/Queue/Worker 变更，不推进主任务实机验收。文档仅做编码、链接、脱敏和差异检查，自动 CI 以 PR 实际 Head 为准。
+Draft [PR #68](https://github.com/etereath/PRA-project/pull/68)，分支 `codex/jincheng-platform-discovery`，基于 `main@aaa9349`：**两平台首轮只读探索完成 / 寻梦与锦成接入未实现**。[锦成记录](reports/jincheng_platform_discovery_20261005.md)覆盖22组路径，商品可见终点、成交详情缺完成证据；[寻梦记录](reports/xunmeng_platform_discovery_20261005.md)覆盖24组路径，商品与普通订单均有终点，并确认跨日场次、加载空态及库存设置联动等边界。
+
+2026-10-07已形成[UIA 多平台实施规划](plans/multiplatform_uia_integration_plan.md)：承接 F1/F2 最新直接 Windows UIA 方向，影刀仅保留已验写链分阶段退出，官方 HTTP API 不作为前置条件。规划引用 F2 本地固定提交 `4c8ce4c` 的独立驱动与订单实读证据，不把它当 main 已合并或整包通过。新增平台按“共享驱动及桌面串行边界 → 寻梦只读纵切 → 锦成商品/订单补证 → 经营组合 → 写迁移”推进；第二平台前明确 Supply 共享、Commitment 有条件汇总、Exposure 独立及同桌面互斥。下一步为规划 U0/U1 与寻梦最小链开发，正式接管仍依赖相应 F1/F2 证据及 F3 authority 切换。本轮只有文档，完成编码、链接与直接语义检查；未开发新 Reader、运行实机/回归、修改 Runtime/Queue/Worker 或推进主任务验收。
 
 角色：Current Status；项目进度与验证状态的唯一维护页。仅在阶段、范围、blocker 或验证结论发生实质变化时更新；即时 Head/CI 以 GitHub 为准，`index.md` 仅负责索引。更新于 2026-10-03。
 
