@@ -27,6 +27,7 @@
 
 ## 任务计划与证据目录
 
+- [UIA 多平台接入实施规划](plans/multiplatform_uia_integration_plan.md)：平台适配、共用桌面隔离、经营组合与迁移交接
 - [13.7-1 RM0 受控真实平台验收准备](reports/task13_7_1_rm0_controlled_real_machine_preparation_20260907.md)：环境检查、blocker、RM1 步骤与证据模板
 - [13.7-1 已满足目标确认与授权回执](reports/task13_7_1_p2_authorization_receipts_20260907.md)：P2 修复报告
 - [13.7-1 人工终态收口](reports/task13_7_1_p1_human_resolution_20260907.md)：P1 修复报告

@@ -1,5 +1,11 @@
 # PRA 当前阶段与验证状态
 
+## 旁路：锦成与寻梦供应商平台探索（2026-10-05）
+
+Draft [PR #68](https://github.com/etereath/PRA-project/pull/68)，分支 `codex/jincheng-platform-discovery`，基于 `main@aaa9349`：**两平台首轮只读探索完成 / 寻梦与锦成接入未实现**。[锦成记录](reports/jincheng_platform_discovery_20261005.md)覆盖22组路径，商品可见终点、成交详情缺完成证据；[寻梦记录](reports/xunmeng_platform_discovery_20261005.md)覆盖24组路径，商品与普通订单均有终点，并确认跨日场次、加载空态及库存设置联动等边界。
+
+2026-10-07已形成[UIA 多平台实施规划](plans/multiplatform_uia_integration_plan.md)：承接 F1/F2 最新直接 Windows UIA 方向，影刀仅保留已验写链分阶段退出，官方 HTTP API 不作为前置条件。规划引用 F2 本地固定提交 `4c8ce4c` 的独立驱动与订单实读证据，不把它当 main 已合并或整包通过。新增平台按“共享驱动及桌面串行边界 → 寻梦只读纵切 → 锦成商品/订单补证 → 经营组合 → 写迁移”推进；第二平台前明确 Supply 共享、Commitment 有条件汇总、Exposure 独立及同桌面互斥。下一步为规划 U0/U1 与寻梦最小链开发，正式接管仍依赖相应 F1/F2 证据及 F3 authority 切换。本轮只有文档，完成编码、链接与直接语义检查；未开发新 Reader、运行实机/回归、修改 Runtime/Queue/Worker 或推进主任务验收。
+
 角色：Current Status；项目进度与验证状态的唯一维护页。仅在阶段、范围、blocker 或验证结论发生实质变化时更新；即时 Head/CI 以 GitHub 为准，`index.md` 仅负责索引。更新于 2026-10-03。
 
 PR [#47](https://github.com/etereath/PRA-project/pull/47)、RM0 交付 PR [#49](https://github.com/etereath/PRA-project/pull/49)、收口 PR [#50](https://github.com/etereath/PRA-project/pull/50)、Authority Contract PR [#52](https://github.com/etereath/PRA-project/pull/52)、Runtime Product/Mapping Authority PR [#53](https://github.com/etereath/PRA-project/pull/53) 与开发资源治理 PR [#56](https://github.com/etereath/PRA-project/pull/56) 均已合并。2026-09-09 PR #54 已同步 current `main@0b1135787ac33c3c6c96531f874924418924bb8a` 并开始 Task 13.7-2C。Task 13.7-1 Implementation Review = **PASS**，P1-47-01、P2-47-01、P2-47-02 均 **CLOSED**。代码和 RM0 记录已进入 main；RM1-A 真实 READ_ONLY 已通过。RM1-B 首次授权在提交前以 `OLD_PRICE_PARSE_FAILED / NOT_STARTED` 失败，相关列表筛选、Web 责任表达及固定价格新鲜度门禁已经修复；2026-09-08 负责人重新授权后，`AISHA-B-60-Z` 已通过唯一一次真实提交由 `10.80` 调整为 `10.30`，写后独立回读、Importer、Archive、锁释放及持久 continuation 收口均为 **VERIFIED**。
