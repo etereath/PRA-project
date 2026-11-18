@@ -6,9 +6,11 @@ Draft [PR #68](https://github.com/etereath/PRA-project/pull/68)，分支 `codex/
 
 2026-10-07已形成[UIA 多平台实施规划](plans/multiplatform_uia_integration_plan.md)：承接 F1/F2 最新直接 Windows UIA 方向，影刀仅保留已验写链分阶段退出，官方 HTTP API 不作为前置条件。规划引用 F2 本地固定提交 `4c8ce4c` 的独立驱动与订单实读证据，不把它当 main 已合并或整包通过。新增平台按“共享驱动及桌面串行边界 → 寻梦只读纵切 → 锦成商品/订单补证 → 经营组合 → 写迁移”推进；第二平台前明确 Supply 共享、Commitment 有条件汇总、Exposure 独立及同桌面互斥。下一步为规划 U0/U1 与寻梦最小链开发，正式接管仍依赖相应 F1/F2 证据及 F3 authority 切换。本轮只有文档，完成编码、链接与直接语义检查；未开发新 Reader、运行实机/回归、修改 Runtime/Queue/Worker 或推进主任务验收。
 
-2026-11-18 锦成商品读取核心与端口合同已实现。4.5.0 实机全部范围页头 33、可见尾标 21 张，出售中标签 4、实际可见 2 张，两者均存在覆盖差异。全部页脱敏结构回放返回 `PARTIAL / PRODUCT_COUNT_MISMATCH`。下一步由锦成接入开发者在共享 Windows 驱动可集成后接通端口，并确认计数范围和取得来源绑定证据。商品正式导入与经营查询闭环因此尚未完成，详见[锦成复核](reports/jincheng_platform_discovery_20261005.md#2026-11-18-商品列表复核)。
+2026-11-19 负责人确认锦成商品括号计数有误，已撤销其完整性门槛。读取核心按实读卡片计数，校验范围、累计补载、显示身份和可见尾标处的稳定回读。4.5.0 样本以 21 张全部商品卡片为准。下一步由锦成接入开发者接通共享 Windows 驱动，取得独立实读和正式来源绑定证据。[商品复核](reports/jincheng_platform_discovery_20261005.md#2026-11-18-商品列表复核)
 
-角色：Current Status；项目进度与验证状态的唯一维护页。仅在阶段、范围、blocker 或验证结论发生实质变化时更新；即时 Head/CI 以 GitHub 为准，`index.md` 仅负责索引。更新于 2026-11-18。
+同日确认 MP-RO1 当前锦成归档均请求今日送货，明日需备货尚未计入。采样器支持单独请求明日送货，并按页面所选送货日期记录，明日非空场次落盘仍缺现场证据。[日期口径](reports/jincheng_platform_discovery_20261005.md#2026-11-19-今日需送货与明日需备货)
+
+角色：Current Status；项目进度与验证状态的唯一维护页。仅在阶段、范围、blocker 或验证结论发生实质变化时更新；即时 Head/CI 以 GitHub 为准，`index.md` 仅负责索引。更新于 2026-11-19。
 
 PR [#47](https://github.com/etereath/PRA-project/pull/47)、RM0 交付 PR [#49](https://github.com/etereath/PRA-project/pull/49)、收口 PR [#50](https://github.com/etereath/PRA-project/pull/50)、Authority Contract PR [#52](https://github.com/etereath/PRA-project/pull/52)、Runtime Product/Mapping Authority PR [#53](https://github.com/etereath/PRA-project/pull/53) 与开发资源治理 PR [#56](https://github.com/etereath/PRA-project/pull/56) 均已合并。2026-09-09 PR #54 已同步 current `main@0b1135787ac33c3c6c96531f874924418924bb8a` 并开始 Task 13.7-2C。Task 13.7-1 Implementation Review = **PASS**，P1-47-01、P2-47-01、P2-47-02 均 **CLOSED**。代码和 RM0 记录已进入 main；RM1-A 真实 READ_ONLY 已通过。RM1-B 首次授权在提交前以 `OLD_PRICE_PARSE_FAILED / NOT_STARTED` 失败，相关列表筛选、Web 责任表达及固定价格新鲜度门禁已经修复；2026-09-08 负责人重新授权后，`AISHA-B-60-Z` 已通过唯一一次真实提交由 `10.80` 调整为 `10.30`，写后独立回读、Importer、Archive、锁释放及持久 continuation 收口均为 **VERIFIED**。
 

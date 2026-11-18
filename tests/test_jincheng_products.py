@@ -100,23 +100,25 @@ def test_cumulative_reader_keeps_sold_out_online_and_pending_activation_separate
     )
 
 
-def test_visible_tail_does_not_qualify_21_cards_against_header_33():
+@pytest.mark.parametrize("last_count", [33, 4, 0])
+def test_stable_visible_tail_counts_actual_cards_despite_tab_numbers(last_count):
     cards = tuple(_card(f"样品{i}") for i in range(21))
     result = capture_jincheng_products(
         [
             _frame(*cards[:20], count=33, tail=False),
             _frame(*cards, count=33),
+            _frame(*cards, count=last_count),
         ]
     )
-    assert (result.status, result.reason) == ("PARTIAL", "PRODUCT_COUNT_MISMATCH")
-    assert result.end_marker_verified and len(result.rows) == 21
+    assert (result.status, result.reason) == ("COMPLETE", "")
+    assert result.end_marker_verified and result.row_count == 21
 
 
 @pytest.mark.parametrize(
     ("frames", "reason"),
     [
         ([_frame(_card("样品甲"), visible=False)] * 2, "PRODUCT_TAIL_UNCONFIRMED"),
-        ([_frame(_card("样品甲"))], "PRODUCT_TAIL_UNSTABLE"),
+        ([_frame(_card("样品甲"), count=33)], "PRODUCT_TAIL_UNSTABLE"),
         (
             [_frame(_card("样品甲"), _card("样品甲", qty="2"))],
             "PRODUCT_IDENTITY_AMBIGUOUS",

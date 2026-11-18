@@ -9,7 +9,7 @@ from decimal import Decimal
 from typing import Literal, Protocol
 
 
-_COUNT = re.compile(r"全部\(([0-9]+)\)")
+_ALL_TAB = re.compile(r"全部(?:\([0-9]+\))?")
 _TITLE = re.compile(
     r"(?P<name>[^｜|]+)[｜|]\s*【(?P<grade>[A-Z](?:\+)?)级】\s*(?P<spec>.+)"
 )
@@ -64,9 +64,12 @@ class JinchengProductFrame:
 class JinchengProductCapture:
     status: Literal["COMPLETE", "PARTIAL"]
     reason: str
-    expected_count: int
     end_marker_verified: bool
     rows: tuple[JinchengProduct, ...]
+
+    @property
+    def row_count(self) -> int:
+        return len(self.rows)
 
 
 class JinchengProductPort(Protocol):
@@ -117,7 +120,7 @@ def _prices(
 
 def _parse_frame(
     frame: JinchengProductFrame,
-) -> tuple[int, bool, tuple[JinchengProduct, ...]]:
+) -> tuple[bool, tuple[JinchengProduct, ...]]:
     if not frame.full_scope_verified:
         raise JinchengProductReadError("PRODUCT_SCOPE_UNCONFIRMED")
     tokens = tuple(
@@ -127,17 +130,10 @@ def _parse_frame(
     )
     if not tokens or tokens[0] != "商品管理":
         raise JinchengProductReadError("PRODUCT_DOCUMENT_UNCONFIRMED")
-    counts = [
-        (i, m) for i, token in enumerate(tokens) if (m := _COUNT.fullmatch(token))
-    ]
-    if len(counts) != 1:
-        raise JinchengProductReadError("PRODUCT_COUNT_UNCONFIRMED")
-    count_index, match = counts[0]
-    expected = int(match[1])
-    if (
-        tokens.count("全部下架") != 1
-        or (start := tokens.index("全部下架")) <= count_index
-    ):
+    if tokens.count("全部下架") != 1:
+        raise JinchengProductReadError("PRODUCT_LIST_UNCONFIRMED")
+    start = tokens.index("全部下架")
+    if sum(bool(_ALL_TAB.fullmatch(token)) for token in tokens[:start]) != 1:
         raise JinchengProductReadError("PRODUCT_LIST_UNCONFIRMED")
     list_tokens = tokens[start + 1 :]
     stop = next(
@@ -193,7 +189,7 @@ def _parse_frame(
     if not rows:
         # No stable, explicit empty-state layout has been qualified for this page.
         raise JinchengProductReadError("PRODUCT_ROWS_UNCONFIRMED")
-    return expected, marker and frame.footer_visible, tuple(rows)
+    return marker and frame.footer_visible, tuple(rows)
 
 
 def capture_jincheng_products(
@@ -203,35 +199,31 @@ def capture_jincheng_products(
 
     Screens may overlap because the document includes earlier loaded rows.
     Require append-only progression, then two agreeing reads at the visible tail.
+    Tab counts are unreliable; count the cards in the qualified capture.
     The capture is not a source-bound Runtime observation or an atomic snapshot.
     """
     if max_frames < 2:
         raise ValueError("max_frames must allow two terminal reads")
-    expected = None
     rows: tuple[JinchengProduct, ...] = ()
     end_seen = False
     for _, frame in zip(range(max_frames), frames):
-        count, end, current = _parse_frame(frame)
-        if expected is not None and (count != expected or current[: len(rows)] != rows):
+        end, current = _parse_frame(frame)
+        if current[: len(rows)] != rows:
             return JinchengProductCapture(
-                "PARTIAL", "PRODUCT_LIST_CHANGED", expected, False, rows
+                "PARTIAL", "PRODUCT_LIST_CHANGED", False, rows
             )
         current_keys = {row.display_key for row in current}
         if len(current_keys) != len(current):
             return JinchengProductCapture(
-                "PARTIAL", "PRODUCT_IDENTITY_AMBIGUOUS", count, end, current
-            )
-        if len(current) > count or (end and len(current) != count):
-            return JinchengProductCapture(
-                "PARTIAL", "PRODUCT_COUNT_MISMATCH", count, end, current
+                "PARTIAL", "PRODUCT_IDENTITY_AMBIGUOUS", end, current
             )
         if end and end_seen and current == rows:
-            return JinchengProductCapture("COMPLETE", "", count, True, current)
-        expected, rows, end_seen = count, current, end
-    if expected is None:
+            return JinchengProductCapture("COMPLETE", "", True, current)
+        rows, end_seen = current, end
+    if not rows:
         raise JinchengProductReadError("PRODUCT_DOCUMENT_UNCONFIRMED")
     reason = "PRODUCT_TAIL_UNSTABLE" if end_seen else "PRODUCT_TAIL_UNCONFIRMED"
-    return JinchengProductCapture("PARTIAL", reason, expected, end_seen, rows)
+    return JinchengProductCapture("PARTIAL", reason, end_seen, rows)
 
 
 def read_jincheng_products(
