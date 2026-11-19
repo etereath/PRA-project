@@ -10,6 +10,8 @@ Draft [PR #68](https://github.com/etereath/PRA-project/pull/68)，分支 `codex/
 
 同日锦成独立双范围实机首轮失败，经诊断修正「暂无数据...」空态和相对送货日误判。隔离增量 `codex/jincheng-delivery-day-sampling@281b719` 复测按日落盘与查询通过：凌晨「今日送货」仍对应11月18日，明确空态 `SUCCESS`，「明日送货」对应11月19日，非空无尾标 `PARTIAL`。28项定向测试通过，采样进程已退出。下一步由接入开发者取得两页对同一送货日的跨切换样本，核对累计覆盖和实际切换时刻，再验证正式销量来源与独立日结。[日期口径](reports/jincheng_platform_discovery_20261005.md#2026-11-19-今日需送货与明日需备货)
 
+负责人已取消锦成整点采样，规定每轮从工作台出发并回到工作台。[Light / Full 流程复核](reports/jincheng_platform_discovery_20261005.md#锦成-light-scan-与-full-scan-流程复核)已记录两种扫描的页面范围、刷新与收尾条件。旧整点读数未确认实际刷新，撤销据此推断的切换下界。11:00待验证，约15:50重新进入小程序后已确认新日期对。锦成正式 Light / Full 仍待 Windows 端口接线和手动实机验收。
+
 角色：Current Status；项目进度与验证状态的唯一维护页。仅在阶段、范围、blocker 或验证结论发生实质变化时更新；即时 Head/CI 以 GitHub 为准，`index.md` 仅负责索引。更新于 2026-11-19。
 
 PR [#47](https://github.com/etereath/PRA-project/pull/47)、RM0 交付 PR [#49](https://github.com/etereath/PRA-project/pull/49)、收口 PR [#50](https://github.com/etereath/PRA-project/pull/50)、Authority Contract PR [#52](https://github.com/etereath/PRA-project/pull/52)、Runtime Product/Mapping Authority PR [#53](https://github.com/etereath/PRA-project/pull/53) 与开发资源治理 PR [#56](https://github.com/etereath/PRA-project/pull/56) 均已合并。2026-09-09 PR #54 已同步 current `main@0b1135787ac33c3c6c96531f874924418924bb8a` 并开始 Task 13.7-2C。Task 13.7-1 Implementation Review = **PASS**，P1-47-01、P2-47-01、P2-47-02 均 **CLOSED**。代码和 RM0 记录已进入 main；RM1-A 真实 READ_ONLY 已通过。RM1-B 首次授权在提交前以 `OLD_PRICE_PARSE_FAILED / NOT_STARTED` 失败，相关列表筛选、Web 责任表达及固定价格新鲜度门禁已经修复；2026-09-08 负责人重新授权后，`AISHA-B-60-Z` 已通过唯一一次真实提交由 `10.80` 调整为 `10.30`，写后独立回读、Importer、Archive、锁释放及持久 continuation 收口均为 **VERIFIED**。
