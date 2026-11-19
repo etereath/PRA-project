@@ -1,6 +1,22 @@
 # PRA 当前阶段与验证状态
 
-角色：Current Status；项目进度与验证状态的唯一维护页。仅在阶段、范围、blocker 或验证结论发生实质变化时更新；即时 Head/CI 以 GitHub 为准，`index.md` 仅负责索引。更新于 2026-10-03。
+## 旁路：锦成与寻梦供应商平台探索（2026-10-05）
+
+Draft [PR #68](https://github.com/etereath/PRA-project/pull/68)，分支 `codex/jincheng-platform-discovery`，基于 `main@aaa9349`：**两平台首轮只读探索完成 / 寻梦与锦成接入未实现**。[锦成记录](reports/jincheng_platform_discovery_20261005.md)覆盖22组路径，商品可见终点、成交详情缺完成证据；[寻梦记录](reports/xunmeng_platform_discovery_20261005.md)覆盖24组路径，商品与普通订单均有终点，并确认跨日场次、加载空态及库存设置联动等边界。
+
+2026-10-07已形成[UIA 多平台实施规划](plans/multiplatform_uia_integration_plan.md)：承接 F1/F2 最新直接 Windows UIA 方向，影刀仅保留已验写链分阶段退出，官方 HTTP API 不作为前置条件。规划引用 F2 本地固定提交 `4c8ce4c` 的独立驱动与订单实读证据，不把它当 main 已合并或整包通过。新增平台按“共享驱动及桌面串行边界 → 寻梦只读纵切 → 锦成商品/订单补证 → 经营组合 → 写迁移”推进；第二平台前明确 Supply 共享、Commitment 有条件汇总、Exposure 独立及同桌面互斥。下一步为规划 U0/U1 与寻梦最小链开发，正式接管仍依赖相应 F1/F2 证据及 F3 authority 切换。本轮只有文档，完成编码、链接与直接语义检查；未开发新 Reader、运行实机/回归、修改 Runtime/Queue/Worker 或推进主任务验收。
+
+2026-11-19 负责人确认锦成商品括号计数有误，已撤销其完整性门槛。读取核心按实读卡片计数，校验范围、累计补载、显示身份和可见尾标处的稳定回读。4.5.0 样本以 21 张全部商品卡片为准。下一步由锦成接入开发者接通共享 Windows 驱动，取得独立实读和正式来源绑定证据。[商品复核](reports/jincheng_platform_discovery_20261005.md#2026-11-18-商品列表复核)
+
+同日锦成独立双范围实机首轮失败，经诊断修正「暂无数据...」空态和相对送货日误判。隔离增量 `codex/jincheng-delivery-day-sampling@281b719` 复测按日落盘与查询通过：凌晨「今日送货」仍对应11月18日，明确空态 `SUCCESS`，「明日送货」对应11月19日，非空无尾标 `PARTIAL`。28项定向测试通过，采样进程已退出。下一步由接入开发者取得两页对同一送货日的跨切换样本，核对累计覆盖和实际切换时刻，再验证正式销量来源与独立日结。[日期口径](reports/jincheng_platform_discovery_20261005.md#2026-11-19-今日需送货与明日需备货)
+
+负责人已取消锦成整点采样，规定每轮从工作台出发并回到工作台。[Light / Full 流程复核](reports/jincheng_platform_discovery_20261005.md#锦成-light-scan-与-full-scan-流程复核)已记录两种扫描的页面范围、刷新与收尾条件。旧整点读数未确认实际刷新，撤销据此推断的切换下界。11:00待验证，约15:50重新进入小程序后已确认新日期对。锦成正式 Light / Full 仍待 Windows 端口接线和手动实机验收。
+
+锦成[跨日订单扫描流程](reports/jincheng_platform_discovery_20261005.md#锦成跨日订单扫描closing)已记录历史选日、按商品组读取、回工作台与正式日结导入条件。两轮实机只读复核完成工作台往返，确认重新进入销售统计会沿用所选日期，选日后须等待稳定回读。历史空态和非空商品组对账已验证，非空详情滚动无明确尾标，完整性验收未通过。接入开发者继续确认锦成交易日与冻结条件、补完整范围证据，再接隔离 Runtime。正式日结尚未启用。
+
+[三种扫描实机计时](reports/jincheng_platform_discovery_20261005.md#2026-11-19-三种扫描的实机计时)已完成四轮工作台往返。Full 逐屏复核末批补载及 21 张卡片，UIA 活动文档截断是独立 Reader 接线的实测限制。Light 的「出售中」范围漏掉仍可下架的售罄商品，销量页及非空 Closing 详情仍缺明确尾标。计时供诊断，正式扫描和导入资格待验。
+
+角色：Current Status；项目进度与验证状态的唯一维护页。仅在阶段、范围、blocker 或验证结论发生实质变化时更新；即时 Head/CI 以 GitHub 为准，`index.md` 仅负责索引。更新于 2026-11-19。
 
 PR [#47](https://github.com/etereath/PRA-project/pull/47)、RM0 交付 PR [#49](https://github.com/etereath/PRA-project/pull/49)、收口 PR [#50](https://github.com/etereath/PRA-project/pull/50)、Authority Contract PR [#52](https://github.com/etereath/PRA-project/pull/52)、Runtime Product/Mapping Authority PR [#53](https://github.com/etereath/PRA-project/pull/53) 与开发资源治理 PR [#56](https://github.com/etereath/PRA-project/pull/56) 均已合并。2026-09-09 PR #54 已同步 current `main@0b1135787ac33c3c6c96531f874924418924bb8a` 并开始 Task 13.7-2C。Task 13.7-1 Implementation Review = **PASS**，P1-47-01、P2-47-01、P2-47-02 均 **CLOSED**。代码和 RM0 记录已进入 main；RM1-A 真实 READ_ONLY 已通过。RM1-B 首次授权在提交前以 `OLD_PRICE_PARSE_FAILED / NOT_STARTED` 失败，相关列表筛选、Web 责任表达及固定价格新鲜度门禁已经修复；2026-09-08 负责人重新授权后，`AISHA-B-60-Z` 已通过唯一一次真实提交由 `10.80` 调整为 `10.30`，写后独立回读、Importer、Archive、锁释放及持久 continuation 收口均为 **VERIFIED**。
 
